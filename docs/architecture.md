@@ -16,10 +16,9 @@
 | FastAPI | 最新安定版 | Web APIサーバー | asyncio対応、WebSocket、自動APIドキュメント生成 |
 | uvicorn | 最新安定版 | ASGIサーバー | FastAPIと組み合わせで高パフォーマンス |
 | pymodbus | 3.x | Modbus RTU通信 | asyncio対応、Python製Modbus実装のデファクトスタンダード |
-| python-can | 4.x | CAN bus通信 | Kvaser backenに対応 |
+| python-can | 4.x | CAN bus通信 | Kvaser backendに対応 |
 | asyncpg | 最新安定版 | PostgreSQL非同期ドライバ | asyncio対応で高速書き込み |
-| RPi.GPIO | 最新安定版 | GPIO制御 | Raspberry Pi GPIO、UPS検知・非常停止割り込み |
-| smbus2 | 最新安定版 | I2C通信 | X1201 UPS残量取得（I2C 0x36） |
+| RPi.GPIO | 最新安定版 | GPIO制御 | AC UPS接点出力によるAC断検知・非常停止割り込み |
 | numpy | 最新安定版 | 運転モデル補間 | 高速な2次元グリッド補間 |
 | scipy | 最新安定版 | 運転モデル補間 | RegularGridInterpolator |
 | gzip / shutil | 標準ライブラリ | ログアーカイブ圧縮 | 追加インストール不要 |
@@ -250,15 +249,13 @@ Raspberry Pi 5 (16GB)
 │
 ├── USB            →  Kvaser USB-CAN         →  シャシダイナモ CAN bus
 │
-├── GPIO 6         →  X1201 UPS (AC断検知)
-├── I2C 0x36       →  X1201 UPS (バッテリー残量)
+├── GPIO (IN, TBD) →  AC UPS 接点出力（バッテリー運転中信号、AC断検知）
 ├── GPIO (IN)      →  非常停止スイッチ #1 (シャシダイナモ室)
 │                   →  非常停止スイッチ #2 (操作エリア)  ← 並列接続
 │
-├── Geekworm X1201 UPS (5V)  ← Raspberry Pi本体 + 内蔵SSD
-│
-└── 24V UPS (TBD)  →  P-CON-CB #1 / #2 電源バックアップ
-                       └→ AC断時に home_return() を実行する時間を確保
+└── AC UPS (TBD)   →  5V PSU  →  Raspberry Pi 本体 + 内蔵SSD
+                    →  24V PSU →  P-CON-CB #1 / #2
+                    └→ AC断時に両系統バックアップ、接点出力でAC断をRPiに通知
 ```
 
 ### Modbus RTU 通信設定
@@ -340,7 +337,7 @@ Raspberry Pi 5 (16GB)
 - アクチュエータ単体Modbus通信（位置指令・読み取り）
 - CAN受信（シャシダイナモまたは模擬信号発生器）
 - 非常停止GPIO割り込み動作確認
-- X1201 UPS残量取得
+- AC UPS接点出力によるAC断検知確認
 - AC電源断シーケンス（実際にコンセントを抜いて確認）
 
 ---

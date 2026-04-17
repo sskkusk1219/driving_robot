@@ -34,8 +34,7 @@ graph TB
         PCON1[P-CON-CB #1<br/>アクセル SLAVE_ID=1]
         PCON2[P-CON-CB #2<br/>ブレーキ SLAVE_ID=2]
         CAN[Kvaser USB-CAN<br/>シャシダイナモ]
-        UPS5V[X1201 UPS 5V<br/>GPIO6 / I2C 0x36]
-        UPS24V[UPS 24V<br/>P-CON-CB電源]
+        ACUPS[AC UPS<br/>接点出力 → GPIO(TBD)]
         EmergencyStop[非常停止スイッチ<br/>2個並列]
     end
 
@@ -55,7 +54,7 @@ graph TB
     AccelDriver <-->|Modbus RTU| PCON1
     BrakeDriver <-->|Modbus RTU| PCON2
     CANReader <-->|CAN bus| CAN
-    GPIOMonitor <-->|GPIO / I2C| UPS5V
+    GPIOMonitor <-->|GPIO 接点入力| ACUPS
     PCON1 --> ActuatorA[アクセルアクチュエータ<br/>IAI RCP6-ROD]
     PCON2 --> ActuatorB[ブレーキアクチュエータ<br/>IAI RCP6-ROD]
 ```
@@ -69,12 +68,12 @@ graph TB
 | 言語 | Python 3.13 | asyncioによる並列制御、豊富なライブラリ |
 | 非同期フレームワーク | asyncio | 10ms制御ループとI/O並列化 |
 | Webフレームワーク | FastAPI | 非同期対応、自動API生成、WebSocket |
-| Web UI | HTML/JS + Jinja2 (or Streamlit) | ブラウザ接続のみで操作可能 |
+| Web UI | HTML/JS + Jinja2 | ブラウザ接続のみで操作可能、FastAPIと統合容易 |
 | Modbusライブラリ | pymodbus | Modbus RTU/ASCII対応 |
 | CANライブラリ | python-can (Kvaser backend) | Kvaser USB-CANドライバ対応 |
 | データベース | PostgreSQL 15 | 時系列ログ管理、3ヶ月分 |
 | ORMなし | psycopg2 / asyncpg | シンプルなSQL、高速書き込み |
-| GPIO/I2C | RPi.GPIO / smbus2 | UPS残量取得、AC断検知 |
+| GPIO | RPi.GPIO | AC UPS接点出力によるAC断検知、非常停止割り込み |
 | 圧縮・アーカイブ | gzip / shutil | ログCSV圧縮 |
 | 設定管理 | JSON / TOML | 車両プロファイル |
 
@@ -328,15 +327,31 @@ class ActuatorDriver:
     async def is_alarm_active() -> bool
 ```
 
-**Modbusレジスタマッピング** (P-CON-CB仕様に基づく):
-| 機能 | レジスタ | R/W |
-|------|---------|-----|
-| 位置指令 | TBD | W |
-| 現在位置 | TBD | R |
-| 電流値 | TBD | R |
-| サーボON | TBD | W |
-| アラームリセット | TBD | W |
-| アラーム状態 | TBD | R |
+**Modbusレジスタマッピング** (MJ0162-12A Modbus仕様書 第12版より):
+
+FC03 読み取り:
+| 機能 | アドレス (HEX) | サイズ | 記号 | 備考 |
+|------|--------------|--------|------|------|
+| 現在位置 | 0x9000-0x9001 | 32bit符号付き | PNOW | 単位: 0.01mm |
+| アラームコード | 0x9002 | 16bit | ALMC | 0=正常 |
+| デバイスステータス1 | 0x9005 | 16bit | DSS1 | bit12=SV, bit10=ALMH, bit4=HEND, bit3=PEND |
+| 拡張デバイスステータス | 0x9007 | 16bit | DSSE | bit5=MOVE(移動中) |
+| 電流値 | 0x900C-0x900D | 32bit符号付き | CNOW | 単位: mA |
+
+FC05 コイル書き込み:
+| 機能 | アドレス (HEX) | ON値 | 記号 | 備考 |
+|------|--------------|------|------|------|
+| サーボON | 0x0403 | FF00 | SON | 0000でOFF |
+| アラームリセット | 0x0407 | FF00 | ALRS | エッジ入力、完了後0000に戻す |
+| 原点復帰 | 0x040B | FF00 | HOME | DSS1 HEND(bit4)=1で完了確認 |
+
+FC10 直値移動指令 (レジスタ書き込み後、自動的に移動開始):
+| 機能 | アドレス (HEX) | サイズ | 記号 | 備考 |
+|------|--------------|--------|------|------|
+| 目標位置 | 0x9900-0x9901 | 32bit符号付き | PCMD | 単位: 0.01mm |
+| 速度指令 | 0x9904-0x9905 | 32bit | VCMD | 単位: mm/s |
+| 加減速指令 | 0x9906 | 16bit | ACMD | 単位: mm/s² |
+| 制御フラグ | 0x9908 | 16bit | CTLF | |
 
 ---
 
@@ -380,10 +395,27 @@ class PIDController:
 **制御則**:
 ```
 error = ref_speed - actual_speed
-output = Kp * error + Ki * ∫error dt + Kd * d(error)/dt
+pid_correction = Kp * error + Ki * ∫error dt + Kd * d(error)/dt
+```
 
-# アクセル: output > 0 → accel_opening += output
-# ブレーキ: output < 0 → brake_opening += |output|
+**FF+PID出力合成と最終開度算出** (RobotController内で実行):
+```
+# FFコントローラーから目標開度を取得
+ff_accel, ff_brake = ff_controller.predict(ref_speed, delta_speed)
+
+# PID補正量を加算（符号でアクセル/ブレーキを振り分け）
+raw_accel = ff_accel + max(0.0, pid_correction)
+raw_brake = ff_brake + max(0.0, -pid_correction)
+
+# アクセル・ブレーキの排他制御（初期実装）
+# 両方に開度が生じた場合はアクセル優先でブレーキをゼロにする
+# ※ 実機チューニングで変更の可能性あり
+if raw_accel > 0.0 and raw_brake > 0.0:
+    raw_brake = 0.0
+
+# プロファイルの最大開度でクランプ
+final_accel = clamp(raw_accel, 0.0, profile.max_accel_opening)
+final_brake = clamp(raw_brake, 0.0, profile.max_brake_opening)
 ```
 
 ---
@@ -393,7 +425,7 @@ output = Kp * error + Ki * ∫error dt + Kd * d(error)/dt
 **責務**:
 - 非常停止スイッチ（GPIO）の監視（割り込みベース）
 - 電流値異常の監視
-- AC電源断の監視（GPIO6: X1201 UPS）
+- AC電源断の監視（AC UPS 接点出力 → GPIO、ピン番号TBD）
 - 逸脱条件による自動停止
 
 ```python
@@ -420,12 +452,23 @@ if current > OVERCURRENT_LIMIT:
 
 **AC電源断シーケンス**:
 ```
-1. GPIO6でAC断検知 → 安全停止トリガ
-2. 全アクチュエータ home_return()（24V UPS給電中）
+1. AC UPS接点出力 → GPIO でAC断検知 → 安全停止トリガ
+2. 全アクチュエータ home_return()（AC UPS バッテリー給電中）
 3. 走行ログを PostgreSQL にフラッシュ
 4. PostgreSQL 正常終了
 5. システムシャットダウン
 ```
+
+**AC UPS に関する設計前提（機種未確定）**:
+
+> ⚠️ **TBD**: AC UPS の機種は未確定。以下の前提で設計しており、機種確定後に見直しが必要。
+
+- **電源構成**: `AC100V → AC UPS → 5V PSU → Raspberry Pi` および `AC UPS → 24V PSU → P-CON-CB`
+- **AC断検知**: AC UPS の「バッテリー運転中」接点出力を Raspberry Pi GPIO（ピン番号TBD）に接続
+  - 接点 OFF（通電中）→ ON（バッテリー運転中）の立ち上がりエッジで検知
+- **バックアップ時間の前提**: AC断後、30秒以上のバックアップ給電が可能であること
+  - home_return() + PostgreSQL終了 + シャットダウン を合計30秒以内に収める設計とする
+- **UPS残量監視**: 機種確定後に接点出力または USB（NUT）経由での残量取得を検討する
 
 ---
 
@@ -648,6 +691,76 @@ sequenceDiagram
     Note over UI: リセットボタンでREADYに戻る
 ```
 
+### UC5: 手動操作
+
+```mermaid
+sequenceDiagram
+    participant Op as オペレーター
+    participant UI as Web UI
+    participant RC as RobotController
+    participant HW as アクチュエータ
+
+    Op->>UI: 手動操作画面を開く
+    Op->>UI: 手動操作開始ボタン押下
+    UI->>RC: start_manual()
+    RC->>RC: 走行前チェック（6項目）
+    alt チェックNG
+        RC-->>UI: エラー内容表示
+    else チェックOK
+        RC->>HW: サーボON確認
+        RC-->>UI: MANUAL状態・スライダー有効化
+        loop スライダー操作中
+            Op->>UI: アクセル/ブレーキ開度を調整
+            UI->>RC: set_opening(accel%, brake%)
+            RC->>HW: 位置指令送信（FC10, 両軸）
+            HW-->>RC: 現在位置・電流値
+            RC-->>UI: WebSocket: 現在開度・電流値更新
+        end
+        Op->>UI: 手動操作終了ボタン押下
+        UI->>RC: stop_manual()
+        RC->>HW: home_return() 両軸
+        RC-->>UI: STANDBY状態
+    end
+```
+
+---
+
+### UC6: 学習運転
+
+```mermaid
+sequenceDiagram
+    participant Op as オペレーター
+    participant UI as Web UI
+    participant RC as RobotController
+    participant LM as LearningDriveManager
+    participant HW as アクチュエータ
+    participant LW as LogWriter
+
+    Op->>UI: 学習運転開始ボタン押下
+    UI->>RC: start_learning_drive()
+    RC->>RC: 走行前チェック（6項目）
+    alt チェックNG
+        RC-->>UI: エラー内容表示
+    else チェックOK
+        RC->>LM: generate_patterns(profile)
+        LM-->>RC: 速度×加速度グリッドのパターンリスト
+        RC-->>UI: RUNNING状態・推定残り時間表示
+        RC->>LW: start_session(mode='learning')
+        loop 各パターン実行
+            RC->>HW: パターン開度を指令（FC10）
+            HW-->>RC: 現在位置・電流値
+            RC->>LW: log(100ms周期)
+            RC-->>UI: WebSocket: 進捗・実車速更新
+            alt 最大開度/G上限超過
+                RC->>RC: パターンスキップ
+            end
+        end
+        RC->>HW: home_return() 両軸
+        RC->>LW: end_session(status='completed')
+        RC-->>UI: STANDBY状態・学習運転完了通知
+    end
+```
+
 ---
 
 ## 走行前チェック仕様
@@ -660,7 +773,7 @@ sequenceDiagram
 | 2 | サーボ状態 | サーボON・アラームなし | エラー表示・停止 |
 | 3 | キャリブレーション | 有効なキャリブレーションデータあり | エラー表示・停止 |
 | 4 | プロファイル | 車両プロファイル選択済み | エラー表示・停止 |
-| 5 | UPS残量 | X1201バッテリー残量 20%以上 | 警告表示（続行可） |
+| 5 | UPS残量 | AC UPS バッテリー残量 20%以上（TBD: 取得方法は機種確定後） | エラー表示・停止 |
 | 6 | アクチュエータ位置 | 両軸が原点付近にあること | エラー表示・停止 |
 
 ---
@@ -754,7 +867,7 @@ Push: {
 | 走行逸脱 | 自動停止 → 原点復帰 | 「逸脱超過：±Xkm/h × Ys」 |
 | AC電源断 | 安全停止シーケンス | 「AC電源断：安全停止中」 |
 | キャリブレーション失敗 | 停止・エラー保存 | 「キャリブレーション失敗：[項目]」 |
-| UPS残量低下 | 走行継続 + 警告 | 「UPS残量低下：XX%」 |
+| UPS残量低下 | 走行前チェックで停止 | 「UPS残量不足：XX%（20%以上必要）」 |
 
 ---
 
