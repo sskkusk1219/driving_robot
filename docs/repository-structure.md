@@ -21,6 +21,7 @@ driving_robot/
 ├── data/                       # 実行時データ
 │   ├── models/                 # 運転モデルファイル (.pkl)
 │   └── system_state.json       # シャットダウン時状態保存
+├── sample/                     # 実装サンプル・動作確認用スクリプト（MVP完了後に削除予定）
 ├── scripts/                    # セットアップ・起動スクリプト
 ├── docs/                       # プロジェクトドキュメント
 ├── .steering/                  # 作業単位のステアリングファイル
@@ -96,20 +97,20 @@ src/app/
 
 **配置ファイル**:
 - `control/`: 制御アルゴリズム群
-- `calibration.py`: キャリブレーション管理
-- `learning_drive.py`: 学習運転管理
-- `safety_monitor.py`: 安全監視
+- `calibration.py`: キャリブレーション管理（`CalibrationManager`）
+- `learning_drive.py`: 学習運転管理（`LearningDriveManager`）
+- `safety_monitor.py`: 安全監視（`SafetyMonitor`）
 
 **例**:
 ```
 src/domain/
 ├── control/
-│   ├── feedforward.py      # フィードフォワード制御
-│   ├── pid.py              # PIDコントローラ
-│   └── drive_loop.py       # 10ms制御ループ
-├── calibration.py
-├── learning_drive.py
-└── safety_monitor.py
+│   ├── feedforward.py      # フィードフォワード制御 (FeedforwardController)
+│   ├── pid.py              # PIDコントローラ (PIDController)
+│   └── drive_loop.py       # 10ms制御ループ (DriveLoop)
+├── calibration.py          # CalibrationManager
+├── learning_drive.py       # LearningDriveManager
+└── safety_monitor.py       # SafetyMonitor
 ```
 
 ---
@@ -210,7 +211,7 @@ tests/hardware/
 ├── test_actuator_modbus.py     # Modbus RTU通信
 ├── test_can_reader.py          # CAN受信
 ├── test_gpio_emergency.py      # 非常停止GPIO
-└── test_ups_i2c.py             # X1201 UPS残量取得
+└── test_ac_ups_detect.py       # AC UPS接点出力によるAC断検知確認
 ```
 
 ---
@@ -220,10 +221,11 @@ tests/hardware/
 ```
 config/
 ├── can/
-│   └── dyno_speed.dbc          # シャシダイナモ車速CAN定義（自作）
+│   └── MEIDEN_MEIDACS.dbc      # シャシダイナモ車速CAN定義（明電舎 MEIDACS）
 ├── profiles/
 │   └── [profile_name].json     # 車両プロファイルJSONバックアップ
-└── settings.toml               # システム設定（ポート・閾値・パス等）
+├── settings.toml               # システム設定（gitignore対象、機器固有値）
+└── settings.toml.example       # 設定テンプレート（バージョン管理対象）
 ```
 
 **settings.toml の構造**:
@@ -241,12 +243,8 @@ channel = 0
 dsn = "postgresql://localhost/driving_robot"
 
 [gpio]
-ac_detect_pin = 6
-emergency_stop_pin = 17
-
-[ups]
-i2c_address = 0x36
-battery_warning_pct = 20
+ac_detect_pin = 27        # AC UPS接点出力（物理ピン13）[要確認: AC UPS機種確定後に更新]
+emergency_stop_pin = 17   # 非常停止スイッチ（物理ピン11）
 
 [archive]
 usb_ssd_path = "/mnt/usb_ssd/archive"

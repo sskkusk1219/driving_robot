@@ -13,10 +13,23 @@ venv/
 .venv/
 env/
 
-# ログ・データ
+# 運転モデル（容量大、再学習可能）
+*.pkl
+data/models/
+
+# 実行時データ
+data/system_state.json
+
+# 機密・環境設定（テンプレートのみ管理）
+config/settings.toml
+.env
+
+# ログ
 *.log
-data/calibration/*.csv
-data/raw/
+
+# テスト
+.coverage
+htmlcov/
 
 # IDE
 .vscode/
@@ -25,6 +38,3 @@ data/raw/
 # OS
 .DS_Store
 Thumbs.db
-
-# Claude
-.claude/

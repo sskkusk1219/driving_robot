@@ -6,7 +6,7 @@
 
 | 技術 | バージョン | 選定理由 |
 |------|-----------|----------|
-| Python | 3.13 | asyncioによる10ms制御ループ、豊富な科学計算・通信ライブラリ |
+| Python | 3.13 | asyncioによる50ms制御ループ、豊富な科学計算・通信ライブラリ |
 | PostgreSQL | 15 | 時系列ログの高速書き込み・検索、JSON型でプロファイル保存可能 |
 
 ### フレームワーク・ライブラリ
@@ -85,7 +85,7 @@ Python asyncioのイベントループで全コンポーネントを並列実行
 ```
 asyncio イベントループ
 │
-├── 制御タスク（10ms周期）
+├── 制御タスク（50ms周期）
 │   ├── CAN車速受信
 │   ├── アクセル位置指令送信（ttyUSB0）
 │   └── ブレーキ位置指令送信（ttyUSB1）
@@ -104,9 +104,9 @@ asyncio イベントループ
 └── FastAPI（HTTPリクエスト処理）
 ```
 
-**10ms制御ループの実装方針**:
-- `asyncio.create_task()` + `asyncio.sleep(0.01)` ではなく
-- `asyncio.get_event_loop().run_forever()` + `loop.call_later(0.01, ...)` を使用
+**50ms制御ループの実装方針**:
+- `asyncio.create_task()` + `asyncio.sleep(0.05)` ではなく
+- `asyncio.get_event_loop().run_forever()` + `loop.call_later(0.05, ...)` を使用
 - アクチュエータへの2軸同時送信は `asyncio.gather()` で並列実行
 
 ---
@@ -165,7 +165,8 @@ driving_robot/
 │   ├── domain/               # ドメインレイヤー
 │   │   ├── control/
 │   │   │   ├── feedforward.py
-│   │   │   └── pid.py
+│   │   │   ├── pid.py
+│   │   │   └── drive_loop.py
 │   │   ├── calibration.py
 │   │   ├── learning_drive.py
 │   │   └── safety_monitor.py
@@ -174,11 +175,13 @@ driving_robot/
 │   │   ├── can_reader.py
 │   │   ├── gpio_monitor.py
 │   │   ├── log_writer.py
-│   │   └── archive_manager.py
+│   │   ├── archive_manager.py
+│   │   └── db.py
 │   └── models/               # データモデル (dataclass / pydantic)
 │       ├── profile.py
 │       ├── calibration.py
 │       ├── drive_log.py
+│       ├── driving_mode.py
 │       └── system_state.py
 ├── config/
 │   ├── can/                  # DBCファイル（自作）
@@ -193,6 +196,7 @@ driving_robot/
 │   └── hardware/             # 実機テスト（手動実行）
 ├── scripts/
 │   ├── setup_db.py           # DB初期化
+│   ├── setup_env.sh          # 仮想環境・依存関係セットアップ
 │   └── start.sh              # システム起動スクリプト
 └── docs/
 ```
@@ -205,7 +209,7 @@ driving_robot/
 
 | 操作 | 目標時間 | 測定方法 |
 |------|---------|---------|
-| 制御ループ1周期 | 10ms以内 | asyncio ループ計測 |
+| 制御ループ1周期 | 50ms以内 | asyncio ループ計測 |
 | ログ書き込み（100ms周期） | 5ms以内 | asyncpg INSERT計測 |
 | WebSocket配信遅延 | 100ms以内 | クライアント受信時刻との差分 |
 | GUI起動（電源ON後） | 60秒以内 | 起動スクリプト計測 |
@@ -217,19 +221,27 @@ driving_robot/
 |---------|------|------|
 | CPU（制御ループ） | 20%以内 | 他プロセスへの影響を最小化 |
 | 制御ループメモリ | 512MB以内 | ログバッファ含む |
-| 内蔵SSD（PostgreSQL） | 3ヶ月分：推定10GB以内 | 100ms×8h×5回/日×90日 |
-| 制御ループジッタ | ±2ms以内 | 10ms周期の安定性確保 |
+| 内蔵SSD（PostgreSQL） | 3ヶ月分：推定20GB以内（マージン込み） | 最悪ケース: 100ms×10h×5回/日×90日=16.2GB |
+| 制御ループジッタ | ±5ms以内 | 50ms周期の安定性確保 |
 
 ### 推定ログ容量計算
 
 ```
 1レコードサイズ: 約100バイト（8フィールド × 8バイト + オーバーヘッド）
 100ms周期 → 10レコード/秒
-1走行8時間: 10 × 60 × 60 × 8 = 288,000レコード ≈ 28.8MB
-1日5走行: 144MB
-3ヶ月(90日): 144 × 90 = 12.96GB（PostgreSQL）
 
-→ アーカイブは外付けUSB SSDで管理
+【典型ケース: 8h × 3走行/日】
+1走行8時間: 10 × 3600 × 8 = 288,000レコード ≈ 28.8MB
+1日3走行: 86.4MB
+3ヶ月(90日): 86.4 × 90 ≈ 7.8GB
+
+【最悪ケース: 10h × 5走行/日（PRD「連続稼働10時間以上」準拠）】
+1走行10時間: 10 × 3600 × 10 = 360,000レコード ≈ 36MB
+1日5走行: 180MB
+3ヶ月(90日): 180 × 90 = 16.2GB（PostgreSQL）
+
+→ 内蔵SSD容量要件: 最悪ケース16.2GBに対し20GBマージンを確保
+→ 3ヶ月を超えたログはアーカイブして外付けUSB SSDで管理
 ```
 
 ---
@@ -249,9 +261,9 @@ Raspberry Pi 5 (16GB)
 │
 ├── USB            →  Kvaser USB-CAN         →  シャシダイナモ CAN bus
 │
-├── GPIO (IN, TBD) →  AC UPS 接点出力（バッテリー運転中信号、AC断検知）
-├── GPIO (IN)      →  非常停止スイッチ #1 (シャシダイナモ室)
+├── GPIO17 (IN)    →  非常停止スイッチ #1 (シャシダイナモ室)  ← 物理ピン11、プルアップ、LOW=停止
 │                   →  非常停止スイッチ #2 (操作エリア)  ← 並列接続
+├── GPIO27 (IN)    →  AC UPS 接点出力（AC断検知）  ← 物理ピン13、プルアップ、LOW=AC断 [要確認: AC UPS機種確定後に更新]
 │
 └── AC UPS (TBD)   →  5V PSU  →  Raspberry Pi 本体 + 内蔵SSD
                     →  24V PSU →  P-CON-CB #1 / #2
@@ -262,7 +274,7 @@ Raspberry Pi 5 (16GB)
 
 | 項目 | 値 |
 |------|---|
-| ボーレート | 57600 bps（P-CON-CB仕様に準拠） |
+| ボーレート | 38400 bps（P-CON-CB実機確認値） |
 | データビット | 8 |
 | パリティ | なし |
 | ストップビット | 1 |
@@ -276,7 +288,7 @@ Raspberry Pi 5 (16GB)
 ### ネットワークアクセス制御
 
 - **ローカルLAN限定**: FastAPIをバインドするネットワークインターフェースをLAN側のみに制限
-- **ポート**: HTTP 8080（または設定可能）
+- **ポート**: HTTP **8080**（デフォルト固定、`config/settings.toml` の `server.port` で変更可能）
 - **認証なし**: 同一LAN内からの接続を信頼する（シャシダイナモ室の閉じたネットワーク）
 
 ### データ保護
@@ -297,7 +309,7 @@ Raspberry Pi 5 (16GB)
 
 ### データ増加への対応
 
-- **3ヶ月超ログ**: `ArchiveManager` が自動的にCSV+gzip圧縮してUSB SSDへ移行
+- **3ヶ月超ログ**: 内蔵SSD使用率が閾値（80%）を超えた場合に `ArchiveManager` が古いレコードからCSV+gzip圧縮してUSB SSDへ移行（常時起動ではないため定期実行ではなく容量トリガー）
 - **USB SSD 80%超**: 最古のアーカイブから自動削除
 - **車両プロファイル数**: 上限なし（PostgreSQLの行数制限のみ）
 - **走行モード数**: 上限なし（CSVファイルサイズに依存）
@@ -353,11 +365,33 @@ Raspberry Pi 5 (16GB)
 - **USB接続**: ttyUSB0・ttyUSB1 が安定してデバイスに割り当てられること
   - udev rules で固定割り当てを推奨（シリアル番号でデバイスを固定）
 - **CAN**: Kvaser Linux ドライバインストール済み
+- **AC UPS**: AC断後 **30秒以上** のバックアップ給電が可能な機種を選定すること
+  - 根拠: home_return() + PostgreSQL正常終了 + シャットダウンを30秒以内に完了する設計
 
 ### パフォーマンス制約
 
-- 10ms制御ループのジッタ: Raspberry Pi OSはリアルタイムOSではないため±2ms程度を許容
-- Modbus RTU応答時間: P-CON-CB仕様の応答時間（TBD、典型的に数ms）を考慮したループ設計が必要
+- 50ms制御ループのジッタ: Raspberry Pi OSはリアルタイムOSではないため±5ms程度を許容
+- Modbus RTU応答時間（MJ0162-12A 表4.1-1より）:
+  - 内部処理時間（位置・ステータスレジスタ）: 最大 1ms
+  - 従局トランスミッター活性化最小遅延（Param No.17）: 初期値 5ms（要チューニング、縮小可能）
+  - レスポンス後インターメッセージギャップ: 1ms
+  - 合計レスポンス遅延: 最大 7ms（Param No.17 デフォルト時）
+
+**制御ループのタイムバジェット（38,400bps、2軸、FC03で6レジスタ読み取り）**:
+
+| 処理 | 時間 |
+|------|------|
+| FC03 クエリー送信（8バイト × 0.286ms/byte） | 2.3ms |
+| P-CON-CB 内部処理 + Param No.17 遅延 | 最大 6ms |
+| FC03 レスポンス受信（17バイト × 0.286ms/byte） | 4.9ms |
+| インターメッセージギャップ | 1ms |
+| **1軸あたり小計** | **約 14ms** |
+| **2軸合計（RS-485 逐次）** | **約 28ms** |
+
+> ⚠️ 38,400bps では 2 軸逐次読み取りだけで約 28ms かかる。
+> 10ms・20ms ループは不可能。**50ms ループ（20Hz）を推奨**。
+> 位置指令（FC10）は値が変化した場合のみ送信することで実質的なレイテンシを低減する。
+> Param No.17 を 1ms に縮小すると約 4ms 短縮可能（実機チューニングで検証）。
 
 ### ネットワーク制約
 
@@ -376,7 +410,6 @@ Raspberry Pi 5 (16GB)
 | python-can | CAN通信 | `>=4.0.0` Kvaser backend |
 | asyncpg | PostgreSQL | `>=0.28.0` |
 | RPi.GPIO | GPIO | `>=0.7.0` |
-| smbus2 | I2C | `>=0.4.0` |
 | numpy | 数値計算 | `>=1.25.0` |
 | scipy | 補間 | `>=1.11.0` |
 | pydantic | バリデーション | `>=2.0.0` v2 API |
@@ -385,6 +418,6 @@ Raspberry Pi 5 (16GB)
 | ruff | Lint/Format | `>=0.1.0` |
 
 **管理方針**:
-- `requirements.txt` または `pyproject.toml` で最小バージョンを指定
+- `pyproject.toml` で最小バージョンを指定（Python 3.13 対応のモダン構成）
 - 再現性のため `pip freeze > requirements.lock` を使用
 - ライブラリは `.venv` 内にのみインストール（グローバル禁止）

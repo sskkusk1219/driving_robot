@@ -10,7 +10,7 @@ graph TB
         WebUI[Web UI<br/>FastAPI + フロントエンド]
 
         subgraph ControlLayer["制御レイヤー (asyncio)"]
-            RobotController[RobotController<br/>メインループ 10ms]
+            RobotController[RobotController<br/>メインループ 50ms]
             FFController[FeedforwardController<br/>運転モデル]
             PIDController[PIDController<br/>フィードバック]
             SafetyMonitor[SafetyMonitor<br/>常時監視]
@@ -66,7 +66,7 @@ graph TB
 | 分類 | 技術 | 選定理由 |
 |------|------|----------|
 | 言語 | Python 3.13 | asyncioによる並列制御、豊富なライブラリ |
-| 非同期フレームワーク | asyncio | 10ms制御ループとI/O並列化 |
+| 非同期フレームワーク | asyncio | 50ms制御ループとI/O並列化 |
 | Webフレームワーク | FastAPI | 非同期対応、自動API生成、WebSocket |
 | Web UI | HTML/JS + Jinja2 | ブラウザ接続のみで操作可能、FastAPIと統合容易 |
 | Modbusライブラリ | pymodbus | Modbus RTU/ASCII対応 |
@@ -107,8 +107,8 @@ class PIDGains:
 
 @dataclass
 class StopConfig:
-    deviation_threshold: float   # 逸脱閾値 [km/h]（例: 2.0）
-    deviation_duration: float    # 逸脱継続時間 [s]（例: 4.0）
+    deviation_threshold_kmh: float   # 逸脱閾値 [km/h]（例: 2.0）
+    deviation_duration_s: float      # 逸脱継続時間 [s]（例: 4.0）
 ```
 
 **制約**:
@@ -269,7 +269,7 @@ erDiagram
 ### RobotController（メインコントローラ）
 
 **責務**:
-- 10ms制御ループのスケジューリング（asyncio）
+- 50ms制御ループのスケジューリング（asyncio）
 - システム状態機械の管理
 - 各コンポーネントの協調制御
 
@@ -366,7 +366,6 @@ class FeedforwardController:
     def load_model(model_path: str) -> None
     def predict(
         ref_speed: float,        # 基準車速 [km/h]
-        actual_speed: float,     # 実車速 [km/h]
         ref_accel: float,        # 基準加速度 [km/h/s]
     ) -> tuple[float, float]     # (accel_opening%, brake_opening%)
 ```
@@ -387,7 +386,7 @@ class FeedforwardController:
 
 ```python
 class PIDController:
-    def __init__(kp: float, ki: float, kd: float, dt: float = 0.01)
+    def __init__(kp: float, ki: float, kd: float, dt: float = 0.05)
     def update(setpoint: float, measurement: float) -> float
     def reset() -> None
 ```
@@ -401,7 +400,7 @@ pid_correction = Kp * error + Ki * ∫error dt + Kd * d(error)/dt
 **FF+PID出力合成と最終開度算出** (RobotController内で実行):
 ```
 # FFコントローラーから目標開度を取得
-ff_accel, ff_brake = ff_controller.predict(ref_speed, delta_speed)
+ff_accel, ff_brake = ff_controller.predict(ref_speed, ref_accel)
 
 # PID補正量を加算（符号でアクセル/ブレーキを振り分け）
 raw_accel = ff_accel + max(0.0, pid_correction)
@@ -425,7 +424,7 @@ final_brake = clamp(raw_brake, 0.0, profile.max_brake_opening)
 **責務**:
 - 非常停止スイッチ（GPIO）の監視（割り込みベース）
 - 電流値異常の監視
-- AC電源断の監視（AC UPS 接点出力 → GPIO、ピン番号TBD）
+- AC電源断の監視（AC UPS 接点出力 → GPIO27、物理ピン13、プルアップ、LOW=AC断）[要確認: AC UPS機種確定後に更新]
 - 逸脱条件による自動停止
 
 ```python
@@ -464,7 +463,8 @@ if current > OVERCURRENT_LIMIT:
 > ⚠️ **TBD**: AC UPS の機種は未確定。以下の前提で設計しており、機種確定後に見直しが必要。
 
 - **電源構成**: `AC100V → AC UPS → 5V PSU → Raspberry Pi` および `AC UPS → 24V PSU → P-CON-CB`
-- **AC断検知**: AC UPS の「バッテリー運転中」接点出力を Raspberry Pi GPIO（ピン番号TBD）に接続
+- **AC断検知**: AC UPS の「バッテリー運転中」接点出力を Raspberry Pi GPIO27（物理ピン13）に接続 [要確認: AC UPS機種確定後に更新]
+  - プルアップ設定、LOW=AC断
   - 接点 OFF（通電中）→ ON（バッテリー運転中）の立ち上がりエッジで検知
 - **バックアップ時間の前提**: AC断後、30秒以上のバックアップ給電が可能であること
   - home_return() + PostgreSQL終了 + シャットダウン を合計30秒以内に収める設計とする
@@ -558,12 +558,14 @@ class LogWriter:
 ### ArchiveManager（アーカイブ管理）
 
 **責務**:
-- 3ヶ月超のセッションをCSV+gzip圧縮でUSB SSDに移行
+- 内蔵SSD使用率が80%を超えた場合に3ヶ月超のセッションをCSV+gzip圧縮でUSB SSDに移行（常時起動ではないため定期実行なし、容量トリガー）
 - USB SSDが80%超で古いアーカイブから自動削除
+
+**実行タイミング**: 起動時・走行終了時に内蔵SSD使用率をチェックし、80%超の場合のみ実行
 
 ```python
 class ArchiveManager:
-    async def run_archiving() -> None    # 定期実行（例: 毎日深夜）
+    async def check_and_archive() -> None  # 容量チェック → 必要なら移行
     def _export_to_csv(session_id: str) -> Path
     def _compress(csv_path: Path) -> Path
     def _check_storage_usage() -> float  # 使用率 [%]
@@ -654,9 +656,9 @@ sequenceDiagram
         RC-->>UI: エラー項目表示
     else チェックOK
         RC->>HW: CAN車速受信開始
-        loop 10ms制御ループ
+        loop 50ms制御ループ
             HW-->>RC: 実車速 (CAN)
-            RC->>FF: predict(ref_speed, actual_speed, ref_accel)
+            RC->>FF: predict(ref_speed, ref_accel)
             FF-->>RC: ff_accel%, ff_brake%
             RC->>PID: update(ref_speed, actual_speed)
             PID-->>RC: pid_correction
@@ -719,7 +721,7 @@ sequenceDiagram
         Op->>UI: 手動操作終了ボタン押下
         UI->>RC: stop_manual()
         RC->>HW: home_return() 両軸
-        RC-->>UI: STANDBY状態
+        RC-->>UI: READY状態
     end
 ```
 
@@ -757,7 +759,7 @@ sequenceDiagram
         end
         RC->>HW: home_return() 両軸
         RC->>LW: end_session(status='completed')
-        RC-->>UI: STANDBY状態・学習運転完了通知
+        RC-->>UI: READY状態・学習運転完了通知
     end
 ```
 
