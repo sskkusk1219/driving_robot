@@ -107,7 +107,7 @@ src/domain/
 ├── control/
 │   ├── feedforward.py      # フィードフォワード制御 (FeedforwardController)
 │   ├── pid.py              # PIDコントローラ (PIDController)
-│   └── drive_loop.py       # 10ms制御ループ (DriveLoop)
+│   └── drive_loop.py       # 50ms制御ループ (DriveLoop)
 ├── calibration.py          # CalibrationManager
 ├── learning_drive.py       # LearningDriveManager
 └── safety_monitor.py       # SafetyMonitor
@@ -233,7 +233,7 @@ config/
 [serial]
 accel_port = "/dev/ttyUSB0"
 brake_port = "/dev/ttyUSB1"
-baud_rate = 57600
+baud_rate = 38400
 
 [can]
 interface = "kvaser"
@@ -252,7 +252,7 @@ active_log_days = 90
 storage_limit_pct = 80
 
 [control]
-loop_interval_ms = 10
+loop_interval_ms = 50
 log_interval_ms = 100
 ```
 
@@ -366,7 +366,7 @@ docs/
 
 - **クラス**: PascalCase（`RobotController`、`ActuatorDriver`）
 - **関数・メソッド**: snake_case（`run_calibration()`、`read_current()`）
-- **定数**: UPPER_SNAKE_CASE（`MAX_LOOP_INTERVAL_MS = 10`）
+- **定数**: UPPER_SNAKE_CASE（`CONTROL_LOOP_INTERVAL_MS = 50`）
 - **async関数**: 通常と同じsnake_case（`async def start_auto_drive()`）
 
 ---

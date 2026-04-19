@@ -45,7 +45,7 @@ class SystemStatusResponse(BaseModel): ...
 
 ```python
 # UPPER_SNAKE_CASE
-CONTROL_LOOP_INTERVAL_MS = 10
+CONTROL_LOOP_INTERVAL_MS = 50
 LOG_INTERVAL_MS = 100
 OVERCURRENT_LIMIT_MA = 3000
 BATTERY_WARNING_PCT = 20
@@ -588,7 +588,7 @@ git commit -m "build: <ライブラリ名> を追加"
 ### 制御・安全（制御系コードの場合）
 - [ ] フェイルセーフ（例外時の原点復帰）が `finally` で実装されている
 - [ ] 開度がクランプされている
-- [ ] 10ms制御ループ内にブロッキング処理がない
+- [ ] 50ms制御ループ内にブロッキング処理がない
 - [ ] 非常停止ハンドラが優先的に動作する
 
 ### テスト

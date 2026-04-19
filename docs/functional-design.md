@@ -34,7 +34,7 @@ graph TB
         PCON1[P-CON-CB #1<br/>アクセル SLAVE_ID=1]
         PCON2[P-CON-CB #2<br/>ブレーキ SLAVE_ID=2]
         CAN[Kvaser USB-CAN<br/>シャシダイナモ]
-        ACUPS[AC UPS<br/>接点出力 → GPIO(TBD)]
+        ACUPS[AC UPS<br/>接点出力 → GPIO27(物理ピン13)]
         EmergencyStop[非常停止スイッチ<br/>2個並列]
     end
 
