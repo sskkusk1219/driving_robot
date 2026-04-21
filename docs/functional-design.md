@@ -430,9 +430,10 @@ final_brake = clamp(raw_brake, 0.0, profile.max_brake_opening)
 ```python
 class SafetyMonitor:
     async def start_monitoring() -> None
-    def register_emergency_callback(cb: Callable) -> None
+    def register_emergency_callback(cb: Callable[[], Awaitable[None]]) -> None
     def check_overcurrent(current_ma: float, axis: str) -> bool
     def check_deviation(ref: float, actual: float, duration: float) -> bool
+    async def trigger_emergency() -> None   # GPIOMonitor・RobotControllerから呼ばれる
     async def handle_ac_power_loss() -> None
 ```
 
@@ -824,28 +825,57 @@ stateDiagram-v2
 
 ---
 
-## REST API設計（Post-MVP）
+## REST API設計（実装済み: `src/web/routers/`）
 
-### 走行制御
+### 走行制御（`/api/v1/drive/`）
 
 ```
+POST /api/v1/drive/initialize
+Response: { "status": "ok" }
+
 POST /api/v1/drive/start
-Body: { "mode_id": "uuid", "profile_id": "uuid" }
-Response: { "session_id": "uuid", "status": "running" }
+Body: { "mode_id": "uuid" }
+Response: DriveSessionResponse
 
 POST /api/v1/drive/stop
-Response: { "session_id": "uuid", "status": "stopped" }
+Response: { "status": "ok" }
 
 GET /api/v1/drive/status
-Response: { "state": "RUNNING", "actual_speed": 60.2, "ref_speed": 60.0, ... }
+Response: SystemStateResponse { "robot_state": "READY", "active_profile_id": null, ... }
+
+POST /api/v1/drive/emergency
+Response: { "status": "ok" }
+
+POST /api/v1/drive/reset-emergency
+Response: { "status": "ok" }
+
+POST /api/v1/drive/manual/start
+Response: DriveSessionResponse
+
+POST /api/v1/drive/manual/stop
+Response: { "status": "ok" }
+```
+
+### プロファイル・モード・セッション（スタブ）
+
+```
+GET /api/v1/profiles/           → 空リスト
+GET /api/v1/profiles/{id}       → 404
+POST/PUT/DELETE /api/v1/profiles/ → 501 (DB連携は別フェーズ)
+
+GET /api/v1/modes/              → 空リスト
+GET /api/v1/sessions/           → 空リスト
+GET /api/v1/sessions/{id}/logs  → 空リスト
 ```
 
 ### WebSocket（リアルタイムデータ）
 
 ```
 WS /ws/realtime
-Push: {
+Push (100ms周期):
+{
   "timestamp": "ISO8601",
+  "robot_state": "READY",
   "actual_speed_kmh": 60.2,
   "ref_speed_kmh": 60.0,
   "accel_opening": 42.3,

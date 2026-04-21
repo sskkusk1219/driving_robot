@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>driving_robot ダッシュボード</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+<header>
+  <h1>driving_robot</h1>
+  <span id="state-badge" class="BOOTING">BOOTING</span>
+</header>
+
+<main>
+
+  <!-- 速度表示 -->
+  <div class="row two">
+    <div class="card">
+      <h2>実車速</h2>
+      <div class="big-value"><span id="actual-speed">—</span><span class="unit">km/h</span></div>
+    </div>
+    <div class="card">
+      <h2>基準車速</h2>
+      <div class="big-value"><span id="ref-speed">—</span><span class="unit">km/h</span></div>
+    </div>
+  </div>
+
+  <!-- 開度ゲージ -->
+  <div class="row two">
+    <div class="card">
+      <h2>アクセル開度</h2>
+      <div class="gauge-wrap">
+        <progress id="accel-progress" max="100" value="0"></progress>
+        <div id="accel-label" class="gauge-label">0.0%</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>ブレーキ開度</h2>
+      <div class="gauge-wrap">
+        <progress id="brake-progress" class="brake" max="100" value="0"></progress>
+        <div id="brake-label" class="gauge-label">0.0%</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- リアルタイムグラフ -->
+  <div class="card">
+    <h2>速度グラフ　<span style="color:#ef4444">■ 基準</span>　<span style="color:#3b82f6">■ 実車速</span></h2>
+    <canvas id="speed-chart" width="800" height="200"></canvas>
+  </div>
+
+  <!-- 操作ボタン -->
+  <div class="card">
+    <h2>操作</h2>
+    <div class="btn-grid" style="margin-top:12px">
+      <button id="btn-initialize"       class="btn-primary">初期化</button>
+      <button id="btn-auto-start"       class="btn-success">自動走行 開始</button>
+      <button id="btn-stop"             class="btn-secondary">停止</button>
+      <button id="btn-manual-start"     class="btn-warning">手動操作 開始</button>
+      <button id="btn-manual-stop"      class="btn-secondary">手動操作 終了</button>
+      <button id="btn-reset-emergency"  class="btn-secondary">非常停止 リセット</button>
+      <button id="btn-emergency"        class="btn-danger">🛑 緊急停止</button>
+    </div>
+  </div>
+
+</main>
+
+<div id="toast"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

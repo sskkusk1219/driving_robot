@@ -1,0 +1,42 @@
+# settings.toml.example
+# このファイルをコピーして config/settings.toml として使用してください。
+# settings.toml は .gitignore 対象です（機器固有値を含むため）。
+
+[serial]
+# アクセルアクチュエータ用 USB-RS485 デバイスパス
+accel_port = "/dev/ttyUSB0"
+# ブレーキアクチュエータ用 USB-RS485 デバイスパス
+brake_port = "/dev/ttyUSB1"
+# Modbus RTU ボーレート（P-CON-CB 実機確認値）
+baud_rate = 38400
+
+[can]
+# python-can インターフェース名
+interface = "kvaser"
+# Kvaser USB-CAN チャンネル番号
+channel = 0
+
+[database]
+# asyncpg 接続文字列
+dsn = "postgresql://localhost/driving_robot"
+
+[gpio]
+# AC UPS 接点出力 → AC断検知ピン（BCM番号、物理ピン13）
+# ⚠️ TBD: AC UPS 機種確定後に更新すること
+ac_detect_pin = 27
+# 非常停止スイッチ入力ピン（BCM番号、物理ピン11）
+emergency_stop_pin = 17
+
+[archive]
+# アーカイブ先 USB SSD のマウントパス
+usb_ssd_path = "/mnt/usb_ssd/archive"
+# アクティブログの保持日数（これを超えたセッションがアーカイブ対象）
+active_log_days = 90
+# 内蔵SSD / USB SSD 使用率の閾値 [%]（これを超えるとアーカイブ実行）
+storage_limit_pct = 80
+
+[control]
+# 制御ループ周期 [ms]
+loop_interval_ms = 50
+# ログ書き込み周期 [ms]
+log_interval_ms = 100
