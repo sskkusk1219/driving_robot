@@ -439,11 +439,9 @@ class SafetyMonitor:
 
 **電流異常検出アルゴリズム**:
 ```
-# キャリブレーション中の接触点・フル検出
-moving_avg = 移動平均（ウィンドウ幅: 50ms分 = 5サンプル）
-threshold = baseline_current * 1.5  # 平常時電流の1.5倍
-if current > moving_avg + threshold:
-    → 機械的終端に到達（接触点またはフル位置）
+# キャリブレーション中の過電流安全監視（緊急遮断のみ）
+if current > OVERCURRENT_EMERGENCY_LIMIT:
+    → 緊急停止（ジョグ操作中の安全保護）
 
 # 走行中の過電流保護（閾値はP-CON-CB仕様から設定）
 if current > OVERCURRENT_LIMIT:
@@ -492,7 +490,7 @@ class CANReader:
 
 **責務**:
 - アクセル・ブレーキの独立したゼロフルキャリブレーション実行
-- バリデーション（接触点・フル・ストローク・順序）
+- バリデーション（ストローク妥当性・ゼロ<フルの順序）
 - 結果のプロファイルへの保存
 
 ```python
@@ -500,24 +498,22 @@ class CalibrationManager:
     async def run_calibration(profile_id: str) -> CalibrationResult
 
     async def _detect_zero(driver: ActuatorDriver) -> int
-    # ゆっくり押し込み → 電流急増で接触点を検出
+    # 原点復帰後、オペレーターがジョグ操作でゼロ位置を合わせて記録
 
     async def _detect_full(driver: ActuatorDriver, zero_pos: int) -> int
-    # さらに押し込み → 電流急増でフル位置を検出
+    # ゼロ位置からオペレーターがジョグ操作でフル位置を合わせて記録
 
     def _validate(result: CalibrationData) -> ValidationResult
-    # 接触点 < フル位置、ストローク妥当性チェック
+    # ゼロ < フル位置、ストローク妥当性チェック
 ```
 
 **キャリブレーション手順**（アクセル・ブレーキ独立、順序任意）:
 ```
 1. サーボON → 原点復帰
-2. 低速で正方向に移動開始
-3. 電流移動平均 + 閾値超えで接触点(zero)を記録
-4. 接触点から低速でさらに正方向に移動
-5. 再び閾値超えでフル位置(full)を記録
-6. 原点復帰
-7. ストローク = full - zero を計算・バリデーション
+2. オペレーターがジョグ操作（+/-キー）でゼロ位置に合わせて確定
+3. オペレーターがジョグ操作でフル位置に合わせて確定
+4. 原点復帰
+5. ストローク = full - zero を計算・バリデーション
 ```
 
 ---
@@ -617,14 +613,21 @@ sequenceDiagram
 
     Op->>UI: キャリブレーション開始
     UI->>CM: run_calibration(profile_id)
-    CM->>HW: アクセル低速移動開始
-    loop 電流監視
-        CM->>HW: read_current()
-        HW-->>CM: 電流値
+    CM->>HW: 原点復帰
+    Note over Op,HW: アクセル ゼロ点設定
+    loop ジョグ操作
+        Op->>UI: ジョグキー入力（+/-）
+        UI->>HW: move_to_position(pos)
     end
-    CM->>CM: 接触点(zero)検出
-    CM->>HW: さらに移動継続
-    CM->>CM: フル位置(full)検出
+    Op->>UI: ゼロ点確定
+    UI->>CM: zero_pos 記録
+    Note over Op,HW: アクセル フル点設定（同様）
+    loop ジョグ操作
+        Op->>UI: ジョグキー入力（+/-）
+        UI->>HW: move_to_position(pos)
+    end
+    Op->>UI: フル点確定
+    UI->>CM: full_pos 記録
     CM->>HW: 原点復帰
     Note over CM: ブレーキも同様に実施
     CM->>CM: バリデーション実施
