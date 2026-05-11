@@ -18,6 +18,8 @@ class SerialSettings:
 class CanSettings:
     interface: str = "kvaser"
     channel: int = 0
+    bitrate: int = 500000
+    dbc_path: str = "config/can/MEIDEN_MEIDACS.dbc"
 
 
 @dataclass
@@ -45,6 +47,11 @@ class ControlSettings:
 
 
 @dataclass
+class SafetySettings:
+    overcurrent_limit_ma: float = 3000.0
+
+
+@dataclass
 class AppSettings:
     serial: SerialSettings = field(default_factory=SerialSettings)
     can: CanSettings = field(default_factory=CanSettings)
@@ -52,6 +59,7 @@ class AppSettings:
     gpio: GpioSettings = field(default_factory=GpioSettings)
     archive: ArchiveSettings = field(default_factory=ArchiveSettings)
     control: ControlSettings = field(default_factory=ControlSettings)
+    safety: SafetySettings = field(default_factory=SafetySettings)
 
 
 def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
@@ -72,6 +80,7 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
     gpio = GpioSettings(**{k: v for k, v in raw.get("gpio", {}).items()})
     archive = ArchiveSettings(**{k: v for k, v in raw.get("archive", {}).items()})
     control = ControlSettings(**{k: v for k, v in raw.get("control", {}).items()})
+    safety = SafetySettings(**{k: v for k, v in raw.get("safety", {}).items()})
 
     return AppSettings(
         serial=serial,
@@ -80,4 +89,5 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
         gpio=gpio,
         archive=archive,
         control=control,
+        safety=safety,
     )

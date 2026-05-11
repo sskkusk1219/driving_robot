@@ -1,4 +1,4 @@
-from datetime import UTC
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,6 +15,7 @@ from src.models.system_state import RobotState
 def make_accel_driver() -> MagicMock:
     driver = MagicMock()
     driver.connect = AsyncMock()
+    driver.enable_modbus_control = AsyncMock()
     driver.home_return = AsyncMock()
     driver.servo_off = AsyncMock()
     driver.servo_on = AsyncMock()
@@ -353,6 +354,62 @@ class TestRunCalibration:
         with pytest.raises(InvalidStateTransition):
             await ctrl.run_calibration()
 
+    @pytest.mark.asyncio
+    async def test_run_calibration_without_manager_returns_not_configured(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        result = await ctrl.run_calibration()
+        assert result.success is False
+        assert result.error_message == "キャリブレーション未設定"
+        assert result.data is None
+
+    @pytest.mark.asyncio
+    async def test_run_calibration_delegates_to_manager(self) -> None:
+        from src.models.calibration import CalibrationData, CalibrationResult
+
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+
+        calib_data = CalibrationData(
+            accel_zero_pos=100,
+            accel_full_pos=5100,
+            accel_stroke=5000,
+            brake_zero_pos=200,
+            brake_full_pos=5200,
+            brake_stroke=5000,
+            calibrated_at=datetime.now(tz=UTC),
+            is_valid=True,
+        )
+        expected_result = CalibrationResult(success=True, data=calib_data, error_message=None)
+        mock_manager = AsyncMock()
+        mock_manager.run_calibration = AsyncMock(return_value=expected_result)
+        ctrl._calibration_manager = mock_manager  # type: ignore[assignment]
+
+        result = await ctrl.run_calibration()
+
+        mock_manager.run_calibration.assert_awaited_once()
+        assert result.success is True
+        assert result.data is calib_data
+
+    @pytest.mark.asyncio
+    async def test_run_calibration_state_returns_to_ready_after_manager_failure(self) -> None:
+        from src.models.calibration import CalibrationResult
+
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+
+        failed_result = CalibrationResult(
+            success=False, data=None, error_message="スパイク未検出"
+        )
+        mock_manager = AsyncMock()
+        mock_manager.run_calibration = AsyncMock(return_value=failed_result)
+        ctrl._calibration_manager = mock_manager  # type: ignore[assignment]
+
+        result = await ctrl.run_calibration()
+
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+        assert result.success is False
+
 
 class TestStartAutoDrive:
     @pytest.mark.asyncio
@@ -499,6 +556,14 @@ class TestStartConnectsHardware:
 
 class TestInitializeResetsAlarmAndServosOn:
     @pytest.mark.asyncio
+    async def test_initialize_calls_enable_modbus_control_on_both_drivers(self) -> None:
+        ctrl = make_controller()
+        await ctrl.start()
+        await ctrl.initialize()
+        ctrl._accel_driver.enable_modbus_control.assert_called_once()  # type: ignore[attr-defined]
+        ctrl._brake_driver.enable_modbus_control.assert_called_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
     async def test_initialize_calls_reset_alarm_on_both_drivers(self) -> None:
         ctrl = make_controller()
         await ctrl.start()
@@ -560,3 +625,322 @@ class TestGetRealtimeData:
 
         with pytest.raises(RuntimeError):
             await ctrl.get_realtime_data()
+
+
+class TestPreCheckIntegration:
+    """走行前チェックと RobotController の統合テスト。"""
+
+    def make_passing_pre_check_runner(self) -> AsyncMock:
+        from src.models.pre_check import PreCheckItemResult, PreCheckResult
+
+        runner = AsyncMock()
+        runner.run = AsyncMock(
+            return_value=PreCheckResult(
+                passed=True,
+                items=[PreCheckItemResult(item_name="通信確認", passed=True)],
+            )
+        )
+        return runner
+
+    def make_failing_pre_check_runner(self) -> AsyncMock:
+        from src.models.pre_check import PreCheckItemResult, PreCheckResult
+
+        runner = AsyncMock()
+        runner.run = AsyncMock(
+            return_value=PreCheckResult(
+                passed=False,
+                items=[
+                    PreCheckItemResult(
+                        item_name="UPS残量",
+                        passed=False,
+                        error_message="UPS残量不足: 5.0%（20%以上必要）",
+                    )
+                ],
+            )
+        )
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_start_auto_drive_without_pre_check_runner_transitions_to_running(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(mode_id="mode-1")
+        assert ctrl.get_system_state().robot_state == RobotState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_start_auto_drive_with_passing_pre_check_transitions_to_running(self) -> None:
+        ctrl = make_controller()
+        ctrl._pre_check_runner = self.make_passing_pre_check_runner()  # type: ignore[assignment]
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(mode_id="mode-1")
+        assert ctrl.get_system_state().robot_state == RobotState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_start_auto_drive_with_failing_pre_check_raises_pre_check_failed(self) -> None:
+        from src.app.robot_controller import PreCheckFailed  # noqa: PLC0415
+
+        ctrl = make_controller()
+        ctrl._pre_check_runner = self.make_failing_pre_check_runner()  # type: ignore[assignment]
+        await advance_to_ready(ctrl)
+        with pytest.raises(PreCheckFailed) as exc_info:
+            await ctrl.start_auto_drive(mode_id="mode-1")
+        assert exc_info.value.result is not None
+        assert not exc_info.value.result.passed
+
+    @pytest.mark.asyncio
+    async def test_start_auto_drive_with_failing_pre_check_returns_to_ready(self) -> None:
+        from src.app.robot_controller import PreCheckFailed  # noqa: PLC0415
+
+        ctrl = make_controller()
+        ctrl._pre_check_runner = self.make_failing_pre_check_runner()  # type: ignore[assignment]
+        await advance_to_ready(ctrl)
+        with pytest.raises(PreCheckFailed):
+            await ctrl.start_auto_drive(mode_id="mode-1")
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
+    @pytest.mark.asyncio
+    async def test_start_manual_with_passing_pre_check_transitions_to_manual(self) -> None:
+        ctrl = make_controller()
+        ctrl._pre_check_runner = self.make_passing_pre_check_runner()  # type: ignore[assignment]
+        await advance_to_ready(ctrl)
+        await ctrl.start_manual()
+        assert ctrl.get_system_state().robot_state == RobotState.MANUAL
+
+    @pytest.mark.asyncio
+    async def test_start_manual_with_failing_pre_check_raises_pre_check_failed(self) -> None:
+        from src.app.robot_controller import PreCheckFailed  # noqa: PLC0415
+
+        ctrl = make_controller()
+        ctrl._pre_check_runner = self.make_failing_pre_check_runner()  # type: ignore[assignment]
+        await advance_to_ready(ctrl)
+        with pytest.raises(PreCheckFailed):
+            await ctrl.start_manual()
+
+    @pytest.mark.asyncio
+    async def test_start_manual_with_failing_pre_check_returns_to_ready(self) -> None:
+        from src.app.robot_controller import PreCheckFailed  # noqa: PLC0415
+
+        ctrl = make_controller()
+        ctrl._pre_check_runner = self.make_failing_pre_check_runner()  # type: ignore[assignment]
+        await advance_to_ready(ctrl)
+        with pytest.raises(PreCheckFailed):
+            await ctrl.start_manual()
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
+
+class TestShutdown:
+    @pytest.mark.asyncio
+    async def test_shutdown_from_standby_calls_stop_monitoring(self) -> None:
+        ctrl = make_controller()
+        await ctrl.start()
+        await ctrl.shutdown()
+        ctrl._safety_monitor.stop_monitoring.assert_called_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_from_ready_calls_stop_monitoring(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.shutdown()
+        ctrl._safety_monitor.stop_monitoring.assert_called_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_from_booting_calls_stop_monitoring(self) -> None:
+        ctrl = make_controller()
+        assert ctrl.get_system_state().robot_state == RobotState.BOOTING
+        await ctrl.shutdown()
+        ctrl._safety_monitor.stop_monitoring.assert_called_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_stops_drive_loop_if_running(self) -> None:
+        from unittest.mock import MagicMock
+
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(mode_id="mode-1")
+
+        mock_loop = MagicMock()
+        ctrl._drive_loop = mock_loop  # type: ignore[assignment]
+
+        await ctrl.shutdown()
+
+        mock_loop.stop.assert_called_once()
+        assert ctrl._drive_loop is None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_without_drive_loop_does_not_raise(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        assert ctrl._drive_loop is None
+        await ctrl.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_active_learning_task(self) -> None:
+        import asyncio  # noqa: PLC0415
+
+        ctrl = make_controller()
+        mock_task = MagicMock(spec=asyncio.Task)
+        ctrl._active_learning_task = mock_task
+
+        await ctrl.shutdown()
+
+        mock_task.cancel.assert_called_once()
+        assert ctrl._active_learning_task is None
+
+
+class TestSelectProfile:
+    def _make_profile(self) -> object:
+        from datetime import datetime  # noqa: PLC0415
+
+        from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
+
+        return VehicleProfile(
+            id="abc-123",
+            name="TestCar",
+            max_accel_opening=80.0,
+            max_brake_opening=60.0,
+            max_speed=180.0,
+            max_decel_g=0.5,
+            pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+            stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+            calibration=None,
+            model_path=None,
+            created_at=datetime.now(tz=UTC),
+            updated_at=datetime.now(tz=UTC),
+        )
+
+    @pytest.mark.asyncio
+    async def test_select_profile_sets_active_profile(self) -> None:
+        ctrl = make_controller()
+        await ctrl.start()  # BOOTING → STANDBY
+        profile = self._make_profile()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+        assert ctrl.get_active_profile() is profile
+
+    @pytest.mark.asyncio
+    async def test_select_profile_updates_active_profile_id_in_system_state(self) -> None:
+        ctrl = make_controller()
+        await ctrl.start()  # BOOTING → STANDBY
+        profile = self._make_profile()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+        assert ctrl.get_system_state().active_profile_id == "abc-123"
+
+    def test_get_active_profile_returns_none_initially(self) -> None:
+        ctrl = make_controller()
+        assert ctrl.get_active_profile() is None
+
+    def test_select_profile_raises_in_booting_state(self) -> None:
+        from src.app.robot_controller import InvalidStateTransition  # noqa: PLC0415
+
+        ctrl = make_controller()
+        profile = self._make_profile()
+        with pytest.raises(InvalidStateTransition):
+            ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_select_profile_can_be_overwritten(self) -> None:
+        from datetime import datetime  # noqa: PLC0415
+
+        from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
+
+        ctrl = make_controller()
+        await ctrl.start()  # BOOTING → STANDBY
+        p1 = VehicleProfile(
+            id="p1",
+            name="Car1",
+            max_accel_opening=80.0,
+            max_brake_opening=60.0,
+            max_speed=180.0,
+            max_decel_g=0.5,
+            pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+            stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+            calibration=None,
+            model_path=None,
+            created_at=datetime.now(tz=UTC),
+            updated_at=datetime.now(tz=UTC),
+        )
+        p2 = VehicleProfile(
+            id="p2",
+            name="Car2",
+            max_accel_opening=70.0,
+            max_brake_opening=50.0,
+            max_speed=150.0,
+            max_decel_g=0.4,
+            pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+            stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+            calibration=None,
+            model_path=None,
+            created_at=datetime.now(tz=UTC),
+            updated_at=datetime.now(tz=UTC),
+        )
+        ctrl.select_profile(p1)
+        ctrl.select_profile(p2)
+        assert ctrl.get_active_profile() is p2
+
+
+class TestStartLearningDrive:
+    """start_learning_drive() の状態遷移・返り値テスト。"""
+
+    @pytest.mark.asyncio
+    async def test_transitions_to_running(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.start_learning_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_returns_learning_drive_session(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        session = await ctrl.start_learning_drive()
+        assert session.run_type == "learning"
+        assert session.mode_id is None
+        assert session.status == "running"
+
+    @pytest.mark.asyncio
+    async def test_active_session_id_is_set(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        session = await ctrl.start_learning_drive()
+        assert ctrl.get_system_state().active_session_id == session.id
+
+    @pytest.mark.asyncio
+    async def test_pre_check_failed_returns_to_ready(self) -> None:
+        from src.app.robot_controller import PreCheckFailed  # noqa: PLC0415
+        from src.models.pre_check import PreCheckItemResult, PreCheckResult  # noqa: PLC0415
+
+        runner = MagicMock()
+        runner.run = AsyncMock(
+            return_value=PreCheckResult(
+                passed=False,
+                items=[
+                    PreCheckItemResult(
+                        item_name="UPS残量",
+                        passed=False,
+                        error_message="UPS残量不足: 5.0%",
+                    )
+                ],
+            )
+        )
+        ctrl = make_controller()
+        ctrl._pre_check_runner = runner  # type: ignore[assignment]
+        await advance_to_ready(ctrl)
+        with pytest.raises(PreCheckFailed):
+            await ctrl.start_learning_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
+    @pytest.mark.asyncio
+    async def test_with_passing_pre_check_transitions_to_running(self) -> None:
+        from src.models.pre_check import PreCheckItemResult, PreCheckResult  # noqa: PLC0415
+
+        runner = MagicMock()
+        runner.run = AsyncMock(
+            return_value=PreCheckResult(
+                passed=True,
+                items=[PreCheckItemResult(item_name="通信確認", passed=True)],
+            )
+        )
+        ctrl = make_controller()
+        ctrl._pre_check_runner = runner  # type: ignore[assignment]
+        await advance_to_ready(ctrl)
+        await ctrl.start_learning_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.RUNNING

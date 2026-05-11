@@ -33,6 +33,7 @@ _DSSE_MOVE = 1 << 5  # 移動中
 _COIL_SON = 0x0403   # サーボON
 _COIL_ALRS = 0x0407  # アラームリセット
 _COIL_HOME = 0x040B  # 原点復帰
+_COIL_PMSL = 0x0427  # Modbus 操作権（PIO 無効化・Modbus 指令優先）
 
 # FC10 書き込みレジスタアドレス（HEX）
 _REG_PCMD_HI = 0x9900  # 目標位置 上位 16bit
@@ -41,8 +42,8 @@ _REG_ACMD = 0x9906     # 加減速指令
 _REG_CTLF = 0x9908     # 制御フラグ
 
 # デフォルト移動パラメータ
-_DEFAULT_SPEED_MM_S = 50       # 速度 [mm/s]
-_DEFAULT_ACCEL_MM_S2 = 1000    # 加減速 [mm/s²]
+_DEFAULT_SPEED_MM_S = 100   # 速度 [mm/s]
+_DEFAULT_ACCEL = 30         # 加減速指令（ACMD）[コントローラ固有単位 ≈ 0.01G]
 
 _HOME_RETURN_TIMEOUT_S = 30.0
 _HOME_RETURN_POLL_INTERVAL_S = 0.1
@@ -110,6 +111,16 @@ class ActuatorDriver:
             self._client = None
         logger.info("ActuatorDriver 切断: port=%s", self._port)
 
+    async def enable_modbus_control(self) -> None:
+        """Modbus 操作権を有効化する（PMSL コイル = True）。
+
+        PIO 入力を無効化し、Modbus による位置指令を受け付ける状態にする。
+        reset_alarm() / servo_on() より前に呼ぶこと。
+        """
+        client = self._require_client()
+        await client.write_coil(address=_COIL_PMSL, value=True, device_id=self._slave_id)
+        logger.debug("enable_modbus_control: slave_id=%d", self._slave_id)
+
     async def reset_alarm(self) -> None:
         """アラームをリセットする（ALRS コイルをエッジ入力）。"""
         client = self._require_client()
@@ -136,6 +147,9 @@ class ActuatorDriver:
         タイムアウト (_HOME_RETURN_TIMEOUT_S) を超えた場合は TimeoutError を送出。
         """
         client = self._require_client()
+        # P-CON-CB はコイルの立ち上がりエッジ（False→True）で原点復帰をトリガーする
+        await client.write_coil(address=_COIL_HOME, value=False, device_id=self._slave_id)
+        await asyncio.sleep(0.05)
         await client.write_coil(address=_COIL_HOME, value=True, device_id=self._slave_id)
         logger.info("home_return 開始: slave_id=%d", self._slave_id)
 
@@ -159,28 +173,28 @@ class ActuatorDriver:
         self,
         pos: int,
         speed_mm_s: int = _DEFAULT_SPEED_MM_S,
-        accel_mm_s2: int = _DEFAULT_ACCEL_MM_S2,
+        accel: int = _DEFAULT_ACCEL,
     ) -> None:
-        """指定位置へ移動指令を送出する（FC10 直値移動）。
+        """指定位置へ移動指令を送出する（FC10 絶対位置移動）。
 
         Args:
             pos: 目標位置 [pulse / 0.01mm 単位]
             speed_mm_s: 移動速度 [mm/s]
-            accel_mm_s2: 加減速 [mm/s²]
+            accel: 加減速指令 [コントローラ固有単位 ≈ 0.01G]
         """
         client = self._require_client()
         pcmd_hi, pcmd_lo = _from_signed32(pos)
-        vcmd_hi, vcmd_lo = _from_signed32(speed_mm_s)
+        vcmd_hi, vcmd_lo = _from_signed32(speed_mm_s * 100)  # VCMD は 0.01mm/s 単位
 
-        # 9900: PCMD_HI, 9901: PCMD_LO, 9902-9903: 未使用（0）,
-        # 9904: VCMD_HI, 9905: VCMD_LO, 9906: ACMD, 9907: 未使用, 9908: CTLF
+        # 9900: PCMD_HI, 9901: PCMD_LO, 9902: INP_HI, 9903: INP_LO,
+        # 9904: VCMD_HI, 9905: VCMD_LO, 9906: ACMD, 9907: 予約, 9908: CTLF
         registers = [
-            pcmd_hi, pcmd_lo,  # 9900-9901: PCMD
-            0, 0,               # 9902-9903: 予約
-            vcmd_hi, vcmd_lo,  # 9904-9905: VCMD
-            accel_mm_s2,        # 9906: ACMD
+            pcmd_hi, pcmd_lo,  # 9900-9901: PCMD（目標位置 0.01mm 単位）
+            0, 10,              # 9902-9903: INP（位置決め完了幅）
+            vcmd_hi, vcmd_lo,  # 9904-9905: VCMD（0.01mm/s 単位）
+            accel,              # 9906: ACMD
             0,                  # 9907: 予約
-            0x0002,             # 9908: CTLF = 直値移動有効
+            0x0000,             # 9908: CTLF = 絶対位置移動
         ]
         await client.write_registers(
             address=_REG_PCMD_HI, values=registers, device_id=self._slave_id

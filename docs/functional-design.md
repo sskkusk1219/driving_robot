@@ -777,7 +777,7 @@ sequenceDiagram
 | 3 | キャリブレーション | 有効なキャリブレーションデータあり | エラー表示・停止 |
 | 4 | プロファイル | 車両プロファイル選択済み | エラー表示・停止 |
 | 5 | UPS残量 | AC UPS バッテリー残量 20%以上（TBD: 取得方法は機種確定後） | エラー表示・停止 |
-| 6 | アクチュエータ位置 | 両軸が原点付近にあること | エラー表示・停止 |
+| 6 | アクチュエータ位置 | 両軸が原点付近にあること（±10pulse = ±0.1mm） | エラー表示・停止 |
 
 ---
 
@@ -856,16 +856,59 @@ POST /api/v1/drive/manual/stop
 Response: { "status": "ok" }
 ```
 
-### プロファイル・モード・セッション（スタブ）
+### プロファイル管理（`/api/v1/profiles/`）
 
 ```
-GET /api/v1/profiles/           → 空リスト
-GET /api/v1/profiles/{id}       → 404
-POST/PUT/DELETE /api/v1/profiles/ → 501 (DB連携は別フェーズ)
+GET    /api/v1/profiles/
+Response: list[ProfileResponse]
 
-GET /api/v1/modes/              → 空リスト
-GET /api/v1/sessions/           → 空リスト
-GET /api/v1/sessions/{id}/logs  → 空リスト
+POST   /api/v1/profiles/
+Body: ProfileCreateRequest { name, max_accel_opening, max_brake_opening, max_speed, max_decel_g, pid_gains, stop_config, model_path }
+Response: ProfileResponse (201)
+
+GET    /api/v1/profiles/{profile_id}
+Response: ProfileResponse | 404
+
+PUT    /api/v1/profiles/{profile_id}
+Body: ProfileUpdateRequest (全フィールド省略可)
+Response: ProfileResponse | 404
+
+DELETE /api/v1/profiles/{profile_id}
+Response: 204 | 404
+
+POST   /api/v1/drive/select-profile
+Body: { "profile_id": "uuid" }
+Response: { "status": "ok", "profile_id": "uuid" } | 404
+```
+
+### 走行モード管理（`/api/v1/modes/`）
+
+```
+GET    /api/v1/modes/
+Response: list[ModeResponse]
+
+POST   /api/v1/modes/upload   (multipart/form-data)
+Body: file (CSV: time_s,speed_kmh), name?, description?
+Response: ModeResponse (201)
+
+GET    /api/v1/modes/{mode_id}
+Response: ModeDetailResponse (reference_speed含む) | 404
+
+DELETE /api/v1/modes/{mode_id}
+Response: 204 | 404
+```
+
+### セッション参照（`/api/v1/sessions/`）
+
+```
+GET    /api/v1/sessions/
+Response: list[SessionResponse]
+
+GET    /api/v1/sessions/{session_id}
+Response: SessionResponse | 404
+
+GET    /api/v1/sessions/{session_id}/logs
+Response: list[LogResponse]
 ```
 
 ### WebSocket（リアルタイムデータ）

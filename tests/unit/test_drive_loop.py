@@ -611,3 +611,53 @@ class TestStartStop:
         on_complete.assert_not_called()
         on_emergency.assert_not_called()
         can_reader.read_speed.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# current_accel_opening / current_brake_opening プロパティ
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentOpeningProperties:
+    def test_initial_values_are_zero(self) -> None:
+        dl = _make_loop()
+        assert dl.current_accel_opening == 0.0
+        assert dl.current_brake_opening == 0.0
+
+    @pytest.mark.asyncio
+    async def test_properties_updated_after_cycle(self) -> None:
+        ff = MagicMock(spec=FeedforwardController)
+        ff.predict = MagicMock(return_value=(40.0, 0.0))
+        can_reader = _make_can_reader(speed=50.0)
+
+        dl = _make_loop(ff=ff, can_reader=can_reader)
+        dl._running = True
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 1.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        # FF が (40.0, 0.0) を返し PID ゲイン 0 なので accel_opening=40.0, brake_opening=0.0
+        assert dl.current_accel_opening == pytest.approx(40.0)
+        assert dl.current_brake_opening == pytest.approx(0.0)
+
+    @pytest.mark.asyncio
+    async def test_brake_opening_set_when_ff_predicts_brake(self) -> None:
+        ff = MagicMock(spec=FeedforwardController)
+        ff.predict = MagicMock(return_value=(0.0, 30.0))
+        can_reader = _make_can_reader(speed=60.0)
+
+        dl = _make_loop(ff=ff, can_reader=can_reader)
+        dl._running = True
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 1.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        assert dl.current_brake_opening == pytest.approx(30.0)

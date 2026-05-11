@@ -7,6 +7,11 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from src.app.robot_controller import RobotController
+from src.app.stubs import (
+    InMemoryModeRepository,
+    InMemoryProfileRepository,
+    InMemorySessionRepository,
+)
 from src.models.system_state import RobotState, SystemState
 from src.web.app import app
 
@@ -34,6 +39,10 @@ def _make_stub_controller() -> MagicMock:
 def inject_controller() -> MagicMock:
     ctrl = _make_stub_controller()
     app.state.controller = ctrl
+    app.state.profile_repo = InMemoryProfileRepository()
+    app.state.mode_repo = InMemoryModeRepository()
+    app.state.session_repo = InMemorySessionRepository()
+    app.state.db_pool = None
     return ctrl
 
 

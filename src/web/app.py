@@ -9,23 +9,50 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.app.robot_controller import RobotController
-from src.app.stubs import build_stub_controller
+from src.app.stubs import (
+    InMemoryModeRepository,
+    InMemoryProfileRepository,
+    InMemorySessionRepository,
+    build_stub_controller,
+)
 from src.web.routers import drive, modes, profiles, sessions
 from src.web.ws import broadcast_loop, realtime_ws
 
 
-def _build_controller() -> RobotController:
+async def _build_controller() -> RobotController:
     if os.environ.get("DRIVING_ROBOT_USE_REAL_HW") == "1":
-        from src.app.factory import build_real_controller
-        from src.infra.settings import load_settings
+        from src.app.factory import build_real_controller  # noqa: PLC0415
+        from src.infra.settings import load_settings  # noqa: PLC0415
 
-        return build_real_controller(load_settings())
+        return await build_real_controller(load_settings())
     return build_stub_controller()
+
+
+async def _build_repos(app: FastAPI) -> None:
+    """DB が利用可能なら DB バックエンド、そうでなければ in-memory リポジトリを設定する。"""
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        from src.infra.db import create_pool  # noqa: PLC0415
+        from src.infra.mode_repository import ModeRepository  # noqa: PLC0415
+        from src.infra.profile_repository import ProfileRepository  # noqa: PLC0415
+        from src.infra.session_repository import SessionRepository  # noqa: PLC0415
+
+        pool = await create_pool(db_url)
+        app.state.db_pool = pool
+        app.state.profile_repo = ProfileRepository(pool)
+        app.state.mode_repo = ModeRepository(pool)
+        app.state.session_repo = SessionRepository(pool)
+    else:
+        app.state.db_pool = None
+        app.state.profile_repo = InMemoryProfileRepository()
+        app.state.mode_repo = InMemoryModeRepository()
+        app.state.session_repo = InMemorySessionRepository()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    controller = _build_controller()
+    await _build_repos(app)
+    controller = await _build_controller()
     await controller.start()
     app.state.controller = controller
     task = asyncio.create_task(broadcast_loop(app))
@@ -37,6 +64,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await task
         except asyncio.CancelledError:
             pass
+        await controller.shutdown()
+        if app.state.db_pool is not None:
+            await app.state.db_pool.close()
 
 
 app = FastAPI(

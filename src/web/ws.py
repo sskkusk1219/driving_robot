@@ -72,13 +72,14 @@ async def broadcast_loop(app: Starlette) -> None:
             actual_speed = 0.0
             accel_current = 0.0
             brake_current = 0.0
+        accel_opening, brake_opening = controller.current_openings
         data = RealtimeData(
             timestamp=datetime.now(tz=UTC).isoformat(),
             robot_state=RobotState(state.robot_state),
             actual_speed_kmh=actual_speed,
             ref_speed_kmh=None,
-            accel_opening=0.0,
-            brake_opening=0.0,
+            accel_opening=accel_opening,
+            brake_opening=brake_opening,
             accel_current_ma=accel_current,
             brake_current_ma=brake_current,
         )

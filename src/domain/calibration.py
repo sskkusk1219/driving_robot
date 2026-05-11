@@ -25,6 +25,10 @@ class CalibrationActuatorProtocol(Protocol):
     async def read_current(self) -> float: ...
 
 
+class ProfileRepositoryProtocol(Protocol):
+    async def save_calibration(self, profile_id: str, data: CalibrationData) -> None: ...
+
+
 @dataclass
 class CalibrationConfig:
     move_step_pulse: int = field(default=CALIB_MOVE_STEP_PULSE)
@@ -46,23 +50,25 @@ class CalibrationManager:
     _accel_driver: CalibrationActuatorProtocol
     _brake_driver: CalibrationActuatorProtocol
     _config: CalibrationConfig
+    _profile_repo: ProfileRepositoryProtocol | None
 
     def __init__(
         self,
         accel_driver: CalibrationActuatorProtocol,
         brake_driver: CalibrationActuatorProtocol,
         config: CalibrationConfig | None = None,
+        profile_repo: ProfileRepositoryProtocol | None = None,
     ) -> None:
         self._accel_driver = accel_driver
         self._brake_driver = brake_driver
         self._config = config if config is not None else CalibrationConfig()
+        self._profile_repo = profile_repo
 
-    async def run_calibration(self, profile_id: str) -> CalibrationResult:  # noqa: ARG002
+    async def run_calibration(self, profile_id: str) -> CalibrationResult:
         """両軸のゼロフルキャリブレーションを順番に実行し、バリデーション済みの結果を返す。
 
-        TODO: バリデーション成功後に profile_id のプロファイルへ data を永続化する。
-              ProfileRepository Protocol を注入して CalibrationData を保存することで
-              走行前チェック #3（有効なキャリブレーションデータあり）が通るようになる。
+        バリデーション成功時かつ profile_repo が注入されている場合、
+        profile_id のプロファイルへ CalibrationData を永続化する。
         """
         try:
             accel_zero = await self._detect_zero(self._accel_driver)
@@ -87,6 +93,8 @@ class CalibrationManager:
         )
         validation = self._validate(data)
         data.is_valid = validation.is_valid
+        if validation.is_valid and self._profile_repo is not None:
+            await self._profile_repo.save_calibration(profile_id, data)
         return CalibrationResult(
             success=validation.is_valid,
             data=data,

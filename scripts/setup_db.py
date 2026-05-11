@@ -25,7 +25,7 @@ DDL_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS calibration_data (
         id              UUID PRIMARY KEY,
-        profile_id      UUID NOT NULL REFERENCES vehicle_profiles(id),
+        profile_id      UUID NOT NULL UNIQUE REFERENCES vehicle_profiles(id),
         accel_zero_pos  INTEGER NOT NULL,
         accel_full_pos  INTEGER NOT NULL,
         accel_stroke    INTEGER NOT NULL,

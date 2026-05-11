@@ -1,6 +1,7 @@
 """CalibrationManager のユニットテスト。"""
 
 from collections.abc import AsyncIterator
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -409,6 +410,132 @@ class TestRunCalibration:
         assert result.success is False
         assert result.data is not None  # 検出成功のためデータは存在する
         assert result.error_message is not None
+
+
+# ---------------------------------------------------------------------------
+# CalibrationManager with ProfileRepository テスト
+# ---------------------------------------------------------------------------
+
+class TestRunCalibrationWithProfileRepo:
+    def _spike_currents(self, normal_count: int = 4) -> list[float]:
+        normal = [100.0] * normal_count
+        spike = [400.0]
+        return normal + spike + normal + spike + [100.0] * 50
+
+    @pytest.mark.asyncio
+    async def test_save_calibration_called_on_valid_result(self) -> None:
+        """バリデーション成功時に profile_repo.save_calibration が呼ばれること。"""
+        repo = AsyncMock()
+        accel = MockActuatorDriver(self._spike_currents())
+        brake = MockActuatorDriver(self._spike_currents())
+        cfg = CalibrationConfig(
+            move_step_pulse=1000,
+            step_interval_s=0.0,
+            current_window=3,
+            current_spike_ratio=1.5,
+            min_stroke_pulse=500,
+            max_stroke_pulse=20000,
+            max_search_pulse=30000,
+        )
+        manager = CalibrationManager(
+            accel_driver=accel, brake_driver=brake, config=cfg, profile_repo=repo
+        )
+        result = await manager.run_calibration(profile_id="profile-1")
+        if result.success:
+            repo.save_calibration.assert_awaited_once()
+            call_args = repo.save_calibration.call_args
+            assert call_args[0][0] == "profile-1"
+            assert isinstance(call_args[0][1], CalibrationData)
+
+    @pytest.mark.asyncio
+    async def test_save_calibration_not_called_on_validation_failure(self) -> None:
+        """バリデーション失敗時には profile_repo.save_calibration が呼ばれないこと。"""
+        repo = AsyncMock()
+        flat = [100.0] * 100
+        cfg = CalibrationConfig(
+            move_step_pulse=1000,
+            step_interval_s=0.0,
+            current_window=3,
+            current_spike_ratio=1.5,
+            min_stroke_pulse=100000,  # 必ずストローク不足でバリデーション NG
+            max_stroke_pulse=200000,
+            max_search_pulse=30000,
+        )
+        manager = CalibrationManager(
+            accel_driver=MockActuatorDriver(flat),
+            brake_driver=MockActuatorDriver(flat),
+            config=cfg,
+            profile_repo=repo,
+        )
+        result = await manager.run_calibration(profile_id="profile-1")
+        assert result.success is False
+        repo.save_calibration.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_save_calibration_not_called_on_detection_error(self) -> None:
+        """スパイク検出失敗時には profile_repo.save_calibration が呼ばれないこと。"""
+        repo = AsyncMock()
+        flat = [100.0] * 100
+        cfg = CalibrationConfig(
+            move_step_pulse=1000,
+            step_interval_s=0.0,
+            current_window=3,
+            current_spike_ratio=1.5,
+            min_stroke_pulse=500,
+            max_stroke_pulse=20000,
+            max_search_pulse=3000,  # 探索距離不足でスパイク未検出
+        )
+        manager = CalibrationManager(
+            accel_driver=MockActuatorDriver(flat),
+            brake_driver=MockActuatorDriver(flat),
+            config=cfg,
+            profile_repo=repo,
+        )
+        result = await manager.run_calibration(profile_id="profile-1")
+        assert result.success is False
+        repo.save_calibration.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_profile_repo_none_does_not_raise(self) -> None:
+        """`profile_repo=None` でも正常に動作すること（後方互換性）。"""
+        accel = MockActuatorDriver(self._spike_currents())
+        brake = MockActuatorDriver(self._spike_currents())
+        cfg = CalibrationConfig(
+            move_step_pulse=1000,
+            step_interval_s=0.0,
+            current_window=3,
+            current_spike_ratio=1.5,
+            min_stroke_pulse=500,
+            max_stroke_pulse=20000,
+            max_search_pulse=30000,
+        )
+        manager = CalibrationManager(
+            accel_driver=accel, brake_driver=brake, config=cfg, profile_repo=None
+        )
+        result = await manager.run_calibration(profile_id="profile-1")
+        assert isinstance(result, CalibrationResult)
+
+    @pytest.mark.asyncio
+    async def test_save_calibration_exception_propagates(self) -> None:
+        """`save_calibration` が例外を投げた場合、呼び出し元まで伝播すること。"""
+        repo = AsyncMock()
+        repo.save_calibration.side_effect = RuntimeError("DB接続エラー")
+        accel = MockActuatorDriver(self._spike_currents())
+        brake = MockActuatorDriver(self._spike_currents())
+        cfg = CalibrationConfig(
+            move_step_pulse=1000,
+            step_interval_s=0.0,
+            current_window=3,
+            current_spike_ratio=1.5,
+            min_stroke_pulse=500,
+            max_stroke_pulse=20000,
+            max_search_pulse=30000,
+        )
+        manager = CalibrationManager(
+            accel_driver=accel, brake_driver=brake, config=cfg, profile_repo=repo
+        )
+        with pytest.raises(RuntimeError, match="DB接続エラー"):
+            await manager.run_calibration(profile_id="profile-1")
 
 
 # ---------------------------------------------------------------------------

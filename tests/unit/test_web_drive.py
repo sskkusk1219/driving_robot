@@ -53,7 +53,17 @@ def _make_stub_controller(state: RobotState = RobotState.READY) -> MagicMock:
 
 @pytest.fixture
 def stub_controller() -> MagicMock:
-    return _make_stub_controller()
+    ctrl = _make_stub_controller()
+    from src.app.stubs import (  # noqa: PLC0415
+        InMemoryModeRepository,
+        InMemoryProfileRepository,
+        InMemorySessionRepository,
+    )
+
+    app.state.profile_repo = InMemoryProfileRepository()
+    app.state.mode_repo = InMemoryModeRepository()
+    app.state.session_repo = InMemorySessionRepository()
+    return ctrl
 
 
 @pytest.mark.asyncio
@@ -170,4 +180,160 @@ async def test_manual_start_precheck_failed_returns_422(stub_controller: MagicMo
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         res = await c.post("/api/v1/drive/manual/start")
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_calibrate_ok(stub_controller: MagicMock) -> None:
+    from datetime import UTC, datetime
+
+    from src.models.calibration import CalibrationData, CalibrationResult
+
+    calib_data = CalibrationData(
+        accel_zero_pos=100,
+        accel_full_pos=5100,
+        accel_stroke=5000,
+        brake_zero_pos=200,
+        brake_full_pos=5200,
+        brake_stroke=5000,
+        calibrated_at=datetime(2026, 4, 22, 0, 0, 0, tzinfo=UTC),
+        is_valid=True,
+    )
+    stub_controller.run_calibration = AsyncMock(
+        return_value=CalibrationResult(success=True, data=calib_data, error_message=None)
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/calibrate")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["success"] is True
+    assert body["error_message"] is None
+    assert body["data"]["accel_stroke"] == 5000
+    assert body["data"]["is_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_calibrate_returns_failure_result(stub_controller: MagicMock) -> None:
+    from src.models.calibration import CalibrationResult
+
+    stub_controller.run_calibration = AsyncMock(
+        return_value=CalibrationResult(
+            success=False, data=None, error_message="スパイク未検出"
+        )
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/calibrate")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["success"] is False
+    assert body["error_message"] == "スパイク未検出"
+    assert body["data"] is None
+
+
+@pytest.mark.asyncio
+async def test_calibrate_invalid_state_returns_409(stub_controller: MagicMock) -> None:
+    stub_controller.run_calibration = AsyncMock(
+        side_effect=InvalidStateTransition("READY 以外でキャリブレーション不可")
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/calibrate")
+    assert res.status_code == 409
+    assert "READY 以外でキャリブレーション不可" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_select_profile_ok(stub_controller: MagicMock) -> None:
+    """プロファイルが存在する場合に select_profile が呼ばれて 200 が返ること。"""
+    from datetime import datetime  # noqa: PLC0415
+    from uuid import uuid4  # noqa: PLC0415
+
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
+
+    profile_id = str(uuid4())
+    profile = VehicleProfile(
+        id=profile_id,
+        name="TestCar",
+        max_accel_opening=80.0,
+        max_brake_opening=60.0,
+        max_speed=180.0,
+        max_decel_g=0.5,
+        pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
+    )
+    await app.state.profile_repo.create(profile)
+
+    stub_controller.select_profile = MagicMock()
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/select-profile", json={"profile_id": profile_id})
+    assert res.status_code == 200
+    assert res.json()["profile_id"] == profile_id
+    stub_controller.select_profile.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_select_profile_not_found_returns_404(stub_controller: MagicMock) -> None:
+    """存在しない profile_id に対して 404 が返ること。"""
+    from uuid import uuid4  # noqa: PLC0415
+
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/drive/select-profile", json={"profile_id": str(uuid4())}
+        )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_learning_start_ok(stub_controller: MagicMock) -> None:
+    """学習走行開始: 200 で DriveSession(run_type='learning') が返ること。"""
+    stub_learning_session = DriveSession(
+        id="session-learning-001",
+        profile_id="",
+        mode_id=None,
+        run_type="learning",
+        started_at=datetime.now(tz=UTC),
+        ended_at=None,
+        status="running",
+    )
+    stub_controller.start_learning_drive = AsyncMock(return_value=stub_learning_session)
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/start")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["id"] == "session-learning-001"
+    assert data["run_type"] == "learning"
+    assert data["mode_id"] is None
+    stub_controller.start_learning_drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_learning_start_invalid_state_returns_409(stub_controller: MagicMock) -> None:
+    """InvalidStateTransition 時に 409 が返ること。"""
+    stub_controller.start_learning_drive = AsyncMock(
+        side_effect=InvalidStateTransition("READY 以外不可")
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/start")
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_learning_start_precheck_failed_returns_422(stub_controller: MagicMock) -> None:
+    """PreCheckFailed 時に 422 が返ること。"""
+    stub_controller.start_learning_drive = AsyncMock(
+        side_effect=PreCheckFailed("サーボ未ON")
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/start")
     assert res.status_code == 422

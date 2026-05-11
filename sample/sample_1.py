@@ -4,7 +4,7 @@ import time
 # --- 通信設定 ---
 # ポート名やボーレートはPCONのパラメーター設定（デフォルト38400等）に合わせてください
 client = ModbusSerialClient(
-    port = "/dev/ttyUSB0",
+    port = "/dev/ttyUSB1",
     baudrate = 38400,
     parity = 'N',
     stopbits = 1,

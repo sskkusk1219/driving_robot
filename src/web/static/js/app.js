@@ -144,6 +144,11 @@ document.getElementById('btn-auto-start').addEventListener('click', async () => 
   if (r) showToast(`自動走行を開始: セッション ${r.id}`, 'ok');
 });
 
+document.getElementById('btn-learning-start').addEventListener('click', async () => {
+  const r = await api('POST', '/api/v1/drive/learning/start');
+  if (r) showToast(`学習運転を開始: セッション ${r.id}`, 'ok');
+});
+
 document.getElementById('btn-stop').addEventListener('click', async () => {
   const r = await api('POST', '/api/v1/drive/stop');
   if (r) showToast('停止しました', 'ok');

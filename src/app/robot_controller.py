@@ -7,9 +7,10 @@ from uuid import uuid4
 from src.domain.control.drive_loop import DriveLoop, LogWriterProtocol
 from src.domain.control.feedforward import FeedforwardController
 from src.domain.control.pid import PIDController
-from src.models.calibration import CalibrationData, CalibrationResult
+from src.models.calibration import CalibrationResult
 from src.models.drive_log import DriveSession
 from src.models.driving_mode import DrivingMode
+from src.models.pre_check import PreCheckResult
 from src.models.profile import VehicleProfile
 from src.models.system_state import RealtimeSnapshot, RobotState, SystemState
 
@@ -20,6 +21,10 @@ class InvalidStateTransition(Exception):
 
 class PreCheckFailed(Exception):
     """走行前チェックが失敗した場合に送出。"""
+
+    def __init__(self, result: "PreCheckResult | None" = None) -> None:
+        self.result = result
+        super().__init__(str(result))
 
 
 VALID_TRANSITIONS: dict[RobotState, frozenset[RobotState]] = {
@@ -41,6 +46,8 @@ VALID_TRANSITIONS: dict[RobotState, frozenset[RobotState]] = {
 
 class ActuatorDriverProtocol(Protocol):
     async def connect(self) -> None: ...
+
+    async def enable_modbus_control(self) -> None: ...
 
     async def home_return(self) -> None: ...
 
@@ -83,11 +90,23 @@ class SafetyCheckProtocol(Protocol):
     def check_deviation(self, ref: float, actual: float, duration: float) -> bool: ...
 
 
+class CalibrationManagerProtocol(Protocol):
+    async def run_calibration(self, profile_id: str) -> CalibrationResult: ...
+
+
+class PreCheckRunnerProtocol(Protocol):
+    async def run(self) -> PreCheckResult: ...
+
+
+class LearningDriveManagerProtocol(Protocol):
+    """学習走行マネージャーの最低限のプロトコル（将来拡張用）。"""
+
+
 class RobotController:
     """システム状態機械とコンポーネント協調制御を担うアプリケーションレイヤー。"""
 
     _state: RobotState
-    _active_profile_id: str | None
+    _active_profile: VehicleProfile | None
     _active_session_id: str | None
     _last_normal_shutdown: bool
     _accel_driver: ActuatorDriverProtocol
@@ -97,7 +116,11 @@ class RobotController:
     _pid: PIDController
     _ff_controller: FeedforwardController | None
     _safety_check: SafetyCheckProtocol | None
+    _pre_check_runner: PreCheckRunnerProtocol | None
+    _calibration_manager: CalibrationManagerProtocol | None
+    _learning_manager: LearningDriveManagerProtocol | None
     _drive_loop: DriveLoop | None
+    _active_learning_task: asyncio.Task[None] | None
 
     def __init__(
         self,
@@ -109,9 +132,12 @@ class RobotController:
         last_normal_shutdown: bool = False,
         ff_controller: FeedforwardController | None = None,
         safety_check: SafetyCheckProtocol | None = None,
+        pre_check_runner: PreCheckRunnerProtocol | None = None,
+        calibration_manager: CalibrationManagerProtocol | None = None,
+        learning_manager: LearningDriveManagerProtocol | None = None,
     ) -> None:
         self._state = RobotState.BOOTING
-        self._active_profile_id = None
+        self._active_profile = None
         self._active_session_id = None
         self._last_normal_shutdown = last_normal_shutdown
         self._accel_driver = accel_driver
@@ -121,7 +147,11 @@ class RobotController:
         self._pid = pid
         self._ff_controller = ff_controller
         self._safety_check = safety_check
+        self._pre_check_runner = pre_check_runner
+        self._calibration_manager = calibration_manager
+        self._learning_manager = learning_manager
         self._drive_loop = None
+        self._active_learning_task = None
 
     def _transition(self, new_state: RobotState) -> None:
         allowed = VALID_TRANSITIONS.get(self._state, frozenset())
@@ -132,11 +162,30 @@ class RobotController:
     def get_system_state(self) -> SystemState:
         return SystemState(
             robot_state=self._state,
-            active_profile_id=self._active_profile_id,
+            active_profile_id=self._active_profile.id if self._active_profile else None,
             active_session_id=self._active_session_id,
             last_normal_shutdown=self._last_normal_shutdown,
             updated_at=datetime.now(tz=UTC),
         )
+
+    def select_profile(self, profile: VehicleProfile) -> None:
+        """アクティブプロファイルを設定する。STANDBY/READY 状態のみ許可。"""
+        if self._state not in (RobotState.STANDBY, RobotState.READY):
+            raise InvalidStateTransition(
+                f"select_profile は STANDBY/READY 状態でのみ呼べます (現在: {self._state})"
+            )
+        self._active_profile = profile
+
+    def get_active_profile(self) -> VehicleProfile | None:
+        """現在選択中のプロファイルを返す。未選択の場合は None。"""
+        return self._active_profile
+
+    @property
+    def current_openings(self) -> tuple[float, float]:
+        """現在のアクセル・ブレーキ開度 [%] を返す。DriveLoop 非動作時は (0.0, 0.0)。"""
+        if self._drive_loop is not None:
+            return self._drive_loop.current_accel_opening, self._drive_loop.current_brake_opening
+        return 0.0, 0.0
 
     async def get_realtime_data(self) -> RealtimeSnapshot:
         """ハードウェアからリアルタイム計測値を並列取得する。"""
@@ -173,6 +222,10 @@ class RobotController:
         """アラームリセット・サーボON・必要に応じて原点復帰。"""
         self._transition(RobotState.INITIALIZING)
         await asyncio.gather(
+            self._accel_driver.enable_modbus_control(),
+            self._brake_driver.enable_modbus_control(),
+        )
+        await asyncio.gather(
             self._accel_driver.reset_alarm(),
             self._brake_driver.reset_alarm(),
         )
@@ -208,6 +261,16 @@ class RobotController:
         self._active_session_id = None
         self._last_normal_shutdown = True
 
+    async def shutdown(self) -> None:
+        """グレースフルシャットダウン: 状態を問わず DriveLoop を停止し安全監視を解除する。"""
+        if self._drive_loop is not None:
+            self._drive_loop.stop()
+            self._drive_loop = None
+        if self._active_learning_task is not None:
+            self._active_learning_task.cancel()
+            self._active_learning_task = None
+        await self._safety_monitor.stop_monitoring()
+
     async def emergency_stop(self) -> None:
         """非常停止: 即座に EMERGENCY へ遷移し、両軸を原点復帰させる。
 
@@ -239,18 +302,13 @@ class RobotController:
         """キャリブレーション実行。READY → CALIBRATING → READY。"""
         self._transition(RobotState.CALIBRATING)
         try:
-            # 実機実装: CalibrationManager.run_calibration() を呼ぶ
-            stub_data = CalibrationData(
-                accel_zero_pos=0,
-                accel_full_pos=0,
-                accel_stroke=0,
-                brake_zero_pos=0,
-                brake_full_pos=0,
-                brake_stroke=0,
-                calibrated_at=datetime.now(tz=UTC),
-                is_valid=False,
+            if self._calibration_manager is not None:
+                return await self._calibration_manager.run_calibration(
+                    profile_id=self._active_profile.id if self._active_profile else ""
+                )
+            return CalibrationResult(
+                success=False, data=None, error_message="キャリブレーション未設定"
             )
-            return CalibrationResult(success=False, data=stub_data, error_message="未実装")
         finally:
             self._transition(RobotState.READY)
 
@@ -266,11 +324,21 @@ class RobotController:
         mode / profile / ff_controller / safety_check が全て揃っている場合に DriveLoop を起動する。
         """
         self._transition(RobotState.PRE_CHECK)
-        # 実機実装: 走行前チェック6項目を実施。NG なら _transition(READY) + raise PreCheckFailed
-        self._transition(RobotState.RUNNING)
+        try:
+            if self._pre_check_runner is not None:
+                result = await self._pre_check_runner.run()
+                if not result.passed:
+                    raise PreCheckFailed(result)
+            self._transition(RobotState.RUNNING)
+        except PreCheckFailed:
+            self._transition(RobotState.READY)
+            raise
+        except Exception:
+            self._transition(RobotState.READY)
+            raise
         session = DriveSession(
             id=str(uuid4()),
-            profile_id=self._active_profile_id or "",
+            profile_id=self._active_profile.id if self._active_profile else "",
             mode_id=mode_id,
             run_type="auto",
             started_at=datetime.now(tz=UTC),
@@ -319,11 +387,21 @@ class RobotController:
     async def start_manual(self) -> DriveSession:
         """手動操作開始。READY → PRE_CHECK → MANUAL。"""
         self._transition(RobotState.PRE_CHECK)
-        # 実機実装: 走行前チェック6項目を実施。NG なら _transition(READY) + raise PreCheckFailed
-        self._transition(RobotState.MANUAL)
+        try:
+            if self._pre_check_runner is not None:
+                result = await self._pre_check_runner.run()
+                if not result.passed:
+                    raise PreCheckFailed(result)
+            self._transition(RobotState.MANUAL)
+        except PreCheckFailed:
+            self._transition(RobotState.READY)
+            raise
+        except Exception:
+            self._transition(RobotState.READY)
+            raise
         session = DriveSession(
             id=str(uuid4()),
-            profile_id=self._active_profile_id or "",
+            profile_id=self._active_profile.id if self._active_profile else "",
             mode_id=None,
             run_type="manual",
             started_at=datetime.now(tz=UTC),
@@ -345,3 +423,33 @@ class RobotController:
             self._brake_driver.home_return(),
         )
         self._active_session_id = None
+
+    async def start_learning_drive(self) -> DriveSession:
+        """学習走行開始。READY → PRE_CHECK → RUNNING。
+
+        学習パターンの非同期実行は _active_learning_task として管理する。
+        """
+        self._transition(RobotState.PRE_CHECK)
+        try:
+            if self._pre_check_runner is not None:
+                result = await self._pre_check_runner.run()
+                if not result.passed:
+                    raise PreCheckFailed(result)
+            self._transition(RobotState.RUNNING)
+        except PreCheckFailed:
+            self._transition(RobotState.READY)
+            raise
+        except Exception:
+            self._transition(RobotState.READY)
+            raise
+        session = DriveSession(
+            id=str(uuid4()),
+            profile_id=self._active_profile.id if self._active_profile else "",
+            mode_id=None,
+            run_type="learning",
+            started_at=datetime.now(tz=UTC),
+            ended_at=None,
+            status="running",
+        )
+        self._active_session_id = session.id
+        return session

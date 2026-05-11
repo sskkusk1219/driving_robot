@@ -9,11 +9,14 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 
 from src.app.robot_controller import RobotController, SafetyMonitorProtocol
+from src.domain.calibration import CalibrationManager
 from src.domain.control.pid import PIDController
 from src.domain.safety_monitor import SafetyMonitor
 from src.infra.actuator_driver import ActuatorDriver
 from src.infra.can_reader import CANReader
+from src.infra.db import create_pool
 from src.infra.gpio_monitor import GPIOMonitor
+from src.infra.profile_repository import ProfileRepository
 from src.infra.settings import AppSettings
 from src.models.profile import StopConfig
 
@@ -46,12 +49,11 @@ class _GpioSafetyAdapter:
         await self._monitor.trigger_emergency()
 
 
-def build_real_controller(settings: AppSettings) -> RobotController:
+async def build_real_controller(settings: AppSettings) -> RobotController:
     """実ハードウェアに接続する RobotController を生成する。
 
     ポート・スレーブID・GPIO ピン番号はすべて settings から取得する。
-    DBC ファイルは dbc_path=None（未指定）で動作するが、実測車速取得には
-    config/can/ 以下に DBC ファイルを配置して CANReader に渡すこと。
+    DB 接続プールを確立し、ProfileRepository を CalibrationManager に注入する。
 
     Args:
         settings: config/settings.toml から読み込んだ AppSettings。
@@ -66,12 +68,13 @@ def build_real_controller(settings: AppSettings) -> RobotController:
     )
     brake_driver = ActuatorDriver(
         port=settings.serial.brake_port,
-        slave_id=2,
+        slave_id=1,  # 各軸が独立した RS-485 バスを持つため両軸とも slave_id=1
         baud_rate=settings.serial.baud_rate,
     )
     can_reader = CANReader(
         interface=settings.can.interface,
         channel=settings.can.channel,
+        dbc_path=settings.can.dbc_path,
     )
     gpio_monitor = GPIOMonitor(
         emergency_pin=settings.gpio.emergency_stop_pin,
@@ -81,10 +84,21 @@ def build_real_controller(settings: AppSettings) -> RobotController:
         deviation_threshold_kmh=2.0,
         deviation_duration_s=4.0,
     )
-    safety_monitor = SafetyMonitor(stop_config=stop_config)
+    safety_monitor = SafetyMonitor(
+        stop_config=stop_config,
+        overcurrent_limit_ma=settings.safety.overcurrent_limit_ma,
+    )
     safety_adapter: SafetyMonitorProtocol = _GpioSafetyAdapter(safety_monitor, gpio_monitor)
 
+    pool = await create_pool(settings.database.dsn)
+    profile_repo = ProfileRepository(pool)
+
     pid = PIDController(kp=1.0, ki=0.0, kd=0.0)
+    calibration_manager = CalibrationManager(
+        accel_driver=accel_driver,
+        brake_driver=brake_driver,
+        profile_repo=profile_repo,
+    )
 
     return RobotController(
         accel_driver=accel_driver,
@@ -93,4 +107,6 @@ def build_real_controller(settings: AppSettings) -> RobotController:
         safety_monitor=safety_adapter,
         pid=pid,
         last_normal_shutdown=False,
+        safety_check=safety_monitor,
+        calibration_manager=calibration_manager,
     )

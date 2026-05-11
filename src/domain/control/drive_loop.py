@@ -83,6 +83,8 @@ class DriveLoop:
         self._started_at = 0.0
         self._cycle_count = 0
         self._deviation_start = None
+        self._current_accel_opening: float = 0.0
+        self._current_brake_opening: float = 0.0
 
     def start(self) -> None:
         """制御ループを開始する。既に実行中の場合は何もしない。"""
@@ -103,6 +105,14 @@ class DriveLoop:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def current_accel_opening(self) -> float:
+        return self._current_accel_opening
+
+    @property
+    def current_brake_opening(self) -> float:
+        return self._current_brake_opening
 
     def _schedule_next_cycle(self) -> None:
         if not self._running:
@@ -144,6 +154,8 @@ class DriveLoop:
 
         accel_opening = max(0.0, min(self._profile.max_accel_opening, raw_accel))
         brake_opening = max(0.0, min(self._profile.max_brake_opening, raw_brake))
+        self._current_accel_opening = accel_opening
+        self._current_brake_opening = brake_opening
 
         calib = self._profile.calibration
         if calib is None:

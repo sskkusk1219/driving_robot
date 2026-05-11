@@ -15,6 +15,10 @@ baud_rate = 38400
 interface = "kvaser"
 # Kvaser USB-CAN チャンネル番号
 channel = 0
+# CAN バス通信速度 [bps]（シャシダイナモ送信側と合わせること）
+bitrate = 500000
+# DBC ファイルパス（シャシダイナモ車速デコード用）
+dbc_path = "config/can/MEIDEN_MEIDACS.dbc"
 
 [database]
 # asyncpg 接続文字列
@@ -40,3 +44,7 @@ storage_limit_pct = 80
 loop_interval_ms = 50
 # ログ書き込み周期 [ms]
 log_interval_ms = 100
+
+[safety]
+# 走行中の過電流検知閾値 [mA]（P-CON-CB 仕様から設定）
+overcurrent_limit_ma = 3000

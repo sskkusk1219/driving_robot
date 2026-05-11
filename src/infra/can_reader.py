@@ -14,7 +14,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _CAN_RECV_TIMEOUT_S = 0.1
-_SPEED_SIGNAL_NAME = "VehicleSpeed"
+# MEIDEN_MEIDACS.dbc の MEIDACS_Frame0 (0x120) に定義されたシグナル名
+# DBC を差し替える場合はシグナル名を合わせて更新すること
+_SPEED_SIGNAL_NAME = "Speed"
 
 
 class CANReader:
@@ -28,10 +30,12 @@ class CANReader:
         self,
         interface: str = "kvaser",
         channel: int = 0,
+        bitrate: int = 500000,
         dbc_path: str | None = None,
     ) -> None:
         self._interface = interface
         self._channel = channel
+        self._bitrate = bitrate
         self._dbc_path = Path(dbc_path) if dbc_path else None
         self._bus: Any = None
         self._db: Any = None
@@ -43,7 +47,11 @@ class CANReader:
         loop = asyncio.get_event_loop()
         self._bus = await loop.run_in_executor(
             None,
-            lambda: can.Bus(interface=self._interface, channel=self._channel),
+            lambda: can.Bus(
+                interface=self._interface,
+                channel=self._channel,
+                bitrate=self._bitrate,
+            ),
         )
 
         if self._dbc_path is not None:

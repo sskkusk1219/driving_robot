@@ -256,13 +256,14 @@ Raspberry Pi 5 (16GB)
 ├── USB (ttyUSB0)  →  USB-RS485変換ケーブル  →  P-CON-CB #1 (アクセル, SLAVE_ID=1)
 │                                                 └→ IAI RCP6-ROD (アクセル)
 │
-├── USB (ttyUSB1)  →  USB-RS485変換ケーブル  →  P-CON-CB #2 (ブレーキ, SLAVE_ID=2)
+├── USB (ttyUSB1)  →  USB-RS485変換ケーブル  →  P-CON-CB #2 (ブレーキ, SLAVE_ID=1)
 │                                                 └→ IAI RCP6-ROD (ブレーキ)
 │
 ├── USB            →  Kvaser USB-CAN         →  シャシダイナモ CAN bus
 │
-├── GPIO17 (IN)    →  非常停止スイッチ #1 (シャシダイナモ室)  ← 物理ピン11、プルアップ、LOW=停止
+├── GPIO17 (IN)    →  非常停止スイッチ #1 (シャシダイナモ室)  ← 物理ピン11、NC接点、プルアップ、HIGH=停止（RISING検知）
 │                   →  非常停止スイッチ #2 (操作エリア)  ← 並列接続
+│                      LOW=通常（NC接点閉→GND）、HIGH=停止（NC接点開→プルアップ有効、断線時も停止）
 ├── GPIO27 (IN)    →  AC UPS 接点出力（AC断検知）  ← 物理ピン13、プルアップ、LOW=AC断 [要確認: AC UPS機種確定後に更新]
 │
 └── AC UPS (TBD)   →  5V PSU  →  Raspberry Pi 本体 + 内蔵SSD
@@ -279,7 +280,7 @@ Raspberry Pi 5 (16GB)
 | パリティ | なし |
 | ストップビット | 1 |
 | アクセル SLAVE_ID | 1（ttyUSB0） |
-| ブレーキ SLAVE_ID | 2（ttyUSB1） |
+| ブレーキ SLAVE_ID | 1（ttyUSB1）※各軸が独立した RS-485 バスのため両軸とも 1 |
 
 ---
 

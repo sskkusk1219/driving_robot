@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -148,9 +148,10 @@ class TestHomeReturn:
         with patch("asyncio.sleep", AsyncMock()):
             await driver.home_return()
 
-        mock_client.write_coil.assert_awaited_once_with(
-            address=0x040B, value=True, device_id=1
-        )
+        calls = mock_client.write_coil.await_args_list
+        assert len(calls) == 2
+        assert calls[0] == call(address=0x040B, value=False, device_id=1)
+        assert calls[1] == call(address=0x040B, value=True, device_id=1)
 
     @pytest.mark.asyncio
     async def test_home_return_timeout(self) -> None:
@@ -176,11 +177,21 @@ class TestHomeReturn:
                 await driver.home_return()
 
 
+class TestEnableModbusControl:
+    @pytest.mark.asyncio
+    async def test_enable_modbus_control_writes_pmsl(self) -> None:
+        driver, mock_client = _make_driver()
+        await driver.enable_modbus_control()
+        mock_client.write_coil.assert_awaited_once_with(
+            address=0x0427, value=True, device_id=1
+        )
+
+
 class TestMoveToPosition:
     @pytest.mark.asyncio
     async def test_move_to_position_calls_write_registers(self) -> None:
         driver, mock_client = _make_driver()
-        await driver.move_to_position(pos=1000, speed_mm_s=50, accel_mm_s2=1000)
+        await driver.move_to_position(pos=1000, speed_mm_s=50, accel=30)
 
         mock_client.write_registers.assert_awaited_once()
         call_kwargs = mock_client.write_registers.await_args.kwargs
@@ -191,8 +202,11 @@ class TestMoveToPosition:
         # PCMD = 1000 → 0x000003E8
         assert regs[0] == 0x0000  # hi
         assert regs[1] == 0x03E8  # lo
-        # CTLF = 0x0002
-        assert regs[8] == 0x0002
+        # VCMD = 50mm/s → 5000 (0.01mm/s単位) → 0x00001388
+        assert regs[4] == 0x0000  # hi
+        assert regs[5] == 0x1388  # lo (5000)
+        # CTLF = 0x0000 (絶対位置移動)
+        assert regs[8] == 0x0000
 
 
 class TestReadPosition:
