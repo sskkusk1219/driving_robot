@@ -199,6 +199,48 @@ async def _control_loop(self) -> None:
 
 ---
 
+### ハードウェア固有の実装パターン
+
+#### lgpio GPIO コールバック（Raspberry Pi OS Bookworm以降）
+
+`lgpio` は `RPi.GPIO` の後継ライブラリ。コールバックのシグネチャが異なるため注意。
+
+```python
+import lgpio
+
+# ✅ lgpio のコールバックシグネチャ: (chip, gpio, level, timestamp)
+def _on_emergency_stop(chip: int, gpio: int, level: int, timestamp: int) -> None:
+    ...
+
+handle = lgpio.gpiochip_open(0)
+lgpio.gpio_claim_input(handle, pin)
+lgpio.callback(handle, pin, lgpio.RISING_EDGE, _on_emergency_stop)
+
+# ❌ RPi.GPIO の旧シグネチャ（lgpio では使えない）
+def _on_emergency_stop(channel):  # 'channel' キーワード引数は lgpio には存在しない
+    ...
+```
+
+#### CAN フレームデコード（cantools）
+
+受信フレームのデータ長が DBC 定義より短い場合（例: 4バイト受信 / DBC 定義8バイト）は
+`DecodeError` が発生する。`allow_truncated=True` を使うことで先頭部分の有効シグナルをデコードできる。
+
+```python
+# ✅ allow_truncated=True で短いフレームも正常デコード
+try:
+    decoded = db.decode_message(msg.arbitration_id, msg.data, allow_truncated=True)
+except KeyError:
+    raise ValueError(f"不明な CAN フレーム ID: 0x{msg.arbitration_id:X}") from None
+except Exception as e:
+    raise ValueError(f"デコードエラー: ID=0x{msg.arbitration_id:X} ({e})") from None
+
+# ❌ デフォルト（allow_truncated=False）では長さ不一致で DecodeError
+decoded = db.decode_message(msg.arbitration_id, msg.data)  # 4バイト受信・8バイト定義で例外
+```
+
+---
+
 ### 安全に関わるコードの原則
 
 制御系・安全系のコードには以下のルールを必ず適用します。
@@ -543,9 +585,22 @@ pytest tests/unit/ tests/integration/ -v
 bash scripts/start.sh
 ```
 
-> **Kvaser Linux ドライバ**: Kvaser公式サイト（https://www.kvaser.com/downloads/）から
-> Raspberry Pi OS (arm64) 対応のドライバをダウンロードしてインストールする。
-> インストール後に `ls /dev/kvaser*` でデバイスが認識されていることを確認する。
+> **lgpio (GPIO ライブラリ)**: `lgpio` は apt パッケージで管理するため pip install できない。
+> `sudo apt install python3-lgpio` でインストール後、venv から参照するために以下の `.pth` ファイルを作成する:
+> ```
+> echo "/usr/lib/python3/dist-packages" > .venv/lib/python3.13/site-packages/system-dist-packages.pth
+> ```
+> 確認: `.venv/bin/python -c "import lgpio; print(lgpio.__file__)"` が出力されれば OK。
+>
+> **Kvaser Linux ドライバ**: Kvaser公式サイト（https://www.kvaser.com/downloads-kvaser/）から
+> `linuxcan.tar.gz` をダウンロードし、`sudo make KV_NO_PCI=1 && sudo make install KV_NO_PCI=1` でビルド・インストールする。
+> インストール後に `sudo modprobe usbcanII leaf mhydra` でモジュールをロードし、
+> `listChannels` で Kvaser デバイスが表示されること・`/dev/usbcanII0` が作成されることを確認する。
+> `ip link show` には `can0` は出ない（Kvaser は SocketCAN ではないため正常）。
+>
+> **python-can aarch64 パッチ**: Raspberry Pi 5 (aarch64) では python-can に2つのバグがあり、インストール後に手動パッチが必要。
+> 詳細と修正方法は `docs/architecture.md` の「python-can aarch64 既知バグ」セクションを参照。
+> `pip install --upgrade python-can` を実行した場合は再パッチが必要なため注意。
 
 > **udev rules によるシリアルポート固定**: 複数の USB-RS485 デバイスを接続する場合、
 > 再接続でポート番号が変わることがある。`udev rules` でシリアル番号に基づき

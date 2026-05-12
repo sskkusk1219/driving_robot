@@ -113,10 +113,14 @@ class CANReader:
 
         db = self._db
         try:
-            decoded = db.decode_message(msg.arbitration_id, msg.data)
+            decoded = db.decode_message(msg.arbitration_id, msg.data, allow_truncated=True)
         except KeyError:
             raise ValueError(
                 f"不明な CAN フレーム ID: 0x{msg.arbitration_id:X}"
+            ) from None
+        except Exception as e:
+            raise ValueError(
+                f"デコードエラー: ID=0x{msg.arbitration_id:X} len={len(msg.data)} ({e})"
             ) from None
 
         if _SPEED_SIGNAL_NAME not in decoded:

@@ -13,6 +13,9 @@ dependencies = [
     "numpy>=1.25.0",
     "scipy>=1.11.0",
     "pydantic>=2.0.0",
+    # lgpio は apt パッケージ (python3-lgpio) で管理。pip install 不可のため
+    # .venv/lib/python3.13/site-packages/system-dist-packages.pth で参照させる。
+    # 再セットアップ時は: sudo apt install python3-lgpio
 ]
 
 [project.optional-dependencies]

@@ -18,7 +18,7 @@
 | pymodbus | 3.x | Modbus RTU通信 | asyncio対応、Python製Modbus実装のデファクトスタンダード |
 | python-can | 4.x | CAN bus通信 | Kvaser backendに対応 |
 | asyncpg | 最新安定版 | PostgreSQL非同期ドライバ | asyncio対応で高速書き込み |
-| RPi.GPIO | 最新安定版 | GPIO制御 | AC UPS接点出力によるAC断検知・非常停止割り込み |
+| lgpio | 最新安定版 | GPIO制御 | AC UPS接点出力によるAC断検知・非常停止割り込み。RPi.GPIO の後継（Raspberry Pi OS Bookworm以降の推奨ライブラリ） |
 | numpy | 最新安定版 | 運転モデル補間 | 高速な2次元グリッド補間 |
 | scipy | 最新安定版 | 運転モデル補間 | RegularGridInterpolator |
 | gzip / shutil | 標準ライブラリ | ログアーカイブ圧縮 | 追加インストール不要 |
@@ -282,6 +282,31 @@ Raspberry Pi 5 (16GB)
 | アクセル SLAVE_ID | 1（ttyUSB0） |
 | ブレーキ SLAVE_ID | 1（ttyUSB1）※各軸が独立した RS-485 バスのため両軸とも 1 |
 
+### CAN 通信・配線設定
+
+#### ノード構成
+
+| 機器 | CAN ドライバ | インターフェース | ビットレート |
+|------|------------|----------------|------------|
+| RPi3B (driving_simulator) | SocketCAN (MCP2515 HAT) | `can0` | 500kbps |
+| RPi5 (driving_robot) | Kvaser canlib (usbcanII) | `/dev/usbcanII0` | 500kbps |
+
+#### Kvaser USB-CAN の注意点
+
+- Kvaser Memorator は **SocketCAN ではなく Kvaser canlib 経由**でアクセスする
+- そのため `ip link show` の出力に `can0` などのインターフェースは**表示されない**（正常動作）
+- デバイス認識確認は `listChannels` コマンドを使用し、`/dev/usbcanII0`, `/dev/usbcanII1` が表示されることを確認する
+- 実行には `sudo` が必要（udev rules 未設定の場合）
+
+#### 異電源間の CAN 配線注意点（RPi3B ↔ RPi5）
+
+- **GND 接続必須**: 別電源のノード間は CANH/CANL だけでなく GND も接続しなければ通信できない
+  - Kvaser DB9 ピン3(GND) ↔ MCP2515 HAT GND を配線すること
+- **終端抵抗**: 2ノード構成では両端末ノードそれぞれに 120Ω の終端抵抗が必要
+  - MCP2515 HAT 側: ジャンパで内蔵終端を有効化
+  - Kvaser Memorator 側: 終端内蔵なし → DB9 ピン7(CANH) と ピン2(CANL) の間に 120Ω を外付け
+  - **確認方法**: CANH-CANL 間をテスターで測定 → **約60Ω** が正常値（120Ω × 2個並列 = 60Ω）
+
 ---
 
 ## セキュリティアーキテクチャ
@@ -393,6 +418,26 @@ Raspberry Pi 5 (16GB)
 > 10ms・20ms ループは不可能。**50ms ループ（20Hz）を推奨**。
 > 位置指令（FC10）は値が変化した場合のみ送信することで実質的なレイテンシを低減する。
 > Param No.17 を 1ms に縮小すると約 4ms 短縮可能（実機チューニングで検証）。
+
+### python-can aarch64 既知バグ（要パッチ）
+
+python-can 4.x を aarch64 (Raspberry Pi 5) で使用する場合、以下の2つのバグをパッチする必要がある。
+パッチは `.venv` 内のファイルを直接修正する。`pip install --upgrade python-can` で上書きされたら再パッチが必要。
+
+**バグ1: `ctypes.c_long` のサイズ不一致**
+
+- 場所: `.venv/lib/.../can/interfaces/kvaser/canlib.py` line 509 付近
+- 原因: aarch64 では `ctypes.c_long` が 8バイト。canlib ioctl に `c_long` + `size=4` を渡すと `canERR_PARAM`
+- 修正: `ctypes.c_long(TIMESTAMP_RESOLUTION)` → `ctypes.c_uint(TIMESTAMP_RESOLUTION)`、`4` → `ctypes.sizeof(ctypes.c_uint)`
+
+**バグ2: `canIOCTL_SET_LOCAL_TXACK` 未サポートエラー**
+
+- 場所: 同ファイルの `canIoCtlInit` 呼び出し部
+- 原因: Kvaser Memorator は `canIOCTL_SET_LOCAL_TXACK` 未サポートで `canERR_PARAM` を返す
+- 注意: `canIoCtlInit` と `canIoCtl` は ctypes のキャッシュにより同一関数オブジェクトを返すため、
+  `errcheck` が `__check_status_operation` に上書きされる。
+  `except CANLIBInitializationError` では捕捉できず `except CANLIBError` が必要
+- 修正: `canIoCtlInit(SET_LOCAL_TXACK, ...)` を `try/except CANLIBError` で囲む
 
 ### ネットワーク制約
 

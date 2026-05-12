@@ -67,13 +67,22 @@
 
 ## フェーズ5: 物理配線の確認（未完了・申し送り）
 
-- [ ] **GND 接続**: RPi3B と RPi5 は別電源のため GND 接続が必要
+- [x] **GND 接続**: RPi3B と RPi5 は別電源のため GND 接続が必要
   - Kvaser DB9 ピン3(GND) ↔ MCP2515 HAT GND を配線すること
-- [ ] **終端抵抗の確認**:
+- [x] **終端抵抗の確認**:
   - MCP2515 HAT 側: ジャンパで内蔵終端が有効になっているか確認
   - Kvaser Memorator 側: 終端内蔵なし → DB9 ピン7(CANH) と ピン2(CANL) の間に 120Ω を外付け
   - 確認方法: テスターで CANH-CANL 間を測定 → 約60Ω なら両端OK
-- [ ] **実機受信確認**: 上記配線完了後に `sudo .venv/bin/python -u scripts/check_can.py` で車速表示を確認
+- [x] **実機受信確認**: `sudo .venv/bin/python scripts/check_can.py` で車速表示を確認
+  - `Speed: 0.00 km/h` が約100ms間隔で継続受信を確認
+
+## フェーズ6: DecodeError修正
+
+- [x] `can_reader.py` の `decode_message()` に `allow_truncated=True` を追加
+  - DBC は8バイト定義（Speed 32bit + dummy 32bit）だが実フレームは4バイト
+  - `allow_truncated=True` でSpeedシグナル（最初の4バイト）を正常デコード
+- [x] `cantools.database.errors.DecodeError` を `ValueError` に変換して `check_can.py` の SKIP 処理で捕捉
+- [x] 修正後に `sudo .venv/bin/python scripts/check_can.py` で車速表示を確認（2026-05-12）
 
 ---
 
@@ -95,7 +104,7 @@
 ## 実装後の振り返り
 
 ### 実装完了日
-2026-05-10（フェーズ1〜4完了、フェーズ5は物理配線待ち）
+2026-05-10（フェーズ1〜4完了）、2026-05-12（フェーズ5〜6完了・全タスク完了）
 
 ### 計画と実績の差分
 
@@ -119,7 +128,18 @@
 - CAN バスは CANH/CANL に加え GND も異電源間では必須
 - 2ノード構成では両端に 120Ω 終端が必要。CANH-CANL 間テスターで約 60Ω が正常値
 
+### 追記（2026-05-12 フェーズ5〜6）
+
+**実機確認で発覚したバグ**:
+- cantools `decode_message()` がフレーム長不一致で `DecodeError` を送出するが未キャッチだった
+- DBC 定義 8バイトに対し実フレームは 4バイト（Speed 32bit のみ）
+- 修正: `allow_truncated=True` 追加 + `Exception` → `ValueError` 変換
+
+**実機受信結果**:
+- `Speed: 0.00 km/h` を約100ms間隔で継続受信確認（シャシダイナモ停止中）
+
 ### 次回への改善提案
 - python-can の aarch64 バグを upstream に PR する
 - udev rules を設定して `sudo` 不要にする
 - Kvaser インストール手順を `docs/` または `scripts/setup_env.sh` に追記する
+- DBC の `MEIDACS_Frame0` を 4バイト定義に修正し dummy シグナルを削除する（実フレームに合わせる）
