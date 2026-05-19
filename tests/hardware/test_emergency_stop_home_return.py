@@ -18,6 +18,7 @@ functional-design.md UC4 のシーケンスをハードウェア実機で再現�
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 # lgpio はシステムパッケージ (/usr/lib/python3/dist-packages)。
@@ -26,11 +27,13 @@ sys.path.insert(0, "/usr/lib/python3/dist-packages")
 try:
     import lgpio
 except ImportError:
-    print("ERROR: lgpio が見つかりません。sudo apt install python3-lgpio を実行してください。", file=sys.stderr)
+    print(
+        "ERROR: lgpio が見つかりません。sudo apt install python3-lgpio を実行してください。",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 # プロジェクトルートからのインポートのため sys.path を調整
-import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.infra.actuator_driver import ActuatorDriver
@@ -88,7 +91,7 @@ async def main() -> None:
     except ConnectionError as e:
         print(f"ERROR: Modbus 接続失敗: {e}", file=sys.stderr)
         sys.exit(1)
-    print("Modbus 接続完了（アクセル軸: {}, ブレーキ軸: {}）".format(_ACCEL_PORT, _BRAKE_PORT))
+    print(f"Modbus 接続完了（アクセル軸: {_ACCEL_PORT}, ブレーキ軸: {_BRAKE_PORT}）")
 
     # 起動時前処理: reset_alarm → servo_on → home_return
     # 初期化は逐次実行（pymodbus 2ポート同時リクエストの競合を回避）
@@ -109,9 +112,14 @@ async def main() -> None:
     h = lgpio.gpiochip_open(_GPIO_CHIP)
     lgpio.gpio_claim_alert(h, _EMERGENCY_PIN, lgpio.RISING_EDGE, lgpio.SET_PULL_UP)
     lgpio.gpio_set_debounce_micros(h, _EMERGENCY_PIN, _DEBOUNCE_US)
-    cb = lgpio.callback(h, _EMERGENCY_PIN, lgpio.RISING_EDGE, _make_emergency_callback(loop, accel, brake))
+    cb = lgpio.callback(
+        h, _EMERGENCY_PIN, lgpio.RISING_EDGE, _make_emergency_callback(loop, accel, brake)
+    )
 
-    print("非常停止スイッチ監視中（GPIO17 RISING エッジ）。スイッチを押すと原点復帰します。Ctrl+C で終了。")
+    print(
+        "非常停止スイッチ監視中（GPIO17 RISING エッジ）。"
+        "スイッチを押すと原点復帰します。Ctrl+C で終了。"
+    )
     print("-" * 60)
 
     try:

@@ -317,10 +317,11 @@ stateDiagram-v2
 class ActuatorDriver:
     def __init__(port: str, slave_id: int)
     async def connect() -> None
+    async def enable_modbus_control() -> None  # PMSL コイルで Modbus 操作権を取得（reset_alarm より先に呼ぶ）
     async def reset_alarm() -> None
     async def servo_on() -> None
     async def servo_off() -> None
-    async def move_to_position(pos: int) -> None  # 10ms周期で呼ぶ
+    async def move_to_position(pos: int) -> None  # 50ms周期で呼ぶ
     async def home_return() -> None               # 原点復帰
     async def read_position() -> int              # 現在位置 [pulse]
     async def read_current() -> float             # 電流値 [mA]

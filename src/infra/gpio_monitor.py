@@ -3,7 +3,8 @@
 GPIO17: 非常停止スイッチ（物理ピン11、NC接点、プルアップ、RISING=停止）
         LOW=通常（NC接点が閉じてGNDに落ちている）
         HIGH=停止（NC接点が開いてプルアップが有効 / ケーブル断線でも停止）
-GPIO27: AC UPS 接点出力 AC断検知（物理ピン13、プルアップ、FALLING=AC断）[要確認: AC UPS機種確定後に更新]
+GPIO27: AC UPS 接点出力 AC断検知（物理ピン13、プルアップ、FALLING=AC断）
+        [要確認: AC UPS機種確定後に更新]
 """
 
 from __future__ import annotations

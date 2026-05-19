@@ -31,7 +31,7 @@ class _GpioSafetyAdapter:
     def __init__(self, monitor: SafetyMonitor, gpio: GPIOMonitor) -> None:
         self._monitor = monitor
         self._gpio = gpio
-        gpio.register_emergency_callback(monitor.trigger_emergency)
+        # AC断のみここで登録。非常停止は build_real_controller でコントローラ生成後に登録する
         gpio.register_ac_loss_callback(monitor.handle_ac_power_loss)
 
     async def start_monitoring(self) -> None:
@@ -100,7 +100,7 @@ async def build_real_controller(settings: AppSettings) -> RobotController:
         profile_repo=profile_repo,
     )
 
-    return RobotController(
+    controller = RobotController(
         accel_driver=accel_driver,
         brake_driver=brake_driver,
         can_reader=can_reader,
@@ -110,3 +110,7 @@ async def build_real_controller(settings: AppSettings) -> RobotController:
         safety_check=safety_monitor,
         calibration_manager=calibration_manager,
     )
+    # GPIO非常停止 → controller.emergency_stop() を直接呼ぶ
+    # （trigger_emergency経由にすると controller が自身を再帰呼び出しするループが生じるため）
+    gpio_monitor.register_emergency_callback(controller.emergency_stop)
+    return controller

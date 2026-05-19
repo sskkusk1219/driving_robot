@@ -17,6 +17,9 @@ class _StubActuator:
     async def connect(self) -> None:
         pass
 
+    async def enable_modbus_control(self) -> None:
+        pass
+
     async def home_return(self) -> None:
         pass
 

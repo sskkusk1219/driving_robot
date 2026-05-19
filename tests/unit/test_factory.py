@@ -139,24 +139,25 @@ class TestBuildRealController:
         mock_gpio.assert_called_once_with(emergency_pin=17, ac_detect_pin=27)
 
     @pytest.mark.asyncio
-    async def test_gpio_emergency_callback_registered_to_safety_monitor(self) -> None:
+    async def test_gpio_emergency_callback_registered_to_controller(self) -> None:
+        """GPIO非常停止コールバックが controller.emergency_stop に直接配線されること。
+        trigger_emergency 経由にすると循環呼び出しが生じるため、コントローラを直接登録する。
+        """
         settings = make_settings()
         with (
             patch("src.app.factory.ActuatorDriver"),
             patch("src.app.factory.CANReader"),
             patch("src.app.factory.GPIOMonitor") as mock_gpio_cls,
-            patch("src.app.factory.SafetyMonitor") as mock_monitor_cls,
+            patch("src.app.factory.SafetyMonitor"),
             patch("src.app.factory.create_pool", new_callable=AsyncMock),
             patch("src.app.factory.ProfileRepository"),
         ):
             mock_gpio = MagicMock()
             mock_gpio_cls.return_value = mock_gpio
-            mock_monitor = MagicMock()
-            mock_monitor_cls.return_value = mock_monitor
-            await build_real_controller(settings)
+            ctrl = await build_real_controller(settings)
 
         mock_gpio.register_emergency_callback.assert_called_once_with(
-            mock_monitor.trigger_emergency
+            ctrl.emergency_stop
         )
 
     @pytest.mark.asyncio

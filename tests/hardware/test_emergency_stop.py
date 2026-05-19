@@ -36,7 +36,10 @@ def main() -> None:
     time.sleep(0.1)
 
     current = lgpio.gpio_read(h, EMERGENCY_PIN)
-    state_str = "LOW（通常: NC接点が閉じている）" if current == 0 else "HIGH（非常停止中: NC接点が開いている）"
+    state_str = (
+        "LOW（通常: NC接点が閉じている）" if current == 0
+        else "HIGH（非常停止中: NC接点が開いている）"
+    )
     print(f"GPIO{EMERGENCY_PIN} 初期状態: {state_str}")
     print("スイッチを押すと HIGH になります。終了は Ctrl+C")
     print("-" * 40)
