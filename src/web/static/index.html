@@ -11,9 +11,43 @@
 <header>
   <h1>driving_robot</h1>
   <span id="state-badge" class="BOOTING">BOOTING</span>
+  <span id="active-profile-badge" class="profile-badge">プロファイル未選択</span>
 </header>
 
 <main>
+
+  <!-- 車両プロファイル管理 -->
+  <div class="card">
+    <div class="card-header">
+      <h2>車両プロファイル</h2>
+      <button id="btn-new-profile" class="btn-primary btn-sm">＋ 新規作成</button>
+    </div>
+    <div id="profile-list" class="profile-list">
+      <p class="empty-msg">読み込み中...</p>
+    </div>
+  </div>
+
+  <!-- 走行制御 -->
+  <div class="card">
+    <h2>走行制御</h2>
+    <div class="btn-grid" style="margin-top:12px">
+      <button id="btn-initialize"       class="btn-primary">初期化</button>
+      <button id="btn-calibrate"        class="btn-warning">キャリブレーション</button>
+      <button id="btn-auto-start"       class="btn-success">自動走行 開始</button>
+      <button id="btn-learning-start"   class="btn-warning">学習運転 開始</button>
+      <button id="btn-stop"             class="btn-secondary">停止</button>
+      <button id="btn-manual-start"     class="btn-warning">手動操作 開始</button>
+      <button id="btn-manual-stop"      class="btn-secondary">手動操作 終了</button>
+      <button id="btn-reset-emergency"  class="btn-secondary">非常停止 リセット</button>
+      <button id="btn-emergency"        class="btn-danger">緊急停止</button>
+    </div>
+  </div>
+
+  <!-- キャリブレーション結果 -->
+  <div class="card" id="calib-result-card" style="display:none">
+    <h2>キャリブレーション結果</h2>
+    <div id="calib-result-body" class="calib-result"></div>
+  </div>
 
   <!-- 速度表示 -->
   <div class="row two">
@@ -51,22 +85,82 @@
     <canvas id="speed-chart" width="800" height="200"></canvas>
   </div>
 
-  <!-- 操作ボタン -->
-  <div class="card">
-    <h2>操作</h2>
-    <div class="btn-grid" style="margin-top:12px">
-      <button id="btn-initialize"       class="btn-primary">初期化</button>
-      <button id="btn-auto-start"       class="btn-success">自動走行 開始</button>
-      <button id="btn-learning-start"   class="btn-warning">学習運転 開始</button>
-      <button id="btn-stop"             class="btn-secondary">停止</button>
-      <button id="btn-manual-start"     class="btn-warning">手動操作 開始</button>
-      <button id="btn-manual-stop"      class="btn-secondary">手動操作 終了</button>
-      <button id="btn-reset-emergency"  class="btn-secondary">非常停止 リセット</button>
-      <button id="btn-emergency"        class="btn-danger">緊急停止</button>
+</main>
+
+<!-- プロファイル作成・編集 モーダル -->
+<div id="profile-modal" class="modal-overlay hidden">
+  <div class="modal">
+    <h3 id="modal-title">プロファイル作成</h3>
+    <form id="profile-form" autocomplete="off">
+      <input type="hidden" id="form-profile-id" />
+
+      <div class="form-group">
+        <label>プロファイル名 <span class="required">*</span></label>
+        <input type="text" id="form-name" placeholder="例: 軽自動車A" required />
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label>最大アクセル開度 (%)</label>
+          <input type="number" id="form-max-accel" min="0" max="100" step="0.1" value="80" required />
+        </div>
+        <div class="form-group">
+          <label>最大ブレーキ開度 (%)</label>
+          <input type="number" id="form-max-brake" min="0" max="100" step="0.1" value="80" required />
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label>最高車速 (km/h)</label>
+          <input type="number" id="form-max-speed" min="1" step="0.1" value="120" required />
+        </div>
+        <div class="form-group">
+          <label>最大減速度 (G)</label>
+          <input type="number" id="form-max-decel" min="0.01" step="0.01" value="0.3" required />
+        </div>
+      </div>
+
+      <div class="form-section-label">PIDゲイン</div>
+      <div class="form-row three">
+        <div class="form-group">
+          <label>Kp</label>
+          <input type="number" id="form-kp" step="0.01" value="1.0" required />
+        </div>
+        <div class="form-group">
+          <label>Ki</label>
+          <input type="number" id="form-ki" step="0.001" value="0.0" required />
+        </div>
+        <div class="form-group">
+          <label>Kd</label>
+          <input type="number" id="form-kd" step="0.001" value="0.0" required />
+        </div>
+      </div>
+
+      <div class="form-section-label">逸脱停止設定</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>逸脱閾値 (km/h)</label>
+          <input type="number" id="form-dev-threshold" min="0" step="0.1" value="2.0" required />
+        </div>
+        <div class="form-group">
+          <label>逸脱継続時間 (s)</label>
+          <input type="number" id="form-dev-duration" min="0" step="0.1" value="4.0" required />
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>モデルパス (任意)</label>
+        <input type="text" id="form-model-path" placeholder="例: data/models/car_a.pkl" />
+      </div>
+    </form>
+
+    <div class="modal-footer">
+      <button id="btn-modal-cancel" class="btn-secondary">キャンセル</button>
+      <button id="btn-modal-save"   class="btn-primary">保存</button>
     </div>
   </div>
-
-</main>
+</div>
 
 <div id="toast"></div>
 
