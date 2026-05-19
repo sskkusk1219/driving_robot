@@ -16,6 +16,7 @@ def _make_can_message(arbitration_id: int = 0x100, data: bytes = b"\x00" * 8) ->
     msg = MagicMock()
     msg.arbitration_id = arbitration_id
     msg.data = data
+    msg.is_error_frame = False
     return msg
 
 
@@ -23,13 +24,13 @@ class TestConnect:
     @pytest.mark.asyncio
     async def test_connect_without_dbc(self) -> None:
         mock_bus = MagicMock()
-        with patch.dict("sys.modules", {"can": MagicMock()}):
-            import can
+        mock_can = MagicMock()
+        mock_can.Bus.return_value = mock_bus
+        mock_can.AsyncBufferedReader.return_value = MagicMock()
+        mock_can.Notifier.return_value = MagicMock()
 
-            can.Bus.return_value = mock_bus  # type: ignore[attr-defined]
-
+        with patch.dict("sys.modules", {"can": mock_can}):
             reader = CANReader(interface="kvaser", channel=0, dbc_path=None)
-            reader._bus = None
 
             with patch("asyncio.get_event_loop") as mock_loop_fn:
                 mock_loop = MagicMock()
@@ -40,6 +41,8 @@ class TestConnect:
 
         assert reader._bus is not None
         assert reader._db is None  # DBC 未指定
+        assert reader._async_reader is not None
+        assert reader._notifier is not None
 
     @pytest.mark.asyncio
     async def test_connect_with_missing_dbc_raises(self, tmp_path: Path) -> None:
@@ -47,8 +50,10 @@ class TestConnect:
         reader = CANReader(dbc_path=str(dbc_path))
 
         mock_bus = MagicMock()
+        mock_can = MagicMock()
+        mock_can.Bus.return_value = mock_bus
 
-        with patch.dict("sys.modules", {"can": MagicMock()}):
+        with patch.dict("sys.modules", {"can": mock_can}):
             with patch("asyncio.get_event_loop") as mock_loop_fn:
                 mock_loop = MagicMock()
                 mock_loop_fn.return_value = mock_loop
@@ -62,8 +67,8 @@ class TestReadSpeed:
     @pytest.mark.asyncio
     async def test_read_speed_without_db_raises(self) -> None:
         reader = CANReader()
-        reader._bus = MagicMock()
-        reader._db = None  # DB 未ロード
+        reader._async_reader = MagicMock()
+        reader._db = None
 
         with pytest.raises(NotImplementedError):
             await reader.read_speed()
@@ -71,7 +76,7 @@ class TestReadSpeed:
     @pytest.mark.asyncio
     async def test_read_speed_without_connect_raises(self) -> None:
         reader = CANReader()
-        reader._bus = None
+        reader._async_reader = None
         reader._db = MagicMock()
 
         with pytest.raises(RuntimeError):
@@ -80,95 +85,74 @@ class TestReadSpeed:
     @pytest.mark.asyncio
     async def test_read_speed_success(self) -> None:
         reader = CANReader()
-        mock_bus = MagicMock()
         mock_db = MagicMock()
-        reader._bus = mock_bus
         reader._db = mock_db
+        reader._async_reader = MagicMock()
 
-        can_msg = _make_can_message(arbitration_id=0x100)
+        can_msg = _make_can_message(arbitration_id=0x120)
         mock_db.decode_message.return_value = {"Speed": 72.5}
+        reader._async_reader.get_message = AsyncMock(return_value=can_msg)
 
-        with patch("asyncio.get_event_loop") as mock_loop_fn:
-            mock_loop = MagicMock()
-            mock_loop_fn.return_value = mock_loop
-            mock_loop.run_in_executor = AsyncMock(return_value=can_msg)
-
-            speed = await reader.read_speed()
+        speed = await reader.read_speed()
 
         assert speed == 72.5
 
     @pytest.mark.asyncio
-    async def test_read_speed_timeout_raises(self) -> None:
+    async def test_read_speed_skips_unknown_frame_id(self) -> None:
+        """不明な ID のフレームはスキップして次の Speed フレームを待つ。"""
         reader = CANReader()
-        reader._bus = MagicMock()
-        reader._db = MagicMock()
-
-        with patch("asyncio.get_event_loop") as mock_loop_fn:
-            mock_loop = MagicMock()
-            mock_loop_fn.return_value = mock_loop
-            mock_loop.run_in_executor = AsyncMock(return_value=None)
-
-            with pytest.raises(TimeoutError):
-                await reader.read_speed()
-
-    @pytest.mark.asyncio
-    async def test_read_speed_unknown_frame_id_raises(self) -> None:
-        reader = CANReader()
-        reader._bus = MagicMock()
         mock_db = MagicMock()
         reader._db = mock_db
+        reader._async_reader = MagicMock()
 
-        can_msg = _make_can_message(arbitration_id=0x999)
-        mock_db.decode_message.side_effect = KeyError("unknown frame")
+        unknown_msg = _make_can_message(arbitration_id=0x999)
+        speed_msg = _make_can_message(arbitration_id=0x120)
 
-        with patch("asyncio.get_event_loop") as mock_loop_fn:
-            mock_loop = MagicMock()
-            mock_loop_fn.return_value = mock_loop
-            mock_loop.run_in_executor = AsyncMock(return_value=can_msg)
+        mock_db.decode_message.side_effect = [KeyError("unknown"), {"Speed": 50.0}]
+        reader._async_reader.get_message = AsyncMock(side_effect=[unknown_msg, speed_msg])
 
-            with pytest.raises(ValueError, match="0x999"):
-                await reader.read_speed()
+        speed = await reader.read_speed()
+
+        assert speed == 50.0
 
     @pytest.mark.asyncio
-    async def test_read_speed_missing_signal_raises(self) -> None:
+    async def test_read_speed_skips_frame_without_speed_signal(self) -> None:
+        """Speed シグナルを含まないフレームはスキップして次を待つ。"""
         reader = CANReader()
-        mock_bus = MagicMock()
         mock_db = MagicMock()
-        reader._bus = mock_bus
         reader._db = mock_db
+        reader._async_reader = MagicMock()
 
-        can_msg = _make_can_message()
-        mock_db.decode_message.return_value = {"OtherSignal": 10.0}
+        other_msg = _make_can_message(arbitration_id=0x100)
+        speed_msg = _make_can_message(arbitration_id=0x120)
 
-        with patch("asyncio.get_event_loop") as mock_loop_fn:
-            mock_loop = MagicMock()
-            mock_loop_fn.return_value = mock_loop
-            mock_loop.run_in_executor = AsyncMock(return_value=can_msg)
+        mock_db.decode_message.side_effect = [{"OtherSignal": 10.0}, {"Speed": 30.0}]
+        reader._async_reader.get_message = AsyncMock(side_effect=[other_msg, speed_msg])
 
-            with pytest.raises(ValueError, match="Speed"):
-                await reader.read_speed()
+        speed = await reader.read_speed()
+
+        assert speed == 30.0
 
 
 class TestClose:
     @pytest.mark.asyncio
-    async def test_close_shuts_down_bus(self) -> None:
+    async def test_close_shuts_down_bus_and_notifier(self) -> None:
         reader = CANReader()
         mock_bus = MagicMock()
-        mock_bus.shutdown = MagicMock()
+        mock_notifier = MagicMock()
         reader._bus = mock_bus
+        reader._notifier = mock_notifier
 
         with patch("asyncio.get_event_loop") as mock_loop_fn:
             mock_loop = MagicMock()
             mock_loop_fn.return_value = mock_loop
             mock_loop.run_in_executor = AsyncMock()
 
-            with patch.dict("sys.modules", {"can": MagicMock()}):
-                import can
+            await reader.close()
 
-                can.BusABC = object  # type: ignore[attr-defined]
-                await reader.close()
-
+        mock_notifier.stop.assert_called_once()
         assert reader._bus is None
+        assert reader._notifier is None
 
 
 class TestDbcIntegration:
@@ -210,15 +194,11 @@ class TestDbcIntegration:
 
         reader = CANReader(dbc_path=str(_DBC_PATH))
         reader._db = db
-        reader._bus = MagicMock()
+        reader._async_reader = MagicMock()
 
         can_msg = _make_can_message(arbitration_id=msg_def.frame_id, data=bytes(raw_data))
+        reader._async_reader.get_message = AsyncMock(return_value=can_msg)
 
-        with patch("asyncio.get_event_loop") as mock_loop_fn:
-            mock_loop = MagicMock()
-            mock_loop_fn.return_value = mock_loop
-            mock_loop.run_in_executor = AsyncMock(return_value=can_msg)
-
-            speed = await reader.read_speed()
+        speed = await reader.read_speed()
 
         assert abs(speed - 100.0) < 0.01

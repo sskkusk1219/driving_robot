@@ -57,13 +57,8 @@ async def main() -> None:
 
     try:
         while True:
-            try:
-                speed = await reader.read_speed()
-                print(f"[{_now()}] Speed: {speed:6.2f} km/h")
-            except TimeoutError:
-                print(f"[{_now()}] TIMEOUT - フレームが受信できませんでした")
-            except ValueError as e:
-                print(f"[{_now()}] SKIP - {e}")
+            speed = await reader.read_speed()
+            print(f"[{_now()}] Speed: {speed:6.2f} km/h")
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:

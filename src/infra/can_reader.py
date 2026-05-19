@@ -13,7 +13,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_CAN_RECV_TIMEOUT_S = 0.1
 # MEIDEN_MEIDACS.dbc の MEIDACS_Frame0 (0x120) に定義されたシグナル名
 # DBC を差し替える場合はシグナル名を合わせて更新すること
 _SPEED_SIGNAL_NAME = "Speed"
@@ -22,8 +21,9 @@ _SPEED_SIGNAL_NAME = "Speed"
 class CANReader:
     """CAN bus から車速を読み取る非同期クラス。
 
-    python-can の Bus は同期 API であるため、
-    asyncio の run_in_executor 経由でスレッドプールに委譲する。
+    can.Notifier + can.AsyncBufferedReader によるイベント駆動型受信を使用する。
+    フレームはバックグラウンドスレッドで受信されキューに積まれるため、
+    ポーリングのタイムアウトによる誤 TimeoutError が発生しない。
     """
 
     def __init__(
@@ -39,20 +39,35 @@ class CANReader:
         self._dbc_path = Path(dbc_path) if dbc_path else None
         self._bus: Any = None
         self._db: Any = None
+        self._notifier: Any = None
+        self._async_reader: Any = None
 
     async def connect(self) -> None:
         """CAN バスに接続し、DBC ファイルをロードする。"""
         import can
 
         loop = asyncio.get_event_loop()
-        self._bus = await loop.run_in_executor(
-            None,
-            lambda: can.Bus(
-                interface=self._interface,
-                channel=self._channel,
-                bitrate=self._bitrate,
-            ),
-        )
+
+        # Kvaser の一部デバイスは canSetAcceptanceFilter が未実装 (Error Code -32) のため
+        # Bus 初期化時に can.kvaser ロガーが error を出力する。機能には影響しないので抑制する。
+        _kvaser_log = logging.getLogger("can.kvaser")
+        _prev_level = _kvaser_log.level
+        _kvaser_log.setLevel(logging.CRITICAL)
+        try:
+            self._bus = await loop.run_in_executor(
+                None,
+                lambda: can.Bus(
+                    interface=self._interface,
+                    channel=self._channel,
+                    bitrate=self._bitrate,
+                    # single_handle=True: 1ハンドルで送受信を共用する。
+                    # デフォルト(False)は読み書きで別ハンドルを開くが、
+                    # usbcanII などの旧デバイスで ACK 送出が不安定になる場合がある。
+                    single_handle=True,
+                ),
+            )
+        finally:
+            _kvaser_log.setLevel(_prev_level)
 
         if self._dbc_path is not None:
             if not self._dbc_path.exists():
@@ -66,68 +81,70 @@ class CANReader:
                 "DBC ファイル未指定。read_speed() は NotImplementedError を送出します。"
             )
 
+        # イベント駆動型受信: Notifier がバックグラウンドスレッドでフレームを受け取り
+        # AsyncBufferedReader のキューに積む
+        self._async_reader = can.AsyncBufferedReader()
+        self._notifier = can.Notifier(self._bus, [self._async_reader], loop=loop)
+
         logger.info(
             "CANReader 接続完了: interface=%s channel=%d", self._interface, self._channel
         )
 
     async def close(self) -> None:
         """CAN バスを閉じる。"""
+        if self._notifier is not None:
+            self._notifier.stop()
+            self._notifier = None
         if self._bus is not None:
             bus = self._bus
+            self._bus = None
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, bus.shutdown)
-            self._bus = None
             logger.info("CANReader 切断: interface=%s", self._interface)
 
     async def read_speed(self) -> float:
-        """CAN フレームを受信し、車速 [km/h] を返す。
+        """次の Speed フレームが届くまで待機し、車速 [km/h] を返す。
 
         DBC ファイルが未指定の場合は NotImplementedError を送出する。
-        受信タイムアウト時は最後に受信した値を返す（初回はタイムアウト例外）。
+        Speed 以外の ID のフレームは読み飛ばして次を待つ。
 
         Returns:
             車速 [km/h]
 
         Raises:
             NotImplementedError: DBC ファイルが未指定
-            TimeoutError: CAN フレームを受信できなかった
+            RuntimeError: connect() 未呼び出し
         """
         if self._db is None:
             raise NotImplementedError(
                 "DBC ファイルが未指定です。CANReader に dbc_path を渡してください。"
             )
-        if self._bus is None:
+        if self._async_reader is None:
             raise RuntimeError("connect() を先に呼んでください。")
 
-        import can
+        while True:
+            msg = await self._async_reader.get_message()
 
-        bus = self._bus
-        loop = asyncio.get_event_loop()
+            if msg.is_error_frame:
+                logger.warning("エラーフレーム受信: ID=0x%X", msg.arbitration_id)
+                continue
 
-        msg: can.Message | None = await loop.run_in_executor(
-            None,
-            lambda: bus.recv(timeout=_CAN_RECV_TIMEOUT_S),
-        )
-        if msg is None:
-            raise TimeoutError("CAN フレームの受信タイムアウト")
+            try:
+                decoded = self._db.decode_message(
+                    msg.arbitration_id, msg.data, allow_truncated=True
+                )
+            except KeyError:
+                logger.debug("不明な CAN フレーム ID: 0x%X (スキップ)", msg.arbitration_id)
+                continue
+            except Exception as e:
+                logger.warning(
+                    "デコードエラー: ID=0x%X len=%d (%s)", msg.arbitration_id, len(msg.data), e
+                )
+                continue
 
-        db = self._db
-        try:
-            decoded = db.decode_message(msg.arbitration_id, msg.data, allow_truncated=True)
-        except KeyError:
-            raise ValueError(
-                f"不明な CAN フレーム ID: 0x{msg.arbitration_id:X}"
-            ) from None
-        except Exception as e:
-            raise ValueError(
-                f"デコードエラー: ID=0x{msg.arbitration_id:X} len={len(msg.data)} ({e})"
-            ) from None
+            if _SPEED_SIGNAL_NAME not in decoded:
+                continue
 
-        if _SPEED_SIGNAL_NAME not in decoded:
-            raise ValueError(
-                f"DBC に '{_SPEED_SIGNAL_NAME}' シグナルが見つかりません。"
-            )
-
-        speed: float = float(decoded[_SPEED_SIGNAL_NAME])
-        logger.debug("read_speed: %.2f km/h", speed)
-        return speed
+            speed: float = float(decoded[_SPEED_SIGNAL_NAME])
+            logger.debug("read_speed: %.2f km/h", speed)
+            return speed
