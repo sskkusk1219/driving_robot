@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
 from src.models.driving_mode import DrivingMode, SpeedPoint
 from src.web.deps import ModeRepoProtocol, get_mode_repo
@@ -41,28 +41,62 @@ def _to_detail_response(m: DrivingMode) -> ModeDetailResponse:
     )
 
 
-def _parse_csv(content: bytes) -> list[SpeedPoint]:
-    """CSV (time_s,speed_kmh) をパースして SpeedPoint リストを返す。
+import re as _re
 
-    ヘッダー行が time_s, speed_kmh であることを検証する。
+
+def _normalize_col(name: str) -> str:
+    """カラム名から記号・空白を除去して小文字化する。例: 'Time [s]' → 'times'"""
+    return _re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+_TIME_NORMS = {"times", "timesec", "timesecs", "time", "t", "elapsed", "elapseds", "ts"}
+_SPEED_NORMS = {"speedkmh", "speedkm", "speed", "vkmh", "v", "vel", "velocity", "kmh", "refspeed"}
+
+
+def _detect_columns(fieldnames: list[str]) -> tuple[str, str]:
+    """時刻列・速度列のカラム名を検出する。
+
+    正規化マッチを優先し、見つからない場合は列位置（1列目=時刻、2列目=速度）で代替する。
+    """
+    pairs = [(_normalize_col(f), f) for f in fieldnames]
+
+    time_col = next((orig for norm, orig in pairs if norm in _TIME_NORMS), None)
+    speed_col = next((orig for norm, orig in pairs if norm in _SPEED_NORMS), None)
+
+    if time_col is None and len(fieldnames) >= 1:
+        time_col = fieldnames[0]
+    if speed_col is None and len(fieldnames) >= 2:
+        speed_col = fieldnames[1]
+
+    if time_col is None or speed_col is None:
+        raise ValueError("CSV に 2 列以上のデータが必要です")
+
+    return time_col, speed_col
+
+
+def _parse_csv(content: bytes) -> list[SpeedPoint]:
+    """CSV をパースして SpeedPoint リストを返す。
+
+    カラム名は柔軟に検出する（time_s/speed_kmh 以外も可）。
     時刻の単調増加と速度の非負を検証する。
     """
     text = content.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
-    if reader.fieldnames is None or set(reader.fieldnames) < {"time_s", "speed_kmh"}:
-        raise ValueError("CSV ヘッダーに time_s, speed_kmh が必要です")
+    if not reader.fieldnames:
+        raise ValueError("CSV にヘッダー行がありません")
+    time_col, speed_col = _detect_columns(list(reader.fieldnames))
     points: list[SpeedPoint] = []
     prev_time = -1.0
     for i, row in enumerate(reader):
         try:
-            t = float(row["time_s"])
-            s = float(row["speed_kmh"])
+            t = float(row[time_col])
+            s = float(row[speed_col])
         except (KeyError, ValueError) as e:
             raise ValueError(f"行 {i + 2}: 数値変換エラー ({e})") from e
         if t <= prev_time:
-            raise ValueError(f"行 {i + 2}: time_s が単調増加していません ({t} <= {prev_time})")
+            raise ValueError(f"行 {i + 2}: 時刻列が単調増加していません ({t} <= {prev_time})")
         if s < 0:
-            raise ValueError(f"行 {i + 2}: speed_kmh が負の値です ({s})")
+            raise ValueError(f"行 {i + 2}: 速度列に負の値があります ({s})")
         points.append(SpeedPoint(time_s=t, speed_kmh=s))
         prev_time = t
     if not points:
@@ -80,8 +114,8 @@ async def list_modes(repo: ModeRepo) -> list[ModeResponse]:
 async def upload_mode(
     file: UploadFile,
     repo: ModeRepo,
-    name: str = "",
-    description: str = "",
+    name: Annotated[str, Form()] = "",
+    description: Annotated[str, Form()] = "",
 ) -> ModeResponse:
     """基準車速 CSV をアップロードして走行モードを作成する。
 

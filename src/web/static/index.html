@@ -3,167 +3,83 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>driving_robot ダッシュボード</title>
-  <link rel="stylesheet" href="/static/css/style.css" />
+  <title>Driving Robot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Patrick+Hand&family=Kalam:wght@400;700&display=swap" rel="stylesheet" />
+  <style>
+    html, body, #root { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+    body {
+      font-family: 'Patrick Hand', 'Kalam', 'Comic Sans MS', cursive;
+      background: #ece9e2;
+      color: #1f1f1f;
+      -webkit-font-smoothing: antialiased;
+    }
+    * { box-sizing: border-box; }
+    #root { display: flex; flex-direction: column; }
+
+    /* Toast notification */
+    #toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+    }
+    .toast {
+      background: #1f1f1f;
+      color: #fafaf7;
+      padding: 10px 18px;
+      border-radius: 6px;
+      font-family: 'Patrick Hand', cursive;
+      font-size: 15px;
+      box-shadow: 3px 3px 0 rgba(0,0,0,0.25);
+      animation: slideIn 0.2s ease;
+      pointer-events: auto;
+    }
+    .toast.error {
+      background: #f1d8d2;
+      color: #5e1414;
+      border: 1.5px solid #a23232;
+    }
+    .toast.success {
+      background: #dfeadc;
+      color: #22421f;
+      border: 1.5px solid #3f6b3f;
+    }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateX(20px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+  </style>
+  <!-- React 18 + ReactDOM + Babel -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin></script>
 </head>
 <body>
+  <div id="root"></div>
+  <div id="toast-container"></div>
 
-<header>
-  <h1>driving_robot</h1>
-  <span id="state-badge" class="BOOTING">BOOTING</span>
-  <span id="active-profile-badge" class="profile-badge">プロファイル未選択</span>
-</header>
-
-<main>
-
-  <!-- 車両プロファイル管理 -->
-  <div class="card">
-    <div class="card-header">
-      <h2>車両プロファイル</h2>
-      <button id="btn-new-profile" class="btn-primary btn-sm">＋ 新規作成</button>
-    </div>
-    <div id="profile-list" class="profile-list">
-      <p class="empty-msg">読み込み中...</p>
-    </div>
-  </div>
-
-  <!-- 走行制御 -->
-  <div class="card">
-    <h2>走行制御</h2>
-    <div class="btn-grid" style="margin-top:12px">
-      <button id="btn-initialize"       class="btn-primary">初期化</button>
-      <button id="btn-calibrate"        class="btn-warning">キャリブレーション</button>
-      <button id="btn-auto-start"       class="btn-success">自動走行 開始</button>
-      <button id="btn-learning-start"   class="btn-warning">学習運転 開始</button>
-      <button id="btn-stop"             class="btn-secondary">停止</button>
-      <button id="btn-manual-start"     class="btn-warning">手動操作 開始</button>
-      <button id="btn-manual-stop"      class="btn-secondary">手動操作 終了</button>
-      <button id="btn-reset-emergency"  class="btn-secondary">非常停止 リセット</button>
-      <button id="btn-emergency"        class="btn-danger">緊急停止</button>
-    </div>
-  </div>
-
-  <!-- キャリブレーション結果 -->
-  <div class="card" id="calib-result-card" style="display:none">
-    <h2>キャリブレーション結果</h2>
-    <div id="calib-result-body" class="calib-result"></div>
-  </div>
-
-  <!-- 速度表示 -->
-  <div class="row two">
-    <div class="card">
-      <h2>実車速</h2>
-      <div class="big-value"><span id="actual-speed">—</span><span class="unit">km/h</span></div>
-    </div>
-    <div class="card">
-      <h2>基準車速</h2>
-      <div class="big-value"><span id="ref-speed">—</span><span class="unit">km/h</span></div>
-    </div>
-  </div>
-
-  <!-- 開度ゲージ -->
-  <div class="row two">
-    <div class="card">
-      <h2>アクセル開度</h2>
-      <div class="gauge-wrap">
-        <progress id="accel-progress" max="100" value="0"></progress>
-        <div id="accel-label" class="gauge-label">0.0%</div>
-      </div>
-    </div>
-    <div class="card">
-      <h2>ブレーキ開度</h2>
-      <div class="gauge-wrap">
-        <progress id="brake-progress" class="brake" max="100" value="0"></progress>
-        <div id="brake-label" class="gauge-label">0.0%</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- リアルタイムグラフ -->
-  <div class="card">
-    <h2>速度グラフ　<span style="color:#ef4444">■ 基準</span>　<span style="color:#3b82f6">■ 実車速</span></h2>
-    <canvas id="speed-chart" width="800" height="200"></canvas>
-  </div>
-
-</main>
-
-<!-- プロファイル作成・編集 モーダル -->
-<div id="profile-modal" class="modal-overlay hidden">
-  <div class="modal">
-    <h3 id="modal-title">プロファイル作成</h3>
-    <form id="profile-form" autocomplete="off">
-      <input type="hidden" id="form-profile-id" />
-
-      <div class="form-group">
-        <label>プロファイル名 <span class="required">*</span></label>
-        <input type="text" id="form-name" placeholder="例: 軽自動車A" required />
-      </div>
-
-      <div class="form-row">
-        <div class="form-group">
-          <label>最大アクセル開度 (%)</label>
-          <input type="number" id="form-max-accel" min="0" max="100" step="0.1" value="80" required />
-        </div>
-        <div class="form-group">
-          <label>最大ブレーキ開度 (%)</label>
-          <input type="number" id="form-max-brake" min="0" max="100" step="0.1" value="80" required />
-        </div>
-      </div>
-
-      <div class="form-row">
-        <div class="form-group">
-          <label>最高車速 (km/h)</label>
-          <input type="number" id="form-max-speed" min="1" step="0.1" value="120" required />
-        </div>
-        <div class="form-group">
-          <label>最大減速度 (G)</label>
-          <input type="number" id="form-max-decel" min="0.01" step="0.01" value="0.3" required />
-        </div>
-      </div>
-
-      <div class="form-section-label">PIDゲイン</div>
-      <div class="form-row three">
-        <div class="form-group">
-          <label>Kp</label>
-          <input type="number" id="form-kp" step="0.01" value="1.0" required />
-        </div>
-        <div class="form-group">
-          <label>Ki</label>
-          <input type="number" id="form-ki" step="0.001" value="0.0" required />
-        </div>
-        <div class="form-group">
-          <label>Kd</label>
-          <input type="number" id="form-kd" step="0.001" value="0.0" required />
-        </div>
-      </div>
-
-      <div class="form-section-label">逸脱停止設定</div>
-      <div class="form-row">
-        <div class="form-group">
-          <label>逸脱閾値 (km/h)</label>
-          <input type="number" id="form-dev-threshold" min="0" step="0.1" value="2.0" required />
-        </div>
-        <div class="form-group">
-          <label>逸脱継続時間 (s)</label>
-          <input type="number" id="form-dev-duration" min="0" step="0.1" value="4.0" required />
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label>モデルパス (任意)</label>
-        <input type="text" id="form-model-path" placeholder="例: data/models/car_a.pkl" />
-      </div>
-    </form>
-
-    <div class="modal-footer">
-      <button id="btn-modal-cancel" class="btn-secondary">キャンセル</button>
-      <button id="btn-modal-save"   class="btn-primary">保存</button>
-    </div>
-  </div>
-</div>
-
-<div id="toast"></div>
-
-<script src="/static/js/app.js"></script>
+  <!-- UI primitives (sketch.jsx ベース) -->
+  <script type="text/babel" src="/static/js/sketch.js"></script>
+  <!-- Calibration/Manual jog components -->
+  <script type="text/babel" src="/static/js/calib-components.js"></script>
+  <!-- Screens -->
+  <script type="text/babel" src="/static/js/screens/system-states.js"></script>
+  <script type="text/babel" src="/static/js/screens/init.js"></script>
+  <script type="text/babel" src="/static/js/screens/profiles.js"></script>
+  <script type="text/babel" src="/static/js/screens/calibration.js"></script>
+  <script type="text/babel" src="/static/js/screens/modes.js"></script>
+  <script type="text/babel" src="/static/js/screens/auto-drive.js"></script>
+  <script type="text/babel" src="/static/js/screens/manual.js"></script>
+  <script type="text/babel" src="/static/js/screens/learning.js"></script>
+  <script type="text/babel" src="/static/js/screens/logs.js"></script>
+  <script type="text/babel" src="/static/js/screens/schedule-sequence.js"></script>
+  <!-- Main app -->
+  <script type="text/babel" src="/static/js/app.js"></script>
 </body>
 </html>
