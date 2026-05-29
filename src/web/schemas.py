@@ -53,6 +53,16 @@ class SelectProfileRequest(BaseModel):
     profile_id: str
 
 
+# ── UPS ──────────────────────────────────────────────────────────────────────
+
+class UPSStatusResponse(BaseModel):
+    battery_charge_pct: float
+    on_battery: bool
+    low_battery: bool
+    status_flags: str
+    is_available: bool
+
+
 # ── Realtime WebSocket ────────────────────────────────────────────────────────
 
 class RealtimeData(BaseModel):
@@ -64,6 +74,8 @@ class RealtimeData(BaseModel):
     brake_opening: float
     accel_current_ma: float
     brake_current_ma: float
+    ups_battery_pct: float | None = None
+    ups_on_battery: bool = False
 
 
 # ── Vehicle Profile ───────────────────────────────────────────────────────────
@@ -169,6 +181,11 @@ class ModeDetailResponse(BaseModel):
     total_duration: float
     max_speed: float
     created_at: datetime
+
+
+class ModeUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
 
 
 # ── Session / Log ─────────────────────────────────────────────────────────────

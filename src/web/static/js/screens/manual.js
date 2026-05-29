@@ -1,45 +1,41 @@
 // ── Manual drive screen ───────────────────────────────────
-// ManualJog: jog-based manual drive matching wireframe
 
-function AxisJog({ label, axisId, currentPos, zero, full, openingPct, maxPct, currentMa, onJog, onHome }) {
-  const { INK, INK_SOFT, INK_MUTE, PAPER, Box, Btn } = window;
-  const { JogKey, PosRuler } = window;
+function AxisJog({ label, axisId, currentPos, openingPct, maxPct, currentMa, onJog, onHome }) {
+  const { INK, INK_SOFT, PAPER, Box, Btn } = window;
+  const { JogKey, DragSlider } = window;
 
   return (
-    <Box label={label} style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 10 }}>
-      <PosRuler
-        zeroPos={zero ?? undefined}
-        fullPos={full ?? undefined}
-        currentPos={currentPos}
-        maxPulse={5000}
-      />
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <JogKey label="−10" hint="Shift+←" onClick={() => onJog(axisId, -10)} />
-        <JogKey label="−1"  hint="←"       onClick={() => onJog(axisId, -1)} />
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1 }}>
-          <div style={{ fontSize: 12, color: INK_SOFT }}>現在位置</div>
-          <div style={{ fontSize: 32, fontFamily: 'monospace', fontWeight: 800, lineHeight: 1 }}>{currentPos}</div>
-          <div style={{ fontSize: 11, color: INK_SOFT }}>pulse</div>
+    <Box label={label} style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minHeight: 0 }}>
+
+      {/* Jog buttons + drag slider */}
+      <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
+        {/* Left buttons */}
+        <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
+          <JogKey label="−10" hint="Shift+←" onClick={() => onJog(axisId, -10)} />
+          <JogKey label="−1"  hint="←"       onClick={() => onJog(axisId, -1)} />
         </div>
-        <JogKey label="+1"  hint="→"       onClick={() => onJog(axisId, 1)} />
-        <JogKey label="+10" hint="Shift+→" onClick={() => onJog(axisId, 10)} />
+
+        <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} />
+
+        {/* Right buttons */}
+        <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
+          <JogKey label="+1"  hint="→"       onClick={() => onJog(axisId, 1)} />
+          <JogKey label="+10" hint="Shift+→" onClick={() => onJog(axisId, 10)} />
+        </div>
       </div>
+
       {/* Opening bar */}
       <div>
-        <div style={{
-          display: 'flex', justifyContent: 'space-between',
-          fontSize: 11, color: INK_SOFT, marginBottom: 3, fontFamily: 'monospace',
-        }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: INK_SOFT, marginBottom: 3, fontFamily: 'monospace' }}>
           <span>0 %</span><span>50</span><span>100 % (max {maxPct})</span>
         </div>
-        <div style={{ height: 14, border: `1.4px solid ${INK}`, position: 'relative', background: PAPER }}>
-          <div style={{
-            position: 'absolute', left: 0, top: 0, bottom: 0,
-            width: `${openingPct}%`, background: INK, opacity: 0.82,
-          }} />
+        <div style={{ height: 13, border: `1.4px solid ${INK}`, position: 'relative', background: PAPER }}>
+          <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${openingPct}%`, background: INK, opacity: 0.82 }} />
         </div>
       </div>
-      <div style={{ display: 'flex', gap: 14, fontSize: 13, color: INK_SOFT, alignItems: 'center' }}>
+
+      {/* Info + home */}
+      <div style={{ display: 'flex', gap: 12, fontSize: 12, color: INK_SOFT, alignItems: 'center' }}>
         <span>開度 <b style={{ fontFamily: 'monospace', color: INK }}>{openingPct.toFixed(1)} %</b></span>
         <span>電流 <b style={{ fontFamily: 'monospace', color: INK }}>{currentMa} mA</b></span>
         <div style={{ flex: 1 }} />
@@ -51,8 +47,8 @@ function AxisJog({ label, axisId, currentPos, zero, full, openingPct, maxPct, cu
 
 function ManualScreen() {
   const { useState, useContext } = React;
-  const { apiFetch, realtimeData } = useContext(window.AppContext);
-  const { INK_SOFT, PAPER_2, Box, Btn, Note, Row } = window;
+  const { apiFetch, realtimeData, robotState } = useContext(window.AppContext);
+  const { Box, Btn, Note, Row } = window;
   const { ConfirmStopPopup } = window;
 
   const [brk, setBrk] = useState({ currentPos: 0 });
@@ -77,6 +73,11 @@ function ManualScreen() {
     window.showToast('原点へ戻しました', 'success');
   }
 
+  async function handleStart() {
+    const r = await apiFetch('POST', '/api/v1/drive/manual/start');
+    if (r) window.showToast('手動運転を開始しました', 'success');
+  }
+
   async function handleStop() {
     const r = await apiFetch('POST', '/api/v1/drive/manual/stop');
     if (r) {
@@ -85,7 +86,6 @@ function ManualScreen() {
     }
   }
 
-  // Derive opening % from calibration data in realtimeData if available, else 0
   const brkOpeningPct = realtimeData.brake_opening ?? 0;
   const accOpeningPct = realtimeData.accel_opening ?? 0;
   const brkMa = realtimeData.brake_current_ma ?? 0;
@@ -94,52 +94,46 @@ function ManualScreen() {
   return (
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 10, flex: 1, minHeight: 0 }}>
 
-      {/* 2×2 grid */}
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: '1fr 1fr',
-        gridTemplateRows: '1fr auto',
-        gap: 10,
-        flex: 1,
-        minHeight: 0,
-      }}>
+      {/* Top: axis panels (fill remaining height) */}
+      <div style={{ display: 'flex', gap: 10, flex: 1, minHeight: 0 }}>
         <AxisJog
           label="ブレーキ" axisId="brake"
           currentPos={brk.currentPos}
-          zero={realtimeData.brake_zero ?? null}
-          full={realtimeData.brake_full ?? null}
           openingPct={brkOpeningPct} maxPct={70} currentMa={brkMa}
           onJog={handleJog} onHome={handleHome}
         />
         <AxisJog
           label="アクセル" axisId="accel"
           currentPos={acc.currentPos}
-          zero={realtimeData.accel_zero ?? null}
-          full={realtimeData.accel_full ?? null}
           openingPct={accOpeningPct} maxPct={80} currentMa={accMa}
           onJog={handleJog} onHome={handleHome}
         />
+      </div>
 
-        {/* Lower left: keyboard shortcuts */}
-        <Box label="キーボードショートカット" style={{ padding: 12 }}>
-          <div style={{ fontSize: 13, lineHeight: 1.9, fontFamily: 'monospace' }}>
+      {/* Bottom: shortcuts | status + button */}
+      <div style={{ display: 'flex', gap: 10 }}>
+        <Box label="キーボードショートカット" style={{ padding: '10px 12px', flex: 1 }}>
+          <div style={{ fontSize: 12, lineHeight: 1.7, fontFamily: 'monospace' }}>
             <div>← / →        : ±1 pulse</div>
             <div>Shift+← / →  : ±10 pulse</div>
             <div>Tab           : 軸切替 (アクセル ↔ ブレーキ)</div>
             <div>Esc           : 手動運転終了</div>
           </div>
-          <Note style={{ marginTop: 8 }}>ジョグ中は最大開度リミットが有効です。電流値を常時監視中。</Note>
+          <Note style={{ marginTop: 6 }}>ジョグ中は最大開度リミットが有効です。電流値を常時監視中。</Note>
         </Box>
 
-        {/* Lower right: status + stop button */}
-        <div style={{ display: 'flex', gap: 10, alignItems: 'stretch' }}>
+        <div style={{ display: 'flex', gap: 10, flex: 1 }}>
           <Box style={{ padding: '10px 14px', fontSize: 13, flex: 1 }}>
             <Row cells={[['実車速',       '1.4fr'], [`${(realtimeData.actual_speed_kmh ?? 0).toFixed(1)} km/h`, '1fr', 'mono']]} />
             <Row cells={[['ブレーキ pos', '1.4fr'], [`${brk.currentPos} pulse`, '1fr', 'mono']]} />
             <Row cells={[['アクセル pos', '1.4fr'], [`${acc.currentPos} pulse`, '1fr', 'mono']]} />
           </Box>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
-            <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 運転終了</Btn>
+          <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
+            {robotState === 'RUNNING' ? (
+              <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 運転終了</Btn>
+            ) : (
+              <Btn big style={{ flex: 1, borderColor: '#3f6b3f', background: '#dfeadc', color: '#22421f' }} onClick={handleStart}>▶ 走行開始</Btn>
+            )}
           </div>
         </div>
       </div>

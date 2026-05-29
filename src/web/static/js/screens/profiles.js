@@ -3,7 +3,7 @@
 function ProfilesScreen() {
   const { useState, useEffect, useContext } = React;
   const { apiFetch, activeProfileId, setActiveProfileId, setActiveProfileName, setNav } = useContext(window.AppContext);
-  const { INK, INK_SOFT, INK_MUTE, PAPER, PAPER_2, HATCH, Box, Btn, Pill, H2, Row } = window;
+  const { INK, INK_SOFT, INK_MUTE, PAPER, PAPER_2, HATCH, Box, Btn, Pill, H2, Row, RowActions } = window;
 
   const [profiles, setProfiles] = useState([]);
   const [mode, setMode] = useState('list'); // list | create | edit
@@ -11,6 +11,8 @@ function ProfilesScreen() {
   const [search, setSearch] = useState('');
   const [sortKey, setSortKey] = useState(null);  // 'name' | 'max_speed'
   const [sortAsc, setSortAsc] = useState(true);
+  const [editingNameId, setEditingNameId] = useState(null);
+  const [editingNameValue, setEditingNameValue] = useState('');
 
   useEffect(() => { loadProfiles(); }, []);
 
@@ -26,6 +28,50 @@ function ProfilesScreen() {
     setActiveProfileName(p.name);
     window.showToast(`「${p.name}」を選択しました`, 'success');
     loadProfiles();
+  }
+
+  function startEditName(p) {
+    setEditingNameId(p.id);
+    setEditingNameValue(p.name);
+  }
+
+  function cancelEditName() {
+    setEditingNameId(null);
+    setEditingNameValue('');
+  }
+
+  async function handleSaveName(p) {
+    const trimmed = editingNameValue.trim();
+    if (!trimmed) { window.showToast('プロファイル名を入力してください', 'error'); return; }
+    if (trimmed === p.name) { cancelEditName(); return; }
+    const r = await apiFetch('PUT', `/api/v1/profiles/${p.id}`, { name: trimmed });
+    if (r) {
+      window.showToast('名前を更新しました', 'success');
+      setEditingNameId(null);
+      setEditingNameValue('');
+      loadProfiles();
+    }
+  }
+
+  async function handleCopy(p) {
+    const payload = {
+      name: `${p.name} のコピー`,
+      max_accel_opening: p.max_accel_opening,
+      max_brake_opening: p.max_brake_opening,
+      max_speed: p.max_speed,
+      max_decel_g: p.max_decel_g,
+      pid_gains: { kp: p.pid_gains?.kp ?? 1.0, ki: p.pid_gains?.ki ?? 0.0, kd: p.pid_gains?.kd ?? 0.0 },
+      stop_config: {
+        deviation_threshold_kmh: p.stop_config?.deviation_threshold_kmh ?? 2.0,
+        deviation_duration_s: p.stop_config?.deviation_duration_s ?? 4.0,
+      },
+      model_path: null,
+    };
+    const r = await apiFetch('POST', '/api/v1/profiles/', payload);
+    if (r) {
+      window.showToast(`「${r.name}」を作成しました`, 'success');
+      loadProfiles();
+    }
   }
 
   async function handleDelete(p) {
@@ -46,8 +92,6 @@ function ProfilesScreen() {
         if (r) { window.showToast(`「${r.name}」を作成しました`, 'success'); setMode('list'); loadProfiles(); }
       },
       onCancel: () => setMode('list'),
-      onGoCalib: () => setNav('calibration'),
-      onGoLearning: () => setNav('learning'),
     });
   }
 
@@ -60,8 +104,6 @@ function ProfilesScreen() {
       },
       onCancel: () => { setMode('list'); setEditTarget(null); },
       onDelete: () => handleDelete(editTarget),
-      onGoCalib: () => setNav('calibration'),
-      onGoLearning: () => setNav('learning'),
     });
   }
 
@@ -104,7 +146,7 @@ function ProfilesScreen() {
           width: 200,
         },
       }),
-      React.createElement(Btn, { primary: true, big: true, onClick: () => setMode('create') }, '+ 新規プロファイル'),
+      React.createElement(Btn, { primary: true, big: true, onClick: () => setMode('create') }, '＋ 新規作成'),
     ),
 
     // Table
@@ -113,14 +155,13 @@ function ProfilesScreen() {
       React.createElement('div', {
         style: {
           display: 'grid',
-          gridTemplateColumns: '40px 2fr 1.4fr 1fr 1.4fr 0.7fr 0.7fr 1fr',
+          gridTemplateColumns: '2fr 1.4fr 1fr 1.4fr 0.7fr 0.7fr 2fr',
           borderBottom: `1px solid ${INK}`,
           padding: '10px 14px',
           background: PAPER_2,
           fontSize: 14, fontWeight: 700,
         },
       },
-        React.createElement('div', null, ''),
         React.createElement('div', {
           onClick: () => handleSortClick('name'),
           style: { cursor: 'pointer', userSelect: 'none' },
@@ -152,8 +193,42 @@ function ProfilesScreen() {
             return React.createElement(Row, {
               key: p.id,
               cells: [
-                [isActive ? '●' : '', '40px'],
-                [React.createElement('b', { key: 'n' }, p.name), '2fr'],
+                [editingNameId === p.id
+                  ? React.createElement('div', { key: 'ne', style: { display: 'flex', gap: 4, alignItems: 'center' } },
+                      React.createElement('input', {
+                        autoFocus: true,
+                        value: editingNameValue,
+                        onChange: e => setEditingNameValue(e.target.value),
+                        onKeyDown: e => {
+                          if (e.key === 'Enter') handleSaveName(p);
+                          if (e.key === 'Escape') cancelEditName();
+                        },
+                        style: {
+                          fontSize: 14, padding: '2px 6px',
+                          border: `1.3px solid ${INK}`, borderRadius: 3,
+                          fontFamily: 'inherit', width: '100%',
+                        },
+                      }),
+                      React.createElement('span', {
+                        onClick: () => handleSaveName(p),
+                        title: '保存',
+                        style: { cursor: 'pointer', fontSize: 16, userSelect: 'none' },
+                      }, '✓'),
+                      React.createElement('span', {
+                        onClick: cancelEditName,
+                        title: 'キャンセル',
+                        style: { cursor: 'pointer', fontSize: 16, userSelect: 'none' },
+                      }, '✗'),
+                    )
+                  : React.createElement('div', { key: 'n', style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                      React.createElement('b', null, p.name),
+                      React.createElement('span', {
+                        onClick: () => startEditName(p),
+                        title: '名前を変更',
+                        style: { cursor: 'pointer', opacity: 0.5, fontSize: 13, userSelect: 'none' },
+                      }, '✎'),
+                    ),
+                  '2fr'],
                 [`${p.max_accel_opening} / ${p.max_brake_opening} %`, '1.4fr', 'mono'],
                 [`${p.max_speed} km/h`, '1fr', 'mono'],
                 [`${kp} / ${ki} / ${kd}`, '1.4fr', 'mono'],
@@ -165,10 +240,14 @@ function ProfilesScreen() {
                   ? React.createElement(Pill, { key: 'm', accent: 'READY' }, 'あり')
                   : React.createElement(Pill, { key: 'm' }, 'なし'),
                   '0.7fr'],
-                [React.createElement('div', { key: 'b', style: { display: 'flex', gap: 6 } },
-                  !isActive && React.createElement(Btn, { onClick: () => handleSelect(p) }, '選択'),
-                  React.createElement(Btn, { onClick: () => { setEditTarget(p); setMode('edit'); } }, '編集'),
-                ), '1fr'],
+                [React.createElement(RowActions, {
+                  key: 'b',
+                  isActive,
+                  onSelect: () => handleSelect(p),
+                  onEdit:   () => { setEditTarget(p); setMode('edit'); },
+                  onCopy:   () => handleCopy(p),
+                  onDelete: () => handleDelete(p),
+                }), '2fr'],
               ],
               style: {
                 padding: '12px 14px',
@@ -193,9 +272,9 @@ function ProfilesScreen() {
 }
 
 // ── ProfileForm — 新規作成・編集共用 ────────────────────────────
-function ProfileForm({ initial, onSave, onCancel, onDelete, onGoCalib, onGoLearning }) {
+function ProfileForm({ initial, onSave, onCancel, onDelete }) {
   const { useState } = React;
-  const { INK_SOFT, INK_MUTE, Box, Btn, H2, Input, Row, Note, Hatch } = window;
+  const { INK, INK_SOFT, INK_MUTE, Box, Btn, H2, Input, Row } = window;
   const isEdit = !!initial;
 
   const [form, setForm] = useState({
@@ -247,14 +326,12 @@ function ProfileForm({ initial, onSave, onCancel, onDelete, onGoCalib, onGoLearn
   const calibDate = calib?.calibrated_at
     ? new Date(calib.calibrated_at).toLocaleString('ja-JP')
     : null;
-  const accelZero   = calib?.accel_zero ?? '—';
-  const accelFull   = calib?.accel_full ?? '—';
-  const accelStroke = (typeof calib?.accel_zero === 'number' && typeof calib?.accel_full === 'number')
-    ? calib.accel_full - calib.accel_zero : '—';
-  const brakeZero   = calib?.brake_zero ?? '—';
-  const brakeFull   = calib?.brake_full ?? '—';
-  const brakeStroke = (typeof calib?.brake_zero === 'number' && typeof calib?.brake_full === 'number')
-    ? calib.brake_full - calib.brake_zero : '—';
+  const accelZero   = calib?.accel_zero_pos ?? '—';
+  const accelFull   = calib?.accel_full_pos ?? '—';
+  const accelStroke = calib?.accel_stroke ?? '—';
+  const brakeZero   = calib?.brake_zero_pos ?? '—';
+  const brakeFull   = calib?.brake_full_pos ?? '—';
+  const brakeStroke = calib?.brake_stroke ?? '—';
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, height: '100%' } },
 
@@ -268,7 +345,7 @@ function ProfileForm({ initial, onSave, onCancel, onDelete, onGoCalib, onGoLearn
 
     // 2-column body
     React.createElement('div', {
-      style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, flex: 1, minHeight: 0, overflow: 'auto' }
+      style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, flex: 1, minHeight: 0, overflow: 'auto', paddingTop: 12 }
     },
 
       // ── Left column ──────────────────────────────────────
@@ -309,16 +386,9 @@ function ProfileForm({ initial, onSave, onCancel, onDelete, onGoCalib, onGoLearn
       React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
 
         // キャリブレーションデータ
-        React.createElement(Box, { label: 'キャリブレーションデータ', style: { padding: 18 } },
-          !isEdit || !calib?.is_valid
-            ? React.createElement('div', null,
-                React.createElement('div', { style: { fontSize: 14, color: INK_SOFT, lineHeight: 1.8, marginBottom: 10 } },
-                  isEdit
-                    ? 'キャリブレーションが未実施です。キャリブレーション画面でゼロ/フル位置を設定してください。'
-                    : 'プロファイル保存後にキャリブレーション画面でゼロ/フル位置を設定してください。'
-                ),
-                React.createElement(Btn, { onClick: onGoCalib }, 'キャリブレーション画面へ →'),
-              )
+        React.createElement(Box, { label: 'キャリブレーションデータ', style: { padding: 18, flex: 1 } },
+          (!isEdit || !calib?.is_valid)
+            ? React.createElement('div', { style: { fontSize: 14, color: INK_SOFT } }, '未実施')
             : React.createElement('div', null,
                 React.createElement(Row, {
                   cells: [['', '1fr'], ['ZERO', '1fr', 'mono'], ['FULL', '1fr', 'mono'], ['STROKE', '1fr', 'mono']],
@@ -343,48 +413,25 @@ function ProfileForm({ initial, onSave, onCancel, onDelete, onGoCalib, onGoLearn
                 calibDate && React.createElement('div', { style: { fontSize: 12, color: INK_SOFT, marginTop: 6 } },
                   `校正日: ${calibDate}`
                 ),
-                React.createElement('div', { style: { marginTop: 10 } },
-                  React.createElement(Btn, { onClick: onGoCalib }, 'キャリブレーション画面へ →'),
-                ),
               ),
         ),
 
         // 運転モデル
-        React.createElement(Box, { label: '運転モデル', style: { padding: 18 } },
-          !isEdit || !initial?.model_path
-            ? React.createElement('div', null,
-                React.createElement('div', { style: { fontSize: 14, color: INK_SOFT, lineHeight: 1.8, marginBottom: 10 } },
-                  isEdit
-                    ? 'モデルがありません。学習運転を行いモデルを取得してください。'
-                    : 'キャリブレーション完了後に学習運転を行いモデルを取得してください。'
-                ),
-                React.createElement(Btn, { onClick: onGoLearning }, '学習運転画面へ →'),
-              )
-            : React.createElement('div', null,
-                React.createElement(Hatch, { width: '100%', height: 110, label: 'learned model heatmap (speed × accel)' }),
-                React.createElement('div', { style: { fontSize: 12, color: INK_SOFT, marginTop: 6 } },
-                  initial.model_path,
-                ),
-                React.createElement('div', { style: { marginTop: 10 } },
-                  React.createElement(Btn, { onClick: onGoLearning }, '学習運転画面へ →'),
-                ),
+        React.createElement(Box, { label: '運転モデル', style: { padding: 18, flex: 1 } },
+          (!isEdit || !initial?.model_path)
+            ? React.createElement('div', { style: { fontSize: 14, color: INK_SOFT } }, '未実施')
+            : React.createElement('div', { style: { fontSize: 13, color: INK_SOFT, fontFamily: 'monospace', wordBreak: 'break-all' } },
+                initial.model_path,
               ),
         ),
-
-        // Note
-        React.createElement(Note, null,
-          isEdit
-            ? 'PIDゲイン変更後は自動走行の動作を確認してください。キャリブレーションデータは保持されます。'
-            : 'プロファイル保存後、キャリブレーション → 学習運転の順で設定を完了させてください。'
-        ),
-
-        // Action buttons (right-aligned)
-        React.createElement('div', { style: { display: 'flex', gap: 12, justifyContent: 'flex-end', marginTop: 'auto' } },
-          isEdit && React.createElement(Btn, { danger: true, onClick: onDelete }, '削除'),
-          React.createElement(Btn, { onClick: onCancel }, 'キャンセル'),
-          React.createElement(Btn, { primary: true, big: true, onClick: handleSave }, isEdit ? '保存' : '作成'),
-        ),
       ),
+    ),
+
+    // Action buttons (outside grid)
+    React.createElement('div', { style: { display: 'flex', gap: 12, justifyContent: 'flex-end' } },
+      isEdit && React.createElement(Btn, { danger: true, onClick: onDelete }, '削除'),
+      React.createElement(Btn, { onClick: onCancel }, 'キャンセル'),
+      React.createElement(Btn, { primary: true, big: true, onClick: handleSave }, isEdit ? '保存' : '作成'),
     ),
   );
 }

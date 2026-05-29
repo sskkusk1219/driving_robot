@@ -73,6 +73,18 @@ async def broadcast_loop(app: Starlette) -> None:
             accel_current = 0.0
             brake_current = 0.0
         accel_opening, brake_opening = controller.current_openings
+
+        ups_battery_pct: float | None = None
+        ups_on_battery: bool = False
+        try:
+            ups_monitor = app.state.ups_monitor
+            ups_status = await ups_monitor.get_status()
+            if ups_status.is_available:
+                ups_battery_pct = ups_status.battery_charge_pct
+                ups_on_battery = ups_status.on_battery
+        except Exception as exc:
+            logger.debug("UPS 状態取得失敗: %s", exc)
+
         data = RealtimeData(
             timestamp=datetime.now(tz=UTC).isoformat(),
             robot_state=RobotState(state.robot_state),
@@ -82,5 +94,7 @@ async def broadcast_loop(app: Starlette) -> None:
             brake_opening=brake_opening,
             accel_current_ma=accel_current,
             brake_current_ma=brake_current,
+            ups_battery_pct=ups_battery_pct,
+            ups_on_battery=ups_on_battery,
         )
         await manager.broadcast(data.model_dump_json())

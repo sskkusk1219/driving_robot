@@ -80,6 +80,30 @@ class ModeRepository:
             created_at=mode.created_at,
         )
 
+    async def update(self, mode: DrivingMode) -> DrivingMode | None:
+        """走行モードを更新する。存在しない場合は None。"""
+        ref_speed_json = json.dumps(
+            [{"time_s": p.time_s, "speed_kmh": p.speed_kmh} for p in mode.reference_speed]
+        )
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE driving_modes
+                SET name = $1, description = $2, reference_speed = $3::jsonb,
+                    total_duration = $4, max_speed = $5
+                WHERE id = $6
+                """,
+                mode.name,
+                mode.description,
+                ref_speed_json,
+                mode.total_duration,
+                mode.max_speed,
+                uuid.UUID(mode.id),
+            )
+        if str(result) == "UPDATE 0":
+            return None
+        return mode
+
     async def delete(self, mode_id: str) -> bool:
         """走行モードを削除する。削除できた場合 True。"""
         async with self._pool.acquire() as conn:

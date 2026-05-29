@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
 from src.models.driving_mode import DrivingMode, SpeedPoint
 from src.web.deps import ModeRepoProtocol, get_mode_repo
-from src.web.schemas import ModeDetailResponse, ModeResponse, SpeedPointSchema
+from src.web.schemas import ModeDetailResponse, ModeResponse, ModeUpdateRequest, SpeedPointSchema
 
 router = APIRouter(prefix="/api/v1/modes", tags=["modes"])
 
@@ -161,6 +161,70 @@ async def get_mode(mode_id: str, repo: ModeRepo) -> ModeDetailResponse:
     if mode is None:
         raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
     return _to_detail_response(mode)
+
+
+@router.put("/{mode_id}", response_model=ModeResponse)
+async def replace_mode(
+    mode_id: str,
+    repo: ModeRepo,
+    file: UploadFile,
+    name: Annotated[str, Form()] = "",
+    description: Annotated[str, Form()] = "",
+) -> ModeResponse:
+    """基準車速 CSV を再アップロードして走行モードを差し替える。"""
+    try:
+        existing = await repo.get_by_id(mode_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="mode_id が UUID 形式ではありません")
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
+
+    _MAX_CSV_BYTES = 10 * 1024 * 1024
+    content = await file.read()
+    if len(content) > _MAX_CSV_BYTES:
+        raise HTTPException(status_code=413, detail="CSV ファイルが大きすぎます（上限 10MB）")
+    try:
+        points = _parse_csv(content)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    mode_name = name.strip() or existing.name
+    merged = DrivingMode(
+        id=existing.id,
+        name=mode_name,
+        description=description.strip() if description.strip() else existing.description,
+        reference_speed=points,
+        total_duration=points[-1].time_s,
+        max_speed=max(p.speed_kmh for p in points),
+        created_at=existing.created_at,
+    )
+    updated = await repo.update(merged)
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
+    return _to_response(updated)
+
+
+@router.patch("/{mode_id}", response_model=ModeResponse)
+async def update_mode(mode_id: str, req: ModeUpdateRequest, repo: ModeRepo) -> ModeResponse:
+    try:
+        existing = await repo.get_by_id(mode_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="mode_id が UUID 形式ではありません")
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
+    merged = DrivingMode(
+        id=existing.id,
+        name=req.name if req.name is not None else existing.name,
+        description=req.description if req.description is not None else existing.description,
+        reference_speed=existing.reference_speed,
+        total_duration=existing.total_duration,
+        max_speed=existing.max_speed,
+        created_at=existing.created_at,
+    )
+    updated = await repo.update(merged)
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
+    return _to_response(updated)
 
 
 @router.delete("/{mode_id}", status_code=204)

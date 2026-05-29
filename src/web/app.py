@@ -13,19 +13,11 @@ from src.app.stubs import (
     InMemoryModeRepository,
     InMemoryProfileRepository,
     InMemorySessionRepository,
+    _StubUPSMonitor,
     build_stub_controller,
 )
-from src.web.routers import drive, modes, profiles, sessions
+from src.web.routers import drive, modes, profiles, sessions, ups
 from src.web.ws import broadcast_loop, realtime_ws
-
-
-async def _build_controller() -> RobotController:
-    if os.environ.get("DRIVING_ROBOT_USE_REAL_HW") == "1":
-        from src.app.factory import build_real_controller  # noqa: PLC0415
-        from src.infra.settings import load_settings  # noqa: PLC0415
-
-        return await build_real_controller(load_settings())
-    return build_stub_controller()
 
 
 async def _build_repos(app: FastAPI) -> None:
@@ -52,9 +44,21 @@ async def _build_repos(app: FastAPI) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _build_repos(app)
-    controller = await _build_controller()
+
+    if os.environ.get("DRIVING_ROBOT_USE_REAL_HW") == "1":
+        from src.app.factory import build_real_controller  # noqa: PLC0415
+        from src.infra.settings import load_settings  # noqa: PLC0415
+
+        controller, ups_monitor = await build_real_controller(load_settings())
+        await ups_monitor.start_polling()
+    else:
+        controller = build_stub_controller()
+        ups_monitor = _StubUPSMonitor()
+
     await controller.start()
     app.state.controller = controller
+    app.state.ups_monitor = ups_monitor
+
     task = asyncio.create_task(broadcast_loop(app))
     try:
         yield
@@ -65,6 +69,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except asyncio.CancelledError:
             pass
         await controller.shutdown()
+        await ups_monitor.stop_polling()
         if app.state.db_pool is not None:
             await app.state.db_pool.close()
 
@@ -80,6 +85,7 @@ app.include_router(drive.router)
 app.include_router(profiles.router)
 app.include_router(modes.router)
 app.include_router(sessions.router)
+app.include_router(ups.router)
 
 _static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")

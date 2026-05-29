@@ -97,6 +97,8 @@ class CalibrationManagerProtocol(Protocol):
 class PreCheckRunnerProtocol(Protocol):
     async def run(self) -> PreCheckResult: ...
 
+    def set_profile(self, profile: VehicleProfile | None) -> None: ...
+
 
 class LearningDriveManagerProtocol(Protocol):
     """学習走行マネージャーの最低限のプロトコル（将来拡張用）。"""
@@ -175,6 +177,8 @@ class RobotController:
                 f"select_profile は STANDBY/READY 状態でのみ呼べます (現在: {self._state})"
             )
         self._active_profile = profile
+        if self._pre_check_runner is not None:
+            self._pre_check_runner.set_profile(profile)
 
     def get_active_profile(self) -> VehicleProfile | None:
         """現在選択中のプロファイルを返す。未選択の場合は None。"""

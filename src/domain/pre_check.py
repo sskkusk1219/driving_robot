@@ -48,6 +48,10 @@ class PreCheckRunner:
         self._tolerance = home_position_tolerance_pulse
         self._ups_min = ups_min_battery_pct
 
+    def set_profile(self, profile: VehicleProfile | None) -> None:
+        """アクティブプロファイルを更新する。RobotController.select_profile() から呼ばれる。"""
+        self._profile = profile
+
     async def run(self) -> PreCheckResult:
         """全6項目をチェックし結果を返す。いずれか1項目でも NG なら passed=False。"""
         items = [

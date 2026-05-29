@@ -25,11 +25,23 @@ dbc_path = "config/can/MEIDEN_MEIDACS.dbc"
 dsn = "postgresql://localhost/driving_robot"
 
 [gpio]
-# AC UPS 接点出力 → AC断検知ピン（BCM番号、物理ピン13）
-# ⚠️ TBD: AC UPS 機種確定後に更新すること
+# AC断検知ピン（BCM番号）
+# APC Smart-UPS 750 はシリアル経由の NUT で AC断を検知するため、このピンは使用しない。
+# 別機種で接点出力を使う場合に設定する（factory.py の GPIOMonitor に渡されるが登録されない）
 ac_detect_pin = 27
 # 非常停止スイッチ入力ピン（BCM番号、物理ピン11）
 emergency_stop_pin = 17
+
+[ups]
+# NUT (Network UPS Tools) サーバーのホスト名
+# 通常は localhost（Raspberry Pi 上で upsd を実行）
+nut_host = "localhost"
+# NUT サーバーのポート番号（デフォルト 3493）
+nut_port = 3493
+# NUT での UPS 名（/etc/nut/ups.conf の [] 内の名前と一致させること）
+ups_name = "apcups"
+# バッテリー状態ポーリング間隔 [s]（AC断検知の応答時間に影響）
+poll_interval_s = 5.0
 
 [archive]
 # アーカイブ先 USB SSD のマウントパス

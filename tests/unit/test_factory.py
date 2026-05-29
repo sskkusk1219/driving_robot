@@ -50,13 +50,13 @@ class TestBuildRealController:
             patch("src.app.factory.CANReader"),
             patch("src.app.factory.GPIOMonitor") as mock_gpio,
             patch("src.app.factory.SafetyMonitor"),
+            patch("src.app.factory.NutUPSMonitor"),
             patch("src.app.factory.create_pool", new_callable=AsyncMock),
             patch("src.app.factory.ProfileRepository"),
         ):
             mock_gpio.return_value.register_emergency_callback = MagicMock()
-            mock_gpio.return_value.register_ac_loss_callback = MagicMock()
             mock_actuator.return_value = MagicMock()
-            ctrl = await build_real_controller(settings)
+            ctrl, _ = await build_real_controller(settings)
 
         assert isinstance(ctrl, RobotController)
 
@@ -149,35 +149,41 @@ class TestBuildRealController:
             patch("src.app.factory.CANReader"),
             patch("src.app.factory.GPIOMonitor") as mock_gpio_cls,
             patch("src.app.factory.SafetyMonitor"),
+            patch("src.app.factory.NutUPSMonitor"),
             patch("src.app.factory.create_pool", new_callable=AsyncMock),
             patch("src.app.factory.ProfileRepository"),
         ):
             mock_gpio = MagicMock()
             mock_gpio_cls.return_value = mock_gpio
-            ctrl = await build_real_controller(settings)
+            ctrl, _ = await build_real_controller(settings)
 
         mock_gpio.register_emergency_callback.assert_called_once_with(
             ctrl.emergency_stop
         )
 
     @pytest.mark.asyncio
-    async def test_gpio_ac_loss_callback_registered_to_safety_monitor(self) -> None:
+    async def test_nut_ac_loss_callback_registered_to_safety_monitor(self) -> None:
+        """NutUPSMonitor の AC断コールバックが SafetyMonitor.handle_ac_power_loss に配線されること。
+        APC Smart-UPS 750 は NC/NO 接点なし → GPIO ではなく NUT ポーリングで AC断を検知する。
+        """
         settings = make_settings()
         with (
             patch("src.app.factory.ActuatorDriver"),
             patch("src.app.factory.CANReader"),
             patch("src.app.factory.GPIOMonitor") as mock_gpio_cls,
             patch("src.app.factory.SafetyMonitor") as mock_monitor_cls,
+            patch("src.app.factory.NutUPSMonitor") as mock_ups_cls,
             patch("src.app.factory.create_pool", new_callable=AsyncMock),
             patch("src.app.factory.ProfileRepository"),
         ):
-            mock_gpio = MagicMock()
-            mock_gpio_cls.return_value = mock_gpio
+            mock_gpio_cls.return_value = MagicMock()
             mock_monitor = MagicMock()
             mock_monitor_cls.return_value = mock_monitor
+            mock_ups_monitor = MagicMock()
+            mock_ups_cls.return_value = mock_ups_monitor
             await build_real_controller(settings)
 
-        mock_gpio.register_ac_loss_callback.assert_called_once_with(
+        mock_ups_monitor.register_ac_loss_callback.assert_called_once_with(
             mock_monitor.handle_ac_power_loss
         )
 
@@ -262,12 +268,12 @@ class TestBuildRealController:
             patch("src.app.factory.ActuatorDriver"),
             patch("src.app.factory.CANReader"),
             patch("src.app.factory.GPIOMonitor") as mock_gpio,
+            patch("src.app.factory.NutUPSMonitor"),
             patch("src.app.factory.create_pool", new_callable=AsyncMock),
             patch("src.app.factory.ProfileRepository"),
         ):
             mock_gpio.return_value.register_emergency_callback = MagicMock()
-            mock_gpio.return_value.register_ac_loss_callback = MagicMock()
-            ctrl = await build_real_controller(settings)
+            ctrl, _ = await build_real_controller(settings)
 
         assert ctrl._safety_check is not None
         assert isinstance(ctrl._safety_check, SafetyMonitor)
@@ -281,12 +287,12 @@ class TestBuildRealController:
             patch("src.app.factory.ActuatorDriver"),
             patch("src.app.factory.CANReader"),
             patch("src.app.factory.GPIOMonitor") as mock_gpio,
+            patch("src.app.factory.NutUPSMonitor"),
             patch("src.app.factory.create_pool", new_callable=AsyncMock),
             patch("src.app.factory.ProfileRepository"),
         ):
             mock_gpio.return_value.register_emergency_callback = MagicMock()
-            mock_gpio.return_value.register_ac_loss_callback = MagicMock()
-            ctrl = await build_real_controller(settings)
+            ctrl, _ = await build_real_controller(settings)
 
         assert isinstance(ctrl._safety_check, SafetyMonitor)
         assert ctrl._safety_check._overcurrent_limit_ma == 1500.0

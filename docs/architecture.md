@@ -264,11 +264,12 @@ Raspberry Pi 5 (16GB)
 ├── GPIO17 (IN)    →  非常停止スイッチ #1 (シャシダイナモ室)  ← 物理ピン11、NC接点、プルアップ、HIGH=停止（RISING検知）
 │                   →  非常停止スイッチ #2 (操作エリア)  ← 並列接続
 │                      LOW=通常（NC接点閉→GND）、HIGH=停止（NC接点開→プルアップ有効、断線時も停止）
-├── GPIO27 (IN)    →  AC UPS 接点出力（AC断検知）  ← 物理ピン13、プルアップ、LOW=AC断 [要確認: AC UPS機種確定後に更新]
+├── GPIO27 (IN)    →  未使用（APC Smart-UPS 750 は接点出力なし。NUT 経由で AC断検知）
 │
-└── AC UPS (TBD)   →  5V PSU  →  Raspberry Pi 本体 + 内蔵SSD
+└── APC Smart-UPS 750 (SUA750JB)
+                    →  5V PSU  →  Raspberry Pi 本体 + 内蔵SSD
                     →  24V PSU →  P-CON-CB #1 / #2
-                    └→ AC断時に両系統バックアップ、接点出力でAC断をRPiに通知
+                    └→ シリアル(DB-9)→USB変換 → /dev/ttyUSBx → NUT (upsd) → NutUPSMonitor
 ```
 
 ### Modbus RTU 通信設定
@@ -391,8 +392,9 @@ Raspberry Pi 5 (16GB)
 - **USB接続**: ttyUSB0・ttyUSB1 が安定してデバイスに割り当てられること
   - udev rules で固定割り当てを推奨（シリアル番号でデバイスを固定）
 - **CAN**: Kvaser Linux ドライバインストール済み
-- **AC UPS**: AC断後 **30秒以上** のバックアップ給電が可能な機種を選定すること
+- **AC UPS**: APC Smart-UPS 750 (SUA750JB) を使用。フル充電時に数分以上のバックアップが可能
   - 根拠: home_return() + PostgreSQL正常終了 + シャットダウンを30秒以内に完了する設計
+  - AC断検知: NUT (Network UPS Tools) + apcsmart ドライバ経由（シリアル接続）
 
 ### パフォーマンス制約
 

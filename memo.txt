@@ -1,0 +1,132 @@
+sudo shutdown -h now
+vcgencmd measure_temp
+
+cd driving_robot
+source .venv/bin/activate
+ssh raspi5_16gb@raspi5-16gb.local
+
+# 非常停止スイッチの原点復帰確認
+.venv/bin/python tests/hardware/test_emergency_stop_home_return.py
+# 過電流の原点復帰確認
+.venv/bin/python tests/hardware/test_overcurrent_home_return.py
+# キャリブレーションの確認
+.venv/bin/python tests/hardware/test_calibration.py
+  操作方法:
+  - e: +0.5mm（前進）
+  - w: -0.5mm（後退）
+  - d: +0.1mm（前進）
+  - s: -0.1mm（後退）
+  - Enter: 確定
+  - q: 中止
+
+# CANの受信確認
+sudo .venv/bin/python scripts/check_can.py
+python /scripts/check_can_2.py
+
+# UPSの確認
+.venv/bin/python tests/hardware/test_ups_monitor.py
+  出力の見方:
+
+  チェック1 — NUT 通信確認（一瞬で完了）
+  NUT socket 接続      : OK
+  battery.charge (raw) : 095.0
+  ups.status (raw)     : OL
+
+  チェック2 — バッテリー残量表示
+  バッテリー残量 : 95.0%  [███████████████████░]
+  UPS ステータス : OL
+  AC 通電中      : YES
+
+  チェック3 — AC断コールバック監視（Ctrl+C まで継続）
+  [   0s] OL      95.0%  OL（AC通電中）
+  ここで UPS の AC ケーブルを抜くと:
+  ★★★ AC断コールバック発火！（1回目）★★★
+      ups.status が OL → OB に遷移しました
+      → SafetyMonitor.handle_ac_power_loss() が呼ばれます
+  ケーブルを戻すと OB→OL になりますが、コールバックは発火しません（立ち上がりエッジのみ）。
+
+
+
+
+# 本番環境の起動
+  初回のみ: DB初期化
+
+  cd /home/raspi5_16gb/projects/driving_robot
+  DATABASE_URL=postgresql://localhost/driving_robot \
+    .venv/bin/python scripts/setup_db.py
+　→済
+　確認方法
+　psql driving_robot -c "\dt"
+
+  サーバー起動
+
+  cd /home/raspi5_16gb/projects/driving_robot
+
+  DRIVING_ROBOT_USE_REAL_HW=1 \
+  DATABASE_URL=postgresql://localhost/driving_robot \
+    .venv/bin/uvicorn src.web.app:app --host 0.0.0.0 --port 8080
+
+  GUI アクセス
+
+  同一LANのブラウザから: http://<RaspberryPi のIP>:8080
+  http://100.64.1.33:8080
+
+  raspiのIP確認方法
+  hostname -I
+  10.155.61.20 2400:2200:436:9f78:459a:47bb:38f0:93c
+
+  ---
+  環境変数の意味
+
+  変数: DRIVING_ROBOT_USE_REAL_HW
+  値: 1       
+  省略時の挙動: スタブ（モック）で起動。HW接続なしで動作するが GPIO・Modbus・CAN は全て無効
+  ────────────────────────────────────────
+  変数: DATABASE_URL
+  値: postgresql://localhost/driving_robot
+  省略時の挙動: in-memory DB で起動。再起動するとプロファイルなどは消える
+
+  ---
+  確認: スタブモードで動作確認（ハード不要）
+  
+  実機を繋がなくても以下でサーバーが起動し、GUIの動作確認ができます:
+
+  cd /home/raspi5_16gb/projects/driving_robot
+
+  # HW なし・DB なし（最小構成）
+  .venv/bin/uvicorn src.web.app:app --host 0.0.0.0 --port 8080
+
+  # HW なし・DB あり（プロファイルを保存したい場合）
+  DATABASE_URL=postgresql://localhost/driving_robot \
+    .venv/bin/uvicorn src.web.app:app --host 0.0.0.0 --port 8080
+
+  # 使用中のプロセスを確認
+  lsof -i :8080
+
+  既存プロセスを止めてから再起動する場合:
+
+  # プロセスを終了
+  kill $(lsof -ti :8080)
+
+  ---
+  注意点
+  
+  現状 start.sh は存在しません（scripts/ には setup_db.py と check_can.py のみ）。毎回上記コマンドを手動実行する必要があります。
+
+  systemd サービス化するか、start.sh を作るかは追加作業になります。必要なら対応できます。
+
+
+
+source .venv/bin/activate
+deactivate
+
+claude update
+claude --version
+
+
+  - docs/product-requirements.md ✅
+  - docs/functional-design.md ✅
+  - docs/architecture.md ✅
+  - docs/repository-structure.md ✅
+  - docs/development-guidelines.md ✅
+  - docs/glossary.md ✅

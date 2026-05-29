@@ -544,10 +544,52 @@ function ConfirmStopPopup({ message = '停止しますか？', onYes, onNo }) {
   );
 }
 
+// ── ValidationPopup ──────────────────────────────────────────
+function ValidationPopup({ message, actionLabel = 'OK', onAction }) {
+  return (
+    <div style={{
+      position: 'absolute', inset: 0, zIndex: 997,
+      background: 'rgba(30,20,10,0.45)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <div style={{
+        background: PAPER, border: `2px solid ${INK}`,
+        borderRadius: 8, padding: '32px 44px',
+        textAlign: 'center', boxShadow: '4px 4px 0 rgba(0,0,0,0.2)',
+        transform: 'rotate(-0.3deg)', minWidth: 340,
+        fontFamily: "'Patrick Hand', cursive",
+      }}>
+        <div style={{ fontSize: 40, marginBottom: 12, color: '#7a5c1c' }}>⚠</div>
+        <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 24, color: INK }}>{message}</div>
+        <div onClick={onAction} style={{
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          border: `2px solid ${INK}`, borderRadius: 6, padding: '10px 32px',
+          background: PAPER, color: INK,
+          fontWeight: 700, fontSize: 18, fontFamily: 'inherit', cursor: 'pointer',
+          boxShadow: '2px 2px 0 rgba(0,0,0,0.12)',
+        }}>{actionLabel}</div>
+      </div>
+    </div>
+  );
+}
+
+// ── RowActions — 一覧行の操作ボタン共通コンポーネント ────────────
+// onSelect, onEdit, onCopy, onDelete: handler 関数
+// isActive: 選択中かどうか (true のとき「選択」ボタンを primary スタイルに)
+function RowActions({ onSelect, isActive, onEdit, onCopy, onDelete }) {
+  return React.createElement('div', { style: { display: 'flex', gap: 6 } },
+    React.createElement(Btn, { primary: isActive, onClick: onSelect }, '選択'),
+    React.createElement(Btn, { onClick: onEdit }, '編集'),
+    React.createElement(Btn, { onClick: onCopy }, 'コピー'),
+    React.createElement(Btn, { danger: true, onClick: onDelete }, '削除'),
+  );
+}
+
 // ── Export ───────────────────────────────────────────────────
 Object.assign(window, {
   INK, INK_SOFT, INK_MUTE, PAPER, PAPER_2, HATCH, STATE_TINT, NAV,
   Frame, Box, Btn, Pill, Note, H2, Input, Row, Squig, Hatch,
+  RowActions,
   SpeedGraph, PedalGauge, BigSpeed, TimeProgress, EmergencyBtn,
-  EmergencyOverlay, ConfirmStopPopup, StateBadge, UpsIndicator, TopBar, Sidebar,
+  EmergencyOverlay, ConfirmStopPopup, ValidationPopup, StateBadge, UpsIndicator, TopBar, Sidebar,
 });

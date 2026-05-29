@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from src.app.robot_controller import RobotController
 from src.domain.control.pid import PIDController
+from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession
 from src.models.driving_mode import DrivingMode
@@ -51,6 +52,39 @@ class _StubCANReader:
 
     async def read_speed(self) -> float:
         return 0.0
+
+
+class _StubUPSMonitor:
+    """開発・テスト用 UPS スタブ。常に満充電・AC通電中を返す。"""
+
+    async def get_battery_level_pct(self) -> float:
+        return 100.0
+
+    async def get_status(self) -> UPSStatus:
+        return UPSStatus(
+            battery_charge_pct=100.0,
+            on_battery=False,
+            low_battery=False,
+            status_flags="OL",
+            is_available=True,
+        )
+
+    def register_ac_loss_callback(self, cb: object) -> None:
+        pass
+
+    async def start_polling(self) -> None:
+        pass
+
+    async def stop_polling(self) -> None:
+        pass
+
+    @property
+    def is_on_battery(self) -> bool:
+        return False
+
+    @property
+    def is_available(self) -> bool:
+        return True
 
 
 class _StubSafetyMonitor:
@@ -168,6 +202,12 @@ class InMemoryModeRepository:
         )
         self._modes[mode_id] = stored
         return stored
+
+    async def update(self, mode: DrivingMode) -> DrivingMode | None:
+        if mode.id not in self._modes:
+            return None
+        self._modes[mode.id] = mode
+        return mode
 
     async def delete(self, mode_id: str) -> bool:
         if mode_id not in self._modes:

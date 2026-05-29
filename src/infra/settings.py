@@ -52,6 +52,14 @@ class SafetySettings:
 
 
 @dataclass
+class UpsSettings:
+    nut_host: str = "localhost"
+    nut_port: int = 3493
+    ups_name: str = "apcups"
+    poll_interval_s: float = 5.0
+
+
+@dataclass
 class AppSettings:
     serial: SerialSettings = field(default_factory=SerialSettings)
     can: CanSettings = field(default_factory=CanSettings)
@@ -60,6 +68,7 @@ class AppSettings:
     archive: ArchiveSettings = field(default_factory=ArchiveSettings)
     control: ControlSettings = field(default_factory=ControlSettings)
     safety: SafetySettings = field(default_factory=SafetySettings)
+    ups: UpsSettings = field(default_factory=UpsSettings)
 
 
 def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
@@ -81,6 +90,7 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
     archive = ArchiveSettings(**{k: v for k, v in raw.get("archive", {}).items()})
     control = ControlSettings(**{k: v for k, v in raw.get("control", {}).items()})
     safety = SafetySettings(**{k: v for k, v in raw.get("safety", {}).items()})
+    ups = UpsSettings(**{k: v for k, v in raw.get("ups", {}).items()})
 
     return AppSettings(
         serial=serial,
@@ -90,4 +100,5 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
         archive=archive,
         control=control,
         safety=safety,
+        ups=ups,
     )

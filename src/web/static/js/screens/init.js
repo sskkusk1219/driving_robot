@@ -21,12 +21,12 @@ function InitScreen() {
   }, [isInitializing]);
 
   const STEPS = [
-    { label: '通信確認 (ttyUSB0)',      sub: 'pymodbus connect OK' },
-    { label: '通信確認 (ttyUSB1)',      sub: 'pymodbus connect OK' },
-    { label: '通信確認 (CAN/Kvaser)',   sub: '/dev/usbcanII0 ready' },
-    { label: 'アラームリセット (両軸)',  sub: 'FC05 0x0407 → FF00' },
-    { label: 'サーボON (両軸)',         sub: 'FC05 0x0403' },
-    { label: '原点復帰',               sub: '前回正常終了 → スキップ予定' },
+    { label: '通信確認 (ブレーキ)' },
+    { label: '通信確認 (アクセル)' },
+    { label: '通信確認 (CAN)' },
+    { label: 'アラームリセット (両軸)' },
+    { label: 'サーボON (両軸)' },
+    { label: '原点復帰' },
   ];
 
   function stepStatus(i) {
@@ -50,33 +50,29 @@ function InitScreen() {
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', gap: 18, height: '100%',
-      maxWidth: 760, margin: '0 auto', justifyContent: 'center',
     }}>
-      <H2 sub="アラームリセット → サーボON → 原点復帰 (必要時)">
-        初期化を実行します
-      </H2>
 
-      <Box style={{ padding: 18 }}>
+      <Box style={{ padding: 18, flex: 1 }}>
         {STEPS.map(({ label, sub }, i) => {
           const st = stepStatus(i);
           return (
             <div key={label} style={{
-              display: 'flex', alignItems: 'center', gap: 12,
-              padding: '10px 4px',
+              display: 'flex', alignItems: 'center', gap: 16,
+              padding: '18px 8px',
               borderBottom: `1px dashed ${INK_MUTE}`,
             }}>
               <div style={{
-                width: 26, height: 26, borderRadius: '50%',
-                border: `1.4px solid ${st === true ? '#3f6b3f' : st === 'now' ? INK : INK_MUTE}`,
+                width: 36, height: 36, borderRadius: '50%',
+                border: `1.8px solid ${st === true ? '#3f6b3f' : st === 'now' ? INK : INK_MUTE}`,
                 background: st === true ? '#dfeadc' : st === 'now' ? PAPER_2 : 'transparent',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                fontWeight: 700, fontSize: 14,
+                fontWeight: 700, fontSize: 18,
               }}>
                 {st === true ? '✓' : st === 'now' ? '⟳' : '—'}
               </div>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 16, fontWeight: st === 'now' ? 700 : 400 }}>{label}</div>
-                <div style={{ fontSize: 12, color: INK_SOFT, fontFamily: 'monospace' }}>{sub}</div>
+                <div style={{ fontSize: 20, fontWeight: st === 'now' ? 700 : 400 }}>{label}</div>
+                {sub && <div style={{ fontSize: 12, color: INK_SOFT, fontFamily: 'monospace' }}>{sub}</div>}
               </div>
               {st === 'now' && <div style={{ fontSize: 13, color: INK_SOFT }}>実行中...</div>}
             </div>
@@ -85,9 +81,6 @@ function InitScreen() {
       </Box>
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
-        <Btn onClick={() => setNav('profiles')} disabled={isInitializing}>
-          キャンセル
-        </Btn>
         <Btn primary big onClick={isInitializing ? undefined : handleInitialize} disabled={isInitializing}>
           {isInitializing ? 'READY 待ち...' : '初期化を実行'}
         </Btn>

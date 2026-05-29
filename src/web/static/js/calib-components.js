@@ -116,4 +116,95 @@ function OpeningBar({ value = 0, color = '#1f1f1f', label = '' }) {
   );
 }
 
-Object.assign(window, { JogKey, PosRuler, OpeningBar });
+// ── DragSlider ────────────────────────────────────────────
+// Horizontal drag slider (left=decrease, right=increase).
+// Optional zeroPos / fullPos show calibration markers.
+function DragSlider({ currentPos, maxPulse = 5000, axisId, onJog, zeroPos, fullPos }) {
+  const { useRef } = React;
+  const { INK, INK_SOFT, PAPER, HATCH } = window;
+
+  const ref = useRef(null);
+  const dragging = useRef(false);
+  const lastX = useRef(0);
+  const pending = useRef(0);
+  const timer = useRef(null);
+
+  function flush() {
+    if (pending.current !== 0) { onJog(axisId, pending.current); pending.current = 0; }
+    timer.current = null;
+  }
+
+  function onPointerDown(e) {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragging.current = true;
+    lastX.current = e.clientX;
+  }
+
+  function onPointerMove(e) {
+    if (!dragging.current || !ref.current) return;
+    const w = ref.current.getBoundingClientRect().width;
+    if (w === 0) return;
+    const dx = e.clientX - lastX.current;
+    const step = Math.round((dx / w) * maxPulse);
+    if (step !== 0) {
+      pending.current += step;
+      lastX.current = e.clientX;
+      if (!timer.current) timer.current = setTimeout(flush, 80);
+    }
+  }
+
+  function onPointerUp() { dragging.current = false; }
+
+  const pct = v => Math.max(0, Math.min(100, (v / maxPulse) * 100));
+  const fillPct = pct(currentPos);
+  const ticks = [0, 0.25, 0.5, 0.75, 1];
+
+  return (
+    <div ref={ref} style={{
+      flex: 1, minHeight: 0, position: 'relative',
+      border: `1.4px solid ${INK}`, background: PAPER,
+      cursor: 'ew-resize', userSelect: 'none', overflow: 'hidden',
+    }}
+    onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+    onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
+    >
+      {/* Tick lines */}
+      {ticks.map(f => (
+        <div key={f} style={{ position: 'absolute', top: 0, bottom: 0, left: `${f * 100}%`, width: 1, background: HATCH, opacity: 0.6, pointerEvents: 'none' }} />
+      ))}
+
+      {/* Fill */}
+      <div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: `${fillPct}%`, background: INK, opacity: 0.10, pointerEvents: 'none' }} />
+
+      {/* Handle line */}
+      <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${fillPct}%`, width: 3, background: INK, pointerEvents: 'none' }} />
+
+      {/* ZERO marker */}
+      {zeroPos != null && (
+        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pct(zeroPos)}%`, width: 2, background: '#2a7a2a', pointerEvents: 'none' }}>
+          <div style={{ position: 'absolute', top: 4, left: 4, fontSize: 9, color: '#2a7a2a', fontWeight: 700, whiteSpace: 'nowrap' }}>ZERO</div>
+        </div>
+      )}
+
+      {/* FULL marker */}
+      {fullPos != null && (
+        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pct(fullPos)}%`, width: 2, background: '#a23232', pointerEvents: 'none' }}>
+          <div style={{ position: 'absolute', top: 4, left: 4, fontSize: 9, color: '#a23232', fontWeight: 700, whiteSpace: 'nowrap' }}>FULL</div>
+        </div>
+      )}
+
+      {/* Current value */}
+      <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2, pointerEvents: 'none' }}>
+        <div style={{ fontSize: 26, fontFamily: 'monospace', fontWeight: 800, lineHeight: 1 }}>{currentPos}</div>
+        <div style={{ fontSize: 10, color: INK_SOFT }}>pulse</div>
+        <div style={{ fontSize: 10, color: INK_SOFT, marginTop: 4 }}>← ドラッグ →</div>
+      </div>
+
+      {/* Scale labels */}
+      <div style={{ position: 'absolute', top: 3, left: 5, fontSize: 9, color: INK_SOFT, pointerEvents: 'none', fontFamily: 'monospace' }}>0</div>
+      <div style={{ position: 'absolute', top: 3, right: 5, fontSize: 9, color: INK_SOFT, pointerEvents: 'none', fontFamily: 'monospace' }}>{maxPulse}</div>
+    </div>
+  );
+}
+
+Object.assign(window, { JogKey, PosRuler, OpeningBar, DragSlider });
