@@ -18,9 +18,15 @@ DDL_STATEMENTS = [
         pid_gains   JSONB NOT NULL,
         stop_config JSONB NOT NULL,
         model_path  TEXT,
+        feedforward_params JSONB,
         created_at  TIMESTAMPTZ NOT NULL,
         updated_at  TIMESTAMPTZ NOT NULL
     )
+    """,
+    # 既存DB向けマイグレーション（CREATE TABLE IF NOT EXISTS は列追加しないため）
+    """
+    ALTER TABLE vehicle_profiles
+        ADD COLUMN IF NOT EXISTS feedforward_params JSONB
     """,
     """
     CREATE TABLE IF NOT EXISTS calibration_data (
@@ -35,6 +41,21 @@ DDL_STATEMENTS = [
         calibrated_at   TIMESTAMPTZ NOT NULL,
         is_valid        BOOLEAN NOT NULL
     )
+    """,
+    # 既存DB向けマイグレーション: UNIQUE(profile_id) 制約を冪等に追加する。
+    # 旧 setup_db で UNIQUE 無しに作成されたテーブルは CREATE TABLE IF NOT EXISTS では
+    # 変更されず、save_calibration の ON CONFLICT(profile_id) が失敗するため。
+    # Postgres は ADD CONSTRAINT IF NOT EXISTS 非対応のため DO ブロックで存在チェックする。
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'calibration_data_profile_id_key'
+        ) THEN
+            ALTER TABLE calibration_data
+                ADD CONSTRAINT calibration_data_profile_id_key UNIQUE (profile_id);
+        END IF;
+    END $$;
     """,
     """
     CREATE TABLE IF NOT EXISTS driving_modes (

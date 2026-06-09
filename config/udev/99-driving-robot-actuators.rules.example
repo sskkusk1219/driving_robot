@@ -1,0 +1,14 @@
+# driving_robot: IAI アクチュエータ用 USB-RS485(FTDI) の安定シンボリックリンク
+#
+# USB 列挙順 (ttyUSBn) は接続順や再起動で変わりうるため、FTDI のシリアル番号で
+# アクセル/ブレーキ軸を固定する。設置は scripts/setup_udev.sh を使うこと。
+#
+# このファイルはテンプレート（.example）。機器固有のシリアル番号を含む実ファイル
+# (99-driving-robot-actuators.rules) は gitignore 対象。
+#
+# シリアル番号の確認: scripts/setup_udev.sh --list
+# 設置:               sudo scripts/setup_udev.sh <accel_serial> <brake_serial>
+#
+# 例（実環境のシリアルに置き換えること）:
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="ACCEL_SERIAL", SYMLINK+="actuator_accel", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="BRAKE_SERIAL", SYMLINK+="actuator_brake", GROUP="dialout", MODE="0660"

@@ -3,10 +3,16 @@
 # settings.toml は .gitignore 対象です（機器固有値を含むため）。
 
 [serial]
-# アクセルアクチュエータ用 USB-RS485 デバイスパス
-accel_port = "/dev/ttyUSB0"
-# ブレーキアクチュエータ用 USB-RS485 デバイスパス
-brake_port = "/dev/ttyUSB1"
+# アクチュエータ用 USB-RS485 デバイスパス。
+# USB 列挙順 (ttyUSBn) は接続順・再起動で変わりうる（UPS シリアル等と衝突する）ため、
+# scripts/setup_udev.sh で FTDI シリアル番号に基づく固定シンボリックリンクを設置し、
+# 以下の /dev/actuator_* を使うことを推奨する（直接 /dev/ttyUSBn も指定可）。
+#   確認: scripts/setup_udev.sh --list
+#   設置: sudo scripts/setup_udev.sh <accel_serial> <brake_serial>
+# アクセルアクチュエータ
+accel_port = "/dev/actuator_accel"
+# ブレーキアクチュエータ
+brake_port = "/dev/actuator_brake"
 # Modbus RTU ボーレート（P-CON-CB 実機確認値）
 baud_rate = 38400
 

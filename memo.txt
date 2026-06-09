@@ -62,8 +62,14 @@ python /scripts/check_can_2.py
 
   cd /home/raspi5_16gb/projects/driving_robot
 
+  # ハードあり本番環境
   DRIVING_ROBOT_USE_REAL_HW=1 \
   DATABASE_URL=postgresql://localhost/driving_robot \
+    .venv/bin/uvicorn src.web.app:app --host 0.0.0.0 --port 8080
+
+  # ベンチモード
+  DRIVING_ROBOT_USE_REAL_HW=1 DRIVING_ROBOT_BENCH_GPIO_ONLY=1 \
+    DATABASE_URL=postgresql://localhost/driving_robot \
     .venv/bin/uvicorn src.web.app:app --host 0.0.0.0 --port 8080
 
   GUI アクセス

@@ -22,6 +22,8 @@ data/system_state.json
 
 # 機密・環境設定（テンプレートのみ管理）
 config/settings.toml
+# 機器固有のシリアルを含む udev 実ルール（.example のみ管理、scripts/setup_udev.sh で生成）
+config/udev/99-driving-robot-actuators.rules
 .env
 
 # ログ
