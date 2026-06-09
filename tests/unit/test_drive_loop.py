@@ -12,6 +12,7 @@ import pytest
 from src.domain.control.drive_loop import DriveLoop
 from src.domain.control.feedforward import FeedforwardController
 from src.domain.control.pid import PIDController
+from src.domain.model_training import LOOKAHEAD_HORIZONS_S
 from src.models.calibration import CalibrationData
 from src.models.driving_mode import DrivingMode, SpeedPoint
 from src.models.profile import PIDGains, StopConfig, VehicleProfile
@@ -80,9 +81,11 @@ def _make_mode(
     )
 
 
-def _make_ff() -> FeedforwardController:
+def _make_ff(return_value: tuple[float, float] = (50.0, 0.0)) -> MagicMock:
     ff = MagicMock(spec=FeedforwardController)
-    ff.predict = MagicMock(return_value=(50.0, 0.0))
+    ff.predict = MagicMock(return_value=return_value)
+    # DriveLoop は ff.horizons を反復して先読み速度を組むため、実タプルを設定する
+    ff.horizons = LOOKAHEAD_HORIZONS_S
     return ff
 
 
@@ -152,36 +155,22 @@ def _make_loop(
 
 
 # ---------------------------------------------------------------------------
-# _get_ref_speed_and_accel
+# _ref_speed_at（基準軌跡の補間・先読みサンプリング）
 # ---------------------------------------------------------------------------
 
 
-class TestGetRefSpeedAndAccel:
+class TestRefSpeedAt:
     def test_at_start_returns_first_point_speed(self) -> None:
         dl = _make_loop(mode=_make_mode())
-        speed, _ = dl._get_ref_speed_and_accel(0.0)
-        assert speed == pytest.approx(0.0)
+        assert dl._ref_speed_at(0.0) == pytest.approx(0.0)
 
     def test_at_end_returns_last_point_speed(self) -> None:
         dl = _make_loop(mode=_make_mode())
-        speed, accel = dl._get_ref_speed_and_accel(10.0)
-        assert speed == pytest.approx(60.0)
-        assert accel == pytest.approx(0.0)
+        assert dl._ref_speed_at(10.0) == pytest.approx(60.0)
 
     def test_interpolates_midpoint(self) -> None:
         dl = _make_loop(mode=_make_mode())
-        speed, accel = dl._get_ref_speed_and_accel(2.5)
-        assert speed == pytest.approx(30.0)
-        assert accel == pytest.approx(12.0)
-
-    def test_accel_computed_as_speed_difference_over_dt(self) -> None:
-        points = [
-            SpeedPoint(time_s=0.0, speed_kmh=0.0),
-            SpeedPoint(time_s=4.0, speed_kmh=80.0),
-        ]
-        dl = _make_loop(mode=_make_mode(points=points, total_duration=4.0))
-        _, accel = dl._get_ref_speed_and_accel(2.0)
-        assert accel == pytest.approx(20.0)
+        assert dl._ref_speed_at(2.5) == pytest.approx(30.0)
 
     def test_before_first_point_returns_first_speed(self) -> None:
         points = [
@@ -189,21 +178,22 @@ class TestGetRefSpeedAndAccel:
             SpeedPoint(time_s=5.0, speed_kmh=60.0),
         ]
         dl = _make_loop(mode=_make_mode(points=points, total_duration=5.0))
-        speed, _ = dl._get_ref_speed_and_accel(0.0)
-        assert speed == pytest.approx(30.0)
+        assert dl._ref_speed_at(0.0) == pytest.approx(30.0)
+
+    def test_beyond_last_point_clamps_to_last_speed(self) -> None:
+        """先読み（elapsed + horizon）が軌跡末尾を超えても終端値でクランプ。"""
+        dl = _make_loop(mode=_make_mode())
+        assert dl._ref_speed_at(999.0) == pytest.approx(60.0)
 
     def test_empty_points_returns_zero(self) -> None:
         mode = _make_mode(points=[], total_duration=10.0)
         dl = _make_loop(mode=mode)
-        speed, accel = dl._get_ref_speed_and_accel(5.0)
-        assert speed == 0.0
-        assert accel == 0.0
+        assert dl._ref_speed_at(5.0) == 0.0
 
     def test_single_point_mode(self) -> None:
         mode = _make_mode(points=[SpeedPoint(time_s=0.0, speed_kmh=50.0)], total_duration=10.0)
         dl = _make_loop(mode=mode)
-        speed, _ = dl._get_ref_speed_and_accel(5.0)
-        assert speed == pytest.approx(50.0)
+        assert dl._ref_speed_at(5.0) == pytest.approx(50.0)
 
 
 # ---------------------------------------------------------------------------
@@ -239,12 +229,46 @@ class TestOpeningToPosition:
 # ---------------------------------------------------------------------------
 
 
+class TestNoModelBootstrap:
+    @pytest.mark.asyncio
+    async def test_no_model_skips_predict_and_uses_pid_only(self) -> None:
+        """モデル未ロード（has_model=False）では FF.predict を呼ばず PID のみで開度を決める。
+
+        初回学習走行のブートストラップ。ref>actual の正誤差で PID がアクセルを出すこと。
+        """
+        ff = _make_ff(return_value=(50.0, 0.0))
+        ff.has_model = False  # モデル未ロード
+        pid = PIDController(kp=1.0, ki=0.0, kd=0.0)
+        accel_driver = _make_accel_driver()
+        # ref_speed(t=0)=60, actual=0 で正の誤差を作る（PID がアクセルを出す）
+        mode = _make_mode(
+            points=[SpeedPoint(time_s=0.0, speed_kmh=60.0), SpeedPoint(time_s=10.0, speed_kmh=60.0)]
+        )
+        can_reader = _make_can_reader(speed=0.0)
+
+        dl = _make_loop(
+            ff=ff, pid=pid, accel_driver=accel_driver, can_reader=can_reader, mode=mode
+        )
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 0.0
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+
+            await dl._execute_one_cycle()
+
+        ff.predict.assert_not_called()
+        # アクセルに位置指令が出ている（PID 補正分）
+        accel_driver.move_to_position.assert_called_once()
+
+
 class TestOpeningComputation:
     @pytest.mark.asyncio
     async def test_accel_priority_exclusive_control(self) -> None:
         """FF がアクセル、PID 補正がブレーキ方向でも、アクセルがあればブレーキをゼロにする。"""
-        ff = MagicMock(spec=FeedforwardController)
-        ff.predict = MagicMock(return_value=(30.0, 10.0))
+        ff = _make_ff(return_value=(30.0, 10.0))
         pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
 
         accel_driver = _make_accel_driver()
@@ -269,8 +293,7 @@ class TestOpeningComputation:
     @pytest.mark.asyncio
     async def test_clamp_to_max_opening(self) -> None:
         """FF が 200% を返しても max_accel_opening=80 にクランプされること。"""
-        ff = MagicMock(spec=FeedforwardController)
-        ff.predict = MagicMock(return_value=(200.0, 0.0))
+        ff = _make_ff(return_value=(200.0, 0.0))
         pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
         profile = _make_profile(max_accel=80.0)
         accel_driver = _make_accel_driver()
@@ -626,8 +649,7 @@ class TestCurrentOpeningProperties:
 
     @pytest.mark.asyncio
     async def test_properties_updated_after_cycle(self) -> None:
-        ff = MagicMock(spec=FeedforwardController)
-        ff.predict = MagicMock(return_value=(40.0, 0.0))
+        ff = _make_ff(return_value=(40.0, 0.0))
         can_reader = _make_can_reader(speed=50.0)
 
         dl = _make_loop(ff=ff, can_reader=can_reader)
@@ -646,8 +668,7 @@ class TestCurrentOpeningProperties:
 
     @pytest.mark.asyncio
     async def test_brake_opening_set_when_ff_predicts_brake(self) -> None:
-        ff = MagicMock(spec=FeedforwardController)
-        ff.predict = MagicMock(return_value=(0.0, 30.0))
+        ff = _make_ff(return_value=(0.0, 30.0))
         can_reader = _make_can_reader(speed=60.0)
 
         dl = _make_loop(ff=ff, can_reader=can_reader)

@@ -43,6 +43,9 @@ class GPIOMonitor:
         self._handle: int | None = None
         self._cb_emergency = None
         self._cb_ac = None
+        # 直近のエッジから推定する非常停止スイッチ状態（HIGH=押下中）。
+        # 権威ある値は is_emergency_active() の live read。ハンドル未確立時の保険。
+        self._emergency_active = False
 
     def register_emergency_callback(self, cb: AsyncCallback) -> None:
         """非常停止トリガー時に呼ばれる非同期コールバックを登録する。"""
@@ -59,13 +62,15 @@ class GPIOMonitor:
         self._loop = asyncio.get_event_loop()
         self._handle = lgpio.gpiochip_open(_CHIP)
 
-        # 非常停止: NC接点 → RISING エッジ（接点が開いてプルアップが有効になる）
+        # 非常停止: NC接点。押下=RISING(HIGH)、解除=FALLING(LOW)。
+        # 両エッジを監視し、押下で非常停止を発火、解除はログ記録とフラグ更新に使う。
+        # （解除を検知することで is_emergency_active() の判定とリセット可否に活かす）
         lgpio.gpio_claim_alert(
-            self._handle, self._emergency_pin, lgpio.RISING_EDGE, lgpio.SET_PULL_UP
+            self._handle, self._emergency_pin, lgpio.BOTH_EDGES, lgpio.SET_PULL_UP
         )
         lgpio.gpio_set_debounce_micros(self._handle, self._emergency_pin, _DEBOUNCE_US)
         self._cb_emergency = lgpio.callback(
-            self._handle, self._emergency_pin, lgpio.RISING_EDGE, self._on_emergency
+            self._handle, self._emergency_pin, lgpio.BOTH_EDGES, self._on_emergency
         )
 
         # AC断検知: FALLING エッジ（AC断で接点が開放 → LOW になる想定、機種確定後に要確認）
@@ -97,9 +102,31 @@ class GPIOMonitor:
         logger.info("GPIOMonitor 停止: GPIO クリーンアップ完了")
 
     def _on_emergency(self, chip: int, gpio: int, level: int, timestamp: int) -> None:  # noqa: ARG002
-        """非常停止 RISING エッジ割り込みハンドラ（別スレッドから呼ばれる）。"""
-        logger.warning("非常停止スイッチ検知: gpio=%d level=%d", gpio, level)
-        self._fire_callbacks(self._emergency_callbacks)
+        """非常停止 両エッジ割り込みハンドラ（別スレッドから呼ばれる）。
+
+        level=1 (RISING, 押下): 非常停止を発火。
+        level=0 (FALLING, 解除): フラグを下げてログのみ（自動リセットはしない）。
+        level=2 (watchdog) 等は無視する。
+        """
+        if level == 1:
+            self._emergency_active = True
+            logger.warning("非常停止スイッチ検知: gpio=%d level=%d", gpio, level)
+            self._fire_callbacks(self._emergency_callbacks)
+        elif level == 0:
+            self._emergency_active = False
+            logger.info("非常停止スイッチ解除: gpio=%d level=%d", gpio, level)
+
+    def is_emergency_active(self) -> bool:
+        """非常停止スイッチが現在押下（HIGH）されているかを返す。
+
+        エッジ追跡ではなく GPIO の現在レベルを直接読み取る（権威ある値）。
+        HIGH(1)=押下/停止、LOW(0)=解除/通常。ハンドル未確立時は追跡フラグを返す。
+        """
+        if self._handle is None:
+            return self._emergency_active
+        import lgpio  # noqa: PLC0415
+
+        return bool(lgpio.gpio_read(self._handle, self._emergency_pin) == 1)
 
     def _on_ac_loss(self, chip: int, gpio: int, level: int, timestamp: int) -> None:  # noqa: ARG002
         """AC断 FALLING エッジ割り込みハンドラ（別スレッドから呼ばれる）。"""

@@ -63,6 +63,7 @@ def stub_controller() -> MagicMock:
     app.state.profile_repo = InMemoryProfileRepository()
     app.state.mode_repo = InMemoryModeRepository()
     app.state.session_repo = InMemorySessionRepository()
+    app.state.db_pool = None  # DB なし → ログ書き込みは無効（log_writer=None）
     return ctrl
 
 
@@ -105,7 +106,12 @@ async def test_start_drive_ok(stub_controller: MagicMock) -> None:
     data = res.json()
     assert data["id"] == "session-001"
     assert data["run_type"] == "auto"
-    stub_controller.start_auto_drive.assert_awaited_once_with("mode-001")
+    # mode/profile/log_writer を解決して渡す（DB なしのテストでは mode=None, log_writer=None）
+    stub_controller.start_auto_drive.assert_awaited_once()
+    call = stub_controller.start_auto_drive.await_args
+    assert call.args[0] == "mode-001"
+    assert call.kwargs["mode"] is None
+    assert call.kwargs["log_writer"] is None
 
 
 @pytest.mark.asyncio
@@ -313,6 +319,115 @@ async def test_learning_start_ok(stub_controller: MagicMock) -> None:
     assert data["run_type"] == "learning"
     assert data["mode_id"] is None
     stub_controller.start_learning_drive.assert_awaited_once()
+    # DB なし環境では log_writer=None で呼ばれる
+    assert stub_controller.start_learning_drive.await_args.kwargs["log_writer"] is None
+
+
+def test_get_log_writer_returns_none_without_pool() -> None:
+    """db_pool が None なら get_log_writer は None を返す。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from src.web.deps import get_log_writer
+
+    req = MagicMock()
+    req.app.state = SimpleNamespace(db_pool=None)
+    assert get_log_writer(req) is None
+
+
+def test_get_log_writer_returns_log_writer_with_pool() -> None:
+    """db_pool があれば get_log_writer は LogWriter を返す。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from src.infra.log_writer import LogWriter
+    from src.web.deps import get_log_writer
+
+    req = MagicMock()
+    req.app.state = SimpleNamespace(db_pool=MagicMock())
+    assert isinstance(get_log_writer(req), LogWriter)
+
+
+async def _create_profile(profile_id: str) -> None:
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
+
+    await app.state.profile_repo.create(
+        VehicleProfile(
+            id=profile_id,
+            name="TrainCar",
+            max_accel_opening=80.0,
+            max_brake_opening=60.0,
+            max_speed=120.0,
+            max_decel_g=0.4,
+            pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+            stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+            calibration=None,
+            model_path=None,
+            created_at=datetime.now(tz=UTC),
+            updated_at=datetime.now(tz=UTC),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_learning_train_profile_not_found_returns_404(stub_controller: MagicMock) -> None:
+    from uuid import uuid4  # noqa: PLC0415
+
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/drive/learning/train", json={"profile_id": str(uuid4())}
+        )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_learning_train_insufficient_logs_returns_422(stub_controller: MagicMock) -> None:
+    """ログが空（InMemory）の場合、LearningDataError → 422。"""
+    from uuid import uuid4  # noqa: PLC0415
+
+    profile_id = str(uuid4())
+    await _create_profile(profile_id)
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/drive/learning/train", json={"profile_id": profile_id}
+        )
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_learning_train_ok_updates_model_path(
+    stub_controller: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """学習成功時に 200 でメトリクスを返し、プロファイルの model_path が更新されること。"""
+    from uuid import uuid4  # noqa: PLC0415
+
+    profile_id = str(uuid4())
+    await _create_profile(profile_id)
+
+    fake_metrics = {"accel": {"mae": 0.1, "n": 50.0}, "brake": {"mae": 0.2, "n": 40.0}}
+
+    def _fake_train(logs, profile, output_dir="data/models"):  # noqa: ANN001, ANN202, ARG001
+        return "data/models/fake_model.pkl", fake_metrics
+
+    monkeypatch.setattr("src.web.routers.drive.train_inverse_model", _fake_train)
+
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/drive/learning/train", json={"profile_id": profile_id}
+        )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["model_path"] == "data/models/fake_model.pkl"
+    assert body["metrics"]["accel"]["mae"] == 0.1
+    # フィードフォワード定数がレスポンスに含まれる（空ログ→デフォルト保持）
+    assert body["feedforward_params"]["creep_speed_kmh"] == 7.0
+
+    updated = await app.state.profile_repo.get_by_id(profile_id)
+    assert updated.model_path == "data/models/fake_model.pkl"
+    assert updated.feedforward_params is not None
 
 
 @pytest.mark.asyncio

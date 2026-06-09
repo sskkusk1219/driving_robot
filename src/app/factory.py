@@ -8,9 +8,16 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
-from src.app.robot_controller import RobotController, SafetyMonitorProtocol
+from src.app.robot_controller import (
+    ActuatorDriverProtocol,
+    CANReaderProtocol,
+    RobotController,
+    SafetyMonitorProtocol,
+)
 from src.domain.calibration import CalibrationManager
+from src.domain.control.feedforward import FeedforwardController
 from src.domain.control.pid import PIDController
+from src.domain.learning_drive import LearningDriveManager
 from src.domain.pre_check import PreCheckRunner
 from src.domain.safety_monitor import SafetyMonitor
 from src.infra.actuator_driver import ActuatorDriver
@@ -49,9 +56,14 @@ class _GpioSafetyAdapter:
     async def trigger_emergency(self) -> None:
         await self._monitor.trigger_emergency()
 
+    def is_emergency_active(self) -> bool:
+        return self._gpio.is_emergency_active()
+
 
 async def build_real_controller(
     settings: AppSettings,
+    *,
+    bench_gpio_only: bool = False,
 ) -> tuple[RobotController, NutUPSMonitor]:
     """実ハードウェアに接続する RobotController と NutUPSMonitor を生成する。
 
@@ -61,26 +73,41 @@ async def build_real_controller(
 
     Args:
         settings: config/settings.toml から読み込んだ AppSettings。
+        bench_gpio_only: True の場合、非常停止スイッチ(GPIO)のみ実機とし、
+            アクチュエータ・CAN はスタブに置き換える。アクチュエータ/CAN 未接続の
+            ベンチ環境で非常停止スイッチの動作を検証するためのモード。
 
     Returns:
         (RobotController, NutUPSMonitor) のタプル。
         RobotController は start() で実 HW に接続する。
     """
-    accel_driver = ActuatorDriver(
-        port=settings.serial.accel_port,
-        slave_id=1,
-        baud_rate=settings.serial.baud_rate,
-    )
-    brake_driver = ActuatorDriver(
-        port=settings.serial.brake_port,
-        slave_id=1,  # 各軸が独立した RS-485 バスを持つため両軸とも slave_id=1
-        baud_rate=settings.serial.baud_rate,
-    )
-    can_reader = CANReader(
-        interface=settings.can.interface,
-        channel=settings.can.channel,
-        dbc_path=settings.can.dbc_path,
-    )
+    accel_driver: ActuatorDriverProtocol
+    brake_driver: ActuatorDriverProtocol
+    can_reader: CANReaderProtocol
+    if bench_gpio_only:
+        # ベンチ検証用: 非常停止スイッチ(GPIO)のみ実機。アクチュエータ/CAN はスタブ。
+        from src.app.stubs import _StubActuator, _StubCANReader  # noqa: PLC0415
+
+        accel_driver = _StubActuator()
+        brake_driver = _StubActuator()
+        can_reader = _StubCANReader()
+    else:
+        accel_driver = ActuatorDriver(
+            port=settings.serial.accel_port,
+            slave_id=1,
+            baud_rate=settings.serial.baud_rate,
+        )
+        brake_driver = ActuatorDriver(
+            port=settings.serial.brake_port,
+            slave_id=1,  # 各軸が独立した RS-485 バスを持つため両軸とも slave_id=1
+            baud_rate=settings.serial.baud_rate,
+        )
+        can_reader = CANReader(
+            interface=settings.can.interface,
+            channel=settings.can.channel,
+            bitrate=settings.can.bitrate,
+            dbc_path=settings.can.dbc_path,
+        )
     # 非常停止のみ GPIO 経由。AC断は NUT ポーリングに変更したため ac_detect_pin 未使用
     gpio_monitor = GPIOMonitor(
         emergency_pin=settings.gpio.emergency_stop_pin,
@@ -109,6 +136,7 @@ async def build_real_controller(
     profile_repo = ProfileRepository(pool)
 
     pid = PIDController(kp=1.0, ki=0.0, kd=0.0)
+    ff_controller = FeedforwardController()
     calibration_manager = CalibrationManager(
         accel_driver=accel_driver,
         brake_driver=brake_driver,
@@ -128,10 +156,12 @@ async def build_real_controller(
         can_reader=can_reader,
         safety_monitor=safety_adapter,
         pid=pid,
+        ff_controller=ff_controller,
         last_normal_shutdown=False,
         safety_check=safety_monitor,
         calibration_manager=calibration_manager,
         pre_check_runner=pre_check_runner,
+        learning_manager=LearningDriveManager(),
     )
     # GPIO非常停止 → controller.emergency_stop() を直接呼ぶ
     # （trigger_emergency経由にすると controller が自身を再帰呼び出しするループが生じるため）

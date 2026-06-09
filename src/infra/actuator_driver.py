@@ -48,6 +48,11 @@ _DEFAULT_ACCEL = 30         # 加減速指令（ACMD）[コントローラ固有
 _HOME_RETURN_TIMEOUT_S = 30.0
 _HOME_RETURN_POLL_INTERVAL_S = 0.1
 
+_POSITION_COMPLETE_TIMEOUT_S = 10.0
+_POSITION_COMPLETE_POLL_INTERVAL_S = 0.05
+# 移動指令直後は PEND が前回値のまま残ることがあるため、判定開始前に短い猶予を置く
+_POSITION_COMPLETE_START_DELAY_S = 0.05
+
 
 def _to_signed32(hi: int, lo: int) -> int:
     """上位・下位 16bit ワードから符号付き 32bit 整数を生成する。"""
@@ -203,6 +208,40 @@ class ActuatorDriver:
             "move_to_position: slave_id=%d pos=%d speed=%d",
             self._slave_id, pos, speed_mm_s,
         )
+
+    async def wait_for_position_complete(
+        self, timeout_s: float = _POSITION_COMPLETE_TIMEOUT_S
+    ) -> None:
+        """位置決め完了（DSS1 PEND かつ DSSE 非 MOVE）までポーリングする。
+
+        move_to_position 直後に read_position すると移動途中値を読むため、
+        ジョグなど移動完了後の確定位置が必要な場面で本メソッドを挟む。
+        50ms 制御ループ（DriveLoop）では呼ばないこと（ブロックするため）。
+
+        タイムアウト (timeout_s) を超えた場合は TimeoutError を送出する。
+        """
+        client = self._require_client()
+        await asyncio.sleep(_POSITION_COMPLETE_START_DELAY_S)
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            # DSS1(0x9005), 0x9006, DSSE(0x9007) を一括読み取り
+            result = await client.read_holding_registers(
+                address=_REG_DSS1, count=3, device_id=self._slave_id
+            )
+            if result.isError():
+                logger.warning(
+                    "wait_for_position_complete ステータス読み取りエラー: slave_id=%d",
+                    self._slave_id,
+                )
+                await asyncio.sleep(_POSITION_COMPLETE_POLL_INTERVAL_S)
+                continue
+            dss1 = result.registers[0]
+            dsse = result.registers[2]
+            if (dss1 & _DSS1_PEND) and not (dsse & _DSSE_MOVE):
+                return
+            await asyncio.sleep(_POSITION_COMPLETE_POLL_INTERVAL_S)
+
+        raise TimeoutError(f"wait_for_position_complete タイムアウト: slave_id={self._slave_id}")
 
     async def read_position(self) -> int:
         """現在位置を読み取る。

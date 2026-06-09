@@ -4,10 +4,11 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from src.models.profile import PIDGains, StopConfig, VehicleProfile
+from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
 from src.web.deps import ProfileRepoProtocol, get_profile_repo
 from src.web.schemas import (
     CalibrationDataResponse,
+    FeedforwardParamsSchema,
     PIDGainsSchema,
     ProfileCreateRequest,
     ProfileResponse,
@@ -18,6 +19,28 @@ from src.web.schemas import (
 router = APIRouter(prefix="/api/v1/profiles", tags=["profiles"])
 
 ProfileRepo = Annotated[ProfileRepoProtocol, Depends(get_profile_repo)]
+
+
+def _ffp_to_schema(ffp: FeedforwardParams) -> FeedforwardParamsSchema:
+    return FeedforwardParamsSchema(
+        creep_speed_kmh=ffp.creep_speed_kmh,
+        creep_rate_kmhs=ffp.creep_rate_kmhs,
+        engine_brake_decel_kmhs=ffp.engine_brake_decel_kmhs,
+        stop_brake_opening_pct=ffp.stop_brake_opening_pct,
+        brake_deadband_pct=ffp.brake_deadband_pct,
+        accel_deadband_pct=ffp.accel_deadband_pct,
+    )
+
+
+def _ffp_from_schema(s: FeedforwardParamsSchema) -> FeedforwardParams:
+    return FeedforwardParams(
+        creep_speed_kmh=s.creep_speed_kmh,
+        creep_rate_kmhs=s.creep_rate_kmhs,
+        engine_brake_decel_kmhs=s.engine_brake_decel_kmhs,
+        stop_brake_opening_pct=s.stop_brake_opening_pct,
+        brake_deadband_pct=s.brake_deadband_pct,
+        accel_deadband_pct=s.accel_deadband_pct,
+    )
 
 
 def _to_response(p: VehicleProfile) -> ProfileResponse:
@@ -47,6 +70,7 @@ def _to_response(p: VehicleProfile) -> ProfileResponse:
         ),
         calibration=calib,
         model_path=p.model_path,
+        feedforward_params=_ffp_to_schema(p.feedforward_params),
         created_at=p.created_at,
         updated_at=p.updated_at,
     )
@@ -77,6 +101,11 @@ async def create_profile(req: ProfileCreateRequest, repo: ProfileRepo) -> Profil
         model_path=req.model_path,
         created_at=now,
         updated_at=now,
+        feedforward_params=(
+            _ffp_from_schema(req.feedforward_params)
+            if req.feedforward_params is not None
+            else FeedforwardParams()
+        ),
     )
     created = await repo.create(profile)
     return _to_response(created)
@@ -119,9 +148,7 @@ async def update_profile(
         max_speed=req.max_speed if req.max_speed is not None else existing.max_speed,
         max_decel_g=req.max_decel_g if req.max_decel_g is not None else existing.max_decel_g,
         pid_gains=(
-            PIDGains(
-                kp=req.pid_gains.kp, ki=req.pid_gains.ki, kd=req.pid_gains.kd
-            )
+            PIDGains(kp=req.pid_gains.kp, ki=req.pid_gains.ki, kd=req.pid_gains.kd)
             if req.pid_gains is not None
             else existing.pid_gains
         ),
@@ -137,6 +164,11 @@ async def update_profile(
         model_path=req.model_path if req.model_path is not None else existing.model_path,
         created_at=existing.created_at,
         updated_at=existing.updated_at,
+        feedforward_params=(
+            _ffp_from_schema(req.feedforward_params)
+            if req.feedforward_params is not None
+            else existing.feedforward_params
+        ),
     )
     updated = await repo.update(merged)
     if updated is None:

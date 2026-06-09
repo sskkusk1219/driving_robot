@@ -134,7 +134,7 @@ function CsvSpeedGraph({ rows, width = 600, height = 220 }) {
 
 function ModesScreen() {
   const { useState, useEffect, useContext } = React;
-  const { apiFetch, activeModeId, setActiveModeId, setActiveModeName } = useContext(window.AppContext);
+  const { apiFetch, activeModeId, setActiveModeId, activeModeName, setActiveModeName } = useContext(window.AppContext);
   const { INK, INK_SOFT, INK_MUTE, PAPER_2, HATCH, Box, Btn, H2, Note, Pill, Row, Hatch, RowActions } = window;
 
   const [modes, setModes] = useState([]);
@@ -182,6 +182,7 @@ function ModesScreen() {
     const r = await apiFetch('PATCH', `/api/v1/modes/${m.id}`, { name: trimmed });
     if (r) {
       window.showToast('名前を更新しました', 'success');
+      if (m.id === activeModeId) setActiveModeName(trimmed);
       setEditingNameId(null);
       setEditingNameValue('');
       loadModes();
@@ -251,6 +252,7 @@ function ModesScreen() {
         }
         if (r) {
           window.showToast(`「${r.name}」を更新しました`, 'success');
+          if (editTarget.id === activeModeId) setActiveModeName(r.name);
           setMode('list');
           setEditTarget(null);
           loadModes();

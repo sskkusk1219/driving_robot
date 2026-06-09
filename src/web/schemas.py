@@ -49,8 +49,43 @@ class DriveSessionResponse(BaseModel):
     status: str
 
 
+class FeedforwardParamsSchema(BaseModel):
+    """Ridge 逆FFモデルを補う車両物理定数。デフォルトは AT 標準値。"""
+
+    creep_speed_kmh: float = 7.0
+    creep_rate_kmhs: float = 0.5
+    engine_brake_decel_kmhs: float = 1.0
+    stop_brake_opening_pct: float = 20.0
+    brake_deadband_pct: float = 1.0
+    accel_deadband_pct: float = 1.0
+
+
+class TrainModelRequest(BaseModel):
+    profile_id: str
+    session_ids: list[str] | None = None
+
+
+class TrainModelResponse(BaseModel):
+    model_path: str
+    metrics: dict[str, dict[str, float]]
+    feedforward_params: FeedforwardParamsSchema
+
+
 class SelectProfileRequest(BaseModel):
     profile_id: str
+
+
+class JogRequest(BaseModel):
+    axis: str  # "accel" or "brake"
+    step: int  # 移動量 [pulse]
+
+
+class AxisRequest(BaseModel):
+    axis: str  # "accel" or "brake"
+
+
+class JogResponse(BaseModel):
+    position: int  # 操作後の実位置 [pulse]
 
 
 # ── UPS ──────────────────────────────────────────────────────────────────────
@@ -100,6 +135,7 @@ class ProfileCreateRequest(BaseModel):
     pid_gains: PIDGainsSchema
     stop_config: StopConfigSchema
     model_path: str | None = None
+    feedforward_params: FeedforwardParamsSchema | None = None
 
     @field_validator("max_accel_opening", "max_brake_opening")
     @classmethod
@@ -125,6 +161,7 @@ class ProfileUpdateRequest(BaseModel):
     pid_gains: PIDGainsSchema | None = None
     stop_config: StopConfigSchema | None = None
     model_path: str | None = None
+    feedforward_params: FeedforwardParamsSchema | None = None
 
     @field_validator("max_accel_opening", "max_brake_opening")
     @classmethod
@@ -152,6 +189,7 @@ class ProfileResponse(BaseModel):
     stop_config: StopConfigSchema
     calibration: CalibrationDataResponse | None
     model_path: str | None
+    feedforward_params: FeedforwardParamsSchema
     created_at: datetime
     updated_at: datetime
 

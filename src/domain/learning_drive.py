@@ -1,13 +1,12 @@
-import pickle
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 import numpy as np
-from scipy.interpolate import NearestNDInterpolator, griddata
 
 from src.models.calibration import CalibrationData
+from src.models.driving_mode import DrivingMode, SpeedPoint
 from src.models.learning_drive import LearningLog, LearningPattern
 from src.models.profile import VehicleProfile
 
@@ -16,26 +15,14 @@ ACCEL_STEP_KMHS: float = 1.0
 ACCEL_MAX_KMHS: float = 10.0
 HOLD_DURATION_S: float = 2.0
 SPEED_SAMPLE_INTERVAL_S: float = 0.1
-MIN_LOGS_FOR_TRAINING: int = 4
 
 G_TO_KMHS: float = 9.81 * 3.6
 
-
-def _fill_nan_nearest(
-    map_: np.ndarray, grid_speed: np.ndarray, grid_accel: np.ndarray
-) -> np.ndarray:
-    """NaN セルを最近傍の既知値で補完する。全セル NaN の場合は 0 埋め。"""
-    known = ~np.isnan(map_)
-    if not np.any(known):
-        return np.zeros_like(map_)
-    nn = NearestNDInterpolator(
-        np.column_stack([grid_speed[known], grid_accel[known]]),
-        map_[known],
-    )
-    result = map_.copy()
-    nan_mask = np.isnan(result)
-    result[nan_mask] = nn(grid_speed[nan_mask], grid_accel[nan_mask])
-    return result
+# 学習用基準速度プロファイル生成パラメータ
+# 各目標速度への加減速を複数レートで網羅し、逆モデル学習に必要な特徴量空間を広く覆う。
+LEARNING_DWELL_S: float = 1.5  # 各サイクル間の停車保持時間
+LEARNING_ACCEL_RATE_FRACTIONS: tuple[float, ...] = (0.4, 0.7, 1.0)  # accel_max_kmhs に対する割合
+LEARNING_DECEL_RATE_FRACTIONS: tuple[float, ...] = (0.4, 0.7, 1.0)  # 最大減速度に対する割合
 
 
 class LearningActuatorProtocol(Protocol):
@@ -59,7 +46,6 @@ class LearningDriveConfig:
     accel_max_kmhs: float = field(default=ACCEL_MAX_KMHS)
     hold_duration_s: float = field(default=HOLD_DURATION_S)
     speed_sample_interval_s: float = field(default=SPEED_SAMPLE_INTERVAL_S)
-    min_logs_for_training: int = field(default=MIN_LOGS_FOR_TRAINING)
 
 
 class LearningDriveManager:
@@ -69,6 +55,61 @@ class LearningDriveManager:
 
     def __init__(self, config: LearningDriveConfig | None = None) -> None:
         self._config = config if config is not None else LearningDriveConfig()
+
+    def build_learning_reference(self, profile: VehicleProfile) -> DrivingMode:
+        """学習用の連続基準速度プロファイル（DrivingMode）を生成する。
+
+        速度ステップごとに「0→目標速度→保持→0」のサイクルを構成し、加速・減速の
+        各レートを複数（LEARNING_*_RATE_FRACTIONS）切り替えることで、先読み逆モデルが
+        必要とする速度×加減速トレンドの特徴量空間を広く網羅する。
+
+        生成した DrivingMode は永続化されない一時的なもので、走行セッションの mode_id は
+        None のままとする（drive_sessions.mode_id は driving_modes への FK のため）。
+        """
+        max_decel_kmhs = max(profile.max_decel_g * G_TO_KMHS, 1.0)
+        accel_max = max(self._config.accel_max_kmhs, 1.0)
+
+        targets = np.arange(
+            self._config.speed_step_kmh,
+            profile.max_speed + self._config.speed_step_kmh,
+            self._config.speed_step_kmh,
+        )
+        targets = targets[targets <= profile.max_speed + 1e-9]
+
+        points: list[SpeedPoint] = [SpeedPoint(time_s=0.0, speed_kmh=0.0)]
+        t = 0.0
+        for i, target in enumerate(targets):
+            target_v = float(target)
+            accel_rate = (
+                accel_max * LEARNING_ACCEL_RATE_FRACTIONS[i % len(LEARNING_ACCEL_RATE_FRACTIONS)]
+            )
+            decel_rate = (
+                max_decel_kmhs
+                * LEARNING_DECEL_RATE_FRACTIONS[i % len(LEARNING_DECEL_RATE_FRACTIONS)]
+            )
+
+            # 0 → 目標速度（加速）
+            t += target_v / accel_rate
+            points.append(SpeedPoint(time_s=t, speed_kmh=target_v))
+            # 目標速度を保持
+            t += self._config.hold_duration_s
+            points.append(SpeedPoint(time_s=t, speed_kmh=target_v))
+            # 目標速度 → 0（減速）
+            t += target_v / decel_rate
+            points.append(SpeedPoint(time_s=t, speed_kmh=0.0))
+            # 停車保持
+            t += LEARNING_DWELL_S
+            points.append(SpeedPoint(time_s=t, speed_kmh=0.0))
+
+        return DrivingMode(
+            id=f"learning-{uuid4()}",
+            name="learning-reference",
+            description="学習走行用に自動生成した基準速度プロファイル（非永続）",
+            reference_speed=points,
+            total_duration=t,
+            max_speed=profile.max_speed,
+            created_at=datetime.now(tz=UTC),
+        )
 
     def generate_patterns(self, profile: VehicleProfile) -> list[LearningPattern]:
         """max_opening / max_decel_g を超えるパターンを除外した学習パターンリストを返す。"""
@@ -166,63 +207,3 @@ class LearningDriveManager:
     def _opening_to_pulse(self, opening_pct: float, zero_pos: int, stroke: int) -> int:
         """開度 [%] をアクチュエータ位置 [pulse] に換算する。"""
         return zero_pos + int(opening_pct / 100.0 * stroke)
-
-    def train_model(
-        self,
-        logs: list[LearningLog],
-        profile_id: str,
-        output_dir: str = "data/models",
-    ) -> str:
-        """収集ログから pkl モデルを構築・保存してファイルパスを返す。
-
-        Raises:
-            LearningDataError: ログが不足しモデル構築できない場合。
-        """
-        if len(logs) < self._config.min_logs_for_training:
-            raise LearningDataError(
-                f"ログが不足しています ({len(logs)} 点)。"
-                f"モデル構築には最低 {self._config.min_logs_for_training} 点必要です。"
-            )
-
-        speed_vals = np.array([log.pattern.speed_kmh for log in logs])
-        accel_vals = np.array([log.pattern.accel_kmhs for log in logs])
-        accel_openings = np.array([log.accel_opening_applied for log in logs])
-        brake_openings = np.array([log.brake_opening_applied for log in logs])
-
-        speed_grid = np.unique(speed_vals)
-        accel_grid = np.unique(accel_vals)
-
-        if len(speed_grid) < 2 or len(accel_grid) < 2:
-            raise LearningDataError(
-                "グリッドが不十分です。速度・加速度それぞれ 2 点以上のログが必要です。"
-            )
-
-        grid_speed, grid_accel = np.meshgrid(speed_grid, accel_grid, indexing="ij")
-        points = np.column_stack([speed_vals, accel_vals])
-
-        accel_map = griddata(points, accel_openings, (grid_speed, grid_accel), method="linear")
-        brake_map = griddata(points, brake_openings, (grid_speed, grid_accel), method="linear")
-
-        # NaN（フィルタアウトされたグリッド点）を最近傍値で補完する。
-        # 0 埋めだと FF コントローラーが誤った開度を出力するため最近傍補間を使う。
-        accel_map = _fill_nan_nearest(accel_map, grid_speed, grid_accel)
-        brake_map = _fill_nan_nearest(brake_map, grid_speed, grid_accel)
-
-        safe_profile_id = Path(profile_id).name
-        timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
-        filename = f"{safe_profile_id}_{timestamp}.pkl"
-
-        out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        pkl_path = out_dir / filename
-
-        model_data = {
-            "speed_grid": speed_grid,
-            "accel_grid": accel_grid,
-            "accel_map": accel_map,
-            "brake_map": brake_map,
-        }
-        with pkl_path.open("wb") as f:
-            pickle.dump(model_data, f)
-
-        return str(pkl_path)

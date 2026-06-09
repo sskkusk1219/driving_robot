@@ -50,6 +50,51 @@ class SessionRepository:
             )
         return [_row_to_log(row) for row in rows]
 
+    async def list_logs_for_training(
+        self,
+        profile_id: str,
+        session_ids: list[str] | None = None,
+        limit: int = 100_000,
+    ) -> list[DriveLog]:
+        """プロファイルに紐づくセッションのログを学習用に集約取得する。
+
+        session_id ごとにまとめ、各セッション内は timestamp 昇順で返す。
+        （先読み特徴量がセッション境界をまたがないよう、呼び出し側で session_id 単位に
+        グループ化する前提。ここでは平坦なリストを返す。）
+
+        Args:
+            profile_id: 対象プロファイルの UUID 文字列
+            session_ids: 学習に使うセッションを限定する場合に指定（None なら全セッション）
+            limit: 取得ログ件数の上限
+        """
+        async with self._pool.acquire() as conn:
+            if session_ids:
+                rows = await conn.fetch(
+                    """
+                    SELECT l.* FROM drive_logs l
+                    JOIN drive_sessions s ON l.session_id = s.id
+                    WHERE s.profile_id = $1 AND l.session_id = ANY($2::uuid[])
+                    ORDER BY l.session_id, l.timestamp ASC
+                    LIMIT $3
+                    """,
+                    uuid.UUID(profile_id),
+                    [uuid.UUID(sid) for sid in session_ids],
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT l.* FROM drive_logs l
+                    JOIN drive_sessions s ON l.session_id = s.id
+                    WHERE s.profile_id = $1
+                    ORDER BY l.session_id, l.timestamp ASC
+                    LIMIT $2
+                    """,
+                    uuid.UUID(profile_id),
+                    limit,
+                )
+        return [_row_to_log(row) for row in rows]
+
 
 def _row_to_session(row: asyncpg.Record) -> DriveSession:
     return DriveSession(

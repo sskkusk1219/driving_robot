@@ -129,7 +129,7 @@ function ManualScreen() {
             <Row cells={[['アクセル pos', '1.4fr'], [`${acc.currentPos} pulse`, '1fr', 'mono']]} />
           </Box>
           <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
-            {robotState === 'RUNNING' ? (
+            {robotState === 'MANUAL' ? (
               <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 運転終了</Btn>
             ) : (
               <Btn big style={{ flex: 1, borderColor: '#3f6b3f', background: '#dfeadc', color: '#22421f' }} onClick={handleStart}>▶ 走行開始</Btn>

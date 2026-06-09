@@ -7,9 +7,13 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from src.infra.profile_repository import ProfileRepository
+from src.infra.profile_repository import (
+    ProfileRepository,
+    _ffp_from_value,
+    _row_to_profile,
+)
 from src.models.calibration import CalibrationData
-from src.models.profile import PIDGains, StopConfig, VehicleProfile
+from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
 
 PROFILE_ID = str(uuid4())
 PROFILE_UUID = UUID(PROFILE_ID)
@@ -99,10 +103,10 @@ class TestSaveCalibration:
 
         args = conn.execute.call_args[0]
         # args: (sql, record_id, profile_id, accel_zero, accel_full, accel_stroke, ...)
-        assert args[3] == 500   # accel_zero_pos
+        assert args[3] == 500  # accel_zero_pos
         assert args[4] == 5500  # accel_full_pos
         assert args[5] == 5000  # accel_stroke
-        assert args[6] == 600   # brake_zero_pos
+        assert args[6] == 600  # brake_zero_pos
         assert args[7] == 5600  # brake_full_pos
         assert args[8] == 5000  # brake_stroke
 
@@ -173,6 +177,83 @@ class TestCreateProfile:
         result = await repo.create(profile)
 
         assert result.id != ""
+
+
+class TestFeedforwardParamsPersistence:
+    def test_ffp_from_value_none_returns_defaults(self) -> None:
+        assert _ffp_from_value(None) == FeedforwardParams()
+
+    def test_ffp_from_value_partial_json_merges_defaults(self) -> None:
+        ffp = _ffp_from_value('{"creep_speed_kmh": 9.0, "stop_brake_opening_pct": 35.0}')
+        assert ffp.creep_speed_kmh == 9.0
+        assert ffp.stop_brake_opening_pct == 35.0
+        # 欠損キーはデフォルト
+        assert ffp.brake_deadband_pct == FeedforwardParams().brake_deadband_pct
+
+    def test_ffp_from_value_accepts_dict(self) -> None:
+        ffp = _ffp_from_value({"accel_deadband_pct": 2.5})
+        assert ffp.accel_deadband_pct == 2.5
+
+    def test_row_to_profile_parses_feedforward_params(self) -> None:
+        row = {
+            "id": PROFILE_UUID,
+            "name": "Car",
+            "max_accel_opening": 80.0,
+            "max_brake_opening": 60.0,
+            "max_speed": 120.0,
+            "max_decel_g": 0.4,
+            "pid_gains": '{"kp": 1.0, "ki": 0.0, "kd": 0.0}',
+            "stop_config": '{"deviation_threshold_kmh": 2.0, "deviation_duration_s": 4.0}',
+            "model_path": None,
+            "feedforward_params": '{"creep_speed_kmh": 8.5}',
+            "created_at": datetime.now(tz=UTC),
+            "updated_at": datetime.now(tz=UTC),
+        }
+        profile = _row_to_profile(row)
+        assert profile.feedforward_params.creep_speed_kmh == 8.5
+
+    def test_row_to_profile_null_feedforward_params_defaults(self) -> None:
+        row = {
+            "id": PROFILE_UUID,
+            "name": "Car",
+            "max_accel_opening": 80.0,
+            "max_brake_opening": 60.0,
+            "max_speed": 120.0,
+            "max_decel_g": 0.4,
+            "pid_gains": '{"kp": 1.0, "ki": 0.0, "kd": 0.0}',
+            "stop_config": '{"deviation_threshold_kmh": 2.0, "deviation_duration_s": 4.0}',
+            "model_path": None,
+            "feedforward_params": None,
+            "created_at": datetime.now(tz=UTC),
+            "updated_at": datetime.now(tz=UTC),
+        }
+        profile = _row_to_profile(row)
+        assert profile.feedforward_params == FeedforwardParams()
+
+    @pytest.mark.asyncio
+    async def test_create_serializes_feedforward_params(self) -> None:
+        pool, conn = make_mock_pool()
+        repo = ProfileRepository(pool)
+        profile = VehicleProfile(
+            id=str(uuid4()),
+            name="FfpCar",
+            max_accel_opening=80.0,
+            max_brake_opening=60.0,
+            max_speed=120.0,
+            max_decel_g=0.4,
+            pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+            stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+            calibration=None,
+            model_path=None,
+            created_at=datetime.now(tz=UTC),
+            updated_at=datetime.now(tz=UTC),
+            feedforward_params=FeedforwardParams(creep_speed_kmh=9.0),
+        )
+        result = await repo.create(profile)
+        # INSERT 引数のいずれかに feedforward_params JSON が含まれること
+        args = conn.execute.call_args[0]
+        assert any(isinstance(a, str) and "creep_speed_kmh" in a for a in args)
+        assert result.feedforward_params.creep_speed_kmh == 9.0
 
 
 class TestDeleteProfile:

@@ -1,3 +1,14 @@
+// ── localStorage helpers ──────────────────────────────────
+function lsGet(key, fallback = null) {
+  try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+}
+function lsSet(key, value) {
+  try {
+    if (value == null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {}
+}
+
 // ── Global state context ──────────────────────────────────
 const AppContext = React.createContext(null);
 
@@ -54,15 +65,22 @@ window.apiFetch = apiFetch;
 function App() {
   const { useState, useEffect, useRef, useCallback } = React;
 
-  const [nav, setNav] = useState('init');
+  const [nav, setNav] = useState(() => lsGet('drv_nav', 'init'));
   const [robotState, setRobotState] = useState('BOOTING');
-  const [activeProfileId, setActiveProfileId] = useState(null);
-  const [activeProfileName, setActiveProfileName] = useState(null);
-  const [activeModeId, setActiveModeId] = useState(null);
-  const [activeModeName, setActiveModeName] = useState(null);
+  const [activeProfileId, setActiveProfileId] = useState(() => lsGet('drv_profile_id', null));
+  const [activeProfileName, setActiveProfileName] = useState(() => lsGet('drv_profile_name', null));
+  const [activeModeId, setActiveModeId] = useState(() => lsGet('drv_mode_id', null));
+  const [activeModeName, setActiveModeName] = useState(() => lsGet('drv_mode_name', null));
   const [upsLoss, setUpsLoss] = useState(false);
   const [realtimeData, setRealtimeData] = useState(INIT_REALTIME);
   const realtimeBuf = useRef([]);
+
+  // ── Persist nav / profile / mode to localStorage ─────────
+  useEffect(() => { lsSet('drv_nav', nav); }, [nav]);
+  useEffect(() => { lsSet('drv_profile_id', activeProfileId); }, [activeProfileId]);
+  useEffect(() => { lsSet('drv_profile_name', activeProfileName); }, [activeProfileName]);
+  useEffect(() => { lsSet('drv_mode_id', activeModeId); }, [activeModeId]);
+  useEffect(() => { lsSet('drv_mode_name', activeModeName); }, [activeModeName]);
 
   // ── System state screen override ─────────────────────────
   const [systemScreen, setSystemScreen] = useState(null);
@@ -81,7 +99,7 @@ function App() {
       try { d = JSON.parse(ev.data); } catch { return; }
       const state = d.robot_state;
       setRobotState(state);
-      setUpsLoss(d.ups_loss ?? false);
+      setUpsLoss(d.ups_on_battery ?? false);
       setRealtimeData(d);
 
       // push to ring buffer
@@ -108,11 +126,25 @@ function App() {
 
   useEffect(() => {
     connectWS();
-    // Poll system state on mount
-    apiFetch('GET', '/api/v1/drive/status').then(d => {
+    apiFetch('GET', '/api/v1/drive/status').then(async d => {
       if (!d) return;
       setRobotState(d.robot_state);
-      if (d.active_profile_id) setActiveProfileId(d.active_profile_id);
+      const serverProfileId = d.active_profile_id ?? null;
+      if (serverProfileId) {
+        setActiveProfileId(serverProfileId);
+        if (serverProfileId !== lsGet('drv_profile_id')) {
+          const profile = await apiFetch('GET', `/api/v1/profiles/${serverProfileId}`);
+          if (profile) {
+            setActiveProfileName(profile.name);
+          } else {
+            setActiveProfileId(null);
+            setActiveProfileName(null);
+          }
+        }
+      } else {
+        setActiveProfileId(null);
+        setActiveProfileName(null);
+      }
     });
     return () => {
       if (wsRef.current) wsRef.current.close();
@@ -172,7 +204,16 @@ function App() {
         profileName: activeProfileName,
         modeName: activeModeName,
         onNav: key => setNav(key),
-        onGoInit: () => setNav('init'),
+        // 非常停止オーバーレイの「初期化画面へ」。スイッチ解除後、まず非常停止を
+        // リセット（EMERGENCY → STANDBY）してから初期化画面へ遷移する。
+        // リセットしないと robotState が EMERGENCY のままでオーバーレイが消えない。
+        onGoInit: async () => {
+          const r = await apiFetch('POST', '/api/v1/drive/reset-emergency');
+          if (r) {
+            showToast('非常停止をリセットしました', 'success');
+            setNav('init');
+          }
+        },
       },
       renderScreen()
     )

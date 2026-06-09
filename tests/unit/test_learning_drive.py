@@ -1,16 +1,10 @@
 """LearningDriveManager のユニットテスト。"""
 
-import pickle
-import tempfile
 from datetime import UTC, datetime
-from pathlib import Path
 
-import numpy as np
 import pytest
 
-from src.domain.control.feedforward import FeedforwardController
 from src.domain.learning_drive import (
-    LearningDataError,
     LearningDriveConfig,
     LearningDriveManager,
 )
@@ -101,32 +95,51 @@ class MockCAN:
         return self._speed
 
 
-def make_logs(n: int, speeds: list[float] | None = None) -> list[LearningLog]:
-    """n 個の LearningLog を生成する。グリッドは 2×2 以上になるよう速度・加速度を分散させる。"""
-    logs = []
-    speed_list = [10.0, 20.0, 30.0, 40.0]
-    accel_list = [0.0, 2.0, -1.0, 1.0]
-    for i in range(n):
-        s = speed_list[i % len(speed_list)]
-        a = accel_list[i % len(accel_list)]
-        actual = speeds[i] if speeds else s
-        pattern = LearningPattern(
-            speed_kmh=s,
-            accel_kmhs=a,
-            accel_opening=min(40.0 + i * 5, 80.0),
-            brake_opening=0.0 if a >= 0 else 20.0,
-            hold_duration_s=2.0,
-        )
-        logs.append(
-            LearningLog(
-                pattern=pattern,
-                actual_speed_kmh=actual,
-                accel_opening_applied=pattern.accel_opening,
-                brake_opening_applied=pattern.brake_opening,
-                recorded_at=datetime.now(tz=UTC),
-            )
-        )
-    return logs
+# ---------------------------------------------------------------------------
+# build_learning_reference テスト
+# ---------------------------------------------------------------------------
+
+
+class TestBuildLearningReference:
+    def test_returns_driving_mode(self) -> None:
+        from src.models.driving_mode import DrivingMode
+
+        manager = make_manager()
+        mode = manager.build_learning_reference(make_profile(max_speed=100.0))
+        assert isinstance(mode, DrivingMode)
+        assert mode.max_speed == 100.0
+
+    def test_starts_and_ends_at_zero_speed(self) -> None:
+        manager = make_manager()
+        mode = manager.build_learning_reference(make_profile())
+        assert mode.reference_speed[0].speed_kmh == 0.0
+        assert mode.reference_speed[-1].speed_kmh == 0.0
+
+    def test_times_are_monotonically_increasing(self) -> None:
+        manager = make_manager()
+        mode = manager.build_learning_reference(make_profile())
+        times = [p.time_s for p in mode.reference_speed]
+        assert times == sorted(times)
+        assert mode.total_duration == times[-1]
+
+    def test_covers_up_to_max_speed(self) -> None:
+        manager = make_manager(speed_step=20.0)
+        mode = manager.build_learning_reference(make_profile(max_speed=100.0))
+        peak = max(p.speed_kmh for p in mode.reference_speed)
+        assert peak == 100.0
+
+    def test_never_exceeds_max_speed(self) -> None:
+        manager = make_manager(speed_step=30.0)
+        profile = make_profile(max_speed=100.0)
+        mode = manager.build_learning_reference(profile)
+        for p in mode.reference_speed:
+            assert p.speed_kmh <= profile.max_speed + 1e-9
+
+    def test_mode_id_is_not_persisted_uuid(self) -> None:
+        """学習用は一時生成のため learning- プレフィックス付き ID とする。"""
+        manager = make_manager()
+        mode = manager.build_learning_reference(make_profile())
+        assert mode.id.startswith("learning-")
 
 
 # ---------------------------------------------------------------------------
@@ -264,133 +277,3 @@ class TestRunPattern:
 
         # 50% of stroke=5000 → 2500 + zero=100 → 2600
         assert accel.positions_commanded[0] == 2600
-
-
-# ---------------------------------------------------------------------------
-# train_model テスト
-# ---------------------------------------------------------------------------
-
-
-class TestTrainModel:
-    def test_pkl_file_is_created(self) -> None:
-        manager = make_manager()
-        logs = make_logs(8)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = manager.train_model(logs, "test-profile", output_dir=tmpdir)
-            assert Path(path).exists()
-
-    def test_pkl_contains_required_keys(self) -> None:
-        manager = make_manager()
-        logs = make_logs(8)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = manager.train_model(logs, "test-profile", output_dir=tmpdir)
-            with open(path, "rb") as f:
-                data = pickle.load(f)  # noqa: S301
-            assert "speed_grid" in data
-            assert "accel_grid" in data
-            assert "accel_map" in data
-            assert "brake_map" in data
-
-    def test_feedforward_controller_can_load_model(self) -> None:
-        manager = make_manager()
-        logs = make_logs(8)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = manager.train_model(logs, "test-profile", output_dir=tmpdir)
-            ff = FeedforwardController()
-            ff.load_model(path)
-            accel_opening, brake_opening = ff.predict(15.0, 0.0)
-            assert 0.0 <= accel_opening <= 100.0
-            assert 0.0 <= brake_opening <= 100.0
-
-    def test_raises_learning_data_error_when_logs_insufficient(self) -> None:
-        manager = LearningDriveManager(LearningDriveConfig(min_logs_for_training=4))
-        logs = make_logs(3)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(LearningDataError):
-                manager.train_model(logs, "test-profile", output_dir=tmpdir)
-
-    def test_raises_learning_data_error_when_grid_insufficient(self) -> None:
-        manager = make_manager()
-        # 全ログが同一速度・同一加速度 → グリッドが 1×1
-        pattern = LearningPattern(
-            speed_kmh=30.0,
-            accel_kmhs=0.0,
-            accel_opening=40.0,
-            brake_opening=0.0,
-            hold_duration_s=2.0,
-        )
-        logs = [
-            LearningLog(
-                pattern=pattern,
-                actual_speed_kmh=30.0,
-                accel_opening_applied=40.0,
-                brake_opening_applied=0.0,
-                recorded_at=datetime.now(tz=UTC),
-            )
-            for _ in range(4)
-        ]
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(LearningDataError):
-                manager.train_model(logs, "test-profile", output_dir=tmpdir)
-
-    def test_profile_id_with_path_separator_is_sanitized(self) -> None:
-        manager = make_manager()
-        logs = make_logs(8)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = manager.train_model(logs, "../evil/profile", output_dir=tmpdir)
-            assert Path(path).parent == Path(tmpdir)
-
-    def test_accel_map_shape_matches_grid(self) -> None:
-        manager = make_manager()
-        logs = make_logs(8)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = manager.train_model(logs, "test-profile", output_dir=tmpdir)
-            with open(path, "rb") as f:
-                data = pickle.load(f)  # noqa: S301
-            n_speed = len(np.unique([data["speed_grid"]]))
-            n_accel = len(np.unique([data["accel_grid"]]))
-            assert data["accel_map"].shape == (n_speed, n_accel)
-            assert data["brake_map"].shape == (n_speed, n_accel)
-
-    def test_nan_regions_filled_with_nearest_neighbor_not_zero(self) -> None:
-        """griddata でグリッド端にNaNが生じても 0 ではなく最近傍値で補完されること。
-
-        疎なログ（3速度×2加速度の6点）を使って3×3グリッドを構築すると
-        凸包外に NaN が発生する。その NaN が 0 ではなく隣接値で埋まることを確認。
-        """
-        # 3速度 × 2加速度 = 6点のみのログ（3×3グリッドの凸包を外れる点が生まれる）
-        speeds = [10.0, 20.0, 30.0]
-        accels = [0.0, 2.0]
-        logs = []
-        for s in speeds:
-            for a in accels:
-                pattern = LearningPattern(
-                    speed_kmh=s,
-                    accel_kmhs=a,
-                    accel_opening=s * 0.5,  # 速度比例の開度
-                    brake_opening=0.0,
-                    hold_duration_s=2.0,
-                )
-                logs.append(
-                    LearningLog(
-                        pattern=pattern,
-                        actual_speed_kmh=s,
-                        accel_opening_applied=pattern.accel_opening,
-                        brake_opening_applied=pattern.brake_opening,
-                        recorded_at=datetime.now(tz=UTC),
-                    )
-                )
-
-        manager = make_manager()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = manager.train_model(logs, "test-profile", output_dir=tmpdir)
-            with open(path, "rb") as f:
-                data = pickle.load(f)  # noqa: S301
-
-        # マップに NaN が残っていないこと
-        assert not np.any(np.isnan(data["accel_map"]))
-        assert not np.any(np.isnan(data["brake_map"]))
-
-        # 速度比例パターンなので最大速度点の accel_opening は正（0 で埋まっていない）
-        max_speed_idx = len(data["speed_grid"]) - 1
-        assert data["accel_map"][max_speed_idx, :].max() > 0.0

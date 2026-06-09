@@ -6,7 +6,9 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from src.app.robot_controller import RobotController
+from src.domain.control.feedforward import FeedforwardController
 from src.domain.control.pid import PIDController
+from src.domain.learning_drive import LearningDriveManager
 from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession
@@ -43,6 +45,9 @@ class _StubActuator:
         return 0.0
 
     async def move_to_position(self, pos: int) -> None:  # noqa: ARG002
+        pass
+
+    async def wait_for_position_complete(self) -> None:
         pass
 
 
@@ -100,6 +105,9 @@ class _StubSafetyMonitor:
     async def trigger_emergency(self) -> None:
         pass
 
+    def is_emergency_active(self) -> bool:
+        return False
+
 
 def build_stub_controller() -> RobotController:
     pid = PIDController(kp=1.0, ki=0.0, kd=0.0)
@@ -109,7 +117,9 @@ def build_stub_controller() -> RobotController:
         can_reader=_StubCANReader(),
         safety_monitor=_StubSafetyMonitor(),
         pid=pid,
+        ff_controller=FeedforwardController(),
         last_normal_shutdown=False,
+        learning_manager=LearningDriveManager(),
     )
 
 
@@ -141,6 +151,7 @@ class InMemoryProfileRepository:
             model_path=profile.model_path,
             created_at=now,
             updated_at=now,
+            feedforward_params=profile.feedforward_params,
         )
         self._profiles[profile_id] = stored
         return stored
@@ -162,6 +173,7 @@ class InMemoryProfileRepository:
             model_path=profile.model_path,
             created_at=self._profiles[profile.id].created_at,
             updated_at=now,
+            feedforward_params=profile.feedforward_params,
         )
         self._profiles[profile.id] = updated
         return updated
@@ -226,4 +238,12 @@ class InMemorySessionRepository:
         return None
 
     async def list_logs(self, session_id: str, limit: int = 1000) -> list[DriveLog]:  # noqa: ARG002
+        return []
+
+    async def list_logs_for_training(
+        self,
+        profile_id: str,  # noqa: ARG002
+        session_ids: list[str] | None = None,  # noqa: ARG002
+        limit: int = 100_000,  # noqa: ARG002
+    ) -> list[DriveLog]:
         return []

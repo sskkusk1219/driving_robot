@@ -2,7 +2,7 @@
 
 function ProfilesScreen() {
   const { useState, useEffect, useContext } = React;
-  const { apiFetch, activeProfileId, setActiveProfileId, setActiveProfileName, setNav } = useContext(window.AppContext);
+  const { apiFetch, activeProfileId, setActiveProfileId, activeProfileName, setActiveProfileName, setNav } = useContext(window.AppContext);
   const { INK, INK_SOFT, INK_MUTE, PAPER, PAPER_2, HATCH, Box, Btn, Pill, H2, Row, RowActions } = window;
 
   const [profiles, setProfiles] = useState([]);
@@ -47,6 +47,7 @@ function ProfilesScreen() {
     const r = await apiFetch('PUT', `/api/v1/profiles/${p.id}`, { name: trimmed });
     if (r) {
       window.showToast('名前を更新しました', 'success');
+      if (p.id === activeProfileId) setActiveProfileName(trimmed);
       setEditingNameId(null);
       setEditingNameValue('');
       loadProfiles();
@@ -289,6 +290,12 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
     deviation_threshold_kmh: initial?.stop_config?.deviation_threshold_kmh ?? 2.0,
     deviation_duration_s: initial?.stop_config?.deviation_duration_s ?? 4.0,
     model_path: initial?.model_path ?? '',
+    creep_speed_kmh: initial?.feedforward_params?.creep_speed_kmh ?? 7.0,
+    creep_rate_kmhs: initial?.feedforward_params?.creep_rate_kmhs ?? 0.5,
+    engine_brake_decel_kmhs: initial?.feedforward_params?.engine_brake_decel_kmhs ?? 1.0,
+    stop_brake_opening_pct: initial?.feedforward_params?.stop_brake_opening_pct ?? 20.0,
+    brake_deadband_pct: initial?.feedforward_params?.brake_deadband_pct ?? 1.0,
+    accel_deadband_pct: initial?.feedforward_params?.accel_deadband_pct ?? 1.0,
   });
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
@@ -307,6 +314,14 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
         deviation_duration_s: Number(form.deviation_duration_s),
       },
       model_path: form.model_path.trim() || null,
+      feedforward_params: {
+        creep_speed_kmh: Number(form.creep_speed_kmh),
+        creep_rate_kmhs: Number(form.creep_rate_kmhs),
+        engine_brake_decel_kmhs: Number(form.engine_brake_decel_kmhs),
+        stop_brake_opening_pct: Number(form.stop_brake_opening_pct),
+        brake_deadband_pct: Number(form.brake_deadband_pct),
+        accel_deadband_pct: Number(form.accel_deadband_pct),
+      },
     });
   }
 
@@ -378,6 +393,18 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
           React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
             inp('逸脱閾値 [km/h]', 'deviation_threshold_kmh', { type: 'number', mono: true }),
             inp('逸脱継続 [s]', 'deviation_duration_s', { type: 'number', mono: true }),
+          ),
+        ),
+
+        // フィードフォワード定数（学習で自動更新／手動調整可）
+        React.createElement(Box, { label: 'フィードフォワード定数', style: { padding: 18 } },
+          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
+            inp('クリープ車速 [km/h]', 'creep_speed_kmh', { type: 'number', mono: true }),
+            inp('クリープ加速率 [km/h/s]', 'creep_rate_kmhs', { type: 'number', mono: true }),
+            inp('エンジンブレーキ減速量 [km/h/s]', 'engine_brake_decel_kmhs', { type: 'number', mono: true }),
+            inp('停車時ブレーキ開度 [%]', 'stop_brake_opening_pct', { type: 'number', mono: true }),
+            inp('ブレーキ不感帯 [%]', 'brake_deadband_pct', { type: 'number', mono: true }),
+            inp('アクセル不感帯 [%]', 'accel_deadband_pct', { type: 'number', mono: true }),
           ),
         ),
       ),

@@ -13,6 +13,11 @@ logger = logging.getLogger(__name__)
 # WebSocket配信は100ms周期で±5msのジッタ許容のため asyncio.sleep を使用（制御ループとは別基準）
 WS_BROADCAST_INTERVAL_S = 0.1
 
+# get_realtime_data（Modbus 読み取り）の上限。これを超えたら計測値はフォールバックし、
+# robot_state の配信を止めない。非常停止中に home_return がバスを占有しても
+# 状態（EMERGENCY）がフロントへ確実に届くようにするための分離措置。
+GET_REALTIME_TIMEOUT_S = 0.5
+
 
 class ConnectionManager:
     def __init__(self) -> None:
@@ -63,12 +68,16 @@ async def broadcast_loop(app: Starlette) -> None:
         controller = app.state.controller
         state = controller.get_system_state()
         try:
-            snapshot = await controller.get_realtime_data()
+            # HW 読み取りがストールしても robot_state の配信を止めないよう上限を設ける。
+            snapshot = await asyncio.wait_for(
+                controller.get_realtime_data(), timeout=GET_REALTIME_TIMEOUT_S
+            )
             actual_speed = snapshot.actual_speed_kmh
             accel_current = snapshot.accel_current_ma
             brake_current = snapshot.brake_current_ma
         except Exception as exc:
-            logger.debug("get_realtime_data 失敗（フォールバック）: %s", exc)
+            # TimeoutError も Exception のサブクラスのためここで捕捉される。
+            logger.debug("get_realtime_data 失敗/タイムアウト（フォールバック）: %s", exc)
             actual_speed = 0.0
             accel_current = 0.0
             brake_current = 0.0

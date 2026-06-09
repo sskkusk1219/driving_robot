@@ -4,8 +4,8 @@
 キー操作でアクチュエータをジョグし、ペダル位置を目視確認しながらゼロ/フル点を記録する。
 
 操作方法（ジョグモード）:
-    +/-  : ±0.5mm 移動
-    ./,  : ±0.1mm 移動
+    e/w  : ±1.0mm 移動
+    d/s  : ±0.5mm 移動
     Enter: 現在位置を確定
     q    : 中止
 
@@ -32,15 +32,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.infra.actuator_driver import ActuatorDriver
 
 # --- 接続設定 ---
-_ACCEL_PORT = "/dev/ttyUSB0"
-_BRAKE_PORT = "/dev/ttyUSB1"
+_ACCEL_PORT = "/dev/ttyUSB1"
+_BRAKE_PORT = "/dev/ttyUSB2"
 _ACCEL_SLAVE_ID = 1
 _BRAKE_SLAVE_ID = 1  # 両軸とも slave_id=1（各軸が独立した RS-485 バス上）
 _BAUD_RATE = 38400
 
 # --- ジョグパラメータ ---
-_JOG_STEP_LARGE = 100  # +/- キー: 移動量 [pulse] = 1.0mm
-_JOG_STEP_SMALL = 50   # ./,  キー: 移動量 [pulse] = 0.1mm
+_JOG_STEP_LARGE = 100  # e/w キー: 移動量 [pulse] = 1.0mm
+_JOG_STEP_SMALL = 50   # d/s キー: 移動量 [pulse] = 0.5mm
 _STEP_INTERVAL_S = 0.15  # ジョグ後の安定待機時間 [s]
 
 # 電流サンプリング（中央値フィルタ）

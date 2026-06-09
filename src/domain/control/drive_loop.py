@@ -132,7 +132,8 @@ class DriveLoop:
             await self._on_complete()
             return
 
-        ref_speed, ref_accel = self._get_ref_speed_and_accel(elapsed_s)
+        ref_speed = self._ref_speed_at(elapsed_s)
+        future_speeds = [self._ref_speed_at(elapsed_s + h) for h in self._ff.horizons]
 
         try:
             actual_speed = await self._can_reader.read_speed()
@@ -142,7 +143,12 @@ class DriveLoop:
             await self._on_emergency()
             return
 
-        ff_accel, ff_brake = self._ff.predict(ref_speed, ref_accel)
+        # 運転モデル未ロード（初回学習走行）では FF を 0 とし PID のみで基準を追従する。
+        # 収集した連続ログから初回モデルを学習し、以降は FF+PID で精度を上げるブートストラップ。
+        if self._ff.has_model:
+            ff_accel, ff_brake = self._ff.predict(ref_speed, future_speeds)
+        else:
+            ff_accel, ff_brake = 0.0, 0.0
         pid_correction = self._pid.update(ref_speed, actual_speed)
 
         raw_accel = ff_accel + max(0.0, pid_correction)
@@ -230,32 +236,33 @@ class DriveLoop:
             task = asyncio.ensure_future(self._log_writer.write_log(self._session_id, data))
             task.add_done_callback(_log_write_error_callback)
 
-    def _get_ref_speed_and_accel(self, elapsed_s: float) -> tuple[float, float]:
-        """経過時間 [s] から基準車速 [km/h] と基準加速度 [km/h/s] を線形補間で返す。"""
+    def _ref_speed_at(self, t_s: float) -> float:
+        """経過時間 [s] における基準車速 [km/h] を線形補間で返す。範囲外は端点値でクランプ。
+
+        先読み（t_s = elapsed + horizon）でも使うため、軌跡末尾を超える場合は終端値を返す。
+        """
         points = self._mode.reference_speed
 
         if not points:
-            return 0.0, 0.0
+            return 0.0
 
-        if elapsed_s <= points[0].time_s:
-            return points[0].speed_kmh, 0.0
+        if t_s <= points[0].time_s:
+            return points[0].speed_kmh
 
-        if elapsed_s >= points[-1].time_s:
-            return points[-1].speed_kmh, 0.0
+        if t_s >= points[-1].time_s:
+            return points[-1].speed_kmh
 
         for i in range(len(points) - 1):
             p0 = points[i]
             p1 = points[i + 1]
-            if p0.time_s <= elapsed_s <= p1.time_s:
+            if p0.time_s <= t_s <= p1.time_s:
                 dt = p1.time_s - p0.time_s
                 if dt == 0.0:
-                    return p1.speed_kmh, 0.0
-                t_frac = (elapsed_s - p0.time_s) / dt
-                speed = p0.speed_kmh + t_frac * (p1.speed_kmh - p0.speed_kmh)
-                accel = (p1.speed_kmh - p0.speed_kmh) / dt
-                return speed, accel
+                    return p1.speed_kmh
+                t_frac = (t_s - p0.time_s) / dt
+                return p0.speed_kmh + t_frac * (p1.speed_kmh - p0.speed_kmh)
 
-        return points[-1].speed_kmh, 0.0
+        return points[-1].speed_kmh
 
     def _opening_to_position(self, opening_pct: float, zero_pos: int, full_pos: int) -> int:
         """開度 [%] をアクチュエータ位置 [pulse] に変換する。"""

@@ -49,7 +49,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from src.app.factory import build_real_controller  # noqa: PLC0415
         from src.infra.settings import load_settings  # noqa: PLC0415
 
-        controller, ups_monitor = await build_real_controller(load_settings())
+        # ベンチ検証モード: 非常停止スイッチ(GPIO)のみ実機、アクチュエータ/CAN はスタブ
+        bench_gpio_only = os.environ.get("DRIVING_ROBOT_BENCH_GPIO_ONLY") == "1"
+        controller, ups_monitor = await build_real_controller(
+            load_settings(), bench_gpio_only=bench_gpio_only
+        )
         await ups_monitor.start_polling()
     else:
         controller = build_stub_controller()

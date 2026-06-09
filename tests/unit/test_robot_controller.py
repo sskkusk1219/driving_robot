@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.app.robot_controller import (
+    EmergencyStillActive,
     InvalidStateTransition,
     RobotController,
 )
@@ -23,6 +24,8 @@ def make_accel_driver() -> MagicMock:
     driver.reset_alarm = AsyncMock()
     driver.read_position = AsyncMock(return_value=0)
     driver.read_current = AsyncMock(return_value=0.0)
+    driver.move_to_position = AsyncMock()
+    driver.wait_for_position_complete = AsyncMock()
     return driver
 
 
@@ -43,6 +46,7 @@ def make_safety_monitor() -> MagicMock:
     monitor.stop_monitoring = AsyncMock()
     monitor.register_emergency_callback = MagicMock()
     monitor.trigger_emergency = AsyncMock()
+    monitor.is_emergency_active = MagicMock(return_value=False)
     return monitor
 
 
@@ -273,6 +277,34 @@ class TestEmergencyStop:
         assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
 
     @pytest.mark.asyncio
+    async def test_emergency_stop_from_standby(self) -> None:
+        """プロファイル/モード画面や復帰直後(STANDBY)でも非常停止できること。"""
+        ctrl = make_controller()
+        await ctrl.start()  # BOOTING → STANDBY
+        assert ctrl.get_system_state().robot_state == RobotState.STANDBY
+        await ctrl.emergency_stop()
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_from_calibrating(self) -> None:
+        """キャリブレーション画面(CALIBRATING)でも非常停止できること。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.jog_axis("accel", 10)  # READY → CALIBRATING
+        assert ctrl.get_system_state().robot_state == RobotState.CALIBRATING
+        await ctrl.emergency_stop()
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_from_pre_check(self) -> None:
+        """走行前チェック(PRE_CHECK)中でも非常停止できること。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        ctrl._transition(RobotState.PRE_CHECK)  # 走行開始の過渡状態を再現
+        await ctrl.emergency_stop()
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
+
+    @pytest.mark.asyncio
     async def test_emergency_stop_calls_home_return_on_both_axes(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
@@ -304,14 +336,38 @@ class TestEmergencyStop:
         await ctrl.emergency_stop()
         assert ctrl.get_system_state().active_session_id is None
 
+    @pytest.mark.asyncio
+    async def test_emergency_stop_is_reentrant_no_duplicate_home_return(self) -> None:
+        """多重 GPIO 発火を模した連続呼び出しで原点復帰が重複起動しないこと。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.emergency_stop()
+        # 2 回目・3 回目は既に EMERGENCY のため早期 return する想定
+        await ctrl.emergency_stop()
+        await ctrl.emergency_stop()
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
+        ctrl._accel_driver.home_return.assert_called_once()  # type: ignore[attr-defined]
+        ctrl._brake_driver.home_return.assert_called_once()  # type: ignore[attr-defined]
+        ctrl._safety_monitor.trigger_emergency.assert_called_once()  # type: ignore[attr-defined]
+
 
 class TestResetEmergency:
     @pytest.mark.asyncio
-    async def test_reset_emergency_transitions_to_ready(self) -> None:
+    async def test_reset_emergency_transitions_to_standby(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
         await ctrl.emergency_stop()
         await ctrl.reset_emergency()
+        assert ctrl.get_system_state().robot_state == RobotState.STANDBY
+
+    @pytest.mark.asyncio
+    async def test_reset_emergency_then_reinitialize_recovers_to_ready(self) -> None:
+        """非常停止リセット後、初期化を再実行して READY へ復帰できること。"""
+        ctrl = make_controller(last_normal_shutdown=False)
+        await advance_to_ready(ctrl)
+        await ctrl.emergency_stop()
+        await ctrl.reset_emergency()
+        await ctrl.initialize()
         assert ctrl.get_system_state().robot_state == RobotState.READY
 
     @pytest.mark.asyncio
@@ -320,6 +376,31 @@ class TestResetEmergency:
         await advance_to_ready(ctrl)
         with pytest.raises(InvalidStateTransition):
             await ctrl.reset_emergency()
+
+    @pytest.mark.asyncio
+    async def test_reset_emergency_blocked_while_switch_active(self) -> None:
+        """物理スイッチが押下中はリセットを拒否し、EMERGENCY を維持する。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.emergency_stop()
+        ctrl._safety_monitor.is_emergency_active.return_value = True  # type: ignore[attr-defined]
+        with pytest.raises(EmergencyStillActive):
+            await ctrl.reset_emergency()
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
+
+    @pytest.mark.asyncio
+    async def test_reset_emergency_allowed_after_switch_released(self) -> None:
+        """スイッチ解除後はリセットできて STANDBY へ戻る。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.emergency_stop()
+        ctrl._safety_monitor.is_emergency_active.return_value = True  # type: ignore[attr-defined]
+        with pytest.raises(EmergencyStillActive):
+            await ctrl.reset_emergency()
+        # スイッチを戻す
+        ctrl._safety_monitor.is_emergency_active.return_value = False  # type: ignore[attr-defined]
+        await ctrl.reset_emergency()
+        assert ctrl.get_system_state().robot_state == RobotState.STANDBY
 
 
 class TestClearError:
@@ -409,6 +490,116 @@ class TestRunCalibration:
 
         assert ctrl.get_system_state().robot_state == RobotState.READY
         assert result.success is False
+
+
+class TestSaveManualCalibration:
+    async def _enter_calibrating(self, ctrl: RobotController) -> None:
+        """READY から jog で CALIBRATING に入り、両軸の pending を設定する。"""
+        await advance_to_ready(ctrl)
+        await ctrl.jog_axis("accel", 100)  # READY → CALIBRATING
+        ctrl._pending_calib_zero = {"accel": 100, "brake": 200}
+        ctrl._pending_calib_full = {"accel": 5100, "brake": 5200}
+
+    @pytest.mark.asyncio
+    async def test_save_manual_calibration_homes_both_axes_after_save(self) -> None:
+        from src.models.calibration import CalibrationData, CalibrationResult
+
+        ctrl = make_controller()
+        await self._enter_calibrating(ctrl)
+        calib_data = CalibrationData(
+            accel_zero_pos=100,
+            accel_full_pos=5100,
+            accel_stroke=5000,
+            brake_zero_pos=200,
+            brake_full_pos=5200,
+            brake_stroke=5000,
+            calibrated_at=datetime.now(tz=UTC),
+            is_valid=True,
+        )
+        mock_manager = AsyncMock()
+        mock_manager.save_manual = AsyncMock(
+            return_value=CalibrationResult(success=True, data=calib_data, error_message=None)
+        )
+        ctrl._calibration_manager = mock_manager  # type: ignore[assignment]
+        ctrl._accel_driver.home_return.reset_mock()  # type: ignore[attr-defined]
+        ctrl._brake_driver.home_return.reset_mock()  # type: ignore[attr-defined]
+
+        result = await ctrl.save_manual_calibration()
+
+        mock_manager.save_manual.assert_awaited_once()
+        ctrl._accel_driver.home_return.assert_awaited_once()  # type: ignore[attr-defined]
+        ctrl._brake_driver.home_return.assert_awaited_once()  # type: ignore[attr-defined]
+        assert result.success is True
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
+    @pytest.mark.asyncio
+    async def test_save_manual_calibration_failure_stays_calibrating_without_home(self) -> None:
+        from src.models.calibration import CalibrationResult
+
+        ctrl = make_controller()
+        await self._enter_calibrating(ctrl)
+        mock_manager = AsyncMock()
+        mock_manager.save_manual = AsyncMock(
+            return_value=CalibrationResult(
+                success=False, data=None, error_message="ストローク範囲外"
+            )
+        )
+        ctrl._calibration_manager = mock_manager  # type: ignore[assignment]
+        ctrl._accel_driver.home_return.reset_mock()  # type: ignore[attr-defined]
+        ctrl._brake_driver.home_return.reset_mock()  # type: ignore[attr-defined]
+
+        result = await ctrl.save_manual_calibration()
+
+        # 失敗時は原点復帰せず CALIBRATING を維持し、pending を保持してリトライ可能にする
+        ctrl._accel_driver.home_return.assert_not_called()  # type: ignore[attr-defined]
+        ctrl._brake_driver.home_return.assert_not_called()  # type: ignore[attr-defined]
+        assert result.success is False
+        assert ctrl.get_system_state().robot_state == RobotState.CALIBRATING
+        assert ctrl._pending_calib_zero == {"accel": 100, "brake": 200}
+        assert ctrl._pending_calib_full == {"accel": 5100, "brake": 5200}
+
+    @pytest.mark.asyncio
+    async def test_save_manual_calibration_exception_stays_calibrating(self) -> None:
+        ctrl = make_controller()
+        await self._enter_calibrating(ctrl)
+        mock_manager = AsyncMock()
+        mock_manager.save_manual = AsyncMock(side_effect=RuntimeError("DBエラー"))
+        ctrl._calibration_manager = mock_manager  # type: ignore[assignment]
+        ctrl._accel_driver.home_return.reset_mock()  # type: ignore[attr-defined]
+        ctrl._brake_driver.home_return.reset_mock()  # type: ignore[attr-defined]
+
+        with pytest.raises(RuntimeError):
+            await ctrl.save_manual_calibration()
+
+        # 例外時も CALIBRATING を維持しリトライ可能（原点復帰しない）
+        assert ctrl.get_system_state().robot_state == RobotState.CALIBRATING
+        ctrl._accel_driver.home_return.assert_not_called()  # type: ignore[attr-defined]
+        assert ctrl._pending_calib_zero == {"accel": 100, "brake": 200}
+
+    @pytest.mark.asyncio
+    async def test_save_manual_calibration_from_ready_raises(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.save_manual_calibration()
+
+
+class TestJogAxis:
+    @pytest.mark.asyncio
+    async def test_jog_axis_waits_for_position_complete_before_reading(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.jog_axis("accel", 100)
+        # 移動完了待ちを挟んでから位置を読むこと
+        ctrl._accel_driver.wait_for_position_complete.assert_awaited_once()  # type: ignore[attr-defined]
+        ctrl._accel_driver.move_to_position.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_jog_axis_invalid_axis_raises(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        with pytest.raises(ValueError):
+            await ctrl.jog_axis("steering", 100)
 
 
 class TestStartAutoDrive:
@@ -836,6 +1027,65 @@ class TestSelectProfile:
         with pytest.raises(InvalidStateTransition):
             ctrl.select_profile(profile)  # type: ignore[arg-type]
 
+    def _make_controller_with_ff(self, ff: object) -> RobotController:
+        return RobotController(
+            accel_driver=make_accel_driver(),
+            brake_driver=make_brake_driver(),
+            can_reader=make_can_reader(),
+            safety_monitor=make_safety_monitor(),
+            pid=make_pid(),
+            last_normal_shutdown=True,
+            ff_controller=ff,  # type: ignore[arg-type]
+        )
+
+    @pytest.mark.asyncio
+    async def test_select_profile_loads_model_when_path_present(self) -> None:
+        from src.domain.control.feedforward import FeedforwardController  # noqa: PLC0415
+
+        ff = MagicMock(spec=FeedforwardController)
+        ctrl = self._make_controller_with_ff(ff)
+        await ctrl.start()
+        profile = self._make_profile()
+        profile.model_path = "data/models/x.pkl"  # type: ignore[attr-defined]
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+        ff.load_model.assert_called_once_with("data/models/x.pkl")
+
+    @pytest.mark.asyncio
+    async def test_select_profile_sets_feedforward_params(self) -> None:
+        from src.domain.control.feedforward import FeedforwardController  # noqa: PLC0415
+
+        ff = MagicMock(spec=FeedforwardController)
+        ctrl = self._make_controller_with_ff(ff)
+        await ctrl.start()
+        profile = self._make_profile()  # model_path=None でも params は適用される
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+        ff.set_params.assert_called_once_with(profile.feedforward_params)  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_select_profile_without_model_path_skips_load(self) -> None:
+        from src.domain.control.feedforward import FeedforwardController  # noqa: PLC0415
+
+        ff = MagicMock(spec=FeedforwardController)
+        ctrl = self._make_controller_with_ff(ff)
+        await ctrl.start()
+        profile = self._make_profile()  # model_path=None
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+        ff.load_model.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_select_profile_load_failure_does_not_raise(self) -> None:
+        from src.domain.control.feedforward import FeedforwardController  # noqa: PLC0415
+
+        ff = MagicMock(spec=FeedforwardController)
+        ff.load_model.side_effect = FileNotFoundError("missing")
+        ctrl = self._make_controller_with_ff(ff)
+        await ctrl.start()
+        profile = self._make_profile()
+        profile.model_path = "data/models/missing.pkl"  # type: ignore[attr-defined]
+        # ロード失敗でも例外を送出せず、プロファイル選択自体は成功する
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+        assert ctrl.get_active_profile() is profile
+
     @pytest.mark.asyncio
     async def test_select_profile_can_be_overwritten(self) -> None:
         from datetime import datetime  # noqa: PLC0415
@@ -944,3 +1194,153 @@ class TestStartLearningDrive:
         await advance_to_ready(ctrl)
         await ctrl.start_learning_drive()
         assert ctrl.get_system_state().robot_state == RobotState.RUNNING
+
+
+def _make_profile_with_calibration() -> object:
+    from src.models.calibration import CalibrationData  # noqa: PLC0415
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
+
+    return VehicleProfile(
+        id="prof-uuid-1",
+        name="LogCar",
+        max_accel_opening=80.0,
+        max_brake_opening=60.0,
+        max_speed=120.0,
+        max_decel_g=0.5,
+        pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=CalibrationData(
+            accel_zero_pos=0,
+            accel_full_pos=5000,
+            accel_stroke=5000,
+            brake_zero_pos=0,
+            brake_full_pos=5000,
+            brake_stroke=5000,
+            calibrated_at=datetime.now(tz=UTC),
+            is_valid=True,
+        ),
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
+    )
+
+
+def _make_mode() -> object:
+    from src.models.driving_mode import DrivingMode, SpeedPoint  # noqa: PLC0415
+
+    return DrivingMode(
+        id="mode-uuid-1",
+        name="LogMode",
+        description="",
+        reference_speed=[
+            SpeedPoint(time_s=0.0, speed_kmh=0.0),
+            SpeedPoint(time_s=5.0, speed_kmh=60.0),
+        ],
+        total_duration=5.0,
+        max_speed=60.0,
+        created_at=datetime.now(tz=UTC),
+    )
+
+
+def _make_controller_for_logging() -> RobotController:
+    """ff_controller / safety_check / learning_manager を備えた、DriveLoop を起動できる構成。"""
+    from src.domain.control.feedforward import FeedforwardController  # noqa: PLC0415
+
+    accel = make_accel_driver()
+    accel.move_to_position = AsyncMock()
+    brake = make_brake_driver()
+    brake.move_to_position = AsyncMock()
+    learning_manager = MagicMock()
+    learning_manager.build_learning_reference = MagicMock(return_value=_make_mode())
+    return RobotController(
+        accel_driver=accel,
+        brake_driver=brake,
+        can_reader=make_can_reader(),
+        safety_monitor=make_safety_monitor(),
+        pid=make_pid(),
+        last_normal_shutdown=True,
+        ff_controller=MagicMock(spec=FeedforwardController),
+        safety_check=MagicMock(),
+        learning_manager=learning_manager,  # type: ignore[arg-type]
+    )
+
+
+class TestDriveSessionLogging:
+    """走行ログ収集の配線（セッション採番・DriveLoop 起動・end_session 記録）。"""
+
+    @pytest.mark.asyncio
+    async def test_auto_drive_with_log_writer_opens_session_and_builds_loop(self) -> None:
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+        log_writer = MagicMock()
+        log_writer.start_session = AsyncMock(return_value="db-sess-1")
+        log_writer.end_session = AsyncMock()
+
+        session = await ctrl.start_auto_drive(
+            "mode-uuid-1", mode=_make_mode(), profile=profile, log_writer=log_writer  # type: ignore[arg-type]
+        )
+
+        log_writer.start_session.assert_awaited_once_with("prof-uuid-1", "mode-uuid-1", "auto")
+        assert session.id == "db-sess-1"
+        assert ctrl._drive_loop is not None
+
+        await ctrl.stop_auto_drive()
+        log_writer.end_session.assert_awaited_once_with("db-sess-1", "completed")
+        assert ctrl._drive_loop is None
+
+    @pytest.mark.asyncio
+    async def test_auto_drive_emergency_ends_session_with_emergency_status(self) -> None:
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+        log_writer = MagicMock()
+        log_writer.start_session = AsyncMock(return_value="db-sess-2")
+        log_writer.end_session = AsyncMock()
+
+        await ctrl.start_auto_drive(
+            "mode-uuid-1", mode=_make_mode(), profile=profile, log_writer=log_writer  # type: ignore[arg-type]
+        )
+        await ctrl.emergency_stop()
+        log_writer.end_session.assert_awaited_once_with("db-sess-2", "emergency")
+
+    @pytest.mark.asyncio
+    async def test_learning_drive_with_log_writer_opens_session_and_builds_loop(self) -> None:
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+        log_writer = MagicMock()
+        log_writer.start_session = AsyncMock(return_value="learn-sess-1")
+        log_writer.end_session = AsyncMock()
+
+        session = await ctrl.start_learning_drive(log_writer=log_writer)
+
+        log_writer.start_session.assert_awaited_once_with("prof-uuid-1", None, "learning")
+        assert session.run_type == "learning"
+        assert session.mode_id is None
+        assert session.id == "learn-sess-1"
+        ctrl._learning_manager.build_learning_reference.assert_called_once_with(profile)  # type: ignore[attr-defined]
+        assert ctrl._drive_loop is not None
+
+        # 手動停止（/stop）で RUNNING→READY・セッション completed 終了
+        await ctrl.stop()
+        log_writer.end_session.assert_awaited_once_with("learn-sess-1", "completed")
+
+    @pytest.mark.asyncio
+    async def test_learning_drive_without_log_writer_uses_local_uuid(self) -> None:
+        from uuid import UUID  # noqa: PLC0415
+
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+        session = await ctrl.start_learning_drive(log_writer=None)
+        UUID(session.id)  # ローカル採番の UUID として解析できる
+        assert ctrl._log_writer is None

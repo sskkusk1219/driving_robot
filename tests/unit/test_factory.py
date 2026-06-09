@@ -118,6 +118,7 @@ class TestBuildRealController:
         mock_can.assert_called_once_with(
             interface="kvaser",
             channel=0,
+            bitrate=500000,
             dbc_path="config/can/MEIDEN_MEIDACS.dbc",
         )
 
@@ -277,6 +278,32 @@ class TestBuildRealController:
 
         assert ctrl._safety_check is not None
         assert isinstance(ctrl._safety_check, SafetyMonitor)
+
+    @pytest.mark.asyncio
+    async def test_bench_gpio_only_stubs_actuators_and_can_but_keeps_real_gpio(self) -> None:
+        """bench_gpio_only=True ではアクチュエータ/CAN を生成せず、GPIO は実機のまま。"""
+        settings = make_settings()
+        with (
+            patch("src.app.factory.ActuatorDriver") as mock_actuator,
+            patch("src.app.factory.CANReader") as mock_can,
+            patch("src.app.factory.GPIOMonitor") as mock_gpio,
+            patch("src.app.factory.NutUPSMonitor"),
+            patch("src.app.factory.create_pool", new_callable=AsyncMock),
+            patch("src.app.factory.ProfileRepository"),
+        ):
+            mock_gpio.return_value.register_emergency_callback = MagicMock()
+            mock_gpio.return_value.register_ac_loss_callback = MagicMock()
+            ctrl, _ = await build_real_controller(settings, bench_gpio_only=True)
+
+        assert isinstance(ctrl, RobotController)
+        # 実アクチュエータ/CAN は生成されない（スタブに置換）
+        mock_actuator.assert_not_called()
+        mock_can.assert_not_called()
+        # 非常停止スイッチ(GPIO)は実機のまま生成・配線される
+        mock_gpio.assert_called_once_with(emergency_pin=17, ac_detect_pin=27)
+        mock_gpio.return_value.register_emergency_callback.assert_called_once_with(
+            ctrl.emergency_stop
+        )
 
     @pytest.mark.asyncio
     async def test_safety_monitor_uses_overcurrent_limit_from_settings(self) -> None:

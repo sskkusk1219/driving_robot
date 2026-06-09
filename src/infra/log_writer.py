@@ -10,10 +10,13 @@ from src.models.drive_log import DriveLogData
 class LogWriter:
     """走行セッションとログデータを PostgreSQL に永続化する。
 
-    asyncpg.Connection を外部から受け取る設計（接続プール管理は呼び出し元が担当）。
+    asyncpg.Connection または asyncpg.Pool を受け取る。Pool を渡した場合は
+    各操作（start_session / write_log / end_session）ごとに Pool.execute が
+    接続を都度取得・解放するため、Web 駆動で寿命が不定な走行セッションに適合する。
+    単一 Connection を渡した場合は呼び出し元が接続寿命を管理する。
     """
 
-    def __init__(self, conn: asyncpg.Connection) -> None:
+    def __init__(self, conn: asyncpg.Connection | asyncpg.Pool) -> None:
         self._conn = conn
 
     async def start_session(

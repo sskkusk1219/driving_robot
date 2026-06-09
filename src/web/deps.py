@@ -4,8 +4,8 @@ from typing import Protocol
 
 from fastapi import Request
 
-from src.app.robot_controller import RobotController
-from src.infra.ups_monitor import NutUPSMonitor, UPSStatus
+from src.app.robot_controller import LogWriterProtocol, RobotController
+from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession
 from src.models.driving_mode import DrivingMode
@@ -33,6 +33,12 @@ class SessionRepoProtocol(Protocol):
     async def list_all(self, limit: int = 100) -> list[DriveSession]: ...
     async def get_by_id(self, session_id: str) -> DriveSession | None: ...
     async def list_logs(self, session_id: str, limit: int = 1000) -> list[DriveLog]: ...
+    async def list_logs_for_training(
+        self,
+        profile_id: str,
+        session_ids: list[str] | None = None,
+        limit: int = 100_000,
+    ) -> list[DriveLog]: ...
 
 
 class UPSMonitorProtocol(Protocol):
@@ -45,6 +51,19 @@ class UPSMonitorProtocol(Protocol):
 def get_controller(request: Request) -> RobotController:
     controller: RobotController = request.app.state.controller
     return controller
+
+
+def get_log_writer(request: Request) -> LogWriterProtocol | None:
+    """DB プールが利用可能なら走行ログを永続化する LogWriter を返す。
+
+    in-memory 環境（DB なし）では None を返し、走行ログ記録を無効化する。
+    """
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is None:
+        return None
+    from src.infra.log_writer import LogWriter  # noqa: PLC0415
+
+    return LogWriter(pool)
 
 
 def get_profile_repo(request: Request) -> ProfileRepoProtocol:

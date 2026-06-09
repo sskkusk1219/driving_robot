@@ -80,6 +80,41 @@ class TestCallbacks:
         monitor.register_emergency_callback(cb)
         monitor._on_emergency(0, 17, 1, 0)  # ループが None でもクラッシュしない
 
+    def test_release_edge_does_not_fire_emergency(self) -> None:
+        """解除エッジ (level=0) では非常停止コールバックを発火しない。"""
+        monitor = GPIOMonitor(emergency_pin=17, ac_detect_pin=27)
+        mock_loop = MagicMock()
+        monitor._loop = mock_loop
+
+        cb = AsyncMock()
+        monitor.register_emergency_callback(cb)
+        monitor._on_emergency(0, 17, 0, 0)  # FALLING=解除
+
+        mock_loop.is_running.assert_not_called()
+        assert monitor._emergency_active is False
+
+
+class TestIsEmergencyActive:
+    def test_tracks_edges_when_handle_absent(self) -> None:
+        monitor = GPIOMonitor(emergency_pin=17, ac_detect_pin=27)
+        monitor._loop = MagicMock()
+        assert monitor.is_emergency_active() is False
+        monitor._on_emergency(0, 17, 1, 0)  # 押下
+        assert monitor.is_emergency_active() is True
+        monitor._on_emergency(0, 17, 0, 0)  # 解除
+        assert monitor.is_emergency_active() is False
+
+    def test_reads_live_level_when_handle_present(self) -> None:
+        monitor = GPIOMonitor(emergency_pin=17, ac_detect_pin=27)
+        monitor._handle = 0
+        mock_lgpio = _make_lgpio_mock()
+        mock_lgpio.gpio_read.return_value = 1  # HIGH=押下中
+
+        with patch.dict("sys.modules", {"lgpio": mock_lgpio}):
+            assert monitor.is_emergency_active() is True
+            mock_lgpio.gpio_read.return_value = 0  # LOW=解除
+            assert monitor.is_emergency_active() is False
+
     @pytest.mark.asyncio
     async def test_callback_invoked_via_run_coroutine_threadsafe(self) -> None:
         loop = asyncio.get_event_loop()

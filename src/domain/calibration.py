@@ -101,6 +101,46 @@ class CalibrationManager:
             error_message=None if validation.is_valid else validation.error_message,
         )
 
+    async def save_manual(
+        self,
+        profile_id: str,
+        accel_zero: int | None,
+        accel_full: int | None,
+        brake_zero: int | None,
+        brake_full: int | None,
+    ) -> CalibrationResult:
+        """手動ジョグで記録したゼロ/フル点でキャリブレーションデータを保存する。
+
+        バリデーション成功時かつ profile_repo が注入されている場合に永続化する。
+        """
+        if any(v is None for v in [accel_zero, accel_full, brake_zero, brake_full]):
+            return CalibrationResult(
+                success=False,
+                data=None,
+                error_message="全軸の ZERO/FULL が設定されていません",
+            )
+        # 型チェック後は None でないことが確定（mypy 向け）
+        az, af, bz, bf = int(accel_zero), int(accel_full), int(brake_zero), int(brake_full)
+        data = CalibrationData(
+            accel_zero_pos=az,
+            accel_full_pos=af,
+            accel_stroke=af - az,
+            brake_zero_pos=bz,
+            brake_full_pos=bf,
+            brake_stroke=bf - bz,
+            calibrated_at=datetime.now(tz=UTC),
+            is_valid=False,
+        )
+        validation = self._validate(data)
+        data.is_valid = validation.is_valid
+        if validation.is_valid and self._profile_repo is not None:
+            await self._profile_repo.save_calibration(profile_id, data)
+        return CalibrationResult(
+            success=validation.is_valid,
+            data=data,
+            error_message=None if validation.is_valid else validation.error_message,
+        )
+
     async def _detect_zero(self, driver: CalibrationActuatorProtocol) -> int:
         """原点から正方向に移動し、電流急増で接触点(zero)を検出する。"""
         await driver.home_return()
