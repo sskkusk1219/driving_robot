@@ -596,15 +596,23 @@ sequenceDiagram
         RC-->>UI: 待機状態表示
         Op->>UI: 「初期化」ボタン押下
         UI->>RC: initialize()
+        RC->>HW: 通信確認（ブレーキ→アクセル→CAN）
         RC->>HW: アラームリセット → サーボON
         alt 前回正常終了
             Note over RC: 原点復帰スキップ
         else 前回異常終了 or 初回
             RC->>HW: 原点復帰 home_return()
         end
+        Note over RC,UI: 各ステップ完了ごとに進捗(init_steps)を<br/>WebSocketリアルタイム配信し初期化画面と連動
         RC-->>UI: READY状態表示
     end
 ```
+
+> 初期化画面の各チェック欄（通信確認・アラームリセット・サーボON・原点復帰）は、
+> `RobotController.initialize()` が実ハード操作の完了を `init_steps`
+> （pending / running / done / skipped / error）として保持し、WebSocket
+> リアルタイム配信（`RealtimeData.init_steps`）経由でフロントに反映される。
+> フロントは疑似タイマーではなく配信された実進捗を描画する。
 
 ---
 

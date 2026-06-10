@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, field_validator
 
-from src.models.system_state import RobotState
+from src.models.system_state import InitStepStatus, RobotState
 
 # ── Calibration ──────────────────────────────────────────────────────────────
 
@@ -100,6 +100,14 @@ class UPSStatusResponse(BaseModel):
 
 # ── Realtime WebSocket ────────────────────────────────────────────────────────
 
+class InitStepSchema(BaseModel):
+    """初期化シーケンス各ステップの進捗。フロント初期化画面の表示と連動する。"""
+
+    key: str
+    label: str
+    status: InitStepStatus
+
+
 class RealtimeData(BaseModel):
     timestamp: str
     robot_state: RobotState
@@ -111,6 +119,7 @@ class RealtimeData(BaseModel):
     brake_current_ma: float
     ups_battery_pct: float | None = None
     ups_on_battery: bool = False
+    init_steps: list[InitStepSchema] = []
 
 
 # ── Vehicle Profile ───────────────────────────────────────────────────────────

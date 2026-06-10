@@ -21,6 +21,7 @@ const INIT_REALTIME = {
   brake_opening: 0,
   accel_current_ma: 0,
   brake_current_ma: 0,
+  init_steps: [],
 };
 
 // ── Toast system ──────────────────────────────────────────

@@ -13,7 +13,13 @@ from src.models.drive_log import DriveLogData, DriveSession
 from src.models.driving_mode import DrivingMode
 from src.models.pre_check import PreCheckResult
 from src.models.profile import VehicleProfile
-from src.models.system_state import RealtimeSnapshot, RobotState, SystemState
+from src.models.system_state import (
+    InitStep,
+    InitStepStatus,
+    RealtimeSnapshot,
+    RobotState,
+    SystemState,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -166,6 +172,7 @@ class RobotController:
     _active_learning_task: asyncio.Task[None] | None
     _pending_calib_zero: dict[str, int | None]
     _pending_calib_full: dict[str, int | None]
+    _init_steps: list[InitStep]
 
     def __init__(
         self,
@@ -200,6 +207,7 @@ class RobotController:
         self._active_learning_task = None
         self._pending_calib_zero: dict[str, int | None] = {"accel": None, "brake": None}
         self._pending_calib_full: dict[str, int | None] = {"accel": None, "brake": None}
+        self._init_steps = self._build_init_steps()
 
     def _transition(self, new_state: RobotState) -> None:
         allowed = VALID_TRANSITIONS.get(self._state, frozenset())
@@ -283,26 +291,90 @@ class RobotController:
             self._transition(RobotState.ERROR)
             raise
 
+    @staticmethod
+    def _build_init_steps() -> list[InitStep]:
+        """初期化シーケンスのステップ一覧を PENDING で生成する。
+
+        各 key はフロント表示と実ハード操作の対応を示す。順序が表示順となる。
+        """
+        return [
+            InitStep(key="comm_brake", label="通信確認 (ブレーキ)"),
+            InitStep(key="comm_accel", label="通信確認 (アクセル)"),
+            InitStep(key="comm_can", label="通信確認 (CAN)"),
+            InitStep(key="alarm_reset", label="アラームリセット (両軸)"),
+            InitStep(key="servo_on", label="サーボON (両軸)"),
+            InitStep(key="home_return", label="原点復帰"),
+        ]
+
+    @property
+    def init_progress(self) -> list[InitStep]:
+        """初期化シーケンスの現在の進捗を返す。WebSocket 配信で利用する。"""
+        return self._init_steps
+
+    def _set_init_step(self, key: str, status: InitStepStatus) -> None:
+        """指定キーの初期化ステップの状態を更新する。"""
+        for step in self._init_steps:
+            if step.key == key:
+                step.status = status
+                return
+
+    def _fail_running_init_steps(self) -> None:
+        """RUNNING 中の初期化ステップを ERROR にする。例外発生時に呼ぶ。"""
+        for step in self._init_steps:
+            if step.status == InitStepStatus.RUNNING:
+                step.status = InitStepStatus.ERROR
+
     async def initialize(self) -> None:
-        """アラームリセット・サーボON・必要に応じて原点復帰。"""
+        """アラームリセット・サーボON・必要に応じて原点復帰。
+
+        各ハード操作の進捗を ``_init_steps`` に逐次反映し、WebSocket 経由で
+        フロントの初期化画面と連動させる。例外時は実行中ステップを ERROR にする。
+        """
         self._transition(RobotState.INITIALIZING)
-        await asyncio.gather(
-            self._accel_driver.enable_modbus_control(),
-            self._brake_driver.enable_modbus_control(),
-        )
-        await asyncio.gather(
-            self._accel_driver.reset_alarm(),
-            self._brake_driver.reset_alarm(),
-        )
-        await asyncio.gather(
-            self._accel_driver.servo_on(),
-            self._brake_driver.servo_on(),
-        )
-        if not self._last_normal_shutdown:
+        self._init_steps = self._build_init_steps()
+        try:
+            # 通信確認: 各軸・CAN の応答を確認しながらステップを進める。
+            self._set_init_step("comm_brake", InitStepStatus.RUNNING)
+            await self._brake_driver.enable_modbus_control()
+            self._set_init_step("comm_brake", InitStepStatus.DONE)
+
+            self._set_init_step("comm_accel", InitStepStatus.RUNNING)
+            await self._accel_driver.enable_modbus_control()
+            self._set_init_step("comm_accel", InitStepStatus.DONE)
+
+            self._set_init_step("comm_can", InitStepStatus.RUNNING)
+            await self._can_reader.read_speed()
+            self._set_init_step("comm_can", InitStepStatus.DONE)
+
+            # アラームリセット（両軸同時）
+            self._set_init_step("alarm_reset", InitStepStatus.RUNNING)
             await asyncio.gather(
-                self._accel_driver.home_return(),
-                self._brake_driver.home_return(),
+                self._accel_driver.reset_alarm(),
+                self._brake_driver.reset_alarm(),
             )
+            self._set_init_step("alarm_reset", InitStepStatus.DONE)
+
+            # サーボON（両軸同時）
+            self._set_init_step("servo_on", InitStepStatus.RUNNING)
+            await asyncio.gather(
+                self._accel_driver.servo_on(),
+                self._brake_driver.servo_on(),
+            )
+            self._set_init_step("servo_on", InitStepStatus.DONE)
+
+            # 原点復帰（前回正常終了済みならスキップ）
+            if not self._last_normal_shutdown:
+                self._set_init_step("home_return", InitStepStatus.RUNNING)
+                await asyncio.gather(
+                    self._accel_driver.home_return(),
+                    self._brake_driver.home_return(),
+                )
+                self._set_init_step("home_return", InitStepStatus.DONE)
+            else:
+                self._set_init_step("home_return", InitStepStatus.SKIPPED)
+        except Exception:
+            self._fail_running_init_steps()
+            raise
         self._transition(RobotState.READY)
 
     async def stop(self) -> None:

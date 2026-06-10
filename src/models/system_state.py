@@ -16,6 +16,25 @@ class RobotState(StrEnum):
     ERROR = "ERROR"
 
 
+class InitStepStatus(StrEnum):
+    """初期化シーケンス各ステップの進捗状態。フロント表示と連動する。"""
+
+    PENDING = "pending"  # 未実施 (—)
+    RUNNING = "running"  # 実行中 (⟳)
+    DONE = "done"  # 完了 (✓)
+    SKIPPED = "skipped"  # スキップ（前回正常終了で原点復帰不要等）
+    ERROR = "error"  # 失敗 (✗)
+
+
+@dataclass
+class InitStep:
+    """初期化シーケンスの 1 ステップ。key は実ハード操作との対応キー。"""
+
+    key: str
+    label: str
+    status: InitStepStatus = InitStepStatus.PENDING
+
+
 @dataclass
 class SystemState:
     robot_state: RobotState

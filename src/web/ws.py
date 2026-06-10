@@ -6,7 +6,7 @@ from fastapi import WebSocket
 from starlette.applications import Starlette
 
 from src.models.system_state import RobotState
-from src.web.schemas import RealtimeData
+from src.web.schemas import InitStepSchema, RealtimeData
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,11 @@ async def broadcast_loop(app: Starlette) -> None:
             brake_current = 0.0
         accel_opening, brake_opening = controller.current_openings
 
+        init_steps = [
+            InitStepSchema(key=s.key, label=s.label, status=s.status)
+            for s in controller.init_progress
+        ]
+
         ups_battery_pct: float | None = None
         ups_on_battery: bool = False
         try:
@@ -105,5 +110,6 @@ async def broadcast_loop(app: Starlette) -> None:
             brake_current_ma=brake_current,
             ups_battery_pct=ups_battery_pct,
             ups_on_battery=ups_on_battery,
+            init_steps=init_steps,
         )
         await manager.broadcast(data.model_dump_json())

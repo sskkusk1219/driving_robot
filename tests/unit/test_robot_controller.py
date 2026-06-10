@@ -10,7 +10,7 @@ from src.app.robot_controller import (
 )
 from src.domain.control.pid import PIDController
 from src.models.profile import PIDGains, StopConfig
-from src.models.system_state import RobotState
+from src.models.system_state import InitStepStatus, RobotState
 
 
 def make_accel_driver() -> MagicMock:
@@ -778,6 +778,59 @@ class TestInitializeResetsAlarmAndServosOn:
         ctrl._accel_driver.reset_alarm.assert_called_once()  # type: ignore[attr-defined]
         ctrl._accel_driver.servo_on.assert_called_once()  # type: ignore[attr-defined]
         ctrl._accel_driver.home_return.assert_called_once()  # type: ignore[attr-defined]
+
+
+class TestInitProgress:
+    """初期化進捗 (init_progress) がハード操作と連動することを検証。"""
+
+    def test_init_progress_starts_all_pending(self) -> None:
+        ctrl = make_controller()
+        keys = [s.key for s in ctrl.init_progress]
+        assert keys == [
+            "comm_brake",
+            "comm_accel",
+            "comm_can",
+            "alarm_reset",
+            "servo_on",
+            "home_return",
+        ]
+        assert all(s.status == InitStepStatus.PENDING for s in ctrl.init_progress)
+
+    @pytest.mark.asyncio
+    async def test_init_progress_all_done_after_initialize_with_home(self) -> None:
+        ctrl = make_controller(last_normal_shutdown=False)
+        await ctrl.start()
+        await ctrl.initialize()
+        status = {s.key: s.status for s in ctrl.init_progress}
+        assert status["comm_brake"] == InitStepStatus.DONE
+        assert status["comm_accel"] == InitStepStatus.DONE
+        assert status["comm_can"] == InitStepStatus.DONE
+        assert status["alarm_reset"] == InitStepStatus.DONE
+        assert status["servo_on"] == InitStepStatus.DONE
+        assert status["home_return"] == InitStepStatus.DONE
+
+    @pytest.mark.asyncio
+    async def test_init_progress_home_skipped_on_normal_shutdown(self) -> None:
+        ctrl = make_controller(last_normal_shutdown=True)
+        await ctrl.start()
+        await ctrl.initialize()
+        status = {s.key: s.status for s in ctrl.init_progress}
+        assert status["home_return"] == InitStepStatus.SKIPPED
+
+    @pytest.mark.asyncio
+    async def test_init_progress_marks_failing_step_error(self) -> None:
+        ctrl = make_controller()
+        await ctrl.start()
+        ctrl._can_reader.read_speed = AsyncMock(side_effect=RuntimeError("CAN no link"))  # type: ignore[attr-defined]
+        with pytest.raises(RuntimeError):
+            await ctrl.initialize()
+        status = {s.key: s.status for s in ctrl.init_progress}
+        # CAN 通信確認の手前 (ブレーキ・アクセル) は完了済み
+        assert status["comm_brake"] == InitStepStatus.DONE
+        assert status["comm_accel"] == InitStepStatus.DONE
+        # 失敗したステップは ERROR、後続は PENDING のまま
+        assert status["comm_can"] == InitStepStatus.ERROR
+        assert status["alarm_reset"] == InitStepStatus.PENDING
 
 
 class TestGetRealtimeData:
