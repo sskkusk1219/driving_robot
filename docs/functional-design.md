@@ -359,63 +359,121 @@ FC10 直値移動指令 (レジスタ書き込み後、自動的に移動開始)
 ### FeedforwardController（フィードフォワード制御）
 
 **責務**:
-- 運転モデル（学習済みマップ）から目標アクセル・ブレーキ位置を算出
-- 基準車速・速度偏差・加速度を入力として開度[%]を出力
+- 運転モデル（先読み型 Ridge 逆モデル）から符号付き努力量を算出
+- 現在の基準車速と先読み基準車速（0.5/1.0/2.0/3.0 秒先）を入力として努力量を出力
+  （+: 名目アクセル開度 [%]、−: 名目ブレーキ開度 [%]）
 
 ```python
 class FeedforwardController:
     def load_model(model_path: str) -> None
-    def predict(
-        ref_speed: float,        # 基準車速 [km/h]
-        ref_accel: float,        # 基準加速度 [km/h/s]
-    ) -> tuple[float, float]     # (accel_opening%, brake_opening%)
+    def unload_model() -> None     # プロファイル切替時に必ず呼ぶ（前車両モデルの残留防止）
+    def set_params(params: FeedforwardParams) -> None
+    def predict_effort(
+        v0: float,                       # 現在の基準車速 [km/h]
+        future_speeds: Sequence[float],  # 各先読みホライズンの基準車速 [km/h]
+    ) -> float                           # 努力量 [%]（+加速 / −制動）
 ```
 
 **運転モデル構造** (学習運転ログから生成):
-- 入力: `(ref_speed, ref_accel)` の2次元グリッド
-- 出力: `accel_opening [%]`, `brake_opening [%]`
-- 補間: 線形補間（グリッド間）
-- ファイル形式: `.pkl`（pickleまたはnumpy形式）
+- 入力: 先読み特徴量 7 次元 `[v0, dv_0.5, dv_1.0, dv_2.0, dv_3.0, v0², dv_1.0·v0]`
+- レジーム: dv_1.0 ≥ 0 → アクセルモデル、< 0 → ブレーキモデル（Ridge ×2、fit_intercept=False）
+- ファイル形式: `.pkl`（model_type = "ridge_inverse_lookahead"）
+
+**線形モデルで表現できない領域の補完**（FeedforwardParams 定数 + ルール）:
+1. **停車保持**: v0 ≤ 0.5km/h かつ 0.5 秒先 ≤ 0.5km/h → `-stop_brake_opening_pct`
+   （0.5 秒先判定により発進直前まで保持ブレーキを維持する）
+2. **クリープ**: v0 < creep_speed かつ加速要求が [0, creep_rate] → 駆動不要（努力量 0）
+3. **惰行テーパ**: v0 ≥ creep_speed の緩減速（≤ engine_brake_decel）はブレーキではなく
+   スロットルを巡航開度から線形に漸減して作る（dv=0 境界で FF 出力が連続になる）
+4. クリープ速度未満の減速要求はブレーキ必須（ペダルオフでは加速する領域）
 
 ---
 
 ### PIDController（フィードバック制御）
 
 **責務**:
-- 実車速と基準車速の偏差からフィードバック補正量を算出
-- アクセル・ブレーキそれぞれに独立したPID
+- 実車速と基準車速の偏差からフィードバック補正量（努力量への加算分）を算出
+- アンチワインドアップ（条件付き積分 + 積分量クランプ）と出力権限制限を内蔵
 
 ```python
 class PIDController:
-    def __init__(kp: float, ki: float, kd: float, dt: float = 0.05)
-    def update(setpoint: float, measurement: float) -> float
+    def __init__(kp: float, ki: float, kd: float, dt: float = 0.05, output_limit: float = 100.0)
+    def update(
+        setpoint: float,
+        measurement: float,
+        dt: float | None = None,          # 計測 dt（サイクルスキップ時の微分スパイク防止）
+        *,
+        saturated_high: bool = False,     # 前サイクルで加速側が飽和（積分停止）
+        saturated_low: bool = False,      # 前サイクルで制動側が飽和（積分停止）
+    ) -> float                            # ±output_limit にクランプ
     def reset() -> None
+    def set_gains(kp, ki, kd) -> None
+    def set_output_limit(limit: float) -> None  # プロファイルの pid_output_limit_pct を反映
 ```
 
 **制御則**:
 ```
 error = ref_speed - actual_speed
 pid_correction = Kp * error + Ki * ∫error dt + Kd * d(error)/dt
+（飽和方向への積分は停止、|Ki·∫| ≤ output_limit、出力は ±output_limit）
 ```
 
-**FF+PID出力合成と最終開度算出** (RobotController内で実行):
+**FF+PID出力合成とペダル調停** (DriveLoop → PedalArbiter):
 ```
-# FFコントローラーから目標開度を取得
-ff_accel, ff_brake = ff_controller.predict(ref_speed, ref_accel)
+# FF と PID を符号付き努力量として合成（+: 加速、−: 制動）
+effort = ff_controller.predict_effort(ref_speed, future_speeds) + pid_correction
 
-# PID補正量を加算（符号でアクセル/ブレーキを振り分け）
-raw_accel = ff_accel + max(0.0, pid_correction)
-raw_brake = ff_brake + max(0.0, -pid_correction)
+# ペダルへの写像は PedalArbiter のみが行う（同時踏みは構造的に発生しない）
+out = arbiter.arbitrate(effort, dt)
+# out.accel_opening / out.brake_opening（高々一方のみ非ゼロ）
+# out.saturated_high / saturated_low → 次サイクルの PID 条件付き積分へ
+```
 
-# アクセル・ブレーキの排他制御（初期実装）
-# 両方に開度が生じた場合はアクセル優先でブレーキをゼロにする
-# ※ 実機チューニングで変更の可能性あり
-if raw_accel > 0.0 and raw_brake > 0.0:
-    raw_brake = 0.0
+> 旧実装（PID 補正の符号分割 + アクセル優先排他）は、FF アクセル中の減速権限喪失と
+> FF ブレーキのバンバン制御を生むため廃止した（2026-06-11 コードレビュー指摘 #1）。
 
-# プロファイルの最大開度でクランプ
-final_accel = clamp(raw_accel, 0.0, profile.max_accel_opening)
-final_brake = clamp(raw_brake, 0.0, profile.max_brake_opening)
+---
+
+### PedalArbiter（ペダル調停）
+
+**責務**:
+- 努力量 → (アクセル開度, ブレーキ開度) への写像。常にどちらか一方のみ非ゼロ
+- 振動抑制 KPI（偏差符号反転 ≤1 回/5 秒）を機構として支える
+
+**調停ルール**（FeedforwardParams の調停定数で構成）:
+1. **切替ヒステリシス**: |effort| ≤ switch_hysteresis_pct は惰行（両ペダル 0）。
+   帯内の符号チャタでペダル反転しない
+2. **アクセル再踏込ディレイ**: 制動後 accel_reengage_dwell_s 以内のアクセルは抑止。
+   **制動側にディレイはない**（減速権限を遅延させない安全要件）
+3. **不感帯逆補償**: 最終指令が物理死帯 (0, deadband) に落ちない（0 か deadband 以上）
+4. **レートリミット**: 開度の増加方向のみ accel/brake_rate_limit_pct_s で制限。
+   解放・ペダル切替時の旧ペダルは即座に 0
+5. **クランプと飽和フラグ**: プロファイル最大開度でクランプし、削られた方向の
+   飽和フラグを返す（PID のアンチワインドアップ入力）
+
+```python
+class PedalArbiter:
+    def __init__(params: FeedforwardParams, max_accel_opening: float, max_brake_opening: float)
+    def reset() -> None
+    def arbitrate(effort: float, dt: float) -> ArbiterOutput
+```
+
+---
+
+### KPIMonitor（KPI 実行時計測）
+
+**責務**:
+- プライマリー KPI（P95 ≤ 0.2km/h・最大 1.0km/h・符号反転 ≤1 回/5 秒）の走行中計測
+- 1.0km/h ハード上限超過の即時 warning、走行終了時のサマリ提供
+
+固定長ヒストグラム + 5 秒窓 deque のためメモリは走行時間によらず一定。
+走行終了時に RobotController がサマリをログ出力し `last_kpi_summary` で公開する。
+
+```python
+class KPIMonitor:
+    def update(ref_kmh: float, actual_kmh: float, now_s: float) -> None  # 毎サイクル
+    def summary() -> dict[str, float]
+    # {n_samples, max_abs_deviation_kmh, p95_kmh, reversal_max_per_5s, hard_limit_violations}
 ```
 
 ---
@@ -676,15 +734,15 @@ sequenceDiagram
         RC->>HW: CAN車速受信開始
         loop 50ms制御ループ
             HW-->>RC: 実車速 (CAN)
-            RC->>FF: predict(ref_speed, ref_accel)
-            FF-->>RC: ff_accel%, ff_brake%
-            RC->>PID: update(ref_speed, actual_speed)
+            RC->>FF: predict_effort(ref_speed, future_speeds)
+            FF-->>RC: ff_effort（+加速/−制動）
+            RC->>PID: update(ref_speed, actual_speed, dt, 飽和フラグ)
             PID-->>RC: pid_correction
-            RC->>RC: 最終開度算出 + クランプ
+            RC->>RC: PedalArbiter.arbitrate(ff_effort + pid_correction)
             RC->>HW: 位置指令送信 (Modbus RTU x2)
-            RC->>SM: 逸脱チェック・電流チェック
+            RC->>SM: 逸脱チェック・電流チェック（+ KPIMonitor 集計）
             alt 異常検知
-                SM->>RC: emergency_stop()
+                SM->>RC: 非常停止（SafetyMonitor 経由ディスパッチ）
             end
         end
         RC-->>UI: 走行完了

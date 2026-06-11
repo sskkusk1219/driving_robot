@@ -107,12 +107,15 @@ async def build_real_controller(
             channel=settings.can.channel,
             bitrate=settings.can.bitrate,
             dbc_path=settings.can.dbc_path,
+            max_speed_age_s=settings.can.max_speed_age_s,
         )
     # 非常停止のみ GPIO 経由。AC断は NUT ポーリングに変更したため ac_detect_pin 未使用
     gpio_monitor = GPIOMonitor(
         emergency_pin=settings.gpio.emergency_stop_pin,
         ac_detect_pin=settings.gpio.ac_detect_pin,
     )
+    # プロファイル未選択時の暫定値。select_profile() がプロファイルの stop_config で上書きし、
+    # DriveLoop が参照する profile.stop_config と判定基準を一致させる
     stop_config = StopConfig(
         deviation_threshold_kmh=2.0,
         deviation_duration_s=4.0,
@@ -135,7 +138,13 @@ async def build_real_controller(
     pool = await create_pool(settings.database.dsn)
     profile_repo = ProfileRepository(pool)
 
-    pid = PIDController(kp=1.0, ki=0.0, kd=0.0)
+    # 周期は settings を単一ソースとし、PID の dt と DriveLoop の周期を一致させる
+    loop_interval_s = settings.control.loop_interval_ms / 1000.0
+    log_every_n_cycles = max(
+        1, round(settings.control.log_interval_ms / settings.control.loop_interval_ms)
+    )
+    # PID ゲインはプロファイル未選択時の暫定値。select_profile() がプロファイル値で上書きする
+    pid = PIDController(kp=1.0, ki=0.0, kd=0.0, dt=loop_interval_s)
     ff_controller = FeedforwardController()
     calibration_manager = CalibrationManager(
         accel_driver=accel_driver,
@@ -162,8 +171,12 @@ async def build_real_controller(
         calibration_manager=calibration_manager,
         pre_check_runner=pre_check_runner,
         learning_manager=LearningDriveManager(),
+        control_interval_s=loop_interval_s,
+        log_every_n_cycles=log_every_n_cycles,
     )
-    # GPIO非常停止 → controller.emergency_stop() を直接呼ぶ
-    # （trigger_emergency経由にすると controller が自身を再帰呼び出しするループが生じるため）
-    gpio_monitor.register_emergency_callback(controller.emergency_stop)
+    # 非常停止は SafetyMonitor を単一ディスパッチャとする:
+    #   GPIO / AC断(NUT) → SafetyMonitor.trigger_emergency → controller.emergency_stop
+    # controller.emergency_stop は trigger_emergency を呼び返さない（一方向ディスパッチ）。
+    safety_monitor.register_emergency_callback(controller.emergency_stop)
+    gpio_monitor.register_emergency_callback(safety_monitor.trigger_emergency)
     return controller, ups_monitor

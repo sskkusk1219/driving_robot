@@ -136,3 +136,10 @@ claude --version
   - docs/repository-structure.md ✅
   - docs/development-guidelines.md ✅
   - docs/glossary.md ✅
+
+
+# 修正
+・キャリブレーション
+　9500pulseまでにすること
+　フロントエンドのドラッグの表示幅を0~9500にすること
+　ボタンを100と10にすること。キー表示はなし

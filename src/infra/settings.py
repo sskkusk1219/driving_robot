@@ -20,6 +20,9 @@ class CanSettings:
     channel: int = 0
     bitrate: int = 500000
     dbc_path: str = "config/can/MEIDEN_MEIDACS.dbc"
+    # キャッシュ車速の許容鮮度 [s]。シャシダイナモの Speed 送信周期より十分長く、
+    # かつ凍結車速での盲目走行が KPI（偏差 1.0km/h 上限）を破らない範囲で設定する
+    max_speed_age_s: float = 0.2
 
 
 @dataclass

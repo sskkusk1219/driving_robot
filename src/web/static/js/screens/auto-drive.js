@@ -1,14 +1,13 @@
 // ── Auto-drive monitor screen ─────────────────────────────
-// AutoDriveD layout: 3-axis graph + BigSpeed + session info + pause/stop
+// AutoDriveD layout: 3-axis graph + BigSpeed + session info + stop
 
-function DriveMonitorScreen({ showPause = true, showModeAxis = true, profileMaxSpeed = null, screenTitle = '自動走行モニター', driveStartPath = '/api/v1/drive/start', driveStartBody = null }) {
+function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, screenTitle = '自動走行モニター', driveStartPath = '/api/v1/drive/start', driveStartBody = null }) {
   const { useState, useEffect, useContext, useRef } = React;
   const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeProfileName, robotState } = useContext(window.AppContext);
   const { INK, INK_SOFT, PAPER, PAPER_2, HATCH, Box, Btn, Row, BigSpeed } = window;
 
   const [modeDetail, setModeDetail] = useState(null);
   const [elapsed, setElapsed] = useState(0);
-  const [paused, setPaused] = useState(false);
   const [confirmStop, setConfirmStop] = useState(false);
   const [isDriving, setIsDriving] = useState(false);
   const driveStartTimeRef = useRef(null);
@@ -47,12 +46,6 @@ function DriveMonitorScreen({ showPause = true, showModeAxis = true, profileMaxS
   async function handleStop() {
     const r = await apiFetch('POST', '/api/v1/drive/stop');
     if (r) { window.showToast('走行を終了しました', 'success'); setConfirmStop(false); }
-  }
-
-  async function handlePause() {
-    const endpoint = paused ? '/api/v1/drive/resume' : '/api/v1/drive/pause';
-    const r = await apiFetch('POST', endpoint);
-    if (r) { setPaused(p => !p); window.showToast(paused ? '走行を再開しました' : '一時停止しました', 'success'); }
   }
 
   // T2: グラフデータを走行開始後のみに絞る（30秒ウィンドウ）
@@ -251,11 +244,6 @@ function DriveMonitorScreen({ showPause = true, showModeAxis = true, profileMaxS
             {showModeAxis && <Row cells={[['全体時間', '1.4fr'], [totalDurS > 0 ? fmt(totalDurS) : '—', '1fr', 'mono']]} />}
           </Box>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
-            {showPause && (
-              <Btn big style={{ flex: 1 }} disabled={robotState !== 'RUNNING'} onClick={handlePause}>
-                {paused ? '▶ 再開' : '⏸ 一時停止'}
-              </Btn>
-            )}
             {robotState === 'RUNNING' ? (
               <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
             ) : (

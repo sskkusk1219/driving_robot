@@ -15,22 +15,22 @@ logger = logging.getLogger(__name__)
 
 # FC03 読み取りレジスタアドレス（HEX）
 _REG_PNOW_HI = 0x9000  # 現在位置 上位 16bit
-_REG_ALMC = 0x9002      # アラームコード
-_REG_DSS1 = 0x9005      # デバイスステータス1
-_REG_DSSE = 0x9007      # 拡張デバイスステータス
-_REG_CNOW_HI = 0x900C   # 電流値 上位 16bit
+_REG_ALMC = 0x9002  # アラームコード
+_REG_DSS1 = 0x9005  # デバイスステータス1
+_REG_DSSE = 0x9007  # 拡張デバイスステータス
+_REG_CNOW_HI = 0x900C  # 電流値 上位 16bit
 
 # DSS1 ビット定義
-_DSS1_SV = 1 << 12    # サーボON中
+_DSS1_SV = 1 << 12  # サーボON中
 _DSS1_ALMH = 1 << 10  # アラームあり
-_DSS1_HEND = 1 << 4   # 原点復帰完了
-_DSS1_PEND = 1 << 3   # 位置決め完了
+_DSS1_HEND = 1 << 4  # 原点復帰完了
+_DSS1_PEND = 1 << 3  # 位置決め完了
 
 # DSSE ビット定義
 _DSSE_MOVE = 1 << 5  # 移動中
 
 # FC05 コイルアドレス（HEX）
-_COIL_SON = 0x0403   # サーボON
+_COIL_SON = 0x0403  # サーボON
 _COIL_ALRS = 0x0407  # アラームリセット
 _COIL_HOME = 0x040B  # 原点復帰
 _COIL_PMSL = 0x0427  # Modbus 操作権（PIO 無効化・Modbus 指令優先）
@@ -38,12 +38,12 @@ _COIL_PMSL = 0x0427  # Modbus 操作権（PIO 無効化・Modbus 指令優先）
 # FC10 書き込みレジスタアドレス（HEX）
 _REG_PCMD_HI = 0x9900  # 目標位置 上位 16bit
 _REG_VCMD_HI = 0x9904  # 速度指令 上位 16bit
-_REG_ACMD = 0x9906     # 加減速指令
-_REG_CTLF = 0x9908     # 制御フラグ
+_REG_ACMD = 0x9906  # 加減速指令
+_REG_CTLF = 0x9908  # 制御フラグ
 
 # デフォルト移動パラメータ
-_DEFAULT_SPEED_MM_S = 100   # 速度 [mm/s]
-_DEFAULT_ACCEL = 30         # 加減速指令（ACMD）[コントローラ固有単位 ≈ 0.01G]
+_DEFAULT_SPEED_MM_S = 100  # 速度 [mm/s]
+_DEFAULT_ACCEL = 30  # 加減速指令（ACMD）[コントローラ固有単位 ≈ 0.01G]
 
 _HOME_RETURN_TIMEOUT_S = 30.0
 _HOME_RETURN_POLL_INTERVAL_S = 0.1
@@ -194,19 +194,24 @@ class ActuatorDriver:
         # 9900: PCMD_HI, 9901: PCMD_LO, 9902: INP_HI, 9903: INP_LO,
         # 9904: VCMD_HI, 9905: VCMD_LO, 9906: ACMD, 9907: 予約, 9908: CTLF
         registers = [
-            pcmd_hi, pcmd_lo,  # 9900-9901: PCMD（目標位置 0.01mm 単位）
-            0, 10,              # 9902-9903: INP（位置決め完了幅）
-            vcmd_hi, vcmd_lo,  # 9904-9905: VCMD（0.01mm/s 単位）
-            accel,              # 9906: ACMD
-            0,                  # 9907: 予約
-            0x0000,             # 9908: CTLF = 絶対位置移動
+            pcmd_hi,
+            pcmd_lo,  # 9900-9901: PCMD（目標位置 0.01mm 単位）
+            0,
+            10,  # 9902-9903: INP（位置決め完了幅）
+            vcmd_hi,
+            vcmd_lo,  # 9904-9905: VCMD（0.01mm/s 単位）
+            accel,  # 9906: ACMD
+            0,  # 9907: 予約
+            0x0000,  # 9908: CTLF = 絶対位置移動
         ]
         await client.write_registers(
             address=_REG_PCMD_HI, values=registers, device_id=self._slave_id
         )
         logger.debug(
             "move_to_position: slave_id=%d pos=%d speed=%d",
-            self._slave_id, pos, speed_mm_s,
+            self._slave_id,
+            pos,
+            speed_mm_s,
         )
 
     async def wait_for_position_complete(

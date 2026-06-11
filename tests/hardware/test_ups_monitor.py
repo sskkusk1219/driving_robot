@@ -39,12 +39,12 @@ async def _check_communication(monitor: NutUPSMonitor) -> bool:
     try:
         charge = await monitor._nut_get_var("battery.charge")
         status = await monitor._nut_get_var("ups.status")
-        print(f"  NUT socket 接続      : OK")
+        print("  NUT socket 接続      : OK")
         print(f"  battery.charge (raw) : {charge}")
         print(f"  ups.status (raw)     : {status}")
         return True
     except Exception as e:
-        print(f"  NUT socket 接続      : NG")
+        print("  NUT socket 接続      : NG")
         print(f"  エラー               : {e}")
         print()
         print("  確認事項:")
@@ -94,8 +94,8 @@ async def _watch_ac_loss(monitor: NutUPSMonitor) -> None:
         ac_loss_count += 1
         print()
         print(f"  ★★★ AC断コールバック発火！（{ac_loss_count}回目）★★★")
-        print(f"      ups.status が OL → OB に遷移しました")
-        print(f"      → SafetyMonitor.handle_ac_power_loss() が呼ばれます")
+        print("      ups.status が OL → OB に遷移しました")
+        print("      → SafetyMonitor.handle_ac_power_loss() が呼ばれます")
         print()
 
     monitor.register_ac_loss_callback(on_ac_loss)

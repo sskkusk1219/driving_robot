@@ -67,6 +67,22 @@ def stub_controller() -> MagicMock:
     return ctrl
 
 
+async def _seed_mode(mode_id: str = "mode-001") -> None:
+    """走行開始テスト用にモードをリポジトリへ登録する（未登録だと 404 になる）。"""
+    from src.models.driving_mode import DrivingMode, SpeedPoint  # noqa: PLC0415
+
+    mode = DrivingMode(
+        id=mode_id,
+        name="テストモード",
+        description="",
+        reference_speed=[SpeedPoint(time_s=0.0, speed_kmh=0.0)],
+        total_duration=10.0,
+        max_speed=0.0,
+        created_at=datetime.now(tz=UTC),
+    )
+    await app.state.mode_repo.create(mode)
+
+
 @pytest.mark.asyncio
 async def test_get_status(stub_controller: MagicMock) -> None:
     app.state.controller = stub_controller
@@ -100,24 +116,37 @@ async def test_initialize_invalid_state(stub_controller: MagicMock) -> None:
 @pytest.mark.asyncio
 async def test_start_drive_ok(stub_controller: MagicMock) -> None:
     app.state.controller = stub_controller
+    await _seed_mode()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         res = await c.post("/api/v1/drive/start", json={"mode_id": "mode-001"})
     assert res.status_code == 200
     data = res.json()
     assert data["id"] == "session-001"
     assert data["run_type"] == "auto"
-    # mode/profile/log_writer を解決して渡す（DB なしのテストでは mode=None, log_writer=None）
+    # mode/profile/log_writer を解決して渡す（DB なしのテストでは log_writer=None）
     stub_controller.start_auto_drive.assert_awaited_once()
     call = stub_controller.start_auto_drive.await_args
     assert call.args[0] == "mode-001"
-    assert call.kwargs["mode"] is None
+    assert call.kwargs["mode"] is not None
+    assert call.kwargs["mode"].id == "mode-001"
     assert call.kwargs["log_writer"] is None
+
+
+@pytest.mark.asyncio
+async def test_start_drive_unknown_mode_returns_404(stub_controller: MagicMock) -> None:
+    """未登録モードでの走行開始は状態遷移前に 404 で拒否される。"""
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/start", json={"mode_id": "unknown-mode"})
+    assert res.status_code == 404
+    stub_controller.start_auto_drive.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_start_drive_invalid_state(stub_controller: MagicMock) -> None:
     stub_controller.start_auto_drive.side_effect = InvalidStateTransition("READY 以外不可")
     app.state.controller = stub_controller
+    await _seed_mode()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         res = await c.post("/api/v1/drive/start", json={"mode_id": "mode-001"})
     assert res.status_code == 409
@@ -174,6 +203,7 @@ async def test_manual_stop_ok(stub_controller: MagicMock) -> None:
 async def test_start_drive_precheck_failed_returns_422(stub_controller: MagicMock) -> None:
     stub_controller.start_auto_drive.side_effect = PreCheckFailed("キャリブレーション未完了")
     app.state.controller = stub_controller
+    await _seed_mode()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         res = await c.post("/api/v1/drive/start", json={"mode_id": "mode-001"})
     assert res.status_code == 422
@@ -224,9 +254,7 @@ async def test_calibrate_returns_failure_result(stub_controller: MagicMock) -> N
     from src.models.calibration import CalibrationResult
 
     stub_controller.run_calibration = AsyncMock(
-        return_value=CalibrationResult(
-            success=False, data=None, error_message="スパイク未検出"
-        )
+        return_value=CalibrationResult(success=False, data=None, error_message="スパイク未検出")
     )
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -291,9 +319,7 @@ async def test_select_profile_not_found_returns_404(stub_controller: MagicMock) 
 
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        res = await c.post(
-            "/api/v1/drive/select-profile", json={"profile_id": str(uuid4())}
-        )
+        res = await c.post("/api/v1/drive/select-profile", json={"profile_id": str(uuid4())})
     assert res.status_code == 404
 
 
@@ -375,9 +401,7 @@ async def test_learning_train_profile_not_found_returns_404(stub_controller: Mag
 
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        res = await c.post(
-            "/api/v1/drive/learning/train", json={"profile_id": str(uuid4())}
-        )
+        res = await c.post("/api/v1/drive/learning/train", json={"profile_id": str(uuid4())})
     assert res.status_code == 404
 
 
@@ -390,9 +414,7 @@ async def test_learning_train_insufficient_logs_returns_422(stub_controller: Mag
     await _create_profile(profile_id)
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        res = await c.post(
-            "/api/v1/drive/learning/train", json={"profile_id": profile_id}
-        )
+        res = await c.post("/api/v1/drive/learning/train", json={"profile_id": profile_id})
     assert res.status_code == 422
 
 
@@ -415,9 +437,7 @@ async def test_learning_train_ok_updates_model_path(
 
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        res = await c.post(
-            "/api/v1/drive/learning/train", json={"profile_id": profile_id}
-        )
+        res = await c.post("/api/v1/drive/learning/train", json={"profile_id": profile_id})
     assert res.status_code == 200
     body = res.json()
     assert body["model_path"] == "data/models/fake_model.pkl"
@@ -428,6 +448,35 @@ async def test_learning_train_ok_updates_model_path(
     updated = await app.state.profile_repo.get_by_id(profile_id)
     assert updated.model_path == "data/models/fake_model.pkl"
     assert updated.feedforward_params is not None
+
+
+@pytest.mark.asyncio
+async def test_learning_train_refreshes_active_profile(
+    stub_controller: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """学習成功時にコントローラの in-memory プロファイルへ即時反映される（レビュー #10）。
+
+    DB のみ更新すると、学習直後の走行が旧モデル（または FF なし）で実行される。
+    """
+    from uuid import uuid4  # noqa: PLC0415
+
+    profile_id = str(uuid4())
+    await _create_profile(profile_id)
+
+    def _fake_train(logs, profile, output_dir="data/models"):  # noqa: ANN001, ANN202, ARG001
+        return "data/models/fake_model.pkl", {"accel": {"n": 1.0}, "brake": {"n": 1.0}}
+
+    monkeypatch.setattr("src.web.routers.drive.train_inverse_model", _fake_train)
+
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/train", json={"profile_id": profile_id})
+    assert res.status_code == 200
+
+    stub_controller.refresh_active_profile.assert_called_once()
+    refreshed = stub_controller.refresh_active_profile.call_args[0][0]
+    assert refreshed.id == profile_id
+    assert refreshed.model_path == "data/models/fake_model.pkl"
 
 
 @pytest.mark.asyncio
@@ -445,9 +494,7 @@ async def test_learning_start_invalid_state_returns_409(stub_controller: MagicMo
 @pytest.mark.asyncio
 async def test_learning_start_precheck_failed_returns_422(stub_controller: MagicMock) -> None:
     """PreCheckFailed 時に 422 が返ること。"""
-    stub_controller.start_learning_drive = AsyncMock(
-        side_effect=PreCheckFailed("サーボ未ON")
-    )
+    stub_controller.start_learning_drive = AsyncMock(side_effect=PreCheckFailed("サーボ未ON"))
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         res = await c.post("/api/v1/drive/learning/start")

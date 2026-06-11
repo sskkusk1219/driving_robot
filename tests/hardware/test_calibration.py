@@ -32,21 +32,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.infra.actuator_driver import ActuatorDriver
 
 # --- 接続設定 ---
-_ACCEL_PORT = "/dev/ttyUSB1"
-_BRAKE_PORT = "/dev/ttyUSB2"
+_ACCEL_PORT = "/dev/ttyUSB0"
+_BRAKE_PORT = "/dev/ttyUSB1"
 _ACCEL_SLAVE_ID = 1
 _BRAKE_SLAVE_ID = 1  # 両軸とも slave_id=1（各軸が独立した RS-485 バス上）
 _BAUD_RATE = 38400
 
 # --- ジョグパラメータ ---
 _JOG_STEP_LARGE = 100  # e/w キー: 移動量 [pulse] = 1.0mm
-_JOG_STEP_SMALL = 50   # d/s キー: 移動量 [pulse] = 0.5mm
+_JOG_STEP_SMALL = 50  # d/s キー: 移動量 [pulse] = 0.5mm
 _STEP_INTERVAL_S = 0.15  # ジョグ後の安定待機時間 [s]
 
 # 電流サンプリング（中央値フィルタ）
 # P-CON-CB の CNOW は PWM 瞬時電流を返すためランダムなノイズが大きい。
 # N回サンプリングして中央値を取ることで PWM スパイクを除去する。
-_CURRENT_SAMPLES = 9               # サンプル数（中央値抽出）
+_CURRENT_SAMPLES = 9  # サンプル数（中央値抽出）
 _CURRENT_SAMPLE_INTERVAL_S = 0.01  # サンプル間隔 [s]
 
 # 安全閾値: この値を超えたら即 RuntimeError として中断する
@@ -132,20 +132,20 @@ async def _jog_axis(
 
         key = await loop.run_in_executor(None, _read_single_key)
 
-        if key in ('\r', '\n'):
+        if key in ("\r", "\n"):
             actual = await target.read_position()
             print(f"\n  → {point_label}: {actual} pulse ({actual * 0.01:.2f} mm)")
             return actual
-        elif key in ('q', '\x03'):
+        elif key in ("q", "\x03"):
             print()
             raise KeyboardInterrupt
-        elif key == 'e':
+        elif key == "e":
             pos = pos + _JOG_STEP_LARGE
-        elif key == 'w':
+        elif key == "w":
             pos = max(0, pos - _JOG_STEP_LARGE)
-        elif key == 'd':
+        elif key == "d":
             pos = pos + _JOG_STEP_SMALL
-        elif key == 's':
+        elif key == "s":
             pos = max(0, pos - _JOG_STEP_SMALL)
         else:
             continue

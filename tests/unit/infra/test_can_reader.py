@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.infra.can_reader import CANReader
+from src.infra.can_reader import DEFAULT_MAX_SPEED_AGE_S, CANReader
 
 _DBC_PATH = Path("config/can/MEIDEN_MEIDACS.dbc")
 
@@ -18,6 +19,26 @@ def _make_can_message(arbitration_id: int = 0x100, data: bytes = b"\x00" * 8) ->
     msg.data = data
     msg.is_error_frame = False
     return msg
+
+
+def _setup_consumer(reader: CANReader, frames: list[MagicMock]) -> asyncio.Task[None]:
+    """常駐コンシューマを手動起動するヘルパー。
+
+    与えたフレームを順に返し、尽きたら永久待機する get_message を構成し、
+    _consume_frames タスクを起動して返す（テスト終了時に cancel すること）。
+    """
+    pending = list(frames)
+
+    async def fake_get_message() -> MagicMock:
+        if pending:
+            return pending.pop(0)
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    reader._async_reader = MagicMock()
+    reader._async_reader.get_message = fake_get_message
+    reader._first_frame = asyncio.Event()
+    return asyncio.ensure_future(reader._consume_frames())
 
 
 class TestConnect:
@@ -87,13 +108,14 @@ class TestReadSpeed:
         reader = CANReader()
         mock_db = MagicMock()
         reader._db = mock_db
-        reader._async_reader = MagicMock()
 
         can_msg = _make_can_message(arbitration_id=0x120)
         mock_db.decode_message.return_value = {"Speed": 72.5}
-        reader._async_reader.get_message = AsyncMock(return_value=can_msg)
-
-        speed = await reader.read_speed()
+        task = _setup_consumer(reader, [can_msg])
+        try:
+            speed = await reader.read_speed()
+        finally:
+            task.cancel()
 
         assert speed == 72.5
 
@@ -103,15 +125,16 @@ class TestReadSpeed:
         reader = CANReader()
         mock_db = MagicMock()
         reader._db = mock_db
-        reader._async_reader = MagicMock()
 
         unknown_msg = _make_can_message(arbitration_id=0x999)
         speed_msg = _make_can_message(arbitration_id=0x120)
 
         mock_db.decode_message.side_effect = [KeyError("unknown"), {"Speed": 50.0}]
-        reader._async_reader.get_message = AsyncMock(side_effect=[unknown_msg, speed_msg])
-
-        speed = await reader.read_speed()
+        task = _setup_consumer(reader, [unknown_msg, speed_msg])
+        try:
+            speed = await reader.read_speed()
+        finally:
+            task.cancel()
 
         assert speed == 50.0
 
@@ -121,17 +144,97 @@ class TestReadSpeed:
         reader = CANReader()
         mock_db = MagicMock()
         reader._db = mock_db
-        reader._async_reader = MagicMock()
 
         other_msg = _make_can_message(arbitration_id=0x100)
         speed_msg = _make_can_message(arbitration_id=0x120)
 
         mock_db.decode_message.side_effect = [{"OtherSignal": 10.0}, {"Speed": 30.0}]
-        reader._async_reader.get_message = AsyncMock(side_effect=[other_msg, speed_msg])
-
-        speed = await reader.read_speed()
+        task = _setup_consumer(reader, [other_msg, speed_msg])
+        try:
+            speed = await reader.read_speed()
+        finally:
+            task.cancel()
 
         assert speed == 30.0
+
+    @pytest.mark.asyncio
+    async def test_read_speed_returns_latest_not_oldest(self) -> None:
+        """複数フレーム受信後は最古ではなく最新の車速を返す（陳腐化防止）。"""
+        reader = CANReader()
+        mock_db = MagicMock()
+        reader._db = mock_db
+
+        frames = [_make_can_message(arbitration_id=0x120) for _ in range(3)]
+        mock_db.decode_message.side_effect = [
+            {"Speed": 10.0},
+            {"Speed": 20.0},
+            {"Speed": 30.0},
+        ]
+        task = _setup_consumer(reader, frames)
+        try:
+            # コンシューマが全フレームを処理するまで待つ
+            await asyncio.sleep(0.05)
+            speed = await reader.read_speed()
+        finally:
+            task.cancel()
+
+        assert speed == 30.0
+
+    @pytest.mark.asyncio
+    async def test_read_speed_stale_cache_raises_timeout(self) -> None:
+        """キャッシュが鮮度上限を超えて古い場合は TimeoutError（バス無音→非常停止）。"""
+        reader = CANReader()
+        mock_db = MagicMock()
+        reader._db = mock_db
+
+        can_msg = _make_can_message(arbitration_id=0x120)
+        mock_db.decode_message.return_value = {"Speed": 40.0}
+        task = _setup_consumer(reader, [can_msg])
+        try:
+            speed = await reader.read_speed()
+            assert speed == 40.0
+            # 受信時刻を鮮度上限より過去へずらしてバス無音を模擬する
+            reader._latest_at -= 10.0
+            with pytest.raises(TimeoutError):
+                await reader.read_speed()
+        finally:
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_default_freshness_bound_is_tight(self) -> None:
+        """既定の鮮度上限は 0.2s（制御 4 周期）。0.3s 古いキャッシュは拒否される。
+
+        1.0s では凍結車速のまま最大 20 周期制御が走り、減速ランプ中に KPI ハード上限
+        （1.0km/h）超の偏差が逸脱チェックに見えなくなる（レビュー指摘 #2）。
+        """
+        assert DEFAULT_MAX_SPEED_AGE_S == pytest.approx(0.2)
+        reader = CANReader()
+        mock_db = MagicMock()
+        reader._db = mock_db
+        mock_db.decode_message.return_value = {"Speed": 40.0}
+        task = _setup_consumer(reader, [_make_can_message(arbitration_id=0x120)])
+        try:
+            await reader.read_speed()
+            reader._latest_at -= 0.3
+            with pytest.raises(TimeoutError):
+                await reader.read_speed()
+        finally:
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_freshness_bound_configurable(self) -> None:
+        """max_speed_age_s を緩めた場合は同じ古さでも許容される（設定可能）。"""
+        reader = CANReader(max_speed_age_s=1.0)
+        mock_db = MagicMock()
+        reader._db = mock_db
+        mock_db.decode_message.return_value = {"Speed": 40.0}
+        task = _setup_consumer(reader, [_make_can_message(arbitration_id=0x120)])
+        try:
+            await reader.read_speed()
+            reader._latest_at -= 0.3
+            assert await reader.read_speed() == 40.0
+        finally:
+            task.cancel()
 
 
 class TestClose:
@@ -194,11 +297,12 @@ class TestDbcIntegration:
 
         reader = CANReader(dbc_path=str(_DBC_PATH))
         reader._db = db
-        reader._async_reader = MagicMock()
 
         can_msg = _make_can_message(arbitration_id=msg_def.frame_id, data=bytes(raw_data))
-        reader._async_reader.get_message = AsyncMock(return_value=can_msg)
-
-        speed = await reader.read_speed()
+        task = _setup_consumer(reader, [can_msg])
+        try:
+            speed = await reader.read_speed()
+        finally:
+            task.cancel()
 
         assert abs(speed - 100.0) < 0.01

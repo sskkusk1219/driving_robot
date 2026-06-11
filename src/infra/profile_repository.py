@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import fields
 from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
 
+from src.infra.db import DuplicateNameError
 from src.models.calibration import CalibrationData
 from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
 
@@ -26,29 +28,15 @@ def _ffp_from_value(value: object) -> FeedforwardParams:
     else:
         return FeedforwardParams()
     defaults = FeedforwardParams()
-    return FeedforwardParams(
-        creep_speed_kmh=data.get("creep_speed_kmh", defaults.creep_speed_kmh),
-        creep_rate_kmhs=data.get("creep_rate_kmhs", defaults.creep_rate_kmhs),
-        engine_brake_decel_kmhs=data.get(
-            "engine_brake_decel_kmhs", defaults.engine_brake_decel_kmhs
-        ),
-        stop_brake_opening_pct=data.get("stop_brake_opening_pct", defaults.stop_brake_opening_pct),
-        brake_deadband_pct=data.get("brake_deadband_pct", defaults.brake_deadband_pct),
-        accel_deadband_pct=data.get("accel_deadband_pct", defaults.accel_deadband_pct),
-    )
+    # 旧レコードに存在しないキー（後から追加した調停定数等）はデフォルトで補完する
+    kwargs = {
+        f.name: data.get(f.name, getattr(defaults, f.name)) for f in fields(FeedforwardParams)
+    }
+    return FeedforwardParams(**kwargs)
 
 
 def _ffp_to_json(ffp: FeedforwardParams) -> str:
-    return json.dumps(
-        {
-            "creep_speed_kmh": ffp.creep_speed_kmh,
-            "creep_rate_kmhs": ffp.creep_rate_kmhs,
-            "engine_brake_decel_kmhs": ffp.engine_brake_decel_kmhs,
-            "stop_brake_opening_pct": ffp.stop_brake_opening_pct,
-            "brake_deadband_pct": ffp.brake_deadband_pct,
-            "accel_deadband_pct": ffp.accel_deadband_pct,
-        }
-    )
+    return json.dumps({f.name: getattr(ffp, f.name) for f in fields(FeedforwardParams)})
 
 
 def _row_to_profile(row: asyncpg.Record) -> VehicleProfile:
@@ -131,27 +119,32 @@ class ProfileRepository:
         )
         ffp_json = _ffp_to_json(profile.feedforward_params)
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO vehicle_profiles
-                    (id, name, max_accel_opening, max_brake_opening, max_speed,
-                     max_decel_g, pid_gains, stop_config, model_path,
-                     feedforward_params, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10::jsonb, $11, $12)
-                """,
-                uuid.UUID(profile_id),
-                profile.name,
-                profile.max_accel_opening,
-                profile.max_brake_opening,
-                profile.max_speed,
-                profile.max_decel_g,
-                pid_json,
-                stop_json,
-                profile.model_path,
-                ffp_json,
-                now,
-                now,
-            )
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO vehicle_profiles
+                        (id, name, max_accel_opening, max_brake_opening, max_speed,
+                         max_decel_g, pid_gains, stop_config, model_path,
+                         feedforward_params, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10::jsonb, $11, $12)
+                    """,
+                    uuid.UUID(profile_id),
+                    profile.name,
+                    profile.max_accel_opening,
+                    profile.max_brake_opening,
+                    profile.max_speed,
+                    profile.max_decel_g,
+                    pid_json,
+                    stop_json,
+                    profile.model_path,
+                    ffp_json,
+                    now,
+                    now,
+                )
+            except asyncpg.UniqueViolationError as e:
+                raise DuplicateNameError(
+                    f"プロファイル名 {profile.name!r} は既に使用されています"
+                ) from e
         created = VehicleProfile(
             id=profile_id,
             name=profile.name,

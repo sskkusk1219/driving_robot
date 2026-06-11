@@ -37,7 +37,8 @@ def main() -> None:
 
     current = lgpio.gpio_read(h, EMERGENCY_PIN)
     state_str = (
-        "LOW（通常: NC接点が閉じている）" if current == 0
+        "LOW（通常: NC接点が閉じている）"
+        if current == 0
         else "HIGH（非常停止中: NC接点が開いている）"
     )
     print(f"GPIO{EMERGENCY_PIN} 初期状態: {state_str}")

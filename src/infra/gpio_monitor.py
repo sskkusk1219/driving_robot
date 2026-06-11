@@ -10,6 +10,7 @@ GPIO27: AC UPS 接点出力 AC断検知（物理ピン13、プルアップ、FAL
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 from collections.abc import Callable, Coroutine
 from typing import Any
@@ -134,9 +135,24 @@ class GPIOMonitor:
         self._fire_callbacks(self._ac_loss_callbacks)
 
     def _fire_callbacks(self, callbacks: list[AsyncCallback]) -> None:
-        """登録済みの非同期コールバックをイベントループに投入する。"""
+        """登録済みの非同期コールバックをイベントループに投入する。
+
+        Future を破棄するとコールバック内の例外（非常停止シーケンスの失敗）が
+        どこにも記録されないため、必ず done_callback で例外を回収してログに残す。
+        """
         if self._loop is None or not self._loop.is_running():
             logger.error("イベントループが実行中でないため、コールバックを投入できません。")
             return
         for cb in callbacks:
-            asyncio.run_coroutine_threadsafe(cb(), self._loop)
+            future = asyncio.run_coroutine_threadsafe(cb(), self._loop)
+            future.add_done_callback(_log_callback_failure)
+
+
+def _log_callback_failure(future: concurrent.futures.Future[None]) -> None:
+    """GPIO コールバックの例外をログに記録する（黙殺防止）。"""
+    if future.cancelled():
+        logger.error("GPIO コールバックがキャンセルされました。")
+        return
+    exc = future.exception()
+    if exc is not None:
+        logger.error("GPIO コールバックが失敗しました: %r", exc, exc_info=exc)

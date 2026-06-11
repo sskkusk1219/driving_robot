@@ -110,17 +110,13 @@ class TestServoControl:
     async def test_servo_on(self) -> None:
         driver, mock_client = _make_driver()
         await driver.servo_on()
-        mock_client.write_coil.assert_awaited_once_with(
-            address=0x0403, value=True, device_id=1
-        )
+        mock_client.write_coil.assert_awaited_once_with(address=0x0403, value=True, device_id=1)
 
     @pytest.mark.asyncio
     async def test_servo_off(self) -> None:
         driver, mock_client = _make_driver()
         await driver.servo_off()
-        mock_client.write_coil.assert_awaited_once_with(
-            address=0x0403, value=False, device_id=1
-        )
+        mock_client.write_coil.assert_awaited_once_with(address=0x0403, value=False, device_id=1)
 
 
 class TestResetAlarm:
@@ -182,9 +178,7 @@ class TestEnableModbusControl:
     async def test_enable_modbus_control_writes_pmsl(self) -> None:
         driver, mock_client = _make_driver()
         await driver.enable_modbus_control()
-        mock_client.write_coil.assert_awaited_once_with(
-            address=0x0427, value=True, device_id=1
-        )
+        mock_client.write_coil.assert_awaited_once_with(address=0x0427, value=True, device_id=1)
 
 
 class TestMoveToPosition:

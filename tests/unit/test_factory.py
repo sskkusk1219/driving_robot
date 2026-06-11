@@ -120,6 +120,7 @@ class TestBuildRealController:
             channel=0,
             bitrate=500000,
             dbc_path="config/can/MEIDEN_MEIDACS.dbc",
+            max_speed_age_s=0.2,
         )
 
     @pytest.mark.asyncio
@@ -141,26 +142,30 @@ class TestBuildRealController:
 
     @pytest.mark.asyncio
     async def test_gpio_emergency_callback_registered_to_controller(self) -> None:
-        """GPIO非常停止コールバックが controller.emergency_stop に直接配線されること。
-        trigger_emergency 経由にすると循環呼び出しが生じるため、コントローラを直接登録する。
+        """非常停止が SafetyMonitor を単一ディスパッチャとして配線されること。
+
+        GPIO → SafetyMonitor.trigger_emergency → controller.emergency_stop の一方向配線。
+        SafetyMonitor に controller.emergency_stop が登録されることで、
+        AC断（NUT → handle_ac_power_loss → trigger_emergency）も同じ経路で停止する。
         """
         settings = make_settings()
         with (
             patch("src.app.factory.ActuatorDriver"),
             patch("src.app.factory.CANReader"),
             patch("src.app.factory.GPIOMonitor") as mock_gpio_cls,
-            patch("src.app.factory.SafetyMonitor"),
+            patch("src.app.factory.SafetyMonitor") as mock_safety_cls,
             patch("src.app.factory.NutUPSMonitor"),
             patch("src.app.factory.create_pool", new_callable=AsyncMock),
             patch("src.app.factory.ProfileRepository"),
         ):
             mock_gpio = MagicMock()
             mock_gpio_cls.return_value = mock_gpio
+            mock_safety = MagicMock()
+            mock_safety_cls.return_value = mock_safety
             ctrl, _ = await build_real_controller(settings)
 
-        mock_gpio.register_emergency_callback.assert_called_once_with(
-            ctrl.emergency_stop
-        )
+        mock_safety.register_emergency_callback.assert_called_once_with(ctrl.emergency_stop)
+        mock_gpio.register_emergency_callback.assert_called_once_with(mock_safety.trigger_emergency)
 
     @pytest.mark.asyncio
     async def test_nut_ac_loss_callback_registered_to_safety_monitor(self) -> None:
@@ -199,9 +204,7 @@ class TestBuildRealController:
     async def test_baud_rate_propagated_to_both_drivers(
         self, accel_port: str, brake_port: str, baud_rate: int
     ) -> None:
-        settings = make_settings(
-            accel_port=accel_port, brake_port=brake_port, baud_rate=baud_rate
-        )
+        settings = make_settings(accel_port=accel_port, brake_port=brake_port, baud_rate=baud_rate)
         with (
             patch("src.app.factory.ActuatorDriver") as mock_actuator,
             patch("src.app.factory.CANReader"),
@@ -299,11 +302,13 @@ class TestBuildRealController:
         # 実アクチュエータ/CAN は生成されない（スタブに置換）
         mock_actuator.assert_not_called()
         mock_can.assert_not_called()
-        # 非常停止スイッチ(GPIO)は実機のまま生成・配線される
+        # 非常停止スイッチ(GPIO)は実機のまま生成・配線される（SafetyMonitor 経由）
         mock_gpio.assert_called_once_with(emergency_pin=17, ac_detect_pin=27)
-        mock_gpio.return_value.register_emergency_callback.assert_called_once_with(
-            ctrl.emergency_stop
-        )
+        mock_gpio.return_value.register_emergency_callback.assert_called_once()
+        registered_cb = mock_gpio.return_value.register_emergency_callback.call_args[0][0]
+        assert registered_cb.__name__ == "trigger_emergency"
+        # SafetyMonitor には controller.emergency_stop が登録されている
+        assert registered_cb.__self__._emergency_callbacks == [ctrl.emergency_stop]
 
     @pytest.mark.asyncio
     async def test_safety_monitor_uses_overcurrent_limit_from_settings(self) -> None:

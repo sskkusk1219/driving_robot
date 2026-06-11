@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from src.infra.db import DuplicateNameError
 from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
 from src.web.deps import ProfileRepoProtocol, get_profile_repo
 from src.web.schemas import (
@@ -107,7 +108,10 @@ async def create_profile(req: ProfileCreateRequest, repo: ProfileRepo) -> Profil
             else FeedforwardParams()
         ),
     )
-    created = await repo.create(profile)
+    try:
+        created = await repo.create(profile)
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     return _to_response(created)
 
 

@@ -316,11 +316,16 @@ class TestEmergencyStop:
         ctrl._brake_driver.home_return.assert_called_once()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
-    async def test_emergency_stop_triggers_safety_monitor(self) -> None:
+    async def test_emergency_stop_does_not_call_trigger_emergency(self) -> None:
+        """emergency_stop は trigger_emergency を呼び返さない（一方向ディスパッチ）。
+
+        本番配線では SafetyMonitor.trigger_emergency のコールバックとして
+        emergency_stop 自身が登録されるため、呼び返すと再帰ループになる。
+        """
         ctrl = make_controller()
         await advance_to_ready(ctrl)
         await ctrl.emergency_stop()
-        ctrl._safety_monitor.trigger_emergency.assert_called_once()  # type: ignore[attr-defined]
+        ctrl._safety_monitor.trigger_emergency.assert_not_called()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_emergency_stop_from_booting_raises(self) -> None:
@@ -348,7 +353,6 @@ class TestEmergencyStop:
         assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
         ctrl._accel_driver.home_return.assert_called_once()  # type: ignore[attr-defined]
         ctrl._brake_driver.home_return.assert_called_once()  # type: ignore[attr-defined]
-        ctrl._safety_monitor.trigger_emergency.assert_called_once()  # type: ignore[attr-defined]
 
 
 class TestResetEmergency:
@@ -479,9 +483,7 @@ class TestRunCalibration:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
 
-        failed_result = CalibrationResult(
-            success=False, data=None, error_message="スパイク未検出"
-        )
+        failed_result = CalibrationResult(success=False, data=None, error_message="スパイク未検出")
         mock_manager = AsyncMock()
         mock_manager.run_calibration = AsyncMock(return_value=failed_result)
         ctrl._calibration_manager = mock_manager  # type: ignore[assignment]
@@ -1003,11 +1005,13 @@ class TestShutdown:
         await ctrl.start_auto_drive(mode_id="mode-1")
 
         mock_loop = MagicMock()
+        mock_loop.stop_and_join = AsyncMock()
         ctrl._drive_loop = mock_loop  # type: ignore[assignment]
 
         await ctrl.shutdown()
 
-        mock_loop.stop.assert_called_once()
+        # 飛行中サイクルの完了を待ってからペダル解放する（stop() 単発ではない）
+        mock_loop.stop_and_join.assert_awaited_once()
         assert ctrl._drive_loop is None
 
     @pytest.mark.asyncio
@@ -1333,7 +1337,10 @@ class TestDriveSessionLogging:
         log_writer.end_session = AsyncMock()
 
         session = await ctrl.start_auto_drive(
-            "mode-uuid-1", mode=_make_mode(), profile=profile, log_writer=log_writer  # type: ignore[arg-type]
+            "mode-uuid-1",
+            mode=_make_mode(),
+            profile=profile,
+            log_writer=log_writer,  # type: ignore[arg-type]
         )
 
         log_writer.start_session.assert_awaited_once_with("prof-uuid-1", "mode-uuid-1", "auto")
@@ -1356,7 +1363,10 @@ class TestDriveSessionLogging:
         log_writer.end_session = AsyncMock()
 
         await ctrl.start_auto_drive(
-            "mode-uuid-1", mode=_make_mode(), profile=profile, log_writer=log_writer  # type: ignore[arg-type]
+            "mode-uuid-1",
+            mode=_make_mode(),
+            profile=profile,
+            log_writer=log_writer,  # type: ignore[arg-type]
         )
         await ctrl.emergency_stop()
         log_writer.end_session.assert_awaited_once_with("db-sess-2", "emergency")
@@ -1397,3 +1407,293 @@ class TestDriveSessionLogging:
         session = await ctrl.start_learning_drive(log_writer=None)
         UUID(session.id)  # ローカル採番の UUID として解析できる
         assert ctrl._log_writer is None
+
+
+# ---------------------------------------------------------------------------
+# プロファイル⇔制御スタック整合（コードレビュー 2026-06-11 指摘 #4/#10）
+# ---------------------------------------------------------------------------
+
+
+def _make_safety_check() -> MagicMock:
+    sc = MagicMock()
+    sc.check_overcurrent = MagicMock(return_value=False)
+    sc.check_deviation = MagicMock(return_value=False)
+    sc.set_stop_config = MagicMock()
+    return sc
+
+
+def _make_ctrl_with_ff() -> "RobotController":
+    from src.domain.control.feedforward import FeedforwardController  # noqa: PLC0415
+
+    return RobotController(
+        accel_driver=make_accel_driver(),
+        brake_driver=make_brake_driver(),
+        can_reader=make_can_reader(),
+        safety_monitor=make_safety_monitor(),
+        pid=make_pid(),
+        last_normal_shutdown=True,
+        ff_controller=FeedforwardController(),
+        safety_check=_make_safety_check(),
+    )
+
+
+def _profile(profile_id: str, model_path: str | None = None, **ffp_kwargs) -> object:
+    from src.models.profile import (  # noqa: PLC0415
+        FeedforwardParams,
+        PIDGains,
+        StopConfig,
+        VehicleProfile,
+    )
+
+    return VehicleProfile(
+        id=profile_id,
+        name=f"Car-{profile_id}",
+        max_accel_opening=80.0,
+        max_brake_opening=60.0,
+        max_speed=180.0,
+        max_decel_g=0.5,
+        pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None,
+        model_path=model_path,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
+        feedforward_params=FeedforwardParams(**ffp_kwargs),
+    )
+
+
+class TestProfileModelLifecycle:
+    @pytest.mark.asyncio
+    async def test_switching_to_profile_without_model_unloads_previous(self, tmp_path) -> None:
+        """レビュー #4: model_path なしプロファイルへの切替で前車両のモデルが残留しない。"""
+        from tests.unit.test_feedforward import make_model_file  # noqa: PLC0415
+
+        ctrl = _make_ctrl_with_ff()
+        await ctrl.start()  # STANDBY
+        model_path = str(make_model_file(tmp_path))
+
+        ctrl.select_profile(_profile("vehicle-a", model_path=model_path))  # type: ignore[arg-type]
+        assert ctrl._ff_controller.has_model is True  # type: ignore[union-attr]
+
+        ctrl.select_profile(_profile("vehicle-b", model_path=None))  # type: ignore[arg-type]
+        assert ctrl._ff_controller.has_model is False  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_failed_model_load_leaves_no_stale_model(self, tmp_path) -> None:
+        """ロード失敗時も前車両のモデルが残留せず、警告のみで選択は成功する。"""
+        from tests.unit.test_feedforward import make_model_file  # noqa: PLC0415
+
+        ctrl = _make_ctrl_with_ff()
+        await ctrl.start()
+        ctrl.select_profile(  # type: ignore[arg-type]
+            _profile("vehicle-a", model_path=str(make_model_file(tmp_path)))
+        )
+
+        ctrl.select_profile(  # type: ignore[arg-type]
+            _profile("vehicle-b", model_path="/nonexistent/model.pkl")
+        )
+        assert ctrl._ff_controller.has_model is False  # type: ignore[union-attr]
+        assert ctrl.get_active_profile().id == "vehicle-b"  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_pid_output_limit_applied_from_profile(self) -> None:
+        ctrl = _make_ctrl_with_ff()
+        await ctrl.start()
+        ctrl.select_profile(_profile("p1", pid_output_limit_pct=30.0))  # type: ignore[arg-type]
+        assert ctrl._pid._output_limit == pytest.approx(30.0)
+
+
+class TestRefreshActiveProfile:
+    @pytest.mark.asyncio
+    async def test_refresh_applies_new_model_and_params(self, tmp_path) -> None:
+        """レビュー #10: 学習後の refresh でモデルと物理定数が即時反映される。"""
+        from tests.unit.test_feedforward import make_model_file  # noqa: PLC0415
+
+        ctrl = _make_ctrl_with_ff()
+        await ctrl.start()
+        ctrl.select_profile(_profile("p1", model_path=None))  # type: ignore[arg-type]
+        assert ctrl._ff_controller.has_model is False  # type: ignore[union-attr]
+
+        trained = _profile("p1", model_path=str(make_model_file(tmp_path)), creep_speed_kmh=9.0)
+        assert ctrl.refresh_active_profile(trained) is True  # type: ignore[arg-type]
+        assert ctrl._ff_controller.has_model is True  # type: ignore[union-attr]
+        assert ctrl._ff_controller._params.creep_speed_kmh == 9.0  # type: ignore[union-attr]
+        assert ctrl.get_active_profile() is trained
+
+    @pytest.mark.asyncio
+    async def test_refresh_ignores_non_active_profile(self) -> None:
+        ctrl = _make_ctrl_with_ff()
+        await ctrl.start()
+        ctrl.select_profile(_profile("p1"))  # type: ignore[arg-type]
+        assert ctrl.refresh_active_profile(_profile("other")) is False  # type: ignore[arg-type]
+        assert ctrl.get_active_profile().id == "p1"  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_refresh_rejected_while_running(self) -> None:
+        """走行中の制御パラメータ差し替えは反映しない（挙動が不定になるため）。"""
+        ctrl = _make_ctrl_with_ff()
+        await ctrl.start()
+        ctrl.select_profile(_profile("p1"))  # type: ignore[arg-type]
+        ctrl._state = RobotState.RUNNING
+        assert ctrl.refresh_active_profile(_profile("p1")) is False  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# 非常停止経路（コードレビュー 2026-06-11 指摘 #6/#15）
+# ---------------------------------------------------------------------------
+
+
+class TestEmergencyDispatch:
+    @pytest.mark.asyncio
+    async def test_dispatch_routes_through_safety_monitor(self) -> None:
+        """内部起因の非常停止が SafetyMonitor ディスパッチャを経由する（指摘 #15）。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        # 実構成では trigger_emergency → 登録コールバック（emergency_stop）が発火する
+        ctrl._safety_monitor.trigger_emergency = AsyncMock(side_effect=ctrl.emergency_stop)  # type: ignore[attr-defined]
+
+        await ctrl._dispatch_emergency()
+
+        ctrl._safety_monitor.trigger_emergency.assert_awaited_once()  # type: ignore[attr-defined]
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
+        # フォールバックで二重に home_return しない（冪等）
+        assert ctrl._accel_driver.home_return.await_count == 1  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_falls_back_when_no_callback_registered(self) -> None:
+        """コールバック未登録の DI 構成でも emergency_stop に倒れる（安全フォールバック）。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        # trigger_emergency が何もしないスタブ → フォールバックが効く
+        await ctrl._dispatch_emergency()
+
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
+        assert ctrl._accel_driver.home_return.await_count == 1  # type: ignore[attr-defined]
+
+
+class TestEmergencyStopJoinsCycle:
+    @pytest.mark.asyncio
+    async def test_stop_and_join_completes_before_home_return(self) -> None:
+        """レビュー #6: 飛行中サイクルの完了待ちが home_return より先に行われる。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+
+        order: list[str] = []
+
+        mock_loop = MagicMock()
+        mock_loop.stop = MagicMock()
+        mock_loop.kpi_summary = {"n_samples": 0.0}
+
+        async def _join(timeout_s: float = 2.0) -> None:
+            order.append("join")
+
+        async def _home() -> None:
+            order.append("home")
+
+        mock_loop.stop_and_join = _join
+        ctrl._drive_loop = mock_loop  # type: ignore[assignment]
+        ctrl._accel_driver.home_return = _home  # type: ignore[attr-defined]
+
+        await ctrl.emergency_stop()
+
+        assert order.index("join") < order.index("home")
+        assert ctrl._drive_loop is None
+
+
+# ---------------------------------------------------------------------------
+# テレメトリ鮮度（コードレビュー 2026-06-11 指摘 #16）
+# ---------------------------------------------------------------------------
+
+
+class TestRealtimeSnapshotFreshness:
+    @pytest.mark.asyncio
+    async def test_fresh_snapshot_returned_from_cache(self) -> None:
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        from src.models.system_state import RealtimeSnapshot  # noqa: PLC0415
+
+        ctrl = make_controller()
+        snap = RealtimeSnapshot(
+            actual_speed_kmh=42.0,
+            accel_pos=10,
+            brake_pos=20,
+            accel_current_ma=1.0,
+            brake_current_ma=2.0,
+            captured_at=_asyncio.get_running_loop().time(),
+        )
+        mock_loop = MagicMock()
+        mock_loop.last_snapshot = snap
+        ctrl._drive_loop = mock_loop  # type: ignore[assignment]
+
+        assert await ctrl.get_realtime_data() is snap
+        ctrl._can_reader.read_speed.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_stale_snapshot_falls_back_to_hardware_read(self) -> None:
+        """サイクル凍結で古くなったキャッシュは配信せず直接読み取る（障害マスキング防止）。"""
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        from src.models.system_state import RealtimeSnapshot  # noqa: PLC0415
+
+        ctrl = make_controller()
+        stale = RealtimeSnapshot(
+            actual_speed_kmh=42.0,
+            accel_pos=10,
+            brake_pos=20,
+            accel_current_ma=1.0,
+            brake_current_ma=2.0,
+            captured_at=_asyncio.get_running_loop().time() - 10.0,
+        )
+        mock_loop = MagicMock()
+        mock_loop.last_snapshot = stale
+        ctrl._drive_loop = mock_loop  # type: ignore[assignment]
+
+        result = await ctrl.get_realtime_data()
+
+        assert result is not stale
+        ctrl._can_reader.read_speed.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# KPI サマリ記録（コードレビュー 2026-06-11 指摘 #7）
+# ---------------------------------------------------------------------------
+
+
+class TestKpiSummaryRecording:
+    @pytest.mark.asyncio
+    async def test_summary_recorded_on_stop_auto_drive(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        ctrl._state = RobotState.RUNNING
+
+        summary = {
+            "n_samples": 100.0,
+            "max_abs_deviation_kmh": 0.4,
+            "p95_kmh": 0.15,
+            "reversal_max_per_5s": 1.0,
+            "hard_limit_violations": 0.0,
+        }
+        mock_loop = MagicMock()
+        mock_loop.stop_and_join = AsyncMock()
+        mock_loop.kpi_summary = summary
+        ctrl._drive_loop = mock_loop  # type: ignore[assignment]
+
+        await ctrl.stop_auto_drive()
+
+        assert ctrl.last_kpi_summary == summary
+
+    @pytest.mark.asyncio
+    async def test_empty_run_does_not_overwrite_summary(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        ctrl._state = RobotState.RUNNING
+        ctrl._last_kpi_summary = {"n_samples": 10.0}
+
+        mock_loop = MagicMock()
+        mock_loop.stop_and_join = AsyncMock()
+        mock_loop.kpi_summary = {"n_samples": 0.0}
+        ctrl._drive_loop = mock_loop  # type: ignore[assignment]
+
+        await ctrl.stop_auto_drive()
+
+        assert ctrl.last_kpi_summary == {"n_samples": 10.0}

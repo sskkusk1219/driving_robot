@@ -1,5 +1,5 @@
 // ── Learning drive screen ─────────────────────────────────
-// Reuses DriveMonitorScreen with showPause=false.
+// Reuses DriveMonitorScreen.
 // 学習運転が正常終了（RUNNING→READY）したら自動でモデル学習を実行し、
 // プロファイルに紐付ける（手動の「学習」ボタンは廃止）。
 
@@ -65,7 +65,6 @@ function LearningScreen() {
   return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
       {React.createElement(window.DriveMonitorScreen, {
-        showPause: false,
         showModeAxis: false,
         profileMaxSpeed,
         screenTitle: '学習運転',

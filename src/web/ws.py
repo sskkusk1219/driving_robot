@@ -18,6 +18,11 @@ WS_BROADCAST_INTERVAL_S = 0.1
 # 状態（EMERGENCY）がフロントへ確実に届くようにするための分離措置。
 GET_REALTIME_TIMEOUT_S = 0.5
 
+# クライアント毎の送信タイムアウト。1 クライアントの TCP バックプレッシャ（送信
+# バッファ満杯）が全クライアントの監視表示（EMERGENCY 含む）を凍結させないための上限。
+# 超過したクライアントは切断として扱う（コードレビュー 2026-06-11 指摘 #14）。
+SEND_TIMEOUT_S = 0.5
+
 
 class ConnectionManager:
     def __init__(self) -> None:
@@ -36,13 +41,21 @@ class ConnectionManager:
             self._connections.remove(ws)
 
     async def broadcast(self, data: str) -> None:
+        """全クライアントへ並列送信する。
+
+        逐次送信だと 1 クライアントのストールが broadcast_loop 全体を止めるため、
+        タイムアウト付きで並列に送り、失敗・超過したクライアントは切断する。
+        """
         dead: list[WebSocket] = []
-        for ws in self._connections:
+
+        async def _send(ws: WebSocket) -> None:
             try:
-                await ws.send_text(data)
+                await asyncio.wait_for(ws.send_text(data), timeout=SEND_TIMEOUT_S)
             except Exception as exc:
                 logger.debug("WebSocket送信失敗、切断として処理: %s", exc)
                 dead.append(ws)
+
+        await asyncio.gather(*(_send(ws) for ws in list(self._connections)))
         for ws in dead:
             self.disconnect(ws)
 
@@ -103,7 +116,8 @@ async def broadcast_loop(app: Starlette) -> None:
             timestamp=datetime.now(tz=UTC).isoformat(),
             robot_state=RobotState(state.robot_state),
             actual_speed_kmh=actual_speed,
-            ref_speed_kmh=None,
+            # 制御ループが実際に追従している基準車速を配信する（走行中以外は None）
+            ref_speed_kmh=controller.current_ref_speed,
             accel_opening=accel_opening,
             brake_opening=brake_opening,
             accel_current_ma=accel_current,

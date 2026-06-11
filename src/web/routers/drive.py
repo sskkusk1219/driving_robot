@@ -1,3 +1,4 @@
+import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +12,9 @@ from src.app.robot_controller import (
 )
 from src.domain.learning_drive import LearningDataError
 from src.domain.model_training import estimate_dynamics_params, train_inverse_model
+from src.models.calibration import CalibrationResult
+from src.models.drive_log import DriveSession
+from src.models.system_state import RobotState
 from src.web.deps import (
     ModeRepoProtocol,
     ProfileRepoProtocol,
@@ -39,6 +43,37 @@ from src.web.schemas import (
 router = APIRouter(prefix="/api/v1/drive", tags=["drive"])
 
 Controller = Annotated[RobotController, Depends(get_controller)]
+
+
+def _to_session_response(session: DriveSession) -> DriveSessionResponse:
+    return DriveSessionResponse(
+        id=session.id,
+        profile_id=session.profile_id,
+        mode_id=session.mode_id,
+        run_type=session.run_type,
+        started_at=session.started_at,
+        ended_at=session.ended_at,
+        status=session.status,
+    )
+
+
+def _to_calibration_result_response(result: CalibrationResult) -> CalibrationResultResponse:
+    return CalibrationResultResponse(
+        success=result.success,
+        error_message=result.error_message,
+        data=CalibrationDataResponse(
+            accel_zero_pos=result.data.accel_zero_pos,
+            accel_full_pos=result.data.accel_full_pos,
+            accel_stroke=result.data.accel_stroke,
+            brake_zero_pos=result.data.brake_zero_pos,
+            brake_full_pos=result.data.brake_full_pos,
+            brake_stroke=result.data.brake_stroke,
+            calibrated_at=result.data.calibrated_at,
+            is_valid=result.data.is_valid,
+        )
+        if result.data is not None
+        else None,
+    )
 
 
 @router.get("/status", response_model=SystemStateResponse)
@@ -75,6 +110,10 @@ async def start_drive(
     走行ログを `drive_logs` に記録する（DB 利用時）。
     """
     mode = await mode_repo.get_by_id(req.mode_id)
+    if mode is None:
+        # mode 不在のまま start_auto_drive を呼ぶと RUNNING 遷移後に DriveLoop が
+        # 起動しない／DB の FK 違反で 500 になるため、状態遷移前に拒否する。
+        raise HTTPException(status_code=404, detail=f"走行モード {req.mode_id!r} が見つかりません")
     profile = controller.get_active_profile()
     try:
         session = await controller.start_auto_drive(
@@ -84,15 +123,7 @@ async def start_drive(
         raise HTTPException(status_code=409, detail=str(e)) from e
     except PreCheckFailed as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-    return DriveSessionResponse(
-        id=session.id,
-        profile_id=session.profile_id,
-        mode_id=session.mode_id,
-        run_type=session.run_type,
-        started_at=session.started_at,
-        ended_at=session.ended_at,
-        status=session.status,
-    )
+    return _to_session_response(session)
 
 
 @router.post("/stop", status_code=200)
@@ -131,22 +162,7 @@ async def run_calibration(controller: Controller) -> CalibrationResultResponse:
         result = await controller.run_calibration()
     except InvalidStateTransition as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    return CalibrationResultResponse(
-        success=result.success,
-        error_message=result.error_message,
-        data=CalibrationDataResponse(
-            accel_zero_pos=result.data.accel_zero_pos,
-            accel_full_pos=result.data.accel_full_pos,
-            accel_stroke=result.data.accel_stroke,
-            brake_zero_pos=result.data.brake_zero_pos,
-            brake_full_pos=result.data.brake_full_pos,
-            brake_stroke=result.data.brake_stroke,
-            calibrated_at=result.data.calibrated_at,
-            is_valid=result.data.is_valid,
-        )
-        if result.data is not None
-        else None,
-    )
+    return _to_calibration_result_response(result)
 
 
 @router.post("/calib/jog", response_model=JogResponse)
@@ -196,22 +212,7 @@ async def save_calibration(controller: Controller) -> CalibrationResultResponse:
         result = await controller.save_manual_calibration()
     except InvalidStateTransition as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    return CalibrationResultResponse(
-        success=result.success,
-        error_message=result.error_message,
-        data=CalibrationDataResponse(
-            accel_zero_pos=result.data.accel_zero_pos,
-            accel_full_pos=result.data.accel_full_pos,
-            accel_stroke=result.data.accel_stroke,
-            brake_zero_pos=result.data.brake_zero_pos,
-            brake_full_pos=result.data.brake_full_pos,
-            brake_stroke=result.data.brake_stroke,
-            calibrated_at=result.data.calibrated_at,
-            is_valid=result.data.is_valid,
-        )
-        if result.data is not None
-        else None,
-    )
+    return _to_calibration_result_response(result)
 
 
 @router.post("/manual/jog", response_model=JogResponse)
@@ -235,22 +236,17 @@ async def manual_home(req: AxisRequest, controller: Controller) -> JogResponse:
 
 
 @router.post("/manual/start", response_model=DriveSessionResponse)
-async def start_manual(controller: Controller) -> DriveSessionResponse:
+async def start_manual(
+    controller: Controller,
+    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
+) -> DriveSessionResponse:
     try:
-        session = await controller.start_manual()
+        session = await controller.start_manual(log_writer=log_writer)
     except InvalidStateTransition as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except PreCheckFailed as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-    return DriveSessionResponse(
-        id=session.id,
-        profile_id=session.profile_id,
-        mode_id=session.mode_id,
-        run_type=session.run_type,
-        started_at=session.started_at,
-        ended_at=session.ended_at,
-        status=session.status,
-    )
+    return _to_session_response(session)
 
 
 @router.post("/manual/stop", status_code=200)
@@ -278,27 +274,34 @@ async def start_learning_drive(
         raise HTTPException(status_code=409, detail=str(e)) from e
     except PreCheckFailed as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-    return DriveSessionResponse(
-        id=session.id,
-        profile_id=session.profile_id,
-        mode_id=session.mode_id,
-        run_type=session.run_type,
-        started_at=session.started_at,
-        ended_at=session.ended_at,
-        status=session.status,
-    )
+    return _to_session_response(session)
 
 
 @router.post("/learning/train", response_model=TrainModelResponse)
 async def train_learning_model(
     req: TrainModelRequest,
+    controller: Controller,
     profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
     session_repo: Annotated[SessionRepoProtocol, Depends(get_session_repo)],
 ) -> TrainModelResponse:
     """連続走行ログから先読み Ridge 逆モデルを学習し、プロファイルに紐づけて保存する。
 
     再学習も同一エンドポイントで実行できる（model_path を上書き更新）。
+    学習は CPU 負荷の高い同期処理のため to_thread で実行し、50ms 制御ループ・
+    WebSocket 配信・非常停止コールバックが動くイベントループをブロックしない。
     """
+    state = controller.get_system_state().robot_state
+    if state in (
+        RobotState.RUNNING,
+        RobotState.MANUAL,
+        RobotState.CALIBRATING,
+        RobotState.PRE_CHECK,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"走行・操作中はモデル学習を実行できません (現在: {state})",
+        )
+
     profile = await profile_repo.get_by_id(req.profile_id)
     if profile is None:
         raise HTTPException(
@@ -307,16 +310,21 @@ async def train_learning_model(
 
     logs = await session_repo.list_logs_for_training(req.profile_id, req.session_ids)
     try:
-        model_path, metrics = train_inverse_model(logs, profile)
+        model_path, metrics = await asyncio.to_thread(train_inverse_model, logs, profile)
     except LearningDataError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
     # 観測可能な物理定数のみログから推定して上書き（不足項目は既存値を保持）
-    new_params = estimate_dynamics_params(logs, profile.feedforward_params)
+    new_params = await asyncio.to_thread(estimate_dynamics_params, logs, profile.feedforward_params)
 
     profile.model_path = model_path
     profile.feedforward_params = new_params
-    await profile_repo.update(profile)
+    updated = await profile_repo.update(profile)
+
+    # 学習結果をアクティブプロファイルの制御スタックへ即時反映する。
+    # DB だけ更新して in-memory を放置すると、学習直後の走行が旧モデル
+    # （または FF なし）で実行される（コードレビュー 2026-06-11 指摘 #10）。
+    controller.refresh_active_profile(updated if updated is not None else profile)
 
     return TrainModelResponse(
         model_path=model_path,
@@ -328,6 +336,11 @@ async def train_learning_model(
             stop_brake_opening_pct=new_params.stop_brake_opening_pct,
             brake_deadband_pct=new_params.brake_deadband_pct,
             accel_deadband_pct=new_params.accel_deadband_pct,
+            switch_hysteresis_pct=new_params.switch_hysteresis_pct,
+            accel_reengage_dwell_s=new_params.accel_reengage_dwell_s,
+            accel_rate_limit_pct_s=new_params.accel_rate_limit_pct_s,
+            brake_rate_limit_pct_s=new_params.brake_rate_limit_pct_s,
+            pid_output_limit_pct=new_params.pid_output_limit_pct,
         ),
     )
 

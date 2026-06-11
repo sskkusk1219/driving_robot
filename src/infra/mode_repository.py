@@ -7,6 +7,7 @@ import uuid
 
 import asyncpg
 
+from src.infra.db import DuplicateNameError
 from src.models.driving_mode import DrivingMode, SpeedPoint
 
 
@@ -33,9 +34,7 @@ class ModeRepository:
     async def list_all(self) -> list[DrivingMode]:
         """全走行モードを作成日時降順で返す。"""
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM driving_modes ORDER BY created_at DESC"
-            )
+            rows = await conn.fetch("SELECT * FROM driving_modes ORDER BY created_at DESC")
         return [_row_to_mode(row) for row in rows]
 
     async def get_by_id(self, mode_id: str) -> DrivingMode | None:
@@ -56,20 +55,26 @@ class ModeRepository:
             [{"time_s": p.time_s, "speed_kmh": p.speed_kmh} for p in mode.reference_speed]
         )
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO driving_modes
-                    (id, name, description, reference_speed, total_duration, max_speed, created_at)
-                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
-                """,
-                uuid.UUID(mode_id),
-                mode.name,
-                mode.description,
-                ref_speed_json,
-                mode.total_duration,
-                mode.max_speed,
-                mode.created_at,
-            )
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO driving_modes
+                        (id, name, description, reference_speed,
+                         total_duration, max_speed, created_at)
+                    VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
+                    """,
+                    uuid.UUID(mode_id),
+                    mode.name,
+                    mode.description,
+                    ref_speed_json,
+                    mode.total_duration,
+                    mode.max_speed,
+                    mode.created_at,
+                )
+            except asyncpg.UniqueViolationError as e:
+                raise DuplicateNameError(
+                    f"走行モード名 {mode.name!r} は既に使用されています"
+                ) from e
         return DrivingMode(
             id=mode_id,
             name=mode.name,

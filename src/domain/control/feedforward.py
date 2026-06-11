@@ -17,10 +17,11 @@ from src.models.profile import FeedforwardParams
 
 
 class FeedforwardController:
-    """先読み型 Ridge 逆モデルによる FF 制御。load_model() 後に predict() を呼ぶ。
+    """先読み型 Ridge 逆モデルによる FF 制御。load_model() 後に predict_effort() を呼ぶ。
 
-    現在の基準速度 v0 と数秒先の基準速度（先読み）から、名目アクセル/ブレーキ開度を予測する。
-    追従誤差の補正は PID に委ねる純粋フィードフォワード。
+    現在の基準速度 v0 と数秒先の基準速度（先読み）から、符号付き努力量
+    （+: 名目アクセル開度 [%]、−: 名目ブレーキ開度 [%]）を予測する。
+    追従誤差の補正は PID に、ペダルへの写像は PedalArbiter に委ねる純粋フィードフォワード。
     """
 
     def __init__(self) -> None:
@@ -75,15 +76,24 @@ class FeedforwardController:
         self._accel_model = data["accel_model"]
         self._brake_model = data["brake_model"]
 
-    def predict(self, v0: float, future_speeds: Sequence[float]) -> tuple[float, float]:
-        """現在の基準速度と先読み基準速度からアクセル・ブレーキ開度[%]を返す。
+    def unload_model(self) -> None:
+        """運転モデルを破棄する。プロファイル切替時に必ず呼び、前車両のモデル残留を防ぐ。
+
+        モデルなしプロファイルへ切替えた際にアンロードしないと has_model が True のまま
+        前車両のペダルマップが適用される（コードレビュー 2026-06-11 指摘 #4）。
+        """
+        self._accel_model = None
+        self._brake_model = None
+
+    def predict_effort(self, v0: float, future_speeds: Sequence[float]) -> float:
+        """現在の基準速度と先読み基準速度から符号付き努力量 [%] を返す。
 
         Args:
             v0: 現在の基準速度 [km/h]
             future_speeds: 各ホライズン（horizons 順）の基準速度 [km/h]
 
         Returns:
-            (accel_opening, brake_opening) — 各 0.0〜100.0 [%]
+            努力量 [%]。正は名目アクセル開度、負は名目ブレーキ開度。-100.0〜100.0。
 
         Raises:
             RuntimeError: load_model() が呼ばれていない場合
@@ -93,39 +103,47 @@ class FeedforwardController:
 
         p = self._params
 
-        # 1. 停車レジーム: 基準が停車（現在も先読みも停車しきい値以下）→ 停車保持ブレーキ
-        #    fit_intercept=False の Ridge は原点で 0 を返すため、定数で補う必要がある。
-        if v0 <= STOP_SPEED_KMH and all(fs <= STOP_SPEED_KMH for fs in future_speeds):
-            return 0.0, max(0.0, min(100.0, p.stop_brake_opening_pct))
+        # 1. 停車レジーム: 停車保持ブレーキ（fit_intercept=False の Ridge は原点で 0 を
+        #    返すため定数で補う）。判定は最短ホライズン（0.5 秒先）のみ:
+        #    全先読み点（3 秒先まで）で判定すると発進の 3 秒前に保持ブレーキが解除され、
+        #    クリープで基準 0 に逆らって動き出す（レビュー指摘 #5）。
+        if v0 <= STOP_SPEED_KMH and future_speeds and future_speeds[0] <= STOP_SPEED_KMH:
+            return -max(0.0, min(100.0, p.stop_brake_opening_pct))
 
         features = build_feature_row(v0, future_speeds)
         # レジーム判定: 先読みトレンド dv_1.0 の符号（X 列順より features[0, 1+_REGIME_POS]）
         dv_regime = float(features[0, 1 + _REGIME_POS])
         desired_accel = dv_regime / REGIME_HORIZON_S  # km/h/s（正:加速, 負:減速）
 
-        # 2. Ridge 予測（レジーム別）
-        if dv_regime >= 0.0:
-            accel_raw = float(self._accel_model.predict(features)[0])
-            brake_raw = 0.0
+        # 2. 両モデルを評価。負の予測はノイズとして 0。
+        accel_pred = max(0.0, float(self._accel_model.predict(features)[0]))
+        brake_pred = max(0.0, float(self._brake_model.predict(features)[0]))
+
+        # 3. レジーム合成。旧実装の「dv>=0 → アクセルモデル / dv<0 → ブレーキ 0 or
+        #    ブレーキモデル」は dv=0 境界で巡航開度 → 0 の不連続ジャンプを生み、巡航
+        #    うねりで FF がドロップアウトして PID が穴埋めを繰り返していた（指摘 #9）。
+        #    エンジンブレーキで届く緩減速は「スロットルを巡航開度から漸減して作る」のが
+        #    物理実体のため、テーパで連続化する。
+        if desired_accel >= 0.0:
+            # 加速・定常: 駆動側。低速でクリープ能力内の加速要求はペダル不要。
+            # 旧実装の abs() 判定は低速の「緩減速」までペダルオフにし、クリープが車を
+            # 押す方向と逆に誤差が成長していたため、[0, creep_rate] に限定する（指摘 #8）。
+            if v0 < p.creep_speed_kmh and desired_accel <= p.creep_rate_kmhs:
+                effort = 0.0
+            else:
+                effort = accel_pred
+        elif v0 >= p.creep_speed_kmh:
+            eng = p.engine_brake_decel_kmhs
+            if eng > 0.0 and (-desired_accel) <= eng:
+                # 惰行で届く緩減速: スロットルテーパ（dv=0 で accel_pred、-eng で 0）
+                effort = accel_pred * (1.0 - (-desired_accel) / eng)
+            else:
+                effort = -brake_pred
         else:
-            accel_raw = 0.0
-            brake_raw = float(self._brake_model.predict(features)[0])
+            # クリープ速度未満の減速要求: ペダルオフでは加速する領域のため
+            # エンジンブレーキ則を適用せずブレーキを残す（指摘 #8）。
+            effort = -brake_pred
 
-        # 3. クリープ域: 低速で要求加速がクリープ能力内 → 放っておけば進むのでペダル 0
-        if v0 < p.creep_speed_kmh and abs(desired_accel) <= p.creep_rate_kmhs:
-            accel_raw = 0.0
-            brake_raw = 0.0
-
-        # 4. 惰行: 緩減速がエンジンブレーキの範囲内 → ブレーキ不要（惰行で足りる）
-        if dv_regime < 0.0 and (-desired_accel) <= p.engine_brake_decel_kmhs:
-            brake_raw = 0.0
-
-        # 5. 不感帯スナップ: 遊び未満の微小開度は 0（チャタリング抑制）
-        if accel_raw < p.accel_deadband_pct:
-            accel_raw = 0.0
-        if brake_raw < p.brake_deadband_pct:
-            brake_raw = 0.0
-
-        accel_opening = max(0.0, min(100.0, accel_raw))
-        brake_opening = max(0.0, min(100.0, brake_raw))
-        return accel_opening, brake_opening
+        # 不感帯処理は FF 単体では行わない: FF+PID 合成後の最終指令に対して
+        # PedalArbiter が逆補償する（FF 側で切り捨てると合成値が死帯に落ちる。指摘 #11）。
+        return max(-100.0, min(100.0, effort))

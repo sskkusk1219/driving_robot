@@ -1,11 +1,13 @@
 import csv
 import io
+import re as _re
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
+from src.infra.db import DuplicateNameError
 from src.models.driving_mode import DrivingMode, SpeedPoint
 from src.web.deps import ModeRepoProtocol, get_mode_repo
 from src.web.schemas import ModeDetailResponse, ModeResponse, ModeUpdateRequest, SpeedPointSchema
@@ -39,9 +41,6 @@ def _to_detail_response(m: DrivingMode) -> ModeDetailResponse:
         max_speed=m.max_speed,
         created_at=m.created_at,
     )
-
-
-import re as _re
 
 
 def _normalize_col(name: str) -> str:
@@ -133,9 +132,7 @@ async def upload_mode(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
-    mode_name = name.strip() or (
-        file.filename.rsplit(".", 1)[0] if file.filename else "mode"
-    )
+    mode_name = name.strip() or (file.filename.rsplit(".", 1)[0] if file.filename else "mode")
     total_duration = points[-1].time_s
     max_speed = max(p.speed_kmh for p in points)
 
@@ -148,7 +145,10 @@ async def upload_mode(
         max_speed=max_speed,
         created_at=datetime.now(tz=UTC),
     )
-    created = await repo.create(mode)
+    try:
+        created = await repo.create(mode)
+    except DuplicateNameError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     return _to_response(created)
 
 

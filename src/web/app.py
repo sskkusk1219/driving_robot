@@ -8,7 +8,6 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.app.robot_controller import RobotController
 from src.app.stubs import (
     InMemoryModeRepository,
     InMemoryProfileRepository,

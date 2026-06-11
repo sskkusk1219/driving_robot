@@ -28,6 +28,11 @@ class SafetyMonitor:
     def is_monitoring(self) -> bool:
         return self._is_monitoring
 
+    def set_stop_config(self, stop_config: StopConfig) -> None:
+        """逸脱停止条件を更新する。プロファイル選択時に呼び、DriveLoop が参照する
+        profile.stop_config と判定基準を一致させる（閾値の単一ソース化）。"""
+        self._stop_config = stop_config
+
     async def start_monitoring(self) -> None:
         """監視状態に移行する。実機 GPIO 割り込み設定は GPIOMonitor (infra) が担当。"""
         self._is_monitoring = True

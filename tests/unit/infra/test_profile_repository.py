@@ -10,6 +10,7 @@ import pytest
 from src.infra.profile_repository import (
     ProfileRepository,
     _ffp_from_value,
+    _ffp_to_json,
     _row_to_profile,
 )
 from src.models.calibration import CalibrationData
@@ -193,6 +194,24 @@ class TestFeedforwardParamsPersistence:
     def test_ffp_from_value_accepts_dict(self) -> None:
         ffp = _ffp_from_value({"accel_deadband_pct": 2.5})
         assert ffp.accel_deadband_pct == 2.5
+
+    def test_ffp_arbiter_constants_default_filled_from_old_record(self) -> None:
+        # 調停定数追加前の旧 JSONB レコードでもデフォルト補完で読めること
+        ffp = _ffp_from_value('{"creep_speed_kmh": 9.0}')
+        defaults = FeedforwardParams()
+        assert ffp.switch_hysteresis_pct == defaults.switch_hysteresis_pct
+        assert ffp.accel_reengage_dwell_s == defaults.accel_reengage_dwell_s
+        assert ffp.pid_output_limit_pct == defaults.pid_output_limit_pct
+
+    def test_ffp_arbiter_constants_roundtrip(self) -> None:
+        ffp = FeedforwardParams(
+            switch_hysteresis_pct=1.2,
+            accel_reengage_dwell_s=0.5,
+            accel_rate_limit_pct_s=150.0,
+            brake_rate_limit_pct_s=250.0,
+            pid_output_limit_pct=40.0,
+        )
+        assert _ffp_from_value(_ffp_to_json(ffp)) == ffp
 
     def test_row_to_profile_parses_feedforward_params(self) -> None:
         row = {

@@ -36,8 +36,16 @@ async def db_conn() -> AsyncGenerator[asyncpg.Connection]:  # type: ignore[type-
     now = datetime.now(UTC)
     await conn.execute(
         _DUMMY_PROFILE_INSERT,
-        DUMMY_PROFILE_ID, "test-profile", 100.0, 100.0, 200.0,
-        0.5, '{"kp": 1.0, "ki": 0.0, "kd": 0.0}', '{"decel_g": 0.3}', now, now,
+        DUMMY_PROFILE_ID,
+        "test-profile",
+        100.0,
+        100.0,
+        200.0,
+        0.5,
+        '{"kp": 1.0, "ki": 0.0, "kd": 0.0}',
+        '{"decel_g": 0.3}',
+        now,
+        now,
     )
     yield conn
     await conn.execute(

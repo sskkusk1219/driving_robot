@@ -116,3 +116,30 @@ async def test_broadcast_emits_realtime_values_on_normal_read(
     assert data["robot_state"] == "EMERGENCY"
     assert data["actual_speed_kmh"] == 12.5
     assert data["accel_current_ma"] == 500.0
+
+
+@pytest.mark.asyncio
+async def test_broadcast_isolates_stalled_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """1 クライアントの送信ストールが他クライアントの配信を阻害しない（レビュー #14）。
+
+    旧実装は逐次 await のため、TCP バックプレッシャで固まったクライアントが
+    broadcast_loop 全体（EMERGENCY 表示含む）を凍結させていた。
+    """
+    monkeypatch.setattr(ws, "SEND_TIMEOUT_S", 0.05)
+
+    class _StalledWS:
+        async def send_text(self, data: str) -> None:
+            await asyncio.sleep(3600)
+
+    stalled = _StalledWS()
+    healthy = _FakeWS()
+    ws.manager._connections.extend([stalled, healthy])  # type: ignore[list-item]
+    try:
+        await asyncio.wait_for(ws.manager.broadcast("payload"), timeout=1.0)
+    finally:
+        ws.manager.disconnect(stalled)  # type: ignore[arg-type]
+        ws.manager.disconnect(healthy)  # type: ignore[arg-type]
+
+    # 健全なクライアントへは配信され、ストールしたクライアントは切断扱いになる
+    assert healthy.sent == ["payload"]
+    assert stalled not in ws.manager._connections

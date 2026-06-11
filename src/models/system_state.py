@@ -46,10 +46,16 @@ class SystemState:
 
 @dataclass
 class RealtimeSnapshot:
-    """ハードウェアから取得したリアルタイム計測値。"""
+    """ハードウェアから取得したリアルタイム計測値。
+
+    captured_at はイベントループ時刻 [s]（asyncio loop.time() 基準）。
+    制御サイクルが固まった際に凍結キャッシュを「現在値」として配信し続けないよう、
+    消費側（RobotController.get_realtime_data）が鮮度判定に使う。
+    """
 
     actual_speed_kmh: float
     accel_pos: int
     brake_pos: int
     accel_current_ma: float
     brake_current_ma: float
+    captured_at: float = 0.0

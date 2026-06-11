@@ -31,6 +31,15 @@ class FeedforwardParams:
     stop_brake_opening_pct: float = 20.0  # 停車保持に要するブレーキ開度
     brake_deadband_pct: float = 1.0  # これ未満では制動力が出ないブレーキ遊び
     accel_deadband_pct: float = 1.0  # これ未満では駆動力が出ないアクセル遊び
+    # ── ペダル調停（PedalArbiter）定数 ──────────────────────────────────
+    # 振動抑制 KPI（偏差符号反転 ≤1 回/5 秒）をゲイン調整でなく機構で支えるための定数群。
+    switch_hysteresis_pct: float = 0.5  # ペダル切替ヒステリシス半幅（努力量 ±この幅は惰行）
+    accel_reengage_dwell_s: float = (
+        0.3  # ブレーキ解放後のアクセル再踏込ディレイ（制動側は遅延なし）
+    )
+    accel_rate_limit_pct_s: float = 200.0  # アクセル開度レートリミット
+    brake_rate_limit_pct_s: float = 300.0  # ブレーキ開度レートリミット
+    pid_output_limit_pct: float = 50.0  # PID 出力権限上限（FF の補助に留める）
 
 
 @dataclass

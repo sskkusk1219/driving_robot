@@ -100,9 +100,15 @@ class ArchiveManager:
     def _export_to_csv(self, rows: list[asyncpg.Record], path: Path) -> None:
         """走行ログレコードを CSV ファイルに書き出す。"""
         fieldnames = [
-            "timestamp", "ref_speed_kmh", "actual_speed_kmh",
-            "accel_opening", "brake_opening", "accel_pos", "brake_pos",
-            "accel_current", "brake_current",
+            "timestamp",
+            "ref_speed_kmh",
+            "actual_speed_kmh",
+            "accel_opening",
+            "brake_opening",
+            "accel_pos",
+            "brake_pos",
+            "accel_current",
+            "brake_current",
         ]
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)

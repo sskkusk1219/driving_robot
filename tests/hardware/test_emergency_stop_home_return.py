@@ -72,9 +72,7 @@ def _make_emergency_callback(
     def _on_edge(chip: int, gpio: int, level: int, timestamp: int) -> None:  # noqa: ARG001
         if level == 1:
             print(f"\n[GPIO{gpio}] 非常停止検知 → 原点復帰開始")
-            asyncio.run_coroutine_threadsafe(
-                _home_return_both_axes(accel, brake), loop
-            )
+            asyncio.run_coroutine_threadsafe(_home_return_both_axes(accel, brake), loop)
 
     return _on_edge
 

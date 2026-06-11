@@ -62,7 +62,9 @@ async def _read_almc_code(driver: ActuatorDriver) -> int:
         if client is None:
             return -1
         r = await client.read_holding_registers(
-            address=0x9002, count=1, device_id=driver._slave_id  # noqa: SLF001
+            address=0x9002,
+            count=1,
+            device_id=driver._slave_id,  # noqa: SLF001
         )
         return -1 if r.isError() else r.registers[0]
     except Exception:
@@ -81,9 +83,7 @@ async def _home_return_both_axes(accel: ActuatorDriver, brake: ActuatorDriver) -
         print(f"ERROR: 原点復帰エラー: {e}")
 
 
-async def _read_axis_state(
-    driver: ActuatorDriver, name: str
-) -> tuple[float, int, int]:
+async def _read_axis_state(driver: ActuatorDriver, name: str) -> tuple[float, int, int]:
     """電流値・ALMCコード・現在位置を取得する。失敗時は (0.0, -1, 0)。"""
     try:
         current = await driver.read_current()
@@ -117,11 +117,12 @@ async def _poll_current_and_check(
     for _ in range(poll_count):
         await asyncio.sleep(_POLL_INTERVAL_S)
 
-        (accel_cur, accel_almc, accel_pos), (brake_cur, brake_almc, brake_pos) = (
-            await asyncio.gather(
-                _read_axis_state(accel, "accel"),
-                _read_axis_state(brake, "brake"),
-            )
+        (
+            (accel_cur, accel_almc, accel_pos),
+            (brake_cur, brake_almc, brake_pos),
+        ) = await asyncio.gather(
+            _read_axis_state(accel, "accel"),
+            _read_axis_state(brake, "brake"),
         )
 
         alarm_tags = []

@@ -12,7 +12,7 @@ from src.models.calibration import CalibrationResult
 from src.models.drive_log import DriveLogData, DriveSession
 from src.models.driving_mode import DrivingMode
 from src.models.pre_check import PreCheckResult
-from src.models.profile import VehicleProfile
+from src.models.profile import StopConfig, VehicleProfile
 from src.models.system_state import (
     InitStep,
     InitStepStatus,
@@ -22,6 +22,11 @@ from src.models.system_state import (
 )
 
 _logger = logging.getLogger(__name__)
+
+# DriveLoop スナップショットの許容鮮度 [s]。制御サイクルが固まった際に凍結キャッシュを
+# 「現在値」として WS 配信し続けると、操作者に正常なダッシュボードを見せたまま
+# ロボットが無制御になる（コードレビュー 2026-06-11 指摘 #16）。
+SNAPSHOT_MAX_AGE_S: float = 0.5
 
 
 class InvalidStateTransition(Exception):
@@ -46,7 +51,7 @@ VALID_TRANSITIONS: dict[RobotState, frozenset[RobotState]] = {
     # BOOTING 中は GPIO 監視が未起動のため割り込みは発生しない。
     RobotState.BOOTING: frozenset({RobotState.STANDBY, RobotState.ERROR}),
     RobotState.STANDBY: frozenset({RobotState.INITIALIZING, RobotState.EMERGENCY}),
-    RobotState.INITIALIZING: frozenset({RobotState.READY, RobotState.EMERGENCY}),
+    RobotState.INITIALIZING: frozenset({RobotState.READY, RobotState.ERROR, RobotState.EMERGENCY}),
     RobotState.READY: frozenset(
         {RobotState.CALIBRATING, RobotState.PRE_CHECK, RobotState.EMERGENCY}
     ),
@@ -59,7 +64,7 @@ VALID_TRANSITIONS: dict[RobotState, frozenset[RobotState]] = {
     RobotState.EMERGENCY: frozenset({RobotState.STANDBY}),
     # 非常停止からの復帰は STANDBY へ戻し、初期化（アラームリセット→サーボON→原点復帰）を
     # 改めて実施させる。物理スイッチ解除後の安全な再立ち上げ手順に合わせる。
-    RobotState.ERROR: frozenset({RobotState.STANDBY}),
+    RobotState.ERROR: frozenset({RobotState.STANDBY, RobotState.EMERGENCY}),
 }
 
 
@@ -111,6 +116,8 @@ class SafetyCheckProtocol(Protocol):
     def check_overcurrent(self, current_ma: float, axis: str) -> bool: ...
 
     def check_deviation(self, ref: float, actual: float, duration: float) -> bool: ...
+
+    def set_stop_config(self, stop_config: StopConfig) -> None: ...
 
 
 class CalibrationManagerProtocol(Protocol):
@@ -187,6 +194,8 @@ class RobotController:
         pre_check_runner: PreCheckRunnerProtocol | None = None,
         calibration_manager: CalibrationManagerProtocol | None = None,
         learning_manager: LearningDriveManagerProtocol | None = None,
+        control_interval_s: float = 0.05,
+        log_every_n_cycles: int = 2,
     ) -> None:
         self._state = RobotState.BOOTING
         self._active_profile = None
@@ -205,6 +214,9 @@ class RobotController:
         self._drive_loop = None
         self._log_writer = None
         self._active_learning_task = None
+        self._last_kpi_summary: dict[str, float] | None = None
+        self._control_interval_s = control_interval_s
+        self._log_every_n_cycles = log_every_n_cycles
         self._pending_calib_zero: dict[str, int | None] = {"accel": None, "brake": None}
         self._pending_calib_full: dict[str, int | None] = {"accel": None, "brake": None}
         self._init_steps = self._build_init_steps()
@@ -233,11 +245,27 @@ class RobotController:
         self._active_profile = profile
         if self._pre_check_runner is not None:
             self._pre_check_runner.set_profile(profile)
+        self._apply_profile_to_control_stack(profile)
+
+    def _apply_profile_to_control_stack(self, profile: VehicleProfile) -> None:
+        """プロファイルの制御パラメータを制御スタックへ反映する。
+
+        反映しないと UI で調整した PID ゲインが無言で無視され、逸脱停止の閾値も
+        DriveLoop（profile.stop_config）と SafetyMonitor（構築時の固定値）で食い違う。
+        """
+        self._pid.set_gains(profile.pid_gains.kp, profile.pid_gains.ki, profile.pid_gains.kd)
+        self._pid.set_output_limit(profile.feedforward_params.pid_output_limit_pct)
+        if self._safety_check is not None:
+            self._safety_check.set_stop_config(profile.stop_config)
         if self._ff_controller is not None:
             # フィードフォワード物理定数を反映（モデル有無に関わらず適用）。
             self._ff_controller.set_params(profile.feedforward_params)
+            # 前プロファイルのモデルを必ず破棄してからロードする。アンロードしないと
+            # model_path なし・ロード失敗のプロファイルで has_model が True のまま
+            # 前車両のペダルマップが適用される（コードレビュー 2026-06-11 指摘 #4）。
+            self._ff_controller.unload_model()
             # 運転モデルが紐づいていればロードする。
-            # 失敗しても走行不可にはせず警告に留める（走行前チェックで別途担保）。
+            # 失敗しても走行不可にはせず警告に留める（FF なし = PID 単独で走行可能）。
             if profile.model_path:
                 try:
                     self._ff_controller.load_model(profile.model_path)
@@ -249,9 +277,63 @@ class RobotController:
                         e,
                     )
 
+    def refresh_active_profile(self, profile: VehicleProfile) -> bool:
+        """アクティブプロファイルの内容を更新し、制御スタックへ再反映する。
+
+        モデル学習（/learning/train）後に呼ぶ。DB のプロファイルだけ更新して
+        in-memory を放置すると、学習直後の走行が旧モデル（または FF なし）で
+        実行される（コードレビュー 2026-06-11 指摘 #10）。
+
+        Returns:
+            反映した場合 True。アクティブでない・走行系状態のため反映しない場合 False。
+        """
+        if self._active_profile is None or self._active_profile.id != profile.id:
+            return False
+        if self._state in (
+            RobotState.RUNNING,
+            RobotState.MANUAL,
+            RobotState.CALIBRATING,
+            RobotState.PRE_CHECK,
+        ):
+            # 走行・操作中の制御パラメータ差し替えは挙動が不定になるため拒否する
+            _logger.warning(
+                "走行系状態 (%s) のためプロファイル更新を制御スタックへ反映しません", self._state
+            )
+            return False
+        self._active_profile = profile
+        if self._pre_check_runner is not None:
+            self._pre_check_runner.set_profile(profile)
+        self._apply_profile_to_control_stack(profile)
+        return True
+
     def get_active_profile(self) -> VehicleProfile | None:
         """現在選択中のプロファイルを返す。未選択の場合は None。"""
         return self._active_profile
+
+    @property
+    def last_kpi_summary(self) -> dict[str, float] | None:
+        """直近の走行の KPI サマリ（P95・最大偏差・符号反転率・ハード違反数）。"""
+        return self._last_kpi_summary
+
+    def _record_kpi_summary(self, drive_loop: DriveLoop) -> None:
+        """走行終了時に KPI 集計をログへ残し、API/検証用に保持する。
+
+        プライマリー KPI（P95 0.2km/h・最大 1.0km/h・符号反転 ≤1/5s）は逸脱自動停止より
+        厳しく、走行が「正常完了」しても violated であり得るため必ず記録する（指摘 #7）。
+        """
+        summary = drive_loop.kpi_summary
+        if summary.get("n_samples", 0.0) <= 0.0:
+            return
+        self._last_kpi_summary = summary
+        _logger.info(
+            "走行 KPI サマリ: P95=%.2fkm/h 最大偏差=%.2fkm/h 符号反転(最大/5s)=%.0f "
+            "ハード上限(1.0km/h)違反=%.0f回 (n=%.0f)",
+            summary["p95_kmh"],
+            summary["max_abs_deviation_kmh"],
+            summary["reversal_max_per_5s"],
+            summary["hard_limit_violations"],
+            summary["n_samples"],
+        )
 
     @property
     def current_openings(self) -> tuple[float, float]:
@@ -260,8 +342,31 @@ class RobotController:
             return self._drive_loop.current_accel_opening, self._drive_loop.current_brake_opening
         return 0.0, 0.0
 
+    @property
+    def current_ref_speed(self) -> float | None:
+        """現在の基準車速 [km/h]。DriveLoop 非動作時は None。WebSocket 配信で使う。"""
+        if self._drive_loop is not None:
+            return self._drive_loop.current_ref_speed
+        return None
+
     async def get_realtime_data(self) -> RealtimeSnapshot:
-        """ハードウェアからリアルタイム計測値を並列取得する。"""
+        """リアルタイム計測値を返す。
+
+        走行中（DriveLoop 動作中）は直近サイクルの計測値キャッシュを返し、
+        50ms 制御ループが使う Modbus/CAN バスへ追加トランザクションを発行しない。
+        キャッシュがサイクル凍結等で古くなった場合は障害を隠さないよう
+        ハードウェア読み取りへフォールバックする。非走行時もハードウェアから並列取得する。
+        """
+        if self._drive_loop is not None:
+            snapshot = self._drive_loop.last_snapshot
+            if snapshot is not None:
+                age_s = asyncio.get_running_loop().time() - snapshot.captured_at
+                if age_s <= SNAPSHOT_MAX_AGE_S:
+                    return snapshot
+                _logger.warning(
+                    "走行中スナップショットが %.1fs 更新されていません: 直接読み取りへ切替",
+                    age_s,
+                )
         speed, accel_pos, brake_pos, accel_cur, brake_cur = await asyncio.gather(
             self._can_reader.read_speed(),
             self._accel_driver.read_position(),
@@ -275,6 +380,7 @@ class RobotController:
             brake_pos=brake_pos,
             accel_current_ma=accel_cur,
             brake_current_ma=brake_cur,
+            captured_at=asyncio.get_running_loop().time(),
         )
 
     async def start(self) -> None:
@@ -328,8 +434,14 @@ class RobotController:
         """アラームリセット・サーボON・必要に応じて原点復帰。
 
         各ハード操作の進捗を ``_init_steps`` に逐次反映し、WebSocket 経由で
-        フロントの初期化画面と連動させる。例外時は実行中ステップを ERROR にする。
+        フロントの初期化画面と連動させる。
+
+        失敗時は ERROR へ遷移する（INITIALIZING に留まると再試行が
+        InvalidStateTransition で恒久的に拒否され、復旧手段がなくなるため）。
+        ERROR からの再呼び出しは STANDBY を経由して再試行として受け付ける。
         """
+        if self._state == RobotState.ERROR:
+            self._transition(RobotState.STANDBY)
         self._transition(RobotState.INITIALIZING)
         self._init_steps = self._build_init_steps()
         try:
@@ -374,6 +486,7 @@ class RobotController:
                 self._set_init_step("home_return", InitStepStatus.SKIPPED)
         except Exception:
             self._fail_running_init_steps()
+            self._transition(RobotState.ERROR)
             raise
         self._transition(RobotState.READY)
 
@@ -383,9 +496,12 @@ class RobotController:
             raise InvalidStateTransition(
                 f"stop は RUNNING または MANUAL 状態でのみ呼べます (現在: {self._state})"
             )
-        if self._drive_loop is not None:
-            self._drive_loop.stop()
-            self._drive_loop = None
+        drive_loop = self._drive_loop
+        self._drive_loop = None
+        if drive_loop is not None:
+            # 飛行中の位置指令完了を待ってから home_return（バス上のインターリーブ防止）
+            await drive_loop.stop_and_join()
+            self._record_kpi_summary(drive_loop)
         self._transition(RobotState.READY)
         await asyncio.gather(
             self._accel_driver.home_return(),
@@ -399,13 +515,39 @@ class RobotController:
         self._last_normal_shutdown = True
 
     async def shutdown(self) -> None:
-        """グレースフルシャットダウン: 状態を問わず DriveLoop を停止し安全監視を解除する。"""
-        if self._drive_loop is not None:
-            self._drive_loop.stop()
-            self._drive_loop = None
+        """グレースフルシャットダウン: DriveLoop を停止し、ペダル解放とサーボOFFを試みる。
+
+        プロセス終了後はソフトウェア側の監視・制御が一切残らないため、ここで
+        ペダルを解放しないと最終指令位置（例: アクセル40%）のままサーボONで
+        保持され続ける。サーボONになり得る状態ではベストエフォートで
+        原点復帰 → サーボOFF を実施する（失敗してもシャットダウンは続行）。
+        """
+        drive_loop = self._drive_loop
+        self._drive_loop = None
+        if drive_loop is not None:
+            await drive_loop.stop_and_join()
         if self._active_learning_task is not None:
             self._active_learning_task.cancel()
             self._active_learning_task = None
+        if self._state in (
+            RobotState.READY,
+            RobotState.CALIBRATING,
+            RobotState.PRE_CHECK,
+            RobotState.RUNNING,
+            RobotState.MANUAL,
+        ):
+            try:
+                await asyncio.gather(
+                    self._accel_driver.home_return(),
+                    self._brake_driver.home_return(),
+                )
+                await asyncio.gather(
+                    self._accel_driver.servo_off(),
+                    self._brake_driver.servo_off(),
+                )
+            except Exception:
+                _logger.exception("シャットダウン時のペダル解放に失敗しました")
+        await self._close_session("error")
         await self._safety_monitor.stop_monitoring()
 
     async def emergency_stop(self) -> None:
@@ -416,22 +558,44 @@ class RobotController:
         これにより最大30秒かかる home_return が共有 Modbus バス上で多重起動し、
         get_realtime_data（状態配信）を長時間ブロックするのを防ぐ。
 
-        先行コルーチンは最初の await（gather）までに同期的に EMERGENCY へ遷移するため、
+        先行コルーチンは最初の await までに同期的に EMERGENCY へ遷移するため、
         後続コルーチンは確実に EMERGENCY を観測して早期 return できる。
+
+        home_return の前に必ず stop_and_join で飛行中サイクルの完了を待つ。
+        待たないと await 中の位置指令（例: アクセル40%）が原点復帰のコイル操作と
+        同一軸バスでインターリーブし、非常停止中にペダルが再適用され得る
+        （コードレビュー 2026-06-11 指摘 #6）。
         """
-        if self._drive_loop is not None:
-            self._drive_loop.stop()
-            self._drive_loop = None
+        drive_loop = self._drive_loop
+        self._drive_loop = None
+        if drive_loop is not None:
+            drive_loop.stop()  # 同期で停止フラグ（以降のサイクルは書き込み前に中断）
         if self._state == RobotState.EMERGENCY:
+            if drive_loop is not None:
+                await drive_loop.stop_and_join()
             return
         self._transition(RobotState.EMERGENCY)
+        if drive_loop is not None:
+            await drive_loop.stop_and_join()
+            self._record_kpi_summary(drive_loop)
         await asyncio.gather(
             self._accel_driver.home_return(),
             self._brake_driver.home_return(),
         )
-        await self._safety_monitor.trigger_emergency()
         await self._close_session("emergency")
         self._last_normal_shutdown = False
+
+    async def _dispatch_emergency(self) -> None:
+        """DriveLoop 内部起因（過電流・逸脱・CAN断・サイクル例外）の非常停止を発火する。
+
+        GPIO・AC断と同じ SafetyMonitor ディスパッチャを通すことで、登録済みコールバック
+        （通知等）が内部起因の非常停止でも発火する（コードレビュー 2026-06-11 指摘 #15）。
+        コールバック未登録の DI 構成でも安全に倒れるよう、ディスパッチ後に EMERGENCY へ
+        遷移していなければ emergency_stop を直接呼ぶ（冪等）。
+        """
+        await self._safety_monitor.trigger_emergency()
+        if self._state != RobotState.EMERGENCY:
+            await self.emergency_stop()
 
     async def reset_emergency(self) -> None:
         """非常停止リセット: EMERGENCY → STANDBY。
@@ -499,6 +663,82 @@ class RobotController:
         self._log_writer = None
         self._active_session_id = None
 
+    async def _run_pre_check_and_transition(self, target: RobotState) -> None:
+        """READY → PRE_CHECK → target の共通プロローグ。失敗時は READY へロールバックする。"""
+        self._transition(RobotState.PRE_CHECK)
+        try:
+            if self._pre_check_runner is not None:
+                result = await self._pre_check_runner.run()
+                if not result.passed:
+                    raise PreCheckFailed(result)
+            self._transition(target)
+        except Exception:
+            self._transition(RobotState.READY)
+            raise
+
+    async def _begin_session(
+        self,
+        run_type: str,
+        mode_id: str | None,
+        log_writer: LogWriterProtocol | None,
+        expected_state: RobotState,
+    ) -> DriveSession:
+        """走行セッションを開始する。
+
+        _open_session の await 中に非常停止等で状態が変わった場合は、走行を開始せず
+        セッションを閉じて中断する（EMERGENCY 中の DriveLoop 起動を防ぐ）。
+        """
+        profile_id = self._active_profile.id if self._active_profile else ""
+        session_id = await self._open_session(profile_id, mode_id, run_type, log_writer)
+        if self._state != expected_state:
+            await self._close_session("emergency")
+            raise InvalidStateTransition(
+                f"走行開始処理中に状態が {self._state} へ変化したため中断しました"
+            )
+        return DriveSession(
+            id=session_id,
+            profile_id=profile_id,
+            mode_id=mode_id,
+            run_type=run_type,
+            started_at=datetime.now(tz=UTC),
+            ended_at=None,
+            status="running",
+        )
+
+    def _build_and_start_drive_loop(
+        self,
+        mode: DrivingMode | None,
+        profile: VehicleProfile | None,
+        log_writer: LogWriterProtocol | None,
+        session_id: str,
+    ) -> None:
+        """mode / profile / ff_controller / safety_check が揃っていれば DriveLoop を起動する。"""
+        if (
+            mode is None
+            or profile is None
+            or profile.calibration is None
+            or self._ff_controller is None
+            or self._safety_check is None
+        ):
+            return
+        self._drive_loop = DriveLoop(
+            ff_controller=self._ff_controller,
+            pid=self._pid,
+            accel_driver=self._accel_driver,
+            brake_driver=self._brake_driver,
+            can_reader=self._can_reader,
+            profile=profile,
+            mode=mode,
+            safety_check=self._safety_check,
+            on_complete=self.stop_auto_drive,
+            on_emergency=self._dispatch_emergency,
+            log_writer=log_writer,
+            session_id=session_id,
+            interval_s=self._control_interval_s,
+            log_every_n_cycles=self._log_every_n_cycles,
+        )
+        self._drive_loop.start()
+
     async def start_auto_drive(
         self,
         mode_id: str,
@@ -506,65 +746,19 @@ class RobotController:
         profile: VehicleProfile | None = None,
         log_writer: LogWriterProtocol | None = None,
     ) -> DriveSession:
-        """自動走行開始。READY → PRE_CHECK → RUNNING。
-
-        mode / profile / ff_controller / safety_check が全て揃っている場合に DriveLoop を起動する。
-        """
-        self._transition(RobotState.PRE_CHECK)
-        try:
-            if self._pre_check_runner is not None:
-                result = await self._pre_check_runner.run()
-                if not result.passed:
-                    raise PreCheckFailed(result)
-            self._transition(RobotState.RUNNING)
-        except PreCheckFailed:
-            self._transition(RobotState.READY)
-            raise
-        except Exception:
-            self._transition(RobotState.READY)
-            raise
-        profile_id = self._active_profile.id if self._active_profile else ""
-        session_id = await self._open_session(profile_id, mode_id, "auto", log_writer)
-        session = DriveSession(
-            id=session_id,
-            profile_id=profile_id,
-            mode_id=mode_id,
-            run_type="auto",
-            started_at=datetime.now(tz=UTC),
-            ended_at=None,
-            status="running",
-        )
-
-        if (
-            mode is not None
-            and profile is not None
-            and profile.calibration is not None
-            and self._ff_controller is not None
-            and self._safety_check is not None
-        ):
-            self._drive_loop = DriveLoop(
-                ff_controller=self._ff_controller,
-                pid=self._pid,
-                accel_driver=self._accel_driver,
-                brake_driver=self._brake_driver,
-                can_reader=self._can_reader,
-                profile=profile,
-                mode=mode,
-                safety_check=self._safety_check,
-                on_complete=self.stop_auto_drive,
-                on_emergency=self.emergency_stop,
-                log_writer=log_writer,
-                session_id=session.id,
-            )
-            self._drive_loop.start()
-
+        """自動走行開始。READY → PRE_CHECK → RUNNING。"""
+        await self._run_pre_check_and_transition(RobotState.RUNNING)
+        session = await self._begin_session("auto", mode_id, log_writer, RobotState.RUNNING)
+        self._build_and_start_drive_loop(mode, profile, log_writer, session.id)
         return session
 
     async def stop_auto_drive(self) -> None:
         """自動走行停止。RUNNING → READY。"""
-        if self._drive_loop is not None:
-            self._drive_loop.stop()
-            self._drive_loop = None
+        drive_loop = self._drive_loop
+        self._drive_loop = None
+        if drive_loop is not None:
+            await drive_loop.stop_and_join()
+            self._record_kpi_summary(drive_loop)
         self._transition(RobotState.READY)
         await asyncio.gather(
             self._accel_driver.home_return(),
@@ -572,32 +766,13 @@ class RobotController:
         )
         await self._close_session("completed")
 
-    async def start_manual(self) -> DriveSession:
-        """手動操作開始。READY → PRE_CHECK → MANUAL。"""
-        self._transition(RobotState.PRE_CHECK)
-        try:
-            if self._pre_check_runner is not None:
-                result = await self._pre_check_runner.run()
-                if not result.passed:
-                    raise PreCheckFailed(result)
-            self._transition(RobotState.MANUAL)
-        except PreCheckFailed:
-            self._transition(RobotState.READY)
-            raise
-        except Exception:
-            self._transition(RobotState.READY)
-            raise
-        session = DriveSession(
-            id=str(uuid4()),
-            profile_id=self._active_profile.id if self._active_profile else "",
-            mode_id=None,
-            run_type="manual",
-            started_at=datetime.now(tz=UTC),
-            ended_at=None,
-            status="running",
-        )
-        self._active_session_id = session.id
-        return session
+    async def start_manual(
+        self,
+        log_writer: LogWriterProtocol | None = None,
+    ) -> DriveSession:
+        """手動操作開始。READY → PRE_CHECK → MANUAL。セッションは DB 利用時に永続化する。"""
+        await self._run_pre_check_and_transition(RobotState.MANUAL)
+        return await self._begin_session("manual", None, log_writer, RobotState.MANUAL)
 
     async def stop_manual(self) -> None:
         """手動操作終了。MANUAL → READY。MANUAL 状態以外から呼ぶと InvalidStateTransition。"""
@@ -610,7 +785,7 @@ class RobotController:
             self._accel_driver.home_return(),
             self._brake_driver.home_return(),
         )
-        self._active_session_id = None
+        await self._close_session("completed")
 
     async def start_learning_drive(
         self,
@@ -623,56 +798,12 @@ class RobotController:
         正常完了で on_complete=stop_auto_drive により RUNNING→READY 遷移しセッションを
         'completed' で終了する。停止/非常停止でも DriveLoop を止めセッションを終了する。
         """
-        self._transition(RobotState.PRE_CHECK)
-        try:
-            if self._pre_check_runner is not None:
-                result = await self._pre_check_runner.run()
-                if not result.passed:
-                    raise PreCheckFailed(result)
-            self._transition(RobotState.RUNNING)
-        except PreCheckFailed:
-            self._transition(RobotState.READY)
-            raise
-        except Exception:
-            self._transition(RobotState.READY)
-            raise
+        await self._run_pre_check_and_transition(RobotState.RUNNING)
+        session = await self._begin_session("learning", None, log_writer, RobotState.RUNNING)
         profile = self._active_profile
-        profile_id = profile.id if profile else ""
-        session_id = await self._open_session(profile_id, None, "learning", log_writer)
-        session = DriveSession(
-            id=session_id,
-            profile_id=profile_id,
-            mode_id=None,
-            run_type="learning",
-            started_at=datetime.now(tz=UTC),
-            ended_at=None,
-            status="running",
-        )
-
-        if (
-            profile is not None
-            and profile.calibration is not None
-            and self._ff_controller is not None
-            and self._safety_check is not None
-            and self._learning_manager is not None
-        ):
+        if profile is not None and self._learning_manager is not None:
             learning_mode = self._learning_manager.build_learning_reference(profile)
-            self._drive_loop = DriveLoop(
-                ff_controller=self._ff_controller,
-                pid=self._pid,
-                accel_driver=self._accel_driver,
-                brake_driver=self._brake_driver,
-                can_reader=self._can_reader,
-                profile=profile,
-                mode=learning_mode,
-                safety_check=self._safety_check,
-                on_complete=self.stop_auto_drive,
-                on_emergency=self.emergency_stop,
-                log_writer=log_writer,
-                session_id=session_id,
-            )
-            self._drive_loop.start()
-
+            self._build_and_start_drive_loop(learning_mode, profile, log_writer, session.id)
         return session
 
     def _get_axis_driver(self, axis: str) -> ActuatorDriverProtocol:
@@ -699,10 +830,28 @@ class RobotController:
             )
         driver = self._get_axis_driver(axis)
         current = await driver.read_position()
-        await driver.move_to_position(current + step)
+        # 負方向は原点(0)でクランプ。MANUAL（走行ペダル操作）ではさらにキャリブレーション
+        # 範囲内に制限し、フル位置を超えた機械端への押し込みを防ぐ。
+        # CALIBRATING はゼロ/フル点を探索する工程のため上限クランプしない。
+        target = max(0, current + step)
+        if self._state == RobotState.MANUAL:
+            target = self._clamp_to_calibrated_range(axis, target)
+        await driver.move_to_position(target)
         # 移動完了を待ってから位置を読む（直後の read_position は移動途中値を返すため）
         await driver.wait_for_position_complete()
         return await driver.read_position()
+
+    def _clamp_to_calibrated_range(self, axis: str, target: int) -> int:
+        """キャリブレーション済みのゼロ/フル位置の範囲内に目標位置をクランプする。"""
+        if self._active_profile is None or self._active_profile.calibration is None:
+            return target
+        calib = self._active_profile.calibration
+        if axis == "accel":
+            lo, hi = calib.accel_zero_pos, calib.accel_full_pos
+        else:
+            lo, hi = calib.brake_zero_pos, calib.brake_full_pos
+        lo, hi = min(lo, hi), max(lo, hi)
+        return max(lo, min(hi, target))
 
     async def home_axis(self, axis: str) -> int:
         """軸を原点復帰して 0 を返す。

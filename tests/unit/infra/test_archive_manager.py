@@ -210,6 +210,7 @@ class TestCleanupUsbSsd:
         new_file.write_bytes(b"new")
         # 確実に古い方を古くする
         import os
+
         os.utime(old_file, (0, 0))
 
         call_count = 0

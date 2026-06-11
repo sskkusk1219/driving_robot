@@ -16,6 +16,7 @@ from src.models.calibration import CalibrationData, CalibrationResult, Validatio
 # モックドライバ
 # ---------------------------------------------------------------------------
 
+
 class MockActuatorDriver:
     """テスト用アクチュエータモック。current_pattern でサンプルごとの電流値を指定する。"""
 
@@ -84,6 +85,7 @@ def make_manager(
 # ValidationResult モデルテスト
 # ---------------------------------------------------------------------------
 
+
 class TestValidationResult:
     def test_valid_result(self) -> None:
         r = ValidationResult(is_valid=True, error_message=None)
@@ -99,6 +101,7 @@ class TestValidationResult:
 # ---------------------------------------------------------------------------
 # CalibrationManager._validate テスト
 # ---------------------------------------------------------------------------
+
 
 class TestCalibrationManagerValidate:
     def _make_manager(self) -> CalibrationManager:
@@ -210,6 +213,7 @@ class TestCalibrationManagerValidate:
 # CalibrationManager._probe_contact テスト
 # ---------------------------------------------------------------------------
 
+
 class TestProbeContact:
     @pytest.mark.asyncio
     async def test_detects_spike_and_returns_position(self) -> None:
@@ -270,6 +274,7 @@ class TestProbeContact:
 # CalibrationManager._detect_zero / _detect_full テスト
 # ---------------------------------------------------------------------------
 
+
 class TestDetectZeroAndFull:
     @pytest.mark.asyncio
     async def test_detect_zero_calls_home_return(self) -> None:
@@ -291,6 +296,7 @@ class TestDetectZeroAndFull:
 # ---------------------------------------------------------------------------
 # CalibrationManager.run_calibration テスト
 # ---------------------------------------------------------------------------
+
 
 class TestRunCalibration:
     def _spike_currents(self, normal_count: int = 4) -> list[float]:
@@ -415,6 +421,7 @@ class TestRunCalibration:
 # ---------------------------------------------------------------------------
 # CalibrationManager with ProfileRepository テスト
 # ---------------------------------------------------------------------------
+
 
 class TestRunCalibrationWithProfileRepo:
     def _spike_currents(self, normal_count: int = 4) -> list[float]:
@@ -541,6 +548,7 @@ class TestRunCalibrationWithProfileRepo:
 # ---------------------------------------------------------------------------
 # CalibrationConfig のデフォルト値テスト
 # ---------------------------------------------------------------------------
+
 
 class TestCalibrationConfig:
     def test_default_values(self) -> None:

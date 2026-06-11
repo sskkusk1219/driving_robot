@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -9,6 +10,7 @@ from src.app.robot_controller import RobotController
 from src.domain.control.feedforward import FeedforwardController
 from src.domain.control.pid import PIDController
 from src.domain.learning_drive import LearningDriveManager
+from src.infra.db import DuplicateNameError
 from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession
@@ -93,17 +95,23 @@ class _StubUPSMonitor:
 
 
 class _StubSafetyMonitor:
+    """実機の SafetyMonitor と同様にコールバックをディスパッチするスタブ。"""
+
+    def __init__(self) -> None:
+        self._emergency_callbacks: list[Callable[[], Awaitable[None]]] = []
+
     async def start_monitoring(self) -> None:
         pass
 
     async def stop_monitoring(self) -> None:
         pass
 
-    def register_emergency_callback(self, cb: object) -> None:
-        pass
+    def register_emergency_callback(self, cb: Callable[[], Awaitable[None]]) -> None:
+        self._emergency_callbacks.append(cb)
 
     async def trigger_emergency(self) -> None:
-        pass
+        for cb in self._emergency_callbacks:
+            await cb()
 
     def is_emergency_active(self) -> bool:
         return False
@@ -111,16 +119,20 @@ class _StubSafetyMonitor:
 
 def build_stub_controller() -> RobotController:
     pid = PIDController(kp=1.0, ki=0.0, kd=0.0)
-    return RobotController(
+    safety_monitor = _StubSafetyMonitor()
+    controller = RobotController(
         accel_driver=_StubActuator(),
         brake_driver=_StubActuator(),
         can_reader=_StubCANReader(),
-        safety_monitor=_StubSafetyMonitor(),
+        safety_monitor=safety_monitor,
         pid=pid,
         ff_controller=FeedforwardController(),
         last_normal_shutdown=False,
         learning_manager=LearningDriveManager(),
     )
+    # 実機 factory と同じ一方向ディスパッチ配線（monitor → controller）
+    safety_monitor.register_emergency_callback(controller.emergency_stop)
+    return controller
 
 
 class InMemoryProfileRepository:
@@ -136,6 +148,9 @@ class InMemoryProfileRepository:
         return self._profiles.get(profile_id)
 
     async def create(self, profile: VehicleProfile) -> VehicleProfile:
+        # DB の UNIQUE(name) 制約と挙動を揃える
+        if any(p.name == profile.name for p in self._profiles.values()):
+            raise DuplicateNameError(f"プロファイル名 {profile.name!r} は既に使用されています")
         now = datetime.now(tz=UTC)
         profile_id = profile.id if profile.id else str(uuid4())
         stored = VehicleProfile(
@@ -202,6 +217,9 @@ class InMemoryModeRepository:
         return self._modes.get(mode_id)
 
     async def create(self, mode: DrivingMode) -> DrivingMode:
+        # DB の UNIQUE(name) 制約と挙動を揃える
+        if any(m.name == mode.name for m in self._modes.values()):
+            raise DuplicateNameError(f"走行モード名 {mode.name!r} は既に使用されています")
         mode_id = mode.id if mode.id else str(uuid4())
         stored = DrivingMode(
             id=mode_id,

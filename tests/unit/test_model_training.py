@@ -118,9 +118,9 @@ class TestTrainInverseModel:
             assert Path(path).exists()
             ff = FeedforwardController()
             ff.load_model(path)
-            accel, brake = ff.predict(30.0, [33.0, 36.0, 42.0, 48.0])
-            assert 0.0 <= accel <= 100.0
-            assert 0.0 <= brake <= 100.0
+            effort = ff.predict_effort(30.0, [33.0, 36.0, 42.0, 48.0])
+            assert -100.0 <= effort <= 100.0
+            assert effort > 0.0  # 加速予見なので駆動側の努力量
 
     def test_pkl_contains_metadata(self) -> None:
         logs = make_session_logs("s1")
@@ -193,8 +193,9 @@ class TestTrainInverseModel:
             path, _ = train_inverse_model(logs, profile, output_dir=tmpdir)
             ff = FeedforwardController()
             ff.load_model(path)
-            _, brake = ff.predict(60.0, [57.0, 54.0, 48.0, 42.0])
-        assert brake == pytest.approx(0.0, abs=1e-6)
+            # 強い減速予見（エンジンブレーキ超）→ ブレーキモデル出力（負の努力量）
+            effort = ff.predict_effort(60.0, [57.0, 54.0, 48.0, 42.0])
+        assert effort == pytest.approx(0.0, abs=1e-6)
 
 
 def _flat_session(

@@ -1,10 +1,12 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from src.models.system_state import InitStepStatus, RobotState
 
 # ── Calibration ──────────────────────────────────────────────────────────────
+
 
 class CalibrationDataResponse(BaseModel):
     accel_zero_pos: int
@@ -25,6 +27,7 @@ class CalibrationResultResponse(BaseModel):
 
 # ── System state ──────────────────────────────────────────────────────────────
 
+
 class SystemStateResponse(BaseModel):
     robot_state: RobotState
     active_profile_id: str | None
@@ -34,6 +37,7 @@ class SystemStateResponse(BaseModel):
 
 
 # ── Drive session ─────────────────────────────────────────────────────────────
+
 
 class StartDriveRequest(BaseModel):
     mode_id: str
@@ -58,6 +62,12 @@ class FeedforwardParamsSchema(BaseModel):
     stop_brake_opening_pct: float = 20.0
     brake_deadband_pct: float = 1.0
     accel_deadband_pct: float = 1.0
+    # ペダル調停（PedalArbiter）定数
+    switch_hysteresis_pct: float = 0.5
+    accel_reengage_dwell_s: float = 0.3
+    accel_rate_limit_pct_s: float = 200.0
+    brake_rate_limit_pct_s: float = 300.0
+    pid_output_limit_pct: float = 50.0
 
 
 class TrainModelRequest(BaseModel):
@@ -76,12 +86,14 @@ class SelectProfileRequest(BaseModel):
 
 
 class JogRequest(BaseModel):
-    axis: str  # "accel" or "brake"
-    step: int  # 移動量 [pulse]
+    axis: Literal["accel", "brake"]
+    # 移動量 [pulse]。UI のドラッグスライダー最大量(±5000)を上限とし、
+    # 任意クライアントが巨大な step でアクチュエータを機械端まで叩き込むのを防ぐ。
+    step: int = Field(ge=-5000, le=5000)
 
 
 class AxisRequest(BaseModel):
-    axis: str  # "accel" or "brake"
+    axis: Literal["accel", "brake"]
 
 
 class JogResponse(BaseModel):
@@ -89,6 +101,7 @@ class JogResponse(BaseModel):
 
 
 # ── UPS ──────────────────────────────────────────────────────────────────────
+
 
 class UPSStatusResponse(BaseModel):
     battery_charge_pct: float
@@ -99,6 +112,7 @@ class UPSStatusResponse(BaseModel):
 
 
 # ── Realtime WebSocket ────────────────────────────────────────────────────────
+
 
 class InitStepSchema(BaseModel):
     """初期化シーケンス各ステップの進捗。フロント初期化画面の表示と連動する。"""
@@ -123,6 +137,7 @@ class RealtimeData(BaseModel):
 
 
 # ── Vehicle Profile ───────────────────────────────────────────────────────────
+
 
 class PIDGainsSchema(BaseModel):
     kp: float
@@ -205,6 +220,7 @@ class ProfileResponse(BaseModel):
 
 # ── Driving Mode ──────────────────────────────────────────────────────────────
 
+
 class SpeedPointSchema(BaseModel):
     time_s: float
     speed_kmh: float
@@ -237,6 +253,7 @@ class ModeUpdateRequest(BaseModel):
 
 # ── Session / Log ─────────────────────────────────────────────────────────────
 
+
 class SessionResponse(BaseModel):
     id: str
     profile_id: str
@@ -262,6 +279,7 @@ class LogResponse(BaseModel):
 
 
 # ── Error ─────────────────────────────────────────────────────────────────────
+
 
 class ErrorResponse(BaseModel):
     detail: str
