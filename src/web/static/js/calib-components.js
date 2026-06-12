@@ -1,7 +1,7 @@
 // ── JogKey ────────────────────────────────────────────────
 // Square jog button with label and keyboard shortcut hint
 function JogKey({ label, hint, onClick, disabled }) {
-  const { INK, PAPER, PAPER_2, HATCH } = window;
+  const { INK, INK_SOFT, PAPER, PAPER_2, HATCH } = window;
   const style = {
     width: 64, height: 64,
     display: 'flex', flexDirection: 'column',
@@ -35,7 +35,7 @@ function JogKey({ label, hint, onClick, disabled }) {
     onTouchEnd: handleUp,
   },
     React.createElement('span', { style: { fontSize: 20, fontWeight: 700, lineHeight: 1 } }, label),
-    hint && React.createElement('span', { style: { fontSize: 10, color: '#888' } }, hint),
+    hint && React.createElement('span', { style: { fontSize: 10, color: INK_SOFT } }, hint),
   );
 }
 
@@ -65,18 +65,18 @@ function PosRuler({ zeroPos, fullPos, currentPos, maxPulse = 9500, label = '' })
       const x = PL + (v / maxPulse) * trackW;
       return React.createElement('g', { key: v },
         React.createElement('line', { x1: x, y1: H - 10, x2: x, y2: H - 18, stroke: INK, strokeWidth: 1.5 }),
-        React.createElement('text', { x, y: H - 3, textAnchor: 'middle', fontSize: 9, fill: '#666' }, v),
+        React.createElement('text', { x, y: H - 3, textAnchor: 'middle', fontSize: 9, fill: '#9a9080' }, v),
       );
     }),
     // ZERO marker
     zeroPos != null && React.createElement('g', null,
-      React.createElement('path', { d: tri(zeroX, '#2a7a2a'), fill: '#2a7a2a' }),
-      React.createElement('text', { x: zeroX, y: H - 30, textAnchor: 'middle', fontSize: 9, fill: '#2a7a2a', fontWeight: 700 }, 'ZERO'),
+      React.createElement('path', { d: tri(zeroX, '#3aac3a'), fill: '#3aac3a' }),
+      React.createElement('text', { x: zeroX, y: H - 30, textAnchor: 'middle', fontSize: 9, fill: '#3aac3a', fontWeight: 700 }, 'ZERO'),
     ),
     // FULL marker
     fullPos != null && React.createElement('g', null,
-      React.createElement('path', { d: tri(fullX, '#a23232'), fill: '#a23232' }),
-      React.createElement('text', { x: fullX, y: H - 30, textAnchor: 'middle', fontSize: 9, fill: '#a23232', fontWeight: 700 }, 'FULL'),
+      React.createElement('path', { d: tri(fullX, '#e05050'), fill: '#e05050' }),
+      React.createElement('text', { x: fullX, y: H - 30, textAnchor: 'middle', fontSize: 9, fill: '#e05050', fontWeight: 700 }, 'FULL'),
     ),
     // Current position (hollow triangle)
     currentPos != null && React.createElement('g', null,
@@ -84,13 +84,13 @@ function PosRuler({ zeroPos, fullPos, currentPos, maxPulse = 9500, label = '' })
       React.createElement('text', { x: curX, y: 14, textAnchor: 'middle', fontSize: 10, fill: INK }, currentPos),
     ),
     // label
-    label && React.createElement('text', { x: PL, y: 12, fontSize: 11, fill: '#555' }, label),
+    label && React.createElement('text', { x: PL, y: 12, fontSize: 11, fill: '#9a9080' }, label),
   );
 }
 
 // ── OpeningBar ────────────────────────────────────────────
 // Horizontal bar showing current opening percentage
-function OpeningBar({ value = 0, color = '#1f1f1f', label = '' }) {
+function OpeningBar({ value = 0, color = '#ddd4c4', label = '' }) {
   const { INK, PAPER, HATCH } = window;
   const pct = Math.max(0, Math.min(100, value));
   return React.createElement('div', { style: { width: '100%' } },
@@ -183,28 +183,28 @@ function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullP
 
       {/* ZERO marker */}
       {zeroPos != null && (
-        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pct(zeroPos)}%`, width: 2, background: '#2a7a2a', pointerEvents: 'none' }}>
-          <div style={{ position: 'absolute', top: 4, left: 4, fontSize: 9, color: '#2a7a2a', fontWeight: 700, whiteSpace: 'nowrap' }}>ZERO</div>
+        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pct(zeroPos)}%`, width: 2, background: '#3aac3a', pointerEvents: 'none' }}>
+          <div style={{ position: 'absolute', top: 4, left: 4, fontSize: 9, color: '#3aac3a', fontWeight: 700, whiteSpace: 'nowrap' }}>ZERO</div>
         </div>
       )}
 
       {/* FULL marker */}
       {fullPos != null && (
-        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pct(fullPos)}%`, width: 2, background: '#a23232', pointerEvents: 'none' }}>
-          <div style={{ position: 'absolute', top: 4, left: 4, fontSize: 9, color: '#a23232', fontWeight: 700, whiteSpace: 'nowrap' }}>FULL</div>
+        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pct(fullPos)}%`, width: 2, background: '#e05050', pointerEvents: 'none' }}>
+          <div style={{ position: 'absolute', top: 4, left: 4, fontSize: 9, color: '#e05050', fontWeight: 700, whiteSpace: 'nowrap' }}>FULL</div>
         </div>
       )}
 
       {/* Current value */}
       <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2, pointerEvents: 'none' }}>
-        <div style={{ fontSize: 26, fontFamily: 'monospace', fontWeight: 800, lineHeight: 1 }}>{currentPos}</div>
+        <div style={{ fontSize: 26, fontFamily: 'inherit', fontWeight: 700, lineHeight: 1 }}>{currentPos}</div>
         <div style={{ fontSize: 10, color: INK_SOFT }}>pulse</div>
         <div style={{ fontSize: 10, color: INK_SOFT, marginTop: 4 }}>← ドラッグ →</div>
       </div>
 
       {/* Scale labels */}
-      <div style={{ position: 'absolute', top: 3, left: 5, fontSize: 9, color: INK_SOFT, pointerEvents: 'none', fontFamily: 'monospace' }}>0</div>
-      <div style={{ position: 'absolute', top: 3, right: 5, fontSize: 9, color: INK_SOFT, pointerEvents: 'none', fontFamily: 'monospace' }}>{maxPulse}</div>
+      <div style={{ position: 'absolute', top: 3, left: 5, fontSize: 9, color: INK_SOFT, pointerEvents: 'none' }}>0</div>
+      <div style={{ position: 'absolute', top: 3, right: 5, fontSize: 9, color: INK_SOFT, pointerEvents: 'none' }}>{maxPulse}</div>
     </div>
   );
 }

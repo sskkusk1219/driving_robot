@@ -25,11 +25,11 @@ function AxisCal({ label, axisId, currentPos, zero, full, onJog, onSetZero, onSe
 
       {/* ZERO / FULL buttons */}
       <div style={{ display: 'flex', gap: 8 }}>
-        <Btn style={{ flex: 1, borderColor: '#3f6b3f', color: '#22421f', justifyContent: 'center' }}
+        <Btn style={{ flex: 1, borderColor: '#2a6c2a', color: '#54bc54', justifyContent: 'center' }}
              onClick={() => onSetZero(axisId)}>
           ZERO 確定
         </Btn>
-        <Btn style={{ flex: 1, borderColor: '#a23232', color: '#5e1414', justifyContent: 'center' }}
+        <Btn style={{ flex: 1, borderColor: '#943030', color: '#e05050', justifyContent: 'center' }}
              onClick={() => onSetFull(axisId)}>
           FULL 確定
         </Btn>
@@ -37,9 +37,9 @@ function AxisCal({ label, axisId, currentPos, zero, full, onJog, onSetZero, onSe
 
       {/* ZERO / FULL / STROKE info + home button */}
       <div style={{ display: 'flex', gap: 18, fontSize: 12, color: INK_SOFT, alignItems: 'center' }}>
-        <span>ZERO <b style={{ fontFamily: 'monospace', color: zero !== null ? INK : INK_MUTE }}>{zero ?? '—'}</b></span>
-        <span>FULL <b style={{ fontFamily: 'monospace', color: full !== null ? INK : INK_MUTE }}>{full ?? '—'}</b></span>
-        <span>STROKE <b style={{ fontFamily: 'monospace', color: stroke !== null ? INK : INK_MUTE }}>{stroke ?? '—'}</b></span>
+        <span>ZERO <b style={{ fontFamily: 'inherit', color: zero !== null ? INK : INK_MUTE }}>{zero ?? '—'}</b></span>
+        <span>FULL <b style={{ fontFamily: 'inherit', color: full !== null ? INK : INK_MUTE }}>{full ?? '—'}</b></span>
+        <span>STROKE <b style={{ fontFamily: 'inherit', color: stroke !== null ? INK : INK_MUTE }}>{stroke ?? '—'}</b></span>
         <div style={{ flex: 1 }} />
         <Btn onClick={() => onHome(axisId)}>原点へ戻す</Btn>
       </div>

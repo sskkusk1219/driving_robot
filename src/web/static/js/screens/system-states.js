@@ -6,9 +6,9 @@ const { useContext } = React;
 
 // ── Step icon helper ─────────────────────────────────────
 function StepIcon({ st, i }) {
-  const iconColor = st === 'done' ? '#3f6b3f' : st === 'now' ? '#2f5780' : INK_MUTE;
+  const iconColor = st === 'done' ? '#54bc54' : st === 'now' ? '#5aacdc' : INK_MUTE;
   const icon = st === 'done' ? '✓' : st === 'now' ? '⟳' : '—';
-  const bg   = st === 'done' ? '#dfeadc' : st === 'now' ? '#dde6f0' : 'transparent';
+  const bg   = st === 'done' ? '#0e1e0e' : st === 'now' ? '#0e1a24' : 'transparent';
   return (
     <div style={{
       width: 26, height: 26, borderRadius: '50%',
@@ -45,7 +45,7 @@ function BootingScreen() {
               <StepIcon st={st} />
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 16, fontWeight: st === 'now' ? 700 : 400 }}>{label}</div>
-                <div style={{ fontSize: 12, color: INK_SOFT, fontFamily: 'monospace' }}>{sub}</div>
+                <div style={{ fontSize: 12, color: INK_SOFT, fontFamily: 'inherit' }}>{sub}</div>
               </div>
               {st === 'now' && <div style={{ fontSize: 13, color: '#2f5780', fontStyle: 'italic' }}>確認中...</div>}
             </div>
@@ -82,7 +82,7 @@ function ErrorScreen() {
           <div style={{ fontSize: 36, color: '#a23232', lineHeight: 1 }}>⚠</div>
           <div>
             <div style={{ fontSize: 26, fontWeight: 800, color: '#5e1414' }}>通信エラー — 起動できません</div>
-            <div style={{ fontSize: 15, color: '#8a3030', marginTop: 4 }}>
+            <div style={{ fontSize: 15, color: '#c87070', marginTop: 4 }}>
               {failedItems.length}つの通信が失敗しました。接続を確認してから再試行してください。
             </div>
           </div>
@@ -93,16 +93,16 @@ function ErrorScreen() {
             <div key={label} style={{
               display: 'flex', gap: 10, alignItems: 'flex-start',
               padding: '10px 12px',
-              border: `1.2px solid ${ok ? '#3f6b3f' : '#a23232'}`,
-              background: ok ? '#dfeadc' : '#fdf0ee',
+              border: `1.2px solid ${ok ? '#2a6c2a' : '#943030'}`,
+              background: ok ? '#0e1e0e' : '#200e0e',
               borderRadius: 4,
             }}>
-              <div style={{ fontSize: 16, color: ok ? '#22421f' : '#a23232', fontWeight: 700, flexShrink: 0, marginTop: 1 }}>
+              <div style={{ fontSize: 16, color: ok ? '#54bc54' : '#e05050', fontWeight: 700, flexShrink: 0, marginTop: 1 }}>
                 {ok ? '✓' : '✗'}
               </div>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 15, fontWeight: ok ? 400 : 700, color: ok ? '#22421f' : '#5e1414' }}>{label}</div>
-                <div style={{ fontSize: 12, fontFamily: 'monospace', color: ok ? '#3f6b3f' : '#8a3030', marginTop: 2 }}>{msg}</div>
+                <div style={{ fontSize: 15, fontWeight: ok ? 400 : 700, color: ok ? '#54bc54' : '#e05050' }}>{label}</div>
+                <div style={{ fontSize: 12, fontFamily: 'inherit', color: ok ? '#2a6c2a' : '#c87070', marginTop: 2 }}>{msg}</div>
               </div>
             </div>
           ))}
@@ -140,47 +140,47 @@ function AcPowerLossScreen() {
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20 }}>
       <div style={{
-        width: 680, background: '#f1d8d2',
-        border: '2.5px solid #a23232', borderRadius: 8,
+        width: 680, background: '#2a1212',
+        border: '2.5px solid #943030', borderRadius: 8,
         padding: '16px 24px', display: 'flex', alignItems: 'center', gap: 16,
       }}>
-        <div style={{ fontSize: 40, color: '#a23232' }}>⚡</div>
+        <div style={{ fontSize: 40, color: '#e05050' }}>⚡</div>
         <div>
-          <div style={{ fontSize: 26, fontWeight: 800, color: '#5e1414' }}>AC電源断を検知しました</div>
-          <div style={{ fontSize: 15, color: '#8a3030' }}>
+          <div style={{ fontSize: 26, fontWeight: 800, color: '#e05050' }}>AC電源断を検知しました</div>
+          <div style={{ fontSize: 15, color: '#c87070' }}>
             UPS バッテリー給電中 — 安全停止シーケンスを実行しています。操作しないでください。
           </div>
         </div>
         <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
           <div style={{ fontSize: 12, color: INK_SOFT }}>経過</div>
-          <div style={{ fontSize: 28, fontFamily: 'monospace', fontWeight: 700, color: '#5e1414' }}>{elapsed.toFixed(1)}s</div>
-          <div style={{ fontSize: 12, color: '#8a3030' }}>残り ~29s</div>
+          <div style={{ fontSize: 28, fontFamily: 'inherit', fontWeight: 700, color: '#e05050' }}>{elapsed.toFixed(1)}s</div>
+          <div style={{ fontSize: 12, color: '#c87070' }}>残り ~29s</div>
         </div>
       </div>
 
       <Box style={{ width: 680, padding: '18px 22px' }} label="安全停止シーケンス (5ステップ / 30秒以内)">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {steps.map(([label, st, ts], i) => {
-            const iconColor = st === 'done' ? '#3f6b3f' : st === 'now' ? '#a23232' : INK_MUTE;
+            const iconColor = st === 'done' ? '#54bc54' : st === 'now' ? '#e05050' : INK_MUTE;
             const icon = st === 'done' ? '✓' : st === 'now' ? '⟳' : `${i + 1}`;
             return (
               <div key={label} style={{
                 display: 'flex', alignItems: 'center', gap: 12,
                 padding: '8px 10px',
-                background: st === 'now' ? '#fdf0ee' : 'transparent',
-                border: st === 'now' ? '1.5px solid #a23232' : '1px solid transparent',
+                background: st === 'now' ? '#200e0e' : 'transparent',
+                border: st === 'now' ? '1.5px solid #943030' : '1px solid transparent',
                 borderRadius: 4,
               }}>
                 <div style={{
                   width: 28, height: 28, borderRadius: '50%',
                   border: `1.6px solid ${iconColor}`,
-                  background: st === 'done' ? '#dfeadc' : st === 'now' ? '#f1d8d2' : 'transparent',
+                  background: st === 'done' ? '#0e1e0e' : st === 'now' ? '#2a1212' : 'transparent',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
                   fontSize: 13, fontWeight: 700, color: iconColor, flexShrink: 0,
                 }}>{icon}</div>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 15, fontWeight: st === 'now' ? 700 : 400, color: st === 'wait' ? INK_MUTE : INK }}>{label}</div>
-                  <div style={{ fontSize: 11, fontFamily: 'monospace', color: st === 'wait' ? INK_MUTE : INK_SOFT }}>{ts}</div>
+                  <div style={{ fontSize: 11, fontFamily: 'inherit', color: st === 'wait' ? INK_MUTE : INK_SOFT }}>{ts}</div>
                 </div>
                 {st === 'now' && <div style={{ fontSize: 13, color: '#a23232', fontWeight: 700 }}>実行中...</div>}
               </div>
@@ -188,7 +188,7 @@ function AcPowerLossScreen() {
           })}
         </div>
         <div style={{ marginTop: 14 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: INK_SOFT, marginBottom: 4, fontFamily: 'monospace' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: INK_SOFT, marginBottom: 4, fontFamily: 'inherit' }}>
             <span>0s (AC断)</span>
             <span style={{ color: '#a23232' }}>▼ 現在 {elapsed.toFixed(1)}s</span>
             <span>30s (タイムリミット)</span>
@@ -218,14 +218,14 @@ function AutoStopDeviationScreen() {
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20 }}>
       <div style={{
-        border: '2.5px solid #a23232', background: '#f1d8d2',
+        border: '2.5px solid #943030', background: '#2a1212',
         padding: '22px 40px', borderRadius: 8, textAlign: 'center',
-        transform: 'rotate(-0.4deg)', boxShadow: '4px 4px 0 rgba(0,0,0,0.15)',
+        transform: 'rotate(-0.4deg)', boxShadow: '4px 4px 0 rgba(0,0,0,0.5)',
         width: 600,
       }}>
-        <div style={{ fontSize: 38, color: '#a23232', marginBottom: 6 }}>⚠</div>
-        <div style={{ fontSize: 32, fontWeight: 800, color: '#5e1414' }}>自動停止 — 逸脱超過</div>
-        <div style={{ fontSize: 17, color: '#8a3030', marginTop: 8, lineHeight: 1.5 }}>
+        <div style={{ fontSize: 38, color: '#e05050', marginBottom: 6 }}>⚠</div>
+        <div style={{ fontSize: 32, fontWeight: 800, color: '#e05050' }}>自動停止 — 逸脱超過</div>
+        <div style={{ fontSize: 17, color: '#c87070', marginTop: 8, lineHeight: 1.5 }}>
           基準車速からの逸脱が設定閾値を超えたため<br/>自動停止し、原点復帰しました。
         </div>
       </div>
@@ -240,7 +240,7 @@ function AutoStopDeviationScreen() {
           ].map(([l, v]) => (
             <div key={l} style={{ fontSize: 14 }}>
               <div style={{ color: INK_SOFT }}>{l}</div>
-              <div style={{ fontFamily: 'monospace', fontWeight: 700 }}>{v}</div>
+              <div style={{ fontFamily: 'inherit', fontWeight: 700 }}>{v}</div>
             </div>
           ))}
         </div>
@@ -266,14 +266,14 @@ function AutoStopOvercurrentScreen() {
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20 }}>
       <div style={{
-        border: '2.5px solid #a23232', background: '#f1d8d2',
+        border: '2.5px solid #943030', background: '#2a1212',
         padding: '22px 40px', borderRadius: 8, textAlign: 'center',
-        transform: 'rotate(-0.4deg)', boxShadow: '4px 4px 0 rgba(0,0,0,0.15)',
+        transform: 'rotate(-0.4deg)', boxShadow: '4px 4px 0 rgba(0,0,0,0.5)',
         width: 600,
       }}>
-        <div style={{ fontSize: 38, color: '#a23232', marginBottom: 6 }}>⚡</div>
-        <div style={{ fontSize: 32, fontWeight: 800, color: '#5e1414' }}>自動停止 — 過電流検知</div>
-        <div style={{ fontSize: 17, color: '#8a3030', marginTop: 8, lineHeight: 1.5 }}>
+        <div style={{ fontSize: 38, color: '#e05050', marginBottom: 6 }}>⚡</div>
+        <div style={{ fontSize: 32, fontWeight: 800, color: '#e05050' }}>自動停止 — 過電流検知</div>
+        <div style={{ fontSize: 17, color: '#c87070', marginTop: 8, lineHeight: 1.5 }}>
           アクセルアクチュエータの電流値が上限を超えたため<br/>緊急停止しました。機械的な干渉がないか確認してください。
         </div>
       </div>
@@ -290,7 +290,7 @@ function AutoStopOvercurrentScreen() {
           ].map(([l, v]) => (
             <div key={l} style={{ fontSize: 14 }}>
               <div style={{ color: INK_SOFT }}>{l}</div>
-              <div style={{ fontFamily: 'monospace', fontWeight: 700 }}>{v}</div>
+              <div style={{ fontFamily: 'inherit', fontWeight: 700 }}>{v}</div>
             </div>
           ))}
         </div>
@@ -320,14 +320,14 @@ function AutoStopCanTimeoutScreen() {
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20 }}>
       <div style={{
-        border: '2.5px solid #a23232', background: '#f1d8d2',
+        border: '2.5px solid #943030', background: '#2a1212',
         padding: '22px 40px', borderRadius: 8, textAlign: 'center',
-        transform: 'rotate(-0.4deg)', boxShadow: '4px 4px 0 rgba(0,0,0,0.15)',
+        transform: 'rotate(-0.4deg)', boxShadow: '4px 4px 0 rgba(0,0,0,0.5)',
         width: 600,
       }}>
-        <div style={{ fontSize: 38, color: '#a23232', marginBottom: 6 }}>📡</div>
-        <div style={{ fontSize: 32, fontWeight: 800, color: '#5e1414' }}>自動停止 — 車速信号タイムアウト</div>
-        <div style={{ fontSize: 17, color: '#8a3030', marginTop: 8, lineHeight: 1.5 }}>
+        <div style={{ fontSize: 38, color: '#e05050', marginBottom: 6 }}>📡</div>
+        <div style={{ fontSize: 32, fontWeight: 800, color: '#e05050' }}>自動停止 — 車速信号タイムアウト</div>
+        <div style={{ fontSize: 17, color: '#c87070', marginTop: 8, lineHeight: 1.5 }}>
           シャシダイナモからのCAN車速信号が途絶えたため<br/>走行を停止し、原点復帰しました。
         </div>
       </div>
@@ -342,7 +342,7 @@ function AutoStopCanTimeoutScreen() {
           ].map(([l, v]) => (
             <div key={l} style={{ fontSize: 14 }}>
               <div style={{ color: INK_SOFT }}>{l}</div>
-              <div style={{ fontFamily: 'monospace', fontWeight: 700 }}>{v}</div>
+              <div style={{ fontFamily: 'inherit', fontWeight: 700 }}>{v}</div>
             </div>
           ))}
         </div>
@@ -391,14 +391,14 @@ function PreCheckNGScreen({ details = [] }) {
       <div style={{
         display: 'flex', alignItems: 'center', gap: 14,
         padding: '14px 20px',
-        border: '2px solid #a23232', background: '#fdf0ee', borderRadius: 6,
+        border: '2px solid #943030', background: '#200e0e', borderRadius: 6,
       }}>
-        <div style={{ fontSize: 28, color: '#a23232' }}>✗</div>
+        <div style={{ fontSize: 28, color: '#e05050' }}>✗</div>
         <div>
-          <div style={{ fontSize: 22, fontWeight: 800, color: '#5e1414' }}>
+          <div style={{ fontSize: 22, fontWeight: 800, color: '#e05050' }}>
             走行前チェック NG — {failCount}項目が未通過
           </div>
-          <div style={{ fontSize: 14, color: '#8a3030' }}>
+          <div style={{ fontSize: 14, color: '#c87070' }}>
             すべての項目が OK になるまで走行を開始できません。
           </div>
         </div>
@@ -412,18 +412,18 @@ function PreCheckNGScreen({ details = [] }) {
             <div key={label} style={{
               display: 'flex', alignItems: 'center', gap: 10,
               padding: '8px 10px',
-              border: `1.2px solid ${ok ? '#3f6b3f' : '#a23232'}`,
-              background: ok ? '#dfeadc' : '#fdf0ee',
+              border: `1.2px solid ${ok ? '#2a6c2a' : '#943030'}`,
+              background: ok ? '#0e1e0e' : '#200e0e',
               borderRadius: 4,
             }}>
-              <div style={{ fontSize: 18, color: ok ? '#22421f' : '#a23232', fontWeight: 700, width: 20, textAlign: 'center', flexShrink: 0 }}>
+              <div style={{ fontSize: 18, color: ok ? '#54bc54' : '#e05050', fontWeight: 700, width: 20, textAlign: 'center', flexShrink: 0 }}>
                 {ok ? '✓' : '✗'}
               </div>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 15, fontWeight: ok ? 400 : 700, color: ok ? '#22421f' : '#5e1414' }}>{label}</div>
-                <div style={{ fontSize: 12, fontFamily: 'monospace', color: ok ? '#3f6b3f' : '#8a3030' }}>{detail}</div>
+                <div style={{ fontSize: 15, fontWeight: ok ? 400 : 700, color: ok ? '#54bc54' : '#e05050' }}>{label}</div>
+                <div style={{ fontSize: 12, fontFamily: 'inherit', color: ok ? '#2a6c2a' : '#c87070' }}>{detail}</div>
               </div>
-              <div style={{ fontSize: 13, color: ok ? '#3f6b3f' : '#a23232', fontWeight: 700 }}>{ok ? 'OK' : 'NG'}</div>
+              <div style={{ fontSize: 13, color: ok ? '#54bc54' : '#e05050', fontWeight: 700 }}>{ok ? 'OK' : 'NG'}</div>
             </div>
           ))}
         </Box>
@@ -433,8 +433,8 @@ function PreCheckNGScreen({ details = [] }) {
             {checks.filter(c => !c.ok).map(({ label, fix, nav }) => (
               <div key={label} style={{ marginBottom: 18 }}>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
-                  <div style={{ fontSize: 14, color: '#a23232' }}>✗</div>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: '#5e1414' }}>{label}</div>
+                  <div style={{ fontSize: 14, color: '#e05050' }}>✗</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: '#e05050' }}>{label}</div>
                 </div>
                 <div style={{ fontSize: 14, color: INK_SOFT, lineHeight: 1.6, paddingLeft: 22 }}>{fix}</div>
                 {nav && (
@@ -475,15 +475,15 @@ function EmergencyResetScreen() {
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 24 }}>
       <div style={{
-        border: '3px solid #a23232', background: '#f1d8d2',
+        border: '3px solid #943030', background: '#2a1212',
         padding: '24px 40px', borderRadius: 8,
         textAlign: 'center', transform: 'rotate(-0.6deg)',
-        boxShadow: '4px 4px 0 rgba(0,0,0,0.15)',
+        boxShadow: '4px 4px 0 rgba(0,0,0,0.5)',
       }}>
-        <div style={{ fontSize: 38, fontWeight: 800, color: '#5e1414', letterSpacing: 1 }}>
+        <div style={{ fontSize: 38, fontWeight: 800, color: '#e05050', letterSpacing: 1 }}>
           EMERGENCY
         </div>
-        <div style={{ fontSize: 16, color: '#5e1414', marginTop: 4 }}>
+        <div style={{ fontSize: 16, color: '#c87070', marginTop: 4 }}>
           非常停止スイッチ (操作エリア) が押されました
         </div>
       </div>
@@ -495,9 +495,9 @@ function EmergencyResetScreen() {
             display: 'flex', alignItems: 'center', gap: 10,
             padding: '6px 0', fontSize: 14,
           }}>
-            <span style={{ color: '#3f6b3f', fontWeight: 700 }}>✓</span>
+            <span style={{ color: '#54bc54', fontWeight: 700 }}>✓</span>
             <span style={{ flex: 1 }}>{label}</span>
-            <span style={{ fontSize: 11, fontFamily: 'monospace', color: INK_SOFT }}>{note}</span>
+            <span style={{ fontSize: 11, fontFamily: 'inherit', color: INK_SOFT }}>{note}</span>
           </div>
         ))}
       </Box>

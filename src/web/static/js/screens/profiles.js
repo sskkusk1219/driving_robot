@@ -167,12 +167,12 @@ function ProfilesScreen() {
           onClick: () => handleSortClick('name'),
           style: { cursor: 'pointer', userSelect: 'none' },
         }, '名前' + sortIcon('name')),
-        React.createElement('div', { style: { fontFamily: 'monospace' } }, '最大開度 (acc/brk)'),
+        React.createElement('div', { style: { fontFamily: 'inherit' } }, '最大開度 (acc/brk)'),
         React.createElement('div', {
           onClick: () => handleSortClick('max_speed'),
-          style: { cursor: 'pointer', userSelect: 'none', fontFamily: 'monospace' },
+          style: { cursor: 'pointer', userSelect: 'none', fontFamily: 'inherit' },
         }, '最高車速' + sortIcon('max_speed')),
-        React.createElement('div', { style: { fontFamily: 'monospace' } }, 'Kp / Ki / Kd'),
+        React.createElement('div', { style: { fontFamily: 'inherit' } }, 'Kp / Ki / Kd'),
         React.createElement('div', null, 'キャリブ'),
         React.createElement('div', null, 'モデル'),
         React.createElement('div', null, '操作'),
@@ -252,7 +252,7 @@ function ProfilesScreen() {
               ],
               style: {
                 padding: '12px 14px',
-                background: isActive ? '#f4f1e6' : 'transparent',
+                background: isActive ? '#201e16' : 'transparent',
                 borderBottom: `1px dashed ${INK_MUTE}`,
               },
             });
@@ -447,7 +447,7 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
         React.createElement(Box, { label: '運転モデル', style: { padding: 18, flex: 1 } },
           (!isEdit || !initial?.model_path)
             ? React.createElement('div', { style: { fontSize: 14, color: INK_SOFT } }, '未実施')
-            : React.createElement('div', { style: { fontSize: 13, color: INK_SOFT, fontFamily: 'monospace', wordBreak: 'break-all' } },
+            : React.createElement('div', { style: { fontSize: 13, color: INK_SOFT, fontFamily: 'inherit', wordBreak: 'break-all' } },
                 initial.model_path,
               ),
         ),

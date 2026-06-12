@@ -107,7 +107,7 @@ function CsvSpeedGraph({ rows, width = 600, height = 220 }) {
       React.createElement('text', {
         key: `yl${v}`,
         x: padL - 5, y: yAt(v) + 4,
-        fontSize: 10, textAnchor: 'end', fontFamily: 'monospace', fill: window.INK_SOFT,
+        fontSize: 11, textAnchor: 'end', fontFamily: 'inherit', fill: window.INK,
       }, `${v}`)
     ),
     // 速度ライン
@@ -117,17 +117,17 @@ function CsvSpeedGraph({ rows, width = 600, height = 220 }) {
       React.createElement('text', {
         key: label,
         x, y: padT + ph + 14,
-        textAnchor: 'middle', fontSize: 10, fontFamily: 'monospace', fill: window.INK_SOFT,
+        textAnchor: 'middle', fontSize: 10, fontFamily: 'inherit', fill: window.INK_SOFT,
       }, label)
     ),
     // X軸タイトル (目盛りの下、さらに +14px)
     React.createElement('text', {
       x: padL + pw / 2, y: padT + ph + 28,
-      fontSize: 10, textAnchor: 'middle', fontFamily: 'monospace', fill: window.INK_SOFT,
+      fontSize: 10, textAnchor: 'middle', fontFamily: 'inherit', fill: window.INK_SOFT,
     }, 'time [s] →'),
     React.createElement('text', {
       x: 6, y: padT - 2,
-      fontSize: 10, fontFamily: 'monospace', fill: window.INK_SOFT,
+      fontSize: 10, fontFamily: 'inherit', fill: window.INK_SOFT,
     }, 'km/h'),
   );
 }
@@ -437,7 +437,7 @@ function ModesScreen() {
               ],
               style: {
                 padding: '10px 14px',
-                background: isActive ? '#f4f1e6' : 'transparent',
+                background: isActive ? '#201e16' : 'transparent',
                 borderBottom: `1px dashed ${HATCH}`,
               },
             });
@@ -592,7 +592,7 @@ function ModeEdit({ initial, referenceSpeed, onSave, onCancel, onDelete }) {
               }),
             ),
             React.createElement('div', {
-              style: { fontSize: 13, color: file ? INK : INK_MUTE, fontFamily: 'monospace', whiteSpace: file ? 'normal' : 'nowrap', wordBreak: 'break-all' }
+              style: { fontSize: 13, color: file ? INK : INK_MUTE, fontFamily: 'inherit', whiteSpace: file ? 'normal' : 'nowrap', wordBreak: 'break-all' }
             }, file ? file.name : '差し替えない場合は選択不要'),
           ),
 
@@ -603,7 +603,7 @@ function ModeEdit({ initial, referenceSpeed, onSave, onCancel, onDelete }) {
             ...validations.map(({ ok, msg }) =>
               React.createElement('div', {
                 key: msg,
-                style: { fontSize: 13, fontFamily: 'monospace', color: ok ? '#22421f' : '#5e1414' }
+                style: { fontSize: 13, fontFamily: 'inherit', color: ok ? '#68d468' : '#f07070' }
               }, `${ok ? '✓' : '✗'} ${msg}`)
             ),
           ),
@@ -648,12 +648,12 @@ function ModeEdit({ initial, referenceSpeed, onSave, onCancel, onDelete }) {
           ].map(([label, val]) =>
             React.createElement('div', { key: label, style: { display: 'flex', flexDirection: 'column', gap: 2 } },
               React.createElement('div', { style: { fontSize: 12, color: INK_SOFT } }, label),
-              React.createElement('div', { style: { fontSize: 18, fontWeight: 700, fontFamily: 'monospace' } }, val),
+              React.createElement('div', { style: { fontSize: 18, fontWeight: 700, fontFamily: 'inherit' } }, val),
             )
           ),
         ),
         csvSample.length > 0 && React.createElement(Box, { label: 'CSVサンプル (先頭5行)', style: { padding: 12 } },
-          React.createElement('div', { style: { fontFamily: 'monospace', fontSize: 13, lineHeight: 1.8, color: INK_SOFT } },
+          React.createElement('div', { style: { fontFamily: 'inherit', fontSize: 13, lineHeight: 1.8, color: INK_SOFT } },
             csvSample.map((line, i) =>
               React.createElement('div', { key: i, style: i === 0 ? { color: INK, fontWeight: 700 } : {} }, line)
             ),
@@ -848,7 +848,7 @@ function ModeCreate({ onSave, onCancel }) {
               }),
             ),
             React.createElement('div', {
-              style: { fontSize: 13, color: file ? INK : INK_MUTE, fontFamily: 'monospace', whiteSpace: file ? 'normal' : 'nowrap', wordBreak: 'break-all' }
+              style: { fontSize: 13, color: file ? INK : INK_MUTE, fontFamily: 'inherit', whiteSpace: file ? 'normal' : 'nowrap', wordBreak: 'break-all' }
             }, file ? file.name : '.csv / UTF-8 / ヘッダ行あり'),
           ),
 
@@ -863,8 +863,8 @@ function ModeCreate({ onSave, onCancel }) {
               React.createElement('div', {
                 key: msg,
                 style: {
-                  fontSize: 13, fontFamily: 'monospace',
-                  color: ok ? '#22421f' : '#5e1414',
+                  fontSize: 13, fontFamily: 'inherit',
+                  color: ok ? '#68d468' : '#f07070',
                 }
               }, `${ok ? '✓' : '✗'} ${msg}`)
             ),
@@ -920,7 +920,7 @@ function ModeCreate({ onSave, onCancel }) {
             },
               React.createElement('div', { style: { fontSize: 12, color: INK_SOFT } }, label),
               React.createElement('div', {
-                style: { fontSize: 18, fontWeight: 700, fontFamily: 'monospace' }
+                style: { fontSize: 18, fontWeight: 700, fontFamily: 'inherit' }
               }, val),
             )
           ),
@@ -930,7 +930,7 @@ function ModeCreate({ onSave, onCancel }) {
         React.createElement(Box, { label: 'CSVサンプル (先頭5行)', style: { padding: 12 } },
           csvSample.length > 0
             ? React.createElement('div', {
-                style: { fontFamily: 'monospace', fontSize: 13, lineHeight: 1.8, color: INK_SOFT }
+                style: { fontFamily: 'inherit', fontSize: 13, lineHeight: 1.8, color: INK_SOFT }
               },
                 csvSample.map((line, i) =>
                   React.createElement('div', {
@@ -943,7 +943,7 @@ function ModeCreate({ onSave, onCancel }) {
                 }, `… (${csvRows.length - 5}行省略)`),
               )
             : React.createElement('div', {
-                style: { fontSize: 13, color: INK_MUTE, fontFamily: 'monospace' }
+                style: { fontSize: 13, color: INK_MUTE, fontFamily: 'inherit' }
               }, 'CSVをアップロードすると表示されます'),
         ),
       ),

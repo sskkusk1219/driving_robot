@@ -29,10 +29,10 @@ function InitScreen() {
   // status → 表示インジケータ (丸印・色・補足ラベル)
   function indicator(status) {
     switch (status) {
-      case 'done':    return { mark: '✓', border: '#3f6b3f', bg: '#dfeadc',    note: null };
+      case 'done':    return { mark: '✓', border: '#2a6c2a', bg: '#0e1e0e',    note: null };
       case 'running': return { mark: '⟳', border: INK,       bg: PAPER_2,      note: '実行中...' };
-      case 'skipped': return { mark: '⤼', border: INK_MUTE,  bg: '#eef0e8',    note: 'スキップ' };
-      case 'error':   return { mark: '✗', border: '#a23a32', bg: '#f3dada',    note: 'エラー' };
+      case 'skipped': return { mark: '⤼', border: INK_MUTE,  bg: '#1e1e18',    note: 'スキップ' };
+      case 'error':   return { mark: '✗', border: '#943030', bg: '#200e0e',    note: 'エラー' };
       default:        return { mark: '—', border: INK_MUTE,  bg: 'transparent', note: null };
     }
   }

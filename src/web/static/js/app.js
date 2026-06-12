@@ -224,13 +224,13 @@ function App() {
 const NAV_LABEL = {
   init: '初期化',
   profiles: '車両プロファイル',
-  calibration: 'キャリブレーション',
   modes: '走行モード',
+  schedule: 'スケジュールモード',
+  sequence: 'シーケンスモード',
+  calibration: 'キャリブレーション',
   learning: '学習運転',
-  auto: '自動走行',
+  auto: '自動運転',
   manual: '手動運転',
-  schedule: 'タイムスケジュール',
-  sequence: 'シーケンス',
   logs: 'ログ',
 };
 

@@ -11,33 +11,33 @@ function AxisJog({ label, axisId, currentPos, openingPct, maxPct, currentMa, onJ
       <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
         {/* Left buttons */}
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-          <JogKey label="−10" hint="Shift+←" onClick={() => onJog(axisId, -10)} />
-          <JogKey label="−1"  hint="←"       onClick={() => onJog(axisId, -1)} />
+          <JogKey label="−10"  onClick={() => onJog(axisId, -10)} />
+          <JogKey label="−100" onClick={() => onJog(axisId, -100)} />
         </div>
 
         <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} />
 
         {/* Right buttons */}
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-          <JogKey label="+1"  hint="→"       onClick={() => onJog(axisId, 1)} />
-          <JogKey label="+10" hint="Shift+→" onClick={() => onJog(axisId, 10)} />
+          <JogKey label="+10"  onClick={() => onJog(axisId, 10)} />
+          <JogKey label="+100" onClick={() => onJog(axisId, 100)} />
         </div>
       </div>
 
       {/* Opening bar */}
       <div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: INK_SOFT, marginBottom: 3, fontFamily: 'monospace' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: INK_SOFT, marginBottom: 3, fontFamily: 'inherit' }}>
           <span>0 %</span><span>50</span><span>100 % (max {maxPct})</span>
         </div>
-        <div style={{ height: 13, border: `1.4px solid ${INK}`, position: 'relative', background: PAPER }}>
-          <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${openingPct}%`, background: INK, opacity: 0.82 }} />
+        <div style={{ height: 10, border: `1px solid ${HATCH}`, position: 'relative', background: PAPER, borderRadius: 2 }}>
+          <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${openingPct}%`, background: '#c8922a', opacity: 0.9 }} />
         </div>
       </div>
 
       {/* Info + home */}
       <div style={{ display: 'flex', gap: 12, fontSize: 12, color: INK_SOFT, alignItems: 'center' }}>
-        <span>開度 <b style={{ fontFamily: 'monospace', color: INK }}>{openingPct.toFixed(1)} %</b></span>
-        <span>電流 <b style={{ fontFamily: 'monospace', color: INK }}>{currentMa} mA</b></span>
+        <span>開度 <b style={{ fontFamily: 'inherit', color: INK }}>{openingPct.toFixed(1)} %</b></span>
+        <span>電流 <b style={{ fontFamily: 'inherit', color: INK }}>{currentMa} mA</b></span>
         <div style={{ flex: 1 }} />
         <Btn onClick={() => onHome(axisId)}>原点へ戻す</Btn>
       </div>
@@ -113,9 +113,9 @@ function ManualScreen() {
       {/* Bottom: shortcuts | status + button */}
       <div style={{ display: 'flex', gap: 10 }}>
         <Box label="キーボードショートカット" style={{ padding: '10px 12px', flex: 1 }}>
-          <div style={{ fontSize: 12, lineHeight: 1.7, fontFamily: 'monospace' }}>
-            <div>← / →        : ±1 pulse</div>
-            <div>Shift+← / →  : ±10 pulse</div>
+          <div style={{ fontSize: 12, lineHeight: 1.7, fontFamily: 'inherit' }}>
+            <div>← / →        : ±10 pulse</div>
+            <div>Shift+← / →  : ±100 pulse</div>
             <div>Tab           : 軸切替 (アクセル ↔ ブレーキ)</div>
             <div>Esc           : 手動運転終了</div>
           </div>
@@ -132,7 +132,7 @@ function ManualScreen() {
             {robotState === 'MANUAL' ? (
               <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 運転終了</Btn>
             ) : (
-              <Btn big style={{ flex: 1, borderColor: '#3f6b3f', background: '#dfeadc', color: '#22421f' }} onClick={handleStart}>▶ 走行開始</Btn>
+              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleStart}>▶ 走行開始</Btn>
             )}
           </div>
         </div>

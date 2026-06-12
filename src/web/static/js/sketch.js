@@ -1,34 +1,34 @@
 // sketch.js — UI プリミティブ
 // ワイヤーフレームの sketch.jsx をベースに、SPA 用に調整
 
-const INK       = '#1f1f1f';
-const INK_SOFT  = '#5a5a5a';
-const INK_MUTE  = '#9a9a9a';
-const PAPER     = '#fafaf7';
-const PAPER_2   = '#f1efe9';
-const HATCH     = '#d8d6d0';
+const INK       = '#ece4d4';
+const INK_SOFT  = '#c2baaa';
+const INK_MUTE  = '#84786e';
+const PAPER     = '#141210';
+const PAPER_2   = '#1e1b17';
+const HATCH     = '#3c3830';
 
 const STATE_TINT = {
-  STANDBY:      { stroke: '#7a7a7a', fill: '#e9e7e1', text: '#2a2a2a' },
-  BOOTING:      { stroke: '#7a5c1c', fill: '#faf3dc', text: '#5a3e0a' },
-  ERROR:        { stroke: '#a23232', fill: '#f1d8d2', text: '#5e1414' },
-  INITIALIZING: { stroke: '#2f5780', fill: '#dde6f0', text: '#1a3859' },
-  READY:        { stroke: '#3f6b3f', fill: '#dfeadc', text: '#22421f' },
-  RUNNING:      { stroke: '#2f5780', fill: '#dde6f0', text: '#1a3859' },
-  EMERGENCY:    { stroke: '#a23232', fill: '#f1d8d2', text: '#5e1414' },
-  AC_LOSS:      { stroke: '#a23232', fill: '#f1d8d2', text: '#5e1414' },
+  STANDBY:      { stroke: '#58524a', fill: '#1e1b17', text: '#a8a090' },
+  BOOTING:      { stroke: '#b89030', fill: '#221c08', text: '#f0c84a' },
+  ERROR:        { stroke: '#b04040', fill: '#220e0e', text: '#f07070' },
+  INITIALIZING: { stroke: '#3880b8', fill: '#0e1e2c', text: '#78c8f0' },
+  READY:        { stroke: '#3c8c3c', fill: '#0e220e', text: '#68d468' },
+  RUNNING:      { stroke: '#3880b8', fill: '#0e1c2a', text: '#78c8f0' },
+  EMERGENCY:    { stroke: '#b04040', fill: '#220e0e', text: '#f07070' },
+  AC_LOSS:      { stroke: '#b04040', fill: '#220e0e', text: '#f07070' },
 };
 
 const NAV = [
   ['init',       '初期化'],
   ['profiles',   '車両プロファイル'],
-  ['calibration','キャリブレーション'],
   ['modes',      '走行モード'],
+  ['schedule',   'スケジュールモード'],
+  ['sequence',   'シーケンスモード'],
+  ['calibration','キャリブレーション'],
   ['learning',   '学習運転'],
   ['auto',       '自動運転'],
   ['manual',     '手動運転'],
-  ['schedule',   'タイムスケジュール'],
-  ['sequence',   'シーケンス'],
   ['logs',       'ログ'],
 ];
 
@@ -57,26 +57,26 @@ function EmergencyOverlay({ onGoInit }) {
       display: 'flex', alignItems: 'center', justifyContent: 'center',
     }}>
       <div style={{
-        background: '#fff8f6', border: '3px solid #a23232',
+        background: '#200e0e', border: '3px solid #943030',
         borderRadius: 8, padding: '36px 52px',
-        textAlign: 'center', boxShadow: '4px 4px 0 rgba(0,0,0,0.25)',
+        textAlign: 'center', boxShadow: '4px 4px 0 rgba(0,0,0,0.6)',
         transform: 'rotate(-0.5deg)', maxWidth: 460,
         fontFamily: "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
       }}>
-        <div style={{ fontSize: 52, lineHeight: 1, marginBottom: 12, color: '#a23232' }}>⚠</div>
-        <div style={{ fontSize: 28, fontWeight: 800, color: '#5e1414', letterSpacing: 1, marginBottom: 8 }}>
+        <div style={{ fontSize: 52, lineHeight: 1, marginBottom: 12, color: '#e05050' }}>⚠</div>
+        <div style={{ fontSize: 28, fontWeight: 800, color: '#e05050', letterSpacing: 1, marginBottom: 8 }}>
           非常停止スイッチが押されています
         </div>
-        <div style={{ fontSize: 16, color: '#8a3030', lineHeight: 1.6, marginBottom: 24 }}>
+        <div style={{ fontSize: 16, color: '#c87070', lineHeight: 1.6, marginBottom: 24 }}>
           スイッチを解除してから「初期化」画面で<br />
           アラームリセット → サーボON を実施してください。
         </div>
         <div onClick={onGoInit} style={{
           display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-          border: '2px solid #a23232', borderRadius: 6,
-          padding: '9px 28px', background: '#f1d8d2', color: '#5e1414',
+          border: '2px solid #943030', borderRadius: 6,
+          padding: '9px 28px', background: '#2a1212', color: '#e05050',
           fontWeight: 700, fontSize: 16, fontFamily: 'inherit',
-          boxShadow: '2px 2px 0 rgba(0,0,0,0.15)', cursor: 'pointer',
+          boxShadow: '2px 2px 0 rgba(0,0,0,0.4)', cursor: 'pointer',
         }}>初期化画面へ</div>
       </div>
     </div>
@@ -90,7 +90,7 @@ function UpsIndicator({ acLoss = false }) {
       display: 'flex', alignItems: 'center', gap: 5,
       border: `1.2px solid ${acLoss ? '#a23232' : INK_MUTE}`,
       borderRadius: 12, padding: '2px 10px',
-      background: acLoss ? '#f1d8d2' : 'transparent', fontSize: 13,
+      background: acLoss ? '#2a1212' : 'transparent', fontSize: 13,
     }}>
       <span style={{ fontSize: 14, color: acLoss ? '#a23232' : '#3f6b3f' }}>⚡</span>
       <span style={{ color: acLoss ? '#5e1414' : INK_SOFT, fontWeight: acLoss ? 700 : 400 }}>
@@ -106,8 +106,8 @@ function StateBadge({ state }) {
   return (
     <div style={{
       border: `1.5px solid ${t.stroke}`, background: t.fill, color: t.text,
-      padding: '3px 12px', borderRadius: 14, fontSize: 16,
-      fontWeight: 700, letterSpacing: 1, transform: 'rotate(-0.4deg)',
+      padding: '3px 12px', borderRadius: 14, fontSize: 13,
+      fontWeight: 700, letterSpacing: '0.06em',
     }}>● {state}</div>
   );
 }
@@ -119,14 +119,14 @@ function TopBar({ state, screen, upsLoss, profileName, modeName }) {
   return (
     <div style={{
       gridColumn: '1 / -1',
-      borderBottom: `1.5px solid ${INK}`,
+      borderBottom: `1px solid ${HATCH}`,
       display: 'flex', alignItems: 'center',
       padding: '0 22px', gap: 14,
-      background: PAPER,
+      background: PAPER_2,
     }}>
-      <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: 0.5 }}>Driving_Robot</div>
-      <div style={{ width: 1, height: 22, background: INK_MUTE }} />
-      <div style={{ fontSize: 17, color: INK_SOFT }}>{screen}</div>
+      <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: 1, color: INK }}>Driving_Robot</div>
+      <div style={{ width: 1, height: 20, background: HATCH }} />
+      <div style={{ fontSize: 15, color: INK_SOFT }}>{screen}</div>
       <div style={{ flex: 1 }} />
       <UpsIndicator acLoss={showUpsLoss} />
       <StateBadge state={state} />
@@ -144,24 +144,25 @@ function TopBar({ state, screen, upsLoss, profileName, modeName }) {
 function Sidebar({ active, onNav }) {
   return (
     <div style={{
-      borderRight: `1.5px solid ${INK}`,
-      padding: '18px 0',
+      borderRight: `1px solid ${HATCH}`,
+      padding: '14px 0',
       background: PAPER_2,
-      display: 'flex', flexDirection: 'column', gap: 2,
-      fontSize: 17, overflowY: 'auto',
+      display: 'flex', flexDirection: 'column', gap: 1,
+      fontSize: 15, overflowY: 'auto',
     }}>
       {NAV.map(([k, label]) => {
         const on = k === active;
         return (
           <div key={k} onClick={() => onNav(k)} style={{
-            padding: '7px 18px',
-            borderLeft: on ? `4px solid ${INK}` : '4px solid transparent',
-            background: on ? PAPER : 'transparent',
+            padding: '8px 16px 8px 14px',
+            borderLeft: on ? '3px solid #c8922a' : '3px solid transparent',
+            background: on ? 'rgba(200,146,42,0.10)' : 'transparent',
             fontWeight: on ? 700 : 400,
             color: on ? INK : INK_SOFT,
             cursor: 'pointer',
             userSelect: 'none',
             whiteSpace: 'nowrap',
+            transition: 'background 0.15s, color 0.15s',
           }}>{label}</div>
         );
       })}
@@ -177,7 +178,7 @@ function Frame({ children, state = 'READY', screen = '', activeNav = '',
     <div style={{
       width: '100%', height: '100%',
       background: PAPER,
-      fontFamily: "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
+      fontFamily: "'Noto Sans JP', 'Meiryo UI', 'Yu Gothic UI', sans-serif",
       color: INK,
       display: 'grid',
       gridTemplateColumns: '200px 1fr',
@@ -198,10 +199,11 @@ function Frame({ children, state = 'READY', screen = '', activeNav = '',
 
 // ── Box ──────────────────────────────────────────────────────
 function Box({ children, style = {}, label, dashed, thick, tint }) {
+  const bg = tint !== undefined ? tint : PAPER_2;
   return (
     <div style={{
-      border: `${thick ? 2 : 1.4}px ${dashed ? 'dashed' : 'solid'} ${INK}`,
-      background: tint || 'transparent',
+      border: `${thick ? 2 : 1}px ${dashed ? 'dashed' : 'solid'} ${thick ? INK_SOFT : HATCH}`,
+      background: bg,
       position: 'relative',
       borderRadius: 4,
       ...style,
@@ -209,7 +211,9 @@ function Box({ children, style = {}, label, dashed, thick, tint }) {
       {label && (
         <div style={{
           position: 'absolute', top: -10, left: 14,
-          background: PAPER, fontSize: 13, color: INK_SOFT, padding: '0px 6px',
+          background: bg === PAPER_2 ? PAPER_2 : (bg || PAPER_2),
+          fontSize: 12, color: INK_MUTE, padding: '0px 6px',
+          letterSpacing: '0.04em',
         }}>{label}</div>
       )}
       {children}
@@ -221,15 +225,15 @@ function Box({ children, style = {}, label, dashed, thick, tint }) {
 function Btn({ children, primary, danger, big, style = {}, ghost, onClick, disabled }) {
   const base = {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-    border: `${big ? 2 : 1.5}px solid ${danger ? '#a23232' : INK}`,
-    borderRadius: 6,
+    border: `${big ? 2 : 1.5}px solid ${danger ? '#b04040' : primary ? INK_SOFT : HATCH}`,
+    borderRadius: 5,
     padding: big ? '10px 22px' : '6px 14px',
-    background: disabled ? PAPER_2 : ghost ? 'transparent' : primary ? INK : danger ? '#f1d8d2' : PAPER,
-    color: disabled ? INK_MUTE : ghost ? INK : primary ? PAPER : danger ? '#5e1414' : INK,
+    background: disabled ? PAPER_2 : ghost ? 'transparent' : primary ? INK : danger ? '#220e0e' : PAPER_2,
+    color: disabled ? INK_MUTE : ghost ? INK : primary ? PAPER : danger ? '#f07070' : INK,
     fontFamily: 'inherit',
     fontWeight: primary || danger ? 700 : 500,
-    fontSize: big ? 19 : 15,
-    boxShadow: primary && !disabled ? '2px 2px 0 rgba(0,0,0,0.15)' : 'none',
+    fontSize: big ? 17 : 14,
+    boxShadow: primary && !disabled ? '0 1px 4px rgba(0,0,0,0.4)' : 'none',
     cursor: disabled ? 'not-allowed' : 'pointer',
     opacity: disabled ? 0.6 : 1,
     whiteSpace: 'nowrap',
@@ -261,9 +265,10 @@ function Pill({ children, accent, style = {} }) {
 function Note({ children, style = {} }) {
   return (
     <div style={{
-      fontSize: 13, color: '#7a5c1c',
-      background: '#faf3dc', border: `1px dashed #c8a94a`,
-      padding: '6px 10px', borderRadius: 4,
+      fontSize: 13, color: '#f0c84a',
+      background: '#221c08', border: `1px dashed #b89030`,
+      padding: '7px 12px', borderRadius: 4,
+      lineHeight: 1.6,
       ...style,
     }}>※ {children}</div>
   );
@@ -283,11 +288,12 @@ function H2({ children, sub }) {
 function Input({ label, value, defaultValue, width = 200, mono, type = 'text',
                  min, max, step, onChange, placeholder, required, style = {} }) {
   const inputStyle = {
-    width: '100%', padding: '5px 10px',
-    border: `1.3px solid ${INK}`, borderRadius: 3,
-    fontFamily: mono ? 'monospace' : "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
-    fontSize: 15, background: PAPER,
+    width: '100%', padding: '6px 10px',
+    border: `1px solid ${HATCH}`, borderRadius: 4,
+    fontFamily: mono ? "'JetBrains Mono', monospace" : "'Noto Sans JP', 'Meiryo UI', sans-serif",
+    fontSize: 14, background: PAPER, color: INK,
     outline: 'none',
+    transition: 'border-color 0.15s',
   };
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 3, width, ...style }}>
@@ -312,14 +318,14 @@ function Row({ cells, header, style = {} }) {
     <div style={{
       display: 'grid',
       gridTemplateColumns: cells.map(c => c[1] || '1fr').join(' '),
-      borderBottom: `1px ${header ? 'solid' : 'dashed'} ${header ? INK : INK_MUTE}`,
+      borderBottom: `1px ${header ? 'solid' : 'dashed'} ${header ? INK_SOFT : HATCH}`,
       padding: '6px 8px',
       fontSize: 14,
-      fontWeight: header ? 700 : 400,
+      fontWeight: header ? 600 : 400,
       ...style,
     }}>
       {cells.map((c, i) => (
-        <div key={i} style={{ fontFamily: c[2] === 'mono' ? 'monospace' : 'inherit' }}>
+        <div key={i} style={{ fontFamily: c[2] === 'mono' ? "'JetBrains Mono', monospace" : 'inherit' }}>
           {c[0]}
         </div>
       ))}
@@ -396,22 +402,22 @@ function SpeedGraph({ width = 600, height = 220, refPts, actPts, style = {} }) {
   return (
     <svg viewBox={`0 0 ${W} ${H}`} width={width} height={height}
          style={{ ...style, display: 'block' }}>
-      <rect x={padL} y={padT} width={pw} height={ph} fill="none" stroke={INK} strokeWidth="1.2" />
+      <rect x={padL} y={padT} width={pw} height={ph} fill="none" stroke={HATCH} strokeWidth="1.2" />
       {[0, 40, 80, 120].map(v => (
         <g key={v}>
-          <line x1={padL - 4} y1={yAt(v)} x2={padL} y2={yAt(v)} stroke={INK} strokeWidth="1" />
-          <text x={padL - 6} y={yAt(v) + 4} fontSize="11" textAnchor="end" fontFamily="monospace" fill={INK_SOFT}>{v}</text>
+          <line x1={padL - 4} y1={yAt(v)} x2={padL} y2={yAt(v)} stroke={INK_SOFT} strokeWidth="1" />
+          <text x={padL - 6} y={yAt(v) + 4} fontSize="12" textAnchor="end" fontFamily="inherit" fill={INK}>{v}</text>
           <line x1={padL} y1={yAt(v)} x2={padL + pw} y2={yAt(v)} stroke={HATCH} strokeWidth="0.7" strokeDasharray="2 3" />
         </g>
       ))}
-      <text x={padL + pw / 2} y={H - 6} fontSize="11" textAnchor="middle" fontFamily="monospace" fill={INK_SOFT}>time [s] →</text>
-      <text x={6} y={padT - 2} fontSize="11" fontFamily="monospace" fill={INK_SOFT}>km/h</text>
-      <path d={refPath} fill="none" stroke={INK} strokeWidth="1.5" strokeDasharray="4 3" />
-      <path d={actPath} fill="none" stroke="#2f5780" strokeWidth="2.2" />
+      <text x={padL + pw / 2} y={H - 6} fontSize="11" textAnchor="middle" fontFamily="inherit" fill={INK_SOFT}>time [s] →</text>
+      <text x={6} y={padT - 2} fontSize="11" fontFamily="inherit" fill={INK_SOFT}>km/h</text>
+      <path d={refPath} fill="none" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />
+      <path d={actPath} fill="none" stroke="#c8922a" strokeWidth="2.2" />
       <g transform={`translate(${padL + 10}, ${padT + 8})`}>
-        <line x1="0" y1="6" x2="22" y2="6" stroke={INK} strokeWidth="1.5" strokeDasharray="4 3" />
+        <line x1="0" y1="6" x2="22" y2="6" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />
         <text x="28" y="10" fontSize="12" fontFamily="inherit" fill={INK}>基準</text>
-        <line x1="68" y1="6" x2="90" y2="6" stroke="#2f5780" strokeWidth="2.2" />
+        <line x1="68" y1="6" x2="90" y2="6" stroke="#c8922a" strokeWidth="2.2" />
         <text x="96" y="10" fontSize="12" fontFamily="inherit" fill={INK}>実測</text>
       </g>
     </svg>
@@ -424,20 +430,20 @@ function PedalGauge({ label, value = 0, max = 100, width = 60, height = 180, col
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
       <div style={{ fontSize: 14, color: INK_SOFT }}>{label}</div>
-      <div style={{ width, height, border: `1.4px solid ${INK}`, position: 'relative', background: PAPER }}>
+      <div style={{ width, height, border: `1px solid ${HATCH}`, position: 'relative', background: PAPER }}>
         <div style={{
           position: 'absolute', bottom: 0, left: 0, right: 0,
-          height: `${pct * 100}%`, background: color, opacity: 0.85,
+          height: `${pct * 100}%`, background: color, opacity: 0.9,
         }} />
         {[25, 50, 75].map(t => (
           <div key={t} style={{
             position: 'absolute', left: -4, right: -4,
             bottom: `${t}%`, height: 0,
-            borderTop: `1px dashed ${INK_MUTE}`,
+            borderTop: `1px dashed ${HATCH}`,
           }} />
         ))}
       </div>
-      <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace' }}>
+      <div style={{ fontSize: 17, fontWeight: 700, fontFamily: 'inherit' }}>
         {value.toFixed(1)}<span style={{ fontSize: 12, color: INK_SOFT }}> %</span>
       </div>
     </div>
@@ -452,9 +458,9 @@ function BigSpeed({ value = 0, refSpeed = null, size = 220 }) {
       <div style={{ fontSize: size * 0.42, fontWeight: 700, lineHeight: 1, fontFamily: 'inherit' }}>
         {(typeof value === 'number' ? value : 0).toFixed(1)}
       </div>
-      <div style={{ fontSize: 16, color: INK_SOFT, marginTop: -4 }}>km/h</div>
+      <div style={{ fontSize: 14, color: INK_SOFT, marginTop: -2, letterSpacing: '0.04em' }}>km/h</div>
       {refSpeed !== null && (
-        <div style={{ fontSize: 14, color: INK_SOFT, marginTop: 6 }}>
+        <div style={{ fontSize: 13, color: INK_SOFT, marginTop: 6, fontFamily: 'inherit' }}>
           基準 {refSpeed.toFixed(1)} / 偏差 {(value - refSpeed).toFixed(2)}
         </div>
       )}
@@ -473,16 +479,16 @@ function TimeProgress({ elapsed = 380, total = 1800, style = {} }) {
     <div style={style}>
       <div style={{
         display: 'flex', justifyContent: 'space-between',
-        fontSize: 13, color: INK_SOFT, marginBottom: 4, fontFamily: 'monospace',
+        fontSize: 13, color: INK_SOFT, marginBottom: 4, fontFamily: 'inherit',
       }}>
         <span>経過 {fmt(elapsed)}</span>
         <span>{Math.round(pct * 100)}%</span>
         <span>残り {fmt(total - elapsed)}</span>
       </div>
-      <div style={{ height: 14, border: `1.4px solid ${INK}`, position: 'relative', background: PAPER }}>
+      <div style={{ height: 10, border: `1px solid ${HATCH}`, position: 'relative', background: PAPER, borderRadius: 2 }}>
         <div style={{
           position: 'absolute', left: 0, top: 0, bottom: 0,
-          width: `${pct * 100}%`, background: '#2f5780', opacity: 0.7,
+          width: `${pct * 100}%`, background: '#c8922a', opacity: 0.8,
         }} />
       </div>
     </div>
@@ -494,13 +500,13 @@ function EmergencyBtn({ size = 130, style = {} }) {
   return (
     <div style={{
       width: size, height: size, borderRadius: '50%',
-      border: `3px solid #a23232`,
-      background: 'radial-gradient(circle at 35% 30%, #f1d8d2 0%, #d95555 80%)',
+      border: `3px solid #b04040`,
+      background: 'radial-gradient(circle at 35% 30%, #4a1818 0%, #c04040 80%)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      textAlign: 'center', color: '#fff',
+      textAlign: 'center', color: '#f0e0e0',
       fontWeight: 800, fontSize: size * 0.13,
       letterSpacing: 1,
-      boxShadow: '3px 3px 0 rgba(0,0,0,0.2), inset 0 -8px 12px rgba(0,0,0,0.25)',
+      boxShadow: '0 4px 12px rgba(176,64,64,0.35), inset 0 -8px 12px rgba(0,0,0,0.35)',
       transform: 'rotate(-1deg)',
       ...style,
     }}>非常停止<br />STOP</div>
@@ -526,17 +532,17 @@ function ConfirmStopPopup({ message = '停止しますか？', onYes, onNo }) {
         <div style={{ display: 'flex', gap: 16, justifyContent: 'center' }}>
           <div onClick={onYes} style={{
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-            border: '2px solid #a23232', borderRadius: 6, padding: '10px 32px',
-            background: '#f1d8d2', color: '#5e1414',
+            border: '2px solid #943030', borderRadius: 6, padding: '10px 32px',
+            background: '#2a1212', color: '#e05050',
             fontWeight: 700, fontSize: 18, fontFamily: 'inherit', cursor: 'pointer',
-            boxShadow: '2px 2px 0 rgba(0,0,0,0.12)',
+            boxShadow: '2px 2px 0 rgba(0,0,0,0.4)',
           }}>はい</div>
           <div onClick={onNo} style={{
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
             border: `2px solid ${INK}`, borderRadius: 6, padding: '10px 32px',
             background: PAPER, color: INK,
             fontWeight: 700, fontSize: 18, fontFamily: 'inherit', cursor: 'pointer',
-            boxShadow: '2px 2px 0 rgba(0,0,0,0.12)',
+            boxShadow: '2px 2px 0 rgba(0,0,0,0.4)',
           }}>いいえ</div>
         </div>
       </div>
@@ -559,7 +565,7 @@ function ValidationPopup({ message, actionLabel = 'OK', onAction }) {
         transform: 'rotate(-0.3deg)', minWidth: 340,
         fontFamily: "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
       }}>
-        <div style={{ fontSize: 40, marginBottom: 12, color: '#7a5c1c' }}>⚠</div>
+        <div style={{ fontSize: 40, marginBottom: 12, color: '#d4a844' }}>⚠</div>
         <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 24, color: INK }}>{message}</div>
         <div onClick={onAction} style={{
           display: 'inline-flex', alignItems: 'center', justifyContent: 'center',

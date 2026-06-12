@@ -136,3 +136,12 @@ claude --version
   - docs/repository-structure.md ✅
   - docs/development-guidelines.md ✅
   - docs/glossary.md ✅
+
+
+# TODO:
+
+  - UPSの本番環境の確認
+  - 学習運転ができない問題を修正
+  - エラー 422: PreCheckResult(passed=False, items=[PreCheckItemResult(item_name='通信確認', passed=True, error_message=None), PreCheckItemResult(item_name='サーボ状態', passed=True, error_message=None), PreCheckItemResult(item_name='キャリブレーション', passed=True, error_message=None), PreCheckItemResult(item_name='プロファイル', passed=True, error_message=None), PreCheckItemResult(item_name='UPS残量', passed=False, error_message='UPS残量取得エラー: NUT サーバーに接続できません'), PreCheckItemResult(item_name='アクチュエータ位置', passed=True, error_message=None)])
+  - モードは"走行","スケジュール","シーケンス"の中から1つを選択
+    選択されたモードが自動運転ページで実行される
