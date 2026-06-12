@@ -61,7 +61,7 @@ function EmergencyOverlay({ onGoInit }) {
         borderRadius: 8, padding: '36px 52px',
         textAlign: 'center', boxShadow: '4px 4px 0 rgba(0,0,0,0.25)',
         transform: 'rotate(-0.5deg)', maxWidth: 460,
-        fontFamily: "'Patrick Hand', cursive",
+        fontFamily: "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
       }}>
         <div style={{ fontSize: 52, lineHeight: 1, marginBottom: 12, color: '#a23232' }}>⚠</div>
         <div style={{ fontSize: 28, fontWeight: 800, color: '#5e1414', letterSpacing: 1, marginBottom: 8 }}>
@@ -177,7 +177,7 @@ function Frame({ children, state = 'READY', screen = '', activeNav = '',
     <div style={{
       width: '100%', height: '100%',
       background: PAPER,
-      fontFamily: "'Patrick Hand', 'Kalam', 'Comic Sans MS', cursive",
+      fontFamily: "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
       color: INK,
       display: 'grid',
       gridTemplateColumns: '200px 1fr',
@@ -285,7 +285,7 @@ function Input({ label, value, defaultValue, width = 200, mono, type = 'text',
   const inputStyle = {
     width: '100%', padding: '5px 10px',
     border: `1.3px solid ${INK}`, borderRadius: 3,
-    fontFamily: mono ? 'monospace' : "'Patrick Hand', cursive",
+    fontFamily: mono ? 'monospace' : "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
     fontSize: 15, background: PAPER,
     outline: 'none',
   };
@@ -520,7 +520,7 @@ function ConfirmStopPopup({ message = '停止しますか？', onYes, onNo }) {
         borderRadius: 8, padding: '32px 44px',
         textAlign: 'center', boxShadow: '4px 4px 0 rgba(0,0,0,0.2)',
         transform: 'rotate(-0.3deg)', minWidth: 320,
-        fontFamily: "'Patrick Hand', cursive",
+        fontFamily: "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
       }}>
         <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 24, color: INK }}>{message}</div>
         <div style={{ display: 'flex', gap: 16, justifyContent: 'center' }}>
@@ -557,7 +557,7 @@ function ValidationPopup({ message, actionLabel = 'OK', onAction }) {
         borderRadius: 8, padding: '32px 44px',
         textAlign: 'center', boxShadow: '4px 4px 0 rgba(0,0,0,0.2)',
         transform: 'rotate(-0.3deg)', minWidth: 340,
-        fontFamily: "'Patrick Hand', cursive",
+        fontFamily: "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
       }}>
         <div style={{ fontSize: 40, marginBottom: 12, color: '#7a5c1c' }}>⚠</div>
         <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 24, color: INK }}>{message}</div>

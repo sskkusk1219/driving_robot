@@ -41,7 +41,7 @@ function JogKey({ label, hint, onClick, disabled }) {
 
 // ── PosRuler ──────────────────────────────────────────────
 // SVG ruler showing ZERO (green) and FULL (red) markers plus current position triangle
-function PosRuler({ zeroPos, fullPos, currentPos, maxPulse = 5000, label = '' }) {
+function PosRuler({ zeroPos, fullPos, currentPos, maxPulse = 9500, label = '' }) {
   const { INK } = window;
   const W = 480, H = 56;
   const PL = 24, PR = 24;
@@ -55,15 +55,17 @@ function PosRuler({ zeroPos, fullPos, currentPos, maxPulse = 5000, label = '' })
   // triangle pointing down
   const tri = (x, color) => `M${x},${H - 14} L${x - 7},${H - 26} L${x + 7},${H - 26} Z`;
 
+  const tickVals = [0, 2000, 4000, 6000, 8000, 9500];
+
   return React.createElement('svg', { viewBox: `0 0 ${W} ${H}`, width: '100%', height: H, style: { display: 'block', overflow: 'visible' } },
     // track line
     React.createElement('line', { x1: PL, y1: H - 14, x2: PL + trackW, y2: H - 14, stroke: INK, strokeWidth: 2 }),
-    // tick marks every 1000
-    ...[0,1,2,3,4,5].map(i => {
-      const x = PL + (i / 5) * trackW;
-      return React.createElement('g', { key: i },
+    // tick marks at 0, 2000, 4000, 6000, 8000, 9500
+    ...tickVals.map(v => {
+      const x = PL + (v / maxPulse) * trackW;
+      return React.createElement('g', { key: v },
         React.createElement('line', { x1: x, y1: H - 10, x2: x, y2: H - 18, stroke: INK, strokeWidth: 1.5 }),
-        React.createElement('text', { x, y: H - 3, textAnchor: 'middle', fontSize: 9, fill: '#666' }, i * 1000),
+        React.createElement('text', { x, y: H - 3, textAnchor: 'middle', fontSize: 9, fill: '#666' }, v),
       );
     }),
     // ZERO marker
@@ -119,7 +121,7 @@ function OpeningBar({ value = 0, color = '#1f1f1f', label = '' }) {
 // ── DragSlider ────────────────────────────────────────────
 // Horizontal drag slider (left=decrease, right=increase).
 // Optional zeroPos / fullPos show calibration markers.
-function DragSlider({ currentPos, maxPulse = 5000, axisId, onJog, zeroPos, fullPos }) {
+function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullPos }) {
   const { useRef } = React;
   const { INK, INK_SOFT, PAPER, HATCH } = window;
 

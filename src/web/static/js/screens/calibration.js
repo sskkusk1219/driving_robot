@@ -11,15 +11,15 @@ function AxisCal({ label, axisId, currentPos, zero, full, onJog, onSetZero, onSe
       {/* Jog buttons + drag slider */}
       <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-          <JogKey label="−10" hint="Shift+←" onClick={() => onJog(axisId, -10)} />
-          <JogKey label="−1"  hint="←"       onClick={() => onJog(axisId, -1)} />
+          <JogKey label="−10"  onClick={() => onJog(axisId, -10)} />
+          <JogKey label="−100" onClick={() => onJog(axisId, -100)} />
         </div>
 
         <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} zeroPos={zero} fullPos={full} />
 
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-          <JogKey label="+1"  hint="→"       onClick={() => onJog(axisId, 1)} />
-          <JogKey label="+10" hint="Shift+→" onClick={() => onJog(axisId, 10)} />
+          <JogKey label="+10"  onClick={() => onJog(axisId, 10)} />
+          <JogKey label="+100" onClick={() => onJog(axisId, 100)} />
         </div>
       </div>
 
@@ -27,11 +27,11 @@ function AxisCal({ label, axisId, currentPos, zero, full, onJog, onSetZero, onSe
       <div style={{ display: 'flex', gap: 8 }}>
         <Btn style={{ flex: 1, borderColor: '#3f6b3f', color: '#22421f', justifyContent: 'center' }}
              onClick={() => onSetZero(axisId)}>
-          ZERO 確定 [Z]
+          ZERO 確定
         </Btn>
         <Btn style={{ flex: 1, borderColor: '#a23232', color: '#5e1414', justifyContent: 'center' }}
              onClick={() => onSetFull(axisId)}>
-          FULL 確定 [F]
+          FULL 確定
         </Btn>
       </div>
 
@@ -128,20 +128,8 @@ function CalibrationScreen() {
         />
       </div>
 
-      {/* Bottom: shortcuts | recorded + save button */}
+      {/* Bottom: recorded + save button */}
       <div style={{ display: 'flex', gap: 10 }}>
-        <Box label="キーボードショートカット" style={{ padding: '10px 12px', flex: 1 }}>
-          <div style={{ fontSize: 12, lineHeight: 1.7, fontFamily: 'monospace' }}>
-            <div>← / →        : ±1 pulse</div>
-            <div>Shift+← / →  : ±10 pulse</div>
-            <div>Z             : ZERO 確定</div>
-            <div>F             : FULL 確定</div>
-            <div>Tab           : 軸切替 (アクセル ↔ ブレーキ)</div>
-            <div>Esc           : キャンセル</div>
-          </div>
-          <Note style={{ marginTop: 6 }}>キャリブレーション中は最大開度設定が無視されます。電流値を常時監視中。</Note>
-        </Box>
-
         <div style={{ display: 'flex', gap: 10, flex: 1 }}>
           <Box label="記録済み" style={{ padding: '10px 14px', fontSize: 13, flex: 1 }}>
             <Row cells={[['', '22px'], ['軸', '1.4fr'], ['ZERO', '1fr'], ['FULL', '1fr']]} header />
