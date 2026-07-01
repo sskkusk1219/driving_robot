@@ -143,7 +143,7 @@ function ModesScreen() {
   const [mode, setMode] = useState('list'); // list | create | edit
   const [editTarget, setEditTarget] = useState(null);
   const [search, setSearch] = useState('');
-  const [sortKey, setSortKey] = useState(null);   // 'name' | 'total_duration' | 'max_speed'
+  const [sortKey, setSortKey] = useState('name');   // 'name' | 'total_duration' | 'max_speed'
   const [sortAsc, setSortAsc] = useState(true);
   const [editingNameId, setEditingNameId] = useState(null);
   const [editingNameValue, setEditingNameValue] = useState('');
@@ -309,9 +309,6 @@ function ModesScreen() {
 
     // ── ヘッダ ──────────────────────────────────────────────
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
-      React.createElement(H2, {
-        sub: '基準車速CSVをアップロードして管理。自動走行で選択します。',
-      }, '走行モード'),
       React.createElement('div', { style: { flex: 1 } }),
       // 検索ボックス
       React.createElement('input', {
@@ -322,7 +319,7 @@ function ModesScreen() {
         style: {
           padding: '6px 12px', fontSize: 14,
           border: `1.3px solid ${INK}`, borderRadius: 4,
-          fontFamily: 'inherit', background: PAPER, outline: 'none',
+          fontFamily: 'inherit', background: PAPER, color: INK, outline: 'none',
           width: 200,
         },
       }),
@@ -330,7 +327,7 @@ function ModesScreen() {
     ),
 
     // ── テーブル ─────────────────────────────────────────────
-    React.createElement(Box, { style: { padding: 0 } },
+    React.createElement(Box, { style: { padding: 0, display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 } },
       // ヘッダ行 (ソート可能な列はクリッカブル)
       React.createElement('div', {
         style: {
@@ -340,6 +337,7 @@ function ModesScreen() {
           padding: '10px 14px',
           background: PAPER_2,
           fontSize: 14, fontWeight: 700,
+          flexShrink: 0,
         }
       },
         ...[
@@ -362,6 +360,7 @@ function ModesScreen() {
         ),
       ),
 
+      React.createElement('div', { style: { overflowY: 'auto', flex: 1, minHeight: 0 } },
       loading
         ? React.createElement('div', {
             style: { padding: '20px 14px', color: INK_SOFT, fontSize: 14 }
@@ -391,7 +390,8 @@ function ModesScreen() {
                         style: {
                           fontSize: 14, padding: '2px 6px',
                           border: `1.3px solid ${INK}`, borderRadius: 3,
-                          fontFamily: 'inherit', width: '100%',
+                          fontFamily: 'inherit', background: PAPER, color: INK,
+                          outline: 'none', width: '100%',
                         },
                       }),
                       React.createElement('span', {
@@ -442,6 +442,7 @@ function ModesScreen() {
               },
             });
           }),
+      ),
     ),
   );
 }
@@ -562,7 +563,7 @@ function ModeEdit({ initial, referenceSpeed, onSave, onCancel, onDelete }) {
                   width: '100%', padding: '7px 10px',
                   border: `1.3px solid ${INK}`, borderRadius: 3,
                   fontFamily: "'Patrick Hand', cursive",
-                  fontSize: 15, background: PAPER,
+                  fontSize: 15, background: PAPER, color: INK,
                   minHeight: 60, resize: 'vertical', outline: 'none',
                   boxSizing: 'border-box',
                 },
@@ -818,7 +819,7 @@ function ModeCreate({ onSave, onCancel }) {
                   width: '100%', padding: '7px 10px',
                   border: `1.3px solid ${INK}`, borderRadius: 3,
                   fontFamily: "'Patrick Hand', cursive",
-                  fontSize: 15, background: PAPER,
+                  fontSize: 15, background: PAPER, color: INK,
                   minHeight: 60, resize: 'vertical', outline: 'none',
                   boxSizing: 'border-box',
                 },

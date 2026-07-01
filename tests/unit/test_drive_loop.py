@@ -150,6 +150,7 @@ def _make_loop(
     on_emergency: Callable[[], Awaitable[None]] | None = None,
     log_writer: MagicMock | None = None,
     session_id: str | None = None,
+    disable_deviation_check: bool = False,
 ) -> DriveLoop:
     return DriveLoop(
         ff_controller=ff or _make_ff(),
@@ -164,6 +165,7 @@ def _make_loop(
         on_emergency=on_emergency or AsyncMock(),
         log_writer=log_writer,
         session_id=session_id,
+        disable_deviation_check=disable_deviation_check,
     )
 
 
@@ -540,6 +542,34 @@ class TestDeviationEmergency:
 
         on_emergency.assert_called_once()
         assert not dl.is_running
+
+    @pytest.mark.asyncio
+    async def test_deviation_check_suppressed_when_disabled(self) -> None:
+        """disable_deviation_check=True では逸脱しても非常停止しない（PID 自動適合用）。
+
+        過電流等の他の安全網は維持されるため check_deviation 自体も呼ばれない。
+        """
+        on_emergency = AsyncMock()
+        safety_check = _make_safety_check(deviation=True)
+
+        dl = _make_loop(
+            safety_check=safety_check,
+            on_emergency=on_emergency,
+            disable_deviation_check=True,
+        )
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 0.0
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+
+            await dl._execute_one_cycle()
+
+        on_emergency.assert_not_called()
+        safety_check.check_deviation.assert_not_called()
+        assert dl.is_running
 
     @pytest.mark.asyncio
     async def test_deviation_start_reset_when_deviation_clears(self) -> None:
@@ -1016,6 +1046,154 @@ class TestKPIIntegration:
             mock_loop.return_value = loop_obj
             dl.start()
         assert dl.kpi_summary["n_samples"] == 0.0
+
+
+class TestPauseResume:
+    """一時停止／再開: 基準速度タイムライン（経過時間）の凍結と連続再開。"""
+
+    def test_pause_records_frozen_elapsed_and_sets_paused(self) -> None:
+        dl = _make_loop()
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 7.0
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 2.0
+            dl.pause()
+        assert dl.is_paused
+        assert dl._paused_elapsed == pytest.approx(5.0)
+
+    def test_pause_noop_when_not_running(self) -> None:
+        dl = _make_loop()
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 0.0
+            mock_loop.return_value = loop_obj
+            dl._running = False
+            dl.pause()
+        assert not dl.is_paused
+
+    def test_resume_shifts_started_at_to_continue_timeline(self) -> None:
+        dl = _make_loop()
+        dl._paused = True
+        dl._paused_elapsed = 5.0
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 20.0
+            mock_loop.return_value = loop_obj
+            dl.resume()
+        assert not dl.is_paused
+        # elapsed が凍結時点(5.0)の続きから進むよう started_at をシフト
+        assert dl._started_at == pytest.approx(15.0)
+        # 次サイクルの dt スパイクを避けるため計測時刻はリセットされる
+        assert dl._last_cycle_time is None
+
+    def test_resume_noop_when_not_paused(self) -> None:
+        dl = _make_loop()
+        dl._started_at = 3.0
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 99.0
+            mock_loop.return_value = loop_obj
+            dl.resume()
+        assert dl._started_at == 3.0  # 変化しない
+
+    def test_start_resets_paused(self) -> None:
+        dl = _make_loop()
+        dl._paused = True
+        dl._paused_elapsed = 5.0
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 0.0
+            loop_obj.call_later = MagicMock()
+            mock_loop.return_value = loop_obj
+            dl.start()
+        assert not dl.is_paused
+        assert dl._paused_elapsed == 0.0
+
+    @pytest.mark.asyncio
+    async def test_cycle_uses_frozen_elapsed_when_paused(self) -> None:
+        """一時停止中は loop.time() に関わらず凍結経過時間の基準速度を参照する。"""
+        dl = _make_loop(can_reader=_make_can_reader(speed=10.0))
+        dl._running = True
+        dl._paused = True
+        dl._paused_elapsed = 1.0  # 0→0, 5→60 の軌跡で t=1.0s → 12km/h
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 999.0  # 実時刻は大きく進んでいる
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        assert dl.current_ref_speed == pytest.approx(12.0)
+
+    @pytest.mark.asyncio
+    async def test_paused_does_not_auto_complete(self) -> None:
+        """一時停止中は実時刻が総時間を超えても正常完了しない。"""
+        on_complete = AsyncMock()
+        dl = _make_loop(mode=_make_mode(total_duration=5.0), on_complete=on_complete)
+        dl._running = True
+        dl._paused = True
+        dl._paused_elapsed = 1.0
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 999.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        on_complete.assert_not_called()
+        assert dl.is_running
+
+    @pytest.mark.asyncio
+    async def test_paused_skips_kpi_and_log(self) -> None:
+        """一時停止中は KPI 集計とログ書き込みを行わない（保持区間で汚さない）。"""
+        log_writer = MagicMock()
+        log_writer.write_log = AsyncMock()
+        dl = _make_loop(
+            can_reader=_make_can_reader(speed=10.0),
+            log_writer=log_writer,
+            session_id="s1",
+        )
+        dl._running = True
+        dl._paused = True
+        dl._paused_elapsed = 1.0
+        dl._cycle_count = 1  # 一時停止でなければ次サイクルで 2 になりログ対象
+
+        with (
+            patch.object(asyncio, "get_running_loop") as mock_loop,
+            patch.object(asyncio, "ensure_future") as mock_ensure,
+        ):
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 1.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        assert dl.kpi_summary["n_samples"] == 0.0
+        mock_ensure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_paused_still_drives_actuators_to_hold_speed(self) -> None:
+        """一時停止中もアクチュエータ制御は継続し、凍結した目標車速を保持する。"""
+        ff = _make_ff(effort=40.0)
+        accel_driver = _make_accel_driver()
+        dl = _make_loop(ff=ff, accel_driver=accel_driver, can_reader=_make_can_reader(speed=50.0))
+        dl._running = True
+        dl._paused = True
+        dl._paused_elapsed = 1.0
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 999.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        accel_driver.move_to_position.assert_called_once()
+        assert dl.current_accel_opening == pytest.approx(40.0)
 
 
 class TestSnapshotFreshness:

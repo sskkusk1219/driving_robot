@@ -1,16 +1,10 @@
-"""LearningDriveManager のユニットテスト。"""
+"""LearningDriveManager（開度パターン生成）のユニットテスト。"""
 
 from datetime import UTC, datetime
 
-import pytest
-
-from src.domain.learning_drive import (
-    LearningDriveConfig,
-    LearningDriveManager,
-)
-from src.models.calibration import CalibrationData
-from src.models.learning_drive import LearningLog, LearningPattern
-from src.models.profile import PIDGains, StopConfig, VehicleProfile
+from src.domain.learning_drive import LearningDriveConfig, LearningDriveManager
+from src.models.learning_drive import PatternKind
+from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
 
 # ---------------------------------------------------------------------------
 # テスト用ヘルパー
@@ -22,6 +16,7 @@ def make_profile(
     max_accel_opening: float = 80.0,
     max_brake_opening: float = 80.0,
     max_decel_g: float = 0.5,
+    stop_brake_opening_pct: float = 20.0,
 ) -> VehicleProfile:
     return VehicleProfile(
         id="test-profile",
@@ -36,110 +31,32 @@ def make_profile(
         model_path=None,
         created_at=datetime.now(tz=UTC),
         updated_at=datetime.now(tz=UTC),
-    )
-
-
-def make_calibration(
-    accel_zero: int = 0,
-    accel_full: int = 5000,
-    brake_zero: int = 0,
-    brake_full: int = 5000,
-) -> CalibrationData:
-    return CalibrationData(
-        accel_zero_pos=accel_zero,
-        accel_full_pos=accel_full,
-        accel_stroke=accel_full - accel_zero,
-        brake_zero_pos=brake_zero,
-        brake_full_pos=brake_full,
-        brake_stroke=brake_full - brake_zero,
-        calibrated_at=datetime.now(tz=UTC),
-        is_valid=True,
+        feedforward_params=FeedforwardParams(stop_brake_opening_pct=stop_brake_opening_pct),
     )
 
 
 def make_manager(
-    speed_step: float = 20.0,
-    accel_step: float = 2.0,
-    accel_max: float = 4.0,
-    hold_duration: float = 0.0,
-    speed_sample_interval: float = 0.01,
+    creep_steps: int = 5,
+    hold_duration: float = 3.0,
+    *,
+    accel_sweep_fracs: tuple[float, ...] = (0.3, 0.5, 0.7, 1.0),
+    accel_sweep_reset_brake_pct: float = 30.0,
+    brake_hold_openings_pct: tuple[float, ...] = (10.0, 20.0, 30.0, 40.0),
+    brake_hold_accel_pct: float = 70.0,
+    coast_down_count: int = 0,
+    coast_down_accel_pct: float = 70.0,
 ) -> LearningDriveManager:
     cfg = LearningDriveConfig(
-        speed_step_kmh=speed_step,
-        accel_step_kmhs=accel_step,
-        accel_max_kmhs=accel_max,
+        creep_release_steps=creep_steps,
         hold_duration_s=hold_duration,
-        speed_sample_interval_s=speed_sample_interval,
+        accel_sweep_fracs=accel_sweep_fracs,
+        accel_sweep_reset_brake_pct=accel_sweep_reset_brake_pct,
+        brake_hold_openings_pct=brake_hold_openings_pct,
+        brake_hold_accel_pct=brake_hold_accel_pct,
+        coast_down_count=coast_down_count,
+        coast_down_accel_pct=coast_down_accel_pct,
     )
     return LearningDriveManager(config=cfg)
-
-
-class MockActuator:
-    def __init__(self) -> None:
-        self.positions_commanded: list[int] = []
-        self._current_pos = 0
-
-    async def move_to_position(self, pos: int) -> None:
-        self.positions_commanded.append(pos)
-        self._current_pos = pos
-
-    async def read_position(self) -> int:
-        return self._current_pos
-
-
-class MockCAN:
-    def __init__(self, speed: float = 50.0) -> None:
-        self._speed = speed
-
-    async def read_speed(self) -> float:
-        return self._speed
-
-
-# ---------------------------------------------------------------------------
-# build_learning_reference テスト
-# ---------------------------------------------------------------------------
-
-
-class TestBuildLearningReference:
-    def test_returns_driving_mode(self) -> None:
-        from src.models.driving_mode import DrivingMode
-
-        manager = make_manager()
-        mode = manager.build_learning_reference(make_profile(max_speed=100.0))
-        assert isinstance(mode, DrivingMode)
-        assert mode.max_speed == 100.0
-
-    def test_starts_and_ends_at_zero_speed(self) -> None:
-        manager = make_manager()
-        mode = manager.build_learning_reference(make_profile())
-        assert mode.reference_speed[0].speed_kmh == 0.0
-        assert mode.reference_speed[-1].speed_kmh == 0.0
-
-    def test_times_are_monotonically_increasing(self) -> None:
-        manager = make_manager()
-        mode = manager.build_learning_reference(make_profile())
-        times = [p.time_s for p in mode.reference_speed]
-        assert times == sorted(times)
-        assert mode.total_duration == times[-1]
-
-    def test_covers_up_to_max_speed(self) -> None:
-        manager = make_manager(speed_step=20.0)
-        mode = manager.build_learning_reference(make_profile(max_speed=100.0))
-        peak = max(p.speed_kmh for p in mode.reference_speed)
-        assert peak == 100.0
-
-    def test_never_exceeds_max_speed(self) -> None:
-        manager = make_manager(speed_step=30.0)
-        profile = make_profile(max_speed=100.0)
-        mode = manager.build_learning_reference(profile)
-        for p in mode.reference_speed:
-            assert p.speed_kmh <= profile.max_speed + 1e-9
-
-    def test_mode_id_is_not_persisted_uuid(self) -> None:
-        """学習用は一時生成のため learning- プレフィックス付き ID とする。"""
-        manager = make_manager()
-        mode = manager.build_learning_reference(make_profile())
-        assert mode.id.startswith("learning-")
 
 
 # ---------------------------------------------------------------------------
@@ -149,131 +66,204 @@ class TestBuildLearningReference:
 
 class TestGeneratePatterns:
     def test_returns_non_empty_list(self) -> None:
-        manager = make_manager()
-        profile = make_profile()
-        patterns = manager.generate_patterns(profile)
+        patterns = make_manager().generate_patterns(make_profile())
         assert len(patterns) > 0
 
+    def test_contains_expected_kinds(self) -> None:
+        kinds = {
+            p.kind for p in make_manager(coast_down_count=3).generate_patterns(make_profile())
+        }
+        assert kinds == {
+            PatternKind.CREEP,
+            PatternKind.CREEP_SETTLE,
+            PatternKind.ACCEL_SWEEP,
+            PatternKind.BRAKE_HOLD,
+            PatternKind.COAST_DOWN,
+        }
+
+    def test_exactly_one_creep_settle_with_zero_openings(self) -> None:
+        settles = [
+            p
+            for p in make_manager().generate_patterns(make_profile())
+            if p.kind is PatternKind.CREEP_SETTLE
+        ]
+        assert len(settles) == 1
+        assert settles[0].accel_opening == 0.0
+        assert settles[0].brake_opening == 0.0
+
     def test_accel_opening_within_max(self) -> None:
-        manager = make_manager()
         profile = make_profile(max_accel_opening=60.0)
-        for p in manager.generate_patterns(profile):
-            assert p.accel_opening <= profile.max_accel_opening
+        for p in make_manager().generate_patterns(profile):
+            assert p.accel_opening <= profile.max_accel_opening + 1e-9
 
     def test_brake_opening_within_max(self) -> None:
-        manager = make_manager()
         profile = make_profile(max_brake_opening=50.0)
-        for p in manager.generate_patterns(profile):
-            assert p.brake_opening <= profile.max_brake_opening
-
-    def test_decel_patterns_within_max_decel_g(self) -> None:
-        manager = make_manager()
-        profile = make_profile(max_decel_g=0.3)
-        max_decel_kmhs = 0.3 * 9.81 * 3.6
-        for p in manager.generate_patterns(profile):
-            if p.accel_kmhs < 0:
-                assert abs(p.accel_kmhs) <= max_decel_kmhs + 1e-6
-
-    def test_speed_within_max_speed(self) -> None:
-        manager = make_manager()
-        profile = make_profile(max_speed=60.0)
-        for p in manager.generate_patterns(profile):
-            assert p.speed_kmh <= profile.max_speed + 1e-6
+        for p in make_manager().generate_patterns(profile):
+            assert p.brake_opening <= profile.max_brake_opening + 1e-9
 
     def test_all_openings_non_negative(self) -> None:
-        manager = make_manager()
-        profile = make_profile()
-        for p in manager.generate_patterns(profile):
+        for p in make_manager().generate_patterns(make_profile()):
             assert p.accel_opening >= 0.0
             assert p.brake_opening >= 0.0
 
     def test_hold_duration_uses_config(self) -> None:
-        manager = make_manager(hold_duration=3.0)
-        profile = make_profile()
-        patterns = manager.generate_patterns(profile)
-        assert all(p.hold_duration_s == pytest.approx(3.0) for p in patterns)
+        patterns = make_manager(hold_duration=2.5).generate_patterns(make_profile())
+        assert all(p.hold_duration_s == 2.5 for p in patterns)
+
+    def test_creep_release_starts_at_stop_brake_and_decreases_above_zero(self) -> None:
+        profile = make_profile(stop_brake_opening_pct=20.0)
+        creep = [p.brake_opening for p in make_manager(creep_steps=5).generate_patterns(profile)
+                 if p.kind is PatternKind.CREEP]
+        assert creep[0] == 20.0  # 停車保持ブレーキから開始
+        assert creep[-1] > 0.0  # 0 は CREEP_SETTLE が担うため解放ステップは > 0 で終わる
+        assert creep == sorted(creep, reverse=True)  # 単調減少
+
+    def test_creep_brake_clamped_to_max_brake_opening(self) -> None:
+        # 停車保持ブレーキが max_brake_opening を超える設定でもクランプされる
+        profile = make_profile(max_brake_opening=15.0, stop_brake_opening_pct=20.0)
+        for p in make_manager().generate_patterns(profile):
+            assert p.brake_opening <= profile.max_brake_opening + 1e-9
 
 
-# ---------------------------------------------------------------------------
-# run_pattern テスト
-# ---------------------------------------------------------------------------
-
-
-class TestRunPattern:
-    @pytest.mark.asyncio
-    async def test_actuators_receive_position_commands(self) -> None:
-        manager = make_manager(hold_duration=0.0, speed_sample_interval=0.01)
-        accel = MockActuator()
-        brake = MockActuator()
-        can = MockCAN(speed=30.0)
-        calibration = make_calibration()
-
-        pattern = LearningPattern(
-            speed_kmh=30.0,
-            accel_kmhs=0.0,
-            accel_opening=40.0,
-            brake_opening=0.0,
-            hold_duration_s=0.0,
+class TestAccelSweep:
+    def test_accel_sweep_openings_are_fractions_of_max(self) -> None:
+        # 30/50/70/100% of max_accel(80) → 24/40/56/80
+        profile = make_profile(max_accel_opening=80.0)
+        accel = sorted(
+            p.accel_opening
+            for p in make_manager(accel_sweep_fracs=(0.3, 0.5, 0.7, 1.0)).generate_patterns(profile)
+            if p.kind is PatternKind.ACCEL_SWEEP
         )
-        await manager.run_pattern(pattern, accel, brake, can, calibration)
+        assert accel == [24.0, 40.0, 56.0, 80.0]
 
-        assert len(accel.positions_commanded) >= 1
-        assert len(brake.positions_commanded) >= 1
+    def test_accel_sweep_reaches_max_accel_opening(self) -> None:
+        # 全域到達する加速段（最大開度＝cap まで届く段）が含まれる
+        profile = make_profile(max_accel_opening=80.0)
+        accel = [
+            p.accel_opening
+            for p in make_manager().generate_patterns(profile)
+            if p.kind is PatternKind.ACCEL_SWEEP
+        ]
+        assert max(accel) == 80.0
 
-    @pytest.mark.asyncio
-    async def test_returns_learning_log(self) -> None:
-        manager = make_manager(hold_duration=0.0, speed_sample_interval=0.01)
-        accel = MockActuator()
-        brake = MockActuator()
-        can = MockCAN(speed=45.0)
-        calibration = make_calibration()
+    def test_accel_sweep_clamped_to_max(self) -> None:
+        # frac×max でも max を超えない（frac>1 のような設定でもクランプ）
+        profile = make_profile(max_accel_opening=50.0)
+        for p in make_manager(accel_sweep_fracs=(0.5, 1.0, 1.5)).generate_patterns(profile):
+            if p.kind is PatternKind.ACCEL_SWEEP:
+                assert p.accel_opening <= 50.0 + 1e-9
 
-        pattern = LearningPattern(
-            speed_kmh=40.0,
-            accel_kmhs=1.0,
-            accel_opening=30.0,
-            brake_opening=0.0,
-            hold_duration_s=0.0,
+    def test_accel_sweep_has_reset_brake(self) -> None:
+        # ACCEL_SWEEP は停車復帰用のリセットブレーキ（>0）を持つ
+        profile = make_profile(max_brake_opening=80.0)
+        sweeps = [
+            p for p in make_manager(accel_sweep_reset_brake_pct=30.0).generate_patterns(profile)
+            if p.kind is PatternKind.ACCEL_SWEEP
+        ]
+        assert sweeps
+        for p in sweeps:
+            assert p.brake_opening == 30.0
+
+    def test_accel_sweep_reset_brake_clamped_to_max(self) -> None:
+        profile = make_profile(max_brake_opening=20.0)
+        for p in make_manager(accel_sweep_reset_brake_pct=30.0).generate_patterns(profile):
+            if p.kind is PatternKind.ACCEL_SWEEP:
+                assert p.brake_opening == 20.0  # max_brake で頭打ち
+
+    def test_zero_max_accel_yields_no_accel_sweep(self) -> None:
+        profile = make_profile(max_accel_opening=0.0)
+        sweeps = [
+            p for p in make_manager().generate_patterns(profile)
+            if p.kind is PatternKind.ACCEL_SWEEP
+        ]
+        assert sweeps == []
+
+
+class TestBrakeHold:
+    def test_brake_hold_sweeps_several_openings(self) -> None:
+        profile = make_profile(max_brake_opening=80.0)
+        brakes = sorted(
+            p.brake_opening
+            for p in make_manager(
+                brake_hold_openings_pct=(10.0, 20.0, 30.0, 40.0)
+            ).generate_patterns(profile)
+            if p.kind is PatternKind.BRAKE_HOLD
         )
-        log = await manager.run_pattern(pattern, accel, brake, can, calibration)
+        assert brakes == [10.0, 20.0, 30.0, 40.0]
 
-        assert isinstance(log, LearningLog)
+    def test_brake_hold_clamped_to_max_brake(self) -> None:
+        # max_brake を超えるブレーキ段はクランプされる
+        profile = make_profile(max_brake_opening=25.0)
+        for p in make_manager(brake_hold_openings_pct=(10.0, 20.0, 30.0, 40.0)).generate_patterns(
+            profile
+        ):
+            if p.kind is PatternKind.BRAKE_HOLD:
+                assert p.brake_opening <= 25.0 + 1e-9
 
-    @pytest.mark.asyncio
-    async def test_actual_speed_recorded_in_log(self) -> None:
-        manager = make_manager(hold_duration=0.15, speed_sample_interval=0.05)
-        accel = MockActuator()
-        brake = MockActuator()
-        can = MockCAN(speed=55.0)
-        calibration = make_calibration()
+    def test_brake_hold_accel_reaches_cap_and_clamped(self) -> None:
+        # cap まで上げる加速開度を持ち、max_accel でクランプされる
+        profile = make_profile(max_accel_opening=60.0)
+        holds = [
+            p for p in make_manager(brake_hold_accel_pct=70.0).generate_patterns(profile)
+            if p.kind is PatternKind.BRAKE_HOLD
+        ]
+        assert holds
+        for p in holds:
+            assert p.accel_opening == 60.0  # 70% 指定だが max_accel 60 で頭打ち
 
-        pattern = LearningPattern(
-            speed_kmh=50.0,
-            accel_kmhs=0.0,
-            accel_opening=50.0,
-            brake_opening=0.0,
-            hold_duration_s=0.15,
+    def test_zero_max_accel_yields_no_brake_hold(self) -> None:
+        # cap まで上げられないなら BRAKE_HOLD は生成しない
+        profile = make_profile(max_accel_opening=0.0)
+        holds = [
+            p for p in make_manager().generate_patterns(profile)
+            if p.kind is PatternKind.BRAKE_HOLD
+        ]
+        assert holds == []
+
+
+class TestCoastDown:
+    def test_coast_down_patterns_generated(self) -> None:
+        profile = make_profile(max_accel_opening=80.0)
+        patterns = make_manager(coast_down_count=3, coast_down_accel_pct=70.0).generate_patterns(
+            profile
         )
-        log = await manager.run_pattern(pattern, accel, brake, can, calibration)
+        coast = [p for p in patterns if p.kind is PatternKind.COAST_DOWN]
+        assert len(coast) == 3
+        for p in coast:
+            assert p.accel_opening == 70.0
+            assert p.brake_opening == 0.0  # ブレーキ無しで惰行
 
-        assert log.actual_speed_kmh == pytest.approx(55.0)
+    def test_coast_down_accel_clamped_to_max(self) -> None:
+        profile = make_profile(max_accel_opening=30.0)
+        coast = [p for p in make_manager(coast_down_count=2, coast_down_accel_pct=70.0)
+                 .generate_patterns(profile) if p.kind is PatternKind.COAST_DOWN]
+        assert all(p.accel_opening == 30.0 for p in coast)
 
-    @pytest.mark.asyncio
-    async def test_accel_pulse_computed_from_calibration(self) -> None:
-        manager = make_manager(hold_duration=0.0, speed_sample_interval=0.01)
-        accel = MockActuator()
-        brake = MockActuator()
-        can = MockCAN()
-        calibration = make_calibration(accel_zero=100, accel_full=5100)
+    def test_coast_down_count_zero_yields_none(self) -> None:
+        coast = [p for p in make_manager(coast_down_count=0).generate_patterns(make_profile())
+                 if p.kind is PatternKind.COAST_DOWN]
+        assert coast == []
 
-        pattern = LearningPattern(
-            speed_kmh=20.0,
-            accel_kmhs=0.0,
-            accel_opening=50.0,
-            brake_opening=0.0,
-            hold_duration_s=0.0,
+
+class TestOrdering:
+    def test_phases_in_expected_order(self) -> None:
+        # CREEP → CREEP_SETTLE → ACCEL_SWEEP → BRAKE_HOLD → COAST_DOWN の順
+        patterns = make_manager(coast_down_count=2).generate_patterns(make_profile())
+        order = [p.kind for p in patterns]
+        first_idx = {
+            kind: order.index(kind)
+            for kind in (
+                PatternKind.CREEP,
+                PatternKind.CREEP_SETTLE,
+                PatternKind.ACCEL_SWEEP,
+                PatternKind.BRAKE_HOLD,
+                PatternKind.COAST_DOWN,
+            )
+        }
+        assert (
+            first_idx[PatternKind.CREEP]
+            < first_idx[PatternKind.CREEP_SETTLE]
+            < first_idx[PatternKind.ACCEL_SWEEP]
+            < first_idx[PatternKind.BRAKE_HOLD]
+            < first_idx[PatternKind.COAST_DOWN]
         )
-        await manager.run_pattern(pattern, accel, brake, can, calibration)
-
-        # 50% of stroke=5000 → 2500 + zero=100 → 2600
-        assert accel.positions_commanded[0] == 2600

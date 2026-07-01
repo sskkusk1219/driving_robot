@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 
 from src.app.robot_controller import (
     ActuatorDriverProtocol,
+    ButtonServoProtocol,
     CANReaderProtocol,
     RobotController,
     SafetyMonitorProtocol,
@@ -21,6 +22,7 @@ from src.domain.learning_drive import LearningDriveManager
 from src.domain.pre_check import PreCheckRunner
 from src.domain.safety_monitor import SafetyMonitor
 from src.infra.actuator_driver import ActuatorDriver
+from src.infra.button_servo_driver import ButtonServoDriver
 from src.infra.can_reader import CANReader
 from src.infra.db import create_pool
 from src.infra.gpio_monitor import GPIOMonitor
@@ -84,13 +86,19 @@ async def build_real_controller(
     accel_driver: ActuatorDriverProtocol
     brake_driver: ActuatorDriverProtocol
     can_reader: CANReaderProtocol
+    button_servo: ButtonServoProtocol
     if bench_gpio_only:
-        # ベンチ検証用: 非常停止スイッチ(GPIO)のみ実機。アクチュエータ/CAN はスタブ。
-        from src.app.stubs import _StubActuator, _StubCANReader  # noqa: PLC0415
+        # ベンチ検証用: 非常停止スイッチ(GPIO)のみ実機。アクチュエータ/CAN/ボタンサーボはスタブ。
+        from src.app.stubs import (  # noqa: PLC0415
+            _StubActuator,
+            _StubButtonServo,
+            _StubCANReader,
+        )
 
         accel_driver = _StubActuator()
         brake_driver = _StubActuator()
         can_reader = _StubCANReader()
+        button_servo = _StubButtonServo()
     else:
         accel_driver = ActuatorDriver(
             port=settings.serial.accel_port,
@@ -108,6 +116,13 @@ async def build_real_controller(
             bitrate=settings.can.bitrate,
             dbc_path=settings.can.dbc_path,
             max_speed_age_s=settings.can.max_speed_age_s,
+        )
+        button_servo = ButtonServoDriver(
+            i2c_bus=settings.servo.i2c_bus,
+            address=settings.servo.address,
+            pwm_freq_hz=settings.servo.pwm_freq_hz,
+            rest_angle=settings.servo.rest_angle,
+            press_angle=settings.servo.press_angle,
         )
     # 非常停止のみ GPIO 経由。AC断は NUT ポーリングに変更したため ac_detect_pin 未使用
     gpio_monitor = GPIOMonitor(
@@ -157,6 +172,7 @@ async def build_real_controller(
         can_reader=can_reader,
         ups_monitor=ups_monitor,
         profile=None,  # RobotController が select_profile で更新する
+        button_servo=button_servo,  # 走行前チェック項目8（タイムスケジュール時のみ）
     )
 
     controller = RobotController(
@@ -171,6 +187,7 @@ async def build_real_controller(
         calibration_manager=calibration_manager,
         pre_check_runner=pre_check_runner,
         learning_manager=LearningDriveManager(),
+        button_servo=button_servo,
         control_interval_s=loop_interval_s,
         log_every_n_cycles=log_every_n_cycles,
     )

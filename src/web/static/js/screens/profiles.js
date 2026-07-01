@@ -133,7 +133,6 @@ function ProfilesScreen() {
 
     // Header
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
-      React.createElement(H2, { sub: '車両ごとのキャリブレーション・モデル・PIDゲインを管理します' }, '車両プロファイル'),
       React.createElement('div', { style: { flex: 1 } }),
       React.createElement('input', {
         type: 'text',
@@ -143,7 +142,7 @@ function ProfilesScreen() {
         style: {
           padding: '6px 12px', fontSize: 14,
           border: `1.3px solid ${INK}`, borderRadius: 4,
-          fontFamily: 'inherit', background: PAPER, outline: 'none',
+          fontFamily: 'inherit', background: PAPER, color: INK, outline: 'none',
           width: 200,
         },
       }),
@@ -151,7 +150,7 @@ function ProfilesScreen() {
     ),
 
     // Table
-    React.createElement(Box, { style: { padding: 0 } },
+    React.createElement(Box, { style: { padding: 0, display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 } },
       // ヘッダ行
       React.createElement('div', {
         style: {
@@ -161,6 +160,7 @@ function ProfilesScreen() {
           padding: '10px 14px',
           background: PAPER_2,
           fontSize: 14, fontWeight: 700,
+          flexShrink: 0,
         },
       },
         React.createElement('div', {
@@ -178,6 +178,7 @@ function ProfilesScreen() {
         React.createElement('div', null, '操作'),
       ),
 
+      React.createElement('div', { style: { overflowY: 'auto', flex: 1, minHeight: 0 } },
       sorted.length === 0
         ? React.createElement('div', { style: { padding: '20px 14px', color: INK_SOFT, fontSize: 14 } },
             profiles.length === 0
@@ -207,7 +208,8 @@ function ProfilesScreen() {
                         style: {
                           fontSize: 14, padding: '2px 6px',
                           border: `1.3px solid ${INK}`, borderRadius: 3,
-                          fontFamily: 'inherit', width: '100%',
+                          fontFamily: 'inherit', background: PAPER, color: INK,
+                          outline: 'none', width: '100%',
                         },
                       }),
                       React.createElement('span', {
@@ -257,6 +259,7 @@ function ProfilesScreen() {
               },
             });
           }),
+      ),
     ),
 
     // Footer

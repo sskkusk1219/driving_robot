@@ -6,12 +6,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src.app.robot_controller import RobotController
+from src.app.robot_controller import InvalidStateTransition, RobotController
 from src.app.stubs import (
     InMemoryModeRepository,
     InMemoryProfileRepository,
+    InMemoryScheduleRepository,
     InMemorySessionRepository,
 )
+from src.models.drive_log import DriveSession
 from src.models.system_state import RobotState, SystemState
 from src.web.app import app
 
@@ -30,8 +32,36 @@ def _make_stub_controller() -> MagicMock:
     ctrl.reset_emergency = AsyncMock()
     ctrl.stop = AsyncMock()
     ctrl.stop_manual = AsyncMock()
+    ctrl.pause_auto_drive = AsyncMock()
+    ctrl.resume_auto_drive = AsyncMock()
     ctrl.start_auto_drive = AsyncMock()
     ctrl.start_manual = AsyncMock()
+    ctrl.arm_learning_drive = AsyncMock()
+    ctrl.cancel_learning_drive = AsyncMock()
+    ctrl.get_active_profile = MagicMock(return_value=None)
+    ctrl.stop_schedule_drive = AsyncMock()
+    ctrl.start_schedule_drive = AsyncMock(
+        return_value=DriveSession(
+            id="sched-sess-1",
+            profile_id="p1",
+            mode_id=None,
+            run_type="auto",
+            started_at=datetime.now(tz=UTC),
+            ended_at=None,
+            status="running",
+        )
+    )
+    ctrl.start_learning_drive = AsyncMock(
+        return_value=DriveSession(
+            id="learn-sess-1",
+            profile_id="p1",
+            mode_id=None,
+            run_type="learning",
+            started_at=datetime.now(tz=UTC),
+            ended_at=None,
+            status="running",
+        )
+    )
     return ctrl
 
 
@@ -42,6 +72,7 @@ def inject_controller() -> MagicMock:
     app.state.profile_repo = InMemoryProfileRepository()
     app.state.mode_repo = InMemoryModeRepository()
     app.state.session_repo = InMemorySessionRepository()
+    app.state.schedule_repo = InMemoryScheduleRepository()
     app.state.db_pool = None
     return ctrl
 
@@ -94,6 +125,55 @@ async def test_sessions_logs_empty() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sessions_logs_csv_404_when_missing() -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.get("/api/v1/sessions/nonexistent/logs.csv")
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sessions_logs_csv_download() -> None:
+    from src.models.drive_log import DriveLog, DriveSession
+
+    started = datetime(2026, 6, 16, 5, 36, 49, tzinfo=UTC)
+    session = DriveSession(
+        id="sess-1", profile_id="p1", mode_id=None, run_type="learning",
+        started_at=started, ended_at=None, status="error",
+    )
+    log = DriveLog(
+        id=1, session_id="sess-1", timestamp=started,
+        ref_speed_kmh=10.0, actual_speed_kmh=9.5,
+        accel_opening=12.0, brake_opening=0.0,
+        accel_pos=100, brake_pos=0, accel_current=300.0, brake_current=0.0,
+    )
+
+    class _Repo:
+        async def get_by_id(self, session_id: str) -> DriveSession:
+            return session
+
+        async def list_logs(self, session_id: str, limit: int = 1000) -> list[DriveLog]:
+            return [log]
+
+    app.state.session_repo = _Repo()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.get("/api/v1/sessions/sess-1/logs.csv")
+
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/csv")
+    assert "attachment" in res.headers["content-disposition"]
+    # started_at は UTC 05:36:49 → JST 14:36:49 でファイル名に出る
+    assert "session_sess-1_20260616_143649.csv" in res.headers["content-disposition"]
+    lines = res.text.strip().splitlines()
+    assert lines[0] == (
+        "timestamp,ref_speed_kmh,actual_speed_kmh,accel_opening,brake_opening,"
+        "accel_pos,brake_pos,accel_current,brake_current"
+    )
+    # timestamp は UTC 05:36:49 → JST 14:36:49・スペース区切りで出力
+    assert lines[1].startswith("2026-06-16 14:36:49")
+    assert lines[1].endswith("9.5,12.0,0.0,100,0,300.0,0.0")
+
+
+@pytest.mark.asyncio
 async def test_docs_endpoint() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         res = await c.get("/docs")
@@ -108,3 +188,314 @@ async def test_websocket_connect() -> None:
         with client.websocket_connect("/ws/realtime") as ws:
             # 接続直後はサーバーからのメッセージをすぐには受け取れないが接続は成功する
             assert ws is not None
+
+
+@pytest.mark.asyncio
+async def test_learning_arm_then_start_sequence(inject_controller: MagicMock) -> None:
+    """学習運転の確認「はい」フロー: arm → start が全 ASGI スタックを通ること。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        arm = await c.post("/api/v1/drive/learning/arm")
+        start = await c.post("/api/v1/drive/learning/start")
+    assert arm.status_code == 200
+    assert arm.json()["status"] == "armed"
+    assert start.status_code == 200
+    assert start.json()["run_type"] == "learning"
+    inject_controller.arm_learning_drive.assert_awaited_once()
+    inject_controller.start_learning_drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_learning_train_returns_auto_tuned_pid(inject_controller: MagicMock) -> None:
+    """学習モデル学習が FOPDT 同定で PID を自動適合し、応答に反映すること。"""
+    from datetime import timedelta
+
+    from src.models.drive_log import DriveLog
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile
+
+    prof = VehicleProfile(
+        id="p1", name="Train", max_accel_opening=80.0, max_brake_opening=80.0,
+        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None, model_path=None,
+        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+    )
+    await app.state.profile_repo.create(prof)
+
+    def _session_logs(session_id: str) -> list[DriveLog]:
+        t0 = datetime.now(tz=UTC)
+        out: list[DriveLog] = []
+        speed = 0.0
+        i = 0
+        for _ in range(60):  # 加速保持（FOPDT 区間 + アクセルレジーム）
+            speed = min(80.0, speed + 1.5)
+            out.append(DriveLog(
+                id=i, session_id=session_id, timestamp=t0 + timedelta(seconds=0.1 * i),
+                ref_speed_kmh=None, actual_speed_kmh=speed, accel_opening=40.0,
+                brake_opening=0.0, accel_pos=0, brake_pos=0, accel_current=0.0, brake_current=0.0,
+            ))
+            i += 1
+        for _ in range(60):  # 減速（ブレーキレジーム）
+            speed = max(0.0, speed - 1.5)
+            out.append(DriveLog(
+                id=i, session_id=session_id, timestamp=t0 + timedelta(seconds=0.1 * i),
+                ref_speed_kmh=None, actual_speed_kmh=speed, accel_opening=0.0,
+                brake_opening=30.0, accel_pos=0, brake_pos=0, accel_current=0.0, brake_current=0.0,
+            ))
+            i += 1
+        return out
+
+    logs = _session_logs("s1") + _session_logs("s2")
+
+    class _Repo:
+        async def latest_learning_session_id(self, profile_id: str) -> str | None:
+            return "s1"
+
+        async def list_logs_for_training(
+            self, profile_id: str, session_ids: list[str] | None = None, limit: int = 100_000
+        ) -> list[DriveLog]:
+            return logs
+
+    app.state.session_repo = _Repo()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/train", json={"profile_id": "p1"})
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["pid_auto_tuned"] is True
+    assert body["pid_gains"]["kp"] > 0.0
+    assert body["pid_gains"]["ki"] > 0.0
+    assert body["pid_gains"]["kd"] == 0.0
+    inject_controller.refresh_active_profile.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_pid_tune_validate_returns_kpi_and_cost(inject_controller: MagicMock) -> None:
+    """PID 検証走行が KPI サマリとコストを返すこと。"""
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile
+
+    prof = VehicleProfile(
+        id="p1", name="Val", max_accel_opening=80.0, max_brake_opening=80.0,
+        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=2.0, ki=0.5, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None, model_path=None,
+        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+    )
+    await app.state.profile_repo.create(prof)
+    inject_controller.run_pid_validation = AsyncMock(
+        return_value={"n_samples": 500.0, "p95_kmh": 0.15, "max_abs_deviation_kmh": 0.4,
+                      "reversal_max_per_5s": 1.0, "hard_limit_violations": 0.0}
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/pid-tune/validate", json={"profile_id": "p1"})
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["kpi_summary"]["p95_kmh"] == 0.15
+    assert body["cost"] > 0.0
+    assert body["pid_gains"]["kp"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_pid_tune_validate_404_when_profile_missing(inject_controller: MagicMock) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/pid-tune/validate", json={"profile_id": "nope"})
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pid_tune_validate_409_on_invalid_state(inject_controller: MagicMock) -> None:
+    """走行中など不正状態では 409 を返すこと。"""
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile
+
+    prof = VehicleProfile(
+        id="p1", name="Val", max_accel_opening=80.0, max_brake_opening=80.0,
+        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=2.0, ki=0.5, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None, model_path=None,
+        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+    )
+    await app.state.profile_repo.create(prof)
+    inject_controller.run_pid_validation = AsyncMock(
+        side_effect=InvalidStateTransition("not ready")
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/pid-tune/validate", json={"profile_id": "p1"})
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_pid_tune_refine_saves_best_gains(inject_controller: MagicMock) -> None:
+    """PID 絞り込みが最良ゲインを保存し、履歴・最良コストを返すこと。"""
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile
+
+    prof = VehicleProfile(
+        id="p1", name="Ref", max_accel_opening=80.0, max_brake_opening=80.0,
+        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None, model_path=None,
+        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+    )
+    await app.state.profile_repo.create(prof)
+    best = PIDGains(kp=2.5, ki=0.4, kd=0.0)
+    history = [
+        {"kp": 1.0, "ki": 0.1, "kd": 0.0, "cost": 3.0},
+        {"kp": 2.5, "ki": 0.4, "kd": 0.0, "cost": 1.2},
+    ]
+    inject_controller.run_pid_tuning_session = AsyncMock(return_value=(best, history))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/drive/pid-tune/refine", json={"profile_id": "p1", "max_runs": 5}
+        )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["pid_gains"]["kp"] == 2.5
+    assert body["best_cost"] == 1.2
+    assert len(body["history"]) == 2
+    inject_controller.refresh_active_profile.assert_called_once()
+    # 最良ゲインが永続化されていること
+    saved = await app.state.profile_repo.get_by_id("p1")
+    assert saved.pid_gains.kp == 2.5
+
+
+@pytest.mark.asyncio
+async def test_pause_then_resume_sequence(inject_controller: MagicMock) -> None:
+    """自動走行の一時停止 → 走行再開が全 ASGI スタックを通ること。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        pause = await c.post("/api/v1/drive/pause")
+        resume = await c.post("/api/v1/drive/resume")
+    assert pause.status_code == 200
+    assert pause.json()["status"] == "paused"
+    assert resume.status_code == 200
+    assert resume.json()["status"] == "running"
+    inject_controller.pause_auto_drive.assert_awaited_once()
+    inject_controller.resume_auto_drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pause_returns_409_on_invalid_state(inject_controller: MagicMock) -> None:
+    """走行中(RUNNING)以外で一時停止すると 409 を返すこと。"""
+    inject_controller.pause_auto_drive = AsyncMock(
+        side_effect=InvalidStateTransition("not running")
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/pause")
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_learning_arm_then_cancel_sequence(inject_controller: MagicMock) -> None:
+    """学習運転の確認「いいえ」フロー: arm → cancel が通り、start は呼ばれないこと。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        arm = await c.post("/api/v1/drive/learning/arm")
+        cancel = await c.post("/api/v1/drive/learning/cancel")
+    assert arm.status_code == 200
+    assert cancel.status_code == 200
+    assert cancel.json()["status"] == "cancelled"
+    inject_controller.cancel_learning_drive.assert_awaited_once()
+    inject_controller.start_learning_drive.assert_not_awaited()
+
+
+# ── タイムスケジュール（統合タイムライン）CRUD ─────────────────────────
+
+
+def _schedule_payload(name: str = "sched-1") -> dict:
+    return {
+        "name": name,
+        "description": "test schedule",
+        "pedal_points": [
+            {"time_s": 0.0, "accel_opening": 0.0, "brake_opening": 0.0},
+            {"time_s": 5.0, "accel_opening": 40.0, "brake_opening": 0.0},
+        ],
+        "button_events": [{"time_s": 0.5, "channel": 0, "press_duration_s": 1.0}],
+        "loop": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_schedules_crud_flow() -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        empty = await c.get("/api/v1/schedules/")
+        assert empty.status_code == 200
+        assert empty.json() == []
+
+        created = await c.post("/api/v1/schedules/", json=_schedule_payload())
+        assert created.status_code == 201
+        body = created.json()
+        assert body["name"] == "sched-1"
+        assert body["total_duration"] == 5.0
+        assert len(body["pedal_points"]) == 2
+        sid = body["id"]
+
+        listed = await c.get("/api/v1/schedules/")
+        assert listed.status_code == 200
+        assert listed.json()[0]["pedal_point_count"] == 2
+        assert listed.json()[0]["button_event_count"] == 1
+
+        detail = await c.get(f"/api/v1/schedules/{sid}")
+        assert detail.status_code == 200
+        assert detail.json()["button_events"][0]["channel"] == 0
+
+        deleted = await c.delete(f"/api/v1/schedules/{sid}")
+        assert deleted.status_code == 204
+        assert (await c.get(f"/api/v1/schedules/{sid}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_schedule_duplicate_name_returns_409() -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        first = await c.post("/api/v1/schedules/", json=_schedule_payload("dup"))
+        assert first.status_code == 201
+        dup = await c.post("/api/v1/schedules/", json=_schedule_payload("dup"))
+    assert dup.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_schedule_non_monotonic_pedal_points_returns_422() -> None:
+    payload = _schedule_payload("bad")
+    payload["pedal_points"] = [
+        {"time_s": 5.0, "accel_opening": 0.0, "brake_opening": 0.0},
+        {"time_s": 2.0, "accel_opening": 10.0, "brake_opening": 0.0},
+    ]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/schedules/", json=payload)
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_schedule_invalid_channel_returns_422() -> None:
+    payload = _schedule_payload("badch")
+    payload["button_events"] = [{"time_s": 0.0, "channel": 99, "press_duration_s": 1.0}]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/schedules/", json=payload)
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_schedule_drive_start_and_stop(inject_controller: MagicMock) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        created = await c.post("/api/v1/schedules/", json=_schedule_payload("run"))
+        sid = created.json()["id"]
+
+        start = await c.post("/api/v1/drive/schedule/start", json={"schedule_id": sid})
+        assert start.status_code == 200
+        assert start.json()["run_type"] == "auto"
+        inject_controller.start_schedule_drive.assert_awaited_once()
+
+        stop = await c.post("/api/v1/drive/schedule/stop")
+        assert stop.status_code == 200
+        inject_controller.stop_schedule_drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_schedule_drive_start_unknown_id_returns_404() -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/drive/schedule/start",
+            json={"schedule_id": "00000000-0000-0000-0000-000000000000"},
+        )
+    assert res.status_code == 404

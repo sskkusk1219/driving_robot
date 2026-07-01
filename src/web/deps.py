@@ -10,6 +10,7 @@ from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession
 from src.models.driving_mode import DrivingMode
 from src.models.profile import VehicleProfile
+from src.models.time_schedule import TimeSchedule
 
 
 class ProfileRepoProtocol(Protocol):
@@ -29,9 +30,18 @@ class ModeRepoProtocol(Protocol):
     async def delete(self, mode_id: str) -> bool: ...
 
 
+class ScheduleRepoProtocol(Protocol):
+    async def list_all(self) -> list[TimeSchedule]: ...
+    async def get_by_id(self, schedule_id: str) -> TimeSchedule | None: ...
+    async def create(self, schedule: TimeSchedule) -> TimeSchedule: ...
+    async def update(self, schedule: TimeSchedule) -> TimeSchedule | None: ...
+    async def delete(self, schedule_id: str) -> bool: ...
+
+
 class SessionRepoProtocol(Protocol):
     async def list_all(self, limit: int = 100) -> list[DriveSession]: ...
     async def get_by_id(self, session_id: str) -> DriveSession | None: ...
+    async def latest_learning_session_id(self, profile_id: str) -> str | None: ...
     async def list_logs(self, session_id: str, limit: int = 1000) -> list[DriveLog]: ...
     async def list_logs_for_training(
         self,
@@ -78,6 +88,11 @@ def get_mode_repo(request: Request) -> ModeRepoProtocol:
 
 def get_session_repo(request: Request) -> SessionRepoProtocol:
     repo: SessionRepoProtocol = request.app.state.session_repo
+    return repo
+
+
+def get_schedule_repo(request: Request) -> ScheduleRepoProtocol:
+    repo: ScheduleRepoProtocol = request.app.state.schedule_repo
     return repo
 
 

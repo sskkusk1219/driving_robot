@@ -1,26 +1,33 @@
 // ── Manual drive screen ───────────────────────────────────
 
-function AxisJog({ label, axisId, currentPos, openingPct, maxPct, currentMa, onJog, onHome }) {
+function AxisJog({ label, axisId, currentPos, openingPct, maxPct, currentMa, onJog, onHome, enabled = true, active = false }) {
   const { INK, INK_SOFT, PAPER, Box, Btn } = window;
   const { JogKey, DragSlider } = window;
+  const dis = !enabled;
 
   return (
-    <Box label={label} style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minHeight: 0 }}>
+    <Box
+      label={active ? `${label}（操作中）` : label}
+      style={{
+        padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minHeight: 0,
+        ...(active ? { border: '2px solid #c8922a' } : {}),
+      }}
+    >
 
       {/* Jog buttons + drag slider */}
       <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
         {/* Left buttons */}
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-          <JogKey label="−10"  onClick={() => onJog(axisId, -10)} />
-          <JogKey label="−100" onClick={() => onJog(axisId, -100)} />
+          <JogKey label="−10"  onClick={() => onJog(axisId, -10)} disabled={dis} />
+          <JogKey label="−100" onClick={() => onJog(axisId, -100)} disabled={dis} />
         </div>
 
-        <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} />
+        <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} disabled={dis} />
 
         {/* Right buttons */}
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-          <JogKey label="+10"  onClick={() => onJog(axisId, 10)} />
-          <JogKey label="+100" onClick={() => onJog(axisId, 100)} />
+          <JogKey label="+10"  onClick={() => onJog(axisId, 10)} disabled={dis} />
+          <JogKey label="+100" onClick={() => onJog(axisId, 100)} disabled={dis} />
         </div>
       </div>
 
@@ -39,21 +46,53 @@ function AxisJog({ label, axisId, currentPos, openingPct, maxPct, currentMa, onJ
         <span>開度 <b style={{ fontFamily: 'inherit', color: INK }}>{openingPct.toFixed(1)} %</b></span>
         <span>電流 <b style={{ fontFamily: 'inherit', color: INK }}>{currentMa} mA</b></span>
         <div style={{ flex: 1 }} />
-        <Btn onClick={() => onHome(axisId)}>原点へ戻す</Btn>
+        <Btn onClick={() => onHome(axisId)} disabled={dis}>原点へ戻す</Btn>
       </div>
     </Box>
   );
 }
 
 function ManualScreen() {
-  const { useState, useContext } = React;
-  const { apiFetch, realtimeData, robotState } = useContext(window.AppContext);
+  const { useState, useEffect, useContext } = React;
+  const { apiFetch, realtimeData, robotState, setNavLock } = useContext(window.AppContext);
   const { Box, Btn, Note, Row } = window;
   const { ConfirmStopPopup } = window;
 
   const [brk, setBrk] = useState({ currentPos: 0 });
   const [acc, setAcc] = useState({ currentPos: 0 });
+  const [activeAxis, setActiveAxis] = useState('accel'); // キーボード操作対象 (Tabで切替)
   const [confirmStop, setConfirmStop] = useState(false);
+  const [confirmStart, setConfirmStart] = useState(false);
+
+  const enabled = robotState === 'MANUAL';
+
+  // 手動運転中は他ページへの離脱をロック
+  useEffect(() => {
+    setNavLock(enabled);
+    return () => setNavLock(false);
+  }, [enabled]);
+
+  // キーボードショートカット: e/w ±10, d/s ±100, Tab 軸切替
+  useEffect(() => {
+    if (!enabled) return;
+    function onKey(e) {
+      const tag = (e.target.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea') return;
+      switch (e.key) {
+        case 'e': case 'E': handleJog(activeAxis, 10); break;
+        case 'w': case 'W': handleJog(activeAxis, -10); break;
+        case 'd': case 'D': handleJog(activeAxis, 100); break;
+        case 's': case 'S': handleJog(activeAxis, -100); break;
+        case 'Tab':
+          e.preventDefault();
+          setActiveAxis(a => (a === 'accel' ? 'brake' : 'accel'));
+          break;
+        default: return;
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [enabled, activeAxis]);
 
   function setAxisState(axisId, updater) {
     if (axisId === 'brake') setBrk(updater);
@@ -101,12 +140,14 @@ function ManualScreen() {
           currentPos={brk.currentPos}
           openingPct={brkOpeningPct} maxPct={70} currentMa={brkMa}
           onJog={handleJog} onHome={handleHome}
+          enabled={enabled} active={enabled && activeAxis === 'brake'}
         />
         <AxisJog
           label="アクセル" axisId="accel"
           currentPos={acc.currentPos}
           openingPct={accOpeningPct} maxPct={80} currentMa={accMa}
           onJog={handleJog} onHome={handleHome}
+          enabled={enabled} active={enabled && activeAxis === 'accel'}
         />
       </div>
 
@@ -114,10 +155,9 @@ function ManualScreen() {
       <div style={{ display: 'flex', gap: 10 }}>
         <Box label="キーボードショートカット" style={{ padding: '10px 12px', flex: 1 }}>
           <div style={{ fontSize: 12, lineHeight: 1.7, fontFamily: 'inherit' }}>
-            <div>← / →        : ±10 pulse</div>
-            <div>Shift+← / →  : ±100 pulse</div>
-            <div>Tab           : 軸切替 (アクセル ↔ ブレーキ)</div>
-            <div>Esc           : 手動運転終了</div>
+            <div>e / w  : ±10 pulse</div>
+            <div>d / s  : ±100 pulse</div>
+            <div>Tab    : 軸切替 (アクセル ↔ ブレーキ)</div>
           </div>
           <Note style={{ marginTop: 6 }}>ジョグ中は最大開度リミットが有効です。電流値を常時監視中。</Note>
         </Box>
@@ -132,11 +172,19 @@ function ManualScreen() {
             {robotState === 'MANUAL' ? (
               <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 運転終了</Btn>
             ) : (
-              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleStart}>▶ 走行開始</Btn>
+              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={() => setConfirmStart(true)}>▶ 走行開始</Btn>
             )}
           </div>
         </div>
       </div>
+
+      {confirmStart && (
+        <ConfirmStopPopup
+          message="開始しますか？"
+          onYes={() => { handleStart(); setConfirmStart(false); }}
+          onNo={() => setConfirmStart(false)}
+        />
+      )}
 
       {confirmStop && (
         <ConfirmStopPopup

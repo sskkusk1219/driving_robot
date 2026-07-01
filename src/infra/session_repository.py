@@ -35,6 +35,24 @@ class SessionRepository:
             return None
         return _row_to_session(row)
 
+    async def latest_learning_session_id(self, profile_id: str) -> str | None:
+        """プロファイルの最新（開始日時が最も新しい）学習走行セッション ID を返す。
+
+        モデル学習は「直近に実施した学習走行」のみを使うのが正しいため、train 経路が
+        session_id 未指定のときの既定対象を解決するのに使う。学習走行が無ければ None。
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id FROM drive_sessions
+                WHERE profile_id = $1 AND run_type = 'learning'
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                uuid.UUID(profile_id),
+            )
+        return str(row["id"]) if row is not None else None
+
     async def list_logs(self, session_id: str, limit: int = 1000) -> list[DriveLog]:
         """セッションに紐づくログを時刻昇順で返す。"""
         async with self._pool.acquire() as conn:

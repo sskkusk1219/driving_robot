@@ -23,7 +23,6 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 import can  # noqa: E402
 
-
 CHANNEL = "can0"
 BITRATE = 500000
 STATS_INTERVAL_S = 5.0

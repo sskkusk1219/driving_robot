@@ -1,9 +1,7 @@
 import pickle
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
-
-from sklearn.linear_model import Ridge
+from typing import Any, Protocol
 
 from src.domain.model_training import (
     _REGIME_POS,
@@ -16,8 +14,14 @@ from src.domain.model_training import (
 from src.models.profile import FeedforwardParams
 
 
+class _Regressor(Protocol):
+    """逆モデル推定器の構造的型（sklearn Ridge / Pipeline 等が満たす）。"""
+
+    def predict(self, x: Any) -> Any: ...
+
+
 class FeedforwardController:
-    """先読み型 Ridge 逆モデルによる FF 制御。load_model() 後に predict_effort() を呼ぶ。
+    """先読み型 多項式Ridge 逆モデルによる FF 制御。load_model() 後に predict_effort() を呼ぶ。
 
     現在の基準速度 v0 と数秒先の基準速度（先読み）から、符号付き努力量
     （+: 名目アクセル開度 [%]、−: 名目ブレーキ開度 [%]）を予測する。
@@ -25,8 +29,11 @@ class FeedforwardController:
     """
 
     def __init__(self) -> None:
-        self._accel_model: Ridge | None = None
-        self._brake_model: Ridge | None = None
+        self._accel_model: _Regressor | None = None
+        self._brake_model: _Regressor | None = None
+        # 推論時に v0・先読み速度をこの上限へクリップして学習域外の外挿（多項式の暴れ）を防ぐ。
+        # 学習データの観測最高車速。None は無制限（クリップしない）。
+        self._speed_clip_max: float | None = None
         # 車両物理定数。select_profile 時に set_params で更新する。未設定時は AT 標準デフォルト。
         self._params: FeedforwardParams = FeedforwardParams()
 
@@ -48,9 +55,10 @@ class FeedforwardController:
         """pkl ファイルから先読み Ridge 逆モデルをロードする。
 
         pkl は train_inverse_model が出力する dict 形式:
-            model_type:   "ridge_inverse_lookahead"
-            accel_model:  sklearn Ridge
-            brake_model:  sklearn Ridge
+            model_type:     "poly_inverse_lookahead"
+            accel_model:    sklearn Pipeline（多項式＋標準化＋Ridge）
+            brake_model:    sklearn Pipeline
+            speed_clip_max: 学習観測最高車速（推論時の入力クリップ上限）
             feature_names, horizons, ...
 
         運転モデルは開発者がローカルで生成した信頼済みファイルのみを想定。
@@ -75,6 +83,8 @@ class FeedforwardController:
 
         self._accel_model = data["accel_model"]
         self._brake_model = data["brake_model"]
+        clip = data.get("speed_clip_max")
+        self._speed_clip_max = float(clip) if clip is not None else None
 
     def unload_model(self) -> None:
         """運転モデルを破棄する。プロファイル切替時に必ず呼び、前車両のモデル残留を防ぐ。
@@ -84,6 +94,7 @@ class FeedforwardController:
         """
         self._accel_model = None
         self._brake_model = None
+        self._speed_clip_max = None
 
     def predict_effort(self, v0: float, future_speeds: Sequence[float]) -> float:
         """現在の基準速度と先読み基準速度から符号付き努力量 [%] を返す。
@@ -103,12 +114,25 @@ class FeedforwardController:
 
         p = self._params
 
-        # 1. 停車レジーム: 停車保持ブレーキ（fit_intercept=False の Ridge は原点で 0 を
-        #    返すため定数で補う）。判定は最短ホライズン（0.5 秒先）のみ:
+        # 1. 停車レジーム: 停車保持ブレーキ（多項式モデルは原点で 0 を保証しないため定数で補う。
+        #    負予測は後段で 0 にクランプされる）。判定は最短ホライズン（0.5 秒先）のみ:
         #    全先読み点（3 秒先まで）で判定すると発進の 3 秒前に保持ブレーキが解除され、
         #    クリープで基準 0 に逆らって動き出す（レビュー指摘 #5）。
         if v0 <= STOP_SPEED_KMH and future_speeds and future_speeds[0] <= STOP_SPEED_KMH:
             return -max(0.0, min(100.0, p.stop_brake_opening_pct))
+
+        # 学習域外の外挿を防ぐため速度を観測最高車速 cm にクリップ（多項式が域外で暴れるのを避け
+        # 学習端で飽和させる。残差は PID と包絡線ガバナが吸収する）。v0>cm のときは軌跡全体を平行
+        # 移動して v0 を cm に置き、減速/加速の相対トレンド（dv＝レジーム判定の基）を保つ。単純に
+        # 各点を独立クリップすると near-horizon の dv が 0 に潰れてレジームを誤判定するため。
+        cm = self._speed_clip_max
+        if cm is not None:
+            if v0 > cm:
+                shift = v0 - cm
+                v0 = cm
+                future_speeds = [f - shift for f in future_speeds]
+            # 先読みが学習域を超える分（域外への加速要求）は学習端に飽和させる
+            future_speeds = [min(f, cm) for f in future_speeds]
 
         features = build_feature_row(v0, future_speeds)
         # レジーム判定: 先読みトレンド dv_1.0 の符号（X 列順より features[0, 1+_REGIME_POS]）

@@ -32,8 +32,14 @@ def make_model_file(
     tmp_path: Path,
     accel_coef: list[float] | None = None,
     brake_coef: list[float] | None = None,
+    speed_clip_max: float | None = 1000.0,
 ) -> Path:
-    """新フォーマット（ridge_inverse_lookahead）のモデル pkl を作る。"""
+    """新フォーマット（poly_inverse_lookahead）のモデル pkl を作る。
+
+    予測ロジックの検証では推定器に決定論的な線形 Ridge（係数指定）を直接注入する。FF 側は
+    `.predict()` を呼ぶだけのため Ridge / Pipeline いずれも受けられる。`speed_clip_max` は既定で
+    十分大きく取り（=クリップ無効）、既存の予測アサーションに影響しないようにする。
+    """
     # v0 係数だけ持つ単純モデル（accel: 0.5·v0, brake: 0.3·v0）
     accel_coef = accel_coef or [0.5] + [0.0] * (N_FEATURES - 1)
     brake_coef = brake_coef or [0.3] + [0.0] * (N_FEATURES - 1)
@@ -45,6 +51,7 @@ def make_model_file(
         "feature_names": FEATURE_NAMES,
         "horizons": list(LOOKAHEAD_HORIZONS_S),
         "regime_horizon": REGIME_HORIZON_S,
+        "speed_clip_max": speed_clip_max,
     }
     path = tmp_path / "test_model.pkl"
     with path.open("wb") as f:
@@ -179,6 +186,22 @@ class TestFeedforwardControllerPredictEffort:
         ff = FeedforwardController()
         ff.load_model(str(path))
         assert ff.predict_effort(50.0, _rising(50.0)) == 0.0
+
+    def test_input_clipped_to_speed_clip_max(self, tmp_path: Path) -> None:
+        """v0・先読み速度が学習観測レンジ(speed_clip_max)を超えたら端へクリップされる。"""
+        # accel: 0.5·v0。clip=50 で v0=80 を入れても 50 にクリップ → 0.5·50=25。
+        path = make_model_file(tmp_path, speed_clip_max=50.0)
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        clipped = ff.predict_effort(80.0, _rising(80.0))
+        assert clipped == pytest.approx(0.5 * 50.0)  # 0.5·80=40 ではなく 0.5·50=25
+
+    def test_no_clip_when_speed_clip_max_absent(self, tmp_path: Path) -> None:
+        """speed_clip_max が無い payload はクリップ無効（v0 をそのまま使う）。"""
+        path = make_model_file(tmp_path, speed_clip_max=None)
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        assert ff.predict_effort(80.0, _rising(80.0)) == pytest.approx(0.5 * 80.0)
 
     def test_horizons_property(self, tmp_path: Path) -> None:
         ff = FeedforwardController()

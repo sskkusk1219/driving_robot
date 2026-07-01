@@ -70,6 +70,12 @@ class FeedforwardParamsSchema(BaseModel):
     pid_output_limit_pct: float = 50.0
 
 
+class PIDGainsSchema(BaseModel):
+    kp: float
+    ki: float
+    kd: float
+
+
 class TrainModelRequest(BaseModel):
     profile_id: str
     session_ids: list[str] | None = None
@@ -79,6 +85,34 @@ class TrainModelResponse(BaseModel):
     model_path: str
     metrics: dict[str, dict[str, float]]
     feedforward_params: FeedforwardParamsSchema
+    # 学習ログから解析的に自動適合した PID ゲイン。同定不能（区間不足）なら None。
+    pid_gains: PIDGainsSchema | None = None
+    pid_auto_tuned: bool = False
+
+
+class PidValidateRequest(BaseModel):
+    profile_id: str
+
+
+class PidValidateResponse(BaseModel):
+    """規定パターン 1 回走行の追従性能。"""
+
+    kpi_summary: dict[str, float]
+    cost: float
+    pid_gains: PIDGainsSchema
+
+
+class PidRefineRequest(BaseModel):
+    profile_id: str
+    max_runs: int = Field(default=15, ge=1, le=50)
+
+
+class PidRefineResponse(BaseModel):
+    """閉ループ絞り込みの最良ゲインと反復履歴。"""
+
+    pid_gains: PIDGainsSchema
+    best_cost: float
+    history: list[dict[str, float]]
 
 
 class SelectProfileRequest(BaseModel):
@@ -137,12 +171,6 @@ class RealtimeData(BaseModel):
 
 
 # ── Vehicle Profile ───────────────────────────────────────────────────────────
-
-
-class PIDGainsSchema(BaseModel):
-    kp: float
-    ki: float
-    kd: float
 
 
 class StopConfigSchema(BaseModel):
@@ -249,6 +277,101 @@ class ModeDetailResponse(BaseModel):
 class ModeUpdateRequest(BaseModel):
     name: str | None = None
     description: str | None = None
+
+
+# ── Time schedule（統合タイムライン）─────────────────────────────────────────────
+
+
+class PedalPointSchema(BaseModel):
+    time_s: float = Field(ge=0.0)
+    accel_opening: float = Field(ge=0.0, le=100.0)
+    brake_opening: float = Field(ge=0.0, le=100.0)
+
+
+class ButtonEventSchema(BaseModel):
+    time_s: float = Field(ge=0.0)
+    channel: int = Field(ge=0, le=15)
+    press_duration_s: float = Field(gt=0.0)
+
+
+class ScheduleResponse(BaseModel):
+    id: str
+    name: str
+    description: str
+    total_duration: float
+    pedal_point_count: int
+    button_event_count: int
+    loop: bool
+    created_at: datetime
+
+
+class ScheduleDetailResponse(BaseModel):
+    id: str
+    name: str
+    description: str
+    pedal_points: list[PedalPointSchema]
+    button_events: list[ButtonEventSchema]
+    total_duration: float
+    loop: bool
+    created_at: datetime
+
+
+class ScheduleCreateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    description: str = ""
+    pedal_points: list[PedalPointSchema] = Field(default_factory=list)
+    button_events: list[ButtonEventSchema] = Field(default_factory=list)
+    loop: bool = False
+
+    @field_validator("pedal_points")
+    @classmethod
+    def _pedal_points_monotonic(
+        cls, v: list[PedalPointSchema]
+    ) -> list[PedalPointSchema]:
+        prev = -1.0
+        for p in v:
+            if p.time_s <= prev:
+                raise ValueError("pedal_points の time_s は単調増加である必要があります")
+            prev = p.time_s
+        return v
+
+    @field_validator("button_events")
+    @classmethod
+    def _button_events_sorted(
+        cls, v: list[ButtonEventSchema]
+    ) -> list[ButtonEventSchema]:
+        prev = -1.0
+        for e in v:
+            if e.time_s < prev:
+                raise ValueError("button_events の time_s は昇順である必要があります")
+            prev = e.time_s
+        return v
+
+
+class ScheduleUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1)
+    description: str | None = None
+    pedal_points: list[PedalPointSchema] | None = None
+    button_events: list[ButtonEventSchema] | None = None
+    loop: bool | None = None
+
+    @field_validator("pedal_points")
+    @classmethod
+    def _pedal_points_monotonic(
+        cls, v: list[PedalPointSchema] | None
+    ) -> list[PedalPointSchema] | None:
+        if v is None:
+            return v
+        prev = -1.0
+        for p in v:
+            if p.time_s <= prev:
+                raise ValueError("pedal_points の time_s は単調増加である必要があります")
+            prev = p.time_s
+        return v
+
+
+class StartScheduleRequest(BaseModel):
+    schedule_id: str
 
 
 # ── Session / Log ─────────────────────────────────────────────────────────────

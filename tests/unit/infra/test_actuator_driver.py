@@ -203,6 +203,49 @@ class TestMoveToPosition:
         assert regs[8] == 0x0000
 
 
+class TestMoveToPositionTimed:
+    @pytest.mark.asyncio
+    async def test_speed_computed_from_distance_and_duration(self) -> None:
+        driver, mock_client = _make_driver()
+        # 距離 7500pulse=75.0mm を 1.5s → 50mm/s → VCMD 5000(0.01mm/s) = 0x1388
+        await driver.move_to_position_timed(target_pos=7500, current_pos=0, duration_s=1.5)
+        regs = mock_client.write_registers.await_args.kwargs["values"]
+        assert regs[0] == 0x0000 and regs[1] == 0x1D4C  # PCMD = 7500
+        assert regs[4] == 0x0000 and regs[5] == 0x1388  # VCMD = 5000 (50mm/s)
+
+    @pytest.mark.asyncio
+    async def test_speed_clamped_to_floor(self) -> None:
+        driver, mock_client = _make_driver()
+        # 0.1mm を 10s → 0.01mm/s → round→0 → 下限 1mm/s → VCMD 100 = 0x0064
+        await driver.move_to_position_timed(target_pos=10, current_pos=0, duration_s=10.0)
+        regs = mock_client.write_registers.await_args.kwargs["values"]
+        assert regs[4] == 0x0000 and regs[5] == 0x0064
+
+    @pytest.mark.asyncio
+    async def test_speed_clamped_to_ceiling(self) -> None:
+        driver, mock_client = _make_driver()
+        # 1000mm を 0.1s → 10000mm/s → 上限 100mm/s → VCMD 10000 = 0x2710
+        await driver.move_to_position_timed(target_pos=100000, current_pos=0, duration_s=0.1)
+        regs = mock_client.write_registers.await_args.kwargs["values"]
+        assert regs[4] == 0x0000 and regs[5] == 0x2710
+
+    @pytest.mark.asyncio
+    async def test_nonpositive_duration_uses_max_speed(self) -> None:
+        driver, mock_client = _make_driver()
+        # duration<=0（安全フリーズ経路）→ 許容最速 100mm/s で目標へ
+        await driver.move_to_position_timed(target_pos=7500, current_pos=0, duration_s=0.0)
+        regs = mock_client.write_registers.await_args.kwargs["values"]
+        assert regs[1] == 0x1D4C  # PCMD = 7500（目標は届く）
+        assert regs[5] == 0x2710  # VCMD = 10000 (100mm/s)
+
+    @pytest.mark.asyncio
+    async def test_zero_distance_uses_max_speed(self) -> None:
+        driver, mock_client = _make_driver()
+        await driver.move_to_position_timed(target_pos=500, current_pos=500, duration_s=1.0)
+        regs = mock_client.write_registers.await_args.kwargs["values"]
+        assert regs[5] == 0x2710  # 距離0 → 最速フォールバック
+
+
 class TestReadPosition:
     @pytest.mark.asyncio
     async def test_read_position_positive(self) -> None:

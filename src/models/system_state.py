@@ -11,6 +11,7 @@ class RobotState(StrEnum):
     CALIBRATING = "CALIBRATING"
     PRE_CHECK = "PRE_CHECK"
     RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
     MANUAL = "MANUAL"
     EMERGENCY = "EMERGENCY"
     ERROR = "ERROR"

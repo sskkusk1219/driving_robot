@@ -34,7 +34,7 @@ function BootingScreen() {
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 28 }}>
       <div style={{ textAlign: 'center' }}>
-        <div style={{ fontSize: 40, fontWeight: 800, letterSpacing: 1 }}>Driving_Robot</div>
+        <div style={{ fontSize: 40, fontWeight: 800, letterSpacing: 1 }}><span style={{ fontSize: 22 }}>ﾈﾝ0系</span> あま</div>
         <div style={{ fontSize: 18, color: INK_SOFT, marginTop: 4 }}>システムを起動しています — 通信確認中...</div>
       </div>
 

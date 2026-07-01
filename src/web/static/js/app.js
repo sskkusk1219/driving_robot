@@ -73,6 +73,7 @@ function App() {
   const [activeModeId, setActiveModeId] = useState(() => lsGet('drv_mode_id', null));
   const [activeModeName, setActiveModeName] = useState(() => lsGet('drv_mode_name', null));
   const [upsLoss, setUpsLoss] = useState(false);
+  const [navLock, setNavLock] = useState(false);
   const [realtimeData, setRealtimeData] = useState(INIT_REALTIME);
   const realtimeBuf = useRef([]);
 
@@ -161,6 +162,7 @@ function App() {
     activeModeId, setActiveModeId,
     activeModeName, setActiveModeName,
     upsLoss,
+    navLock, setNavLock,
     realtimeData,
     realtimeBuf,
     showToast,
@@ -202,9 +204,16 @@ function App() {
         screen: NAV_LABEL[nav] ?? nav,
         activeNav: nav,
         upsLoss,
+        locked: navLock,
         profileName: activeProfileName,
         modeName: activeModeName,
-        onNav: key => setNav(key),
+        onNav: key => {
+          if (navLock && key !== nav) {
+            showToast('実行中は他のページに移動できません', 'error');
+            return;
+          }
+          setNav(key);
+        },
         // 非常停止オーバーレイの「初期化画面へ」。スイッチ解除後、まず非常停止を
         // リセット（EMERGENCY → STANDBY）してから初期化画面へ遷移する。
         // リセットしないと robotState が EMERGENCY のままでオーバーレイが消えない。

@@ -19,6 +19,7 @@ graph TB
         subgraph HWLayer["ハードウェア抽象レイヤー"]
             AccelDriver[AccelActuatorDriver<br/>ttyUSB0 / Modbus RTU]
             BrakeDriver[BrakeActuatorDriver<br/>ttyUSB1 / Modbus RTU]
+            ButtonServoDriver[ButtonServoDriver<br/>I2C / PCA9685]
             CANReader[CANReader<br/>Kvaser USB-CAN]
             GPIOMonitor[GPIOMonitor<br/>UPS / 非常停止]
         end
@@ -33,6 +34,7 @@ graph TB
     subgraph Hardware["ハードウェア"]
         PCON1[P-CON-CB #1<br/>アクセル SLAVE_ID=1]
         PCON2[P-CON-CB #2<br/>ブレーキ SLAVE_ID=2]
+        PCA9685[PCA9685<br/>I2C 0x40 / 16ch PWM]
         CAN[Kvaser USB-CAN<br/>シャシダイナモ]
         ACUPS[AC UPS<br/>接点出力 → GPIO27(物理ピン13)]
         EmergencyStop[非常停止スイッチ<br/>2個並列]
@@ -45,6 +47,7 @@ graph TB
     RobotController --> SafetyMonitor
     RobotController --> AccelDriver
     RobotController --> BrakeDriver
+    RobotController --> ButtonServoDriver
     RobotController --> CANReader
     RobotController --> GPIOMonitor
     RobotController --> LogWriter
@@ -53,10 +56,12 @@ graph TB
     ArchiveManager -->|圧縮CSV| USBSSD[(USB SSD<br/>アーカイブ)]
     AccelDriver <-->|Modbus RTU| PCON1
     BrakeDriver <-->|Modbus RTU| PCON2
+    ButtonServoDriver <-->|I2C| PCA9685
     CANReader <-->|CAN bus| CAN
     GPIOMonitor <-->|GPIO 接点入力| ACUPS
     PCON1 --> ActuatorA[アクセルアクチュエータ<br/>IAI RCP6-ROD]
     PCON2 --> ActuatorB[ブレーキアクチュエータ<br/>IAI RCP6-ROD]
+    PCA9685 --> ButtonServos[ボタンサーボ ×16<br/>SG90 / エンジンスタート・シフト・オプション]
 ```
 
 ---
@@ -156,6 +161,37 @@ class DrivingMode:
 class SpeedPoint:
     time_s: float                # 時刻 [s]
     speed_kmh: float             # 基準車速 [km/h]
+```
+
+---
+
+### エンティティ: TimeSchedule（タイムスケジュール）
+
+基準車速を使わず、時系列でペダル開度とボタン操作を自動化する。ペダル動作とボタンイベントを**同一タイムライン**上で管理する（統合タイムライン）。実行は `ScheduleLoop`（開ループ・100ms 周期）が担い、ペダル開度を線形補間して位置指令、ボタンイベントを時刻で発火する。走行ログは run_type='auto'・mode_id=None・ref_speed=None で記録する。
+
+```python
+@dataclass
+class TimeSchedule:
+    id: str                      # UUID
+    name: str                    # スケジュール名
+    description: str             # 説明
+    pedal_points: list[PedalPoint]    # 時系列のアクセル・ブレーキ開度
+    button_events: list[ButtonEvent]  # 時系列のボタン押下イベント
+    total_duration: float        # 総時間 [s]
+    loop: bool                   # ループ再生の有無
+    created_at: datetime
+
+@dataclass
+class PedalPoint:
+    time_s: float                # 時刻 [s]
+    accel_opening: float         # アクセル開度 [%]
+    brake_opening: float         # ブレーキ開度 [%]
+
+@dataclass
+class ButtonEvent:
+    time_s: float                # 押下開始時刻 [s]
+    channel: int                 # PCA9685 チャンネル（0-15、ButtonServoDriver のマッピング参照）
+    press_duration_s: float      # 押下時間 [s]（ボタンごとに設定、例: 始動1.0 / シフト0.5）
 ```
 
 ---
@@ -356,10 +392,47 @@ FC10 直値移動指令 (レジスタ書き込み後、自動的に移動開始)
 
 ---
 
+### ButtonServoDriver（ボタンサーボドライバ）
+
+**責務**:
+- I2C経由でPCA9685にPWM信号を設定し、指定チャンネルのボタンサーボ（SG90）を押下／待機位置に駆動
+- ボタンの押下（待機位置 → 押下位置 → 待機位置へ復帰）を、指定した押下時間だけ保持して実行
+- 非常停止・エラー時に全チャンネルを待機位置へ復帰
+
+**設計方針**:
+- `ActuatorDriver` と同様に `Protocol` ベースのインターフェースとし、非ハードウェア環境向けスタブと差し替え可能にする
+- 押下角度は全チャンネル共通のグローバル設定値（待機／押下の2ポジション）。押下時間のみ呼び出し側（タイムスケジュール）で可変
+- PCA9685のI2Cバスはアクセル・ブレーキ用のRS-485バス（Modbus RTU）と独立しており、50ms制御ループと競合しない
+
+```python
+class ButtonServoDriver:
+    def __init__(i2c_address: int, pwm_freq_hz: int, rest_angle: float, press_angle: float)
+    async def connect() -> None
+    async def press(channel: int, duration_s: float) -> None  # 押下 → duration_s 保持 → 待機へ復帰
+    async def release_all() -> None                            # 全チャンネルを待機位置へ（非常停止・エラー時）
+```
+
+**チャンネル ⇔ ボタン マッピング**:
+
+| Channel | ボタン | Channel | ボタン |
+|---------|--------|---------|--------|
+| 0 | エンジンスタート | 8 | オプション_5 |
+| 1 | シフト P | 9 | オプション_6 |
+| 2 | シフト N | 10 | オプション_7 |
+| 3 | シフト D | 11 | オプション_8 |
+| 4 | オプション_1 | 12 | オプション_9 |
+| 5 | オプション_2 | 13 | オプション_10 |
+| 6 | オプション_3 | 14 | オプション_11 |
+| 7 | オプション_4 | 15 | オプション_12 |
+
+**PWM諸元**: I2Cアドレス 0x40（既定）、PWM周波数 50Hz。押下角度は全チャンネル共通のグローバル設定（`config/settings.toml` の `[servo]` セクション）。
+
+---
+
 ### FeedforwardController（フィードフォワード制御）
 
 **責務**:
-- 運転モデル（先読み型 Ridge 逆モデル）から符号付き努力量を算出
+- 運転モデル（先読み型 多項式Ridge 逆モデル）から符号付き努力量を算出
 - 現在の基準車速と先読み基準車速（0.5/1.0/2.0/3.0 秒先）を入力として努力量を出力
   （+: 名目アクセル開度 [%]、−: 名目ブレーキ開度 [%]）
 
@@ -376,8 +449,15 @@ class FeedforwardController:
 
 **運転モデル構造** (学習運転ログから生成):
 - 入力: 先読み特徴量 7 次元 `[v0, dv_0.5, dv_1.0, dv_2.0, dv_3.0, v0², dv_1.0·v0]`
-- レジーム: dv_1.0 ≥ 0 → アクセルモデル、< 0 → ブレーキモデル（Ridge ×2、fit_intercept=False）
-- ファイル形式: `.pkl`（model_type = "ridge_inverse_lookahead"）
+- 推定器: 完全2次多項式展開 → 標準化 → Ridge の Pipeline ×2（`PolynomialFeatures(2)`→`StandardScaler`
+  →`Ridge`）。ブレーキの「不感帯→急制動」非線形を多項式項で表現する（純線形 Ridge では減速 R² が
+  頭打ちだった）。停止時 0 の物理制約は FF 側の停車短絡・負予測クランプで担保する。
+- レジーム: dv_1.0 ≥ 0 → アクセルモデル、< 0 → ブレーキモデル（coast 含む全減速標本で学習）。
+- 学習データ: **直近に実施した学習走行セッションのみ**を使う（過去の旧データ混在を避けるため、train
+  経路が最新の learning セッションを既定対象に解決する。明示の session_ids 指定時はそれを優先）。
+- 外挿対策: 学習観測最高車速 `speed_clip_max` を保存し、推論時に v0・先読み速度を学習域へクリップ
+  （多項式の域外発散を防ぎ学習端で飽和。残差は PID・包絡線ガバナが吸収）。
+- ファイル形式: `.pkl`（model_type = "poly_inverse_lookahead"）
 
 **線形モデルで表現できない領域の補完**（FeedforwardParams 定数 + ルール）:
 1. **停車保持**: v0 ≤ 0.5km/h かつ 0.5 秒先 ≤ 0.5km/h → `-stop_brake_opening_pct`
@@ -582,22 +662,97 @@ class CalibrationManager:
 
 ---
 
-### LearningDriveManager（学習運転管理）
+### LearningDriveManager（学習運転 パターン生成）
 
 **責務**:
-- 学習パターン（速度・加速度グリッド）の生成とフィルタリング
-- パターン走行の実行とログ収集
-- 運転モデルの学習・更新
+- 開ループ実行する開度パターン列を生成する（Phase 8 方式）
 
 ```python
 class LearningDriveManager:
     def generate_patterns(profile: VehicleProfile) -> list[LearningPattern]
-    # max_opening / max_decel_g を超えるパターンを自動スキップ
-
-    async def run_pattern(pattern: LearningPattern) -> LearningLog
-    def train_model(logs: list[LearningLog], profile_id: str) -> str
-    # 学習結果を model_path に保存し、プロファイルを更新
+    # ① クリープ解放（停車保持ブレーキを段階的に緩める）→ ② クリープ安定待ち（accel=brake=0）
+    # → ③ 全車速域 加速スイープ（ACCEL_SWEEP）数段: 固定アクセル開度（max_accel の 30/50/70/100%）で
+    #     0→0.9×max_speed（cap）まで加速し、速度全域 × 異なる加速率を採取。cap 到達/timeout 後に
+    #     リセットブレーキで停車へ戻す（各段の起点を 0 に揃え「踏む→戻す→低速キープ」を解消）。
+    # → ④ 定常ブレーキ計測（BRAKE_HOLD）数段: cap まで加速→固定ブレーキ開度（10/20/30/40%）を一定保持
+    #     して定常減速を記録（加速プラトーと対称・清浄な減速サンプル）。
+    # → ⑤ コーストダウン数本（高開度で加速→ブレーキ無しで低速まで惰行＝エンジンブレーキ計測）
+    # accel_sweep_fracs / brake_hold_openings_pct / coast_down_count で段数（=本数・予算）を制御。
+    # max_accel_opening / max_brake_opening でスケール・クランプ。
 ```
+
+**実行は LearningLoop（開ループ実行ループ）が担う**:
+- 走行全体を連続した1本の (実車速, 開度) 軌跡として `drive_logs` に記録（基準速度は持たないため
+  `ref_speed_kmh=None`）。電流・車速・安全判定は毎サイクル、位置指令はフェーズ入場時のみ。
+- 全車速域 加速（ACCEL_SWEEP）: DRIVE_ACCEL（固定開度で cap まで加速）→ DRIVE_BRAKE（リセットブレーキで
+  停車復帰）。加速区間は brake=0 の純アクセルで全車速域 × 加速率のクリーンなサンプルを採る。
+- 定常ブレーキ（BRAKE_HOLD）: DRIVE_ACCEL（cap まで加速）→ BRAKE_HOLD（固定ブレーキを一定保持して定常
+  減速を記録）。減速区間は accel=0 の純ブレーキで、加速プラトーと対称な清浄な減速サンプルになる。
+  各フェーズは片軸のみ非ゼロ＝加速と制動を物理的に分離する（同時踏み禁止）。
+- **包絡線ガバナ（プロファイルの上限G・最高車速を厳守）**: 学習走行はプロファイルの安全包絡内に収める。
+  - 上限G: 平滑加速度（時間窓スロープ。CAN ノイズ対策）が `max_decel_g × g_limit_frac` を超えたら、
+    アクセル/ブレーキの開度の踏み増しを止め、超過が続けば段階的に下げる（加速・減速とも上限G以内に保つ）。
+  - 最高車速: 加速は `max_speed × accel_speed_cap_frac`（cap）到達を主離脱条件にする（max_speed 手前で
+    終了）。万一超過したら惰行では戻らないため DRIVE_BRAKE で能動的に（上限G以内で）減速して復帰する。
+  - 上限開度: 開度→位置換算時に `max_accel_opening`/`max_brake_opening` でクランプ。
+  - 自動走行も同じ包絡内でしか動かないため、包絡を超える高開度は学習対象外（踏まない）。effective な開度は
+    「上限G に達する開度まで」に自然に絞られる。
+- 加速離脱（DRIVE_ACCEL）: cap 到達を主離脱条件とし、cap に届かない低開度は `accel_full_range_timeout_s`
+  で打ち切る（プラトー早期離脱はせず、cap まで加速を伸ばして全車速域を採取する）。
+- 惰行計測（COAST / COAST_DOWN）: COAST_DOWN は accel=brake=0 でエンジンブレーキ＋走行抵抗の自然減速率を
+  低速まで惰行して計測し、速度全域の減速カーブを採る。
+- 時間指定の滑らかな踏み込み（ランプ）: いきなり目標開度を指令せず、`ramp_time_s` 秒かけて 0→目標へ
+  到達する**時間指定移動**（servo が距離÷時間で速度算出）でアクチュエータを滑らかに動かす。制御ループの
+  周期ジッタに依存しない。ガバナ後の指令開度が変化した軸だけ移動を発行する。
+- 同時踏み禁止: 各フェーズは片ペダルのみ非ゼロ。最終段で `enforce_pedal_exclusion` を通し、自動走行
+  （PedalArbiter）と学習走行の双方で構造的に同時踏みを起こさない。
+- クリープ安定待ち（CREEP_SETTLE）: accel=brake=0 で車速が安定するまで保持しクリープ車速・加速率を採る。
+- 非常停止: 過電流・CAN 断・サイクル例外は非常停止。包絡超過（G/速度）は非常停止せずガバナ/能動制動で守る。
+
+**運転モデルの学習は model_training モジュールが担う**（`/drive/learning/train`）:
+- 連続走行ログから先読み 多項式Ridge 逆モデルを学習し `model_path` に保存。
+- `estimate_dynamics_params` がクリープ車速・クリープ加速率等の物理定数を推定しプロファイルへ反映。
+
+---
+
+### PIDTuning（PID 自動適合）
+
+FF が名目開度を出し PID は残差（追従誤差）だけを補正する構成のため、PID が見るプラントは
+「開度→車速」の物理特性そのもの。これを **学習運転が記録した開ループのステップ応答**
+（アクセル一定保持→車速プラトー）から同定し、PID を自動適合する（`src/domain/pid_tuning.py`）。
+手動編集（プロファイル編集フォーム）は温存する。
+
+**A. モデルベース解析適合（追加走行ゼロ）** — `/drive/learning/train` に統合:
+- `identify_fopdt` が学習ログのアクセル保持区間から一次遅れ+むだ時間（FOPDT: ゲインK・時定数τ・
+  むだ時間θ）を中央値集約で同定（区間不足なら None を返し既存ゲインを保持）。
+- `compute_pid_gains_simc` が SIMC（Skogestad）則で Kp/Ki を算出（Kd は初期 0）。閉ループ時定数
+  τc = max(θ, tau_c_factor·τ) を安定性ノブとする。
+- 算出ゲインは `profile.pid_gains` へ自動保存し `refresh_active_profile` で制御スタックへ即時反映。
+
+**B. 閉ループ検証/絞り込み（規定パターン走行）** — `/drive/pid-tune/validate`・`/refine`:
+- `build_tuning_trajectory` が規定速度パターン（加速・保持・再加速・保持・減速・保持・停止）を生成。
+  **プロファイルの安全包絡を厳守**: 全速度点 ≤ `max_speed`、加減速レート = `DECEL_MARGIN(0.8)×max_decel_g×G_TO_KMHS`
+  （減速区間長を上限Gから算出し ≤ 上限G を保証）。
+- 既存の自動走行経路（`start_auto_drive`／走行前チェック・非常停止経路を含む）で走行し、
+  `KPIMonitor` の集計（`last_kpi_summary`）を `tuning_cost` で正規化スカラーへ写像。
+- `validate` は 1 回走行して KPI・コストを提示（API のみ）。`refine` は `CoordinateDescentTuner`（座標降下）が
+  Kp/Ki/Kd を反復探索（既定最大 15 回）し最良ゲインを保存。hard 上限違反は 100x ペナルティで
+  自動棄却、走行中の非常停止は `PidTuningAborted` で中断する。
+- **適合中は逸脱（基準車速からの乖離）による自動非常停止を無効化する**（`DriveLoop(disable_deviation_check=True)`）。
+  未適合ゲインの追従誤差が逸脱しきい値を超えて非常停止すると適合自体が成立しないため。過電流・CAN 断・
+  サイクルウォッチドッグ等の他の安全網は維持する。KPI 集計も従来どおり行う（コスト評価に必要）。
+
+**学習運転フロー（4 ステップ・自動連続）**: 学習運転ページ（`learning.js`）は学習走行の正常終了
+（RUNNING→READY）を契機に、①開度パターン走行 → ②モデル作成 → ③PID 初期値設定（=A の `/learning/train`）
+→ ④規定パターン走行で PID 最適化（=B の `/pid-tune/refine`）を**自動で一気通貫**実行する。④は内部で
+RUNNING→READY を繰り返すため `busyRef` で学習の再トリガーを抑止する。学習ページのグラフには基準パターン
+（ref 線）を描画せず実車速のみ表示し、規定パターン内容は文字情報で提示する。
+
+**学習終了 → 適合への橋渡し（緩減速・停止確認）**: 学習の最終パターンは惰行/減速の途中で終わり車両が
+転動したまま終わることがある。その状態で④の規定パターン（0km/h 始点）を走らせると追従誤差が大きく
+逸脱扱いになるため、`stop_learning_drive` は READY へ遷移する前に **~0.1G の緩減速で停止を確認**してから
+停車保持ブレーキへ移行する（`_decelerate_to_stop`：閉ループでブレーキ開度を調整し車速が停車しきい値
+未満へ収束するまで待つ）。原点復帰はせず停止保持を維持し、適合セッション完了時に解放する。
 
 ---
 
@@ -727,7 +882,7 @@ sequenceDiagram
 
     Op->>UI: 走行モード選択 → 開始
     UI->>RC: start_auto_drive(mode_id)
-    RC->>RC: 走行前チェック（6項目）
+    RC->>RC: 走行前チェック（7項目）
     alt チェックNG
         RC-->>UI: エラー項目表示
     else チェックOK
@@ -781,7 +936,7 @@ sequenceDiagram
     Op->>UI: 手動操作画面を開く
     Op->>UI: 手動操作開始ボタン押下
     UI->>RC: start_manual()
-    RC->>RC: 走行前チェック（6項目）
+    RC->>RC: 走行前チェック（7項目）
     alt チェックNG
         RC-->>UI: エラー内容表示
     else チェックOK
@@ -811,31 +966,59 @@ sequenceDiagram
     participant UI as Web UI
     participant RC as RobotController
     participant LM as LearningDriveManager
+    participant LL as LearningLoop
     participant HW as アクチュエータ
     participant LW as LogWriter
 
     Op->>UI: 学習運転開始ボタン押下
-    UI->>RC: start_learning_drive()
-    RC->>RC: 走行前チェック（6項目）
+    UI->>RC: arm_learning_drive()
+    RC->>RC: 踏込前チェック（車速確認を除外。両ペダルが原点付近にある等を確認）
+    RC->>HW: 停車保持ブレーキ（stop_brake_opening_pct）まで踏む
+    RC->>RC: 車速が 0 に収束するまで待機（タイムアウトあり）
+    RC->>RC: 踏込後チェック（アクチュエータ位置を除外。車速0/通信/サーボ等を判定）
     alt チェックNG
+        RC->>HW: ブレーキ原点復帰（home_return）→ READY
         RC-->>UI: エラー内容表示
     else チェックOK
-        RC->>LM: generate_patterns(profile)
-        LM-->>RC: 速度×加速度グリッドのパターンリスト
-        RC-->>UI: RUNNING状態・推定残り時間表示
-        RC->>LW: start_session(mode='learning')
-        loop 各パターン実行
-            RC->>HW: パターン開度を指令（FC10）
-            HW-->>RC: 現在位置・電流値
-            RC->>LW: log(100ms周期)
-            RC-->>UI: WebSocket: 進捗・実車速更新
-            alt 最大開度/G上限超過
-                RC->>RC: パターンスキップ
+        RC-->>UI: PRE_CHECK（確認待ち）
+        UI-->>Op: 「学習運転を開始しますか?」ポップアップ
+        alt いいえ
+            Op->>UI: いいえ
+            UI->>RC: cancel_learning_drive()
+            RC->>HW: ブレーキリリース（home_return）→ READY
+        else はい
+            Op->>UI: はい
+            UI->>RC: start_learning_drive()
+            RC->>LM: generate_patterns(profile)
+            LM-->>RC: 開度スイープのパターン列
+            RC->>LW: start_session(run_type='learning')
+            RC->>LL: start(patterns)
+            RC-->>UI: RUNNING状態
+            loop 100ms 周期（クリープ解放→クリープ安定待ち→アクセル2%刻み→ブレーキ2%刻み）
+                LL->>HW: 固定開度を開ループ指令（FC10）
+                HW-->>LL: 現在位置・電流値
+                LL->>LW: log(連続時系列, ref_speed=None)
+                LL-->>UI: WebSocket: 実車速・開度更新
+                alt 過速度/過G
+                    LL->>LL: 当該パターン打ち切り→次の開度（非常停止しない）
+                else 過電流/CAN断
+                    LL->>RC: on_emergency（非常停止）
+                end
             end
+            LL->>RC: on_complete
+            RC->>HW: home_return() 両軸
+            RC->>LW: end_session(status='completed')
+            RC-->>UI: READY
+            Note over UI,LW: 以降は learning.js が自動で一気通貫実行（busyRef で再トリガー抑止）
+            UI->>RC: /learning/train（モデル作成＋PID初期値: FOPDT同定→SIMC）
+            RC-->>UI: model_path・metrics（MAE/RMSE/R²）・pid_gains
+            UI->>RC: /pid-tune/refine（規定パターン走行でPID最適化, max_runs=15）
+            loop 最大15回（座標降下）
+                RC->>HW: 規定パターン走行（上限G/最高車速厳守）→ KPI集計
+            end
+            RC->>RC: 最良ゲインを保存・反映（refresh_active_profile）
+            RC-->>UI: 最良 pid_gains・最良コスト・履歴
         end
-        RC->>HW: home_return() 両軸
-        RC->>LW: end_session(status='completed')
-        RC-->>UI: READY状態・学習運転完了通知
     end
 ```
 
@@ -843,7 +1026,7 @@ sequenceDiagram
 
 ## 走行前チェック仕様
 
-走行開始前に以下の6項目をすべてパスする必要があります（自動運転・学習運転・手動操作共通）。
+走行開始前に以下の項目をすべてパスする必要があります。項目1〜7は全モード共通（自動運転・学習運転・手動操作）、項目8はタイムスケジュール実行時（ボタンイベントを含む場合）のみ適用します。
 
 | # | チェック項目 | 確認内容 | NG時の動作 |
 |---|------------|---------|-----------|
@@ -853,6 +1036,8 @@ sequenceDiagram
 | 4 | プロファイル | 車両プロファイル選択済み | エラー表示・停止 |
 | 5 | UPS残量 | AC UPS バッテリー残量 20%以上（NUT `battery.charge` で取得） | エラー表示・停止 |
 | 6 | アクチュエータ位置 | 両軸が原点付近にあること（±10pulse = ±0.1mm） | エラー表示・停止 |
+| 7 | 車速確認 | 車速が 0（0.5km/h 未満）であること（走行中の開始を防止） | エラー表示・停止 |
+| 8 | ボタンサーボ確認（タイムスケジュール時のみ） | PCA9685 のI2C疎通・全ボタンサーボが待機位置にあること | エラー表示・停止 |
 
 ---
 
@@ -886,14 +1071,14 @@ stateDiagram-v2
 | システム状態 | STANDBY / READY / RUNNING / EMERGENCY（バッジ） |
 | 実車速 | 大きな数値表示 [km/h] |
 | アクセル・ブレーキ開度 | ゲージ [%] |
-| 基準車速グラフ | リアルタイムライングラフ（基準・実車速） |
+| 基準車速グラフ | リアルタイムライングラフ（基準・実車速）。中央固定プレイヘッド方式（現在位置は中央の●ポインタ） |
 | 操作ボタン | 初期化 / 自動走行 / 学習運転 / 手動 / 停止 |
 
 #### 自動走行モニター
 
 | 表示要素 | 内容 |
 |---------|------|
-| リアルタイムグラフ | 直近30秒ウィンドウ。1軸目: 基準車速（灰色点線）・実車速（青色実線）。2軸目: アクセル/ブレーキ開度。3軸目: 全体プロファイルと現在位置マーカー。走行開始後のデータのみ表示 |
+| リアルタイムグラフ | **中央固定プレイヘッド**方式の30秒ウィンドウ（過去15秒＋未来15秒）。現在時刻を常にグラフ中央に固定し、波形（軌跡）は右→左へ流れる。現在位置は中央の**●ポインタ**で表され上下にのみ動く（走行前=値0でも常時表示）。1軸目: 基準車速（灰色点線、右半分に先読み表示）・実車速（金色実線）。2軸目: アクセル開度（青）/ブレーキ開度（赤）。3軸目: 全体プロファイルと進捗マーカー（別系統）。実測・開度は走行開始後のデータのみで、画面外（過去15秒より前）の点は描画しない |
 | 逸脱量 | 実車速 - 基準車速 [km/h] |
 | 経過時間 / 残り時間 | 走行開始ボタン押下後から計測開始 |
 | 非常停止ボタン | 常時表示 |
@@ -929,6 +1114,20 @@ Response: DriveSessionResponse
 
 POST /api/v1/drive/manual/stop
 Response: { "status": "ok" }
+
+# 学習運転（arm→確認→start/cancel→自動で train→pid-tune）
+POST /api/v1/drive/learning/arm | /start | /cancel
+POST /api/v1/drive/learning/train
+Body: { "profile_id": "uuid", "session_ids": [...]? }
+Response: TrainModelResponse { model_path, metrics{accel/brake: mae/rmse/r2/n}, pid_gains, pid_auto_tuned }
+
+# PID自動適合（規定パターン走行）
+POST /api/v1/drive/pid-tune/validate   # 1回走行して KPI・コスト（API のみ）
+Body: { "profile_id": "uuid" }
+Response: { kpi_summary, cost, pid_gains }
+POST /api/v1/drive/pid-tune/refine     # 反復走行で最適化し最良ゲインを保存
+Body: { "profile_id": "uuid", "max_runs": 15 }
+Response: { pid_gains, best_cost, history }
 ```
 
 ### プロファイル管理（`/api/v1/profiles/`）
@@ -973,6 +1172,32 @@ DELETE /api/v1/modes/{mode_id}
 Response: 204 | 404
 ```
 
+### タイムスケジュール管理（`/api/v1/schedules/`）
+
+走行モード管理（`modes.py`）と同じCRUDパターン、実行制御は走行制御（`drive.py`）と同じコマンドパターンに従う。ボタンイベントとペダル動作を含む統合タイムラインを1エンティティとして扱う。作成・更新は JSON ボディで受ける（`pedal_points` の time_s は単調増加、`channel` は 0-15、`press_duration_s` > 0）。
+
+```
+GET    /api/v1/schedules/
+Response: list[ScheduleResponse]
+
+POST   /api/v1/schedules/
+Body: { name, description?, pedal_points[], button_events[], loop }
+Response: ScheduleDetailResponse (201) | 409（名称重複）
+
+GET    /api/v1/schedules/{schedule_id}
+Response: ScheduleDetailResponse (pedal_points・button_events含む) | 404
+
+PUT    /api/v1/schedules/{schedule_id}
+Response: ScheduleDetailResponse | 404 | 409
+
+DELETE /api/v1/schedules/{schedule_id}
+Response: 204 | 404
+
+# 実行制御（RobotController のコマンド。InvalidStateTransition→409, PreCheckFailed→422）
+POST   /api/v1/drive/schedule/start   Body: { schedule_id }
+POST   /api/v1/drive/schedule/stop
+```
+
 ### セッション参照（`/api/v1/sessions/`）
 
 ```
@@ -984,6 +1209,9 @@ Response: SessionResponse | 404
 
 GET    /api/v1/sessions/{session_id}/logs
 Response: list[LogResponse]
+
+GET    /api/v1/sessions/{session_id}/logs.csv
+Response: text/csv（添付ダウンロード。列順は ArchiveManager の CSV と一致） | 404
 ```
 
 ### WebSocket（リアルタイムデータ）

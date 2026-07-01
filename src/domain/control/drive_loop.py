@@ -11,6 +11,7 @@ from typing import Protocol
 from src.domain.control.feedforward import FeedforwardController
 from src.domain.control.kpi_monitor import KPIMonitor
 from src.domain.control.pedal_arbiter import PedalArbiter
+from src.domain.control.pedal_safety import enforce_pedal_exclusion
 from src.domain.control.pid import PIDController
 from src.models.drive_log import DriveLogData
 from src.models.driving_mode import DrivingMode
@@ -62,6 +63,8 @@ class DriveLoop:
     """
 
     _running: bool
+    _paused: bool
+    _paused_elapsed: float
     _started_at: float
     _cycle_count: int
     _deviation_start: float | None
@@ -82,6 +85,7 @@ class DriveLoop:
         session_id: str | None = None,
         interval_s: float = CONTROL_LOOP_INTERVAL_S,
         log_every_n_cycles: int = LOG_EVERY_N_CYCLES,
+        disable_deviation_check: bool = False,
     ) -> None:
         self._ff = ff_controller
         self._pid = pid
@@ -97,8 +101,14 @@ class DriveLoop:
         self._session_id = session_id
         self._interval_s = interval_s
         self._log_every_n_cycles = log_every_n_cycles
+        # 逸脱（基準車速からの乖離）による自動非常停止を無効化するか。PID 自動適合では
+        # 未適合ゲインの追従誤差が逸脱しきい値を超えて非常停止し、適合自体が成立しなく
+        # なるため True にする。過電流・CAN 断・ウォッチドッグ等の安全網は維持される。
+        self._disable_deviation_check = disable_deviation_check
 
         self._running = False
+        self._paused = False
+        self._paused_elapsed = 0.0
         self._started_at = 0.0
         self._cycle_count = 0
         self._deviation_start = None
@@ -135,6 +145,8 @@ class DriveLoop:
         if self._running:
             return
         self._running = True
+        self._paused = False
+        self._paused_elapsed = 0.0
         self._pid.reset()
         self._arbiter.reset()
         self._kpi = KPIMonitor()
@@ -152,6 +164,38 @@ class DriveLoop:
         """制御ループを停止する。進行中のサイクルはアクチュエータ書き込み前に中断される。"""
         self._running = False
 
+    def pause(self) -> None:
+        """走行を一時停止する。基準速度タイムライン（経過時間の進行）を凍結する。
+
+        制御サイクル自体は止めず、一時停止した瞬間の経過時間を保持して以降のサイクルで
+        その時刻の基準速度を参照し続ける。これにより目標車速が一定値に固定され、PID が
+        その速度を保持して走り続ける（安全チェック・ウォッチドッグも通常どおり継続）。
+        実行中でない、または既に一時停止中の場合は何もしない。
+        """
+        if not self._running or self._paused:
+            return
+        loop = asyncio.get_running_loop()
+        self._paused_elapsed = loop.time() - self._started_at
+        self._paused = True
+
+    def resume(self) -> None:
+        """一時停止した走行を再開する。タイムラインを凍結時点の続きから進める。
+
+        _started_at を現在時刻から凍結経過時間を引いた値へシフトし、elapsed_s が
+        凍結時点から連続して進むようにする。一時停止中でない場合は何もしない。
+        """
+        if not self._paused:
+            return
+        loop = asyncio.get_running_loop()
+        self._started_at = loop.time() - self._paused_elapsed
+        # サイクルスキップ扱いの dt スパイクを避けるため、次サイクルは固定 dt から再開する
+        self._last_cycle_time = None
+        self._paused = False
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
     async def stop_and_join(self, timeout_s: float = 2.0) -> None:
         """停止し、進行中のサイクルタスクの完了を待つ。
 
@@ -162,10 +206,16 @@ class DriveLoop:
 
         タイムアウト時はタスクをキャンセルする（バスが完全に固まっている場合、
         非常停止をこれ以上遅延させない）。
+
+        on_complete（stop_auto_drive）はサイクルタスク内から await されるため、その経路から
+        本メソッドが呼ばれると自タスクを join しようとして wait_for がタイムアウト→自タスクを
+        cancel し、呼び出し元の後続 await（home_return）が CancelledError で中断される。
+        `current_task() is サイクルタスク` のときは既にサイクルが終了処理中のため join 不要として
+        即 return する（正常完了で約2秒ハング＋原点未復帰になるのを防ぐ）。
         """
         self.stop()
         task = self._cycle_task
-        if task is None or task.done():
+        if task is None or task.done() or task is asyncio.current_task():
             return
         try:
             # shield: タイムアウトしてもサイクルタスク自体は cancel せず明示的に扱う
@@ -256,12 +306,16 @@ class DriveLoop:
             return
 
         loop = asyncio.get_running_loop()
-        elapsed_s = loop.time() - self._started_at
-
-        if elapsed_s >= self._mode.total_duration:
-            self.stop()
-            await self._on_complete()
-            return
+        # 一時停止中は経過時間を凍結時点に固定し、基準速度を一定に保つ。
+        # 自然完了判定もスキップして、保持区間の途中で走行が終了しないようにする。
+        if self._paused:
+            elapsed_s = self._paused_elapsed
+        else:
+            elapsed_s = loop.time() - self._started_at
+            if elapsed_s >= self._mode.total_duration:
+                self.stop()
+                await self._on_complete()
+                return
 
         ref_speed = self._ref_speed_at(elapsed_s)
         self._last_ref_speed = ref_speed
@@ -298,8 +352,10 @@ class DriveLoop:
         arb_out = self._arbiter.arbitrate(ff_effort + pid_u, dt)
         self._saturated_high = arb_out.saturated_high
         self._saturated_low = arb_out.saturated_low
-        accel_opening = arb_out.accel_opening
-        brake_opening = arb_out.brake_opening
+        # 調停器は構造的に排他（高々一方のみ非ゼロ）だが、最終段でも同時踏み禁止を強制する保険
+        accel_opening, brake_opening = enforce_pedal_exclusion(
+            arb_out.accel_opening, arb_out.brake_opening
+        )
         self._current_accel_opening = accel_opening
         self._current_brake_opening = brake_opening
 
@@ -353,26 +409,35 @@ class DriveLoop:
         # KPI 実行時計測: 逸脱自動停止（運用者設定、例 2.0km/h）はプライマリー KPI
         # （例外なく 1.0km/h 以内）より緩く、ログも間引かれるため、ここで全サンプルを
         # 集計しないと KPI 違反が観測できない（指摘 #7）。
-        self._kpi.update(ref_speed, actual_speed, loop.time())
+        # 一時停止中は保持区間のサンプルで KPI を汚さないため集計しない。
+        if not self._paused:
+            self._kpi.update(ref_speed, actual_speed, loop.time())
 
-        deviation = abs(ref_speed - actual_speed)
-        threshold = self._profile.stop_config.deviation_threshold_kmh
-        if deviation > threshold:
-            if self._deviation_start is None:
-                self._deviation_start = loop.time()
-            deviation_duration = loop.time() - self._deviation_start
-        else:
-            self._deviation_start = None
-            deviation_duration = 0.0
+        # PID 自動適合中は逸脱による非常停止を行わない（未適合ゲインの追従誤差で
+        # 適合が成立しなくなるため）。他の安全網（過電流・CAN 断・ウォッチドッグ）は維持。
+        if not self._disable_deviation_check:
+            deviation = abs(ref_speed - actual_speed)
+            threshold = self._profile.stop_config.deviation_threshold_kmh
+            if deviation > threshold:
+                if self._deviation_start is None:
+                    self._deviation_start = loop.time()
+                deviation_duration = loop.time() - self._deviation_start
+            else:
+                self._deviation_start = None
+                deviation_duration = 0.0
 
-        if self._safety_check.check_deviation(ref_speed, actual_speed, deviation_duration):
-            _logger.warning(
-                "走行逸脱: ref=%.1f actual=%.1f duration=%.1fs",
-                ref_speed,
-                actual_speed,
-                deviation_duration,
-            )
-            await self._abort_emergency()
+            if self._safety_check.check_deviation(ref_speed, actual_speed, deviation_duration):
+                _logger.warning(
+                    "走行逸脱: ref=%.1f actual=%.1f duration=%.1fs",
+                    ref_speed,
+                    actual_speed,
+                    deviation_duration,
+                )
+                await self._abort_emergency()
+                return
+
+        # 一時停止中は保持区間のログを残さない（再開後にタイムラインが連続するため）
+        if self._paused:
             return
 
         self._cycle_count += 1

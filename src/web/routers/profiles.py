@@ -4,9 +4,10 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from src.app.robot_controller import RobotController
 from src.infra.db import DuplicateNameError
 from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
-from src.web.deps import ProfileRepoProtocol, get_profile_repo
+from src.web.deps import ProfileRepoProtocol, get_controller, get_profile_repo
 from src.web.schemas import (
     CalibrationDataResponse,
     FeedforwardParamsSchema,
@@ -20,6 +21,7 @@ from src.web.schemas import (
 router = APIRouter(prefix="/api/v1/profiles", tags=["profiles"])
 
 ProfileRepo = Annotated[ProfileRepoProtocol, Depends(get_profile_repo)]
+Controller = Annotated[RobotController, Depends(get_controller)]
 
 
 def _ffp_to_schema(ffp: FeedforwardParams) -> FeedforwardParamsSchema:
@@ -128,7 +130,7 @@ async def get_profile(profile_id: str, repo: ProfileRepo) -> ProfileResponse:
 
 @router.put("/{profile_id}", response_model=ProfileResponse)
 async def update_profile(
-    profile_id: str, req: ProfileUpdateRequest, repo: ProfileRepo
+    profile_id: str, req: ProfileUpdateRequest, repo: ProfileRepo, controller: Controller
 ) -> ProfileResponse:
     try:
         existing = await repo.get_by_id(profile_id)
@@ -177,6 +179,10 @@ async def update_profile(
     updated = await repo.update(merged)
     if updated is None:
         raise HTTPException(status_code=404, detail=f"プロファイル {profile_id!r} が見つかりません")
+    # 編集が「アクティブプロファイル」なら制御スタック（in-memory）へ即時反映する。
+    # これをしないと stop_brake_opening_pct 等を編集しても arm のブレーキ踏込量が
+    # 旧値のまま変わらない（コントローラが古い _active_profile を保持し続けるため）。
+    controller.refresh_active_profile(updated)
     return _to_response(updated)
 
 

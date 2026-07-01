@@ -7,22 +7,26 @@ from src.app.robot_controller import (
     EmergencyStillActive,
     InvalidStateTransition,
     LogWriterProtocol,
+    PidTuningAborted,
     PreCheckFailed,
     RobotController,
 )
 from src.domain.learning_drive import LearningDataError
 from src.domain.model_training import estimate_dynamics_params, train_inverse_model
+from src.domain.pid_tuning import compute_pid_gains_simc, identify_fopdt, tuning_cost
 from src.models.calibration import CalibrationResult
 from src.models.drive_log import DriveSession
 from src.models.system_state import RobotState
 from src.web.deps import (
     ModeRepoProtocol,
     ProfileRepoProtocol,
+    ScheduleRepoProtocol,
     SessionRepoProtocol,
     get_controller,
     get_log_writer,
     get_mode_repo,
     get_profile_repo,
+    get_schedule_repo,
     get_session_repo,
 )
 from src.web.schemas import (
@@ -33,8 +37,14 @@ from src.web.schemas import (
     FeedforwardParamsSchema,
     JogRequest,
     JogResponse,
+    PIDGainsSchema,
+    PidRefineRequest,
+    PidRefineResponse,
+    PidValidateRequest,
+    PidValidateResponse,
     SelectProfileRequest,
     StartDriveRequest,
+    StartScheduleRequest,
     SystemStateResponse,
     TrainModelRequest,
     TrainModelResponse,
@@ -97,6 +107,36 @@ async def initialize(controller: Controller) -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.post("/arm", status_code=200)
+async def arm_drive(controller: Controller) -> dict[str, str]:
+    """自動走行を準備する。READY → PRE_CHECK 遷移。
+
+    走行前チェック（車速0含む）を実施し、合格したら停車保持ブレーキまで踏み込んで
+    確認待ち（PRE_CHECK）にする。フロントは確認ポップアップを表示し、「はい」で
+    /start、「いいえ」で /cancel を呼ぶ（学習運転と同じ arm フロー）。
+    """
+    try:
+        await controller.arm_auto_drive()
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except PreCheckFailed as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"status": "armed"}
+
+
+@router.post("/cancel", status_code=200)
+async def cancel_drive(controller: Controller) -> dict[str, str]:
+    """自動走行を中止する（確認ポップアップ「いいえ」）。PRE_CHECK → READY。
+
+    arm でかけた保持ブレーキをリリースする。セッションは未開始のためログは残らない。
+    """
+    try:
+        await controller.cancel_auto_drive()
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"status": "cancelled"}
+
+
 @router.post("/start", response_model=DriveSessionResponse)
 async def start_drive(
     req: StartDriveRequest,
@@ -124,6 +164,30 @@ async def start_drive(
     except PreCheckFailed as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     return _to_session_response(session)
+
+
+@router.post("/pause", status_code=200)
+async def pause_drive(controller: Controller) -> dict[str, str]:
+    """自動走行を一時停止する。RUNNING → PAUSED。
+
+    基準速度タイムラインを凍結し、一時停止した瞬間の目標車速を保持して走り続ける。
+    フロントの「一時停止」ボタンから呼ぶ。
+    """
+    try:
+        await controller.pause_auto_drive()
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"status": "paused"}
+
+
+@router.post("/resume", status_code=200)
+async def resume_drive(controller: Controller) -> dict[str, str]:
+    """一時停止中の自動走行を再開する。PAUSED → RUNNING。フロントの「走行再開」ボタンから呼ぶ。"""
+    try:
+        await controller.resume_auto_drive()
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"status": "running"}
 
 
 @router.post("/stop", status_code=200)
@@ -258,15 +322,32 @@ async def stop_manual(controller: Controller) -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.post("/learning/arm", status_code=200)
+async def arm_learning_drive(controller: Controller) -> dict[str, str]:
+    """学習運転を準備する。READY → PRE_CHECK 遷移。
+
+    走行前チェック（車速0含む）を実施し、合格したら停車保持ブレーキまで踏み込んで
+    確認待ち（PRE_CHECK）にする。フロントは確認ポップアップを表示し、「はい」で
+    /learning/start、「いいえ」で /learning/cancel を呼ぶ。
+    """
+    try:
+        await controller.arm_learning_drive()
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except PreCheckFailed as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"status": "armed"}
+
+
 @router.post("/learning/start", response_model=DriveSessionResponse)
 async def start_learning_drive(
     controller: Controller,
     log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
 ) -> DriveSessionResponse:
-    """学習走行を開始する。READY → PRE_CHECK → RUNNING 遷移。
+    """学習走行を開始する（確認ポップアップ「はい」）。arm 後（PRE_CHECK）→ RUNNING。
 
-    学習用基準速度プロファイルを DriveLoop で走行し、走行ログを `drive_logs` に
-    記録する（DB 利用時）。
+    開度パターン列を LearningLoop で開ループ実行し、走行ログを `drive_logs` に
+    連続記録する（DB 利用時）。
     """
     try:
         session = await controller.start_learning_drive(log_writer=log_writer)
@@ -277,6 +358,19 @@ async def start_learning_drive(
     return _to_session_response(session)
 
 
+@router.post("/learning/cancel", status_code=200)
+async def cancel_learning_drive(controller: Controller) -> dict[str, str]:
+    """学習運転を中止する（確認ポップアップ「いいえ」）。PRE_CHECK → READY。
+
+    arm でかけた保持ブレーキをリリースする。セッションは未開始のためログは残らない。
+    """
+    try:
+        await controller.cancel_learning_drive()
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"status": "cancelled"}
+
+
 @router.post("/learning/train", response_model=TrainModelResponse)
 async def train_learning_model(
     req: TrainModelRequest,
@@ -284,7 +378,7 @@ async def train_learning_model(
     profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
     session_repo: Annotated[SessionRepoProtocol, Depends(get_session_repo)],
 ) -> TrainModelResponse:
-    """連続走行ログから先読み Ridge 逆モデルを学習し、プロファイルに紐づけて保存する。
+    """直近の学習走行ログから先読み 多項式Ridge 逆モデルを学習し、プロファイルに紐づけて保存する。
 
     再学習も同一エンドポイントで実行できる（model_path を上書き更新）。
     学習は CPU 負荷の高い同期処理のため to_thread で実行し、50ms 制御ループ・
@@ -293,6 +387,7 @@ async def train_learning_model(
     state = controller.get_system_state().robot_state
     if state in (
         RobotState.RUNNING,
+        RobotState.PAUSED,
         RobotState.MANUAL,
         RobotState.CALIBRATING,
         RobotState.PRE_CHECK,
@@ -308,7 +403,19 @@ async def train_learning_model(
             status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
         )
 
-    logs = await session_repo.list_logs_for_training(req.profile_id, req.session_ids)
+    # 学習対象は「直近に実施した学習走行」のみを既定とする（過去の旧データ混在を避ける）。
+    # session_ids を明示指定した場合はそれを優先する（再学習・複数選択の用途）。
+    session_ids = req.session_ids
+    if not session_ids:
+        latest = await session_repo.latest_learning_session_id(req.profile_id)
+        if latest is None:
+            raise HTTPException(
+                status_code=422,
+                detail="学習走行のログがありません。先に学習走行を実施してください。",
+            )
+        session_ids = [latest]
+
+    logs = await session_repo.list_logs_for_training(req.profile_id, session_ids)
     try:
         model_path, metrics = await asyncio.to_thread(train_inverse_model, logs, profile)
     except LearningDataError as e:
@@ -316,6 +423,16 @@ async def train_learning_model(
 
     # 観測可能な物理定数のみログから推定して上書き（不足項目は既存値を保持）
     new_params = await asyncio.to_thread(estimate_dynamics_params, logs, profile.feedforward_params)
+
+    # 学習ログのアクセル保持区間から FOPDT を同定し SIMC で PID を自動適合する。
+    # 同定不能（区間不足）なら既存ゲインを保持する。CPU 同期処理のため to_thread。
+    fopdt = await asyncio.to_thread(identify_fopdt, logs, profile)
+    pid_auto_tuned = False
+    if fopdt is not None:
+        new_gains = compute_pid_gains_simc(fopdt, profile)
+        if new_gains != profile.pid_gains:
+            profile.pid_gains = new_gains
+            pid_auto_tuned = True
 
     profile.model_path = model_path
     profile.feedforward_params = new_params
@@ -342,7 +459,122 @@ async def train_learning_model(
             brake_rate_limit_pct_s=new_params.brake_rate_limit_pct_s,
             pid_output_limit_pct=new_params.pid_output_limit_pct,
         ),
+        pid_gains=PIDGainsSchema(
+            kp=profile.pid_gains.kp,
+            ki=profile.pid_gains.ki,
+            kd=profile.pid_gains.kd,
+        ),
+        pid_auto_tuned=pid_auto_tuned,
     )
+
+
+@router.post("/pid-tune/validate", response_model=PidValidateResponse)
+async def pid_tune_validate(
+    req: PidValidateRequest,
+    controller: Controller,
+    profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
+    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
+) -> PidValidateResponse:
+    """規定パターンを 1 回走行し、現在の PID ゲインの追従 KPI とコストを返す。"""
+    profile = await profile_repo.get_by_id(req.profile_id)
+    if profile is None:
+        raise HTTPException(
+            status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
+        )
+    try:
+        kpi = await controller.run_pid_validation(profile, log_writer)
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except PreCheckFailed as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except PidTuningAborted as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return PidValidateResponse(
+        kpi_summary=kpi,
+        cost=tuning_cost(kpi),
+        pid_gains=PIDGainsSchema(
+            kp=profile.pid_gains.kp, ki=profile.pid_gains.ki, kd=profile.pid_gains.kd
+        ),
+    )
+
+
+@router.post("/pid-tune/refine", response_model=PidRefineResponse)
+async def pid_tune_refine(
+    req: PidRefineRequest,
+    controller: Controller,
+    profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
+    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
+) -> PidRefineResponse:
+    """規定パターンを反復走行し座標降下で PID を絞り込み、最良ゲインを保存する。"""
+    profile = await profile_repo.get_by_id(req.profile_id)
+    if profile is None:
+        raise HTTPException(
+            status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
+        )
+    try:
+        best, history = await controller.run_pid_tuning_session(
+            profile, log_writer, max_runs=req.max_runs
+        )
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except PreCheckFailed as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except PidTuningAborted as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    # 最良ゲインを永続化し、アクティブプロファイルの制御スタックへ反映する。
+    profile.pid_gains = best
+    updated = await profile_repo.update(profile)
+    controller.refresh_active_profile(updated if updated is not None else profile)
+
+    return PidRefineResponse(
+        pid_gains=PIDGainsSchema(kp=best.kp, ki=best.ki, kd=best.kd),
+        best_cost=min((h["cost"] for h in history), default=0.0),
+        history=history,
+    )
+
+
+@router.post("/schedule/start", response_model=DriveSessionResponse)
+async def start_schedule_drive(
+    req: StartScheduleRequest,
+    controller: Controller,
+    schedule_repo: Annotated[ScheduleRepoProtocol, Depends(get_schedule_repo)],
+    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
+) -> DriveSessionResponse:
+    """タイムスケジュール走行を開始する。
+
+    ペダル開度とボタンイベントの統合タイムラインを ScheduleLoop で開ループ実行する。
+    """
+    try:
+        schedule = await schedule_repo.get_by_id(req.schedule_id)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400, detail="schedule_id が UUID 形式ではありません"
+        ) from e
+    if schedule is None:
+        raise HTTPException(
+            status_code=404, detail=f"スケジュール {req.schedule_id!r} が見つかりません"
+        )
+    profile = controller.get_active_profile()
+    try:
+        session = await controller.start_schedule_drive(
+            schedule, profile=profile, log_writer=log_writer
+        )
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except PreCheckFailed as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return _to_session_response(session)
+
+
+@router.post("/schedule/stop", status_code=200)
+async def stop_schedule_drive(controller: Controller) -> dict[str, str]:
+    """タイムスケジュール走行を停止する。RUNNING → READY。"""
+    try:
+        await controller.stop_schedule_drive()
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"status": "ok"}
 
 
 @router.post("/select-profile", status_code=200)

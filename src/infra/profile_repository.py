@@ -222,12 +222,41 @@ class ProfileRepository:
         )
 
     async def delete(self, profile_id: str) -> bool:
-        """プロファイルを削除する。削除できた場合 True。"""
+        """プロファイルを削除する。削除できた場合 True。
+
+        calibration_data / drive_sessions / drive_logs は profile_id を参照する
+        外部キー制約(いずれも ON DELETE CASCADE 無し)を持つため、プロファイル本体
+        より先に下位テーブルから順に削除する。drive_logs は drive_sessions を経由
+        して紐づくので最初に消す。全削除を同一トランザクションで実行し、途中失敗時に
+        一部だけ消える状態を防ぐ。
+
+        注意: プロファイル削除は、そのプロファイルに紐づく走行セッションとログ履歴
+        もすべて削除する。
+        """
+        pid = uuid.UUID(profile_id)
         async with self._pool.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM vehicle_profiles WHERE id = $1",
-                uuid.UUID(profile_id),
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    DELETE FROM drive_logs
+                    WHERE session_id IN (
+                        SELECT id FROM drive_sessions WHERE profile_id = $1
+                    )
+                    """,
+                    pid,
+                )
+                await conn.execute(
+                    "DELETE FROM drive_sessions WHERE profile_id = $1",
+                    pid,
+                )
+                await conn.execute(
+                    "DELETE FROM calibration_data WHERE profile_id = $1",
+                    pid,
+                )
+                result = await conn.execute(
+                    "DELETE FROM vehicle_profiles WHERE id = $1",
+                    pid,
+                )
         return str(result) != "DELETE 0"
 
     async def save_calibration(self, profile_id: str, data: CalibrationData) -> None:

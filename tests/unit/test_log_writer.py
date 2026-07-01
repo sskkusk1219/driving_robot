@@ -199,3 +199,34 @@ class TestLogWriterEndSession:
             writer = LogWriter(conn)
             await writer.end_session("session-uuid", status)
             conn.execute.assert_called_once()
+
+
+class TestLogWriterReapInterruptedSessions:
+    @pytest.mark.asyncio
+    async def test_reap_returns_count(self) -> None:
+        """asyncpg の 'UPDATE <n>' から是正件数を返すこと。"""
+        conn = make_conn()
+        conn.execute = AsyncMock(return_value="UPDATE 2")
+        writer = LogWriter(conn)
+
+        reaped = await writer.reap_interrupted_sessions()
+
+        assert reaped == 2
+
+    @pytest.mark.asyncio
+    async def test_reap_zero_when_none(self) -> None:
+        """是正対象が無ければ 0 を返すこと。"""
+        conn = make_conn()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        writer = LogWriter(conn)
+
+        assert await writer.reap_interrupted_sessions() == 0
+
+    @pytest.mark.asyncio
+    async def test_reap_handles_empty_result(self) -> None:
+        """execute が None/空でも例外を投げず 0 を返すこと。"""
+        conn = make_conn()
+        conn.execute = AsyncMock(return_value=None)
+        writer = LogWriter(conn)
+
+        assert await writer.reap_interrupted_sessions() == 0

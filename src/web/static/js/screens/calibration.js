@@ -1,9 +1,10 @@
 // ── Calibration screen ────────────────────────────────────
 
-function AxisCal({ label, axisId, currentPos, zero, full, onJog, onSetZero, onSetFull, onHome }) {
+function AxisCal({ label, axisId, currentPos, zero, full, onJog, onSetZero, onSetFull, onHome, enabled = true }) {
   const { INK, INK_SOFT, INK_MUTE, Box, Btn } = window;
   const { JogKey, DragSlider } = window;
   const stroke = (zero !== null && full !== null) ? Math.abs(full - zero) : null;
+  const dis = !enabled;
 
   return (
     <Box label={label} style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minHeight: 0 }}>
@@ -11,26 +12,26 @@ function AxisCal({ label, axisId, currentPos, zero, full, onJog, onSetZero, onSe
       {/* Jog buttons + drag slider */}
       <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-          <JogKey label="−10"  onClick={() => onJog(axisId, -10)} />
-          <JogKey label="−100" onClick={() => onJog(axisId, -100)} />
+          <JogKey label="−10"  onClick={() => onJog(axisId, -10)} disabled={dis} />
+          <JogKey label="−100" onClick={() => onJog(axisId, -100)} disabled={dis} />
         </div>
 
-        <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} zeroPos={zero} fullPos={full} />
+        <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} zeroPos={zero} fullPos={full} disabled={dis} />
 
         <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-          <JogKey label="+10"  onClick={() => onJog(axisId, 10)} />
-          <JogKey label="+100" onClick={() => onJog(axisId, 100)} />
+          <JogKey label="+10"  onClick={() => onJog(axisId, 10)} disabled={dis} />
+          <JogKey label="+100" onClick={() => onJog(axisId, 100)} disabled={dis} />
         </div>
       </div>
 
       {/* ZERO / FULL buttons */}
       <div style={{ display: 'flex', gap: 8 }}>
         <Btn style={{ flex: 1, borderColor: '#2a6c2a', color: '#54bc54', justifyContent: 'center' }}
-             onClick={() => onSetZero(axisId)}>
+             disabled={dis} onClick={() => onSetZero(axisId)}>
           ZERO 確定
         </Btn>
         <Btn style={{ flex: 1, borderColor: '#943030', color: '#e05050', justifyContent: 'center' }}
-             onClick={() => onSetFull(axisId)}>
+             disabled={dis} onClick={() => onSetFull(axisId)}>
           FULL 確定
         </Btn>
       </div>
@@ -41,7 +42,7 @@ function AxisCal({ label, axisId, currentPos, zero, full, onJog, onSetZero, onSe
         <span>FULL <b style={{ fontFamily: 'inherit', color: full !== null ? INK : INK_MUTE }}>{full ?? '—'}</b></span>
         <span>STROKE <b style={{ fontFamily: 'inherit', color: stroke !== null ? INK : INK_MUTE }}>{stroke ?? '—'}</b></span>
         <div style={{ flex: 1 }} />
-        <Btn onClick={() => onHome(axisId)}>原点へ戻す</Btn>
+        <Btn onClick={() => onHome(axisId)} disabled={dis}>原点へ戻す</Btn>
       </div>
     </Box>
   );
@@ -49,16 +50,24 @@ function AxisCal({ label, axisId, currentPos, zero, full, onJog, onSetZero, onSe
 
 function CalibrationScreen() {
   const { useState, useEffect, useContext } = React;
-  const { apiFetch, activeProfileId, setNav } = useContext(window.AppContext);
-  const { Box, Btn, Note, Row, ValidationPopup } = window;
+  const { apiFetch, activeProfileId, setNav, setNavLock } = useContext(window.AppContext);
+  const { Box, Btn, Note, Row, ValidationPopup, ConfirmStopPopup } = window;
 
   const [brk, setBrk] = useState({ currentPos: 0, zero: null, full: null });
   const [acc, setAcc] = useState({ currentPos: 0, zero: null, full: null });
   const [popup, setPopup] = useState(null);
+  const [started, setStarted] = useState(false);
+  const [confirmStart, setConfirmStart] = useState(false);
 
   useEffect(() => {
     if (!activeProfileId) setPopup('no_profile');
   }, []);
+
+  // 実行中（開始後）は他ページへの離脱をロック
+  useEffect(() => {
+    setNavLock(started);
+    return () => setNavLock(false);
+  }, [started]);
 
   function setAxisState(axisId, updater) {
     if (axisId === 'brake') setBrk(updater);
@@ -98,7 +107,10 @@ function CalibrationScreen() {
       return;
     }
     const r = await apiFetch('POST', '/api/v1/drive/calib/save');
-    if (r) window.showToast('キャリブレーションを保存しました', 'success');
+    if (r) {
+      window.showToast('キャリブレーションを保存しました', 'success');
+      setStarted(false);  // セッション終了 → ナビロック解除・ボタンを「開始」に戻す
+    }
   }
 
   const canSave = brk.zero !== null && brk.full !== null && acc.zero !== null && acc.full !== null;
@@ -120,11 +132,13 @@ function CalibrationScreen() {
           label="ブレーキ" axisId="brake"
           currentPos={brk.currentPos} zero={brk.zero} full={brk.full}
           onJog={handleJog} onSetZero={handleSetZero} onSetFull={handleSetFull} onHome={handleHome}
+          enabled={started}
         />
         <AxisCal
           label="アクセル" axisId="accel"
           currentPos={acc.currentPos} zero={acc.zero} full={acc.full}
           onJog={handleJog} onSetZero={handleSetZero} onSetFull={handleSetFull} onHome={handleHome}
+          enabled={started}
         />
       </div>
 
@@ -147,12 +161,27 @@ function CalibrationScreen() {
             ]} />
           </Box>
           <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
-            <Btn primary big style={{ flex: 1 }} disabled={!canSave} onClick={handleSave}>
-              キャリブレーション保存
-            </Btn>
+            {started ? (
+              <Btn primary big style={{ flex: 1 }} disabled={!canSave} onClick={handleSave}>
+                キャリブレーション保存
+              </Btn>
+            ) : (
+              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }}
+                   onClick={() => setConfirmStart(true)}>
+                ▶ 開始
+              </Btn>
+            )}
           </div>
         </div>
       </div>
+
+      {confirmStart && (
+        <ConfirmStopPopup
+          message="開始しますか？"
+          onYes={() => { setStarted(true); setConfirmStart(false); }}
+          onNo={() => setConfirmStart(false)}
+        />
+      )}
 
     </div>
   );

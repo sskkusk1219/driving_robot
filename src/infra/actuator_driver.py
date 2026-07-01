@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from pymodbus.client import AsyncModbusSerialClient
 from pymodbus.framer import FramerType
@@ -45,6 +47,10 @@ _REG_CTLF = 0x9908  # 制御フラグ
 _DEFAULT_SPEED_MM_S = 100  # 速度 [mm/s]
 _DEFAULT_ACCEL = 30  # 加減速指令（ACMD）[コントローラ固有単位 ≈ 0.01G]
 
+# 時間指定移動（move_to_position_timed）の速度クランプ範囲 [mm/s]
+_MIN_TIMED_SPEED_MM_S = 1  # 微小移動でも正の VCMD になる下限
+_MAX_TIMED_SPEED_MM_S = _DEFAULT_SPEED_MM_S  # 上限＝既存の固定速度（今より速くはしない）
+
 _HOME_RETURN_TIMEOUT_S = 30.0
 _HOME_RETURN_POLL_INTERVAL_S = 0.1
 
@@ -82,11 +88,48 @@ class ActuatorDriver:
         port: str,
         slave_id: int,
         baud_rate: int = 38400,
+        # retries=0 だと 1 回でも応答が遅延・分割すると即 ModbusIOException となり、
+        # 遅れて届いた応答バイトが OS バッファに残って次トランザクションを汚染し、
+        # 以降のトランザクションが永続的に失敗する（desync カスケード）。
+        # retries>0 にすると pymodbus がタイムアウト時に recv_buffer をクリアして
+        # 再送するため、単発の遅延から自動復旧できる。
+        timeout: float = 0.3,
+        retries: int = 3,
     ) -> None:
         self._port = port
         self._slave_id = slave_id
         self._baud_rate = baud_rate
+        self._timeout = timeout
+        self._retries = retries
         self._client: AsyncModbusSerialClient | None = None
+        # pymodbus は execute() 内に独自ロックを持つが、ここでは「OS バッファ
+        # フラッシュ → トランザクション」を不可分に行うためのロック。フラッシュと
+        # 送信の間に別コルーチンのトランザクションが割り込むのを防ぐ。
+        self._bus_lock = asyncio.Lock()
+
+    def _flush_input_buffer(self) -> None:
+        """OS シリアル受信バッファをクリアする。
+
+        前トランザクションがタイムアウトした後に遅れて届いた応答バイトが
+        OS 受信バッファに残ると、次トランザクションの応答先頭に混入して
+        RTU フレーマーがデシンクする。各トランザクション開始前にフラッシュ
+        することで、この残渣を除去して desync を断ち切る。
+        pymodbus は自身の recv_buffer はクリアするが OS バッファはクリアしない。
+        """
+        try:
+            if self._client is not None:
+                transport = self._client.ctx.transport
+                if hasattr(transport, "sync_serial"):
+                    transport.sync_serial.reset_input_buffer()
+        except Exception:
+            pass
+
+    @asynccontextmanager
+    async def _bus_op(self) -> AsyncIterator[None]:
+        """バス排他 + 受信バッファフラッシュを組み合わせたコンテキストマネージャ。"""
+        async with self._bus_lock:
+            self._flush_input_buffer()
+            yield
 
     async def connect(self) -> None:
         """Modbus RTU 接続を確立する。"""
@@ -97,10 +140,21 @@ class ActuatorDriver:
             parity="N",
             stopbits=1,
             framer=FramerType.RTU,
+            timeout=self._timeout,
+            retries=self._retries,
         )
         connected = await self._client.connect()
         if not connected:
             raise ConnectionError(f"Modbus RTU 接続失敗: port={self._port}")
+        # FTDI USB-RS485 アダプタのレイテンシタイマーをデフォルト 16ms から 1ms に下げる。
+        # 16ms のままでは Modbus 応答だけで最大 16ms 遅れ、50ms 制御ループ予算を超過する。
+        try:
+            transport = self._client.ctx.transport
+            if hasattr(transport, "sync_serial"):
+                transport.sync_serial.set_low_latency_mode(True)
+                logger.debug("FTDI low_latency 設定完了: port=%s", self._port)
+        except Exception:
+            logger.debug("low_latency 設定をスキップ: port=%s（非 FTDI/権限なし）", self._port)
         logger.info("ActuatorDriver 接続完了: port=%s slave_id=%d", self._port, self._slave_id)
 
     def _require_client(self) -> AsyncModbusSerialClient:
@@ -123,27 +177,32 @@ class ActuatorDriver:
         reset_alarm() / servo_on() より前に呼ぶこと。
         """
         client = self._require_client()
-        await client.write_coil(address=_COIL_PMSL, value=True, device_id=self._slave_id)
+        async with self._bus_op():
+            await client.write_coil(address=_COIL_PMSL, value=True, device_id=self._slave_id)
         logger.debug("enable_modbus_control: slave_id=%d", self._slave_id)
 
     async def reset_alarm(self) -> None:
         """アラームをリセットする（ALRS コイルをエッジ入力）。"""
         client = self._require_client()
-        await client.write_coil(address=_COIL_ALRS, value=True, device_id=self._slave_id)
+        async with self._bus_op():
+            await client.write_coil(address=_COIL_ALRS, value=True, device_id=self._slave_id)
         await asyncio.sleep(0.05)
-        await client.write_coil(address=_COIL_ALRS, value=False, device_id=self._slave_id)
+        async with self._bus_op():
+            await client.write_coil(address=_COIL_ALRS, value=False, device_id=self._slave_id)
         logger.debug("reset_alarm 完了: slave_id=%d", self._slave_id)
 
     async def servo_on(self) -> None:
         """サーボをONにする。"""
         client = self._require_client()
-        await client.write_coil(address=_COIL_SON, value=True, device_id=self._slave_id)
+        async with self._bus_op():
+            await client.write_coil(address=_COIL_SON, value=True, device_id=self._slave_id)
         logger.debug("servo_on: slave_id=%d", self._slave_id)
 
     async def servo_off(self) -> None:
         """サーボをOFFにする。"""
         client = self._require_client()
-        await client.write_coil(address=_COIL_SON, value=False, device_id=self._slave_id)
+        async with self._bus_op():
+            await client.write_coil(address=_COIL_SON, value=False, device_id=self._slave_id)
         logger.debug("servo_off: slave_id=%d", self._slave_id)
 
     async def home_return(self) -> None:
@@ -153,17 +212,20 @@ class ActuatorDriver:
         """
         client = self._require_client()
         # P-CON-CB はコイルの立ち上がりエッジ（False→True）で原点復帰をトリガーする
-        await client.write_coil(address=_COIL_HOME, value=False, device_id=self._slave_id)
+        async with self._bus_op():
+            await client.write_coil(address=_COIL_HOME, value=False, device_id=self._slave_id)
         await asyncio.sleep(0.05)
-        await client.write_coil(address=_COIL_HOME, value=True, device_id=self._slave_id)
+        async with self._bus_op():
+            await client.write_coil(address=_COIL_HOME, value=True, device_id=self._slave_id)
         logger.info("home_return 開始: slave_id=%d", self._slave_id)
 
         deadline = asyncio.get_event_loop().time() + _HOME_RETURN_TIMEOUT_S
         while asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(_HOME_RETURN_POLL_INTERVAL_S)
-            result = await client.read_holding_registers(
-                address=_REG_DSS1, count=1, device_id=self._slave_id
-            )
+            async with self._bus_op():
+                result = await client.read_holding_registers(
+                    address=_REG_DSS1, count=1, device_id=self._slave_id
+                )
             if result.isError():
                 logger.warning("home_return DSS1 読み取りエラー: slave_id=%d", self._slave_id)
                 continue
@@ -204,15 +266,43 @@ class ActuatorDriver:
             0,  # 9907: 予約
             0x0000,  # 9908: CTLF = 絶対位置移動
         ]
-        await client.write_registers(
-            address=_REG_PCMD_HI, values=registers, device_id=self._slave_id
-        )
+        async with self._bus_op():
+            await client.write_registers(
+                address=_REG_PCMD_HI, values=registers, device_id=self._slave_id
+            )
         logger.debug(
             "move_to_position: slave_id=%d pos=%d speed=%d",
             self._slave_id,
             pos,
             speed_mm_s,
         )
+
+    async def move_to_position_timed(
+        self,
+        target_pos: int,
+        current_pos: int,
+        duration_s: float,
+        accel: int = _DEFAULT_ACCEL,
+    ) -> None:
+        """目標位置まで「指定時間かけて」移動する（速度を距離÷時間で算出）。
+
+        固定速度（mm/s）ではなく「何秒で目標へ到達するか」を指定したい用途向け。
+        サーボのプロファイル速度（VCMD）を `距離[mm] / duration_s` から決めるため、
+        制御ループの周期ジッタに依存せず一定時間で滑らかにランプする。
+
+        Args:
+            target_pos: 目標位置 [pulse / 0.01mm 単位]
+            current_pos: 現在（直近指令）位置 [同]。距離算出に使う（Modbus 読みは挟まない）
+            duration_s: 目標到達までの目標時間 [s]。<=0 または距離0 のときは許容最速で移動
+            accel: 加減速指令（ACMD）
+        """
+        distance_mm = abs(target_pos - current_pos) / 100.0  # PCMD は 0.01mm 単位
+        if duration_s <= 0.0 or distance_mm <= 0.0:
+            speed_mm_s = _MAX_TIMED_SPEED_MM_S
+        else:
+            speed_mm_s = round(distance_mm / duration_s)
+        speed_mm_s = max(_MIN_TIMED_SPEED_MM_S, min(speed_mm_s, _MAX_TIMED_SPEED_MM_S))
+        await self.move_to_position(target_pos, speed_mm_s=speed_mm_s, accel=accel)
 
     async def wait_for_position_complete(
         self, timeout_s: float = _POSITION_COMPLETE_TIMEOUT_S
@@ -230,9 +320,10 @@ class ActuatorDriver:
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
             # DSS1(0x9005), 0x9006, DSSE(0x9007) を一括読み取り
-            result = await client.read_holding_registers(
-                address=_REG_DSS1, count=3, device_id=self._slave_id
-            )
+            async with self._bus_op():
+                result = await client.read_holding_registers(
+                    address=_REG_DSS1, count=3, device_id=self._slave_id
+                )
             if result.isError():
                 logger.warning(
                     "wait_for_position_complete ステータス読み取りエラー: slave_id=%d",
@@ -255,9 +346,10 @@ class ActuatorDriver:
             現在位置 [pulse / 0.01mm 単位]（符号付き 32bit）
         """
         client = self._require_client()
-        result = await client.read_holding_registers(
-            address=_REG_PNOW_HI, count=2, device_id=self._slave_id
-        )
+        async with self._bus_op():
+            result = await client.read_holding_registers(
+                address=_REG_PNOW_HI, count=2, device_id=self._slave_id
+            )
         if result.isError():
             raise OSError(f"read_position 失敗: slave_id={self._slave_id}")
         return _to_signed32(result.registers[0], result.registers[1])
@@ -269,9 +361,10 @@ class ActuatorDriver:
             電流値 [mA]（符号付き 32bit）
         """
         client = self._require_client()
-        result = await client.read_holding_registers(
-            address=_REG_CNOW_HI, count=2, device_id=self._slave_id
-        )
+        async with self._bus_op():
+            result = await client.read_holding_registers(
+                address=_REG_CNOW_HI, count=2, device_id=self._slave_id
+            )
         if result.isError():
             raise OSError(f"read_current 失敗: slave_id={self._slave_id}")
         return float(_to_signed32(result.registers[0], result.registers[1]))
@@ -283,9 +376,10 @@ class ActuatorDriver:
             True: アラームあり（ALMC ≠ 0）
         """
         client = self._require_client()
-        result = await client.read_holding_registers(
-            address=_REG_ALMC, count=1, device_id=self._slave_id
-        )
+        async with self._bus_op():
+            result = await client.read_holding_registers(
+                address=_REG_ALMC, count=1, device_id=self._slave_id
+            )
         if result.isError():
             raise OSError(f"is_alarm_active 失敗: slave_id={self._slave_id}")
         return result.registers[0] != 0

@@ -15,6 +15,7 @@ from pathlib import Path
 import asyncpg
 
 from src.infra.settings import ArchiveSettings
+from src.utils.time import to_jst_naive
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ class ArchiveManager:
             session_id,
         )
 
-        filename = f"{session_id}_{started_at.strftime('%Y%m%d_%H%M%S')}.csv"
+        filename = f"{session_id}_{to_jst_naive(started_at).strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = self._usb_path / filename
         self._export_to_csv(rows, csv_path)
         gz_path = self._compress(csv_path)
@@ -114,7 +115,9 @@ class ArchiveManager:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for row in rows:
-                writer.writerow(dict(row))
+                record = dict(row)
+                record["timestamp"] = to_jst_naive(record["timestamp"]).isoformat(sep=" ")
+                writer.writerow(record)
 
     def _compress(self, csv_path: Path) -> Path:
         """CSV を gzip 圧縮し、元ファイルを削除して .gz パスを返す。"""

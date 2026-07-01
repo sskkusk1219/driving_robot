@@ -153,6 +153,61 @@ async def test_start_drive_invalid_state(stub_controller: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_arm_ok(stub_controller: MagicMock) -> None:
+    """自動走行 arm: 200 で status='armed'、arm_auto_drive が呼ばれること。"""
+    stub_controller.arm_auto_drive = AsyncMock()
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/arm")
+    assert res.status_code == 200
+    assert res.json()["status"] == "armed"
+    stub_controller.arm_auto_drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_auto_arm_precheck_failed_returns_422(stub_controller: MagicMock) -> None:
+    stub_controller.arm_auto_drive = AsyncMock(
+        side_effect=PreCheckFailed("車速が 0 ではありません")
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/arm")
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_auto_arm_invalid_state_returns_409(stub_controller: MagicMock) -> None:
+    stub_controller.arm_auto_drive = AsyncMock(side_effect=InvalidStateTransition("READY 以外不可"))
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/arm")
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_auto_cancel_ok(stub_controller: MagicMock) -> None:
+    """自動走行 cancel: 200 で status='cancelled'、cancel_auto_drive が呼ばれること。"""
+    stub_controller.cancel_auto_drive = AsyncMock()
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/cancel")
+    assert res.status_code == 200
+    assert res.json()["status"] == "cancelled"
+    stub_controller.cancel_auto_drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_auto_cancel_invalid_state_returns_409(stub_controller: MagicMock) -> None:
+    stub_controller.cancel_auto_drive = AsyncMock(
+        side_effect=InvalidStateTransition("arm 後のみ可")
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/cancel")
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_stop_ok(stub_controller: MagicMock) -> None:
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -349,6 +404,63 @@ async def test_learning_start_ok(stub_controller: MagicMock) -> None:
     assert stub_controller.start_learning_drive.await_args.kwargs["log_writer"] is None
 
 
+@pytest.mark.asyncio
+async def test_learning_arm_ok(stub_controller: MagicMock) -> None:
+    """学習運転 arm: 200 で status='armed'、arm_learning_drive が呼ばれること。"""
+    stub_controller.arm_learning_drive = AsyncMock()
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/arm")
+    assert res.status_code == 200
+    assert res.json()["status"] == "armed"
+    stub_controller.arm_learning_drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_learning_arm_precheck_failed_returns_422(stub_controller: MagicMock) -> None:
+    stub_controller.arm_learning_drive = AsyncMock(
+        side_effect=PreCheckFailed("車速が 0 ではありません")
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/arm")
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_learning_arm_invalid_state_returns_409(stub_controller: MagicMock) -> None:
+    stub_controller.arm_learning_drive = AsyncMock(
+        side_effect=InvalidStateTransition("READY 以外不可")
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/arm")
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_learning_cancel_ok(stub_controller: MagicMock) -> None:
+    """学習運転 cancel: 200 で status='cancelled'、cancel_learning_drive が呼ばれること。"""
+    stub_controller.cancel_learning_drive = AsyncMock()
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/cancel")
+    assert res.status_code == 200
+    assert res.json()["status"] == "cancelled"
+    stub_controller.cancel_learning_drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_learning_cancel_invalid_state_returns_409(stub_controller: MagicMock) -> None:
+    stub_controller.cancel_learning_drive = AsyncMock(
+        side_effect=InvalidStateTransition("arm 後のみ可")
+    )
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/cancel")
+    assert res.status_code == 409
+
+
 def test_get_log_writer_returns_none_without_pool() -> None:
     """db_pool が None なら get_log_writer は None を返す。"""
     from types import SimpleNamespace
@@ -434,6 +546,10 @@ async def test_learning_train_ok_updates_model_path(
         return "data/models/fake_model.pkl", fake_metrics
 
     monkeypatch.setattr("src.web.routers.drive.train_inverse_model", _fake_train)
+    # train は最新の学習走行セッションを既定対象にする（空ログでも fake_train が成功を返す）
+    monkeypatch.setattr(
+        app.state.session_repo, "latest_learning_session_id", AsyncMock(return_value="sess-1")
+    )
 
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -467,6 +583,9 @@ async def test_learning_train_refreshes_active_profile(
         return "data/models/fake_model.pkl", {"accel": {"n": 1.0}, "brake": {"n": 1.0}}
 
     monkeypatch.setattr("src.web.routers.drive.train_inverse_model", _fake_train)
+    monkeypatch.setattr(
+        app.state.session_repo, "latest_learning_session_id", AsyncMock(return_value="sess-1")
+    )
 
     app.state.controller = stub_controller
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -477,6 +596,22 @@ async def test_learning_train_refreshes_active_profile(
     refreshed = stub_controller.refresh_active_profile.call_args[0][0]
     assert refreshed.id == profile_id
     assert refreshed.model_path == "data/models/fake_model.pkl"
+
+
+@pytest.mark.asyncio
+async def test_learning_train_no_learning_session_returns_422(
+    stub_controller: MagicMock,
+) -> None:
+    """学習走行ログが無い（最新学習セッションが None）と 422 を返すこと。"""
+    from uuid import uuid4  # noqa: PLC0415
+
+    profile_id = str(uuid4())
+    await _create_profile(profile_id)
+    # InMemorySessionRepository.latest_learning_session_id は None を返す
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning/train", json={"profile_id": profile_id})
+    assert res.status_code == 422
 
 
 @pytest.mark.asyncio

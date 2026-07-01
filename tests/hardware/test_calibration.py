@@ -13,8 +13,8 @@
     acc : 5.20 mm = 0%, 72.30 mm = 100%  brk : 4.80 mm = 0%, 68.50 mm = 100%
 
 接続:
-    /dev/ttyUSB0  slave_id=1  アクセル軸
-    /dev/ttyUSB1  slave_id=1  ブレーキ軸
+    /dev/actuator_accel  slave_id=1  アクセル軸（udev固定シンボリックリンク FTBB7KRI）
+    /dev/actuator_brake  slave_id=1  ブレーキ軸（udev固定シンボリックリンク FTAQUJJJ）
 
 実行方法: .venv/bin/python tests/hardware/test_calibration.py
 """
@@ -32,8 +32,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.infra.actuator_driver import ActuatorDriver
 
 # --- 接続設定 ---
-_ACCEL_PORT = "/dev/ttyUSB0"
-_BRAKE_PORT = "/dev/ttyUSB1"
+_ACCEL_PORT = "/dev/actuator_accel"
+_BRAKE_PORT = "/dev/actuator_brake"
 _ACCEL_SLAVE_ID = 1
 _BRAKE_SLAVE_ID = 1  # 両軸とも slave_id=1（各軸が独立した RS-485 バス上）
 _BAUD_RATE = 38400

@@ -239,6 +239,29 @@ except Exception as e:
 decoded = db.decode_message(msg.arbitration_id, msg.data)  # 4バイト受信・8バイト定義で例外
 ```
 
+#### PCA9685 / I2C ボタンサーボ（Post-MVP）
+
+`ButtonServoDriver` は `ActuatorDriver` と同様に、ハードウェアライブラリ（`adafruit-*` / `smbus2`）を
+**メソッド内で遅延 import** し、非ハードウェア環境でもモジュールを import 可能に保つ。インターフェースは
+`Protocol` で定義し、非HW環境ではスタブ（`_StubButtonServoDriver`）へ差し替える（既存の `_StubActuator` と同パターン）。
+
+```python
+# ✅ SG90 は 50Hz PWM。角度は「待機／押下」の2ポジションのみ（設定値）
+class ButtonServoDriver:
+    async def press(self, channel: int, duration_s: float) -> None:
+        pca = self._require_pca()           # 遅延 import した PCA9685 インスタンス
+        pca.channels[channel].angle = self._press_angle
+        try:
+            await asyncio.sleep(duration_s)  # 押下時間だけ保持
+        finally:
+            pca.channels[channel].angle = self._rest_angle  # 必ず待機位置へ戻す
+
+# ❌ 任意角度・任意保持は不可（角度は設定の2値、時間のみ可変）
+```
+
+> PCA9685 の I2C バスはアクセル・ブレーキの RS-485（Modbus RTU）とは独立しており、50ms制御ループの
+> バスとは競合しない。ただしボタン押下は状態機械でゲートし、RUNNING／該当モード中のみ許可する。
+
 ---
 
 ### 安全に関わるコードの原則
@@ -275,6 +298,69 @@ if current_ma > OVERCURRENT_LIMIT_MA:
 if current_ma > 3000:  # 何の値か不明
     raise SafetyError("過電流検知")
 ```
+
+4. **安全包絡は生成側で機構的に保証**: 自動生成する基準軌跡・パターンは、プロファイルの
+   安全包絡（最高車速・上限G）を「生成段階」で満たすように作る（実行時の監視だけに頼らない）。
+
+```python
+# ✅ 良い例: 規定パターンの減速区間長を上限Gから算出し、レート ≤ max_decel_g を保証
+rate = max(DECEL_MARGIN * profile.max_decel_g * G_TO_KMHS, MIN_RATE_KMHS)
+dt = (v_from - v_to) / rate            # この区間の所要時間（減速レートが上限以内になる）
+speed = min(speed, profile.max_speed)  # 全点を最高車速以内にクランプ
+```
+
+5. **ボタンサーボは2値角度に制限・非常停止時は待機位置へ**: ボタンサーボ（SG90）の角度は
+   「待機／押下」の2ポジション（設定値）に限定し、任意角度は取らない。非常停止・エラー遷移時は
+   `release_all()` で全チャンネルを待機（非押下）位置へ戻す（ペダルアクチュエータの原点復帰に相当）。
+
+```python
+# 例外の有無にかかわらず全ボタンサーボを待機位置へ
+async def safe_stop(self) -> None:
+    ...
+    await self._button_servo.release_all()  # 押下途中でも待機位置へ復帰
+```
+
+---
+
+### 純粋ロジックとハード実行の分離（テスト容易性）
+
+ハードを動かす制御・適合ロジックは、**純粋な計算ロジック**と**ハード実行**を分離し、計算側を
+注入式（走行結果をコールバックで受け取る等）にしてハード無しで単体テストできるようにする。
+
+```python
+# ✅ 良い例: 座標降下チューナーは走行（ハード）を持たず、候補→コスト報告の純粋ロジック
+tuner = CoordinateDescentTuner(initial_gains, max_runs=15)
+while (cand := tuner.next_candidate()) is not None:
+    cost = run_and_evaluate(cand)   # ← ハード実行は呼び出し側（コントローラ）
+    tuner.report(cand, cost)
+# テストでは run_and_evaluate を既知の凸コスト関数に差し替えて収束を検証できる
+```
+
+> FOPDT同定・SIMC算出・規定パターン生成・コスト関数も同様に `src/domain/pid_tuning.py` の
+> 純粋関数として実装し、ハード結合のオーケストレーションは `RobotController` 側に置く。
+
+---
+
+### フロントエンド規約
+
+React 18 + `@babel/standalone`（CDN・ビルド工程なし）でブラウザ内トランスパイルする構成。グラフは外部チャートライブラリではなく **SVG を直接描画**する。
+
+1. **共有コンポーネントを優先**: 学習運転・自動運転のモニターは共有の `DriveMonitorScreen`（`src/web/static/js/screens/auto-drive.js`）を props 違いで再利用する。画面ごとに重複実装しない。
+
+2. **時間→座標は1箇所に集約**: リアルタイムグラフの時間軸マッピング（スライディングウィンドウ式と `toXFull(frac)`）を一元化し、表示挙動の変更はこのマッピング式を起点に行う。
+
+3. **ライブ表示マーカーは現在値に紐づける**: 「現在位置」など常時表示すべきマーカーは、軌跡（描画済みデータ列）の最終点ではなく `realtimeData` の現在値に紐づける。これにより停止/初期状態（データ0件）でも表示される。
+
+```jsx
+// ✅ 良い例: 走行前(値0)でも中央に表示される
+<circle cx={toXFull(0.5)} cy={toY(rd.actual_speed_kmh, maxSpeed, PH1)} r="4.5" />
+
+// ❌ 悪い例: 走行データが無いと消える
+const p = speedAct_pts[speedAct_pts.length - 1];
+<circle cx={p.x} cy={p.y} r="4.5" />
+```
+
+4. **画面外データはクランプではなく除外**: ウィンドウ外の点は座標をクランプ（端に固定）すると横線アーティファクトになるため、`frac∈[0,1]` でフィルタ除外する。
 
 ---
 
@@ -317,6 +403,7 @@ main                        # 動作確認済みの安定版
 - `control`: 制御アルゴリズム（FF・PID）
 - `safety`: 安全監視
 - `can`: CAN車速受信
+- `servo`: ボタンサーボ（PCA9685 / SG90）・タイムスケジュール
 - `api`: FastAPI・WebSocket
 - `log`: ログ・アーカイブ
 - `profile`: 車両プロファイル管理
@@ -605,6 +692,12 @@ bash scripts/start.sh
 > **udev rules によるシリアルポート固定**: 複数の USB-RS485 デバイスを接続する場合、
 > 再接続でポート番号が変わることがある。`udev rules` でシリアル番号に基づき
 > `/dev/ttyUSB_accel`・`/dev/ttyUSB_brake` に固定することを推奨する。
+
+> **PCA9685 / I2C（ボタンサーボ, Post-MVP）**: `raspi-config`（または `/boot/firmware/config.txt` の
+> `dtparam=i2c_arm=on`）で I2C を有効化し、`sudo apt install i2c-tools` の `i2cdetect -y 1` で
+> PCA9685 が `0x40` に見えることを確認する。Python ライブラリは
+> `pip install adafruit-circuitpython-pca9685`（または `smbus2`）で導入する。
+> SG90 ×16 の電源は PCA9685 の V+ に外部5Vを供給し、本体ロジック電源とは分離する（GNDは共通）。
 
 ### 推奨開発ツール
 

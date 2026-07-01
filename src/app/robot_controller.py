@@ -7,12 +7,21 @@ from uuid import uuid4
 
 from src.domain.control.drive_loop import DriveLoop
 from src.domain.control.feedforward import FeedforwardController
+from src.domain.control.learning_loop import LearningLoop
 from src.domain.control.pid import PIDController
+from src.domain.control.schedule_loop import ScheduleLoop
+from src.domain.pid_tuning import (
+    CoordinateDescentTuner,
+    build_tuning_trajectory,
+    tuning_cost,
+)
+from src.domain.pre_check import ITEM_ACTUATOR_POSITION, ITEM_VEHICLE_STOPPED
 from src.models.calibration import CalibrationResult
 from src.models.drive_log import DriveLogData, DriveSession
 from src.models.driving_mode import DrivingMode
+from src.models.learning_drive import LearningPattern
 from src.models.pre_check import PreCheckResult
-from src.models.profile import StopConfig, VehicleProfile
+from src.models.profile import PIDGains, StopConfig, VehicleProfile
 from src.models.system_state import (
     InitStep,
     InitStepStatus,
@@ -20,6 +29,7 @@ from src.models.system_state import (
     RobotState,
     SystemState,
 )
+from src.models.time_schedule import TimeSchedule
 
 _logger = logging.getLogger(__name__)
 
@@ -27,6 +37,24 @@ _logger = logging.getLogger(__name__)
 # 「現在値」として WS 配信し続けると、操作者に正常なダッシュボードを見せたまま
 # ロボットが無制御になる（コードレビュー 2026-06-11 指摘 #16）。
 SNAPSHOT_MAX_AGE_S: float = 0.5
+
+# 学習運転 arm: ブレーキ踏込後に車速が 0 へ収束するのを待つパラメータ
+_VEHICLE_STOP_SPEED_KMH: float = 0.5  # これ未満を停車とみなす
+_VEHICLE_STOP_TIMEOUT_S: float = 10.0  # 収束待ちのタイムアウト
+_VEHICLE_STOP_POLL_S: float = 0.2  # 車速ポーリング間隔
+
+# 学習運転終了 → PID 自動適合への橋渡し減速。学習最終パターンは惰行/減速の途中で
+# 終わり車両が転動したまま（最大数 km/h）のことがある。その状態で PID 適合の規定パターン
+# （0km/h 始点）を走らせると追従誤差が大きく逸脱扱いになるため、緩やかに減速・停止確認して
+# から適合へ移行する。
+_G_TO_KMHS: float = 9.81 * 3.6  # 1G を km/h/s へ換算（learning_loop.G_TO_KMHS と同一）
+_BRIDGE_DECEL_G: float = 0.1  # 目標減速 [G]（緩減速）
+_BRIDGE_DECEL_POLL_S: float = 0.1  # 速度ポーリング兼ブレーキ調整間隔 [s]
+_BRIDGE_DECEL_TIMEOUT_S: float = 30.0  # 減速の打ち切り（安全網）[s]
+_BRIDGE_BRAKE_STEP_PCT: float = 1.0  # 1 サイクルあたりのブレーキ開度増減 [%]
+
+# アクチュエータのハードウェア上限 [pulse]。これを超えると機械端に当たりタイムアウトになる。
+_ACTUATOR_PULSE_MAX: int = 9500
 
 
 class InvalidStateTransition(Exception):
@@ -45,6 +73,14 @@ class PreCheckFailed(Exception):
         super().__init__(str(result))
 
 
+class PidTuningAborted(Exception):
+    """PID 自動適合の走行中に非常停止が発生し、適合を中断した場合に送出。"""
+
+
+# 規定パターン走行の完了待ちタイムアウト余裕 [s]（total_duration に加算）。
+_PID_TUNING_DRIVE_TIMEOUT_MARGIN_S: float = 30.0
+
+
 VALID_TRANSITIONS: dict[RobotState, frozenset[RobotState]] = {
     # 物理的な非常停止スイッチはどの運用画面でも押されうるため、起動前(BOOTING)を除く
     # 全状態から EMERGENCY への遷移を許可する（安全オーバーライド）。
@@ -59,7 +95,13 @@ VALID_TRANSITIONS: dict[RobotState, frozenset[RobotState]] = {
     RobotState.PRE_CHECK: frozenset(
         {RobotState.RUNNING, RobotState.MANUAL, RobotState.READY, RobotState.EMERGENCY}
     ),
-    RobotState.RUNNING: frozenset({RobotState.READY, RobotState.EMERGENCY}),
+    RobotState.RUNNING: frozenset(
+        {RobotState.READY, RobotState.PAUSED, RobotState.EMERGENCY}
+    ),
+    # 一時停止: 再開（RUNNING）・走行終了（READY）・非常停止（EMERGENCY）へ遷移できる。
+    RobotState.PAUSED: frozenset(
+        {RobotState.RUNNING, RobotState.READY, RobotState.EMERGENCY}
+    ),
     RobotState.MANUAL: frozenset({RobotState.READY, RobotState.EMERGENCY}),
     RobotState.EMERGENCY: frozenset({RobotState.STANDBY}),
     # 非常停止からの復帰は STANDBY へ戻し、初期化（アラームリセット→サーボON→原点復帰）を
@@ -89,6 +131,10 @@ class ActuatorDriverProtocol(Protocol):
 
     async def move_to_position(self, pos: int) -> None: ...
 
+    async def move_to_position_timed(
+        self, target_pos: int, current_pos: int, duration_s: float
+    ) -> None: ...
+
     async def wait_for_position_complete(self) -> None: ...
 
 
@@ -96,6 +142,16 @@ class CANReaderProtocol(Protocol):
     async def connect(self) -> None: ...
 
     async def read_speed(self) -> float: ...
+
+
+class ButtonServoProtocol(Protocol):
+    """ボタンサーボ（PCA9685+SG90）ドライバのプロトコル。ButtonServoDriver が実装する。"""
+
+    async def connect(self) -> None: ...
+
+    async def press(self, channel: int, duration_s: float) -> None: ...
+
+    async def release_all(self) -> None: ...
 
 
 class SafetyMonitorProtocol(Protocol):
@@ -134,7 +190,12 @@ class CalibrationManagerProtocol(Protocol):
 
 
 class PreCheckRunnerProtocol(Protocol):
-    async def run(self) -> PreCheckResult: ...
+    async def run(
+        self,
+        exclude: frozenset[str] = frozenset(),
+        *,
+        include_button_servo: bool = False,
+    ) -> PreCheckResult: ...
 
     def set_profile(self, profile: VehicleProfile | None) -> None: ...
 
@@ -152,8 +213,8 @@ class LogWriterProtocol(Protocol):
 class LearningDriveManagerProtocol(Protocol):
     """学習走行マネージャーのプロトコル。"""
 
-    def build_learning_reference(self, profile: VehicleProfile) -> DrivingMode:
-        """学習用の連続基準速度プロファイル（加減速を網羅）を生成する。"""
+    def generate_patterns(self, profile: VehicleProfile) -> list[LearningPattern]:
+        """開ループ実行する開度パターン列を生成する。"""
         ...
 
 
@@ -174,7 +235,10 @@ class RobotController:
     _pre_check_runner: PreCheckRunnerProtocol | None
     _calibration_manager: CalibrationManagerProtocol | None
     _learning_manager: LearningDriveManagerProtocol | None
+    _learning_loop: LearningLoop | None
     _drive_loop: DriveLoop | None
+    _schedule_loop: ScheduleLoop | None
+    _button_servo: ButtonServoProtocol | None
     _log_writer: LogWriterProtocol | None
     _active_learning_task: asyncio.Task[None] | None
     _pending_calib_zero: dict[str, int | None]
@@ -194,6 +258,7 @@ class RobotController:
         pre_check_runner: PreCheckRunnerProtocol | None = None,
         calibration_manager: CalibrationManagerProtocol | None = None,
         learning_manager: LearningDriveManagerProtocol | None = None,
+        button_servo: ButtonServoProtocol | None = None,
         control_interval_s: float = 0.05,
         log_every_n_cycles: int = 2,
     ) -> None:
@@ -211,10 +276,16 @@ class RobotController:
         self._pre_check_runner = pre_check_runner
         self._calibration_manager = calibration_manager
         self._learning_manager = learning_manager
+        self._button_servo = button_servo
         self._drive_loop = None
+        self._learning_loop = None
+        self._schedule_loop = None
         self._log_writer = None
         self._active_learning_task = None
         self._last_kpi_summary: dict[str, float] | None = None
+        # 自動走行が完了（stop_auto_drive）または非常停止（emergency_stop）したら set される。
+        # PID 自動適合の走行完了待ちに使う。通常 UI 経路では無害な no-op。
+        self._drive_complete = asyncio.Event()
         self._control_interval_s = control_interval_s
         self._log_every_n_cycles = log_every_n_cycles
         self._pending_calib_zero: dict[str, int | None] = {"accel": None, "brake": None}
@@ -336,17 +407,43 @@ class RobotController:
         )
 
     @property
-    def current_openings(self) -> tuple[float, float]:
-        """現在のアクセル・ブレーキ開度 [%] を返す。DriveLoop 非動作時は (0.0, 0.0)。"""
+    def _realtime_loop(self) -> DriveLoop | LearningLoop | ScheduleLoop | None:
+        """現在動作中のループ（走行 DriveLoop / 学習 LearningLoop / スケジュール ScheduleLoop）。
+        3者は同一のリアルタイム計測 I/F（current_*_opening / current_ref_speed /
+        last_snapshot）を公開する。同時には高々1つのみ動作する。"""
         if self._drive_loop is not None:
-            return self._drive_loop.current_accel_opening, self._drive_loop.current_brake_opening
+            return self._drive_loop
+        if self._learning_loop is not None:
+            return self._learning_loop
+        return self._schedule_loop
+
+    def _active_control_loop(self) -> DriveLoop | LearningLoop | ScheduleLoop | None:
+        """現在動作中の制御ループ（stop/stop_and_join を持つ）。同時には高々1つ。"""
+        return self._realtime_loop
+
+    async def _release_button_servo(self) -> None:
+        """全ボタンサーボを待機位置へ戻す。未構成・失敗時も処理は継続する。"""
+        if self._button_servo is None:
+            return
+        try:
+            await self._button_servo.release_all()
+        except Exception:
+            _logger.exception("ボタンサーボの解放に失敗しました（処理は継続）")
+
+    @property
+    def current_openings(self) -> tuple[float, float]:
+        """現在のアクセル・ブレーキ開度 [%] を返す。ループ非動作時は (0.0, 0.0)。"""
+        loop = self._realtime_loop
+        if loop is not None:
+            return loop.current_accel_opening, loop.current_brake_opening
         return 0.0, 0.0
 
     @property
     def current_ref_speed(self) -> float | None:
-        """現在の基準車速 [km/h]。DriveLoop 非動作時は None。WebSocket 配信で使う。"""
-        if self._drive_loop is not None:
-            return self._drive_loop.current_ref_speed
+        """現在の基準車速 [km/h]。ループ非動作時・学習運転時は None。WebSocket 配信で使う。"""
+        loop = self._realtime_loop
+        if loop is not None:
+            return loop.current_ref_speed
         return None
 
     async def get_realtime_data(self) -> RealtimeSnapshot:
@@ -357,8 +454,9 @@ class RobotController:
         キャッシュがサイクル凍結等で古くなった場合は障害を隠さないよう
         ハードウェア読み取りへフォールバックする。非走行時もハードウェアから並列取得する。
         """
-        if self._drive_loop is not None:
-            snapshot = self._drive_loop.last_snapshot
+        realtime_loop = self._realtime_loop
+        if realtime_loop is not None:
+            snapshot = realtime_loop.last_snapshot
             if snapshot is not None:
                 age_s = asyncio.get_running_loop().time() - snapshot.captured_at
                 if age_s <= SNAPSHOT_MAX_AGE_S:
@@ -392,6 +490,15 @@ class RobotController:
                 self._can_reader.connect(),
             )
             await self._safety_monitor.start_monitoring()
+            # ボタンサーボは任意構成。接続失敗はスケジュール走行のみ不可とし、起動自体は継続する。
+            if self._button_servo is not None:
+                try:
+                    await self._button_servo.connect()
+                except Exception:
+                    _logger.warning(
+                        "ボタンサーボの接続に失敗しました（タイムスケジュール走行は利用不可）",
+                        exc_info=True,
+                    )
             self._transition(RobotState.STANDBY)
         except Exception:
             self._transition(RobotState.ERROR)
@@ -491,28 +598,36 @@ class RobotController:
         self._transition(RobotState.READY)
 
     async def stop(self) -> None:
-        """正常停止: 原点復帰 → サーボOFF → READY 遷移。RUNNING または MANUAL 状態でのみ呼べる。"""
-        if self._state not in (RobotState.RUNNING, RobotState.MANUAL):
+        """正常停止: 原点復帰 → サーボOFF → READY。RUNNING・PAUSED・MANUAL 状態でのみ呼べる。"""
+        if self._state not in (RobotState.RUNNING, RobotState.PAUSED, RobotState.MANUAL):
             raise InvalidStateTransition(
-                f"stop は RUNNING または MANUAL 状態でのみ呼べます (現在: {self._state})"
+                f"stop は RUNNING・PAUSED・MANUAL 状態でのみ呼べます (現在: {self._state})"
             )
         drive_loop = self._drive_loop
+        active_loop = self._active_control_loop()
         self._drive_loop = None
-        if drive_loop is not None:
+        self._learning_loop = None
+        self._schedule_loop = None
+        if active_loop is not None:
             # 飛行中の位置指令完了を待ってから home_return（バス上のインターリーブ防止）
-            await drive_loop.stop_and_join()
-            self._record_kpi_summary(drive_loop)
+            await active_loop.stop_and_join()
+            if drive_loop is not None:  # KPI は閉ループ走行のみ集計（学習走行には無い）
+                self._record_kpi_summary(drive_loop)
         self._transition(RobotState.READY)
-        await asyncio.gather(
-            self._accel_driver.home_return(),
-            self._brake_driver.home_return(),
-        )
-        await asyncio.gather(
-            self._accel_driver.servo_off(),
-            self._brake_driver.servo_off(),
-        )
-        await self._close_session("completed")
-        self._last_normal_shutdown = True
+        # home_return / servo_off が失敗してもセッションは必ず閉じる（status='running' 残り防止）
+        try:
+            await self._release_button_servo()  # スケジュール走行のボタンサーボを待機位置へ
+            await asyncio.gather(
+                self._accel_driver.home_return(),
+                self._brake_driver.home_return(),
+            )
+            await asyncio.gather(
+                self._accel_driver.servo_off(),
+                self._brake_driver.servo_off(),
+            )
+        finally:
+            await self._close_session("completed")
+            self._last_normal_shutdown = True
 
     async def shutdown(self) -> None:
         """グレースフルシャットダウン: DriveLoop を停止し、ペダル解放とサーボOFFを試みる。
@@ -523,9 +638,18 @@ class RobotController:
         原点復帰 → サーボOFF を実施する（失敗してもシャットダウンは続行）。
         """
         drive_loop = self._drive_loop
+        learning_loop = self._learning_loop
+        schedule_loop = self._schedule_loop
         self._drive_loop = None
+        self._learning_loop = None
+        self._schedule_loop = None
         if drive_loop is not None:
             await drive_loop.stop_and_join()
+        if learning_loop is not None:
+            await learning_loop.stop_and_join()
+        if schedule_loop is not None:
+            await schedule_loop.stop_and_join()
+        await self._release_button_servo()
         if self._active_learning_task is not None:
             self._active_learning_task.cancel()
             self._active_learning_task = None
@@ -534,6 +658,7 @@ class RobotController:
             RobotState.CALIBRATING,
             RobotState.PRE_CHECK,
             RobotState.RUNNING,
+            RobotState.PAUSED,
             RobotState.MANUAL,
         ):
             try:
@@ -566,24 +691,39 @@ class RobotController:
         同一軸バスでインターリーブし、非常停止中にペダルが再適用され得る
         （コードレビュー 2026-06-11 指摘 #6）。
         """
+        # 走行/学習/スケジュールのいずれが動作中でも停止する（同時には動かない）
         drive_loop = self._drive_loop
+        active_loop = self._active_control_loop()
         self._drive_loop = None
-        if drive_loop is not None:
-            drive_loop.stop()  # 同期で停止フラグ（以降のサイクルは書き込み前に中断）
+        self._learning_loop = None
+        self._schedule_loop = None
+        if active_loop is not None:
+            active_loop.stop()  # 同期で停止フラグ（以降のサイクルは書き込み前に中断）
         if self._state == RobotState.EMERGENCY:
-            if drive_loop is not None:
-                await drive_loop.stop_and_join()
+            if active_loop is not None:
+                await active_loop.stop_and_join()
+            await self._release_button_servo()
+            # 先行呼び出しが home_return 失敗等で閉じ損ねた場合に備え、ここでも閉じる（冪等）
+            await self._close_session("emergency")
+            self._drive_complete.set()  # PID 自動適合の走行完了待ちを起こす（中断検知）
             return
         self._transition(RobotState.EMERGENCY)
-        if drive_loop is not None:
-            await drive_loop.stop_and_join()
-            self._record_kpi_summary(drive_loop)
-        await asyncio.gather(
-            self._accel_driver.home_return(),
-            self._brake_driver.home_return(),
-        )
-        await self._close_session("emergency")
-        self._last_normal_shutdown = False
+        # home_return（実機 Modbus）が失敗してもセッションは必ず 'emergency' で閉じる。
+        # try なしだと例外で _close_session に到達せず status='running' のまま残る。
+        try:
+            if active_loop is not None:
+                await active_loop.stop_and_join()
+                if drive_loop is not None:  # KPI は閉ループ走行のみ集計（学習走行には無い）
+                    self._record_kpi_summary(drive_loop)
+            await self._release_button_servo()  # 全ボタンサーボを待機位置へ
+            await asyncio.gather(
+                self._accel_driver.home_return(),
+                self._brake_driver.home_return(),
+            )
+        finally:
+            await self._close_session("emergency")
+            self._last_normal_shutdown = False
+            self._drive_complete.set()  # PID 自動適合の走行完了待ちを起こす（中断検知）
 
     async def _dispatch_emergency(self) -> None:
         """DriveLoop 内部起因（過電流・逸脱・CAN断・サイクル例外）の非常停止を発火する。
@@ -663,12 +803,20 @@ class RobotController:
         self._log_writer = None
         self._active_session_id = None
 
-    async def _run_pre_check_and_transition(self, target: RobotState) -> None:
-        """READY → PRE_CHECK → target の共通プロローグ。失敗時は READY へロールバックする。"""
+    async def _run_pre_check_and_transition(
+        self, target: RobotState, *, include_button_servo: bool = False
+    ) -> None:
+        """READY → PRE_CHECK → target の共通プロローグ。失敗時は READY へロールバックする。
+
+        include_button_servo=True でボタンサーボ確認（走行前チェック項目8）を追加する
+        （タイムスケジュール実行時のみ）。
+        """
         self._transition(RobotState.PRE_CHECK)
         try:
             if self._pre_check_runner is not None:
-                result = await self._pre_check_runner.run()
+                result = await self._pre_check_runner.run(
+                    include_button_servo=include_button_servo
+                )
                 if not result.passed:
                     raise PreCheckFailed(result)
             self._transition(target)
@@ -705,14 +853,143 @@ class RobotController:
             status="running",
         )
 
+    async def _run_tuning_drive(
+        self, profile: VehicleProfile, log_writer: LogWriterProtocol | None
+    ) -> dict[str, float]:
+        """規定パターンを 1 回走行し、完了を待って KPI サマリを返す。
+
+        **走行前チェック・arm はしない**。学習終了（停車保持ブレーキで停止）／前の最適化走行
+        終了（同上）で車両は既に停止保持済みのため、DriveLoop を直接起動する。各走行の終了でも
+        原点復帰せず停止保持を維持する（on_complete=_stop_tuning_drive）。最適化セッション全体の
+        完了時にのみ原点復帰で解放する。
+
+        完了（_stop_tuning_drive で _drive_complete set）または非常停止まで待つ。
+        非常停止・タイムアウト時は PidTuningAborted を送出する。
+        """
+        mode = build_tuning_trajectory(profile)
+        self._drive_complete.clear()
+        # READY → PRE_CHECK → RUNNING。状態機械は PRE_CHECK を経由必須だが、走行前チェック
+        # （PreCheckRunner）は実行しない（車両は停止保持済みのため）。
+        self._transition(RobotState.PRE_CHECK)
+        self._transition(RobotState.RUNNING)
+        # mode_id=None: 規定パターンは永続化された DrivingMode ではない（drive_sessions.mode_id は
+        # UUID カラムで "pid-tune" を渡すと DataError→500。学習運転と同様に None）。
+        session = await self._begin_session("auto", None, log_writer, RobotState.RUNNING)
+        self._build_and_start_drive_loop(
+            mode,
+            profile,
+            log_writer,
+            session.id,
+            on_complete=self._stop_tuning_drive,
+            disable_deviation_check=True,  # 適合中は逸脱で非常停止しない
+        )
+        timeout = mode.total_duration + _PID_TUNING_DRIVE_TIMEOUT_MARGIN_S
+        try:
+            await asyncio.wait_for(self._drive_complete.wait(), timeout)
+        except TimeoutError as e:
+            raise PidTuningAborted("PID 自動適合の走行がタイムアウトしました") from e
+        if self._state == RobotState.EMERGENCY:
+            raise PidTuningAborted("走行中に非常停止が発生したため PID 自動適合を中断しました")
+        return self._last_kpi_summary or {}
+
+    async def _stop_tuning_drive(self) -> None:
+        """PID 最適化の 1 走行終了。原点復帰せず停車保持ブレーキで停止維持して READY へ。
+
+        次の最適化走行へ停止状態のまま移行するため home_return しない。最適化セッション全体の
+        完了時に呼び出し元（run_pid_validation / run_pid_tuning_session）が原点復帰で解放する。
+        """
+        drive_loop = self._drive_loop
+        self._drive_loop = None
+        if drive_loop is not None:
+            await drive_loop.stop_and_join()
+            self._record_kpi_summary(drive_loop)
+        self._transition(RobotState.READY)
+        try:
+            if self._active_profile is not None:
+                await self._apply_brake_hold(self._active_profile)
+        finally:
+            await self._close_session("completed")
+            self._drive_complete.set()
+
+    async def _release_after_tuning(self) -> None:
+        """PID 最適化セッション終了時に停車保持ブレーキを解放（両軸原点復帰）する。"""
+        await asyncio.gather(
+            self._accel_driver.home_return(),
+            self._brake_driver.home_return(),
+        )
+
+    async def run_pid_validation(
+        self, profile: VehicleProfile, log_writer: LogWriterProtocol | None = None
+    ) -> dict[str, float]:
+        """規定パターンを現在のプロファイルゲインで 1 回走行し KPI サマリを返す。"""
+        self._assert_tuning_preconditions(profile)
+        g = profile.pid_gains
+        self._pid.set_gains(g.kp, g.ki, g.kd)
+        try:
+            return await self._run_tuning_drive(profile, log_writer)
+        finally:
+            await self._release_after_tuning()  # 停止保持を解放して終了
+
+    async def run_pid_tuning_session(
+        self,
+        profile: VehicleProfile,
+        log_writer: LogWriterProtocol | None = None,
+        max_runs: int = 15,
+    ) -> tuple[PIDGains, list[dict[str, float]]]:
+        """規定パターンを反復走行し座標降下で KPI コストを最小化する。
+
+        各走行は走行前チェックなしで停止保持状態から直接実行し、走行間も停止保持を維持する。
+        セッション完了/中断時に停車保持ブレーキを解放（原点復帰）する。
+
+        Returns:
+            (最良ゲイン, 反復履歴) のタプル。履歴は各走行のゲイン・コスト・KPI を含む。
+            最良ゲインは制御スタックへ反映済み（永続化は呼び出し元の責務）。
+        """
+        self._assert_tuning_preconditions(profile)
+        tuner = CoordinateDescentTuner(profile.pid_gains, max_runs=max_runs)
+        history: list[dict[str, float]] = []
+        try:
+            while (cand := tuner.next_candidate()) is not None:
+                self._pid.set_gains(cand.kp, cand.ki, cand.kd)
+                kpi = await self._run_tuning_drive(profile, log_writer)
+                cost = tuning_cost(kpi)
+                tuner.report(cand, cost)
+                history.append(
+                    {"kp": cand.kp, "ki": cand.ki, "kd": cand.kd, "cost": cost, **kpi}
+                )
+            best = tuner.best
+            self._pid.set_gains(best.kp, best.ki, best.kd)  # 最良ゲインを制御スタックへ反映
+        finally:
+            await self._release_after_tuning()  # 停止保持を解放して終了（中断時も）
+        return best, history
+
+    def _assert_tuning_preconditions(self, profile: VehicleProfile) -> None:
+        """PID 自動適合の前提（READY 状態・キャリブレーション済み）を検証する。"""
+        if self._state != RobotState.READY:
+            raise InvalidStateTransition(
+                f"PID 自動適合は READY 状態でのみ開始できます (現在: {self._state})"
+            )
+        if profile.calibration is None:
+            raise InvalidStateTransition(
+                "PID 自動適合にはキャリブレーション済みプロファイルが必要です"
+            )
+
     def _build_and_start_drive_loop(
         self,
         mode: DrivingMode | None,
         profile: VehicleProfile | None,
         log_writer: LogWriterProtocol | None,
         session_id: str,
+        on_complete: Callable[[], Awaitable[None]] | None = None,
+        disable_deviation_check: bool = False,
     ) -> None:
-        """mode / profile / ff_controller / safety_check が揃っていれば DriveLoop を起動する。"""
+        """mode / profile / ff_controller / safety_check が揃っていれば DriveLoop を起動する。
+
+        on_complete は走行正常終了時のコールバック。未指定なら自動走行の stop_auto_drive
+        （原点復帰あり）。PID 最適化は停止保持を維持する _stop_tuning_drive を渡す。
+
+        disable_deviation_check=True で逸脱による非常停止を無効化する（PID 自動適合用）。
+        """
         if (
             mode is None
             or profile is None
@@ -730,12 +1007,13 @@ class RobotController:
             profile=profile,
             mode=mode,
             safety_check=self._safety_check,
-            on_complete=self.stop_auto_drive,
+            on_complete=on_complete or self.stop_auto_drive,
             on_emergency=self._dispatch_emergency,
             log_writer=log_writer,
             session_id=session_id,
             interval_s=self._control_interval_s,
             log_every_n_cycles=self._log_every_n_cycles,
+            disable_deviation_check=disable_deviation_check,
         )
         self._drive_loop.start()
 
@@ -746,9 +1024,19 @@ class RobotController:
         profile: VehicleProfile | None = None,
         log_writer: LogWriterProtocol | None = None,
     ) -> DriveSession:
-        """自動走行開始。READY → PRE_CHECK → RUNNING。"""
-        await self._run_pre_check_and_transition(RobotState.RUNNING)
-        session = await self._begin_session("auto", mode_id, log_writer, RobotState.RUNNING)
+        """自動走行開始。
+
+        二経路に対応する:
+          - PRE_CHECK（arm 済み・確認ポップアップ「はい」）: 走行前チェックは arm 済みのため、
+            セッションを開始して RUNNING へ遷移するだけ（学習運転と同じ arm フロー）。
+          - READY（arm なしの直接開始）: 従来どおり走行前チェックを実施して開始する（後方互換）。
+        """
+        if self._state == RobotState.PRE_CHECK:
+            session = await self._begin_session("auto", mode_id, log_writer, RobotState.PRE_CHECK)
+            self._transition(RobotState.RUNNING)
+        else:
+            await self._run_pre_check_and_transition(RobotState.RUNNING)
+            session = await self._begin_session("auto", mode_id, log_writer, RobotState.RUNNING)
         self._build_and_start_drive_loop(mode, profile, log_writer, session.id)
         return session
 
@@ -760,11 +1048,108 @@ class RobotController:
             await drive_loop.stop_and_join()
             self._record_kpi_summary(drive_loop)
         self._transition(RobotState.READY)
-        await asyncio.gather(
-            self._accel_driver.home_return(),
-            self._brake_driver.home_return(),
+        try:
+            await asyncio.gather(
+                self._accel_driver.home_return(),
+                self._brake_driver.home_return(),
+            )
+        finally:
+            await self._close_session("completed")
+            self._drive_complete.set()  # PID 自動適合の走行完了待ちを起こす
+
+    def _build_and_start_schedule_loop(
+        self,
+        schedule: TimeSchedule,
+        profile: VehicleProfile | None,
+        log_writer: LogWriterProtocol | None,
+        session_id: str,
+    ) -> None:
+        """profile / calibration / safety_check が揃っていれば ScheduleLoop を起動する。
+
+        ボタンサーボは任意（未構成でもペダル再生は動く。ボタンイベントは空撃ちで前進）。
+        """
+        if profile is None or profile.calibration is None or self._safety_check is None:
+            return
+        self._schedule_loop = ScheduleLoop(
+            accel_driver=self._accel_driver,
+            brake_driver=self._brake_driver,
+            can_reader=self._can_reader,
+            profile=profile,
+            schedule=schedule,
+            safety_check=self._safety_check,
+            on_complete=self.stop_schedule_drive,
+            on_emergency=self._dispatch_emergency,
+            button_servo=self._button_servo,
+            log_writer=log_writer,
+            session_id=session_id,
+            # 周期はモジュール定数 SCHEDULE_LOOP_INTERVAL_S(100ms=ログ周期)を単一ソースにする
+            # （LearningLoop と同方針。制御ループ周期 control_interval_s とは独立）。
         )
-        await self._close_session("completed")
+        self._schedule_loop.start()
+
+    async def start_schedule_drive(
+        self,
+        schedule: TimeSchedule,
+        profile: VehicleProfile | None = None,
+        log_writer: LogWriterProtocol | None = None,
+    ) -> DriveSession:
+        """タイムスケジュール走行開始。READY → PRE_CHECK → RUNNING。
+
+        ペダル開度とボタンイベントの統合タイムラインを ScheduleLoop で開ループ実行し、
+        走行ログを `drive_logs` に記録する（run_type='auto'、mode_id=None、ref_speed=None）。
+        走行前チェックはボタンサーボ確認（項目8）を含めて実施する。
+        """
+        await self._run_pre_check_and_transition(
+            RobotState.RUNNING, include_button_servo=bool(schedule.button_events)
+        )
+        session = await self._begin_session("auto", None, log_writer, RobotState.RUNNING)
+        self._build_and_start_schedule_loop(schedule, profile, log_writer, session.id)
+        return session
+
+    async def stop_schedule_drive(self) -> None:
+        """タイムスケジュール走行停止（on_complete / 手動停止）。RUNNING → READY。
+
+        ループ停止 → 全ボタンサーボ待機位置へ → 両軸原点復帰 → セッション終了。
+        """
+        schedule_loop = self._schedule_loop
+        self._schedule_loop = None
+        if schedule_loop is not None:
+            await schedule_loop.stop_and_join()
+        self._transition(RobotState.READY)
+        try:
+            await self._release_button_servo()
+            await asyncio.gather(
+                self._accel_driver.home_return(),
+                self._brake_driver.home_return(),
+            )
+        finally:
+            await self._close_session("completed")
+
+    async def pause_auto_drive(self) -> None:
+        """自動走行を一時停止する。RUNNING → PAUSED。
+
+        基準速度タイムラインを凍結し、一時停止した瞬間の目標車速を保持して走り続ける
+        （DriveLoop.pause を参照）。RUNNING 以外、または DriveLoop が無い場合は拒否する。
+        """
+        if self._state != RobotState.RUNNING or self._drive_loop is None:
+            raise InvalidStateTransition(
+                f"pause_auto_drive は自動走行中(RUNNING)でのみ呼べます (現在: {self._state})"
+            )
+        self._drive_loop.pause()
+        self._transition(RobotState.PAUSED)
+
+    async def resume_auto_drive(self) -> None:
+        """一時停止中の自動走行を再開する。PAUSED → RUNNING。
+
+        凍結したタイムラインを続きから進める（DriveLoop.resume を参照）。
+        PAUSED 以外、または DriveLoop が無い場合は拒否する。
+        """
+        if self._state != RobotState.PAUSED or self._drive_loop is None:
+            raise InvalidStateTransition(
+                f"resume_auto_drive は一時停止中(PAUSED)でのみ呼べます (現在: {self._state})"
+            )
+        self._drive_loop.resume()
+        self._transition(RobotState.RUNNING)
 
     async def start_manual(
         self,
@@ -781,30 +1166,246 @@ class RobotController:
                 f"stop_manual は MANUAL 状態でのみ呼べます (現在: {self._state})"
             )
         self._transition(RobotState.READY)
-        await asyncio.gather(
-            self._accel_driver.home_return(),
-            self._brake_driver.home_return(),
-        )
-        await self._close_session("completed")
+        try:
+            await asyncio.gather(
+                self._accel_driver.home_return(),
+                self._brake_driver.home_return(),
+            )
+        finally:
+            await self._close_session("completed")
+
+    async def arm_learning_drive(self) -> None:
+        """学習運転の準備。READY → PRE_CHECK。
+
+        共通の arm 処理（`_arm_drive`）に加えて学習マネージャの存在を必須化する。
+        フロントは「はい」で start_learning_drive、「いいえ」で cancel_learning_drive を呼ぶ。
+        """
+        await self._arm_drive(require_learning_manager=True)
+
+    async def arm_auto_drive(self) -> None:
+        """自動走行の準備。READY → PRE_CHECK。
+
+        学習運転の arm と同じ手順（停車保持ブレーキ踏込 → 車速0確認 → 走行前チェック）を実施する。
+        フロントは「はい」で start_auto_drive、「いいえ」で cancel_auto_drive を呼ぶ。
+        """
+        await self._arm_drive(require_learning_manager=False)
+
+    async def _arm_drive(self, *, require_learning_manager: bool) -> None:
+        """自動走行・学習運転に共通の arm 処理。READY → PRE_CHECK。
+
+        手順:
+          1. 停車保持ブレーキ（`stop_brake_opening_pct`）まで踏み込む
+          2. 車速が 0 に収束するまで待機（タイムアウトあり）
+          3. 走行前チェック（車速0・通信・サーボ等）を実施
+          4. 合格なら PRE_CHECK のまま待機（フロントが確認ポップアップを表示）
+
+        車速判定はブレーキを踏んで停止させた後に行う（踏む前に車速が出ていても、踏んで
+        止めてから判定する）。失敗時はブレーキを原点復帰して READY へロールバックする。
+        """
+        self._transition(RobotState.PRE_CHECK)
+        try:
+            profile = self._active_profile
+            # 依存欠落は silent no-op せず明示的に弾く（ブレーキ換算に calibration が必要）
+            if profile is None or profile.calibration is None:
+                raise InvalidStateTransition("走行に必要な構成が不足しています")
+            if require_learning_manager and self._learning_manager is None:
+                raise InvalidStateTransition("学習運転に必要な構成が不足しています")
+            runner = self._pre_check_runner
+            # 1. 踏込前チェック: 車速確認のみ除外（この時点では車速が出ていてよい）。
+            #    両ペダルが原点付近にあること等をここで確認する。
+            if runner is not None:
+                pre = await runner.run(exclude=frozenset({ITEM_VEHICLE_STOPPED}))
+                if not pre.passed:
+                    raise PreCheckFailed(pre)
+            # 2. ブレーキを停車保持開度まで踏む → 3. 車速が 0 に収束するまで待機
+            await self._apply_brake_hold(profile)
+            await self._wait_for_vehicle_stopped()
+            # 4. 踏込後チェック: アクチュエータ位置を除外（保持ブレーキで意図的に原点から離れる）。
+            #    停止後に車速0・通信・サーボ等を判定する。
+            if runner is not None:
+                post = await runner.run(exclude=frozenset({ITEM_ACTUATOR_POSITION}))
+                if not post.passed:
+                    raise PreCheckFailed(post)
+        except Exception:
+            # 踏んだブレーキを解放してから READY へ戻す（home_return 失敗は握りつぶす）
+            try:
+                await asyncio.gather(
+                    self._accel_driver.home_return(),
+                    self._brake_driver.home_return(),
+                )
+            except Exception:
+                _logger.exception("arm 失敗時のブレーキ原点復帰に失敗しました（処理は継続）")
+            self._transition(RobotState.READY)
+            raise
+
+    async def _wait_for_vehicle_stopped(self) -> None:
+        """車速が停車しきい値未満へ収束するまで待機する。
+
+        ブレーキ踏込後に呼ぶ。タイムアウトしても例外は送出せず、後続の走行前チェック
+        （車速確認）に NG 判定を委ねる。CAN 読取例外も同様に走行前チェック（通信確認）へ委ねる。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _VEHICLE_STOP_TIMEOUT_S
+        while loop.time() < deadline:
+            try:
+                speed = await self._can_reader.read_speed()
+            except Exception:
+                return  # 通信異常は走行前チェック（通信確認）で検出させる
+            if abs(speed) < _VEHICLE_STOP_SPEED_KMH:
+                return
+            await asyncio.sleep(_VEHICLE_STOP_POLL_S)
 
     async def start_learning_drive(
         self,
         log_writer: LogWriterProtocol | None = None,
     ) -> DriveSession:
-        """学習走行開始。READY → PRE_CHECK → RUNNING。
+        """学習走行開始。arm 後（PRE_CHECK）→ RUNNING。
 
-        学習用の連続基準速度プロファイル（加減速を網羅）を DriveLoop で走行し、
-        100ms 周期で走行ログ（DriveLog）を `drive_logs` に記録する（run_type='learning'）。
-        正常完了で on_complete=stop_auto_drive により RUNNING→READY 遷移しセッションを
-        'completed' で終了する。停止/非常停止でも DriveLoop を止めセッションを終了する。
+        開度パターン列を LearningLoop で開ループ実行し、100ms 周期で走行ログを
+        `drive_logs` に記録する（run_type='learning'）。正常完了で
+        on_complete=stop_learning_drive により RUNNING→READY 遷移しセッションを
+        'completed' で終了する。停止/非常停止でも LearningLoop を止めセッションを終了する。
         """
-        await self._run_pre_check_and_transition(RobotState.RUNNING)
-        session = await self._begin_session("learning", None, log_writer, RobotState.RUNNING)
+        if self._state != RobotState.PRE_CHECK:
+            raise InvalidStateTransition(
+                f"start_learning_drive は arm 後（PRE_CHECK）にのみ呼べます (現在: {self._state})"
+            )
         profile = self._active_profile
-        if profile is not None and self._learning_manager is not None:
-            learning_mode = self._learning_manager.build_learning_reference(profile)
-            self._build_and_start_drive_loop(learning_mode, profile, log_writer, session.id)
+        if (
+            profile is None
+            or profile.calibration is None
+            or self._learning_manager is None
+            or self._safety_check is None
+        ):
+            self._transition(RobotState.READY)
+            raise InvalidStateTransition("学習運転に必要な構成が不足しています")
+
+        session = await self._begin_session("learning", None, log_writer, RobotState.PRE_CHECK)
+        self._transition(RobotState.RUNNING)
+        patterns = self._learning_manager.generate_patterns(profile)
+        self._learning_loop = LearningLoop(
+            accel_driver=self._accel_driver,
+            brake_driver=self._brake_driver,
+            can_reader=self._can_reader,
+            profile=profile,
+            patterns=patterns,
+            safety_check=self._safety_check,
+            on_complete=self.stop_learning_drive,
+            on_emergency=self._dispatch_emergency,
+            log_writer=log_writer,
+            session_id=session.id,
+        )
+        self._learning_loop.start()
         return session
+
+    async def cancel_learning_drive(self) -> None:
+        """学習運転の中止（確認ポップアップ「いいえ」）。PRE_CHECK → READY。
+
+        arm でかけた保持ブレーキをリリースする。arm 段階ではセッションを開始しないため、
+        ログ・学習は発生しない。
+        """
+        await self._cancel_armed_drive()
+
+    async def cancel_auto_drive(self) -> None:
+        """自動走行の中止（確認ポップアップ「いいえ」）。PRE_CHECK → READY。
+
+        arm でかけた保持ブレーキをリリースする。arm 段階ではセッションを開始しないため、
+        ログは残らない。
+        """
+        await self._cancel_armed_drive()
+
+    async def _cancel_armed_drive(self) -> None:
+        """arm 済み（確認待ち）の走行を中止する共通処理。PRE_CHECK → READY。
+
+        arm でかけた保持ブレーキを原点復帰でリリースする。arm 段階ではセッションを
+        開始しないため、ログは残らない。
+        """
+        if self._state != RobotState.PRE_CHECK:
+            raise InvalidStateTransition(
+                f"cancel は arm 後（PRE_CHECK）にのみ呼べます (現在: {self._state})"
+            )
+        self._transition(RobotState.READY)
+        await asyncio.gather(
+            self._accel_driver.home_return(),
+            self._brake_driver.home_return(),
+        )
+
+    async def stop_learning_drive(self) -> None:
+        """学習走行停止（on_complete / 手動停止）。RUNNING → READY。
+
+        原点復帰せず**緩やかに減速・停止確認してから停車保持ブレーキで車両を停止保持**したまま
+        READY へ遷移する。学習終了後はそのまま PID 最適化（規定パターン走行）へ移行する設計のため、
+        車両を停止状態に保つ。学習最終パターンは惰行/減速の途中で終わり車両が転動したまま終わる
+        ことがあるため、READY へ遷移する前に ~0.1G で減速して停止を確認する（転動したまま適合の
+        規定パターンを走らせると追従誤差が大きく逸脱になる）。原点復帰するとシャシダイナモ上で
+        車両がクリープし、最適化開始前に再停止・走行前チェックが必要になるため原点復帰はしない。
+        停車保持ブレーキは最適化セッション完了時に解放される（_release_after_tuning）。
+        """
+        learning_loop = self._learning_loop
+        self._learning_loop = None
+        if learning_loop is not None:
+            await learning_loop.stop_and_join()
+        try:
+            if self._active_profile is not None:
+                await self._decelerate_to_stop(self._active_profile)
+        finally:
+            self._transition(RobotState.READY)
+            await self._close_session("completed")
+
+    async def _decelerate_to_stop(self, profile: VehicleProfile) -> None:
+        """~0.1G の緩減速で車両を停止させ、停止を確認してから停車保持ブレーキへ移行する。
+
+        閉ループでブレーキ開度を調整し、減速G を目標(~0.1G)付近に保ちながら車速が停車しきい値
+        未満へ収束するまで待つ。停止確認後（またはタイムアウト時）は停車保持ブレーキ
+        （`stop_brake_opening_pct`）を適用して終了する。CAN 読取例外時も停車保持ブレーキへ
+        フォールバックし、停止判定は後続（PID 適合側）に委ねる。
+        """
+        calib = profile.calibration
+        if calib is None:
+            return
+        loop = asyncio.get_running_loop()
+        target_decel_kmhs = _BRIDGE_DECEL_G * _G_TO_KMHS
+        max_brake = profile.max_brake_opening
+        brake_pct = 0.0
+        prev_speed: float | None = None
+        prev_t: float | None = None
+        deadline = loop.time() + _BRIDGE_DECEL_TIMEOUT_S
+        while loop.time() < deadline:
+            try:
+                speed = await self._can_reader.read_speed()
+            except Exception:
+                break  # 通信異常は停車保持へフォールバック（後続の走行前判定に委ねる）
+            if abs(speed) < _VEHICLE_STOP_SPEED_KMH:
+                break  # 停止確認
+            now = loop.time()
+            if prev_speed is not None and prev_t is not None and now > prev_t:
+                decel = (prev_speed - speed) / (now - prev_t)  # >0 が減速
+                if decel < target_decel_kmhs:
+                    brake_pct = min(max_brake, brake_pct + _BRIDGE_BRAKE_STEP_PCT)
+                elif decel > target_decel_kmhs:
+                    brake_pct = max(0.0, brake_pct - _BRIDGE_BRAKE_STEP_PCT)
+            else:
+                brake_pct = min(max_brake, brake_pct + _BRIDGE_BRAKE_STEP_PCT)  # 初動は踏み増し
+            pos = calib.brake_zero_pos + round(
+                (calib.brake_full_pos - calib.brake_zero_pos) * brake_pct / 100.0
+            )
+            await self._brake_driver.move_to_position(pos)
+            prev_speed, prev_t = speed, now
+            await asyncio.sleep(_BRIDGE_DECEL_POLL_S)
+        await self._apply_brake_hold(profile)
+
+    async def _apply_brake_hold(self, profile: VehicleProfile) -> None:
+        """停車保持ブレーキ（`stop_brake_opening_pct`）までブレーキ軸を踏み込む。"""
+        calib = profile.calibration
+        if calib is None:
+            return
+        pct = max(
+            0.0, min(profile.feedforward_params.stop_brake_opening_pct, profile.max_brake_opening)
+        )
+        pos = calib.brake_zero_pos + round(
+            (calib.brake_full_pos - calib.brake_zero_pos) * pct / 100.0
+        )
+        await self._brake_driver.move_to_position(pos)
 
     def _get_axis_driver(self, axis: str) -> ActuatorDriverProtocol:
         """軸名からドライバを返す。不明な軸名は ValueError。"""
@@ -830,10 +1431,9 @@ class RobotController:
             )
         driver = self._get_axis_driver(axis)
         current = await driver.read_position()
-        # 負方向は原点(0)でクランプ。MANUAL（走行ペダル操作）ではさらにキャリブレーション
-        # 範囲内に制限し、フル位置を超えた機械端への押し込みを防ぐ。
-        # CALIBRATING はゼロ/フル点を探索する工程のため上限クランプしない。
-        target = max(0, current + step)
+        # 下限: 原点(0)、上限: ハードウェア機械端(_ACTUATOR_PULSE_MAX)でクランプ。
+        # MANUAL ではさらにキャリブレーション範囲内に制限する。
+        target = max(0, min(_ACTUATOR_PULSE_MAX, current + step))
         if self._state == RobotState.MANUAL:
             target = self._clamp_to_calibrated_range(axis, target)
         await driver.move_to_position(target)

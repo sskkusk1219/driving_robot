@@ -1,38 +1,31 @@
+"""学習運転の開度パターン生成を担うドメインモジュール。
+
+Phase 8（学習運転）の方針に従い、固定の開度パターンを開ループで順に実行するための
+パターン列を生成する。実際の走行・ログ記録・安全監視は LearningLoop が担う。
+"""
+
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from typing import Protocol
-from uuid import uuid4
 
-import numpy as np
-
-from src.models.calibration import CalibrationData
-from src.models.driving_mode import DrivingMode, SpeedPoint
-from src.models.learning_drive import LearningLog, LearningPattern
+from src.models.learning_drive import LearningPattern, PatternKind
 from src.models.profile import VehicleProfile
 
-SPEED_STEP_KMH: float = 10.0
-ACCEL_STEP_KMHS: float = 1.0
-ACCEL_MAX_KMHS: float = 10.0
-HOLD_DURATION_S: float = 2.0
-SPEED_SAMPLE_INTERVAL_S: float = 0.1
+# 開度パターン生成の既定パラメータ
+CREEP_RELEASE_STEPS: int = 5  # 停車保持→0 へブレーキを緩める段数
+HOLD_DURATION_S: float = 3.0  # 各パターンの最大保持時間（プラトー/上限未達時の打ち切り）
 
-G_TO_KMHS: float = 9.81 * 3.6
+# 全車速域 加速スイープ（ACCEL_SWEEP）: max_accel_opening に対する割合で数段振る。
+# 低開度は低速プラトー、高開度は cap（0.9×max_speed）到達まで加速し、速度全域 × 加速率を採取する。
+ACCEL_SWEEP_FRACS: tuple[float, ...] = (0.3, 0.5, 0.7, 1.0)
+# ACCEL_SWEEP 後に停車へ戻すリセットブレーキ開度（中庸＝過G にならず素早く停車）
+ACCEL_SWEEP_RESET_BRAKE_PCT: float = 30.0
 
-# 学習用基準速度プロファイル生成パラメータ
-# 各目標速度への加減速を複数レートで網羅し、逆モデル学習に必要な特徴量空間を広く覆う。
-LEARNING_DWELL_S: float = 1.5  # 各サイクル間の停車保持時間
-LEARNING_ACCEL_RATE_FRACTIONS: tuple[float, ...] = (0.4, 0.7, 1.0)  # accel_max_kmhs に対する割合
-LEARNING_DECEL_RATE_FRACTIONS: tuple[float, ...] = (0.4, 0.7, 1.0)  # 最大減速度に対する割合
+# 定常ブレーキ計測（BRAKE_HOLD）: 高速まで上げてから保持するブレーキ開度を数段スイープ。
+BRAKE_HOLD_OPENINGS_PCT: tuple[float, ...] = (10.0, 20.0, 30.0, 40.0)
+# BRAKE_HOLD で cap まで上げる加速開度（ガバナで 0.9×上限G に収束。確実に cap へ届く高開度）
+BRAKE_HOLD_ACCEL_PCT: float = 70.0
 
-
-class LearningActuatorProtocol(Protocol):
-    async def move_to_position(self, pos: int) -> None: ...
-
-    async def read_position(self) -> int: ...
-
-
-class LearningCANProtocol(Protocol):
-    async def read_speed(self) -> float: ...
+COAST_DOWN_COUNT: int = 3  # 専用コーストダウン本数（速度全域の減速カーブ計測）
+COAST_DOWN_ACCEL_PCT: float = 70.0  # コーストダウンの加速アクセル開度（cap まで上げる標準値）
 
 
 class LearningDataError(Exception):
@@ -41,169 +34,110 @@ class LearningDataError(Exception):
 
 @dataclass
 class LearningDriveConfig:
-    speed_step_kmh: float = field(default=SPEED_STEP_KMH)
-    accel_step_kmhs: float = field(default=ACCEL_STEP_KMHS)
-    accel_max_kmhs: float = field(default=ACCEL_MAX_KMHS)
+    creep_release_steps: int = field(default=CREEP_RELEASE_STEPS)
     hold_duration_s: float = field(default=HOLD_DURATION_S)
-    speed_sample_interval_s: float = field(default=SPEED_SAMPLE_INTERVAL_S)
+    accel_sweep_fracs: tuple[float, ...] = field(default=ACCEL_SWEEP_FRACS)
+    accel_sweep_reset_brake_pct: float = field(default=ACCEL_SWEEP_RESET_BRAKE_PCT)
+    brake_hold_openings_pct: tuple[float, ...] = field(default=BRAKE_HOLD_OPENINGS_PCT)
+    brake_hold_accel_pct: float = field(default=BRAKE_HOLD_ACCEL_PCT)
+    coast_down_count: int = field(default=COAST_DOWN_COUNT)
+    coast_down_accel_pct: float = field(default=COAST_DOWN_ACCEL_PCT)
 
 
 class LearningDriveManager:
-    """学習パターンの生成・走行実行・運転モデル学習を担うドメインクラス。"""
+    """学習運転の開度パターン列を生成するドメインクラス。"""
 
     _config: LearningDriveConfig
 
     def __init__(self, config: LearningDriveConfig | None = None) -> None:
         self._config = config if config is not None else LearningDriveConfig()
 
-    def build_learning_reference(self, profile: VehicleProfile) -> DrivingMode:
-        """学習用の連続基準速度プロファイル（DrivingMode）を生成する。
-
-        速度ステップごとに「0→目標速度→保持→0」のサイクルを構成し、加速・減速の
-        各レートを複数（LEARNING_*_RATE_FRACTIONS）切り替えることで、先読み逆モデルが
-        必要とする速度×加減速トレンドの特徴量空間を広く網羅する。
-
-        生成した DrivingMode は永続化されない一時的なもので、走行セッションの mode_id は
-        None のままとする（drive_sessions.mode_id は driving_modes への FK のため）。
-        """
-        max_decel_kmhs = max(profile.max_decel_g * G_TO_KMHS, 1.0)
-        accel_max = max(self._config.accel_max_kmhs, 1.0)
-
-        targets = np.arange(
-            self._config.speed_step_kmh,
-            profile.max_speed + self._config.speed_step_kmh,
-            self._config.speed_step_kmh,
-        )
-        targets = targets[targets <= profile.max_speed + 1e-9]
-
-        points: list[SpeedPoint] = [SpeedPoint(time_s=0.0, speed_kmh=0.0)]
-        t = 0.0
-        for i, target in enumerate(targets):
-            target_v = float(target)
-            accel_rate = (
-                accel_max * LEARNING_ACCEL_RATE_FRACTIONS[i % len(LEARNING_ACCEL_RATE_FRACTIONS)]
-            )
-            decel_rate = (
-                max_decel_kmhs
-                * LEARNING_DECEL_RATE_FRACTIONS[i % len(LEARNING_DECEL_RATE_FRACTIONS)]
-            )
-
-            # 0 → 目標速度（加速）
-            t += target_v / accel_rate
-            points.append(SpeedPoint(time_s=t, speed_kmh=target_v))
-            # 目標速度を保持
-            t += self._config.hold_duration_s
-            points.append(SpeedPoint(time_s=t, speed_kmh=target_v))
-            # 目標速度 → 0（減速）
-            t += target_v / decel_rate
-            points.append(SpeedPoint(time_s=t, speed_kmh=0.0))
-            # 停車保持
-            t += LEARNING_DWELL_S
-            points.append(SpeedPoint(time_s=t, speed_kmh=0.0))
-
-        return DrivingMode(
-            id=f"learning-{uuid4()}",
-            name="learning-reference",
-            description="学習走行用に自動生成した基準速度プロファイル（非永続）",
-            reference_speed=points,
-            total_duration=t,
-            max_speed=profile.max_speed,
-            created_at=datetime.now(tz=UTC),
-        )
-
     def generate_patterns(self, profile: VehicleProfile) -> list[LearningPattern]:
-        """max_opening / max_decel_g を超えるパターンを除外した学習パターンリストを返す。"""
-        max_decel_kmhs = profile.max_decel_g * G_TO_KMHS
+        """車両プロファイルから開度パターン列を生成する。
 
-        speed_points = np.arange(
-            self._config.speed_step_kmh,
-            profile.max_speed + self._config.speed_step_kmh,
-            self._config.speed_step_kmh,
-        )
-        accel_points = np.arange(
-            -max_decel_kmhs,
-            self._config.accel_max_kmhs + self._config.accel_step_kmhs,
-            self._config.accel_step_kmhs,
-        )
+        構成（連続軌跡として LearningLoop が順に実行する）:
+          1. クリープ解放: 停車保持ブレーキ（`stop_brake_opening_pct`）から段階的にブレーキを緩める
+          2. クリープ安定待ち: accel=brake=0 で車速が安定するまで待機（クリープ車速・加速率を計測）
+          3. 全車速域 加速スイープ（ACCEL_SWEEP）数段: 固定アクセル開度で 0→0.9×max_speed（cap）
+             まで加速し、速度全域 × 異なる加速率の加速サンプルを採る。各段は cap 到達/タイムアウト
+             後にブレーキで停車へ戻し、次段の起点を 0 に揃える（「踏む→戻す→低速キープ」を解消）。
+          4. 定常ブレーキ計測（BRAKE_HOLD）数段: 高速（cap）まで加速→固定ブレーキ開度を一定保持して
+             定常減速を記録する（加速側プラトー保持と対称）。ブレーキ開度を数段スイープする。
+          5. コーストダウン（COAST_DOWN）数本: アクセルで加速→ブレーキ無しで低速まで惰行し、
+             エンジンブレーキ＋走行抵抗の減速率を速度全域で計測する
 
+        いずれも車両プロファイルの最大開度を超えないようにスケール・クランプする。
+        """
+        hold = self._config.hold_duration_s
         patterns: list[LearningPattern] = []
-        for speed in speed_points:
-            for accel in accel_points:
-                accel_opening, brake_opening = self._compute_initial_opening(
-                    float(speed), float(accel), profile
+
+        # 1. クリープ解放（停車保持ブレーキを段階的に緩める。0 は次の安定待ちが担うため > 0 まで）
+        stop_brake = min(
+            profile.feedforward_params.stop_brake_opening_pct, profile.max_brake_opening
+        )
+        steps = max(self._config.creep_release_steps, 1)
+        for i in range(steps, 0, -1):
+            patterns.append(
+                LearningPattern(
+                    kind=PatternKind.CREEP,
+                    accel_opening=0.0,
+                    brake_opening=stop_brake * (i / steps),
+                    hold_duration_s=hold,
                 )
-                if accel_opening > profile.max_accel_opening:
-                    continue
-                if brake_opening > profile.max_brake_opening:
-                    continue
-                if accel < 0 and abs(accel) > max_decel_kmhs + 1e-9:
+            )
+        # 2. クリープ安定待ち（accel=brake=0 で車速が安定するまで保持。hold は LearningLoop 側の
+        #    creep_settle_* で制御するためここでは便宜上の値）
+        patterns.append(
+            LearningPattern(
+                kind=PatternKind.CREEP_SETTLE,
+                accel_opening=0.0,
+                brake_opening=0.0,
+                hold_duration_s=hold,
+            )
+        )
+
+        # 3. 全車速域 加速スイープ（固定開度で cap まで加速 → リセットブレーキで停車復帰）
+        reset_brake = min(self._config.accel_sweep_reset_brake_pct, profile.max_brake_opening)
+        for frac in self._config.accel_sweep_fracs:
+            accel = min(max(frac, 0.0) * profile.max_accel_opening, profile.max_accel_opening)
+            if accel <= 0.0:
+                continue
+            patterns.append(
+                LearningPattern(
+                    kind=PatternKind.ACCEL_SWEEP,
+                    accel_opening=accel,
+                    brake_opening=reset_brake,
+                    hold_duration_s=hold,
+                )
+            )
+
+        # 4. 定常ブレーキ計測（cap まで加速 → 固定ブレーキ開度を一定保持して定常減速を記録）
+        brake_accel = min(self._config.brake_hold_accel_pct, profile.max_accel_opening)
+        if brake_accel > 0.0:
+            for brake_pct in self._config.brake_hold_openings_pct:
+                brake = min(max(brake_pct, 0.0), profile.max_brake_opening)
+                if brake <= 0.0:
                     continue
                 patterns.append(
                     LearningPattern(
-                        speed_kmh=float(speed),
-                        accel_kmhs=float(accel),
-                        accel_opening=accel_opening,
-                        brake_opening=brake_opening,
-                        hold_duration_s=self._config.hold_duration_s,
+                        kind=PatternKind.BRAKE_HOLD,
+                        accel_opening=brake_accel,
+                        brake_opening=brake,
+                        hold_duration_s=hold,
                     )
                 )
+
+        # 5. コーストダウン（高速まで加速→ブレーキ無しで惰行。減速率 vs 速度の全域カーブ）
+        coast_accel = min(self._config.coast_down_accel_pct, profile.max_accel_opening)
+        if coast_accel > 0.0:
+            for _ in range(max(self._config.coast_down_count, 0)):
+                patterns.append(
+                    LearningPattern(
+                        kind=PatternKind.COAST_DOWN,
+                        accel_opening=coast_accel,
+                        brake_opening=0.0,
+                        hold_duration_s=hold,
+                    )
+                )
+
         return patterns
-
-    def _compute_initial_opening(
-        self, speed_kmh: float, accel_kmhs: float, profile: VehicleProfile
-    ) -> tuple[float, float]:
-        """速度・加速度から初期開度を線形マッピングで計算する。"""
-        if accel_kmhs >= 0:
-            ratio = min(1.0, speed_kmh / max(profile.max_speed, 1.0))
-            accel_ratio = min(1.0, accel_kmhs / max(self._config.accel_max_kmhs, 1.0))
-            accel_opening = profile.max_accel_opening * (ratio * 0.5 + accel_ratio * 0.5)
-            brake_opening = 0.0
-        else:
-            decel_ratio = min(1.0, abs(accel_kmhs) / max(profile.max_decel_g * G_TO_KMHS, 1.0))
-            accel_opening = 0.0
-            brake_opening = profile.max_brake_opening * decel_ratio
-        return accel_opening, brake_opening
-
-    async def run_pattern(
-        self,
-        pattern: LearningPattern,
-        accel_driver: LearningActuatorProtocol,
-        brake_driver: LearningActuatorProtocol,
-        can_reader: LearningCANProtocol,
-        calibration: CalibrationData,
-    ) -> LearningLog:
-        """パターンの開度指令を送信し、実車速を記録して LearningLog を返す。"""
-        import asyncio
-
-        accel_pulse = self._opening_to_pulse(
-            pattern.accel_opening, calibration.accel_zero_pos, calibration.accel_stroke
-        )
-        brake_pulse = self._opening_to_pulse(
-            pattern.brake_opening, calibration.brake_zero_pos, calibration.brake_stroke
-        )
-
-        await asyncio.gather(
-            accel_driver.move_to_position(accel_pulse),
-            brake_driver.move_to_position(brake_pulse),
-        )
-
-        speed_samples: list[float] = []
-        elapsed = 0.0
-        while elapsed < pattern.hold_duration_s:
-            await asyncio.sleep(self._config.speed_sample_interval_s)
-            speed_samples.append(await can_reader.read_speed())
-            elapsed += self._config.speed_sample_interval_s
-
-        actual_speed = sum(speed_samples) / len(speed_samples) if speed_samples else 0.0
-
-        return LearningLog(
-            pattern=pattern,
-            actual_speed_kmh=actual_speed,
-            accel_opening_applied=pattern.accel_opening,
-            brake_opening_applied=pattern.brake_opening,
-            recorded_at=datetime.now(tz=UTC),
-        )
-
-    def _opening_to_pulse(self, opening_pct: float, zero_pos: int, stroke: int) -> int:
-        """開度 [%] をアクチュエータ位置 [pulse] に換算する。"""
-        return zero_pos + int(opening_pct / 100.0 * stroke)

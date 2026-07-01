@@ -1,20 +1,32 @@
 from dataclasses import dataclass
-from datetime import datetime
+from enum import StrEnum
 
 
-@dataclass
+class PatternKind(StrEnum):
+    """開度パターンの種別。LearningLoop が実行時の前進条件を決めるのに使う。"""
+
+    CREEP = "creep"  # 停車保持から段階的にブレーキを緩める（解放ステップ）
+    CREEP_SETTLE = "creep_settle"  # アクセル・ブレーキ 0% で車速が安定するまで待機しクリープ計測
+    # 固定アクセル開度で 0→0.9×max_speed（cap）まで加速し全車速域の加速サンプルを採る。
+    # cap 到達/タイムアウト後はブレーキで停車まで戻す（次パターンの起点を 0 に揃える）。
+    ACCEL_SWEEP = "accel_sweep"
+    # 高速（cap）まで加速→固定ブレーキ開度を一定保持し定常減速を採る（加速プラトーと対称）。
+    BRAKE_HOLD = "brake_hold"
+    # アクセルで加速→ブレーキ無しで低速まで惰行（エンジンブレーキ減速率を計測）
+    COAST_DOWN = "coast_down"
+
+
+@dataclass(frozen=True)
 class LearningPattern:
-    speed_kmh: float
-    accel_kmhs: float
+    """学習運転で開ループ実行する1つの固定開度パターン。
+
+    開度 [%] はアクチュエータ位置への換算前の論理値。`hold_duration_s` は
+    速度プラトーや上限に達しない場合に当該パターンを打ち切る最大保持時間。
+    ACCEL_SWEEP は accel_opening（加速の目標）と brake_opening（停車復帰のリセットブレーキ）、
+    BRAKE_HOLD は accel_opening（cap まで上げる加速）と brake_opening（保持する定常ブレーキ）。
+    """
+
+    kind: PatternKind
     accel_opening: float
     brake_opening: float
     hold_duration_s: float
-
-
-@dataclass
-class LearningLog:
-    pattern: LearningPattern
-    actual_speed_kmh: float
-    accel_opening_applied: float
-    brake_opening_applied: float
-    recorded_at: datetime

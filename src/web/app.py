@@ -1,21 +1,25 @@
 import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.responses import Response
 
 from src.app.stubs import (
     InMemoryModeRepository,
     InMemoryProfileRepository,
+    InMemoryScheduleRepository,
     InMemorySessionRepository,
     _StubUPSMonitor,
     build_stub_controller,
 )
-from src.web.routers import drive, modes, profiles, sessions, ups
+from src.web.routers import drive, modes, profiles, schedules, sessions, ups
 from src.web.ws import broadcast_loop, realtime_ws
 
 
@@ -26,6 +30,7 @@ async def _build_repos(app: FastAPI) -> None:
         from src.infra.db import create_pool  # noqa: PLC0415
         from src.infra.mode_repository import ModeRepository  # noqa: PLC0415
         from src.infra.profile_repository import ProfileRepository  # noqa: PLC0415
+        from src.infra.schedule_repository import ScheduleRepository  # noqa: PLC0415
         from src.infra.session_repository import SessionRepository  # noqa: PLC0415
 
         pool = await create_pool(db_url)
@@ -33,11 +38,22 @@ async def _build_repos(app: FastAPI) -> None:
         app.state.profile_repo = ProfileRepository(pool)
         app.state.mode_repo = ModeRepository(pool)
         app.state.session_repo = SessionRepository(pool)
+        app.state.schedule_repo = ScheduleRepository(pool)
+
+        # 前回プロセスの異常終了で 'running' のまま残った孤児セッションを是正する。
+        from src.infra.log_writer import LogWriter  # noqa: PLC0415
+
+        reaped = await LogWriter(pool).reap_interrupted_sessions()
+        if reaped:
+            logging.getLogger(__name__).warning(
+                "起動時に未終了セッション %d 件を 'error' で終了済みに是正しました", reaped
+            )
     else:
         app.state.db_pool = None
         app.state.profile_repo = InMemoryProfileRepository()
         app.state.mode_repo = InMemoryModeRepository()
         app.state.session_repo = InMemorySessionRepository()
+        app.state.schedule_repo = InMemoryScheduleRepository()
 
 
 @asynccontextmanager
@@ -87,8 +103,27 @@ app = FastAPI(
 app.include_router(drive.router)
 app.include_router(profiles.router)
 app.include_router(modes.router)
+app.include_router(schedules.router)
 app.include_router(sessions.router)
 app.include_router(ups.router)
+
+class _NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    """/static 配下に `Cache-Control: no-cache` を付与する。
+
+    ブラウザに毎回 ETag/Last-Modified での再検証を強制し（変更が無ければ 304）、
+    UI（JS/CSS）を更新した際に古いキャッシュが使われ続ける事故を防ぐ。
+    """
+
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+
+app.add_middleware(_NoCacheStaticMiddleware)
 
 _static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")

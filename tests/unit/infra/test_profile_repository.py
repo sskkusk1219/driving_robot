@@ -48,6 +48,12 @@ def make_mock_pool() -> tuple[MagicMock, AsyncMock]:
         yield conn
 
     pool.acquire = _acquire
+
+    @asynccontextmanager
+    async def _transaction():
+        yield
+
+    conn.transaction = MagicMock(side_effect=_transaction)
     return pool, conn
 
 

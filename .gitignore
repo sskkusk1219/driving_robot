@@ -40,3 +40,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code / Playwright ツールの実行時アーティファクト
+.claude/plans/
+.playwright-mcp/

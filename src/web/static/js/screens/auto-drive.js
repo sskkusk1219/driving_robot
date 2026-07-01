@@ -1,36 +1,82 @@
 // ── Auto-drive monitor screen ─────────────────────────────
 // AutoDriveD layout: 3-axis graph + BigSpeed + session info + stop
 
-function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, screenTitle = '自動走行モニター', driveStartPath = '/api/v1/drive/start', driveStartBody = null }) {
+function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMaxSpeed = null, screenTitle = '自動走行モニター', driveStartPath = '/api/v1/drive/start', driveStartBody = null, driveArmPath = null, driveCancelPath = null, confirmStartMessage = '走行を開始しますか？' }) {
   const { useState, useEffect, useContext, useRef } = React;
-  const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeProfileName, robotState } = useContext(window.AppContext);
+  const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeProfileName, robotState, setNavLock } = useContext(window.AppContext);
   const { INK, INK_SOFT, PAPER, PAPER_2, HATCH, Box, Btn, Row, BigSpeed } = window;
 
   const [modeDetail, setModeDetail] = useState(null);
-  const [elapsed, setElapsed] = useState(0);
+  const [nowS, setNowS] = useState(0);
   const [confirmStop, setConfirmStop] = useState(false);
+  const [confirmStart, setConfirmStart] = useState(false);
   const [isDriving, setIsDriving] = useState(false);
   const driveStartTimeRef = useRef(null);
+  const confirmStartRef = useRef(false);
+  // 一時停止区間の累積実時間 [ms] と、現在の一時停止開始時刻。プレイヘッド(nowS)を
+  // バックエンドの _started_at シフトと整合させ、再開後もタイムラインを連続させる。
+  const pausedAccumMsRef = useRef(0);
+  const pauseStartRef = useRef(null);
 
-  // T1: タイマーを robotState=RUNNING 時のみ動作させる
+  // 確認ポップアップ表示中（arm 済み・未確定）に画面を離脱したら、保持ブレーキを
+  // 取り残さないよう best-effort で cancel する。confirmStartRef でアンマウント時のみ発火。
+  useEffect(() => { confirmStartRef.current = confirmStart; }, [confirmStart]);
+  useEffect(() => () => {
+    if (confirmStartRef.current && driveCancelPath) apiFetch('POST', driveCancelPath);
+  }, []);
+
+  // 走行中（RUNNING / PAUSED）は他ページへの離脱をロック
   useEffect(() => {
-    if (robotState !== 'RUNNING') {
+    const driving = robotState === 'RUNNING' || robotState === 'PAUSED';
+    setNavLock(driving);
+    return () => setNavLock(false);
+  }, [robotState]);
+
+  // T1: 走行中（RUNNING / PAUSED）のみ経過時間を進める。
+  // グラフの横スクロールを滑らかにするため、整数秒の setInterval ではなく
+  // requestAnimationFrame で小数秒（nowS）を更新し、毎フレーム再描画する。
+  // （旧実装は 1Hz 更新だったため、ウィンドウが 1 秒ごとにカクッと左へ跳ねていた）
+  // 一時停止（PAUSED）中は rAF を回さず nowS を凍結し、再開時に一時停止区間の実時間を
+  // pausedAccumMs に加算してタイムライン（プレイヘッド）を連続させる。
+  useEffect(() => {
+    const driving = robotState === 'RUNNING' || robotState === 'PAUSED';
+    if (!driving) {
       driveStartTimeRef.current = null;
+      pausedAccumMsRef.current = 0;
+      pauseStartRef.current = null;
       setIsDriving(false);
+      setNowS(0);
       return;
     }
     if (!driveStartTimeRef.current) {
       driveStartTimeRef.current = Date.now();
-      setElapsed(0);
+      pausedAccumMsRef.current = 0;
+      pauseStartRef.current = null;
       setIsDriving(true);
     }
-    const id = setInterval(() => {
+    if (robotState === 'PAUSED') {
+      // 一時停止: プレイヘッドを凍結し、再開に備えて一時停止開始時刻を記録する
+      if (pauseStartRef.current === null) pauseStartRef.current = Date.now();
+      return;
+    }
+    // RUNNING: 直前が一時停止なら、その実時間を累積へ加えてタイムラインを連続させる
+    if (pauseStartRef.current !== null) {
+      pausedAccumMsRef.current += Date.now() - pauseStartRef.current;
+      pauseStartRef.current = null;
+    }
+    let raf;
+    const tick = () => {
       if (driveStartTimeRef.current) {
-        setElapsed(Math.floor((Date.now() - driveStartTimeRef.current) / 1000));
+        setNowS((Date.now() - driveStartTimeRef.current - pausedAccumMsRef.current) / 1000);
       }
-    }, 1000);
-    return () => clearInterval(id);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
   }, [robotState]);
+
+  // 表示用の整数秒（mm:ss ラベルは秒単位で十分）
+  const elapsed = Math.floor(nowS);
 
   useEffect(() => {
     if (activeModeId) {
@@ -39,13 +85,39 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
   }, [activeModeId]);
 
   async function handleStart() {
+    // arm フロー（学習運転）: arm → 確認ポップアップ → はい/いいえ
+    if (driveArmPath) {
+      const r = await apiFetch('POST', driveArmPath);
+      if (r) setConfirmStart(true);
+      return;
+    }
     const r = await apiFetch('POST', driveStartPath, driveStartBody);
     if (r) window.showToast('走行を開始しました', 'success');
+  }
+
+  async function handleConfirmStartYes() {
+    const r = await apiFetch('POST', driveStartPath, driveStartBody);
+    if (r) { window.showToast('走行を開始しました', 'success'); setConfirmStart(false); }
+  }
+
+  async function handleConfirmStartNo() {
+    await apiFetch('POST', driveCancelPath);
+    setConfirmStart(false);
   }
 
   async function handleStop() {
     const r = await apiFetch('POST', '/api/v1/drive/stop');
     if (r) { window.showToast('走行を終了しました', 'success'); setConfirmStop(false); }
+  }
+
+  async function handlePause() {
+    const r = await apiFetch('POST', '/api/v1/drive/pause');
+    if (r) window.showToast('一時停止しました', 'success');
+  }
+
+  async function handleResume() {
+    const r = await apiFetch('POST', '/api/v1/drive/resume');
+    if (r) window.showToast('走行を再開しました', 'success');
   }
 
   const buf = realtimeBuf.current;
@@ -69,7 +141,23 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
   function polyline(pts, color, strokeW = 2, dasharray) {
     if (pts.length < 2) return null;
     const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-    return <path d={d} fill="none" stroke={color} strokeWidth={strokeW} strokeDasharray={dasharray} />;
+    return <path d={d} fill="none" stroke={color} strokeWidth={strokeW} strokeDasharray={dasharray} strokeLinejoin="round" strokeLinecap="round" />;
+  }
+
+  // 現在位置ポインタ: 中央(frac=0.5)に固定し、現在のセンサ値で上下にのみ動く。
+  // 軌跡(polyline)は左へ流れ、その先端にこの●が常に乗る（走行前=0でも表示）。
+  // SVG は preserveAspectRatio="none" で非等比に伸縮するため、円を <circle> で描くと
+  // グラフの縦横比に応じて楕円に歪む（軸3を持たない学習運転ページで顕著）。
+  // 固定 px サイズの HTML 要素をパーセント位置で重ねることで、常に真円を保つ。
+  function marker(val, valMax, height, color) {
+    return <div style={{
+      position: 'absolute',
+      left: `${(toXFull(0.5) / VW) * 100}%`,
+      top: `${(toY(val, valMax, height) / height) * 100}%`,
+      width: 12, height: 12, boxSizing: 'border-box',
+      borderRadius: '50%', background: color, border: `1.5px solid ${PAPER}`,
+      transform: 'translate(-50%, -50%)', pointerEvents: 'none',
+    }} />;
   }
 
   // Axis 3: profile data
@@ -89,11 +177,22 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
     return speed;
   }
 
-  // Axis 1: 30秒スライディングウィンドウ（時間軸基準）
-  // 走行前はプロファイル先頭30秒をプレビュー表示。走行中は経過時間に追従。
+  // Axis 1: 30秒ウィンドウ・中央固定プレイヘッド（時間軸基準）
+  // 現在時刻(nowS)を常にグラフ中央(frac=0.5)に固定し、波形は左へ流れる。
+  // 左半分=過去(実測+基準)、中央=現在、右半分=未来(基準の先読み)。
   const WINDOW_S = 30;
-  const windowEndS   = isDriving ? Math.max(WINDOW_S, elapsed) : WINDOW_S;
-  const windowStartS = Math.max(0, windowEndS - WINDOW_S);
+  const HALF_S = WINDOW_S / 2;
+  const windowStartS = nowS - HALF_S;   // クランプしない（now を常に中央に保つ）。走行前は nowS=0 → [-15, +15]
+  const windowEndS   = nowS + HALF_S;
+
+  const toFrac = elapsedS => (elapsedS - windowStartS) / WINDOW_S;
+  // 画面外(frac<0)の古い点は左端への山積みを避けるため除外する
+  const onScreen = (d, key, max, h) => {
+    const frac = toFrac((d.ts - driveStart) / 1000);
+    return frac >= 0 && frac <= 1
+      ? { x: toXFull(frac), y: toY(d[key], max, h) }
+      : null;
+  };
 
   // 基準車速: プロファイルから直接サンプリング（モードロード済なら常に表示）
   const speedRef_pts = refProfile.length > 0
@@ -104,29 +203,17 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
       })
     : [];
 
-  // 実車速: 同一時間軸に位置合わせ（走行中のみ）
+  // 実車速: 同一時間軸に位置合わせ（走行中のみ）。最新点は中央(frac=0.5)に張り付く
   const speedAct_pts = isDriving && driveStart
-    ? recent.map(d => {
-        const elapsedS = (d.ts - driveStart) / 1000;
-        const frac = Math.max(0, Math.min(1, (elapsedS - windowStartS) / WINDOW_S));
-        return { x: toXFull(frac), y: toY(d.actual_speed_kmh, maxSpeed, PH1) };
-      })
+    ? recent.map(d => onScreen(d, 'actual_speed_kmh', maxSpeed, PH1)).filter(Boolean)
     : [];
 
   // Axis 2: openings — axis 1 と共通の時間軸
   const accelPts = isDriving && driveStart
-    ? recent.map(d => {
-        const elapsedS = (d.ts - driveStart) / 1000;
-        const frac = Math.max(0, Math.min(1, (elapsedS - windowStartS) / WINDOW_S));
-        return { x: toXFull(frac), y: toY(d.accel_opening, 100, PH2) };
-      })
+    ? recent.map(d => onScreen(d, 'accel_opening', 100, PH2)).filter(Boolean)
     : [];
   const brakePts = isDriving && driveStart
-    ? recent.map(d => {
-        const elapsedS = (d.ts - driveStart) / 1000;
-        const frac = Math.max(0, Math.min(1, (elapsedS - windowStartS) / WINDOW_S));
-        return { x: toXFull(frac), y: toY(d.brake_opening, 100, PH2) };
-      })
+    ? recent.map(d => onScreen(d, 'brake_opening', 100, PH2)).filter(Boolean)
     : [];
 
   // T4: マーカーと進捗は走行中のみ
@@ -136,7 +223,7 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
     x: toXFull(totalDurS > 0 ? p.time_s / totalDurS : 0),
     y: toY(p.speed_kmh, maxSpeed, PH3, G3_PAD_T, G3_PAD_B),
   }));
-  const progressFrac = isDriving && totalDurS > 0 ? Math.min(1, elapsed / totalDurS) : 0;
+  const progressFrac = isDriving && totalDurS > 0 ? Math.min(1, nowS / totalDurS) : 0;
   const markerX = toXFull(progressFrac);
 
   const fmt = s => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
@@ -167,19 +254,22 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
 
       {/* Axis 1: speed graph — 1と2軸は同じ高さ */}
       <Box style={{ padding: '6px 0 2px', flex: 2, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <div style={{ flex: 1, minHeight: 0 }}>
+        <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <GraphSvg height={PH1} yMax={maxSpeed} unit="" unitLabel="km/h">
-            {polyline(speedRef_pts, INK_SOFT, 1.5, '4 3')}
+            {showModeAxis && polyline(speedRef_pts, INK_SOFT, 1.5, '4 3')}
             {polyline(speedAct_pts, '#c8922a', 2.2)}
           </GraphSvg>
+          {marker(rd.actual_speed_kmh, maxSpeed, PH1, '#c8922a')}
         </div>
         <div style={{ display: 'flex', gap: 20, fontSize: 12, color: INK_SOFT, paddingLeft: PL, paddingBottom: 4, alignItems: 'center' }}>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <svg width="28" height="10" style={{ flexShrink: 0 }}>
-              <line x1="0" y1="5" x2="28" y2="5" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />
-            </svg>
-            基準
-          </span>
+          {showModeAxis && (
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <svg width="28" height="10" style={{ flexShrink: 0 }}>
+                <line x1="0" y1="5" x2="28" y2="5" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />
+              </svg>
+              基準
+            </span>
+          )}
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <svg width="28" height="10" style={{ flexShrink: 0 }}>
               <line x1="0" y1="5" x2="28" y2="5" stroke="#c8922a" strokeWidth="2.2" />
@@ -191,18 +281,20 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
 
       {/* Axis 2: openings graph — 1と2軸は同じ高さ */}
       <Box style={{ padding: '6px 0 2px', flex: 2, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <div style={{ flex: 1, minHeight: 0 }}>
+        <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <GraphSvg height={PH2} yMax={100} unit="%">
             {polyline(accelPts, '#78c8f0', 2.2)}
             {polyline(brakePts, '#f07070', 2.2)}
           </GraphSvg>
+          {marker(rd.accel_opening, 100, PH2, '#78c8f0')}
+          {marker(rd.brake_opening, 100, PH2, '#f07070')}
         </div>
         {/* 共通時間軸ラベル（5秒ごと） */}
         <svg viewBox={`0 0 ${VW} 18`} width="100%" height="18" preserveAspectRatio="none" style={{ display: 'block' }}>
           <line x1={PL} y1={0} x2={PL + PW} y2={0} stroke={HATCH} strokeWidth="0.5" />
           <text x={PL + PW + 8} y={15} textAnchor="start" fontSize="10" fill={INK_SOFT}>s</text>
           {(() => {
-            const first = Math.ceil(windowStartS / 5) * 5;
+            const first = Math.max(0, Math.ceil(windowStartS / 5) * 5);
             const ticks = [];
             for (let t = first; t <= windowEndS; t += 5) ticks.push(t);
             return ticks.map(t => {
@@ -263,7 +355,7 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
       {/* Bottom: BigSpeed + profile | session info + buttons */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
         <Box style={{ display: 'flex', gap: 12, alignItems: 'center', padding: 12 }}>
-          <BigSpeed value={rd.actual_speed_kmh} refSpeed={rd.ref_speed_kmh ?? null} size={110} />
+          <BigSpeed value={rd.actual_speed_kmh} refSpeed={rd.ref_speed_kmh ?? null} size={110} showRef={showModeAxis} />
           <Box label="プロファイル / モード" style={{ flex: 1, padding: '8px 12px' }}>
             <div style={{ fontSize: 15, fontWeight: 700 }}>{activeProfileName ?? '—'}</div>
             <div style={{ fontSize: 12, color: INK_SOFT, marginTop: 4 }}>{activeModeName ?? '—'}</div>
@@ -279,7 +371,17 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
           </Box>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
             {robotState === 'RUNNING' ? (
-              <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
+              <>
+                {showPause && (
+                  <Btn big style={{ flex: 1, borderColor: INK_SOFT, background: PAPER_2, color: INK }} onClick={handlePause}>⏸ 一時停止</Btn>
+                )}
+                <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
+              </>
+            ) : robotState === 'PAUSED' ? (
+              <>
+                <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleResume}>▶ 走行再開</Btn>
+                <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
+              </>
             ) : (
               <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleStart}>▶ 走行開始</Btn>
             )}
@@ -291,6 +393,12 @@ function DriveMonitorScreen({ showModeAxis = true, profileMaxSpeed = null, scree
         message: '走行を終了しますか？',
         onYes: handleStop,
         onNo: () => setConfirmStop(false),
+      })}
+
+      {confirmStart && React.createElement(window.ConfirmStopPopup, {
+        message: confirmStartMessage,
+        onYes: handleConfirmStartYes,
+        onNo: handleConfirmStartNo,
       })}
     </div>
   );
@@ -323,7 +431,10 @@ function AutoDriveScreen() {
     <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
       <DriveMonitorScreen showPause={true} screenTitle="自動走行モニター"
         driveStartPath="/api/v1/drive/start"
-        driveStartBody={activeModeId ? { mode_id: activeModeId } : null} />
+        driveStartBody={activeModeId ? { mode_id: activeModeId } : null}
+        driveArmPath="/api/v1/drive/arm"
+        driveCancelPath="/api/v1/drive/cancel"
+        confirmStartMessage="走行前チェックに合格しました。自動走行を開始しますか？" />
       {cfg && (
         <ValidationPopup
           message={cfg.message}

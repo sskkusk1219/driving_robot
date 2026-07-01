@@ -61,10 +61,16 @@ src/web/
 │   └── system.py           # /api/system
 ├── websocket.py
 └── static/
-    ├── index.html
+    ├── index.html         # React 18 + Babel standalone を CDN 読み込み（ビルド工程なし）
     ├── js/
+    │   ├── sketch.js      # 共通テーマ定数・UI部品（INK/PAPER 等を window 経由で共有）
+    │   └── screens/       # 画面別コンポーネント（learning.js / auto-drive.js 等）
     └── css/
 ```
+
+**フロントエンド補足**:
+- 走行モニターは共有コンポーネント `DriveMonitorScreen`（`js/screens/auto-drive.js`）で実装し、学習運転(`learning.js`)・自動運転の両画面が props 違いで再利用する。グラフ仕様の変更はこの1ファイルで両画面に反映される。
+- リアルタイムグラフは SVG 描画・中央固定プレイヘッド方式。
 
 ---
 
@@ -98,7 +104,9 @@ src/app/
 **配置ファイル**:
 - `control/`: 制御アルゴリズム群
 - `calibration.py`: キャリブレーション管理（`CalibrationManager`）
-- `learning_drive.py`: 学習運転管理（`LearningDriveManager`）
+- `learning_drive.py`: 学習運転の開度パターン生成（`LearningDriveManager`）
+- `model_training.py`: 先読み Ridge 逆モデルの学習・物理定数推定
+- `pid_tuning.py`: PID自動適合（FOPDT同定・SIMCゲイン算出・規定パターン生成・コスト・座標降下チューナー）
 - `safety_monitor.py`: 安全監視（`SafetyMonitor`）
 
 **例**:
@@ -107,9 +115,13 @@ src/domain/
 ├── control/
 │   ├── feedforward.py      # フィードフォワード制御 (FeedforwardController)
 │   ├── pid.py              # PIDコントローラ (PIDController)
-│   └── drive_loop.py       # 50ms制御ループ (DriveLoop)
+│   ├── drive_loop.py       # 50ms制御ループ (DriveLoop, 閉ループ FF+PID)
+│   ├── kpi_monitor.py      # KPI実行時計測 (KPIMonitor)
+│   └── learning_loop.py    # 学習運転の開ループ実行ループ (LearningLoop)
 ├── calibration.py          # CalibrationManager
-├── learning_drive.py       # LearningDriveManager
+├── learning_drive.py       # LearningDriveManager（開度パターン生成）
+├── model_training.py       # 運転モデル学習・物理定数推定
+├── pid_tuning.py           # PID自動適合（FOPDT/SIMC/規定パターン/座標降下）
 └── safety_monitor.py       # SafetyMonitor
 ```
 
@@ -124,6 +136,7 @@ src/domain/
 
 **配置ファイル**:
 - `actuator_driver.py`: P-CON-CB Modbus RTU通信
+- `button_servo_driver.py`: PCA9685 I2C PWMによるボタンサーボ（SG90 ×16）制御 ※Post-MVP
 - `can_reader.py`: Kvaser USB-CAN車速受信
 - `gpio_monitor.py`: GPIO（非常停止・UPS）監視
 - `log_writer.py`: PostgreSQL非同期ログ書き込み
@@ -134,6 +147,7 @@ src/domain/
 ```
 src/infra/
 ├── actuator_driver.py
+├── button_servo_driver.py   # Post-MVP
 ├── can_reader.py
 ├── gpio_monitor.py
 ├── log_writer.py
@@ -155,6 +169,7 @@ src/infra/
 - `calibration.py`: CalibrationData
 - `drive_log.py`: DriveSession・DriveLog・DriveLogData
 - `driving_mode.py`: DrivingMode・SpeedPoint
+- `time_schedule.py`: TimeSchedule・PedalPoint・ButtonEvent（統合タイムライン） ※Post-MVP
 - `system_state.py`: SystemState（シャットダウン時保存）
 
 **例**:
@@ -164,6 +179,7 @@ src/models/
 ├── calibration.py
 ├── drive_log.py
 ├── driving_mode.py
+├── time_schedule.py   # Post-MVP
 └── system_state.py
 ```
 
@@ -185,6 +201,7 @@ tests/unit/
 │   │   └── test_pid.py
 │   ├── test_calibration.py
 │   └── test_safety_monitor.py
+├── test_pid_tuning.py        # FOPDT同定・SIMC・規定パターン・コスト・座標降下
 └── infra/
     └── test_archive_manager.py
 ```
@@ -245,6 +262,12 @@ dsn = "postgresql://localhost/driving_robot"
 [gpio]
 ac_detect_pin = 27        # AC UPS接点出力（物理ピン13）[要確認: AC UPS機種確定後に更新]
 emergency_stop_pin = 17   # 非常停止スイッチ（物理ピン11）
+
+[servo]                   # ボタンサーボ（PCA9685 + SG90 ×16）※Post-MVP
+i2c_address = 0x40        # PCA9685 I2Cアドレス
+pwm_freq_hz = 50          # SG90標準
+rest_angle = 0            # 待機角度（全チャンネル共通）
+press_angle = 60          # 押下角度（全チャンネル共通）
 
 [archive]
 usb_ssd_path = "/mnt/usb_ssd/archive"

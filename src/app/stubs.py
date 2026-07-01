@@ -16,6 +16,7 @@ from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession
 from src.models.driving_mode import DrivingMode
 from src.models.profile import VehicleProfile
+from src.models.time_schedule import TimeSchedule
 
 
 class _StubActuator:
@@ -47,6 +48,11 @@ class _StubActuator:
         return 0.0
 
     async def move_to_position(self, pos: int) -> None:  # noqa: ARG002
+        pass
+
+    async def move_to_position_timed(  # noqa: ARG002
+        self, target_pos: int, current_pos: int, duration_s: float
+    ) -> None:
         pass
 
     async def wait_for_position_complete(self) -> None:
@@ -94,6 +100,22 @@ class _StubUPSMonitor:
         return True
 
 
+class _StubButtonServo:
+    """開発・テスト用ボタンサーボスタブ。押下・解放を no-op で受ける。"""
+
+    async def connect(self) -> None:
+        pass
+
+    async def press(self, channel: int, duration_s: float) -> None:  # noqa: ARG002
+        pass
+
+    async def release_all(self) -> None:
+        pass
+
+    async def check_connection(self) -> bool:
+        return True
+
+
 class _StubSafetyMonitor:
     """実機の SafetyMonitor と同様にコールバックをディスパッチするスタブ。"""
 
@@ -129,6 +151,7 @@ def build_stub_controller() -> RobotController:
         ff_controller=FeedforwardController(),
         last_normal_shutdown=False,
         learning_manager=LearningDriveManager(),
+        button_servo=_StubButtonServo(),
     )
     # 実機 factory と同じ一方向ディスパッチ配線（monitor → controller）
     safety_monitor.register_emergency_callback(controller.emergency_stop)
@@ -246,6 +269,55 @@ class InMemoryModeRepository:
         return True
 
 
+class InMemoryScheduleRepository:
+    """DB なし環境用の in-memory タイムスケジュールリポジトリ。"""
+
+    def __init__(self) -> None:
+        self._schedules: dict[str, TimeSchedule] = {}
+
+    async def list_all(self) -> list[TimeSchedule]:
+        return sorted(self._schedules.values(), key=lambda s: s.created_at, reverse=True)
+
+    async def get_by_id(self, schedule_id: str) -> TimeSchedule | None:
+        return self._schedules.get(schedule_id)
+
+    async def create(self, schedule: TimeSchedule) -> TimeSchedule:
+        # DB の UNIQUE(name) 制約と挙動を揃える
+        if any(s.name == schedule.name for s in self._schedules.values()):
+            raise DuplicateNameError(f"スケジュール名 {schedule.name!r} は既に使用されています")
+        schedule_id = schedule.id if schedule.id else str(uuid4())
+        stored = TimeSchedule(
+            id=schedule_id,
+            name=schedule.name,
+            description=schedule.description,
+            pedal_points=schedule.pedal_points,
+            button_events=schedule.button_events,
+            total_duration=schedule.total_duration,
+            loop=schedule.loop,
+            created_at=schedule.created_at,
+        )
+        self._schedules[schedule_id] = stored
+        return stored
+
+    async def update(self, schedule: TimeSchedule) -> TimeSchedule | None:
+        if schedule.id not in self._schedules:
+            return None
+        # 別レコードとの名称重複を DB と同様に弾く
+        if any(
+            s.name == schedule.name and sid != schedule.id
+            for sid, s in self._schedules.items()
+        ):
+            raise DuplicateNameError(f"スケジュール名 {schedule.name!r} は既に使用されています")
+        self._schedules[schedule.id] = schedule
+        return schedule
+
+    async def delete(self, schedule_id: str) -> bool:
+        if schedule_id not in self._schedules:
+            return False
+        del self._schedules[schedule_id]
+        return True
+
+
 class InMemorySessionRepository:
     """DB なし環境用の in-memory セッションリポジトリ（常に空）。"""
 
@@ -253,6 +325,9 @@ class InMemorySessionRepository:
         return []
 
     async def get_by_id(self, session_id: str) -> DriveSession | None:  # noqa: ARG002
+        return None
+
+    async def latest_learning_session_id(self, profile_id: str) -> str | None:  # noqa: ARG002
         return None
 
     async def list_logs(self, session_id: str, limit: int = 1000) -> list[DriveLog]:  # noqa: ARG002

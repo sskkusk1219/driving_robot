@@ -88,3 +88,29 @@ class LogWriter:
             session_id,
             status,
         )
+
+    async def reap_interrupted_sessions(self) -> int:
+        """起動時に取り残された未終了セッションを 'error' で閉じる。
+
+        サーバ起動直後に status='running'（または ended_at IS NULL）のセッションが
+        残っているのは、前回のプロセス異常終了（強制 kill / クラッシュ）で
+        end_session が呼ばれなかった孤児セッションのみ。実行中の走行は存在し得ない
+        ため、これらを終了済みに是正する。ended_at は記録された最後のログ時刻
+        （なければ started_at）に設定し、走行時間表示を妥当にする。
+
+        Returns:
+            是正したセッション件数。
+        """
+        result = await self._conn.execute(
+            """
+            UPDATE drive_sessions s
+            SET status = 'error',
+                ended_at = COALESCE(
+                    (SELECT MAX(l.timestamp) FROM drive_logs l WHERE l.session_id = s.id),
+                    s.started_at
+                )
+            WHERE s.ended_at IS NULL OR s.status = 'running'
+            """
+        )
+        # asyncpg は "UPDATE <n>" を返す
+        return int(result.split()[-1]) if result else 0

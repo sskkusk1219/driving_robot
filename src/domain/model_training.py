@@ -1,8 +1,12 @@
-"""連続走行ログから先読み型 Ridge 逆モデルを学習するドメインモジュール。
+"""連続走行ログから先読み型 多項式Ridge 逆モデルを学習するドメインモジュール。
 
 人間の運転を模した「先読み（look-ahead / preview）型」の純粋フィードフォワード逆モデル。
 現在の基準速度 v0 と数秒先の基準速度トレンド（Δv）から、名目アクセル/ブレーキ開度を予測する。
 追従誤差の補正は PID に委ねるため、FF は基準軌跡のみの関数とする。
+
+推定器は 7次元入力の完全2次多項式展開＋標準化＋Ridge（`_make_estimator`）。ブレーキの
+「不感帯→急制動」非線形を多項式項で表現する（純線形 Ridge では減速 R² が頭打ちだった）。
+学習は最新の学習走行セッションのみを用いる（Web 経路で session_id を限定）。
 
 学習データ構築:
     手動/学習走行の連続ログには目標速度系列が記録されないため、実車速の軌跡そのものを
@@ -25,12 +29,17 @@ from pathlib import Path
 import numpy as np
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
 from src.domain.learning_drive import LearningDataError
 from src.models.drive_log import DriveLog
 from src.models.profile import FeedforwardParams, VehicleProfile
 
-MODEL_TYPE: str = "ridge_inverse_lookahead"
+# 多項式(2次)＋標準化＋Ridge の逆モデル。ブレーキの「不感帯→急制動」非線形を、同じ7次元入力の
+# 完全2次多項式展開で表現する（線形 Ridge では捉えられず減速 R² が頭打ちだった）。
+MODEL_TYPE: str = "poly_inverse_lookahead"
+POLY_DEGREE: int = 2  # 多項式特徴量の次数
 
 # 先読みホライズン [s]。学習・推論で共有する。
 LOOKAHEAD_HORIZONS_S: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
@@ -60,6 +69,20 @@ FEATURE_NAMES: list[str] = [
 _REGIME_POS: int = LOOKAHEAD_HORIZONS_S.index(REGIME_HORIZON_S)
 # X の列順: [v0, dv_0.5, dv_1.0, ..., v0², dv1·v0] なのでレジーム列は 1 + _REGIME_POS
 _REGIME_COL: int = 1 + _REGIME_POS
+
+
+def _make_estimator() -> Pipeline:
+    """逆モデルの推定器を返す: 7次元入力 → 完全2次多項式展開 → 標準化 → Ridge。
+
+    ブレーキの「不感帯→急制動」非線形を、多項式展開（dv²・dv·v0 等の相互作用を含む）で表現する。
+    StandardScaler はスケール差の大きい多項式項（v0² 等）の正則化を均す。`build_feature_row` の
+    7次元入力をそのまま受け、Pipeline 内で展開するため呼び出し側の入力形状は不変。
+    """
+    return make_pipeline(
+        PolynomialFeatures(POLY_DEGREE, include_bias=False),
+        StandardScaler(),
+        Ridge(alpha=RIDGE_ALPHA),
+    )
 
 
 def build_feature_row(v0: float, future_speeds: Sequence[float]) -> np.ndarray:
@@ -126,7 +149,7 @@ def _group_by_session(logs: list[DriveLog]) -> list[list[DriveLog]]:
     return [sorted(g, key=lambda x: x.timestamp) for g in grouped.values()]
 
 
-def _metrics(model: Ridge, x: np.ndarray, y: np.ndarray) -> dict[str, float]:
+def _metrics(model: Pipeline, x: np.ndarray, y: np.ndarray) -> dict[str, float]:
     """学習データに対する評価指標（in-sample）を返す。"""
     pred = model.predict(x)
     result: dict[str, float] = {
@@ -162,6 +185,7 @@ def train_inverse_model(
     y_accel_parts: list[np.ndarray] = []
     x_brake_parts: list[np.ndarray] = []
     y_brake_parts: list[np.ndarray] = []
+    speed_clip_max = 0.0  # 全ログの観測最高車速（推論時の入力クリップ＝外挿の飽和に使う）
 
     # ブレーキ整形のデッドバンドは車両プロファイルの不感帯を使う（既定 1.0 で従来と等価）
     brake_db = profile.feedforward_params.brake_deadband_pct
@@ -172,6 +196,7 @@ def train_inverse_model(
         speed = np.clip(
             np.array([log.actual_speed_kmh for log in session_logs], dtype=float), 0.0, None
         )
+        speed_clip_max = max(speed_clip_max, float(speed.max()))
         accel_open = np.array([log.accel_opening for log in session_logs], dtype=float)
         brake_raw = np.array([log.brake_opening for log in session_logs], dtype=float)
         brake_open = np.where(brake_raw >= brake_db, brake_raw, 0.0)
@@ -181,7 +206,9 @@ def train_inverse_model(
         if len(idx) == 0:
             continue
 
-        # レジーム分割: dv_1.0 >= 0 → アクセル、< 0 → ブレーキ
+        # レジーム分割: dv_1.0 >= 0 → アクセル、< 0 → ブレーキ（coast 含む全減速標本）。
+        # coast（brake < 不感帯）はラベル 0 として残し、多項式モデルが「緩減速ではブレーキ 0」も
+        # 学習する（推論時の coast 緩減速は FF のエンジンブレーキ テーパが担当）。
         accel_mask = x[:, _REGIME_COL] >= 0.0
         x_accel_parts.append(x[accel_mask])
         y_accel_parts.append(accel_open[idx][accel_mask])
@@ -210,10 +237,11 @@ def train_inverse_model(
             f"最低 {MIN_REGIME_SAMPLES} 点必要です。"
         )
 
-    # fit_intercept=False: 停止時 (v0=0, 全 dv=0) → 開度 0 の物理制約を保証
-    accel_model = Ridge(alpha=RIDGE_ALPHA, fit_intercept=False)
+    # 多項式(2次)＋標準化＋Ridge。停止時 (v0=0,全dv=0) → 開度0 の物理制約は fit_intercept ではなく
+    # FF 側（predict_effort の停車短絡・負予測クランプ）が担保する。
+    accel_model = _make_estimator()
     accel_model.fit(x_accel, y_accel)
-    brake_model = Ridge(alpha=RIDGE_ALPHA, fit_intercept=False)
+    brake_model = _make_estimator()
     brake_model.fit(x_brake, y_brake)
 
     metrics = {
@@ -236,6 +264,7 @@ def train_inverse_model(
         "feature_names": FEATURE_NAMES,
         "horizons": list(LOOKAHEAD_HORIZONS_S),
         "regime_horizon": REGIME_HORIZON_S,
+        "speed_clip_max": speed_clip_max,
         "profile_id": profile.id,
         "trained_at": datetime.now(tz=UTC).isoformat(),
         "metrics": metrics,

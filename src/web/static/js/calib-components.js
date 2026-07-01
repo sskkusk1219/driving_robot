@@ -121,7 +121,7 @@ function OpeningBar({ value = 0, color = '#ddd4c4', label = '' }) {
 // ── DragSlider ────────────────────────────────────────────
 // Horizontal drag slider (left=decrease, right=increase).
 // Optional zeroPos / fullPos show calibration markers.
-function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullPos }) {
+function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullPos, disabled }) {
   const { useRef } = React;
   const { INK, INK_SOFT, PAPER, HATCH } = window;
 
@@ -137,13 +137,14 @@ function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullP
   }
 
   function onPointerDown(e) {
+    if (disabled) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     dragging.current = true;
     lastX.current = e.clientX;
   }
 
   function onPointerMove(e) {
-    if (!dragging.current || !ref.current) return;
+    if (disabled || !dragging.current || !ref.current) return;
     const w = ref.current.getBoundingClientRect().width;
     if (w === 0) return;
     const dx = e.clientX - lastX.current;
@@ -165,7 +166,8 @@ function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullP
     <div ref={ref} style={{
       flex: 1, minHeight: 0, position: 'relative',
       border: `1.4px solid ${INK}`, background: PAPER,
-      cursor: 'ew-resize', userSelect: 'none', overflow: 'hidden',
+      cursor: disabled ? 'not-allowed' : 'ew-resize', userSelect: 'none', overflow: 'hidden',
+      opacity: disabled ? 0.4 : 1,
     }}
     onPointerDown={onPointerDown} onPointerMove={onPointerMove}
     onPointerUp={onPointerUp} onPointerCancel={onPointerUp}

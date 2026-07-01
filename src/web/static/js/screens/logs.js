@@ -3,7 +3,7 @@
 function LogsScreen() {
   const { useState, useEffect, useContext } = React;
   const { apiFetch } = useContext(window.AppContext);
-  const { INK, PAPER, PAPER_2, HATCH, Box, Btn, H2, Note } = window;
+  const { INK, PAPER, PAPER_2, HATCH, Btn, H2, Note } = window;
 
   const [sessions, setSessions] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -38,23 +38,19 @@ function LogsScreen() {
     return `${Math.floor(diff / 60)} 分 ${diff % 60} 秒`;
   }
 
-  return React.createElement('div', { style: { padding: 32 } },
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 } },
-      React.createElement(H2, null, 'ログ'),
-      React.createElement(Btn, { variant: 'ghost', onClick: loadSessions }, '更新'),
-    ),
-
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', height: '100%', padding: 32 } },
     sessions.length === 0
       ? React.createElement(Note, null, 'セッションログがありません。')
-      : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+      : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto', flex: 1, minHeight: 0 } },
           ...sessions.map(s => {
             const isSelected = s.id === selectedId;
             return React.createElement('div', { key: s.id },
-              React.createElement(Box, {
+              React.createElement('div', {
                 style: {
                   padding: '14px 20px',
-                  borderColor: isSelected ? INK : HATCH,
-                  borderWidth: isSelected ? 2.5 : 1.5,
+                  background: PAPER_2,
+                  borderRadius: 4,
+                  border: `${isSelected ? 2.5 : 1.5}px solid ${isSelected ? INK : HATCH}`,
                   cursor: 'pointer',
                 },
                 onClick: () => handleSelect(s.id),
@@ -78,8 +74,11 @@ function LogsScreen() {
                 loadingLogs
                   ? React.createElement('div', { style: { fontSize: 13, color: '#888' } }, '読み込み中…')
                   : logs && logs.length > 0
-                    ? React.createElement(LogChart, { logs })
-                    : React.createElement('div', { style: { fontSize: 13, color: '#888' } }, 'ログデータなし'),
+                    ? React.createElement(LogDetail, { sessionId: s.id, logs })
+                    : React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 } },
+                        React.createElement('span', { style: { fontSize: 13, color: '#888' } }, 'ログデータなし'),
+                        React.createElement(CsvDownloadButton, { sessionId: s.id }),
+                      ),
               ),
             );
           }),
@@ -92,15 +91,19 @@ function LogChart({ logs }) {
   const W = 700, H = 140, PL = 44, PR = 16, PB = 20, PT = 8;
   const PW = W - PL - PR, PH = H - PB - PT;
 
-  const maxSpeed = Math.max(...logs.map(l => Math.max(l.ref_speed_kmh ?? 0, l.actual_speed_kmh ?? 0)), 1);
+  // 自動運転ページと同じく、最高値を 20 の倍数（20,40,…,160）へ切り上げる。
+  const dataMax = Math.max(...logs.map(l => Math.max(l.ref_speed_kmh ?? 0, l.actual_speed_kmh ?? 0)), 0);
+  const maxSpeed = Math.max(20, Math.ceil(dataMax / 20) * 20);
   const n = logs.length;
-  const toX = i => PL + (i / Math.max(1, n - 1)) * PW;
+  // x 軸はサンプル番号ではなく実経過時間ベース。ログ欠落（バス再送によるサイクル
+  // スキップ）区間が時間的に圧縮されず、実走行時間どおりの横軸で描画する。
+  const t0 = new Date(logs[0].timestamp).getTime();
+  const tSpan = Math.max(1, new Date(logs[n - 1].timestamp).getTime() - t0);
+  const toX = i => PL + ((new Date(logs[i].timestamp).getTime() - t0) / tSpan) * PW;
   const toY = v => PT + PH - (Math.max(0, v) / maxSpeed) * PH;
 
   const refPath  = logs.map((l, i) => `${i === 0 ? 'M' : 'L'}${toX(i).toFixed(1)},${toY(l.ref_speed_kmh ?? 0).toFixed(1)}`).join(' ');
   const actPath  = logs.map((l, i) => `${i === 0 ? 'M' : 'L'}${toX(i).toFixed(1)},${toY(l.actual_speed_kmh).toFixed(1)}`).join(' ');
-
-  const maxSpeedActual = Math.max(...logs.map(l => l.actual_speed_kmh ?? 0)).toFixed(1);
 
   return React.createElement('div', null,
     React.createElement('div', { style: { fontSize: 12, color: '#666', marginBottom: 6 } },
@@ -108,25 +111,109 @@ function LogChart({ logs }) {
       React.createElement('span', { style: { color: '#888' } }, '— 基準  '),
       React.createElement('span', { style: { color: '#a23232' } }, '— 実車速'),
     ),
-    React.createElement('svg', { width: W, height: H },
-      // Grid lines
-      ...[0, 0.5, 1].map(f =>
+    React.createElement('svg', {
+      viewBox: `0 0 ${W} ${H}`,
+      preserveAspectRatio: 'none',
+      width: '100%',
+      style: { display: 'block', width: '100%', height: 'auto', maxWidth: W },
+    },
+      // Grid lines（自動運転ページと同じく 4 等分 = 5 本）
+      ...[0, 0.25, 0.5, 0.75, 1].map((f, i) =>
         React.createElement('g', { key: f },
           React.createElement('line', {
             x1: PL, y1: PT + PH - f * PH, x2: PL + PW, y2: PT + PH - f * PH,
-            stroke: HATCH, strokeWidth: 1,
+            stroke: HATCH, strokeWidth: 1, strokeDasharray: '3 4',
           }),
           React.createElement('text', {
-            x: PL - 4, y: PT + PH - f * PH + 4, textAnchor: 'end', fontSize: 10, fill: '#666',
-          }, `${(f * maxSpeed).toFixed(0)}`),
+            x: PL - 4, y: PT + PH - f * PH + (i === 0 ? -3 : 4), textAnchor: 'end', fontSize: 11, fill: INK,
+          }, `${Math.round(f * maxSpeed)}`),
         )
       ),
       React.createElement('path', { d: refPath, fill: 'none', stroke: '#888', strokeWidth: 1.5 }),
       React.createElement('path', { d: actPath, fill: 'none', stroke: '#a23232', strokeWidth: 2 }),
     ),
-    React.createElement('div', { style: { marginTop: 10, display: 'flex', gap: 32, fontSize: 13 } },
-      React.createElement('span', null, `最高車速: ${maxSpeedActual} km/h`),
-      React.createElement('span', null, `サンプル数: ${logs.length}`),
+  );
+}
+
+// CSV ダウンロードボタン（ブラウザの添付ダウンロードをそのまま利用）
+function CsvDownloadButton({ sessionId }) {
+  const { INK, HATCH, PAPER_2 } = window;
+  return React.createElement('a', {
+    href: `/api/v1/sessions/${sessionId}/logs.csv`,
+    download: '',
+    style: {
+      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+      border: `1.5px solid ${HATCH}`, borderRadius: 5,
+      padding: '6px 14px', background: PAPER_2, color: INK,
+      fontSize: 14, fontWeight: 500, textDecoration: 'none',
+      cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
+    },
+  }, 'CSVダウンロード');
+}
+
+function LogDetail({ sessionId, logs }) {
+  return React.createElement('div', null,
+    React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: 12 } },
+      React.createElement(CsvDownloadButton, { sessionId }),
+    ),
+    React.createElement(LogSummary, { logs }),
+    React.createElement('div', { style: { marginTop: 16 } }, React.createElement(LogChart, { logs })),
+    React.createElement('div', { style: { marginTop: 16 } }, React.createElement(LogTable, { logs })),
+  );
+}
+
+function LogSummary({ logs }) {
+  const maxSpeed = Math.max(...logs.map(l => l.actual_speed_kmh ?? 0));
+  const deviations = logs
+    .filter(l => l.ref_speed_kmh != null)
+    .map(l => Math.abs(l.actual_speed_kmh - l.ref_speed_kmh));
+  const avgDev = deviations.length
+    ? deviations.reduce((a, b) => a + b, 0) / deviations.length
+    : null;
+  // 実タイムスタンプ（末尾 - 先頭）から記録時間を求める。サンプル数×100ms の概算は
+  // バス再送によるサイクルスキップでログが欠落すると実走行時間より大幅に短く出る。
+  const first = logs[0], last = logs[logs.length - 1];
+  const durSec = (new Date(last.timestamp) - new Date(first.timestamp)) / 1000;
+
+  const Item = (label, value) => React.createElement('div', null,
+    React.createElement('div', { style: { fontSize: 11, color: '#888' } }, label),
+    React.createElement('div', { style: { fontSize: 15, fontWeight: 700 } }, value),
+  );
+
+  return React.createElement('div', { style: { display: 'flex', gap: 36, flexWrap: 'wrap' } },
+    Item('最高車速', `${maxSpeed.toFixed(1)} km/h`),
+    Item('平均逸脱', avgDev == null ? '—' : `${avgDev.toFixed(2)} km/h`),
+    Item('記録時間', `${durSec.toFixed(1)} 秒`),
+    Item('サンプル数', `${logs.length}`),
+  );
+}
+
+function LogTable({ logs }) {
+  const { HATCH, PAPER_2 } = window;
+  const cols = [
+    ['時刻', l => new Date(l.timestamp).toLocaleTimeString('ja-JP', { hour12: false }) + '.' + String(new Date(l.timestamp).getMilliseconds()).padStart(3, '0')],
+    ['基準[km/h]', l => l.ref_speed_kmh == null ? '—' : l.ref_speed_kmh.toFixed(2)],
+    ['実車速[km/h]', l => l.actual_speed_kmh.toFixed(2)],
+    ['Acc開度[%]', l => l.accel_opening.toFixed(1)],
+    ['Brk開度[%]', l => l.brake_opening.toFixed(1)],
+    ['Acc電流[mA]', l => l.accel_current.toFixed(0)],
+    ['Brk電流[mA]', l => l.brake_current.toFixed(0)],
+  ];
+
+  const th = { textAlign: 'right', padding: '4px 10px', fontSize: 11, color: '#888', fontWeight: 600, position: 'sticky', top: 0, background: PAPER_2, borderBottom: `1.5px solid ${HATCH}` };
+  const td = { textAlign: 'right', padding: '3px 10px', fontSize: 12, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' };
+
+  return React.createElement('div', { style: { maxHeight: 320, overflow: 'auto', border: `1.5px solid ${HATCH}` } },
+    React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
+      React.createElement('thead', null,
+        React.createElement('tr', null, ...cols.map(([label]) => React.createElement('th', { key: label, style: th }, label))),
+      ),
+      React.createElement('tbody', null,
+        ...logs.map((l, i) => React.createElement('tr', {
+          key: l.id ?? i,
+          style: { background: i % 2 ? PAPER_2 : 'transparent' },
+        }, ...cols.map(([label, fn]) => React.createElement('td', { key: label, style: td }, fn(l))))),
+      ),
     ),
   );
 }

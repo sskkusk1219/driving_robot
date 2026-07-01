@@ -15,6 +15,7 @@ const STATE_TINT = {
   INITIALIZING: { stroke: '#3880b8', fill: '#0e1e2c', text: '#78c8f0' },
   READY:        { stroke: '#3c8c3c', fill: '#0e220e', text: '#68d468' },
   RUNNING:      { stroke: '#3880b8', fill: '#0e1c2a', text: '#78c8f0' },
+  PAUSED:       { stroke: '#b89030', fill: '#221c08', text: '#f0c84a' },
   EMERGENCY:    { stroke: '#b04040', fill: '#220e0e', text: '#f07070' },
   AC_LOSS:      { stroke: '#b04040', fill: '#220e0e', text: '#f07070' },
 };
@@ -124,24 +125,20 @@ function TopBar({ state, screen, upsLoss, profileName, modeName }) {
       padding: '0 22px', gap: 14,
       background: PAPER_2,
     }}>
-      <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: 1, color: INK }}>Driving_Robot</div>
+      <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: 1, color: INK }}><span style={{ fontSize: 12 }}>ﾈﾝ0系</span> あま</div>
       <div style={{ width: 1, height: 20, background: HATCH }} />
       <div style={{ fontSize: 15, color: INK_SOFT }}>{screen}</div>
       <div style={{ flex: 1 }} />
-      <UpsIndicator acLoss={showUpsLoss} />
+      <div style={{ fontSize: 15, color: INK_SOFT }}>profile: <b>{profileName || '---'}</b></div>
+      <div style={{ fontSize: 15, color: INK_SOFT }}>mode: <b>{modeName || '---'}</b></div>
       <StateBadge state={state} />
-      {profileName && (
-        <div style={{ fontSize: 15, color: INK_SOFT }}>profile: <b>{profileName}</b></div>
-      )}
-      {modeName && (
-        <div style={{ fontSize: 15, color: INK_SOFT }}>mode: <b>{modeName}</b></div>
-      )}
+      <UpsIndicator acLoss={showUpsLoss} />
     </div>
   );
 }
 
 // ── Sidebar ──────────────────────────────────────────────────
-function Sidebar({ active, onNav }) {
+function Sidebar({ active, onNav, locked }) {
   return (
     <div style={{
       borderRight: `1px solid ${HATCH}`,
@@ -152,6 +149,7 @@ function Sidebar({ active, onNav }) {
     }}>
       {NAV.map(([k, label]) => {
         const on = k === active;
+        const dim = locked && !on;
         return (
           <div key={k} onClick={() => onNav(k)} style={{
             padding: '8px 16px 8px 14px',
@@ -159,7 +157,8 @@ function Sidebar({ active, onNav }) {
             background: on ? 'rgba(200,146,42,0.10)' : 'transparent',
             fontWeight: on ? 700 : 400,
             color: on ? INK : INK_SOFT,
-            cursor: 'pointer',
+            cursor: dim ? 'not-allowed' : 'pointer',
+            opacity: dim ? 0.4 : 1,
             userSelect: 'none',
             whiteSpace: 'nowrap',
             transition: 'background 0.15s, color 0.15s',
@@ -173,7 +172,7 @@ function Sidebar({ active, onNav }) {
 
 // ── Frame ────────────────────────────────────────────────────
 function Frame({ children, state = 'READY', screen = '', activeNav = '',
-                 upsLoss = false, profileName, modeName, onNav, onGoInit }) {
+                 upsLoss = false, locked = false, profileName, modeName, onNav, onGoInit }) {
   return (
     <div style={{
       width: '100%', height: '100%',
@@ -188,7 +187,7 @@ function Frame({ children, state = 'READY', screen = '', activeNav = '',
     }}>
       <TopBar state={state} screen={screen} upsLoss={upsLoss}
               profileName={profileName} modeName={modeName} />
-      <Sidebar active={activeNav} onNav={onNav || (() => {})} />
+      <Sidebar active={activeNav} onNav={onNav || (() => {})} locked={locked} />
       <div style={{ padding: '20px 28px 24px', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         {children}
       </div>
@@ -451,7 +450,10 @@ function PedalGauge({ label, value = 0, max = 100, width = 60, height = 180, col
 }
 
 // ── BigSpeed ─────────────────────────────────────────────────
-function BigSpeed({ value = 0, refSpeed = null, size = 220 }) {
+function BigSpeed({ value = 0, refSpeed = null, size = 220, showRef = null }) {
+  // showRef を省略した場合は従来通り refSpeed の有無で判定。
+  // 明示的に true を渡すと、refSpeed が未確定でも行を確保し枠の高さを固定する。
+  const renderRef = showRef === null ? refSpeed !== null : showRef;
   return (
     <div style={{ width: size, textAlign: 'center', padding: '8px 0' }}>
       <div style={{ fontSize: 14, color: INK_SOFT, letterSpacing: 1 }}>実車速</div>
@@ -459,9 +461,11 @@ function BigSpeed({ value = 0, refSpeed = null, size = 220 }) {
         {(typeof value === 'number' ? value : 0).toFixed(1)}
       </div>
       <div style={{ fontSize: 14, color: INK_SOFT, marginTop: -2, letterSpacing: '0.04em' }}>km/h</div>
-      {refSpeed !== null && (
-        <div style={{ fontSize: 13, color: INK_SOFT, marginTop: 6, fontFamily: 'inherit' }}>
-          基準 {refSpeed.toFixed(1)} / 偏差 {(value - refSpeed).toFixed(2)}
+      {renderRef && (
+        <div style={{ fontSize: 12, color: INK_SOFT, marginTop: 6, fontFamily: 'inherit', whiteSpace: 'nowrap' }}>
+          {refSpeed !== null
+            ? `基準 ${refSpeed.toFixed(1)} / 偏差 ${(value - refSpeed).toFixed(2)}`
+            : '基準 — / 偏差 —'}
         </div>
       )}
     </div>

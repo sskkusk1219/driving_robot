@@ -9,7 +9,7 @@ from src.app.robot_controller import (
     RobotController,
 )
 from src.domain.control.pid import PIDController
-from src.models.profile import PIDGains, StopConfig
+from src.models.profile import PIDGains, StopConfig, VehicleProfile
 from src.models.system_state import InitStepStatus, RobotState
 
 
@@ -352,6 +352,55 @@ class TestEmergencyStop:
         await ctrl.emergency_stop()
         assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
         ctrl._accel_driver.home_return.assert_called_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_closes_session_even_if_home_return_fails(self) -> None:
+        """home_return が例外でもセッションは 'emergency' で必ず閉じること。
+
+        status='running' が残らないこと。
+        実機では Modbus 失敗で home_return が例外を投げ得る。try/finally で
+        _close_session に到達しないと DB に status='running' のセッションが残る。
+        """
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        ctrl.select_profile(MagicMock(id="prof-1", model_path=None))  # type: ignore[arg-type]
+        log_writer = MagicMock()
+        log_writer.start_session = AsyncMock(return_value="sess-1")
+        log_writer.write_log = AsyncMock()
+        log_writer.end_session = AsyncMock()
+        await ctrl.start_auto_drive(mode_id="mode-1", log_writer=log_writer)
+        ctrl._accel_driver.home_return = AsyncMock(  # type: ignore[attr-defined]
+            side_effect=RuntimeError("Modbus desync")
+        )
+
+        with pytest.raises(RuntimeError):
+            await ctrl.emergency_stop()
+
+        # home_return が失敗しても: 状態は EMERGENCY、セッションは閉じられ end_session 記録済み
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
+        assert ctrl.get_system_state().active_session_id is None
+        log_writer.end_session.assert_awaited_once_with("sess-1", "emergency")
+
+    @pytest.mark.asyncio
+    async def test_stop_auto_drive_closes_session_even_if_home_return_fails(self) -> None:
+        """正常停止でも home_return 失敗時にセッションを 'completed' で閉じること。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        ctrl.select_profile(MagicMock(id="prof-1", model_path=None))  # type: ignore[arg-type]
+        log_writer = MagicMock()
+        log_writer.start_session = AsyncMock(return_value="sess-2")
+        log_writer.write_log = AsyncMock()
+        log_writer.end_session = AsyncMock()
+        await ctrl.start_auto_drive(mode_id="mode-1", log_writer=log_writer)
+        ctrl._accel_driver.home_return = AsyncMock(  # type: ignore[attr-defined]
+            side_effect=RuntimeError("Modbus desync")
+        )
+
+        with pytest.raises(RuntimeError):
+            await ctrl.stop_auto_drive()
+
+        assert ctrl.get_system_state().active_session_id is None
+        log_writer.end_session.assert_awaited_once_with("sess-2", "completed")
         ctrl._brake_driver.home_return.assert_called_once()  # type: ignore[attr-defined]
 
 
@@ -660,6 +709,57 @@ class TestStopAutoDrive:
         await advance_to_ready(ctrl)
         with pytest.raises(InvalidStateTransition):
             await ctrl.stop_auto_drive()
+
+
+class TestPauseResumeAutoDrive:
+    @pytest.mark.asyncio
+    async def test_pause_auto_drive_transitions_running_to_paused(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(mode_id="mode-1")
+        ctrl._drive_loop = MagicMock()  # テストでは start で実ループは生成されない
+        await ctrl.pause_auto_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.PAUSED
+        ctrl._drive_loop.pause.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_auto_drive_transitions_paused_to_running(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(mode_id="mode-1")
+        ctrl._drive_loop = MagicMock()
+        await ctrl.pause_auto_drive()
+        await ctrl.resume_auto_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.RUNNING
+        ctrl._drive_loop.resume.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pause_auto_drive_from_ready_raises(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.pause_auto_drive()
+
+    @pytest.mark.asyncio
+    async def test_resume_auto_drive_from_running_raises(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(mode_id="mode-1")
+        ctrl._drive_loop = MagicMock()
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.resume_auto_drive()
+
+    @pytest.mark.asyncio
+    async def test_stop_from_paused_transitions_to_ready(self) -> None:
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(mode_id="mode-1")
+        ctrl._drive_loop = MagicMock()
+        ctrl._drive_loop.stop_and_join = AsyncMock()
+        ctrl._drive_loop.kpi_summary = {"n_samples": 0.0}
+        await ctrl.pause_auto_drive()
+        await ctrl.stop()
+        assert ctrl.get_system_state().robot_state == RobotState.READY
 
 
 class TestStartManual:
@@ -1184,20 +1284,107 @@ class TestSelectProfile:
         assert ctrl.get_active_profile() is p2
 
 
+async def _arm_ready_learning_controller() -> tuple[RobotController, object]:
+    """学習運転を arm 済み（PRE_CHECK）の状態まで進めたコントローラとプロファイルを返す。"""
+    ctrl = _make_controller_for_logging()
+    await advance_to_ready(ctrl)
+    profile = _make_profile_with_calibration()
+    ctrl.select_profile(profile)  # type: ignore[arg-type]
+    return ctrl, profile
+
+
+class TestArmLearningDrive:
+    """arm_learning_drive() の状態遷移とブレーキ保持。"""
+
+    @pytest.mark.asyncio
+    async def test_arm_transitions_to_pre_check(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_learning_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.PRE_CHECK
+
+    @pytest.mark.asyncio
+    async def test_arm_applies_stop_brake_hold(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_learning_drive()
+        # 停車保持ブレーキ（既定 20%、brake stroke 0..5000 → 1000）まで踏み込む
+        ctrl._brake_driver.move_to_position.assert_awaited()  # type: ignore[attr-defined]
+        assert ctrl._brake_driver.move_to_position.await_args.args[0] == 1000  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_arm_two_phase_precheck_brakes_between(self) -> None:
+        """踏込前チェック(車速除外)→ブレーキ踏込→踏込後チェック(位置除外)の順であること。"""
+        from src.domain.pre_check import (  # noqa: PLC0415
+            ITEM_ACTUATOR_POSITION,
+            ITEM_VEHICLE_STOPPED,
+        )
+        from src.models.pre_check import PreCheckItemResult, PreCheckResult  # noqa: PLC0415
+
+        ctrl, _ = await _arm_ready_learning_controller()
+        order: list[str] = []
+        excludes: list[frozenset[str]] = []
+
+        orig_move = ctrl._brake_driver.move_to_position
+
+        async def rec_move(pos: int) -> None:
+            order.append("brake")
+            await orig_move(pos)
+
+        ctrl._brake_driver.move_to_position = AsyncMock(side_effect=rec_move)  # type: ignore[method-assign]
+
+        async def rec_run(exclude: frozenset[str] = frozenset()) -> PreCheckResult:
+            order.append("precheck")
+            excludes.append(exclude)
+            return PreCheckResult(
+                passed=True, items=[PreCheckItemResult(item_name="x", passed=True)]
+            )
+
+        runner = MagicMock()
+        runner.run = AsyncMock(side_effect=rec_run)
+        ctrl._pre_check_runner = runner  # type: ignore[assignment]
+
+        await ctrl.arm_learning_drive()
+        assert order == ["precheck", "brake", "precheck"]
+        assert ITEM_VEHICLE_STOPPED in excludes[0]  # 踏込前は車速確認を除外
+        assert ITEM_ACTUATOR_POSITION in excludes[1]  # 踏込後はアクチュエータ位置を除外
+        assert ctrl.get_system_state().robot_state == RobotState.PRE_CHECK
+
+    @pytest.mark.asyncio
+    async def test_arm_pre_check_failed_returns_to_ready(self) -> None:
+        from src.app.robot_controller import PreCheckFailed  # noqa: PLC0415
+        from src.models.pre_check import PreCheckItemResult, PreCheckResult  # noqa: PLC0415
+
+        ctrl, _ = await _arm_ready_learning_controller()
+        runner = MagicMock()
+        runner.run = AsyncMock(
+            return_value=PreCheckResult(
+                passed=False,
+                items=[
+                    PreCheckItemResult(
+                        item_name="車速確認", passed=False, error_message="車速が 0 ではありません"
+                    )
+                ],
+            )
+        )
+        ctrl._pre_check_runner = runner  # type: ignore[assignment]
+        with pytest.raises(PreCheckFailed):
+            await ctrl.arm_learning_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
+
 class TestStartLearningDrive:
-    """start_learning_drive() の状態遷移・返り値テスト。"""
+    """start_learning_drive() の状態遷移・返り値テスト（arm 後）。"""
 
     @pytest.mark.asyncio
     async def test_transitions_to_running(self) -> None:
-        ctrl = make_controller()
-        await advance_to_ready(ctrl)
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_learning_drive()
         await ctrl.start_learning_drive()
         assert ctrl.get_system_state().robot_state == RobotState.RUNNING
 
     @pytest.mark.asyncio
     async def test_returns_learning_drive_session(self) -> None:
-        ctrl = make_controller()
-        await advance_to_ready(ctrl)
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_learning_drive()
         session = await ctrl.start_learning_drive()
         assert session.run_type == "learning"
         assert session.mode_id is None
@@ -1205,52 +1392,182 @@ class TestStartLearningDrive:
 
     @pytest.mark.asyncio
     async def test_active_session_id_is_set(self) -> None:
-        ctrl = make_controller()
-        await advance_to_ready(ctrl)
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_learning_drive()
         session = await ctrl.start_learning_drive()
         assert ctrl.get_system_state().active_session_id == session.id
 
     @pytest.mark.asyncio
-    async def test_pre_check_failed_returns_to_ready(self) -> None:
+    async def test_start_without_arm_raises(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        # arm せず READY のまま start → InvalidStateTransition
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.start_learning_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
+
+class TestCancelLearningDrive:
+    """cancel_learning_drive() の状態遷移とブレーキリリース。"""
+
+    @pytest.mark.asyncio
+    async def test_cancel_returns_to_ready_and_releases_brake(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_learning_drive()
+        await ctrl.cancel_learning_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+        ctrl._brake_driver.home_return.assert_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_cancel_without_arm_raises(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.cancel_learning_drive()
+
+
+class TestStopLearningDrive:
+    """stop_learning_drive() の緩減速・停止確認・停車保持。"""
+
+    @pytest.mark.asyncio
+    async def test_already_stopped_applies_brake_hold_and_ready(self) -> None:
+        """学習終了時に既に停止していれば即停車保持ブレーキを適用し READY へ。"""
+        ctrl, profile = await _arm_ready_learning_controller()
+        ctrl._active_profile = profile  # type: ignore[assignment]
+        ctrl._state = RobotState.RUNNING
+        ctrl._can_reader.read_speed = AsyncMock(return_value=0.0)  # type: ignore[attr-defined]
+
+        await ctrl.stop_learning_drive()
+
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+        # 停車保持ブレーキ（20% → 1000）を適用。原点復帰はしない（停止保持を維持）。
+        assert ctrl._brake_driver.move_to_position.await_args.args[0] == 1000  # type: ignore[attr-defined]
+        ctrl._brake_driver.home_return.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_decelerates_until_stopped_then_holds(self) -> None:
+        """転動中なら停止が確認できるまで減速し、その後に停車保持ブレーキを適用する。"""
+        ctrl, profile = await _arm_ready_learning_controller()
+        ctrl._active_profile = profile  # type: ignore[assignment]
+        ctrl._state = RobotState.RUNNING
+        # 10 → 5 → 0 km/h と収束。最後の 0 で停止確認しループを抜ける。
+        ctrl._can_reader.read_speed = AsyncMock(side_effect=[10.0, 5.0, 0.0])  # type: ignore[attr-defined]
+
+        await ctrl.stop_learning_drive()
+
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+        # 減速中に複数回ブレーキ位置を指令し、最後は停車保持ブレーキ（1000）。
+        positions = [c.args[0] for c in ctrl._brake_driver.move_to_position.await_args_list]  # type: ignore[attr-defined]
+        assert len(positions) >= 2
+        assert positions[-1] == 1000
+        ctrl._brake_driver.home_return.assert_not_called()  # type: ignore[attr-defined]
+
+
+class TestArmAutoDrive:
+    """arm_auto_drive() の状態遷移とブレーキ保持（学習運転 arm と共通実装）。"""
+
+    @pytest.mark.asyncio
+    async def test_arm_transitions_to_pre_check(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_auto_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.PRE_CHECK
+
+    @pytest.mark.asyncio
+    async def test_arm_applies_stop_brake_hold(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_auto_drive()
+        # 停車保持ブレーキ（既定 20%、brake stroke 0..5000 → 1000）まで踏み込む
+        ctrl._brake_driver.move_to_position.assert_awaited()  # type: ignore[attr-defined]
+        assert ctrl._brake_driver.move_to_position.await_args.args[0] == 1000  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_arm_two_phase_precheck_brakes_between(self) -> None:
+        """踏込前チェック(車速除外)→ブレーキ踏込→踏込後チェック(位置除外)の順であること。"""
+        from src.domain.pre_check import (  # noqa: PLC0415
+            ITEM_ACTUATOR_POSITION,
+            ITEM_VEHICLE_STOPPED,
+        )
+        from src.models.pre_check import PreCheckItemResult, PreCheckResult  # noqa: PLC0415
+
+        ctrl, _ = await _arm_ready_learning_controller()
+        order: list[str] = []
+        excludes: list[frozenset[str]] = []
+
+        orig_move = ctrl._brake_driver.move_to_position
+
+        async def rec_move(pos: int) -> None:
+            order.append("brake")
+            await orig_move(pos)
+
+        ctrl._brake_driver.move_to_position = AsyncMock(side_effect=rec_move)  # type: ignore[method-assign]
+
+        async def rec_run(exclude: frozenset[str] = frozenset()) -> PreCheckResult:
+            order.append("precheck")
+            excludes.append(exclude)
+            return PreCheckResult(
+                passed=True, items=[PreCheckItemResult(item_name="x", passed=True)]
+            )
+
+        runner = MagicMock()
+        runner.run = AsyncMock(side_effect=rec_run)
+        ctrl._pre_check_runner = runner  # type: ignore[assignment]
+
+        await ctrl.arm_auto_drive()
+        assert order == ["precheck", "brake", "precheck"]
+        assert ITEM_VEHICLE_STOPPED in excludes[0]  # 踏込前は車速確認を除外
+        assert ITEM_ACTUATOR_POSITION in excludes[1]  # 踏込後はアクチュエータ位置を除外
+        assert ctrl.get_system_state().robot_state == RobotState.PRE_CHECK
+
+    @pytest.mark.asyncio
+    async def test_arm_pre_check_failed_returns_to_ready(self) -> None:
         from src.app.robot_controller import PreCheckFailed  # noqa: PLC0415
         from src.models.pre_check import PreCheckItemResult, PreCheckResult  # noqa: PLC0415
 
+        ctrl, _ = await _arm_ready_learning_controller()
         runner = MagicMock()
         runner.run = AsyncMock(
             return_value=PreCheckResult(
                 passed=False,
                 items=[
                     PreCheckItemResult(
-                        item_name="UPS残量",
-                        passed=False,
-                        error_message="UPS残量不足: 5.0%",
+                        item_name="車速確認", passed=False, error_message="車速が 0 ではありません"
                     )
                 ],
             )
         )
-        ctrl = make_controller()
         ctrl._pre_check_runner = runner  # type: ignore[assignment]
-        await advance_to_ready(ctrl)
         with pytest.raises(PreCheckFailed):
-            await ctrl.start_learning_drive()
+            await ctrl.arm_auto_drive()
         assert ctrl.get_system_state().robot_state == RobotState.READY
 
-    @pytest.mark.asyncio
-    async def test_with_passing_pre_check_transitions_to_running(self) -> None:
-        from src.models.pre_check import PreCheckItemResult, PreCheckResult  # noqa: PLC0415
 
-        runner = MagicMock()
-        runner.run = AsyncMock(
-            return_value=PreCheckResult(
-                passed=True,
-                items=[PreCheckItemResult(item_name="通信確認", passed=True)],
-            )
-        )
-        ctrl = make_controller()
-        ctrl._pre_check_runner = runner  # type: ignore[assignment]
-        await advance_to_ready(ctrl)
-        await ctrl.start_learning_drive()
+class TestStartAutoDriveAfterArm:
+    """start_auto_drive() を arm 後（PRE_CHECK）から呼ぶ確認ポップアップ「はい」経路。"""
+
+    @pytest.mark.asyncio
+    async def test_start_after_arm_transitions_to_running(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_auto_drive()
+        session = await ctrl.start_auto_drive(mode_id="mode-1")
         assert ctrl.get_system_state().robot_state == RobotState.RUNNING
+        assert session.run_type == "auto"
+        assert ctrl.get_system_state().active_session_id == session.id
+
+
+class TestCancelAutoDrive:
+    """cancel_auto_drive() の状態遷移とブレーキリリース（学習運転 cancel と共通実装）。"""
+
+    @pytest.mark.asyncio
+    async def test_cancel_returns_to_ready_and_releases_brake(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        await ctrl.arm_auto_drive()
+        await ctrl.cancel_auto_drive()
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+        ctrl._brake_driver.home_return.assert_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_cancel_without_arm_raises(self) -> None:
+        ctrl, _ = await _arm_ready_learning_controller()
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.cancel_auto_drive()
 
 
 def _make_profile_with_calibration() -> object:
@@ -1282,6 +1599,19 @@ def _make_profile_with_calibration() -> object:
     )
 
 
+def _make_patterns() -> object:
+    from src.models.learning_drive import LearningPattern, PatternKind  # noqa: PLC0415
+
+    return [
+        LearningPattern(
+            kind=PatternKind.ACCEL_SWEEP,
+            accel_opening=30.0,
+            brake_opening=30.0,
+            hold_duration_s=1.0,
+        )
+    ]
+
+
 def _make_mode() -> object:
     from src.models.driving_mode import DrivingMode, SpeedPoint  # noqa: PLC0415
 
@@ -1308,7 +1638,7 @@ def _make_controller_for_logging() -> RobotController:
     brake = make_brake_driver()
     brake.move_to_position = AsyncMock()
     learning_manager = MagicMock()
-    learning_manager.build_learning_reference = MagicMock(return_value=_make_mode())
+    learning_manager.generate_patterns = MagicMock(return_value=_make_patterns())
     return RobotController(
         accel_driver=accel,
         brake_driver=brake,
@@ -1382,18 +1712,20 @@ class TestDriveSessionLogging:
         log_writer.start_session = AsyncMock(return_value="learn-sess-1")
         log_writer.end_session = AsyncMock()
 
+        await ctrl.arm_learning_drive()
         session = await ctrl.start_learning_drive(log_writer=log_writer)
 
         log_writer.start_session.assert_awaited_once_with("prof-uuid-1", None, "learning")
         assert session.run_type == "learning"
         assert session.mode_id is None
         assert session.id == "learn-sess-1"
-        ctrl._learning_manager.build_learning_reference.assert_called_once_with(profile)  # type: ignore[attr-defined]
-        assert ctrl._drive_loop is not None
+        ctrl._learning_manager.generate_patterns.assert_called_once_with(profile)  # type: ignore[attr-defined]
+        assert ctrl._learning_loop is not None
 
         # 手動停止（/stop）で RUNNING→READY・セッション completed 終了
         await ctrl.stop()
         log_writer.end_session.assert_awaited_once_with("learn-sess-1", "completed")
+        assert ctrl._learning_loop is None
 
     @pytest.mark.asyncio
     async def test_learning_drive_without_log_writer_uses_local_uuid(self) -> None:
@@ -1404,9 +1736,11 @@ class TestDriveSessionLogging:
         profile = _make_profile_with_calibration()
         ctrl.select_profile(profile)  # type: ignore[arg-type]
 
+        await ctrl.arm_learning_drive()
         session = await ctrl.start_learning_drive(log_writer=None)
         UUID(session.id)  # ローカル採番の UUID として解析できる
         assert ctrl._log_writer is None
+        await ctrl.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -1697,3 +2031,304 @@ class TestKpiSummaryRecording:
         await ctrl.stop_auto_drive()
 
         assert ctrl.last_kpi_summary == {"n_samples": 10.0}
+
+
+def _calibrated_profile() -> VehicleProfile:
+    from src.models.calibration import CalibrationData
+
+    calib = CalibrationData(
+        accel_zero_pos=100, accel_full_pos=5100, accel_stroke=5000,
+        brake_zero_pos=200, brake_full_pos=5200, brake_stroke=5000,
+        calibrated_at=datetime.now(tz=UTC), is_valid=True,
+    )
+    return VehicleProfile(
+        id="p1", name="t", max_accel_opening=80.0, max_brake_opening=80.0,
+        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=calib, model_path=None,
+        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+    )
+
+
+class TestPidTuningOrchestration:
+    @pytest.mark.asyncio
+    async def test_validation_requires_ready_state(self) -> None:
+        ctrl = make_controller()  # BOOTING
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.run_pid_validation(_calibrated_profile())
+
+    @pytest.mark.asyncio
+    async def test_validation_requires_calibration(self) -> None:
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        prof = _calibrated_profile()
+        uncalibrated = VehicleProfile(
+            **{**prof.__dict__, "calibration": None}
+        )
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.run_pid_validation(uncalibrated)
+
+    @pytest.mark.asyncio
+    async def test_tuning_session_drives_runs_and_applies_best(self) -> None:
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        prof = _calibrated_profile()
+
+        # _run_tuning_drive をモックし、kp が大きいほど良い（コスト低い）KPI を返す。
+        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+            kp = ctrl._pid._kp  # 直近に set_gains された候補
+            # p95 が kp とともに改善する単調なダミー応答
+            p95 = max(0.05, 1.0 - 0.1 * kp)
+            return {
+                "n_samples": 500.0, "p95_kmh": p95, "max_abs_deviation_kmh": p95 * 2,
+                "reversal_max_per_5s": 1.0, "hard_limit_violations": 0.0,
+            }
+
+        ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
+
+        best, history = await ctrl.run_pid_tuning_session(prof, None, max_runs=12)
+
+        assert len(history) >= 2
+        assert best.kp >= prof.pid_gains.kp  # kp を上げる方向に改善している
+        # 最良ゲインが制御スタックへ反映されている
+        assert ctrl._pid._kp == pytest.approx(best.kp)
+
+    @pytest.mark.asyncio
+    async def test_tuning_drive_aborts_on_emergency(self) -> None:
+        from src.app.robot_controller import PidTuningAborted
+
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        ctrl._active_profile = _calibrated_profile()
+        prof = ctrl._active_profile
+
+        def fake_build(
+            mode: object, profile: object, log_writer: object,
+            session_id: object, on_complete: object = None,
+            disable_deviation_check: bool = False,
+        ) -> None:
+            # 走行開始直後に非常停止が発火したのを模擬
+            ctrl._state = RobotState.EMERGENCY
+            ctrl._drive_complete.set()
+
+        ctrl._build_and_start_drive_loop = fake_build  # type: ignore[assignment]
+
+        with pytest.raises(PidTuningAborted):
+            await ctrl._run_tuning_drive(prof, None)
+
+    @pytest.mark.asyncio
+    async def test_tuning_drive_starts_without_precheck(self) -> None:
+        # 仕様: PID最適化は走行前チェック/arm をせず、停止保持状態から直接走行する。
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        ctrl._active_profile = _calibrated_profile()
+        prof = ctrl._active_profile
+        ctrl.arm_auto_drive = AsyncMock()  # type: ignore[assignment]
+        ctrl._pre_check_runner = MagicMock()
+        ctrl._pre_check_runner.run = AsyncMock()
+
+        def fake_build(
+            mode: object, profile: object, log_writer: object,
+            session_id: object, on_complete: object = None,
+            disable_deviation_check: bool = False,
+        ) -> None:
+            # 走行完了を模擬（停止保持して READY へ）
+            ctrl._state = RobotState.READY
+            ctrl._last_kpi_summary = {"n_samples": 100.0, "p95_kmh": 0.1}
+            ctrl._drive_complete.set()
+
+        ctrl._build_and_start_drive_loop = fake_build  # type: ignore[assignment]
+
+        kpi = await ctrl._run_tuning_drive(prof, None)
+
+        assert kpi["n_samples"] == 100.0
+        ctrl.arm_auto_drive.assert_not_called()       # arm しない
+        ctrl._pre_check_runner.run.assert_not_called()  # 走行前チェックしない
+
+    @pytest.mark.asyncio
+    async def test_tuning_drive_opens_session_with_null_mode_id(self) -> None:
+        # 回帰防止: drive_sessions.mode_id は UUID。規定パターンは永続モードでないため
+        # mode_id=None で開始する（"pid-tune" を渡すと DB DataError→500）。
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        ctrl._active_profile = _calibrated_profile()
+        prof = ctrl._active_profile
+        log_writer = MagicMock()
+        log_writer.start_session = AsyncMock(return_value="sess-1")
+        log_writer.end_session = AsyncMock()
+
+        def fake_build(
+            mode: object, profile: object, lw: object,
+            session_id: object, on_complete: object = None,
+            disable_deviation_check: bool = False,
+        ) -> None:
+            ctrl._state = RobotState.READY
+            ctrl._last_kpi_summary = {"n_samples": 1.0}
+            ctrl._drive_complete.set()
+
+        ctrl._build_and_start_drive_loop = fake_build  # type: ignore[assignment]
+
+        await ctrl._run_tuning_drive(prof, log_writer)
+
+        log_writer.start_session.assert_awaited_once()
+        # start_session(profile_id, mode_id, run_type) → mode_id は None
+        assert log_writer.start_session.await_args.args[1] is None
+
+    @pytest.mark.asyncio
+    async def test_tuning_drive_disables_deviation_check(self) -> None:
+        # 適合中は逸脱による非常停止を無効化して走行する（未適合ゲインでも適合できる）。
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        ctrl._active_profile = _calibrated_profile()
+        prof = ctrl._active_profile
+        captured: dict[str, object] = {}
+
+        def fake_build(
+            mode: object, profile: object, lw: object,
+            session_id: object, on_complete: object = None,
+            disable_deviation_check: bool = False,
+        ) -> None:
+            captured["disable_deviation_check"] = disable_deviation_check
+            ctrl._state = RobotState.READY
+            ctrl._last_kpi_summary = {"n_samples": 1.0}
+            ctrl._drive_complete.set()
+
+        ctrl._build_and_start_drive_loop = fake_build  # type: ignore[assignment]
+
+        await ctrl._run_tuning_drive(prof, None)
+
+        assert captured["disable_deviation_check"] is True
+
+
+# ── タイムスケジュール走行の統合（release_all の保証を含む）─────────────
+
+
+def _make_button_servo() -> MagicMock:
+    servo = MagicMock()
+    servo.connect = AsyncMock()
+    servo.press = AsyncMock()
+    servo.release_all = AsyncMock()
+    return servo
+
+
+def _make_time_schedule(with_button: bool = False) -> object:
+    from src.models.time_schedule import ButtonEvent, PedalPoint, TimeSchedule  # noqa: PLC0415
+
+    return TimeSchedule(
+        id="sched-uuid-1",
+        name="Sched",
+        description="",
+        pedal_points=[PedalPoint(0.0, 0.0, 0.0), PedalPoint(5.0, 40.0, 0.0)],
+        button_events=[ButtonEvent(0.5, 0, 1.0)] if with_button else [],
+        total_duration=5.0,
+        loop=False,
+        created_at=datetime.now(tz=UTC),
+    )
+
+
+def _make_controller_with_button_servo() -> tuple[RobotController, MagicMock]:
+    button = _make_button_servo()
+    safety = MagicMock()
+    safety.check_overcurrent = MagicMock(return_value=False)
+    safety.check_deviation = MagicMock(return_value=False)
+    safety.set_stop_config = MagicMock()
+    ctrl = RobotController(
+        accel_driver=make_accel_driver(),
+        brake_driver=make_brake_driver(),
+        can_reader=make_can_reader(),
+        safety_monitor=make_safety_monitor(),
+        pid=make_pid(),
+        last_normal_shutdown=True,
+        safety_check=safety,
+        button_servo=button,
+    )
+    return ctrl, button
+
+
+class TestScheduleDrive:
+    @pytest.mark.asyncio
+    async def test_start_connects_button_servo_on_start(self) -> None:
+        ctrl, button = _make_controller_with_button_servo()
+        await ctrl.start()
+        button.connect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_start_schedule_drive_builds_and_starts_loop(self) -> None:
+        ctrl, button = _make_controller_with_button_servo()
+        await advance_to_ready(ctrl)
+        ctrl.select_profile(_make_profile_with_calibration())
+        session = await ctrl.start_schedule_drive(
+            _make_time_schedule(), profile=ctrl.get_active_profile()
+        )
+        assert ctrl.get_system_state().robot_state == RobotState.RUNNING
+        assert ctrl._schedule_loop is not None
+        assert ctrl._schedule_loop.is_running is True
+        assert session.run_type == "auto"
+        assert session.mode_id is None
+        await ctrl.stop_schedule_drive()  # クリーンアップ
+
+    @pytest.mark.asyncio
+    async def test_start_schedule_runs_precheck_with_button_flag(self) -> None:
+        from src.models.pre_check import PreCheckResult  # noqa: PLC0415
+
+        ctrl, button = _make_controller_with_button_servo()
+        runner = AsyncMock()
+        runner.run = AsyncMock(return_value=PreCheckResult(passed=True, items=[]))
+        runner.set_profile = MagicMock()
+        ctrl._pre_check_runner = runner
+        await advance_to_ready(ctrl)
+        ctrl.select_profile(_make_profile_with_calibration())
+        await ctrl.start_schedule_drive(
+            _make_time_schedule(with_button=True), profile=ctrl.get_active_profile()
+        )
+        runner.run.assert_awaited_once()
+        assert runner.run.await_args.kwargs.get("include_button_servo") is True
+        await ctrl.stop_schedule_drive()
+
+    @pytest.mark.asyncio
+    async def test_stop_schedule_drive_releases_and_homes(self) -> None:
+        ctrl, button = _make_controller_with_button_servo()
+        await advance_to_ready(ctrl)
+        mock_loop = MagicMock()
+        mock_loop.stop_and_join = AsyncMock()
+        ctrl._schedule_loop = mock_loop
+        ctrl._state = RobotState.RUNNING
+        await ctrl.stop_schedule_drive()
+        mock_loop.stop_and_join.assert_awaited_once()
+        button.release_all.assert_awaited_once()
+        ctrl._accel_driver.home_return.assert_awaited()
+        ctrl._brake_driver.home_return.assert_awaited()
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_releases_button_servo(self) -> None:
+        ctrl, button = _make_controller_with_button_servo()
+        await advance_to_ready(ctrl)
+        mock_loop = MagicMock()
+        mock_loop.stop = MagicMock()
+        mock_loop.stop_and_join = AsyncMock()
+        ctrl._schedule_loop = mock_loop
+        ctrl._state = RobotState.RUNNING
+        await ctrl.emergency_stop()
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
+        mock_loop.stop.assert_called_once()
+        button.release_all.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stop_releases_button_servo_during_schedule(self) -> None:
+        ctrl, button = _make_controller_with_button_servo()
+        await advance_to_ready(ctrl)
+        mock_loop = MagicMock()
+        mock_loop.stop_and_join = AsyncMock()
+        ctrl._schedule_loop = mock_loop
+        ctrl._state = RobotState.RUNNING
+        await ctrl.stop()
+        button.release_all.assert_awaited()
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
+    @pytest.mark.asyncio
+    async def test_shutdown_releases_button_servo(self) -> None:
+        ctrl, button = _make_controller_with_button_servo()
+        await advance_to_ready(ctrl)
+        await ctrl.shutdown()
+        button.release_all.assert_awaited()

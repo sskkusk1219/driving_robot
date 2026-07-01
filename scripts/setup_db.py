@@ -5,7 +5,6 @@ import os
 
 import asyncpg
 
-
 DDL_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS vehicle_profiles (
@@ -92,6 +91,19 @@ DDL_STATEMENTS = [
         brake_pos         INTEGER NOT NULL,
         accel_current     DOUBLE PRECISION NOT NULL,
         brake_current     DOUBLE PRECISION NOT NULL
+    )
+    """,
+    # タイムスケジュール（統合タイムライン）: ペダル開度とボタンイベントを1エンティティで管理
+    """
+    CREATE TABLE IF NOT EXISTS time_schedules (
+        id             UUID PRIMARY KEY,
+        name           TEXT NOT NULL UNIQUE,
+        description    TEXT NOT NULL DEFAULT '',
+        pedal_points   JSONB NOT NULL,
+        button_events  JSONB NOT NULL,
+        total_duration DOUBLE PRECISION NOT NULL,
+        loop           BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at     TIMESTAMPTZ NOT NULL
     )
     """,
     # architecture.md 定義の3インデックス

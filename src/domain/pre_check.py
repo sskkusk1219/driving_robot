@@ -1,4 +1,8 @@
-"""走行前チェック: 走行開始前に実施する6項目のシステム状態確認。"""
+"""走行前チェック: 走行開始前に実施するシステム状態確認。
+
+項目1〜7は全走行モード共通。項目8（ボタンサーボ確認）はタイムスケジュール実行時のみ
+`run(include_button_servo=True)` で追加される。
+"""
 
 from typing import Protocol
 
@@ -7,12 +11,27 @@ from src.models.profile import VehicleProfile
 
 HOME_POSITION_TOLERANCE_PULSE: int = 10
 UPS_MIN_BATTERY_PCT: float = 20.0
+STOPPED_SPEED_THRESHOLD_KMH: float = 0.5  # これ未満を「停車中」とみなす
+
+# チェック項目名（exclude 指定や結果参照に使う）
+ITEM_COMMUNICATION = "通信確認"
+ITEM_SERVO = "サーボ状態"
+ITEM_CALIBRATION = "キャリブレーション"
+ITEM_PROFILE = "プロファイル"
+ITEM_UPS = "UPS残量"
+ITEM_ACTUATOR_POSITION = "アクチュエータ位置"
+ITEM_VEHICLE_STOPPED = "車速確認"
+ITEM_BUTTON_SERVO = "ボタンサーボ確認"  # 項目8: タイムスケジュール実行時のみ
 
 
 class ActuatorPreCheckProtocol(Protocol):
     async def read_position(self) -> int: ...
 
     async def is_alarm_active(self) -> bool: ...
+
+
+class ButtonServoPreCheckProtocol(Protocol):
+    async def check_connection(self) -> bool: ...
 
 
 class CANPreCheckProtocol(Protocol):
@@ -24,7 +43,7 @@ class UPSPreCheckProtocol(Protocol):
 
 
 class PreCheckRunner:
-    """6項目の走行前チェックを実行しドメイン結果を返す。
+    """7項目の走行前チェックを実行しドメイン結果を返す。
 
     ハードウェア依存は Protocol で分離しているためユニットテスト可能。
     UPS 取得方法は機種確定後に UPSPreCheckProtocol の実装を提供する。
@@ -37,32 +56,76 @@ class PreCheckRunner:
         can_reader: CANPreCheckProtocol,
         ups_monitor: UPSPreCheckProtocol,
         profile: VehicleProfile | None,
+        button_servo: ButtonServoPreCheckProtocol | None = None,
         home_position_tolerance_pulse: int = HOME_POSITION_TOLERANCE_PULSE,
         ups_min_battery_pct: float = UPS_MIN_BATTERY_PCT,
+        stopped_speed_threshold_kmh: float = STOPPED_SPEED_THRESHOLD_KMH,
     ) -> None:
         self._accel = accel_driver
         self._brake = brake_driver
         self._can = can_reader
         self._ups = ups_monitor
         self._profile = profile
+        self._button_servo = button_servo
         self._tolerance = home_position_tolerance_pulse
         self._ups_min = ups_min_battery_pct
+        self._stopped_speed = stopped_speed_threshold_kmh
 
     def set_profile(self, profile: VehicleProfile | None) -> None:
         """アクティブプロファイルを更新する。RobotController.select_profile() から呼ばれる。"""
         self._profile = profile
 
-    async def run(self) -> PreCheckResult:
-        """全6項目をチェックし結果を返す。いずれか1項目でも NG なら passed=False。"""
-        items = [
-            await self._check_communication(),
-            await self._check_servo_state(),
-            await self._check_calibration(),
-            await self._check_profile(),
-            await self._check_ups_battery(),
-            await self._check_actuator_position(),
+    async def run(
+        self,
+        exclude: frozenset[str] = frozenset(),
+        *,
+        include_button_servo: bool = False,
+    ) -> PreCheckResult:
+        """走行前チェックを実行し結果を返す。いずれか1項目でも NG なら passed=False。
+
+        `exclude` に項目名（ITEM_* 定数）を渡すとその項目をスキップする。学習運転の arm では
+        「ブレーキ踏込前は車速確認を除外（停止前なので）」「踏込後はアクチュエータ位置を除外
+        （保持ブレーキで意図的に原点から離れているため）」のように2段で使い分ける。
+
+        `include_button_servo=True` でボタンサーボ確認（項目8）を追加する
+        （タイムスケジュール実行時のみ。ボタンイベントを含むスケジュールで指定する）。
+        """
+        checks = [
+            (ITEM_COMMUNICATION, self._check_communication),
+            (ITEM_SERVO, self._check_servo_state),
+            (ITEM_CALIBRATION, self._check_calibration),
+            (ITEM_PROFILE, self._check_profile),
+            (ITEM_UPS, self._check_ups_battery),
+            (ITEM_ACTUATOR_POSITION, self._check_actuator_position),
+            (ITEM_VEHICLE_STOPPED, self._check_vehicle_stopped),
         ]
+        if include_button_servo:
+            checks.append((ITEM_BUTTON_SERVO, self._check_button_servo))
+        items = [await fn() for name, fn in checks if name not in exclude]
         return PreCheckResult(passed=all(i.passed for i in items), items=items)
+
+    async def _check_button_servo(self) -> PreCheckItemResult:
+        """ボタンサーボ確認: PCA9685 の I2C 疎通を確認する（タイムスケジュール時のみ）。"""
+        if self._button_servo is None:
+            return PreCheckItemResult(
+                item_name=ITEM_BUTTON_SERVO,
+                passed=False,
+                error_message="ボタンサーボが構成されていません",
+            )
+        try:
+            if not await self._button_servo.check_connection():
+                return PreCheckItemResult(
+                    item_name=ITEM_BUTTON_SERVO,
+                    passed=False,
+                    error_message="PCA9685 と通信できません（I2C 配線・電源・アドレスを確認）",
+                )
+            return PreCheckItemResult(item_name=ITEM_BUTTON_SERVO, passed=True)
+        except Exception as e:
+            return PreCheckItemResult(
+                item_name=ITEM_BUTTON_SERVO,
+                passed=False,
+                error_message=f"ボタンサーボ確認エラー: {e}",
+            )
 
     async def _check_communication(self) -> PreCheckItemResult:
         """通信確認: ttyUSB0・ttyUSB1・CAN が応答するか。"""
@@ -148,6 +211,25 @@ class PreCheckRunner:
         except Exception as e:
             return PreCheckItemResult(
                 item_name="UPS残量", passed=False, error_message=f"UPS残量取得エラー: {e}"
+            )
+
+    async def _check_vehicle_stopped(self) -> PreCheckItemResult:
+        """車速確認: 車速が停車しきい値未満か。走行中の学習・走行開始を防止する。"""
+        try:
+            speed = await self._can.read_speed()
+            if abs(speed) >= self._stopped_speed:
+                return PreCheckItemResult(
+                    item_name="車速確認",
+                    passed=False,
+                    error_message=(
+                        f"車速が 0 ではありません: {speed:.1f}km/h"
+                        f"（{self._stopped_speed:.1f}km/h 未満で停車）"
+                    ),
+                )
+            return PreCheckItemResult(item_name="車速確認", passed=True)
+        except Exception as e:
+            return PreCheckItemResult(
+                item_name="車速確認", passed=False, error_message=f"車速取得エラー: {e}"
             )
 
     async def _check_actuator_position(self) -> PreCheckItemResult:

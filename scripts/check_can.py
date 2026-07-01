@@ -57,6 +57,7 @@ async def main() -> None:
 
     try:
         while True:
+            await asyncio.sleep(0.001)
             speed = await reader.read_speed()
             print(f"[{_now()}] Speed: {speed:6.2f} km/h")
     except (KeyboardInterrupt, asyncio.CancelledError):

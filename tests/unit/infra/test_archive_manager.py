@@ -32,6 +32,8 @@ def make_conn() -> AsyncMock:
 def make_fake_record(**kwargs: object) -> MagicMock:
     record = MagicMock()
     record.__getitem__ = lambda self, key: kwargs[key]
+    # asyncpg.Record と同様に dict(record) を成立させるため keys() を提供する。
+    record.keys = lambda: list(kwargs.keys())
 
     def _iter() -> object:
         yield from kwargs.items()
@@ -128,6 +130,8 @@ class TestExportToCsv:
         content = csv_path.read_text(encoding="utf-8")
         assert "timestamp" in content
         assert "actual_speed_kmh" in content
+        # timestamp は UTC 2026-01-01 00:00 → JST 09:00・スペース区切りで出力
+        assert "2026-01-01 09:00:00" in content
 
     def test_creates_empty_csv_with_header_for_no_rows(self, tmp_path: Path) -> None:
         """ログなしセッションでも CSV ヘッダーが書き出されること。"""

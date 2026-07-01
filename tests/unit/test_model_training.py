@@ -21,7 +21,6 @@ from src.models.drive_log import DriveLog
 from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
 
 DT_S = 0.1
-MAX_OFFSET = round(max(LOOKAHEAD_HORIZONS_S) / DT_S)  # = 30
 
 
 def make_profile(pid: str = "p1") -> VehicleProfile:
@@ -135,6 +134,23 @@ class TestTrainInverseModel:
         assert data["feature_names"] == FEATURE_NAMES
         assert data["horizons"] == list(LOOKAHEAD_HORIZONS_S)
         assert data["profile_id"] == "p-meta"
+        # 入力クリップ上限＝学習ログ観測最高車速（make_session_logs は 50 ステップ昇速で 50km/h）
+        assert data["speed_clip_max"] == pytest.approx(50.0)
+
+    def test_estimator_is_polynomial_pipeline(self) -> None:
+        """推定器が多項式展開＋標準化＋Ridge の Pipeline であること。"""
+        from sklearn.pipeline import Pipeline  # noqa: PLC0415
+        from sklearn.preprocessing import PolynomialFeatures  # noqa: PLC0415
+
+        logs = make_session_logs("s1")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path, _ = train_inverse_model(logs, make_profile(), output_dir=tmpdir)
+            with open(path, "rb") as f:
+                data = pickle.load(f)  # noqa: S301
+        for key in ("accel_model", "brake_model"):
+            model = data[key]
+            assert isinstance(model, Pipeline)
+            assert isinstance(model.steps[0][1], PolynomialFeatures)
 
     def test_metrics_present(self) -> None:
         logs = make_session_logs("s1")
@@ -169,21 +185,21 @@ class TestTrainInverseModel:
             assert Path(path).parent == Path(tmpdir)
 
     def test_sessions_are_not_crossed(self) -> None:
-        """2 セッションのログを渡すと、各セッション内のみで先読みされる。
+        """2 セッションを渡しても各セッション内のみで先読みされる（境界をまたがない）。
 
-        セッション境界をまたがないため、有効サンプル数 = Σ(len_i - max_offset)。
-        誤って 1 系列として扱うと (合計len - max_offset) になり値が変わる。
+        非クロスなら「まとめて学習した標本数」＝「個別に学習した標本数の和」。誤って 1 系列として
+        扱うと境界をまたぐ先読みで標本数が変わる。coast 除外で標本数がデータ依存になるため、
+        固定の期待値ではなく個別学習との一致で検証する。
         """
-        s1 = make_session_logs("s1")  # 100 件
-        s2 = make_session_logs("s2")  # 100 件
-        # わざと混在順で渡す（リポジトリ順序に依存しないことの確認も兼ねる）
-        logs = s1 + s2
+        s1 = make_session_logs("s1")
+        s2 = make_session_logs("s2")
         profile = make_profile()
         with tempfile.TemporaryDirectory() as tmpdir:
-            _, metrics = train_inverse_model(logs, profile, output_dir=tmpdir)
-        total = metrics["accel"]["n"] + metrics["brake"]["n"]
-        expected = (len(s1) - MAX_OFFSET) + (len(s2) - MAX_OFFSET)
-        assert total == expected
+            _, m_both = train_inverse_model(s1 + s2, profile, output_dir=tmpdir)
+            _, m1 = train_inverse_model(s1, profile, output_dir=tmpdir)
+            _, m2 = train_inverse_model(s2, profile, output_dir=tmpdir)
+        assert m_both["accel"]["n"] == m1["accel"]["n"] + m2["accel"]["n"]
+        assert m_both["brake"]["n"] == m1["brake"]["n"] + m2["brake"]["n"]
 
     def test_brake_deadband_zeroes_small_openings(self) -> None:
         """ブレーキ開度 < 1% は 0 扱いになり、ブレーキモデルがほぼ 0 を出力する。"""

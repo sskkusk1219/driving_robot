@@ -214,6 +214,7 @@ class TestSystemState:
             "CALIBRATING",
             "PRE_CHECK",
             "RUNNING",
+            "PAUSED",
             "MANUAL",
             "EMERGENCY",
             "ERROR",

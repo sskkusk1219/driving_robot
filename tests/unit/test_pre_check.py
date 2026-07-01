@@ -91,10 +91,10 @@ class TestPreCheckRunnerAllPass:
         assert result.passed is True
 
     @pytest.mark.asyncio
-    async def test_all_pass_has_six_items(self) -> None:
+    async def test_all_pass_has_seven_items(self) -> None:
         runner = make_runner()
         result = await runner.run()
-        assert len(result.items) == 6
+        assert len(result.items) == 7
 
     @pytest.mark.asyncio
     async def test_all_pass_no_failed_items(self) -> None:
@@ -304,6 +304,63 @@ class TestCheckActuatorPosition:
         assert pos_item.passed is True
 
 
+class TestRunExclude:
+    @pytest.mark.asyncio
+    async def test_exclude_vehicle_stopped_skips_speed_check(self) -> None:
+        from src.domain.pre_check import ITEM_VEHICLE_STOPPED  # noqa: PLC0415
+
+        # 車速が出ていても、車速確認を除外すれば passed=True になる
+        runner = make_runner(can_speed=5.0)
+        result = await runner.run(exclude=frozenset({ITEM_VEHICLE_STOPPED}))
+        assert result.passed is True
+        assert all(i.item_name != "車速確認" for i in result.items)
+        assert len(result.items) == 6
+
+    @pytest.mark.asyncio
+    async def test_exclude_actuator_position_skips_position_check(self) -> None:
+        from src.domain.pre_check import ITEM_ACTUATOR_POSITION  # noqa: PLC0415
+
+        # ブレーキを踏んで位置が原点から離れていても、位置を除外すれば passed=True
+        runner = make_runner(brake_pos=1575)
+        result = await runner.run(exclude=frozenset({ITEM_ACTUATOR_POSITION}))
+        assert result.passed is True
+        assert all(i.item_name != "アクチュエータ位置" for i in result.items)
+        assert len(result.items) == 6
+
+
+class TestCheckVehicleStopped:
+    @pytest.mark.asyncio
+    async def test_speed_check_fail_when_moving(self) -> None:
+        runner = make_runner(can_speed=5.0)
+        result = await runner.run()
+        assert result.passed is False
+        speed_item = next(i for i in result.items if i.item_name == "車速確認")
+        assert speed_item.passed is False
+        assert "5.0" in (speed_item.error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_speed_check_pass_when_stopped(self) -> None:
+        runner = make_runner(can_speed=0.0)
+        result = await runner.run()
+        speed_item = next(i for i in result.items if i.item_name == "車速確認")
+        assert speed_item.passed is True
+
+    @pytest.mark.asyncio
+    async def test_speed_check_pass_just_below_threshold(self) -> None:
+        runner = make_runner(can_speed=0.4)
+        result = await runner.run()
+        speed_item = next(i for i in result.items if i.item_name == "車速確認")
+        assert speed_item.passed is True
+
+    @pytest.mark.asyncio
+    async def test_speed_check_fail_when_read_raises(self) -> None:
+        runner = make_runner()
+        runner._can.read_speed = AsyncMock(side_effect=RuntimeError("CAN 読取失敗"))
+        result = await runner.run()
+        speed_item = next(i for i in result.items if i.item_name == "車速確認")
+        assert speed_item.passed is False
+
+
 class TestMultipleFailures:
     @pytest.mark.asyncio
     async def test_multiple_failures_all_reflected_in_result(self) -> None:
@@ -321,3 +378,90 @@ class TestMultipleFailures:
         assert result.passed is False
         assert len(result.failed_items) == 1
         assert result.failed_items[0].item_name == "UPS残量"
+
+
+def _make_button_servo(*, ok: bool = True, raises: bool = False) -> AsyncMock:
+    servo = AsyncMock()
+    if raises:
+        servo.check_connection = AsyncMock(side_effect=RuntimeError("I2C error"))
+    else:
+        servo.check_connection = AsyncMock(return_value=ok)
+    return servo
+
+
+class TestCheckButtonServo:
+    @pytest.mark.asyncio
+    async def test_not_included_by_default(self) -> None:
+        """include_button_servo=False（既定）では 7 項目のまま。"""
+        runner = PreCheckRunner(
+            accel_driver=make_accel_driver(),
+            brake_driver=make_brake_driver(),
+            can_reader=make_can_reader(),
+            ups_monitor=make_ups(),
+            profile=make_profile(),
+            button_servo=_make_button_servo(),
+        )
+        result = await runner.run()
+        assert len(result.items) == 7
+        assert all(i.item_name != "ボタンサーボ確認" for i in result.items)
+
+    @pytest.mark.asyncio
+    async def test_included_adds_eighth_item_and_passes(self) -> None:
+        runner = PreCheckRunner(
+            accel_driver=make_accel_driver(),
+            brake_driver=make_brake_driver(),
+            can_reader=make_can_reader(),
+            ups_monitor=make_ups(),
+            profile=make_profile(),
+            button_servo=_make_button_servo(ok=True),
+        )
+        result = await runner.run(include_button_servo=True)
+        assert len(result.items) == 8
+        item = next(i for i in result.items if i.item_name == "ボタンサーボ確認")
+        assert item.passed is True
+        assert result.passed is True
+
+    @pytest.mark.asyncio
+    async def test_missing_button_servo_fails(self) -> None:
+        runner = PreCheckRunner(
+            accel_driver=make_accel_driver(),
+            brake_driver=make_brake_driver(),
+            can_reader=make_can_reader(),
+            ups_monitor=make_ups(),
+            profile=make_profile(),
+            button_servo=None,
+        )
+        result = await runner.run(include_button_servo=True)
+        item = next(i for i in result.items if i.item_name == "ボタンサーボ確認")
+        assert item.passed is False
+        assert result.passed is False
+
+    @pytest.mark.asyncio
+    async def test_i2c_unreachable_fails(self) -> None:
+        runner = PreCheckRunner(
+            accel_driver=make_accel_driver(),
+            brake_driver=make_brake_driver(),
+            can_reader=make_can_reader(),
+            ups_monitor=make_ups(),
+            profile=make_profile(),
+            button_servo=_make_button_servo(ok=False),
+        )
+        result = await runner.run(include_button_servo=True)
+        item = next(i for i in result.items if i.item_name == "ボタンサーボ確認")
+        assert item.passed is False
+        assert "PCA9685" in (item.error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_check_connection_exception_fails(self) -> None:
+        runner = PreCheckRunner(
+            accel_driver=make_accel_driver(),
+            brake_driver=make_brake_driver(),
+            can_reader=make_can_reader(),
+            ups_monitor=make_ups(),
+            profile=make_profile(),
+            button_servo=_make_button_servo(raises=True),
+        )
+        result = await runner.run(include_button_servo=True)
+        item = next(i for i in result.items if i.item_name == "ボタンサーボ確認")
+        assert item.passed is False
+        assert result.passed is False

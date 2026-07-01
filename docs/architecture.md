@@ -19,10 +19,12 @@
 | python-can | 4.x | CAN bus通信 | Kvaser backendに対応 |
 | asyncpg | 最新安定版 | PostgreSQL非同期ドライバ | asyncio対応で高速書き込み |
 | lgpio | 最新安定版 | GPIO制御 | AC UPS接点出力によるAC断検知・非常停止割り込み。RPi.GPIO の後継（Raspberry Pi OS Bookworm以降の推奨ライブラリ） |
+| adafruit-circuitpython-pca9685<br/>（または smbus2） | 最新安定版 | PCA9685 I2C PWM制御 | ボタンサーボ（SG90 ×16）駆動。Post-MVP のタイムスケジュール機能で使用 |
 | numpy | 最新安定版 | 運転モデル補間 | 高速な2次元グリッド補間 |
 | scipy | 最新安定版 | 運転モデル補間 | RegularGridInterpolator |
 | gzip / shutil | 標準ライブラリ | ログアーカイブ圧縮 | 追加インストール不要 |
 | pydantic | v2 | データバリデーション | FastAPIと統合、型安全なAPI |
+| React | 18.x（CDN） | フロントエンドUI | ビルド工程不要。`@babel/standalone` でブラウザ内 JSX トランスパイル。リアルタイムグラフは SVG で描画（中央固定プレイヘッド方式） |
 
 ### 開発ツール
 
@@ -109,6 +111,15 @@ asyncio イベントループ
 - `asyncio.get_event_loop().run_forever()` + `loop.call_later(0.05, ...)` を使用
 - アクチュエータへの2軸同時送信は `asyncio.gather()` で並列実行
 
+**2系統の制御ループ**:
+- **DriveLoop（閉ループ・50ms）**: 自動走行・手動操作・基準速度追従。FF（先読み 多項式Ridge 逆モデル）と
+  PID 補正を符号付き努力量として合成し PedalArbiter でペダルへ写像する。
+- **LearningLoop（開ループ・100ms）**: 学習運転。固定の開度パターンを開ループで指令し、走行全体を
+  連続した (実車速, 開度) 軌跡として `drive_logs` に記録する。コントローラ（FF/PID）に依存しないため
+  運転モデル未学習の初期状態でも開度軸を端から端まで励起でき、逆モデルのブートストラップに適する。
+  call_later スケジューリング・サイクルスキップ ウォッチドッグ・ログ滞留制御は DriveLoop と共通方針。
+  安全は2段階（過速度・過G はパターンスキップ／過電流・通信断は非常停止）。
+
 ---
 
 ## データ永続化戦略
@@ -166,9 +177,12 @@ driving_robot/
 │   │   ├── control/
 │   │   │   ├── feedforward.py
 │   │   │   ├── pid.py
-│   │   │   └── drive_loop.py
+│   │   │   ├── drive_loop.py      # 閉ループ FF+PID（自動/手動）
+│   │   │   └── learning_loop.py   # 開ループ実行ループ（学習運転）
 │   │   ├── calibration.py
-│   │   ├── learning_drive.py
+│   │   ├── learning_drive.py      # 学習運転の開度パターン生成
+│   │   ├── model_training.py      # 運転モデル学習・物理定数推定
+│   │   ├── pid_tuning.py          # PID自動適合（FOPDT同定・SIMC・規定パターン・座標降下）
 │   │   └── safety_monitor.py
 │   ├── infra/                # インフラレイヤー
 │   │   ├── actuator_driver.py
@@ -261,6 +275,10 @@ Raspberry Pi 5 (16GB)
 │
 ├── USB            →  Kvaser USB-CAN         →  シャシダイナモ CAN bus
 │
+├── I2C1 (GPIO2 SDA / GPIO3 SCL)  →  PCA9685 (I2C 0x40, 16ch PWM)  →  SG90 ボタンサーボ ×16
+│                      物理ピン3/5。PCA9685 の V+ は外部5V電源から給電（本体ロジック電源と分離）
+│                      ch0:エンジンスタート, ch1-3:シフトP/N/D, ch4-15:オプション1-12
+│
 ├── GPIO17 (IN)    →  非常停止スイッチ #1 (シャシダイナモ室)  ← 物理ピン11、NC接点、プルアップ、HIGH=停止（RISING検知）
 │                   →  非常停止スイッチ #2 (操作エリア)  ← 並列接続
 │                      LOW=通常（NC接点閉→GND）、HIGH=停止（NC接点開→プルアップ有効、断線時も停止）
@@ -272,6 +290,8 @@ Raspberry Pi 5 (16GB)
                     └→ シリアル(DB-9)→USB変換 → /dev/ttyUSBx → NUT (upsd) → NutUPSMonitor
 ```
 
+> **ボタンサーボの電源分離**: SG90 ×16 の突入・保持電流は Raspberry Pi 本体ロジック電源とは分離した外部5V電源から PCA9685 の V+ 端子に供給する。信号線（I2C）と電源のGNDは共通に接続する。
+
 ### Modbus RTU 通信設定
 
 | 項目 | 値 |
@@ -282,6 +302,18 @@ Raspberry Pi 5 (16GB)
 | ストップビット | 1 |
 | アクセル SLAVE_ID | 1（ttyUSB0） |
 | ブレーキ SLAVE_ID | 1（ttyUSB1）※各軸が独立した RS-485 バスのため両軸とも 1 |
+
+### I2C / ボタンサーボ設定（Post-MVP）
+
+| 項目 | 値 |
+|------|---|
+| バス | I2C1（GPIO2 SDA / GPIO3 SCL） |
+| PCA9685 I2Cアドレス | 0x40（既定） |
+| PWM周波数 | 50Hz（SG90標準） |
+| チャンネル数 | 16（ch0-15） |
+| サーボ角度 | 待機／押下の2ポジション。全チャンネル共通のグローバル設定（`config/settings.toml` `[servo]`） |
+| 押下時間 | ボタンごとにタイムスケジュールで可変（例: エンジンスタート1.0s、シフト0.5s） |
+| 電源 | 外部5V（PCA9685 V+）。本体ロジック電源と分離、GNDは共通 |
 
 ### CAN 通信・配線設定
 
@@ -345,7 +377,25 @@ Raspberry Pi 5 (16GB)
 
 - **外部API（Post-MVP）**: FastAPIルーターを追加するだけで拡張可能
 - **新しいアクチュエータ軸**: `ActuatorDriver` を継承してプラグイン的に追加可能
+- **ボタンサーボ（Post-MVP）**: `ButtonServoDriver`（I2C/PCA9685）をインフラレイヤーに追加。RS-485（Modbus RTU）とは独立したI2Cバスで駆動するため、50ms制御ループと通信バスを共有せず競合しない。押下は「待機／押下」2ポジションの開ループ制御で、タイムスケジュールの時系列から呼び出す
 - **新しい車速ソース**: `CANReader` を抽象化（CAN以外にもOBD2等を将来追加可能）
+- **PID自動適合の同定/同調則**: `pid_tuning.py` は純粋ロジック（FOPDT同定・SIMC・コスト・座標降下）を
+  ハードから分離。同定則（例: ブレーキ側独立同定）や同調則（例: Lambda/ZN）の差し替え・拡張が容易
+
+#### PID自動適合の制御フロー（学習運転フロー内）
+
+```
+学習運転(開ループ) → /learning/train
+   ├─ train_inverse_model        … 多項式Ridge 逆FFモデル（model_path）
+   ├─ estimate_dynamics_params   … クリープ等の物理定数
+   └─ identify_fopdt → compute_pid_gains_simc … PID初期値（profile.pid_gains）
+        ↓ refresh_active_profile（制御スタックへ反映）
+/pid-tune/refine（規定パターン走行・最大15回）
+   build_tuning_trajectory（上限G/最高車速厳守）→ start_auto_drive（既存安全経路）
+   → KPIMonitor.summary → tuning_cost → CoordinateDescentTuner（座標降下）
+   → 最良ゲイン保存・反映
+```
+> 新規の制御/プラントコードは追加せず、既存の自動走行経路（走行前チェック・非常停止・KPI集計）を再利用。
 
 ---
 
@@ -360,6 +410,7 @@ Raspberry Pi 5 (16GB)
   - CalibrationManager（バリデーションロジック）
   - SafetyMonitor（閾値判定・タイマー）
   - ArchiveManager（アーカイブ判定・削除ロジック）
+  - pid_tuning（FOPDT同定・SIMCゲイン算出・規定パターンの上限G厳守・コスト・座標降下の収束）
 - **カバレッジ目標**: ドメインレイヤー 80%以上
 - **モック**: ハードウェアドライバはすべてモック化
 
@@ -458,6 +509,7 @@ python-can 4.x を aarch64 (Raspberry Pi 5) で使用する場合、以下の2�
 | python-can | CAN通信 | `>=4.0.0` Kvaser backend |
 | asyncpg | PostgreSQL | `>=0.28.0` |
 | RPi.GPIO | GPIO | `>=0.7.0` |
+| adafruit-circuitpython-pca9685 | PCA9685 I2C PWM（ボタンサーボ, Post-MVP） | 最新安定版（smbus2 での代替可） |
 | numpy | 数値計算 | `>=1.25.0` |
 | scipy | 補間 | `>=1.11.0` |
 | pydantic | バリデーション | `>=2.0.0` v2 API |
