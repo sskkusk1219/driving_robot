@@ -1,5 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 
 @dataclass
@@ -7,10 +8,22 @@ class DriveSession:
     id: str
     profile_id: str
     mode_id: str | None
-    run_type: str  # 'auto' | 'manual' | 'learning'
+    run_type: str  # 'auto' | 'manual' | 'learning' | 'tuning'
     started_at: datetime
     ended_at: datetime | None
     status: str  # 'running' | 'completed' | 'error' | 'emergency'
+    cycle_id: str | None = None
+
+
+@dataclass
+class LearningCycle:
+    id: str
+    profile_id: str
+    status: str  # 'running' | 'completed' | 'error' | 'aborted'
+    started_at: datetime
+    ended_at: datetime | None
+    detail: dict[str, Any] = field(default_factory=dict)
+    session_count: int = 0
 
 
 @dataclass

@@ -55,7 +55,6 @@ def _make_schedule(
     pedal_points: list[PedalPoint] | None = None,
     button_events: list[ButtonEvent] | None = None,
     total_duration: float = 10.0,
-    loop: bool = False,
 ) -> TimeSchedule:
     if pedal_points is None:
         pedal_points = [
@@ -69,7 +68,6 @@ def _make_schedule(
         pedal_points=pedal_points,
         button_events=button_events or [],
         total_duration=total_duration,
-        loop=loop,
         created_at=datetime.now(tz=UTC),
     )
 
@@ -170,25 +168,24 @@ async def test_cycle_does_not_fire_future_button_events() -> None:
     m["button"].press.assert_not_awaited()
 
 
-async def test_completion_calls_on_complete_when_not_loop() -> None:
-    loop, m = _make_loop(_make_schedule(total_duration=10.0, loop=False))
+async def test_simultaneous_pedal_press_is_not_excluded() -> None:
+    """タイムスケジュールはアクセル・ブレーキの同時踏みを許可する(排他しない)。"""
+    pts = [PedalPoint(time_s=0.0, accel_opening=30.0, brake_opening=40.0)]
+    loop, m = _make_loop(_make_schedule(pedal_points=pts, total_duration=10.0))
+    _set_t(loop, 0.0)
+    await loop._execute_one_cycle()
+    assert loop.current_accel_opening == 30.0
+    assert loop.current_brake_opening == 40.0
+    m["accel"].move_to_position.assert_awaited_once_with(100 + round(500 * 0.3))
+    m["brake"].move_to_position.assert_awaited_once_with(200 + round(500 * 0.4))
+
+
+async def test_completion_calls_on_complete_at_timeline_end() -> None:
+    loop, m = _make_loop(_make_schedule(total_duration=10.0))
     _set_t(loop, 11.0)  # t >= total_duration
     await loop._execute_one_cycle()
     m["on_complete"].assert_awaited_once()
     assert loop.is_running is False
-
-
-async def test_loop_resets_instead_of_completing() -> None:
-    events = [ButtonEvent(time_s=1.0, channel=0, press_duration_s=0.2)]
-    loop, m = _make_loop(
-        _make_schedule(button_events=events, total_duration=10.0, loop=True)
-    )
-    loop._next_event_idx = 1  # 既発火済みの状態を作る
-    _set_t(loop, 11.0)
-    await loop._execute_one_cycle()
-    m["on_complete"].assert_not_awaited()
-    assert loop.is_running is True
-    assert loop._next_event_idx == 0  # 巻き戻しでイベントも再武装
 
 
 async def test_overcurrent_triggers_emergency() -> None:

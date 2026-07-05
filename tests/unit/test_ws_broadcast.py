@@ -33,6 +33,8 @@ def _make_app(controller: MagicMock) -> MagicMock:
     ups_monitor = MagicMock()
     ups_monitor.get_status = AsyncMock(return_value=ups_status)
     app.state.ups_monitor = ups_monitor
+    # cycle_orchestrator 未設定（None）時のフォールバック経路を通す
+    app.state.cycle_orchestrator = None
     return app
 
 
@@ -116,6 +118,55 @@ async def test_broadcast_emits_realtime_values_on_normal_read(
     assert data["robot_state"] == "EMERGENCY"
     assert data["actual_speed_kmh"] == 12.5
     assert data["accel_current_ma"] == 500.0
+
+
+@pytest.mark.asyncio
+async def test_broadcast_includes_cycle_progress_when_orchestrator_present(
+    fake_connection: _FakeWS,
+) -> None:
+    """cycle_orchestrator が設定されていれば cycle_progress が配信に含まれること。"""
+    from src.app.learning_cycle import CyclePhase, CycleProgress
+    from src.models.system_state import RealtimeSnapshot
+
+    async def _ok() -> RealtimeSnapshot:
+        return RealtimeSnapshot(
+            actual_speed_kmh=0.0, accel_pos=0, brake_pos=0, accel_current_ma=0.0,
+            brake_current_ma=0.0,
+        )
+
+    app = _make_app(_make_controller(_ok))
+    orchestrator = MagicMock()
+    orchestrator.progress = CycleProgress(
+        cycle_id="cycle-1", phase=CyclePhase.REFINE_1, run_index=2, run_total=10,
+        best_cost=0.42, message="PID適合を実行しています", started_at=datetime.now(tz=UTC),
+    )
+    app.state.cycle_orchestrator = orchestrator
+
+    data = await _run_until_message(app, fake_connection)
+
+    assert data["cycle_progress"]["cycle_id"] == "cycle-1"
+    assert data["cycle_progress"]["phase"] == "REFINE_1"
+    assert data["cycle_progress"]["run_index"] == 2
+    assert data["cycle_progress"]["run_total"] == 10
+    assert data["cycle_progress"]["best_cost"] == 0.42
+
+
+@pytest.mark.asyncio
+async def test_broadcast_cycle_progress_none_without_orchestrator(
+    fake_connection: _FakeWS,
+) -> None:
+    from src.models.system_state import RealtimeSnapshot
+
+    async def _ok() -> RealtimeSnapshot:
+        return RealtimeSnapshot(
+            actual_speed_kmh=0.0, accel_pos=0, brake_pos=0, accel_current_ma=0.0,
+            brake_current_ma=0.0,
+        )
+
+    app = _make_app(_make_controller(_ok))
+    data = await _run_until_message(app, fake_connection)
+
+    assert data["cycle_progress"] is None
 
 
 @pytest.mark.asyncio

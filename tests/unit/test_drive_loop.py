@@ -12,10 +12,19 @@ import pytest
 from src.domain.control.drive_loop import MAX_PENDING_LOG_TASKS, WEDGED_CYCLE_TIMEOUT_S, DriveLoop
 from src.domain.control.feedforward import FeedforwardController
 from src.domain.control.pid import PIDController
-from src.domain.model_training import LOOKAHEAD_HORIZONS_S
+from src.domain.model_training import DEFAULT_FEATURE_SPEC
 from src.models.calibration import CalibrationData
 from src.models.driving_mode import DrivingMode, SpeedPoint
-from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
+from src.models.profile import (
+    DynamicsParams,
+    FeedforwardParams,
+    PIDGains,
+    StopConfig,
+    VehicleProfile,
+)
+
+LOOKAHEAD_HORIZONS_S = DEFAULT_FEATURE_SPEC.lookahead_horizons_s
+PAST_HORIZONS_S = DEFAULT_FEATURE_SPEC.past_horizons_s
 
 # レートリミット・ディレイを無効化した調停定数。1 サイクルで定常開度に到達させ、
 # 開度値そのものを検証するテストで使う。
@@ -52,6 +61,7 @@ def _make_profile(
     deviation_threshold: float = 2.0,
     deviation_duration: float = 4.0,
     ffp: FeedforwardParams | None = None,
+    dynamics_params: DynamicsParams | None = None,
 ) -> VehicleProfile:
     return VehicleProfile(
         id="profile-1",
@@ -70,6 +80,7 @@ def _make_profile(
         created_at=datetime(2026, 1, 1),
         updated_at=datetime(2026, 1, 1),
         feedforward_params=ffp if ffp is not None else FAST_ARBITER_PARAMS,
+        dynamics_params=dynamics_params if dynamics_params is not None else DynamicsParams(),
     )
 
 
@@ -97,8 +108,9 @@ def _make_mode(
 def _make_ff(effort: float = 50.0) -> MagicMock:
     ff = MagicMock(spec=FeedforwardController)
     ff.predict_effort = MagicMock(return_value=effort)
-    # DriveLoop は ff.horizons を反復して先読み速度を組むため、実タプルを設定する
+    # DriveLoop は ff.horizons / ff.past_horizons を反復して先読み・過去速度を組むため実タプルを設定
     ff.horizons = LOOKAHEAD_HORIZONS_S
+    ff.past_horizons = PAST_HORIZONS_S
     return ff
 
 
@@ -938,6 +950,33 @@ class TestWedgedCycleWatchdog:
         finally:
             dl.stop()
 
+    @pytest.mark.asyncio
+    async def test_stall_summary_accumulates_on_resolved_skip(self) -> None:
+        """連続スキップが解消するたびに 1 件のストールとして回数・時間を集計する。
+
+        ストール切り分け（.steering/20260620-modbus-retry-cycle-stall）用の計装。
+        """
+        dl = _make_loop()
+        dl._running = True
+        dl._consecutive_skips = 3
+        dl._started_at = asyncio.get_running_loop().time()
+
+        dl._schedule_next_cycle()  # 前タスクなし → 正常起動＝直前のストールが解消
+        try:
+            summary = dl.stall_summary
+            assert summary["stall_count"] == 1.0
+            assert summary["stall_total_s"] == pytest.approx(3 * dl._interval_s)
+            assert summary["stall_max_s"] == pytest.approx(3 * dl._interval_s)
+        finally:
+            dl.stop()
+            assert dl._cycle_task is not None
+            await dl._cycle_task
+
+    def test_stall_summary_is_zero_before_any_stall(self) -> None:
+        dl = _make_loop()
+        summary = dl.stall_summary
+        assert summary == {"stall_count": 0.0, "stall_total_s": 0.0, "stall_max_s": 0.0}
+
 
 # ---------------------------------------------------------------------------
 # stop_and_join（飛行中サイクルの停止完了待ち）
@@ -1212,3 +1251,118 @@ class TestSnapshotFreshness:
 
         assert dl.last_snapshot is not None
         assert dl.last_snapshot.captured_at == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# 先読み補償（preview_time_s） — アクチュエータ〜車両系のむだ時間補償
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewTimeCompensation:
+    @pytest.mark.asyncio
+    async def test_ff_and_pid_receive_preview_shifted_reference(self) -> None:
+        """preview_time_s>0 のとき、FF・PID は前倒しした基準速度(t_ctrl)を受け取る。"""
+        mode = _make_mode(
+            points=[
+                SpeedPoint(time_s=0.0, speed_kmh=0.0),
+                SpeedPoint(time_s=10.0, speed_kmh=100.0),
+            ],
+            total_duration=10.0,
+        )
+        profile = _make_profile(dynamics_params=DynamicsParams(preview_time_s=1.0))
+        ff = _make_ff(effort=0.0)
+        pid = MagicMock(spec=PIDController)
+        pid.update = MagicMock(return_value=0.0)
+
+        dl = _make_loop(ff=ff, pid=pid, mode=mode, profile=profile)
+        dl._running = True
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        # t_ctrl = elapsed(2.0) + preview(1.0) = 3.0 → ref = 30.0（前倒しされた基準）
+        ff_args = ff.predict_effort.call_args[0]
+        assert ff_args[0] == pytest.approx(30.0)
+        pid_args = pid.update.call_args[0]
+        assert pid_args[0] == pytest.approx(30.0)
+
+    @pytest.mark.asyncio
+    async def test_kpi_and_last_ref_speed_use_now_frame(self) -> None:
+        """KPI・current_ref_speed は前倒しされない now-frame の基準速度で評価される。"""
+        mode = _make_mode(
+            points=[
+                SpeedPoint(time_s=0.0, speed_kmh=0.0),
+                SpeedPoint(time_s=10.0, speed_kmh=100.0),
+            ],
+            total_duration=10.0,
+        )
+        profile = _make_profile(dynamics_params=DynamicsParams(preview_time_s=1.0))
+        dl = _make_loop(mode=mode, profile=profile, can_reader=_make_can_reader(speed=20.0))
+        dl._running = True
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        # now-frame: t=2.0 → ref=20.0（前倒しされない）
+        assert dl.current_ref_speed == pytest.approx(20.0)
+        summary = dl.kpi_summary
+        assert summary["n_samples"] == 1.0
+        assert summary["max_abs_deviation_kmh"] == pytest.approx(0.0)
+
+    @pytest.mark.asyncio
+    async def test_zero_preview_matches_now_frame(self) -> None:
+        """preview_time_s=0.0（デフォルト）では制御フレームと now-frame が一致する（回帰）。"""
+        mode = _make_mode(
+            points=[
+                SpeedPoint(time_s=0.0, speed_kmh=0.0),
+                SpeedPoint(time_s=10.0, speed_kmh=100.0),
+            ],
+            total_duration=10.0,
+        )
+        profile = _make_profile(dynamics_params=DynamicsParams(preview_time_s=0.0))
+        ff = _make_ff(effort=0.0)
+        dl = _make_loop(ff=ff, mode=mode, profile=profile)
+        dl._running = True
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        ff_args = ff.predict_effort.call_args[0]
+        assert ff_args[0] == pytest.approx(20.0)
+
+    @pytest.mark.asyncio
+    async def test_preview_beyond_trajectory_end_clamps_safely(self) -> None:
+        """軌跡終端付近で t_ctrl が末尾を超えても終端値でクランプされ例外を起こさない。"""
+        mode = _make_mode(
+            points=[
+                SpeedPoint(time_s=0.0, speed_kmh=0.0),
+                SpeedPoint(time_s=5.0, speed_kmh=60.0),
+            ],
+            total_duration=10.0,
+        )
+        profile = _make_profile(dynamics_params=DynamicsParams(preview_time_s=3.0))
+        ff = _make_ff(effort=0.0)
+        dl = _make_loop(ff=ff, mode=mode, profile=profile)
+        dl._running = True
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 4.5  # t_ctrl = 7.5 > 5.0（軌跡末尾）
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        ff_args = ff.predict_effort.call_args[0]
+        assert ff_args[0] == pytest.approx(60.0)  # 終端値でクランプ（例外なし）

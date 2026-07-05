@@ -1,6 +1,6 @@
 import pytest
 
-from src.domain.control.pid import PIDController
+from src.domain.control.pid import DERIV_FILTER_TAU_S, PIDController
 
 DT = 0.05  # 50ms 制御ループ周期
 
@@ -48,25 +48,51 @@ class TestPIDControllerIntegral:
 
 
 class TestPIDControllerDerivative:
+    """微分項は1次LPF（DERIV_FILTER_TAU_S）を通るため、後退差分の生値ではなく
+    フィルタ後の値がkdに乗る。kd=0時は出力に影響しないため既存挙動と完全一致する
+    （TestPIDControllerIntegral等の他クラスはkd=0のため無修正で通る）。
+    """
+
     def test_d_first_step(self) -> None:
         pid = PIDController(kp=0.0, ki=0.0, kd=1.0, dt=DT, output_limit=500.0)
-        # prev_error=0 → error=10 → derivative=(10-0)/0.05=200
+        # prev_error=0, d_filt=0 → error=10 → d_raw=(10-0)/0.05=200
+        # d_filt = 0 + (200-0)*0.05/(0.2+0.05) = 40
         output = pid.update(setpoint=60.0, measurement=50.0)
-        assert output == pytest.approx(200.0)
+        assert output == pytest.approx(40.0)
 
     def test_d_constant_error(self) -> None:
         pid = PIDController(kp=0.0, ki=0.0, kd=1.0, dt=DT)
-        pid.update(setpoint=60.0, measurement=50.0)
-        # error が同じなら derivative=0
+        pid.update(setpoint=60.0, measurement=50.0)  # d_filt=40 (上と同じ)
+        # error が同じなら d_raw=0 だが、フィルタ残留のため即座には0にならない
+        # d_filt = 40 + (0-40)*0.2 = 32
         output = pid.update(setpoint=60.0, measurement=50.0)
-        assert output == pytest.approx(0.0)
+        assert output == pytest.approx(32.0)
 
     def test_d_decreasing_error(self) -> None:
         pid = PIDController(kp=0.0, ki=0.0, kd=1.0, dt=DT)
-        pid.update(setpoint=60.0, measurement=50.0)  # prev_error=10
-        # error が 5 に減少 → derivative=(5-10)/0.05=-100
+        pid.update(setpoint=60.0, measurement=50.0)  # prev_error=10, d_filt=40
+        # error が 5 に減少 → d_raw=(5-10)/0.05=-100
+        # d_filt = 40 + (-100-40)*0.2 = 12
         output = pid.update(setpoint=60.0, measurement=55.0)
-        assert output == pytest.approx(-100.0)
+        assert output == pytest.approx(12.0)
+
+    def test_derivative_lpf_attenuates_spike(self) -> None:
+        """1サンプル誤差ジャンプの微分項出力は未フィルタ理論値の約 dt/(τf+dt) 倍に減衰する"""
+        pid = PIDController(kp=0.0, ki=0.0, kd=1.0, dt=DT, output_limit=500.0)
+        unfiltered_theoretical = 10.0 / DT  # (error-0)/dt = 200
+        output = pid.update(setpoint=60.0, measurement=50.0)
+        expected_ratio = DT / (DERIV_FILTER_TAU_S + DT)
+        assert output == pytest.approx(unfiltered_theoretical * expected_ratio)
+        assert output < 0.25 * unfiltered_theoretical
+
+    def test_reset_clears_derivative_filter(self) -> None:
+        """reset() 後の微分はフィルタ残留の影響を受けず、新規フィルタ状態から始まる。"""
+        pid = PIDController(kp=0.0, ki=0.0, kd=1.0, dt=DT, output_limit=500.0)
+        pid.update(setpoint=60.0, measurement=0.0)  # 大きな誤差でフィルタ状態を積む
+        pid.reset()
+        # reset 後は prev_error=0, d_filt=0 に戻るため、単独の初回ステップと一致する
+        output = pid.update(setpoint=60.0, measurement=50.0)
+        assert output == pytest.approx(40.0)
 
 
 class TestPIDControllerCombined:
@@ -81,9 +107,10 @@ class TestPIDControllerCombined:
         for _ in range(10):
             pid.update(setpoint=100.0, measurement=0.0)
         pid.reset()
-        # リセット後は積分・前回偏差が0になる
+        # リセット後は積分・前回偏差・微分フィルタ状態が0になる
         assert pid._integral == pytest.approx(0.0)
         assert pid._prev_error == pytest.approx(0.0)
+        assert pid._d_filt == pytest.approx(0.0)
 
     def test_integral_grows_while_unsaturated(self) -> None:
         """飽和していない間は偏差が続くほど I 項出力が増加する。"""
@@ -137,12 +164,13 @@ class TestPIDAntiWindup:
 
 class TestPIDMeasuredDt:
     def test_measured_dt_used_for_derivative(self) -> None:
-        """計測 dt を渡すと微分が実経過時間で計算される（スキップ時のスパイク防止）。"""
+        """計測 dt を渡すと微分(フィルタ入力)が実経過時間で計算される（スキップ時のスパイク防止）"""
         pid = PIDController(kp=0.0, ki=0.0, kd=1.0, dt=DT, output_limit=500.0)
-        pid.update(setpoint=60.0, measurement=50.0, dt=DT)  # prev_error=10
-        # 100ms 経過（1 サイクルスキップ）で誤差 10→5: derivative=(5-10)/0.1=-50
+        pid.update(setpoint=60.0, measurement=50.0, dt=DT)  # prev_error=10, d_filt=40
+        # 100ms 経過（1 サイクルスキップ）で誤差 10→5: d_raw=(5-10)/0.1=-50
+        # d_filt = 40 + (-50-40)*0.1/(0.2+0.1) = 40 - 30 = 10
         output = pid.update(setpoint=60.0, measurement=55.0, dt=0.1)
-        assert output == pytest.approx(-50.0)
+        assert output == pytest.approx(10.0)
 
     def test_measured_dt_used_for_integral(self) -> None:
         pid = PIDController(kp=0.0, ki=1.0, kd=0.0, dt=DT)

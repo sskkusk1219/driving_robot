@@ -1,3 +1,9 @@
+# 微分項1次ローパスフィルタの時定数 [s]。公称 dt=50ms の4倍で、CAN 車速の量子化に
+# よる1サンプルスパイクを dt/(τf+dt)=0.2 倍に抑制しつつ、FOPDT 同定の τ（秒オーダー）
+# より十分速く位相遅れは実用上無視できる。
+DERIV_FILTER_TAU_S: float = 0.2
+
+
 class PIDController:
     """離散時間PIDコントローラ（後退差分）。dt = 制御ループ周期 (デフォルト 50ms)。
 
@@ -18,6 +24,7 @@ class PIDController:
     _output_limit: float
     _integral: float
     _prev_error: float
+    _d_filt: float
 
     def __init__(
         self, kp: float, ki: float, kd: float, dt: float = 0.05, output_limit: float = 100.0
@@ -29,6 +36,7 @@ class PIDController:
         self._output_limit = abs(output_limit)
         self._integral = 0.0
         self._prev_error = 0.0
+        self._d_filt = 0.0
 
     def update(
         self,
@@ -65,15 +73,17 @@ class PIDController:
                 integral_limit = self._output_limit / self._ki
                 self._integral = max(-integral_limit, min(integral_limit, self._integral))
 
-        derivative = (error - self._prev_error) / dt_eff
+        d_raw = (error - self._prev_error) / dt_eff
         self._prev_error = error
-        output = self._kp * error + self._ki * self._integral + self._kd * derivative
+        self._d_filt += (d_raw - self._d_filt) * dt_eff / (DERIV_FILTER_TAU_S + dt_eff)
+        output = self._kp * error + self._ki * self._integral + self._kd * self._d_filt
         return max(-self._output_limit, min(self._output_limit, output))
 
     def reset(self) -> None:
-        """積分器と前回偏差をリセットする。走行開始・停止時に呼ぶ。"""
+        """積分器・前回偏差・微分フィルタ状態をリセットする。走行開始・停止時に呼ぶ。"""
         self._integral = 0.0
         self._prev_error = 0.0
+        self._d_filt = 0.0
 
     def set_gains(self, kp: float, ki: float, kd: float) -> None:
         """ゲインを更新し内部状態をリセットする。プロファイル選択時に呼ぶ。"""

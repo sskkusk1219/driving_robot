@@ -1673,7 +1673,9 @@ class TestDriveSessionLogging:
             log_writer=log_writer,  # type: ignore[arg-type]
         )
 
-        log_writer.start_session.assert_awaited_once_with("prof-uuid-1", "mode-uuid-1", "auto")
+        log_writer.start_session.assert_awaited_once_with(
+            "prof-uuid-1", "mode-uuid-1", "auto", cycle_id=None
+        )
         assert session.id == "db-sess-1"
         assert ctrl._drive_loop is not None
 
@@ -1711,11 +1713,15 @@ class TestDriveSessionLogging:
         log_writer = MagicMock()
         log_writer.start_session = AsyncMock(return_value="learn-sess-1")
         log_writer.end_session = AsyncMock()
+        log_writer.start_cycle = AsyncMock(return_value="cycle-1")
 
         await ctrl.arm_learning_drive()
         session = await ctrl.start_learning_drive(log_writer=log_writer)
 
-        log_writer.start_session.assert_awaited_once_with("prof-uuid-1", None, "learning")
+        log_writer.start_cycle.assert_awaited_once_with("prof-uuid-1")
+        log_writer.start_session.assert_awaited_once_with(
+            "prof-uuid-1", None, "learning", cycle_id="cycle-1"
+        )
         assert session.run_type == "learning"
         assert session.mode_id is None
         assert session.id == "learn-sess-1"
@@ -1726,6 +1732,143 @@ class TestDriveSessionLogging:
         await ctrl.stop()
         log_writer.end_session.assert_awaited_once_with("learn-sess-1", "completed")
         assert ctrl._learning_loop is None
+
+
+class TestActiveCycleIdWiring:
+    """学習運転で開設した学習サイクルへ後続の PID 適合走行が参加すること。"""
+
+    @pytest.mark.asyncio
+    async def test_tuning_drive_inherits_active_cycle_id(self) -> None:
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+        log_writer = MagicMock()
+        log_writer.start_session = AsyncMock(side_effect=["learn-sess-1", "tune-sess-1"])
+        log_writer.end_session = AsyncMock()
+        log_writer.start_cycle = AsyncMock(return_value="cycle-1")
+
+        await ctrl.arm_learning_drive()
+        await ctrl.start_learning_drive(log_writer=log_writer)
+        assert ctrl._active_cycle_id == "cycle-1"
+
+        # 学習終了→READY（保持ブレーキのまま）。cycle_id は維持されたまま次の走行へ引き継ぐ。
+        await ctrl.stop_learning_drive()
+        assert ctrl._active_cycle_id == "cycle-1"
+
+        def fake_build(
+            mode: object, profile: object, lw: object,
+            session_id: object, on_complete: object = None,
+            disable_deviation_check: bool = False,
+        ) -> None:
+            ctrl._state = RobotState.READY
+            ctrl._last_kpi_summary = {"n_samples": 1.0}
+            ctrl._drive_complete.set()
+
+        ctrl._build_and_start_drive_loop = fake_build  # type: ignore[assignment]
+        await ctrl._run_tuning_drive(profile, log_writer)  # type: ignore[arg-type]
+
+        second_call = log_writer.start_session.await_args_list[1]
+        assert second_call.args[2] == "tuning"  # run_type
+        assert second_call.kwargs["cycle_id"] == "cycle-1"
+
+    @pytest.mark.asyncio
+    async def test_active_cycle_id_property_and_session_cycle_id(self) -> None:
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+        assert ctrl.active_cycle_id is None
+
+        log_writer = MagicMock()
+        log_writer.start_session = AsyncMock(return_value="learn-sess-1")
+        log_writer.end_session = AsyncMock()
+        log_writer.start_cycle = AsyncMock(return_value="cycle-9")
+
+        await ctrl.arm_learning_drive()
+        session = await ctrl.start_learning_drive(log_writer=log_writer)
+
+        assert ctrl.active_cycle_id == "cycle-9"
+        assert session.cycle_id == "cycle-9"  # 返り値の DriveSession にも反映される
+
+    @pytest.mark.asyncio
+    async def test_select_profile_clears_active_cycle_id(self) -> None:
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+        ctrl._active_cycle_id = "leftover-cycle"
+
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+        assert ctrl._active_cycle_id is None
+
+    @pytest.mark.asyncio
+    async def test_start_learning_drive_without_log_writer_uses_local_uuid(self) -> None:
+        import uuid
+
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+        await ctrl.arm_learning_drive()
+        await ctrl.start_learning_drive(log_writer=None)
+
+        assert ctrl._active_cycle_id is not None
+        uuid.UUID(ctrl._active_cycle_id)  # UUID として解析できれば形式が正しい
+
+
+class TestLearningCompleteEvent:
+    """`_learning_complete` が学習サイクルオーケストレータの完了待ちとして機能すること。"""
+
+    @pytest.mark.asyncio
+    async def test_cleared_at_start_and_set_after_stop_learning_drive(self) -> None:
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+        ctrl._learning_complete.set()  # 事前にセットされていても start でクリアされること
+
+        await ctrl.arm_learning_drive()
+        await ctrl.start_learning_drive(log_writer=None)
+
+        assert not ctrl._learning_complete.is_set()
+
+        await ctrl.stop_learning_drive()
+
+        assert ctrl._learning_complete.is_set()
+
+    @pytest.mark.asyncio
+    async def test_set_on_emergency_stop(self) -> None:
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+        await ctrl.arm_learning_drive()
+        await ctrl.start_learning_drive(log_writer=None)
+        assert not ctrl._learning_complete.is_set()
+
+        await ctrl.emergency_stop()
+
+        assert ctrl._learning_complete.is_set()
+
+    @pytest.mark.asyncio
+    async def test_set_on_generic_stop(self) -> None:
+        ctrl = _make_controller_for_logging()
+        await advance_to_ready(ctrl)
+        profile = _make_profile_with_calibration()
+        ctrl.select_profile(profile)  # type: ignore[arg-type]
+
+        await ctrl.arm_learning_drive()
+        await ctrl.start_learning_drive(log_writer=None)
+        assert not ctrl._learning_complete.is_set()
+
+        await ctrl.stop()
+
+        assert ctrl._learning_complete.is_set()
 
     @pytest.mark.asyncio
     async def test_learning_drive_without_log_writer_uses_local_uuid(self) -> None:
@@ -2010,6 +2153,11 @@ class TestKpiSummaryRecording:
         mock_loop = MagicMock()
         mock_loop.stop_and_join = AsyncMock()
         mock_loop.kpi_summary = summary
+        mock_loop.stall_summary = {
+            "stall_count": 0.0,
+            "stall_total_s": 0.0,
+            "stall_max_s": 0.0,
+        }
         ctrl._drive_loop = mock_loop  # type: ignore[assignment]
 
         await ctrl.stop_auto_drive()
@@ -2092,6 +2240,34 @@ class TestPidTuningOrchestration:
         assert best.kp >= prof.pid_gains.kp  # kp を上げる方向に改善している
         # 最良ゲインが制御スタックへ反映されている
         assert ctrl._pid._kp == pytest.approx(best.kp)
+
+    @pytest.mark.asyncio
+    async def test_tuning_session_injects_candidate_preview_into_drive_profile(self) -> None:
+        """候補の preview_time_s が差し替えられたプロファイルで各走行が実行される。"""
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        prof = _calibrated_profile()
+        seen_previews: list[float] = []
+
+        async def fake_drive(profile: VehicleProfile, log_writer: object) -> dict[str, float]:
+            seen_previews.append(profile.dynamics_params.preview_time_s)
+            preview = profile.dynamics_params.preview_time_s
+            cost_p95 = max(0.05, 1.0 - abs(preview - 1.0))
+            return {
+                "n_samples": 500.0, "p95_kmh": cost_p95, "max_abs_deviation_kmh": cost_p95 * 2,
+                "reversal_max_per_5s": 1.0, "hard_limit_violations": 0.0,
+            }
+
+        ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
+
+        best, history = await ctrl.run_pid_tuning_session(prof, None, max_runs=12)
+
+        # 元プロファイルの preview_time_s(0.0)以外の値も走行に渡っている
+        assert any(p != 0.0 for p in seen_previews)
+        assert best.preview_time_s in seen_previews
+        assert all("preview_time_s" in h for h in history)
+        # 呼び出し元の元プロファイルは不変（dataclasses.replace で新規オブジェクトを渡す）
+        assert prof.dynamics_params.preview_time_s == 0.0
 
     @pytest.mark.asyncio
     async def test_tuning_drive_aborts_on_emergency(self) -> None:
@@ -2200,6 +2376,112 @@ class TestPidTuningOrchestration:
         assert captured["disable_deviation_check"] is True
 
 
+class TestReleaseOnFinishAndOnRun:
+    """2段階学習フロー向けの release_on_finish・on_run コールバック。"""
+
+    @pytest.mark.asyncio
+    async def test_release_on_finish_true_releases_after_normal_completion(self) -> None:
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        prof = _calibrated_profile()
+
+        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+            return {
+                "n_samples": 500.0, "p95_kmh": 0.05, "max_abs_deviation_kmh": 0.1,
+                "reversal_max_per_5s": 0.0, "hard_limit_violations": 0.0,
+            }
+
+        ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
+
+        await ctrl.run_pid_tuning_session(prof, None, max_runs=2, release_on_finish=True)
+
+        ctrl._accel_driver.home_return.assert_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_release_on_finish_false_skips_release_after_normal_completion(self) -> None:
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        prof = _calibrated_profile()
+
+        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+            return {
+                "n_samples": 500.0, "p95_kmh": 0.05, "max_abs_deviation_kmh": 0.1,
+                "reversal_max_per_5s": 0.0, "hard_limit_violations": 0.0,
+            }
+
+        ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
+
+        await ctrl.run_pid_tuning_session(prof, None, max_runs=2, release_on_finish=False)
+
+        ctrl._accel_driver.home_return.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_release_on_finish_false_still_releases_on_exception(self) -> None:
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        prof = _calibrated_profile()
+
+        async def failing_drive(profile: object, log_writer: object) -> dict[str, float]:
+            raise RuntimeError("boom")
+
+        ctrl._run_tuning_drive = failing_drive  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError):
+            await ctrl.run_pid_tuning_session(prof, None, max_runs=2, release_on_finish=False)
+
+        ctrl._accel_driver.home_return.assert_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_on_run_called_with_run_index_gains_and_cost(self) -> None:
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        prof = _calibrated_profile()
+        calls: list[tuple[int, object, float]] = []
+
+        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+            kp = ctrl._pid._kp
+            p95 = max(0.05, 1.0 - 0.1 * kp)
+            return {
+                "n_samples": 500.0, "p95_kmh": p95, "max_abs_deviation_kmh": p95 * 2,
+                "reversal_max_per_5s": 1.0, "hard_limit_violations": 0.0,
+            }
+
+        ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
+
+        def on_run(run_index: int, gains: object, cost: float) -> None:
+            calls.append((run_index, gains, cost))
+
+        await ctrl.run_pid_tuning_session(prof, None, max_runs=3, on_run=on_run)
+
+        assert len(calls) == 3
+        assert [c[0] for c in calls] == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_on_run_exception_aborts_and_releases(self) -> None:
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        prof = _calibrated_profile()
+
+        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+            return {
+                "n_samples": 500.0, "p95_kmh": 0.05, "max_abs_deviation_kmh": 0.1,
+                "reversal_max_per_5s": 0.0, "hard_limit_violations": 0.0,
+            }
+
+        ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
+
+        class Aborted(Exception):
+            pass
+
+        def on_run(run_index: int, gains: object, cost: float) -> None:
+            raise Aborted()
+
+        with pytest.raises(Aborted):
+            await ctrl.run_pid_tuning_session(prof, None, max_runs=3, on_run=on_run)
+
+        ctrl._accel_driver.home_return.assert_awaited()  # type: ignore[attr-defined]
+
+
 # ── タイムスケジュール走行の統合（release_all の保証を含む）─────────────
 
 
@@ -2221,7 +2503,6 @@ def _make_time_schedule(with_button: bool = False) -> object:
         pedal_points=[PedalPoint(0.0, 0.0, 0.0), PedalPoint(5.0, 40.0, 0.0)],
         button_events=[ButtonEvent(0.5, 0, 1.0)] if with_button else [],
         total_duration=5.0,
-        loop=False,
         created_at=datetime.now(tz=UTC),
     )
 

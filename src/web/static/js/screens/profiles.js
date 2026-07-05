@@ -67,6 +67,7 @@ function ProfilesScreen() {
         deviation_duration_s: p.stop_config?.deviation_duration_s ?? 4.0,
       },
       model_path: null,
+      dynamics_params: { preview_time_s: p.dynamics_params?.preview_time_s ?? 0.0 },
     };
     const r = await apiFetch('POST', '/api/v1/profiles/', payload);
     if (r) {
@@ -299,6 +300,7 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
     stop_brake_opening_pct: initial?.feedforward_params?.stop_brake_opening_pct ?? 20.0,
     brake_deadband_pct: initial?.feedforward_params?.brake_deadband_pct ?? 1.0,
     accel_deadband_pct: initial?.feedforward_params?.accel_deadband_pct ?? 1.0,
+    preview_time_s: initial?.dynamics_params?.preview_time_s ?? 0.0,
   });
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
@@ -324,6 +326,14 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
         stop_brake_opening_pct: Number(form.stop_brake_opening_pct),
         brake_deadband_pct: Number(form.brake_deadband_pct),
         accel_deadband_pct: Number(form.accel_deadband_pct),
+      },
+      dynamics_params: {
+        preview_time_s: Number(form.preview_time_s),
+        // FOPDT同定値は学習サイクルが書き込む表示用メタデータ。フォーム保存で消さないよう
+        // 既存値をそのまま送り返す（本フォームに編集UIはない）。
+        fopdt_k: initial?.dynamics_params?.fopdt_k ?? null,
+        fopdt_tau: initial?.dynamics_params?.fopdt_tau ?? null,
+        fopdt_theta: initial?.dynamics_params?.fopdt_theta ?? null,
       },
     });
   }
@@ -363,17 +373,17 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
 
     // 2-column body
     React.createElement('div', {
-      style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, flex: 1, minHeight: 0, overflow: 'auto', paddingTop: 12 }
+      style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, flex: 1, minHeight: 0, paddingTop: 12 }
     },
 
       // ── Left column ──────────────────────────────────────
-      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', justifyContent: 'space-between', height: '100%', minHeight: 0 } },
 
         // 基本情報
-        React.createElement(Box, { label: '基本情報', style: { padding: 18 } },
-          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+        React.createElement(Box, { label: '基本情報', style: { padding: 14 } },
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
             inp('プロファイル名', 'name'),
-            React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
+            React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
               inp('アクセル最大開度 [%]', 'max_accel_opening', { type: 'number', mono: true }),
               inp('ブレーキ最大開度 [%]', 'max_brake_opening', { type: 'number', mono: true }),
               inp('最高車速 [km/h]', 'max_speed', { type: 'number', mono: true }),
@@ -382,29 +392,20 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
           ),
         ),
 
-        // PIDゲイン
-        React.createElement(Box, { label: 'PIDゲイン', style: { padding: 18 } },
-          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 } },
-            inp('Kp', 'kp', { type: 'number', mono: true }),
-            inp('Ki', 'ki', { type: 'number', mono: true }),
-            inp('Kd', 'kd', { type: 'number', mono: true }),
-          ),
-        ),
-
         // 停止判定
-        React.createElement(Box, { label: '停止判定', style: { padding: 18 } },
-          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
+        React.createElement(Box, { label: '停止判定', style: { padding: 14 } },
+          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
             inp('逸脱閾値 [km/h]', 'deviation_threshold_kmh', { type: 'number', mono: true }),
             inp('逸脱継続 [s]', 'deviation_duration_s', { type: 'number', mono: true }),
           ),
         ),
 
-        // フィードフォワード定数（学習で自動更新／手動調整可）
-        React.createElement(Box, { label: 'フィードフォワード定数', style: { padding: 18 } },
-          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
+        // フィードフォワード（学習で自動更新／手動調整可）
+        React.createElement(Box, { label: 'フィードフォワード', style: { padding: 14 } },
+          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
             inp('クリープ車速 [km/h]', 'creep_speed_kmh', { type: 'number', mono: true }),
             inp('クリープ加速率 [km/h/s]', 'creep_rate_kmhs', { type: 'number', mono: true }),
-            inp('エンジンブレーキ減速量 [km/h/s]', 'engine_brake_decel_kmhs', { type: 'number', mono: true }),
+            inp('コースト減速量 [km/h/s]', 'engine_brake_decel_kmhs', { type: 'number', mono: true }),
             inp('停車時ブレーキ開度 [%]', 'stop_brake_opening_pct', { type: 'number', mono: true }),
             inp('ブレーキ不感帯 [%]', 'brake_deadband_pct', { type: 'number', mono: true }),
             inp('アクセル不感帯 [%]', 'accel_deadband_pct', { type: 'number', mono: true }),
@@ -413,10 +414,34 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
       ),
 
       // ── Right column ─────────────────────────────────────
-      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', justifyContent: 'space-between', height: '100%', minHeight: 0 } },
 
-        // キャリブレーションデータ
-        React.createElement(Box, { label: 'キャリブレーションデータ', style: { padding: 18, flex: 1 } },
+        // フィードバック（PIDゲイン）
+        React.createElement(Box, { label: 'フィードバック', style: { padding: 14 } },
+          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
+            inp('Kp', 'kp', { type: 'number', mono: true }),
+            inp('Ki', 'ki', { type: 'number', mono: true }),
+            inp('Kd', 'kd', { type: 'number', mono: true }),
+          ),
+        ),
+
+        // 先読み（アクチュエータ〜車両系のむだ時間補償。PID自動適合で自動算出／手動調整可）
+        React.createElement(Box, { label: '先読み', style: { padding: 14 } },
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+            inp('先読み補償時間 [s]', 'preview_time_s', { type: 'number', mono: true }),
+            React.createElement('div', { style: { fontSize: 12, color: INK_SOFT, lineHeight: 1.4 } },
+              'PID自動適合（学習サイクル）で自動算出されます。'
+            ),
+            React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, fontSize: 13 } },
+              React.createElement('div', null, 'K: ', React.createElement('b', null, initial?.dynamics_params?.fopdt_k ?? '—')),
+              React.createElement('div', null, 'τ [s]: ', React.createElement('b', null, initial?.dynamics_params?.fopdt_tau ?? '—')),
+              React.createElement('div', null, 'θ [s]: ', React.createElement('b', null, initial?.dynamics_params?.fopdt_theta ?? '—')),
+            ),
+          ),
+        ),
+
+        // キャリブレーション
+        React.createElement(Box, { label: 'キャリブレーション', style: { padding: 14 } },
           (!isEdit || !calib?.is_valid)
             ? React.createElement('div', { style: { fontSize: 14, color: INK_SOFT } }, '未実施')
             : React.createElement('div', null,
@@ -446,8 +471,8 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
               ),
         ),
 
-        // 運転モデル
-        React.createElement(Box, { label: '運転モデル', style: { padding: 18, flex: 1 } },
+        // モデル
+        React.createElement(Box, { label: 'モデル', style: { padding: 14 } },
           (!isEdit || !initial?.model_path)
             ? React.createElement('div', { style: { fontSize: 14, color: INK_SOFT } }, '未実施')
             : React.createElement('div', { style: { fontSize: 13, color: INK_SOFT, fontFamily: 'inherit', wordBreak: 'break-all' } },

@@ -1,8 +1,9 @@
-import asyncio
+from dataclasses import replace
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from src.app.learning_cycle import CycleBusyError, LearningCycleOrchestrator
 from src.app.robot_controller import (
     EmergencyStillActive,
     InvalidStateTransition,
@@ -11,9 +12,11 @@ from src.app.robot_controller import (
     PreCheckFailed,
     RobotController,
 )
+from src.app.training_service import train_and_apply
 from src.domain.learning_drive import LearningDataError
-from src.domain.model_training import estimate_dynamics_params, train_inverse_model
-from src.domain.pid_tuning import compute_pid_gains_simc, identify_fopdt, tuning_cost
+from src.domain.model_training import FeatureSpec
+from src.domain.pid_tuning import tuning_cost
+from src.infra.settings import LearningSettings
 from src.models.calibration import CalibrationResult
 from src.models.drive_log import DriveSession
 from src.models.system_state import RobotState
@@ -23,6 +26,9 @@ from src.web.deps import (
     ScheduleRepoProtocol,
     SessionRepoProtocol,
     get_controller,
+    get_cycle_orchestrator,
+    get_feature_spec,
+    get_learning_settings,
     get_log_writer,
     get_mode_repo,
     get_profile_repo,
@@ -33,10 +39,15 @@ from src.web.schemas import (
     AxisRequest,
     CalibrationDataResponse,
     CalibrationResultResponse,
+    CycleProgressSchema,
     DriveSessionResponse,
+    DynamicsParamsSchema,
     FeedforwardParamsSchema,
     JogRequest,
     JogResponse,
+    LearningCycleAbortResponse,
+    LearningCycleStartRequest,
+    LearningCycleStartResponse,
     PIDGainsSchema,
     PidRefineRequest,
     PidRefineResponse,
@@ -377,12 +388,15 @@ async def train_learning_model(
     controller: Controller,
     profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
     session_repo: Annotated[SessionRepoProtocol, Depends(get_session_repo)],
+    feature_spec: Annotated[FeatureSpec, Depends(get_feature_spec)],
 ) -> TrainModelResponse:
     """直近の学習走行ログから先読み 多項式Ridge 逆モデルを学習し、プロファイルに紐づけて保存する。
 
     再学習も同一エンドポイントで実行できる（model_path を上書き更新）。
     学習は CPU 負荷の高い同期処理のため to_thread で実行し、50ms 制御ループ・
     WebSocket 配信・非常停止コールバックが動くイベントループをブロックしない。
+    実処理は training_service.train_and_apply に委譲する（2段階学習フローの
+    オーケストレータとロジックを共有する）。
     """
     state = controller.get_system_state().robot_state
     if state in (
@@ -403,9 +417,17 @@ async def train_learning_model(
             status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
         )
 
-    # 学習対象は「直近に実施した学習走行」のみを既定とする（過去の旧データ混在を避ける）。
     # session_ids を明示指定した場合はそれを優先する（再学習・複数選択の用途）。
+    # 次に cycle_id 指定（サイクル内全セッションで学習）。いずれも無ければ
+    # 「直近に実施した学習走行」のみを既定とする（過去の旧データ混在を避ける）。
     session_ids = req.session_ids
+    if not session_ids and req.cycle_id:
+        session_ids = await session_repo.list_session_ids_for_cycle(req.cycle_id)
+        if not session_ids:
+            raise HTTPException(
+                status_code=422,
+                detail=f"学習サイクル {req.cycle_id!r} にセッションがありません。",
+            )
     if not session_ids:
         latest = await session_repo.latest_learning_session_id(req.profile_id)
         if latest is None:
@@ -415,56 +437,48 @@ async def train_learning_model(
             )
         session_ids = [latest]
 
-    logs = await session_repo.list_logs_for_training(req.profile_id, session_ids)
     try:
-        model_path, metrics = await asyncio.to_thread(train_inverse_model, logs, profile)
+        result = await train_and_apply(
+            profile_repo=profile_repo,
+            session_repo=session_repo,
+            controller=controller,
+            profile_id=req.profile_id,
+            session_ids=session_ids,
+            feature_spec=feature_spec,
+        )
     except LearningDataError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-
-    # 観測可能な物理定数のみログから推定して上書き（不足項目は既存値を保持）
-    new_params = await asyncio.to_thread(estimate_dynamics_params, logs, profile.feedforward_params)
-
-    # 学習ログのアクセル保持区間から FOPDT を同定し SIMC で PID を自動適合する。
-    # 同定不能（区間不足）なら既存ゲインを保持する。CPU 同期処理のため to_thread。
-    fopdt = await asyncio.to_thread(identify_fopdt, logs, profile)
-    pid_auto_tuned = False
-    if fopdt is not None:
-        new_gains = compute_pid_gains_simc(fopdt, profile)
-        if new_gains != profile.pid_gains:
-            profile.pid_gains = new_gains
-            pid_auto_tuned = True
-
-    profile.model_path = model_path
-    profile.feedforward_params = new_params
-    updated = await profile_repo.update(profile)
-
-    # 学習結果をアクティブプロファイルの制御スタックへ即時反映する。
-    # DB だけ更新して in-memory を放置すると、学習直後の走行が旧モデル
-    # （または FF なし）で実行される（コードレビュー 2026-06-11 指摘 #10）。
-    controller.refresh_active_profile(updated if updated is not None else profile)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
     return TrainModelResponse(
-        model_path=model_path,
-        metrics=metrics,
+        model_path=result.model_path,
+        metrics=result.metrics,
         feedforward_params=FeedforwardParamsSchema(
-            creep_speed_kmh=new_params.creep_speed_kmh,
-            creep_rate_kmhs=new_params.creep_rate_kmhs,
-            engine_brake_decel_kmhs=new_params.engine_brake_decel_kmhs,
-            stop_brake_opening_pct=new_params.stop_brake_opening_pct,
-            brake_deadband_pct=new_params.brake_deadband_pct,
-            accel_deadband_pct=new_params.accel_deadband_pct,
-            switch_hysteresis_pct=new_params.switch_hysteresis_pct,
-            accel_reengage_dwell_s=new_params.accel_reengage_dwell_s,
-            accel_rate_limit_pct_s=new_params.accel_rate_limit_pct_s,
-            brake_rate_limit_pct_s=new_params.brake_rate_limit_pct_s,
-            pid_output_limit_pct=new_params.pid_output_limit_pct,
+            creep_speed_kmh=result.feedforward_params.creep_speed_kmh,
+            creep_rate_kmhs=result.feedforward_params.creep_rate_kmhs,
+            engine_brake_decel_kmhs=result.feedforward_params.engine_brake_decel_kmhs,
+            stop_brake_opening_pct=result.feedforward_params.stop_brake_opening_pct,
+            brake_deadband_pct=result.feedforward_params.brake_deadband_pct,
+            accel_deadband_pct=result.feedforward_params.accel_deadband_pct,
+            switch_hysteresis_pct=result.feedforward_params.switch_hysteresis_pct,
+            accel_reengage_dwell_s=result.feedforward_params.accel_reengage_dwell_s,
+            accel_rate_limit_pct_s=result.feedforward_params.accel_rate_limit_pct_s,
+            brake_rate_limit_pct_s=result.feedforward_params.brake_rate_limit_pct_s,
+            pid_output_limit_pct=result.feedforward_params.pid_output_limit_pct,
         ),
         pid_gains=PIDGainsSchema(
-            kp=profile.pid_gains.kp,
-            ki=profile.pid_gains.ki,
-            kd=profile.pid_gains.kd,
+            kp=result.pid_gains.kp,
+            ki=result.pid_gains.ki,
+            kd=result.pid_gains.kd,
         ),
-        pid_auto_tuned=pid_auto_tuned,
+        pid_auto_tuned=result.pid_auto_tuned,
+        dynamics_params=DynamicsParamsSchema(
+            preview_time_s=result.dynamics_params.preview_time_s,
+            fopdt_k=result.dynamics_params.fopdt_k,
+            fopdt_tau=result.dynamics_params.fopdt_tau,
+            fopdt_theta=result.dynamics_params.fopdt_theta,
+        ),
     )
 
 
@@ -522,13 +536,15 @@ async def pid_tune_refine(
     except PidTuningAborted as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
 
-    # 最良ゲインを永続化し、アクティブプロファイルの制御スタックへ反映する。
-    profile.pid_gains = best
+    # 最良ゲイン・先読み補償秒数を永続化し、アクティブプロファイルの制御スタックへ反映する。
+    profile.pid_gains = best.gains
+    profile.dynamics_params = replace(profile.dynamics_params, preview_time_s=best.preview_time_s)
     updated = await profile_repo.update(profile)
     controller.refresh_active_profile(updated if updated is not None else profile)
 
     return PidRefineResponse(
         pid_gains=PIDGainsSchema(kp=best.kp, ki=best.ki, kd=best.kd),
+        preview_time_s=best.preview_time_s,
         best_cost=min((h["cost"] for h in history), default=0.0),
         history=history,
     )
@@ -591,3 +607,77 @@ async def select_profile(
         )
     controller.select_profile(profile)
     return {"status": "ok", "profile_id": profile.id}
+
+
+def _to_cycle_progress_schema(orchestrator: LearningCycleOrchestrator) -> CycleProgressSchema:
+    p = orchestrator.progress
+    return CycleProgressSchema(
+        cycle_id=p.cycle_id,
+        phase=p.phase.value,
+        run_index=p.run_index,
+        run_total=p.run_total,
+        best_cost=p.best_cost,
+        best_preview_time_s=p.best_preview_time_s,
+        message=p.message,
+        started_at=p.started_at,
+    )
+
+
+@router.post("/learning-cycle/start", response_model=LearningCycleStartResponse, status_code=202)
+async def start_learning_cycle(
+    req: LearningCycleStartRequest,
+    controller: Controller,
+    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
+    learning_settings: Annotated[LearningSettings, Depends(get_learning_settings)],
+    feature_spec: Annotated[FeatureSpec, Depends(get_feature_spec)],
+) -> LearningCycleStartResponse:
+    """学習サイクル(学習運転→訓練→PID適合→再学習→PID適合)を1操作で開始する。
+
+    学習運転の準備(arm)〜開始までを同期的に実行するため、応答まで数秒(車速収束待ち)かかる。
+    以降のフェーズはバックグラウンドで進行し、進捗は `GET /learning-cycle/status` または
+    WebSocket(`cycle_progress`)で参照する。
+    """
+    state = controller.get_system_state().robot_state
+    if state != RobotState.READY:
+        raise HTTPException(
+            status_code=409,
+            detail=f"学習サイクルは READY 状態でのみ開始できます (現在: {state})",
+        )
+    profile = controller.get_active_profile()
+    if profile is None:
+        raise HTTPException(status_code=404, detail="プロファイルが選択されていません")
+
+    stage1 = req.refine_runs_stage1 or learning_settings.refine_runs_stage1
+    stage2 = req.refine_runs_stage2 or learning_settings.refine_runs_stage2
+    try:
+        cycle_id = await orchestrator.start(
+            profile.id, stage1, stage2, feature_spec=feature_spec
+        )
+    except CycleBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except PreCheckFailed as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return LearningCycleStartResponse(cycle_id=cycle_id, status="started")
+
+
+@router.post("/learning-cycle/abort", response_model=LearningCycleAbortResponse, status_code=200)
+async def abort_learning_cycle(
+    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
+) -> LearningCycleAbortResponse:
+    """実行中の学習サイクルを中断する。実行中でない場合は 409。"""
+    try:
+        await orchestrator.abort()
+    except InvalidStateTransition as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return LearningCycleAbortResponse(status="aborting")
+
+
+@router.get("/learning-cycle/status", response_model=CycleProgressSchema)
+async def get_learning_cycle_status(
+    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
+) -> CycleProgressSchema:
+    return _to_cycle_progress_schema(orchestrator)

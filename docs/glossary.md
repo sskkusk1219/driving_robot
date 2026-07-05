@@ -116,9 +116,9 @@
 
 **定義**: 基準車速（先読みトレンド）からアクセル・ブレーキ開度を予測する逆モデル
 
-**説明**: 学習運転の連続ログから生成される先読み型 多項式Ridge 逆モデル。フィードフォワード制御の入力として使用される。現在の基準車速 v0 と数秒先の基準車速トレンド（Δv）から名目開度を予測し、加速／減速の2レジームに分かれる。推定器は完全2次多項式展開＋標準化＋Ridge の Pipeline で、ブレーキの不感帯→急制動の非線形を表現する（純線形では減速 R² が頭打ちだった）。学習は直近に実施した学習走行セッションのみを使う（過去の旧データ混在を避ける）。学習観測最高車速 `speed_clip_max` を保存し推論時に入力をクリップして域外発散を防ぐ。`.pkl` 形式（`model_type = "poly_inverse_lookahead"`）でファイル保存され、車両プロファイルに紐づく。
+**説明**: 学習運転の連続ログから生成される先読み型 多項式Ridge 逆モデル。フィードフォワード制御の入力として使用される。現在の基準車速 v0・数秒先の基準車速トレンド（Δv）・過去方向Δv（0.5s/1.0s 前からの速度変化＝ランプ過渡/定常の識別）から名目開度を予測し、加速／減速の2レジームに分かれる。特徴量の構成（ホライズン等）は [FeatureSpec](#featurespec) で設定可能。デフォルトは従来固定だった9特徴と完全一致する。推定器は完全2次多項式展開＋標準化＋Ridge の Pipeline で、ブレーキの不感帯→急制動などの非線形を多項式項で表現する（純線形では減速 R² が頭打ちだった）。一時、単調制約付き HistGradientBoosting（木）を試したが、学習パターンに定常巡航サンプルがほぼ無いため実走行の巡航域で予測が定数に飽和し閉ループ追従が破綻し、poly Ridge に復帰した。手動パス（`/learning/train`）は既定で直近に実施した学習走行セッションのみを使う（過去の旧データ混在を避ける）。[学習サイクル](#学習サイクル)の2段目はサイクル全ログ（学習運転+全PID適合走行）で再学習する。学習観測最高車速 `speed_clip_max` を保存し推論時に入力をクリップして域外を学習端で有界にする。`.pkl` 形式（`model_type = "poly_spec_inverse_lookahead"`。`feature_spec` を同梱）でファイル保存され、車両プロファイルに紐づく。
 
-**関連用語**: フィードフォワード制御、学習運転、車両プロファイル
+**関連用語**: フィードフォワード制御、学習運転、車両プロファイル、FeatureSpec、学習サイクル
 
 **英語表記**: Driving Model
 
@@ -144,7 +144,7 @@
 
 **定義**: 基準車速を使わず、時系列でペダル開度とボタン操作を自動化する実行単位（統合タイムライン）
 
-**説明**: 時刻ごとのアクセル・ブレーキ開度（ペダル動作）と、時刻・対象ボタン・押下時間を指定したボタンイベントを、**同一のタイムライン**上で管理する。ループ再生・保存・一覧管理に対応する。ボタン操作は PCA9685 経由のボタンサーボ（SG90 ×16）で実行される。
+**説明**: 時刻ごとのアクセル・ブレーキ開度（ペダル動作）と、時刻・対象ボタン・押下時間を指定したボタンイベントを、**同一のタイムライン**上で管理する。保存・一覧管理に対応する。ボタン操作は PCA9685 経由のボタンサーボ（SG90 ×16）で実行される。
 
 **関連用語**: ボタンイベント、ボタンサーボ、PCA9685、シーケンス
 
@@ -260,11 +260,11 @@
 
 ### セッション
 
-**定義**: 1回の走行（自動運転・学習運転・手動操作）の単位
+**定義**: 1回の走行（自動運転・学習運転・PID適合走行・手動操作）の単位
 
-**説明**: 走行開始から停止までを1セッションとして管理する。PostgreSQL の `drive_sessions` テーブルに記録され、走行ログは `drive_logs` テーブルに紐づく。
+**説明**: 走行開始から停止までを1セッションとして管理する。PostgreSQL の `drive_sessions` テーブルに記録され、走行ログは `drive_logs` テーブルに紐づく。`run_type` は `'auto'`（通常自動走行）・`'manual'`（手動操作）・`'learning'`（学習運転）・`'tuning'`（PID適合走行）のいずれか。[学習サイクル](#学習サイクル)に参加するセッションは `cycle_id` で束ねられ、ログ画面では1サイクル=1項目としてグループ表示される（`cycle_id=NULL` のセッションは従来どおりフラット表示）。
 
-**関連用語**: 走行ログ、DriveSession
+**関連用語**: 走行ログ、DriveSession、学習サイクル
 
 **英語表記**: Drive Session
 
@@ -487,6 +487,8 @@ src/infra/  → HW通信・DB・ファイルI/O
 |---------|------------|------|
 | `RobotController` | `src/app/robot_controller.py` | システム状態機械・ユースケース調整 |
 | `SessionManager` | `src/app/session_manager.py` | 走行セッションのライフサイクル管理 |
+| `training_service` | `src/app/training_service.py` | 運転モデル学習+PID自動適合（`/learning/train`・学習サイクル共通処理） |
+| `LearningCycleOrchestrator` | `src/app/learning_cycle.py` | 学習サイクル（2段階学習フロー）のフェーズ進行・進捗・中断/エラー処理 |
 | `CalibrationManager` | `src/domain/calibration.py` | キャリブレーション実行・電流急増検出 |
 | `LearningDriveManager` | `src/domain/learning_drive.py` | 学習運転の実行・走行パターン管理 |
 | `SafetyMonitor` | `src/domain/safety_monitor.py` | 非常停止・AC断検知・過電流監視・逸脱監視 |
@@ -544,6 +546,24 @@ src/infra/  → HW通信・DB・ファイルI/O
 | `error` | エラー停止 |
 | `emergency` | 非常停止 |
 
+### セッション種別（DriveSession.run_type）
+
+| 種別 | 意味 |
+|------|------|
+| `auto` | 通常の自動走行（走行モード指定） |
+| `manual` | 手動操作 |
+| `learning` | 学習運転（開ループ開度パターン走行） |
+| `tuning` | PID適合走行（規定パターン走行。通常の自動走行と区別するため分離） |
+
+### 学習サイクル状態（LearningCycle.status）
+
+| ステータス | 意味 |
+|-----------|------|
+| `running` | フェーズ進行中 |
+| `completed` | 全フェーズ正常完了 |
+| `error` | いずれかのフェーズでエラー発生 |
+| `aborted` | オペレーターによる中断 |
+
 ---
 
 ## データモデル用語
@@ -562,6 +582,7 @@ src/infra/  → HW通信・DB・ファイルI/O
 - `pid_gains`: PIDゲイン（JSON）
 - `calibration`: キャリブレーションデータ（外部キー）
 - `model_path`: 運転モデルファイルパス
+- `dynamics_params`: [DynamicsParams](#dynamicsparams)（先読み補償秒数・FOPDT同定値、JSON）
 
 **関連エンティティ**: CalibrationData、DriveSession
 
@@ -605,6 +626,29 @@ src/infra/  → HW通信・DB・ファイルI/O
 
 ---
 
+### DynamicsParams
+
+**定義**: アクチュエータ〜車両系のむだ時間補償（先読み補償）と FOPDT 同定値を保持するデータモデル
+
+**主要フィールド**:
+- `preview_time_s`: 先読み補償秒数 [s]。制御ループが FF・PID の基準速度サンプリング時刻を
+  `elapsed + preview_time_s` へ前倒しし、アクチュエータ〜車両系のむだ時間を補償する。
+  `0.0`（既定）は従来動作（前倒しなし）と完全一致する。
+- `fopdt_k` / `fopdt_tau` / `fopdt_theta`: [PID自動適合](#pid自動適合)の FOPDT 同定値
+  （定常ゲイン・時定数・むだ時間）。学習成果メタデータとして表示用に保持する。
+
+**FF先読み（`FeatureSpec.lookahead_horizons_s`）との違い**: FF先読みは逆モデルの特徴量として
+「目標軌跡を先読みする」ものであり遅れ補償ではない。`preview_time_s` は逆に「制御ループが
+参照する基準速度そのものを前倒しする」ことでむだ時間を補償する、独立した仕組み。
+
+**自動適合**: [PID自動適合](#pid自動適合)の TRAINING 段で FOPDT の `theta` を初期値とし、
+REFINE 段（座標降下）で kp/ki/kd と合わせて4次元で実走絞り込みする。
+
+**コード識別子**: `DynamicsParams`（`src/models/profile.py`、`VehicleProfile.dynamics_params` に
+内包）、`TuningParams`（`src/domain/pid_tuning.py`、座標降下が扱う4パラメータ）
+
+---
+
 ### StopConfig
 
 **定義**: 自動停止判定の設定
@@ -634,6 +678,21 @@ src/infra/  → HW通信・DB・ファイルI/O
 - `brake_current`: ブレーキ電流値 [mA]
 
 **制約**: `session_id + timestamp` でユニーク
+
+---
+
+### LearningCycle
+
+**定義**: [学習サイクル](#学習サイクル)1回分のメタデータ
+
+**主要フィールド**:
+- `id`: サイクルID（UUID）
+- `profile_id`: 車両プロファイルID（外部キー）
+- `status`: `running` / `completed` / `error` / `aborted`
+- `started_at` / `ended_at`: 開始・終了日時
+- `detail`: JSONB。段階別ゲイン・コスト・モデルパス・メトリクスを記録（スキーマレス、将来拡張用）
+
+**コード識別子**: `LearningCycle`（`src/models/drive_log.py`）、`learning_cycles` テーブル
 
 ---
 
@@ -731,7 +790,7 @@ correction = Kp × error + Ki × ∫error dt + Kd × d(error)/dt
 
 **定義**: 学習運転の成果（運転モデル・ログ）から PID ゲインを自動で適合する仕組み。手動編集も併存する。
 
-**説明**: 2段構成。①**モデルベース解析適合**: 学習ログの [FOPDT](#fopdt) 同定 → [SIMC](#simc) で PID 初期値を算出し、モデル学習（`/learning/train`）と同時にプロファイルへ保存（区間不足時は既存値を保持）。②**閉ループ絞り込み**: モデル＋PID初期値で[規定パターン](#規定パターンpid自動適合)を走行し、[座標降下](#座標降下チューニング)で追従 KPI のコストを最小化して最良ゲインを保存（`/pid-tune/refine`）。学習運転の正常終了を契機に①②を自動で一気通貫実行する。
+**説明**: 2段構成。①**モデルベース解析適合**: 学習ログの [FOPDT](#fopdt) 同定 → [SIMC](#simc) で PID 初期値を算出し、モデル学習（`/learning/train`）と同時にプロファイルへ保存（区間不足時は既存値を保持）。同時に FOPDT のむだ時間 `theta` を初期値として [DynamicsParams](#dynamicsparams).`preview_time_s`（先読み補償秒数）も算出・保存する。②**閉ループ絞り込み**: モデル＋PID初期値＋先読み補償初期値で[規定パターン](#規定パターンpid自動適合)を走行し、[座標降下](#座標降下チューニング)で追従 KPI のコストを最小化して最良の kp/ki/kd/preview_time_s を保存（`/pid-tune/refine`）。個別APIとして手動でも実行できるほか、[学習サイクル](#学習サイクル)が2段階（座標降下→サイクル全ログで再学習→座標降下）で自動実行する。
 
 **実装箇所**: `src/domain/pid_tuning.py`、`RobotController.run_pid_tuning_session`
 
@@ -743,7 +802,7 @@ correction = Kp × error + Ki × ∫error dt + Kd × d(error)/dt
 
 **定義**: PID自動適合の閉ループ絞り込みで走行する、コード生成の基準車速パターン
 
-**説明**: 加速→保持→再加速→保持→減速→保持→停止の速度軌跡。**プロファイルの安全包絡を厳守**し、全速度点を最高車速以内、加減速レートを `DECEL_MARGIN(0.8) × max_decel_g × G_TO_KMHS`（=上限G以内）として減速区間長を算出する。DB には永続化せずメモリ上の `DrivingMode` として走行する。
+**説明**: 加速→保持→再加速→保持→減速→保持→停止の速度軌跡。**プロファイルの安全包絡を厳守**し、全速度点を最高車速以内、加減速レートを `DECEL_MARGIN(0.8) × max_decel_g × G_TO_KMHS`（=上限G以内）として減速区間長を算出する。DB には永続化せずメモリ上の `DrivingMode` として走行する。適合走行のセッションは `run_type='tuning'` で記録される（通常の自動走行と区別）。
 
 **実装箇所**: `build_tuning_trajectory`（`src/domain/pid_tuning.py`）
 
@@ -751,10 +810,38 @@ correction = Kp × error + Ki × ∫error dt + Kd × d(error)/dt
 
 ### 座標降下チューニング
 
-**定義**: PID ゲインを KPI コスト最小化方向へ反復探索する導出フリー最適化
+**定義**: PID ゲイン＋先読み補償秒数を KPI コスト最小化方向へ反復探索する導出フリー最適化
 
-**説明**: 初期点（SIMC初期値）を中心に Kp/Ki/Kd を ±ステップで探索し、改善があれば中心を更新、なければステップを縮小する（コンパス探索）。各試行は規定パターンを1回走行し、`KPIMonitor` 集計を `tuning_cost`（p95偏差・最大偏差・符号反転を正規化、ハード上限違反は重ペナルティ）でスカラー化して評価する。`max_runs`（既定15）・最小ステップで停止。走行（ハード）から切り離した注入式の純粋ロジック（`CoordinateDescentTuner`）でハード無しに収束をテストできる。
+**説明**: 初期点（SIMC初期値＋FOPDT由来の先読み補償初期値、または学習サイクル2段目では1段目の適合結果）を中心に Kp/Ki/Kd/`preview_time_s`（[DynamicsParams](#dynamicsparams)、4次元）を ±ステップで探索し、改善があれば中心を更新、なければステップを縮小する（コンパス探索）。各試行は候補の `preview_time_s` を差し替えたプロファイルで規定パターンを1回走行し、`KPIMonitor` 集計を `tuning_cost`（p95偏差・最大偏差・符号反転を正規化、ハード上限違反は重ペナルティ）でスカラー化して評価する。`max_runs`（手動パス既定15、学習サイクルは段階ごとに既定14/5）・最小ステップで停止。走行（ハード）から切り離した注入式の純粋ロジック（`CoordinateDescentTuner`）でハード無しに収束をテストできる。
 
 **実装箇所**: `CoordinateDescentTuner`・`tuning_cost`（`src/domain/pid_tuning.py`）
 
 **英語表記**: Coordinate Descent (Compass Search)
+
+---
+
+### 学習サイクル
+
+**定義**: 学習運転〜訓練〜PID適合〜再学習〜PID適合の一連の処理を1操作で自動進行させる単位。`learning_cycles` テーブルの1行に対応する。
+
+**説明**: WebUI の「学習サイクル開始」ボタン押下から `LearningCycleOrchestrator` がフェーズを自動進行する（`IDLE→ARMING→LEARNING→TRAINING_1→REFINE_1→TRAINING_2→REFINE_2→COMPLETED`、中断時 `ABORTED`、エラー時 `ERROR`）。学習運転開始で新サイクルが開設され、以降の[規定パターン](#規定パターンpid自動適合)適合走行（`run_type='tuning'`）が同一サイクルへ `drive_sessions.cycle_id` で参加する。1段目（座標降下、既定14回）は完了後も停車保持ブレーキを維持し（`release_on_finish=False`）、サイクル内全ログで再学習（`update_pid_gains=False`、1段目のゲインをSIMC値で上書きしない）してから2段目（既定5回、1段目ゲインから継続）を実行、完了時に原点復帰で解放する。中断・エラー時は必ずブレーキを解放してからサイクルをクローズする。manual・通常autoのセッションは `cycle_id=NULL` のまま（サイクル非参加）。
+
+**実装箇所**: `src/app/learning_cycle.py`（`LearningCycleOrchestrator`）、`learning_cycles` テーブル
+
+**関連用語**: PID自動適合、学習運転、セッション
+
+**英語表記**: Learning Cycle
+
+---
+
+### FeatureSpec
+
+**定義**: 運転モデル（先読み型 多項式Ridge 逆モデル）の特徴量構成を表す設定可能な仕様
+
+**説明**: 先読みホライズン・過去ホライズン・レジーム判定ホライズン・二次項/交互作用項の有無・加速度項（中央差分）を dataclass のフィールドとして持つ。デフォルト `DEFAULT_FEATURE_SPEC` は従来固定だった9特徴と完全一致する。学習時に選択した spec は `.pkl` に保存され、推論側（`FeedforwardController`）はそこから復元して特徴構築・レジーム判定を行う（モジュール定数のハードコード参照はしない）。`scripts/evaluate_feature_sets.py` が既存ログで候補セットを in-sample／holdout（実速度・基準速度の両方）で比較するオフライン評価基盤を提供する。
+
+**評価結果（2026-07-03、実ログ）**: 本番デフォルトは9特徴を維持。加速度項（中央差分0.5〜3.0s）・先読み点間の傾き項・過去ホライズン拡張（2.0/3.0s）はいずれも holdout で改善なし〜悪化のため不採用（傾き項は既存Δv特徴の線形結合で poly-Ridge では理論上冗長）。短期先読み（0.1/0.2/0.3s）は訓練データが多い場合のみ有効（-4〜5%）で、学習サイクル運用による訓練データ増加後に再評価する。特徴量選択より訓練データ量の効果が支配的だった。
+
+**実装箇所**: `src/domain/model_training.py`（`FeatureSpec`）、`scripts/evaluate_feature_sets.py`
+
+**英語表記**: Feature Spec

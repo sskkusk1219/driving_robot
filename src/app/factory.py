@@ -86,7 +86,7 @@ async def build_real_controller(
     accel_driver: ActuatorDriverProtocol
     brake_driver: ActuatorDriverProtocol
     can_reader: CANReaderProtocol
-    button_servo: ButtonServoProtocol
+    button_servo: ButtonServoProtocol | None
     if bench_gpio_only:
         # ベンチ検証用: 非常停止スイッチ(GPIO)のみ実機。アクチュエータ/CAN/ボタンサーボはスタブ。
         from src.app.stubs import (  # noqa: PLC0415
@@ -104,11 +104,13 @@ async def build_real_controller(
             port=settings.serial.accel_port,
             slave_id=1,
             baud_rate=settings.serial.baud_rate,
+            axis_name="accel",
         )
         brake_driver = ActuatorDriver(
             port=settings.serial.brake_port,
             slave_id=1,  # 各軸が独立した RS-485 バスを持つため両軸とも slave_id=1
             baud_rate=settings.serial.baud_rate,
+            axis_name="brake",
         )
         can_reader = CANReader(
             interface=settings.can.interface,
@@ -117,13 +119,18 @@ async def build_real_controller(
             dbc_path=settings.can.dbc_path,
             max_speed_age_s=settings.can.max_speed_age_s,
         )
-        button_servo = ButtonServoDriver(
-            i2c_bus=settings.servo.i2c_bus,
-            address=settings.servo.address,
-            pwm_freq_hz=settings.servo.pwm_freq_hz,
-            rest_angle=settings.servo.rest_angle,
-            press_angle=settings.servo.press_angle,
-        )
+        if settings.servo.enabled:
+            button_servo = ButtonServoDriver(
+                i2c_bus=settings.servo.i2c_bus,
+                address=settings.servo.address,
+                pwm_freq_hz=settings.servo.pwm_freq_hz,
+                rest_angle=settings.servo.rest_angle,
+                press_angle=settings.servo.press_angle,
+            )
+        else:
+            # Post-MVP のため既定は無効。None にすることで start() の I2C 接続試行を
+            # 完全にスキップし、未接続（タイムスケジュール走行のみ不可）として扱う。
+            button_servo = None
     # 非常停止のみ GPIO 経由。AC断は NUT ポーリングに変更したため ac_detect_pin 未使用
     gpio_monitor = GPIOMonitor(
         emergency_pin=settings.gpio.emergency_stop_pin,

@@ -168,7 +168,7 @@ function CalibrationScreen() {
             ) : (
               <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }}
                    onClick={() => setConfirmStart(true)}>
-                ▶ 開始
+                開始
               </Btn>
             )}
           </div>

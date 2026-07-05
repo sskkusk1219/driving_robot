@@ -134,7 +134,7 @@ function CsvSpeedGraph({ rows, width = 600, height = 220 }) {
 
 function ModesScreen() {
   const { useState, useEffect, useContext } = React;
-  const { apiFetch, activeModeId, setActiveModeId, activeModeName, setActiveModeName } = useContext(window.AppContext);
+  const { apiFetch, activeModeId, setActiveModeId, activeModeName, setActiveModeName, activeModeKind, setActiveModeKind } = useContext(window.AppContext);
   const { INK, INK_SOFT, INK_MUTE, PAPER_2, HATCH, Box, Btn, H2, Note, Pill, Row, Hatch, RowActions } = window;
 
   const [modes, setModes] = useState([]);
@@ -212,6 +212,7 @@ function ModesScreen() {
   async function handleSelect(m) {
     setActiveModeId(m.id);
     setActiveModeName(m.name);
+    setActiveModeKind('mode');
     window.showToast(`「${m.name}」を選択しました`, 'success');
   }
 
@@ -220,7 +221,7 @@ function ModesScreen() {
     const r = await apiFetch('DELETE', `/api/v1/modes/${m.id}`);
     if (r !== null) {
       window.showToast('走行モードを削除しました', 'success');
-      if (activeModeId === m.id) {
+      if (activeModeKind === 'mode' && activeModeId === m.id) {
         setActiveModeId(null);
         setActiveModeName(null);
       }
@@ -264,7 +265,7 @@ function ModesScreen() {
         const r = await apiFetch('DELETE', `/api/v1/modes/${editTarget.id}`);
         if (r !== null) {
           window.showToast('走行モードを削除しました', 'success');
-          if (activeModeId === editTarget.id) { setActiveModeId(null); setActiveModeName(null); }
+          if (activeModeKind === 'mode' && activeModeId === editTarget.id) { setActiveModeId(null); setActiveModeName(null); }
           setMode('list');
           setEditTarget(null);
           loadModes();
@@ -372,7 +373,7 @@ function ModesScreen() {
               ? '走行モードがありません。CSV ファイルをアップロードして作成してください。'
               : `「${search}」に一致するモードがありません。`)
         : sorted.map((m) => {
-            const isActive = m.id === activeModeId;
+            const isActive = activeModeKind === 'mode' && m.id === activeModeId;
             return React.createElement(Row, {
               key: m.id,
               cells: [

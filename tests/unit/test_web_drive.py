@@ -542,10 +542,10 @@ async def test_learning_train_ok_updates_model_path(
 
     fake_metrics = {"accel": {"mae": 0.1, "n": 50.0}, "brake": {"mae": 0.2, "n": 40.0}}
 
-    def _fake_train(logs, profile, output_dir="data/models"):  # noqa: ANN001, ANN202, ARG001
+    def _fake_train(logs, profile, output_dir="data/models", feature_spec=None):  # noqa: ANN001, ANN202, ARG001
         return "data/models/fake_model.pkl", fake_metrics
 
-    monkeypatch.setattr("src.web.routers.drive.train_inverse_model", _fake_train)
+    monkeypatch.setattr("src.app.training_service.train_inverse_model", _fake_train)
     # train は最新の学習走行セッションを既定対象にする（空ログでも fake_train が成功を返す）
     monkeypatch.setattr(
         app.state.session_repo, "latest_learning_session_id", AsyncMock(return_value="sess-1")
@@ -579,10 +579,10 @@ async def test_learning_train_refreshes_active_profile(
     profile_id = str(uuid4())
     await _create_profile(profile_id)
 
-    def _fake_train(logs, profile, output_dir="data/models"):  # noqa: ANN001, ANN202, ARG001
+    def _fake_train(logs, profile, output_dir="data/models", feature_spec=None):  # noqa: ANN001, ANN202, ARG001
         return "data/models/fake_model.pkl", {"accel": {"n": 1.0}, "brake": {"n": 1.0}}
 
-    monkeypatch.setattr("src.web.routers.drive.train_inverse_model", _fake_train)
+    monkeypatch.setattr("src.app.training_service.train_inverse_model", _fake_train)
     monkeypatch.setattr(
         app.state.session_repo, "latest_learning_session_id", AsyncMock(return_value="sess-1")
     )
@@ -634,3 +634,178 @@ async def test_learning_start_precheck_failed_returns_422(stub_controller: Magic
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         res = await c.post("/api/v1/drive/learning/start")
     assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_learning_train_with_cycle_id_no_sessions_returns_422(
+    stub_controller: MagicMock,
+) -> None:
+    """cycle_id 指定でサイクルにセッションが無ければ 422 を返すこと。"""
+    from uuid import uuid4  # noqa: PLC0415
+
+    profile_id = str(uuid4())
+    await _create_profile(profile_id)
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/drive/learning/train",
+            json={"profile_id": profile_id, "cycle_id": str(uuid4())},
+        )
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_learning_train_with_cycle_id_resolves_sessions(
+    stub_controller: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cycle_id 指定時、list_session_ids_for_cycle で解決したセッションで学習すること。"""
+    from uuid import uuid4  # noqa: PLC0415
+
+    profile_id = str(uuid4())
+    await _create_profile(profile_id)
+
+    def _fake_train(logs, profile, output_dir="data/models", feature_spec=None):  # noqa: ANN001, ANN202, ARG001
+        return "data/models/fake_model.pkl", {"accel": {"n": 1.0}, "brake": {"n": 1.0}}
+
+    monkeypatch.setattr("src.app.training_service.train_inverse_model", _fake_train)
+    monkeypatch.setattr(
+        app.state.session_repo,
+        "list_session_ids_for_cycle",
+        AsyncMock(return_value=["sess-a", "sess-b"]),
+    )
+
+    app.state.controller = stub_controller
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/drive/learning/train",
+            json={"profile_id": profile_id, "cycle_id": "cycle-xyz"},
+        )
+    assert res.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_status_returns_idle_by_default() -> None:
+    """cycle_orchestrator の進捗をそのまま返すこと。"""
+    from src.app.learning_cycle import CyclePhase, CycleProgress  # noqa: PLC0415
+
+    orchestrator = MagicMock()
+    orchestrator.progress = CycleProgress(cycle_id=None, phase=CyclePhase.IDLE)
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.get("/api/v1/drive/learning-cycle/status")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["phase"] == "IDLE"
+    assert body["cycle_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_start_returns_202_with_cycle_id(
+    stub_controller: MagicMock,
+) -> None:
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
+
+    stub_controller.get_active_profile.return_value = VehicleProfile(
+        id="p1", name="t", max_accel_opening=80.0, max_brake_opening=80.0,
+        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None, model_path=None,
+        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+    )
+    app.state.controller = stub_controller
+
+    orchestrator = MagicMock()
+    orchestrator.start = AsyncMock(return_value="cycle-abc")
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/drive/learning-cycle/start",
+            json={"refine_runs_stage1": 3, "refine_runs_stage2": 2},
+        )
+    assert res.status_code == 202
+    assert res.json() == {"cycle_id": "cycle-abc", "status": "started"}
+    orchestrator.start.assert_awaited_once()
+    assert orchestrator.start.await_args.args[0] == "p1"
+    assert orchestrator.start.await_args.args[1] == 3
+    assert orchestrator.start.await_args.args[2] == 2
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_start_not_ready_returns_409(stub_controller: MagicMock) -> None:
+    ctrl = _make_stub_controller(state=RobotState.STANDBY)
+    app.state.controller = ctrl
+    app.state.cycle_orchestrator = MagicMock()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/start", json={})
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_start_no_active_profile_returns_404(
+    stub_controller: MagicMock,
+) -> None:
+    stub_controller.get_active_profile.return_value = None
+    app.state.controller = stub_controller
+    app.state.cycle_orchestrator = MagicMock()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/start", json={})
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_start_busy_returns_409(stub_controller: MagicMock) -> None:
+    from src.app.learning_cycle import CycleBusyError  # noqa: PLC0415
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
+
+    stub_controller.get_active_profile.return_value = VehicleProfile(
+        id="p1", name="t", max_accel_opening=80.0, max_brake_opening=80.0,
+        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None, model_path=None,
+        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+    )
+    app.state.controller = stub_controller
+    orchestrator = MagicMock()
+    orchestrator.start = AsyncMock(side_effect=CycleBusyError("実行中"))
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/start", json={})
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_abort_success() -> None:
+    orchestrator = MagicMock()
+    orchestrator.abort = AsyncMock()
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/abort")
+    assert res.status_code == 200
+    assert res.json() == {"status": "aborting"}
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_abort_not_running_returns_409() -> None:
+    orchestrator = MagicMock()
+    orchestrator.abort = AsyncMock(
+        side_effect=InvalidStateTransition("学習サイクルは実行中ではありません")
+    )
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/abort")
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_sessions_cycles_endpoint_returns_list() -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.get("/api/v1/sessions/cycles")
+    assert res.status_code == 200
+    assert res.json() == []

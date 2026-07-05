@@ -1,9 +1,17 @@
 // ── Auto-drive monitor screen ─────────────────────────────
 // AutoDriveD layout: 3-axis graph + BigSpeed + session info + stop
 
-function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMaxSpeed = null, screenTitle = '自動走行モニター', driveStartPath = '/api/v1/drive/start', driveStartBody = null, driveArmPath = null, driveCancelPath = null, confirmStartMessage = '走行を開始しますか？' }) {
+function DriveMonitorScreen({
+  showModeAxis = true, showPause = false, profileMaxSpeed = null,
+  screenTitle = '自動走行モニター', driveStartPath = '/api/v1/drive/start', driveStartBody = null,
+  driveStopPath = '/api/v1/drive/stop', driveArmPath = null, driveCancelPath = null,
+  confirmStartMessage = '開始しますか？', resultPanel = null,
+  modeRowLabel = showModeAxis ? '走行モード' : null,
+  confirmOnly = false, busy = false, busyLabel = null, onAbort = null,
+  startedToastMessage = '走行を開始しました',
+}) {
   const { useState, useEffect, useContext, useRef } = React;
-  const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeProfileName, robotState, setNavLock } = useContext(window.AppContext);
+  const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeModeKind, robotState, setNavLock } = useContext(window.AppContext);
   const { INK, INK_SOFT, PAPER, PAPER_2, HATCH, Box, Btn, Row, BigSpeed } = window;
 
   const [modeDetail, setModeDetail] = useState(null);
@@ -25,12 +33,12 @@ function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMax
     if (confirmStartRef.current && driveCancelPath) apiFetch('POST', driveCancelPath);
   }, []);
 
-  // 走行中（RUNNING / PAUSED）は他ページへの離脱をロック
+  // 走行中（RUNNING / PAUSED）または busy（学習サイクル等の背後処理中）は他ページへの離脱をロック
   useEffect(() => {
-    const driving = robotState === 'RUNNING' || robotState === 'PAUSED';
+    const driving = robotState === 'RUNNING' || robotState === 'PAUSED' || busy;
     setNavLock(driving);
     return () => setNavLock(false);
-  }, [robotState]);
+  }, [robotState, busy]);
 
   // T1: 走行中（RUNNING / PAUSED）のみ経過時間を進める。
   // グラフの横スクロールを滑らかにするため、整数秒の setInterval ではなく
@@ -79,12 +87,17 @@ function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMax
   const elapsed = Math.floor(nowS);
 
   useEffect(() => {
-    if (activeModeId) {
+    if (activeModeId && activeModeKind !== 'schedule') {
       apiFetch('GET', `/api/v1/modes/${activeModeId}`).then(d => { if (d) setModeDetail(d); });
+    } else {
+      setModeDetail(null);
     }
-  }, [activeModeId]);
+  }, [activeModeId, activeModeKind]);
 
   async function handleStart() {
+    // confirmOnly フロー（学習サイクル等）: driveStartPath 側が自前で arm/precheck を
+    // 同期実行するため、事前の arm HTTP 呼び出しはせず確認ポップアップのみ出す。
+    if (confirmOnly) { setConfirmStart(true); return; }
     // arm フロー（学習運転）: arm → 確認ポップアップ → はい/いいえ
     if (driveArmPath) {
       const r = await apiFetch('POST', driveArmPath);
@@ -92,21 +105,21 @@ function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMax
       return;
     }
     const r = await apiFetch('POST', driveStartPath, driveStartBody);
-    if (r) window.showToast('走行を開始しました', 'success');
+    if (r) window.showToast(startedToastMessage, 'success');
   }
 
   async function handleConfirmStartYes() {
     const r = await apiFetch('POST', driveStartPath, driveStartBody);
-    if (r) { window.showToast('走行を開始しました', 'success'); setConfirmStart(false); }
+    if (r) { window.showToast(startedToastMessage, 'success'); setConfirmStart(false); }
   }
 
   async function handleConfirmStartNo() {
-    await apiFetch('POST', driveCancelPath);
+    if (driveCancelPath) await apiFetch('POST', driveCancelPath);
     setConfirmStart(false);
   }
 
   async function handleStop() {
-    const r = await apiFetch('POST', '/api/v1/drive/stop');
+    const r = await apiFetch('POST', driveStopPath);
     if (r) { window.showToast('走行を終了しました', 'success'); setConfirmStop(false); }
   }
 
@@ -253,7 +266,7 @@ function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMax
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 10, flex: 1, minHeight: 0 }}>
 
       {/* Axis 1: speed graph — 1と2軸は同じ高さ */}
-      <Box style={{ padding: '6px 0 2px', flex: 2, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+      <Box style={{ padding: '6px 0 2px', flex: 3, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <GraphSvg height={PH1} yMax={maxSpeed} unit="" unitLabel="km/h">
             {showModeAxis && polyline(speedRef_pts, INK_SOFT, 1.5, '4 3')}
@@ -280,7 +293,7 @@ function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMax
       </Box>
 
       {/* Axis 2: openings graph — 1と2軸は同じ高さ */}
-      <Box style={{ padding: '6px 0 2px', flex: 2, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+      <Box style={{ padding: '6px 0 2px', flex: 3, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <GraphSvg height={PH2} yMax={100} unit="%">
             {polyline(accelPts, '#78c8f0', 2.2)}
@@ -353,24 +366,36 @@ function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMax
       )}
 
       {/* Bottom: BigSpeed + profile | session info + buttons */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-        <Box style={{ display: 'flex', gap: 12, alignItems: 'center', padding: 12 }}>
-          <BigSpeed value={rd.actual_speed_kmh} refSpeed={rd.ref_speed_kmh ?? null} size={110} showRef={showModeAxis} />
-          <Box label="プロファイル / モード" style={{ flex: 1, padding: '8px 12px' }}>
-            <div style={{ fontSize: 15, fontWeight: 700 }}>{activeProfileName ?? '—'}</div>
-            <div style={{ fontSize: 12, color: INK_SOFT, marginTop: 4 }}>{activeModeName ?? '—'}</div>
-            <div style={{ fontSize: 12, color: INK_SOFT, marginTop: 2 }}>アクセル {rd.accel_opening.toFixed(1)}% / ブレーキ {rd.brake_opening.toFixed(1)}%</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '0.8fr 1.2fr', gap: 10 }}>
+        <Box style={{ display: 'flex', gap: 10, alignItems: 'center', padding: 8 }}>
+          <BigSpeed value={rd.actual_speed_kmh} refSpeed={rd.ref_speed_kmh ?? null} size={84} showRef={showModeAxis} />
+          <Box style={{ flex: 1, padding: '6px 10px', display: 'flex', alignItems: 'center' }}>
+            <div style={{ fontSize: 12, color: INK_SOFT }}>アクセル {rd.accel_opening.toFixed(1)}% / ブレーキ {rd.brake_opening.toFixed(1)}%</div>
           </Box>
         </Box>
         <div style={{ display: 'flex', gap: 10, alignItems: 'stretch' }}>
-          <Box style={{ padding: '10px 14px', fontSize: 13, flex: 1 }}>
+          <Box style={{ padding: '8px 12px', fontSize: 13, flex: 1.6, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
             {/* T6: 経過時間は走行中のみ表示 */}
             <Row cells={[['経過時間', '1.4fr'], [isDriving ? fmt(elapsed) : '—', '1fr', 'mono']]} />
-            {showModeAxis && <Row cells={[['走行モード', '1.4fr'], [activeModeName ?? '—', '1fr']]} />}
+            {modeRowLabel && <Row cells={[[modeRowLabel, '1.4fr'], [activeModeName ?? '—', '1fr']]} />}
             {showModeAxis && <Row cells={[['全体時間', '1.4fr'], [totalDurS > 0 ? fmt(totalDurS) : '—', '1fr', 'mono']]} />}
+            {resultPanel && (
+              // 高さを固定し、内容量（未実行/学習中/完了）で枠が伸縮しないようにする。
+              // はみ出す分は内部スクロールで見せる。
+              <div style={{ marginTop: 6, overflowY: 'auto', height: 72 }}>
+                {resultPanel}
+              </div>
+            )}
           </Box>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
-            {robotState === 'RUNNING' ? (
+            {busy ? (
+              <>
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center', fontSize: 13, color: INK_SOFT, border: `1px solid ${HATCH}`, borderRadius: 4, padding: 8 }}>
+                  {busyLabel ?? '実行中…'}
+                </div>
+                {onAbort && <Btn danger big style={{ flex: 1 }} onClick={onAbort}>■ 中断</Btn>}
+              </>
+            ) : robotState === 'RUNNING' ? (
               <>
                 {showPause && (
                   <Btn big style={{ flex: 1, borderColor: INK_SOFT, background: PAPER_2, color: INK }} onClick={handlePause}>⏸ 一時停止</Btn>
@@ -383,7 +408,7 @@ function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMax
                 <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
               </>
             ) : (
-              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleStart}>▶ 走行開始</Btn>
+              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleStart}>開始</Btn>
             )}
           </div>
         </div>
@@ -406,10 +431,11 @@ function DriveMonitorScreen({ showModeAxis = true, showPause = false, profileMax
 
 function AutoDriveScreen() {
   const { useState, useEffect, useContext } = React;
-  const { apiFetch, activeProfileId, activeModeId, setNav } = useContext(window.AppContext);
+  const { apiFetch, activeProfileId, activeModeId, activeModeKind, setNav } = useContext(window.AppContext);
   const { ValidationPopup } = window;
 
   const [popup, setPopup] = useState(null);
+  const isSchedule = activeModeKind === 'schedule';
 
   useEffect(() => {
     if (!activeProfileId) { setPopup('no_profile'); return; }
@@ -422,19 +448,28 @@ function AutoDriveScreen() {
   const POPUP_CONFIG = {
     no_profile: { message: '車両プロファイルを選択してください',     actionLabel: 'プロファイルへ',       nav: 'profiles' },
     no_calib:   { message: 'キャリブレーションデータがありません',   actionLabel: 'キャリブレーションへ', nav: 'calibration' },
-    no_mode:    { message: '走行モードを選択してください',           actionLabel: '走行モードへ',         nav: 'modes' },
+    no_mode:    { message: '走行モードまたはタイムスケジュールを選択してください', actionLabel: '走行モードへ', nav: 'modes' },
   };
 
   const cfg = popup ? POPUP_CONFIG[popup] : null;
 
   return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-      <DriveMonitorScreen showPause={true} screenTitle="自動走行モニター"
-        driveStartPath="/api/v1/drive/start"
-        driveStartBody={activeModeId ? { mode_id: activeModeId } : null}
-        driveArmPath="/api/v1/drive/arm"
-        driveCancelPath="/api/v1/drive/cancel"
-        confirmStartMessage="走行前チェックに合格しました。自動走行を開始しますか？" />
+      {isSchedule ? (
+        <DriveMonitorScreen showPause={false} showModeAxis={false} modeRowLabel="スケジュール" screenTitle="自動走行モニター"
+          driveStartPath="/api/v1/drive/schedule/start"
+          driveStartBody={activeModeId ? { schedule_id: activeModeId } : null}
+          driveStopPath="/api/v1/drive/schedule/stop"
+          confirmStartMessage="開始しますか？" />
+      ) : (
+        <DriveMonitorScreen showPause={true} screenTitle="自動走行モニター"
+          driveStartPath="/api/v1/drive/start"
+          driveStartBody={activeModeId ? { mode_id: activeModeId } : null}
+          driveStopPath="/api/v1/drive/stop"
+          driveArmPath="/api/v1/drive/arm"
+          driveCancelPath="/api/v1/drive/cancel"
+          confirmStartMessage="開始しますか？" />
+      )}
       {cfg && (
         <ValidationPopup
           message={cfg.message}

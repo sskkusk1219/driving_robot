@@ -61,7 +61,6 @@ def _row_to_schedule(row: asyncpg.Record) -> TimeSchedule:
             for e in button_raw
         ],
         total_duration=row["total_duration"],
-        loop=row["loop"],
         created_at=row["created_at"],
     )
 
@@ -98,8 +97,8 @@ class ScheduleRepository:
                     """
                     INSERT INTO time_schedules
                         (id, name, description, pedal_points, button_events,
-                         total_duration, loop, created_at)
-                    VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8)
+                         total_duration, created_at)
+                    VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
                     """,
                     uuid.UUID(schedule_id),
                     schedule.name,
@@ -107,7 +106,6 @@ class ScheduleRepository:
                     _pedal_points_to_json(schedule.pedal_points),
                     _button_events_to_json(schedule.button_events),
                     schedule.total_duration,
-                    schedule.loop,
                     schedule.created_at,
                 )
             except asyncpg.UniqueViolationError as e:
@@ -121,7 +119,6 @@ class ScheduleRepository:
             pedal_points=schedule.pedal_points,
             button_events=schedule.button_events,
             total_duration=schedule.total_duration,
-            loop=schedule.loop,
             created_at=schedule.created_at,
         )
 
@@ -133,15 +130,14 @@ class ScheduleRepository:
                     """
                     UPDATE time_schedules
                     SET name = $1, description = $2, pedal_points = $3::jsonb,
-                        button_events = $4::jsonb, total_duration = $5, loop = $6
-                    WHERE id = $7
+                        button_events = $4::jsonb, total_duration = $5
+                    WHERE id = $6
                     """,
                     schedule.name,
                     schedule.description,
                     _pedal_points_to_json(schedule.pedal_points),
                     _button_events_to_json(schedule.button_events),
                     schedule.total_duration,
-                    schedule.loop,
                     uuid.UUID(schedule.id),
                 )
             except asyncpg.UniqueViolationError as e:

@@ -13,15 +13,22 @@ from src.models.profile import VehicleProfile
 CREEP_RELEASE_STEPS: int = 5  # 停車保持→0 へブレーキを緩める段数
 HOLD_DURATION_S: float = 3.0  # 各パターンの最大保持時間（プラトー/上限未達時の打ち切り）
 
+# アクセル不感帯プローブ（ACCEL_DEADBAND_PROBE）: 不感帯が疑われる低開度域を無ランプで
+# 昇順に一定時間保持し、開度→応答（加速度）曲線からアクセル不感帯を推定するサンプルを採る
+# （model_training.estimate_dynamics_params が消費する）。
+ACCEL_DEADBAND_PROBE_PCTS: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0, 5.0)
+ACCEL_DEADBAND_PROBE_HOLD_S: float = 3.0
+
 # 全車速域 加速スイープ（ACCEL_SWEEP）: max_accel_opening に対する割合で数段振る。
-# 低開度は低速プラトー、高開度は cap（0.9×max_speed）到達まで加速し、速度全域 × 加速率を採取する。
+# 低開度は低速プラトー、高開度は cap（0.98×max_speed）到達まで加速し、速度全域 × 加速率を採取する。
 ACCEL_SWEEP_FRACS: tuple[float, ...] = (0.3, 0.5, 0.7, 1.0)
 # ACCEL_SWEEP 後に停車へ戻すリセットブレーキ開度（中庸＝過G にならず素早く停車）
 ACCEL_SWEEP_RESET_BRAKE_PCT: float = 30.0
 
 # 定常ブレーキ計測（BRAKE_HOLD）: 高速まで上げてから保持するブレーキ開度を数段スイープ。
-BRAKE_HOLD_OPENINGS_PCT: tuple[float, ...] = (10.0, 20.0, 30.0, 40.0)
-# BRAKE_HOLD で cap まで上げる加速開度（ガバナで 0.9×上限G に収束。確実に cap へ届く高開度）
+# 低開度4段（1/2/3/5%）はブレーキ不感帯推定用のプローブを兼ねる。
+BRAKE_HOLD_OPENINGS_PCT: tuple[float, ...] = (1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 40.0)
+# BRAKE_HOLD で cap まで上げる加速開度（ガバナで 0.98×上限G に収束。確実に cap へ届く高開度）
 BRAKE_HOLD_ACCEL_PCT: float = 70.0
 
 COAST_DOWN_COUNT: int = 3  # 専用コーストダウン本数（速度全域の減速カーブ計測）
@@ -36,6 +43,8 @@ class LearningDataError(Exception):
 class LearningDriveConfig:
     creep_release_steps: int = field(default=CREEP_RELEASE_STEPS)
     hold_duration_s: float = field(default=HOLD_DURATION_S)
+    accel_deadband_probe_pcts: tuple[float, ...] = field(default=ACCEL_DEADBAND_PROBE_PCTS)
+    accel_deadband_probe_hold_s: float = field(default=ACCEL_DEADBAND_PROBE_HOLD_S)
     accel_sweep_fracs: tuple[float, ...] = field(default=ACCEL_SWEEP_FRACS)
     accel_sweep_reset_brake_pct: float = field(default=ACCEL_SWEEP_RESET_BRAKE_PCT)
     brake_hold_openings_pct: tuple[float, ...] = field(default=BRAKE_HOLD_OPENINGS_PCT)
@@ -58,12 +67,15 @@ class LearningDriveManager:
         構成（連続軌跡として LearningLoop が順に実行する）:
           1. クリープ解放: 停車保持ブレーキ（`stop_brake_opening_pct`）から段階的にブレーキを緩める
           2. クリープ安定待ち: accel=brake=0 で車速が安定するまで待機（クリープ車速・加速率を計測）
-          3. 全車速域 加速スイープ（ACCEL_SWEEP）数段: 固定アクセル開度で 0→0.9×max_speed（cap）
+          3. アクセル不感帯プローブ（ACCEL_DEADBAND_PROBE）数段: 低いアクセル開度を無ランプ・
+             昇順で数秒ずつ保持し、開度→応答曲線からアクセル不感帯を推定するサンプルを採る
+             （`estimate_dynamics_params` が消費する）。
+          4. 全車速域 加速スイープ（ACCEL_SWEEP）数段: 固定アクセル開度で 0→0.98×max_speed（cap）
              まで加速し、速度全域 × 異なる加速率の加速サンプルを採る。各段は cap 到達/タイムアウト
              後にブレーキで停車へ戻し、次段の起点を 0 に揃える（「踏む→戻す→低速キープ」を解消）。
-          4. 定常ブレーキ計測（BRAKE_HOLD）数段: 高速（cap）まで加速→固定ブレーキ開度を一定保持して
-             定常減速を記録する（加速側プラトー保持と対称）。ブレーキ開度を数段スイープする。
-          5. コーストダウン（COAST_DOWN）数本: アクセルで加速→ブレーキ無しで低速まで惰行し、
+          5. 定常ブレーキ計測（BRAKE_HOLD）数段: 高速（cap）まで加速→固定ブレーキ開度を一定保持して
+             定常減速を記録する（加速側プラトー保持と対称）。低開度4段はブレーキ不感帯推定を兼ねる。
+          6. コーストダウン（COAST_DOWN）数本: アクセルで加速→ブレーキ無しで低速まで惰行し、
              エンジンブレーキ＋走行抵抗の減速率を速度全域で計測する
 
         いずれも車両プロファイルの最大開度を超えないようにスケール・クランプする。
@@ -96,7 +108,21 @@ class LearningDriveManager:
             )
         )
 
-        # 3. 全車速域 加速スイープ（固定開度で cap まで加速 → リセットブレーキで停車復帰）
+        # 3. アクセル不感帯プローブ（低開度を無ランプ・昇順で数秒ずつ保持）
+        for pct in self._config.accel_deadband_probe_pcts:
+            accel = min(max(pct, 0.0), profile.max_accel_opening)
+            if accel <= 0.0:
+                continue
+            patterns.append(
+                LearningPattern(
+                    kind=PatternKind.ACCEL_DEADBAND_PROBE,
+                    accel_opening=accel,
+                    brake_opening=0.0,
+                    hold_duration_s=self._config.accel_deadband_probe_hold_s,
+                )
+            )
+
+        # 4. 全車速域 加速スイープ（固定開度で cap まで加速 → リセットブレーキで停車復帰）
         reset_brake = min(self._config.accel_sweep_reset_brake_pct, profile.max_brake_opening)
         for frac in self._config.accel_sweep_fracs:
             accel = min(max(frac, 0.0) * profile.max_accel_opening, profile.max_accel_opening)
@@ -111,7 +137,7 @@ class LearningDriveManager:
                 )
             )
 
-        # 4. 定常ブレーキ計測（cap まで加速 → 固定ブレーキ開度を一定保持して定常減速を記録）
+        # 5. 定常ブレーキ計測（cap まで加速 → 固定ブレーキ開度を一定保持して定常減速を記録）
         brake_accel = min(self._config.brake_hold_accel_pct, profile.max_accel_opening)
         if brake_accel > 0.0:
             for brake_pct in self._config.brake_hold_openings_pct:
@@ -127,7 +153,7 @@ class LearningDriveManager:
                     )
                 )
 
-        # 5. コーストダウン（高速まで加速→ブレーキ無しで惰行。減速率 vs 速度の全域カーブ）
+        # 6. コーストダウン（高速まで加速→ブレーキ無しで惰行。減速率 vs 速度の全域カーブ）
         coast_accel = min(self._config.coast_down_accel_pct, profile.max_accel_opening)
         if coast_accel > 0.0:
             for _ in range(max(self._config.coast_down_count, 0)):

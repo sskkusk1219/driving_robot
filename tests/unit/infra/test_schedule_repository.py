@@ -25,7 +25,6 @@ def _make_schedule(name: str = "sched", sid: str = "s1") -> TimeSchedule:
         pedal_points=[PedalPoint(0.0, 0.0, 0.0), PedalPoint(5.0, 40.0, 0.0)],
         button_events=[ButtonEvent(0.5, 0, 1.0)],
         total_duration=5.0,
-        loop=False,
         created_at=datetime.now(tz=UTC),
     )
 
@@ -94,7 +93,6 @@ def test_row_to_schedule_roundtrip() -> None:
         "pedal_points": _pedal_points_to_json(s.pedal_points),
         "button_events": _button_events_to_json(s.button_events),
         "total_duration": s.total_duration,
-        "loop": s.loop,
         "created_at": s.created_at,
     }
     restored = _row_to_schedule(row)

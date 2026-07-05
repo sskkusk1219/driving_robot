@@ -6,6 +6,7 @@
   pytest tests/integration/ -v -s -m integration
 """
 
+import json
 import os
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
@@ -54,6 +55,7 @@ async def db_conn() -> AsyncGenerator[asyncpg.Connection]:  # type: ignore[type-
         DUMMY_PROFILE_ID,
     )
     await conn.execute("DELETE FROM drive_sessions WHERE profile_id = $1", DUMMY_PROFILE_ID)
+    await conn.execute("DELETE FROM learning_cycles WHERE profile_id = $1", DUMMY_PROFILE_ID)
     await conn.execute("DELETE FROM vehicle_profiles WHERE id = $1", DUMMY_PROFILE_ID)
     await conn.close()
 
@@ -143,3 +145,68 @@ async def test_emergency_stop_sets_emergency_status(db_conn: asyncpg.Connection)
     row = await db_conn.fetchrow("SELECT status FROM drive_sessions WHERE id = $1", session_id)
     assert row is not None
     assert row["status"] == "emergency"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_start_session_persists_cycle_id(db_conn: asyncpg.Connection) -> None:
+    """start_session に cycle_id を渡すと drive_sessions.cycle_id に永続化されること。"""
+    writer = LogWriter(db_conn)
+    cycle_id = await writer.start_cycle(profile_id=DUMMY_PROFILE_ID)
+
+    session_id = await writer.start_session(
+        profile_id=DUMMY_PROFILE_ID,
+        mode_id=None,
+        run_type="tuning",
+        cycle_id=cycle_id,
+    )
+
+    row = await db_conn.fetchrow("SELECT * FROM drive_sessions WHERE id = $1", session_id)
+    assert row is not None
+    assert str(row["cycle_id"]) == cycle_id
+    assert row["run_type"] == "tuning"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_start_cycle_inserts_running_row(db_conn: asyncpg.Connection) -> None:
+    """start_cycle が learning_cycles に status='running' で INSERT すること。"""
+    writer = LogWriter(db_conn)
+
+    cycle_id = await writer.start_cycle(profile_id=DUMMY_PROFILE_ID)
+
+    row = await db_conn.fetchrow("SELECT * FROM learning_cycles WHERE id = $1", cycle_id)
+    assert row is not None
+    assert row["status"] == "running"
+    assert row["ended_at"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_end_cycle_updates_status_and_detail(db_conn: asyncpg.Connection) -> None:
+    """end_cycle が status/ended_at/detail を UPDATE すること。"""
+    writer = LogWriter(db_conn)
+    cycle_id = await writer.start_cycle(profile_id=DUMMY_PROFILE_ID)
+
+    await writer.end_cycle(cycle_id, "completed", detail={"stage1_gains": {"kp": 1.0}})
+
+    row = await db_conn.fetchrow("SELECT * FROM learning_cycles WHERE id = $1", cycle_id)
+    assert row is not None
+    assert row["status"] == "completed"
+    assert row["ended_at"] is not None
+    assert json.loads(row["detail"]) == {"stage1_gains": {"kp": 1.0}}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_reap_closes_orphan_running_cycle(db_conn: asyncpg.Connection) -> None:
+    """reap_interrupted_sessions が status='running' の孤児サイクルを 'error' で閉じること。"""
+    writer = LogWriter(db_conn)
+    cycle_id = await writer.start_cycle(profile_id=DUMMY_PROFILE_ID)
+
+    await writer.reap_interrupted_sessions()
+
+    row = await db_conn.fetchrow("SELECT * FROM learning_cycles WHERE id = $1", cycle_id)
+    assert row is not None
+    assert row["status"] == "error"
+    assert row["ended_at"] is not None

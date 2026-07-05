@@ -40,7 +40,7 @@ class _Phase(Enum):
     """パターン実行の内部サブフェーズ。"""
 
     MEASURE = auto()  # CREEP / CREEP_SETTLE 用: 固定開度を適用して計測
-    DRIVE_ACCEL = auto()  # 前半: アクセルをランプで踏み込み cap（0.9×max_speed）到達まで加速
+    DRIVE_ACCEL = auto()  # 前半: アクセルをランプで踏み込み cap（0.98×max_speed）到達まで加速
     COAST = auto()  # 中間: accel=brake=0 で惰行（エンジンブレーキ＋走行抵抗の減速率を計測）
     DRIVE_BRAKE = auto()  # 後半: アクセル解放しブレーキをランプで踏み込み減速・停車
     BRAKE_HOLD = auto()  # 定常ブレーキ: 固定ブレーキ開度をランプ後一定保持して定常減速を記録
@@ -69,12 +69,12 @@ class LearningLoopConfig:
     # - 加速/減速G が `max_decel_g × g_limit_frac` 超で開度の踏み増しを止め、超過継続なら下げる
     # - 加速は `max_speed × accel_speed_cap_frac` で打ち切り（max_speed 手前で終了）
     g_smoothing_window_s: float = field(default=0.4)
-    g_limit_frac: float = field(default=0.9)
+    g_limit_frac: float = field(default=0.98)
     gov_reduce_step_pct: float = field(default=2.0)
-    accel_speed_cap_frac: float = field(default=0.9)
+    accel_speed_cap_frac: float = field(default=0.98)
     # 加速区間は cap（max_speed×accel_speed_cap_frac）到達を主離脱条件にする。低開度が cap 未満で
     # 頭打ちした場合や、実車の加速がガバナ上限Gより緩い場合の予算上限として timeout を設ける。
-    # 高開度（ガバナ加速 0.9×max_decel_g）で cap 到達に要する時間＋十分なマージンを見込む。
+    # 高開度（ガバナ加速 0.98×max_decel_g）で cap 到達に要する時間＋十分なマージンを見込む。
     accel_full_range_timeout_s: float = field(default=20.0)
     # コースト（惰行）: COAST_DOWN が coast_down_stop_speed_kmh まで惰行（速度全域の減速カーブ）。
     # timeout でも前進する（予算上限）。
@@ -83,10 +83,10 @@ class LearningLoopConfig:
     # クリープ安定待ち（accel=brake=0）: 車速が安定する＝|実測加速度| が tol 未満を
     # stable_duration 継続したら確定。最低 min_s は待ってから判定し、timeout で打ち切る。
     # クリープが出ず 0km/h のままでも「安定（|加速度|≈0）」として min_s 後に次へ進む。
-    creep_settle_min_s: float = field(default=3.0)
+    creep_settle_min_s: float = field(default=13.0)
     creep_settle_stable_tol_kmhs: float = field(default=0.3)
     creep_settle_stable_duration_s: float = field(default=2.0)
-    creep_settle_timeout_s: float = field(default=15.0)
+    creep_settle_timeout_s: float = field(default=25.0)
 
 
 class ActuatorDriverProtocol(Protocol):

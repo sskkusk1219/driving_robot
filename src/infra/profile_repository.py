@@ -13,7 +13,13 @@ import asyncpg
 
 from src.infra.db import DuplicateNameError
 from src.models.calibration import CalibrationData
-from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
+from src.models.profile import (
+    DynamicsParams,
+    FeedforwardParams,
+    PIDGains,
+    StopConfig,
+    VehicleProfile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,24 @@ def _ffp_to_json(ffp: FeedforwardParams) -> str:
     return json.dumps({f.name: getattr(ffp, f.name) for f in fields(FeedforwardParams)})
 
 
+def _dyn_from_value(value: object) -> DynamicsParams:
+    """JSONB 値（str/dict/None）を DynamicsParams に変換する。欠損キーはデフォルト。"""
+    data: dict[str, Any]
+    if isinstance(value, str):
+        data = json.loads(value)
+    elif isinstance(value, dict):
+        data = value
+    else:
+        return DynamicsParams()
+    defaults = DynamicsParams()
+    kwargs = {f.name: data.get(f.name, getattr(defaults, f.name)) for f in fields(DynamicsParams)}
+    return DynamicsParams(**kwargs)
+
+
+def _dyn_to_json(dyn: DynamicsParams) -> str:
+    return json.dumps({f.name: getattr(dyn, f.name) for f in fields(DynamicsParams)})
+
+
 def _row_to_profile(row: asyncpg.Record) -> VehicleProfile:
     pid = json.loads(row["pid_gains"])
     stop = json.loads(row["stop_config"])
@@ -59,6 +83,7 @@ def _row_to_profile(row: asyncpg.Record) -> VehicleProfile:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         feedforward_params=_ffp_from_value(row["feedforward_params"]),
+        dynamics_params=_dyn_from_value(row["dynamics_params"]),
     )
 
 
@@ -118,6 +143,7 @@ class ProfileRepository:
             }
         )
         ffp_json = _ffp_to_json(profile.feedforward_params)
+        dyn_json = _dyn_to_json(profile.dynamics_params)
         async with self._pool.acquire() as conn:
             try:
                 await conn.execute(
@@ -125,8 +151,9 @@ class ProfileRepository:
                     INSERT INTO vehicle_profiles
                         (id, name, max_accel_opening, max_brake_opening, max_speed,
                          max_decel_g, pid_gains, stop_config, model_path,
-                         feedforward_params, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10::jsonb, $11, $12)
+                         feedforward_params, dynamics_params, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10::jsonb,
+                            $11::jsonb, $12, $13)
                     """,
                     uuid.UUID(profile_id),
                     profile.name,
@@ -138,6 +165,7 @@ class ProfileRepository:
                     stop_json,
                     profile.model_path,
                     ffp_json,
+                    dyn_json,
                     now,
                     now,
                 )
@@ -159,6 +187,7 @@ class ProfileRepository:
             created_at=now,
             updated_at=now,
             feedforward_params=profile.feedforward_params,
+            dynamics_params=profile.dynamics_params,
         )
         return created
 
@@ -175,6 +204,7 @@ class ProfileRepository:
             }
         )
         ffp_json = _ffp_to_json(profile.feedforward_params)
+        dyn_json = _dyn_to_json(profile.dynamics_params)
         async with self._pool.acquire() as conn:
             result = await conn.execute(
                 """
@@ -188,7 +218,8 @@ class ProfileRepository:
                     stop_config = $8::jsonb,
                     model_path = $9,
                     feedforward_params = $10::jsonb,
-                    updated_at = $11
+                    dynamics_params = $11::jsonb,
+                    updated_at = $12
                 WHERE id = $1
                 """,
                 uuid.UUID(profile.id),
@@ -201,6 +232,7 @@ class ProfileRepository:
                 stop_json,
                 profile.model_path,
                 ffp_json,
+                dyn_json,
                 now,
             )
         if str(result) == "UPDATE 0":
@@ -219,6 +251,7 @@ class ProfileRepository:
             created_at=profile.created_at,
             updated_at=now,
             feedforward_params=profile.feedforward_params,
+            dynamics_params=profile.dynamics_params,
         )
 
     async def delete(self, profile_id: str) -> bool:

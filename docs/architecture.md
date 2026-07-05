@@ -157,6 +157,10 @@ CREATE INDEX idx_drive_sessions_started_at
 -- 3ヶ月アーカイブ対象の特定
 CREATE INDEX idx_drive_sessions_ended_at
     ON drive_sessions (ended_at ASC);
+
+-- 学習サイクル配下セッションの取得（学習サイクル・オーケストレータ、20260703-learning-process-revamp）
+CREATE INDEX idx_drive_sessions_cycle_id
+    ON drive_sessions (cycle_id);
 ```
 
 ---
@@ -172,6 +176,8 @@ driving_robot/
 │   │   └── static/           # フロントエンド (HTML/JS/CSS)
 │   ├── app/                  # アプリケーションレイヤー
 │   │   ├── robot_controller.py
+│   │   ├── training_service.py    # 運転モデル学習+PID自動適合（ルーターから抽出）
+│   │   ├── learning_cycle.py      # 学習サイクル・オーケストレータ（2段階学習フロー）
 │   │   └── session_manager.py
 │   ├── domain/               # ドメインレイヤー
 │   │   ├── control/
@@ -210,6 +216,7 @@ driving_robot/
 │   └── hardware/             # 実機テスト（手動実行）
 ├── scripts/
 │   ├── setup_db.py           # DB初期化
+│   ├── evaluate_feature_sets.py  # FeatureSpec候補セットのオフライン評価（読み取り専用）
 │   ├── setup_env.sh          # 仮想環境・依存関係セットアップ
 │   └── start.sh              # システム起動スクリプト
 └── docs/
@@ -279,6 +286,10 @@ Raspberry Pi 5 (16GB)
 │                      物理ピン3/5。PCA9685 の V+ は外部5V電源から給電（本体ロジック電源と分離）
 │                      ch0:エンジンスタート, ch1-3:シフトP/N/D, ch4-15:オプション1-12
 │
+├── GPIO22 (OUT)   →  PCA9685 OE端子  ← 物理ピン15、負論理（LOW=出力有効／HIGH=出力無効）
+│                      非常停止時にソフトウェア経由（release_all）と並行してハード的に
+│                      全16chのPWM出力を即遮断する冗長系。通常時はLOWを維持
+│
 ├── GPIO17 (IN)    →  非常停止スイッチ #1 (シャシダイナモ室)  ← 物理ピン11、NC接点、プルアップ、HIGH=停止（RISING検知）
 │                   →  非常停止スイッチ #2 (操作エリア)  ← 並列接続
 │                      LOW=通常（NC接点閉→GND）、HIGH=停止（NC接点開→プルアップ有効、断線時も停止）
@@ -292,6 +303,8 @@ Raspberry Pi 5 (16GB)
 
 > **ボタンサーボの電源分離**: SG90 ×16 の突入・保持電流は Raspberry Pi 本体ロジック電源とは分離した外部5V電源から PCA9685 の V+ 端子に供給する。信号線（I2C）と電源のGNDは共通に接続する。
 
+> **ボタンサーボのハードウェア非常停止（OE）**: 非常停止はGPIO17割り込み→ソフトウェア経由（`ButtonServoDriver.release_all()`）が主系統だが、ソフトウェアが正常動作していることが前提となる。PCA9685 の `OE` 端子を GPIO22 に接続し、非常停止トリガ時にソフト処理と並行して GPIO22 を HIGH にすることで、I2C通信やソフト処理を待たずにハードウェアレベルで全16chのPWM出力を即座に遮断できる（ソフトフリーズ時の最終防衛線）。PCA9685 の `VCC`（ロジック電源）は Pi の3.3Vを使用するためOEのしきい値も3.3V系と一致し、レベルシフタなしでGPIO22に直結できる。基板のOE内蔵プルダウン仕様によっては起動直後の既定状態（有効/無効）が変わるため、使用する基板のデータシートで確認すること。
+
 ### Modbus RTU 通信設定
 
 | 項目 | 値 |
@@ -300,8 +313,25 @@ Raspberry Pi 5 (16GB)
 | データビット | 8 |
 | パリティ | なし |
 | ストップビット | 1 |
-| アクセル SLAVE_ID | 1（ttyUSB0） |
-| ブレーキ SLAVE_ID | 1（ttyUSB1）※各軸が独立した RS-485 バスのため両軸とも 1 |
+| アクセル SLAVE_ID | 1（`/dev/actuator_accel`） |
+| ブレーキ SLAVE_ID | 1（`/dev/actuator_brake`）※各軸が独立した RS-485 バスのため両軸とも 1 |
+
+> **ポートの固定**: `/dev/actuator_accel` / `/dev/actuator_brake` は `scripts/setup_udev.sh`
+> が FTDI シリアル番号で固定した安定シンボリックリンク（`/dev/ttyUSBn` は USB 再列挙の
+> たびに番号が変わりうるため直接参照しない）。**NUT（UPS監視）など他プロセスの設定
+> （`/etc/nut/ups.conf` 等）も `/dev/ttyUSBn` ではなく `/dev/serial/by-id/` の安定パスを
+> 使うこと**。2026-07-03、NUT が `/dev/ttyUSB2` を固定指定していたため USB 再列挙後に
+> ブレーキ用アダプタと衝突し、走行前チェック（UPS残量）が失敗する障害が発生した
+> （`.steering/20260620-modbus-retry-cycle-stall`）。
+
+> **制御ループ中のブレーキ軸タイミング**: ブレーキ軸は `move_to_position`（書込）直後に
+> `read_current`（読取）を送ると、初回応答が高頻度で欠落し pymodbus の再送
+> （`retries=3`、実測 ~0.3s/回）が毎サイクル発生してストールする問題があった
+> （accel 軸では再現しない、brake 軸固有の RS-485/スレーブ側タイミング要因と推定）。
+> `timeout` を伸ばしても実測 elapsed が timeout 値に比例してスライドするだけで
+> 無効だったため、`DriveLoop._drive_brake_axis` で書込→読取間に
+> `BRAKE_PRE_READ_DELAY_S`（10ms）の待機を挿入して解消した。詳細・実測値は
+> `.steering/20260620-modbus-retry-cycle-stall/tasklist.md` フェーズ3参照。
 
 ### I2C / ボタンサーボ設定（Post-MVP）
 
@@ -314,6 +344,7 @@ Raspberry Pi 5 (16GB)
 | サーボ角度 | 待機／押下の2ポジション。全チャンネル共通のグローバル設定（`config/settings.toml` `[servo]`） |
 | 押下時間 | ボタンごとにタイムスケジュールで可変（例: エンジンスタート1.0s、シフト0.5s） |
 | 電源 | 外部5V（PCA9685 V+）。本体ロジック電源と分離、GNDは共通 |
+| OE（出力イネーブル） | GPIO22（物理ピン15）に接続。負論理（LOW=有効／HIGH=無効）。非常停止時のハードウェア冗長遮断に使用 |
 
 ### CAN 通信・配線設定
 
@@ -382,20 +413,39 @@ Raspberry Pi 5 (16GB)
 - **PID自動適合の同定/同調則**: `pid_tuning.py` は純粋ロジック（FOPDT同定・SIMC・コスト・座標降下）を
   ハードから分離。同定則（例: ブレーキ側独立同定）や同調則（例: Lambda/ZN）の差し替え・拡張が容易
 
-#### PID自動適合の制御フロー（学習運転フロー内）
+#### PID自動適合の制御フロー（手動パス・個別API）
 
 ```
 学習運転(開ループ) → /learning/train
-   ├─ train_inverse_model        … 多項式Ridge 逆FFモデル（model_path）
+   ├─ train_inverse_model        … 多項式Ridge 逆FFモデル（model_path、feature_spec を pkl に保存）
    ├─ estimate_dynamics_params   … クリープ等の物理定数
    └─ identify_fopdt → compute_pid_gains_simc … PID初期値（profile.pid_gains）
         ↓ refresh_active_profile（制御スタックへ反映）
-/pid-tune/refine（規定パターン走行・最大15回）
+/pid-tune/refine（規定パターン走行・max_runs 指定）
    build_tuning_trajectory（上限G/最高車速厳守）→ start_auto_drive（既存安全経路）
    → KPIMonitor.summary → tuning_cost → CoordinateDescentTuner（座標降下）
    → 最良ゲイン保存・反映
 ```
 > 新規の制御/プラントコードは追加せず、既存の自動走行経路（走行前チェック・非常停止・KPI集計）を再利用。
+> `train_and_apply`（training_service.py）が `/learning/train` の実処理を担い、`LearningCycleOrchestrator`
+> と共有する（下記）。
+
+#### 学習サイクル・オーケストレーション（LearningCycleOrchestrator、20260703-learning-process-revamp）
+
+上記の手動パスを2段階に拡張し、WebUI 1操作（`POST /learning-cycle/start`）で自動進行させる
+（`src/app/learning_cycle.py`）。学習運転→訓練→PID適合(10回)→**サイクル全ログで再学習**
+（ゲイン上書きなし）→PID適合(5回、1段目ゲインから継続)。フェーズ間は停車保持ブレーキを
+維持し続け（`run_pid_tuning_session(release_on_finish=False)`）、2段目完了または
+中断・エラー時にのみ原点復帰で解放する。進捗（フェーズ・走行回数・最良コスト）は
+既存の100ms WebSocket `broadcast_loop` が `orchestrator.progress` を pull 配信する
+（新規イベントバスは作らない）。学習運転〜適合走行は `learning_cycles` テーブル・
+`drive_sessions.cycle_id` で1サイクルとして紐付けられ、ログ画面で1項目に集約表示される。
+
+> **2段階再学習の裏付け（2026-07-03 オフライン評価）**: 実ログ評価で、逆モデルの holdout 精度は
+> 特徴量構成の選択（±5%程度）より訓練データ量（学習セッション1→4本で-16%）の影響が支配的で、
+> 精度の主なボトルネックは開ループ学習データと閉ループ配備データの分布ギャップ（holdout R²が
+> 負〜0.2）であることを確認した。サイクル全ログ（学習+閉ループ適合走行）での再学習はこのギャップを
+> 直接埋める設計であり、特徴量チューニングより優先する。
 
 ---
 

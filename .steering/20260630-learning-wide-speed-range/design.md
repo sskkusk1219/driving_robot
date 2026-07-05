@@ -176,3 +176,103 @@ tests/unit/test_learning_drive.py       # 生成パターン/フェーズ遷移
 
 - BRAKE_HOLD の段数・速度帯は config 化し、車両ごとに調整可能にする。
 - 機能4 のモデル改修は学習データ品質が十分になってから（過剰適合回避）。
+
+---
+
+# フェーズ6-3: 推定器を poly2 Ridge に復帰（GBM の閉ループ破綻対応・2026-07-02）
+
+## 背景（実走行での破綻）
+
+フェーズ6-2 で推定器を単調制約付き HistGradientBoosting＋過去Δv 9特徴に変更し、in-sample で
+MAE≤0.5 / RMSE≤1.0 / R²≥0.8 を達成した（学習モデル `…_20260701_224556.pkl`）。しかし実走行モード
+**06_WLTP_ExHi**（auto session `4c88b2dd`, 2026-07-02 07:59 JST）で追従が破綻:
+
+- 追従偏差 MAE **18.3km/h**・最大 **36.8km/h**。ref 最大 74km/h の区間で実車速 **105.8km/h** まで過加速。
+- 直前の走行（22:58 UTC）は emergency 終了。
+
+## 原因分析（読み取り専用・確定）
+
+学習セッション `b23a2fd1`（このモデルの学習元）と WLTP-ExHi 基準軌跡でオフライン検証した結果:
+
+**1. GBM は巡航域（dv=0）で速度によらず一定値を返す**
+
+| v0 [km/h] | GBM 予測 | poly2 予測 | 妥当値の目安 |
+|---|---|---|---|
+| 40 | 7.3% | 7.4% | ~7% |
+| 60 | **7.3%** | 10.9% | ~11-12% |
+| 80 | **7.3%** | 12.7% | ~13% |
+| 100 | **7.3%** | 10.5% | ~14% |
+
+木モデルは学習データに無い特徴領域（off-manifold）で**定数に飽和**する。巡航で開度不足→失速、
+ランプでは 18〜23% と過大→過加速。この交互で「まともに走らない」挙動になる。
+
+**2. 根本: 学習パターンに定常巡航サンプルがほぼ無い**
+
+ACCEL_SWEEP は「cap まで加速→即リセットブレーキ」のため、|dv|<0.6 かつアクセル踏みの標本が
+各速度帯 n≤5。巡航は**両モデルとも外挿**だが、poly Ridge は滑らかに補間して実用値を返し、GBM は
+破綻する。**in-sample/CV が良くても走行モード軌跡は学習パターンと別分布**であり、CV は同一軌跡
+ファミリー内のシャッフルなので off-manifold 性能を測れない（重要な学び）。
+
+**3. 補足**: プロファイルは max_speed=140 / max_decel_g=0.4 に変更されており、学習セッションの
+133.9km/h は正当（cap=0.9×140=126 の範囲内挙動）。speed_clip_max=133.9 も正常。
+
+## 決定（ユーザー確認済み）
+
+**Ridge 復帰のみ（最小変更）**。以下は推定器と独立の改善なので**維持**する:
+- 過去Δv 9特徴（`PAST_HORIZONS_S`・`build_feature_row`/`_build_feature_matrix`/`predict_effort` の
+  past_speeds・drive_loop の past_speeds 構築）
+- 最新学習セッションのみで学習（`latest_learning_session_id`）
+- `speed_clip_max` 入力クリップ（v0>cm は軌跡平行移動で dv 保持）
+
+巡航データ追加（学習パターンへの巡航保持追加）は今回**スコープ外**（将来課題として記録）。
+
+## 実装設計（フェーズ6-3）
+
+### 1. `src/domain/model_training.py`
+- `_make_estimator()` を poly2 Pipeline に復帰:
+  `make_pipeline(PolynomialFeatures(2, include_bias=False), StandardScaler(), Ridge(alpha=1.0))`。
+  `dv_monotonic` 引数を削除（呼び出し側 2箇所も引数なしに）。
+- import: `sklearn.ensemble.HistGradientBoostingRegressor` を削除し、
+  `sklearn.pipeline.Pipeline, make_pipeline` / `sklearn.preprocessing.PolynomialFeatures,
+  StandardScaler` / `sklearn.linear_model.Ridge` を復活。`_metrics` の型注釈は `Pipeline` に。
+- `MODEL_TYPE = "poly_past_inverse_lookahead"` に変更。**"poly_inverse_lookahead"（旧7特徴）と
+  "gbm_inverse_lookahead" の両方を弾いて再学習を強制する**ための新識別子（旧 pkl をロードすると
+  9特徴入力で predict が壊れるため、識別子で確実に拒否する）。
+- モジュール docstring・コメントを poly 表現に戻す。GBM は off-manifold（巡航域のデータ欠如）で
+  閉ループ破綻したため不採用、の旨をコメントで残す（再発防止）。
+- **9特徴・PAST_HORIZONS_S・speed_clip_max・payload 構成（past_horizons キー含む）は変更しない。**
+
+### 2. `src/domain/control/feedforward.py`
+- docstring のみ更新（HistGradientBoostingRegressor → Pipeline（多項式＋標準化＋Ridge））。
+  ロジック変更なし（`_Regressor` Protocol は `.predict()` のみ要求するのでそのまま動く）。
+
+### 3. テスト
+- `tests/unit/test_model_training.py`:
+  `test_estimator_is_monotonic_gbm` → `test_estimator_is_polynomial_pipeline` に戻す
+  （`isinstance(model, Pipeline)` かつ `model.steps[0][1]` が `PolynomialFeatures`）。
+  他のテスト（9特徴 build_feature_row・past_horizons payload・speed_clip_max）は変更不要。
+- `tests/unit/test_feedforward.py` / `test_drive_loop.py`: 変更不要（payload 形は同一。
+  `make_model_file` の docstring の "gbm_inverse_lookahead" 文言だけ気になるなら直す）。
+
+### 4. ドキュメント
+- `docs/functional-design.md`（運転モデル構造）: 推定器記述を「完全2次多項式展開＋標準化＋Ridge の
+  Pipeline（9特徴・過去Δv 含む・単調制約なし）」に戻し、model_type を更新。GBM を試して閉ループ
+  破綻した経緯を1〜2行残す。
+- `docs/glossary.md`（運転モデル）・`docs/architecture.md`（GBM 逆モデル/逆FFモデルの記述 2箇所）:
+  同様に poly 表現へ。
+
+### 5. 検証手順
+1. `.venv/bin/pytest -m "not hardware"` / `.venv/bin/ruff check` / `.venv/bin/mypy`（変更ファイル）
+2. オフライン: 最新学習セッションで実 `train_inverse_model` 経路の再学習 → in-sample が poly 水準
+   （加速 MAE≈1.3〜1.5 / R²≈0.93 前後）に戻り、巡航予測（dv=0, past dv=0）が 60〜100km/h で
+   10〜13% の滑らかな曲線になること。
+3. ユーザー: サーバ再起動 → 学習運転1回（新 MODEL_TYPE のため再学習必須。それまで FF 無効=PID のみ）
+   → 06_WLTP_ExHi を実走し追従（偏差・過加速なし）を確認。
+
+## 残課題（次フェーズ候補）
+
+- **巡航データの欠如**（両モデル共通の弱点）: ACCEL_SWEEP に「中間開度の巡航保持」を追加し、
+  (v0, dv≈0) × アクセル開度の定常標本を採る。これで 120km/h 超の巡航予測（現状 poly で ~1% と過小）
+  も改善できる。
+- MAE≤0.5 の精度目標は GBM でしか達成できなかったが、閉ループ追従を優先して poly を採用。
+  巡航データ追加後に GBM を再評価する余地はある（off-manifold の穴が埋まれば飽和問題は緩和）。

@@ -7,13 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import TypeVar
 
 from pymodbus.client import AsyncModbusSerialClient
 from pymodbus.framer import FramerType
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # FC03 読み取りレジスタアドレス（HEX）
 _REG_PNOW_HI = 0x9000  # 現在位置 上位 16bit
@@ -93,14 +97,25 @@ class ActuatorDriver:
         # 以降のトランザクションが永続的に失敗する（desync カスケード）。
         # retries>0 にすると pymodbus がタイムアウト時に recv_buffer をクリアして
         # 再送するため、単発の遅延から自動復旧できる。
+        # timeout=0.3: 実機計測（.steering/20260620-modbus-retry-cycle-stall）で
+        # brake 軸 read_current がほぼ毎サイクル 1 回再送していることを確認したため
+        # timeout=0.35 を試したが、elapsed が timeout 値に比例してスライドするのみで
+        # （0.3→実測0.312〜0.325s、0.35→実測0.363〜0.364s）総ブロック時間は改善しなかった
+        # （112.9s→113.1s でほぼ同一、最大ギャップは 0.715s→0.817s に悪化）。
+        # 初回リクエストへの応答が genuinely 遅いのではなく「初回は応答が来ず（欠落）、
+        # 再送は数十ms で成功する」パターンであり、timeout 調整では解決しないと判明した
+        # ため 0.3s に戻した。詳細は tasklist.md フェーズ3参照。
         timeout: float = 0.3,
         retries: int = 3,
+        # ストール切り分け用ログの軸ラベル（"accel"/"brake"）。未指定時は port を使う。
+        axis_name: str | None = None,
     ) -> None:
         self._port = port
         self._slave_id = slave_id
         self._baud_rate = baud_rate
         self._timeout = timeout
         self._retries = retries
+        self._axis_name = axis_name or port
         self._client: AsyncModbusSerialClient | None = None
         # pymodbus は execute() 内に独自ロックを持つが、ここでは「OS バッファ
         # フラッシュ → トランザクション」を不可分に行うためのロック。フラッシュと
@@ -130,6 +145,54 @@ class ActuatorDriver:
         async with self._bus_lock:
             self._flush_input_buffer()
             yield
+
+    async def _execute(self, op_name: str, call: Callable[[], Awaitable[_T]]) -> _T:
+        """バス排他の下でトランザクションを実行し、所要時間・再送回数を計測する。
+
+        pymodbus は再送が発生すると成功応答オブジェクトに `retries`（実行回数-1）を
+        設定する（`pymodbus.transaction.transaction.TransactionManager.execute`）ため、
+        DEBUG ロガーを上げずとも再送回数を直接取得できる。全再送を使い切って例外に
+        なった場合は「上限（self._retries）まで再送した」とみなしてログする。
+        ストール切り分け（.steering/20260620-modbus-retry-cycle-stall）用の計装。
+        """
+        start = time.perf_counter()
+        try:
+            async with self._bus_op():
+                result = await call()
+        except Exception:
+            elapsed = time.perf_counter() - start
+            logger.warning(
+                "Modbus再送上限到達: axis=%s slave_id=%d op=%s elapsed=%.3fs retries=%d(上限)",
+                self._axis_name,
+                self._slave_id,
+                op_name,
+                elapsed,
+                self._retries,
+            )
+            raise
+        elapsed = time.perf_counter() - start
+        # pymodbus の実応答は int を持つが、テストダブル（MagicMock）は未設定の属性への
+        # アクセスでも子 Mock を自動生成し getattr の default が効かないため、型で弾く。
+        retries_raw = getattr(result, "retries", 0)
+        retries = retries_raw if isinstance(retries_raw, int) else 0
+        if retries > 0:
+            logger.warning(
+                "Modbus再送検知: axis=%s slave_id=%d op=%s elapsed=%.3fs retries=%d",
+                self._axis_name,
+                self._slave_id,
+                op_name,
+                elapsed,
+                retries,
+            )
+        else:
+            logger.debug(
+                "Modbusトランザクション: axis=%s slave_id=%d op=%s elapsed=%.3fs",
+                self._axis_name,
+                self._slave_id,
+                op_name,
+                elapsed,
+            )
+        return result
 
     async def connect(self) -> None:
         """Modbus RTU 接続を確立する。"""
@@ -177,32 +240,42 @@ class ActuatorDriver:
         reset_alarm() / servo_on() より前に呼ぶこと。
         """
         client = self._require_client()
-        async with self._bus_op():
-            await client.write_coil(address=_COIL_PMSL, value=True, device_id=self._slave_id)
+        await self._execute(
+            "write_coil:PMSL",
+            lambda: client.write_coil(address=_COIL_PMSL, value=True, device_id=self._slave_id),
+        )
         logger.debug("enable_modbus_control: slave_id=%d", self._slave_id)
 
     async def reset_alarm(self) -> None:
         """アラームをリセットする（ALRS コイルをエッジ入力）。"""
         client = self._require_client()
-        async with self._bus_op():
-            await client.write_coil(address=_COIL_ALRS, value=True, device_id=self._slave_id)
+        await self._execute(
+            "write_coil:ALRS_on",
+            lambda: client.write_coil(address=_COIL_ALRS, value=True, device_id=self._slave_id),
+        )
         await asyncio.sleep(0.05)
-        async with self._bus_op():
-            await client.write_coil(address=_COIL_ALRS, value=False, device_id=self._slave_id)
+        await self._execute(
+            "write_coil:ALRS_off",
+            lambda: client.write_coil(address=_COIL_ALRS, value=False, device_id=self._slave_id),
+        )
         logger.debug("reset_alarm 完了: slave_id=%d", self._slave_id)
 
     async def servo_on(self) -> None:
         """サーボをONにする。"""
         client = self._require_client()
-        async with self._bus_op():
-            await client.write_coil(address=_COIL_SON, value=True, device_id=self._slave_id)
+        await self._execute(
+            "write_coil:SON_on",
+            lambda: client.write_coil(address=_COIL_SON, value=True, device_id=self._slave_id),
+        )
         logger.debug("servo_on: slave_id=%d", self._slave_id)
 
     async def servo_off(self) -> None:
         """サーボをOFFにする。"""
         client = self._require_client()
-        async with self._bus_op():
-            await client.write_coil(address=_COIL_SON, value=False, device_id=self._slave_id)
+        await self._execute(
+            "write_coil:SON_off",
+            lambda: client.write_coil(address=_COIL_SON, value=False, device_id=self._slave_id),
+        )
         logger.debug("servo_off: slave_id=%d", self._slave_id)
 
     async def home_return(self) -> None:
@@ -212,20 +285,26 @@ class ActuatorDriver:
         """
         client = self._require_client()
         # P-CON-CB はコイルの立ち上がりエッジ（False→True）で原点復帰をトリガーする
-        async with self._bus_op():
-            await client.write_coil(address=_COIL_HOME, value=False, device_id=self._slave_id)
+        await self._execute(
+            "write_coil:HOME_reset",
+            lambda: client.write_coil(address=_COIL_HOME, value=False, device_id=self._slave_id),
+        )
         await asyncio.sleep(0.05)
-        async with self._bus_op():
-            await client.write_coil(address=_COIL_HOME, value=True, device_id=self._slave_id)
+        await self._execute(
+            "write_coil:HOME_trigger",
+            lambda: client.write_coil(address=_COIL_HOME, value=True, device_id=self._slave_id),
+        )
         logger.info("home_return 開始: slave_id=%d", self._slave_id)
 
         deadline = asyncio.get_event_loop().time() + _HOME_RETURN_TIMEOUT_S
         while asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(_HOME_RETURN_POLL_INTERVAL_S)
-            async with self._bus_op():
-                result = await client.read_holding_registers(
+            result = await self._execute(
+                "read:DSS1(home)",
+                lambda: client.read_holding_registers(
                     address=_REG_DSS1, count=1, device_id=self._slave_id
-                )
+                ),
+            )
             if result.isError():
                 logger.warning("home_return DSS1 読み取りエラー: slave_id=%d", self._slave_id)
                 continue
@@ -266,10 +345,12 @@ class ActuatorDriver:
             0,  # 9907: 予約
             0x0000,  # 9908: CTLF = 絶対位置移動
         ]
-        async with self._bus_op():
-            await client.write_registers(
+        await self._execute(
+            "move_to_position",
+            lambda: client.write_registers(
                 address=_REG_PCMD_HI, values=registers, device_id=self._slave_id
-            )
+            ),
+        )
         logger.debug(
             "move_to_position: slave_id=%d pos=%d speed=%d",
             self._slave_id,
@@ -320,10 +401,12 @@ class ActuatorDriver:
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
             # DSS1(0x9005), 0x9006, DSSE(0x9007) を一括読み取り
-            async with self._bus_op():
-                result = await client.read_holding_registers(
+            result = await self._execute(
+                "read:DSS1_DSSE(wait_complete)",
+                lambda: client.read_holding_registers(
                     address=_REG_DSS1, count=3, device_id=self._slave_id
-                )
+                ),
+            )
             if result.isError():
                 logger.warning(
                     "wait_for_position_complete ステータス読み取りエラー: slave_id=%d",
@@ -346,10 +429,12 @@ class ActuatorDriver:
             現在位置 [pulse / 0.01mm 単位]（符号付き 32bit）
         """
         client = self._require_client()
-        async with self._bus_op():
-            result = await client.read_holding_registers(
+        result = await self._execute(
+            "read:PNOW",
+            lambda: client.read_holding_registers(
                 address=_REG_PNOW_HI, count=2, device_id=self._slave_id
-            )
+            ),
+        )
         if result.isError():
             raise OSError(f"read_position 失敗: slave_id={self._slave_id}")
         return _to_signed32(result.registers[0], result.registers[1])
@@ -361,10 +446,12 @@ class ActuatorDriver:
             電流値 [mA]（符号付き 32bit）
         """
         client = self._require_client()
-        async with self._bus_op():
-            result = await client.read_holding_registers(
+        result = await self._execute(
+            "read_current",
+            lambda: client.read_holding_registers(
                 address=_REG_CNOW_HI, count=2, device_id=self._slave_id
-            )
+            ),
+        )
         if result.isError():
             raise OSError(f"read_current 失敗: slave_id={self._slave_id}")
         return float(_to_signed32(result.registers[0], result.registers[1]))
@@ -376,10 +463,12 @@ class ActuatorDriver:
             True: アラームあり（ALMC ≠ 0）
         """
         client = self._require_client()
-        async with self._bus_op():
-            result = await client.read_holding_registers(
+        result = await self._execute(
+            "read:ALMC",
+            lambda: client.read_holding_registers(
                 address=_REG_ALMC, count=1, device_id=self._slave_id
-            )
+            ),
+        )
         if result.isError():
             raise OSError(f"is_alarm_active 失敗: slave_id={self._slave_id}")
         return result.registers[0] != 0

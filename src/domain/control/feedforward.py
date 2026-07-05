@@ -4,11 +4,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from src.domain.model_training import (
-    _REGIME_POS,
-    LOOKAHEAD_HORIZONS_S,
+    DEFAULT_FEATURE_SPEC,
     MODEL_TYPE,
-    REGIME_HORIZON_S,
     STOP_SPEED_KMH,
+    FeatureSpec,
     build_feature_row,
 )
 from src.models.profile import FeedforwardParams
@@ -23,9 +22,12 @@ class _Regressor(Protocol):
 class FeedforwardController:
     """先読み型 多項式Ridge 逆モデルによる FF 制御。load_model() 後に predict_effort() を呼ぶ。
 
-    現在の基準速度 v0 と数秒先の基準速度（先読み）から、符号付き努力量
-    （+: 名目アクセル開度 [%]、−: 名目ブレーキ開度 [%]）を予測する。
+    現在の基準速度 v0・数秒先の基準速度（先読み）・数秒前の基準速度（過去Δv＝過渡状態の
+    識別）から、符号付き努力量（+: 名目アクセル開度 [%]、−: 名目ブレーキ開度 [%]）を予測する。
     追従誤差の補正は PID に、ペダルへの写像は PedalArbiter に委ねる純粋フィードフォワード。
+
+    特徴量構成（ホライズン・レジーム判定等）は pkl に保存された `FeatureSpec` から復元する
+    （モジュール定数のハードコード参照はしない）。未ロード時は `DEFAULT_FEATURE_SPEC` を使う。
     """
 
     def __init__(self) -> None:
@@ -36,11 +38,18 @@ class FeedforwardController:
         self._speed_clip_max: float | None = None
         # 車両物理定数。select_profile 時に set_params で更新する。未設定時は AT 標準デフォルト。
         self._params: FeedforwardParams = FeedforwardParams()
+        # 特徴量構成。load_model でロード済み pkl の feature_spec に置き換わる。
+        self._spec: FeatureSpec = DEFAULT_FEATURE_SPEC
 
     @property
     def horizons(self) -> tuple[float, ...]:
         """先読みホライズン [s]（呼び出し元が future_speeds を組むために参照する）。"""
-        return LOOKAHEAD_HORIZONS_S
+        return self._spec.lookahead_horizons_s
+
+    @property
+    def past_horizons(self) -> tuple[float, ...]:
+        """過去方向ホライズン [s]（呼び出し元が past_speeds を組むために参照する）。"""
+        return self._spec.past_horizons_s
 
     @property
     def has_model(self) -> bool:
@@ -52,14 +61,15 @@ class FeedforwardController:
         self._params = params
 
     def load_model(self, model_path: str) -> None:
-        """pkl ファイルから先読み Ridge 逆モデルをロードする。
+        """pkl ファイルから先読み 多項式Ridge 逆モデルをロードする。
 
         pkl は train_inverse_model が出力する dict 形式:
-            model_type:     "poly_inverse_lookahead"
+            model_type:     "poly_spec_inverse_lookahead"
             accel_model:    sklearn Pipeline（多項式＋標準化＋Ridge）
             brake_model:    sklearn Pipeline
             speed_clip_max: 学習観測最高車速（推論時の入力クリップ上限）
-            feature_names, horizons, ...
+            feature_spec:   FeatureSpec を asdict() した plain dict（特徴量構成の正）
+            feature_names, horizons, past_horizons, ...（参考情報。読み手は spec を正として扱う）
 
         運転モデルは開発者がローカルで生成した信頼済みファイルのみを想定。
         外部入力のパスをそのまま渡さないこと（呼び出し元の責務）。
@@ -76,13 +86,20 @@ class FeedforwardController:
                 f"Unsupported model file (expected model_type={MODEL_TYPE!r}): {model_path}"
             )
 
-        required_keys = {"accel_model", "brake_model"}
+        required_keys = {"accel_model", "brake_model", "feature_spec"}
         missing = required_keys - data.keys()
         if missing:
             raise ValueError(f"Model file is missing required keys: {missing}")
 
+        spec_dict = data["feature_spec"]
+        try:
+            spec = FeatureSpec(**spec_dict)
+        except TypeError as e:
+            raise ValueError(f"Model file has an invalid feature_spec: {model_path}") from e
+
         self._accel_model = data["accel_model"]
         self._brake_model = data["brake_model"]
+        self._spec = spec
         clip = data.get("speed_clip_max")
         self._speed_clip_max = float(clip) if clip is not None else None
 
@@ -95,13 +112,18 @@ class FeedforwardController:
         self._accel_model = None
         self._brake_model = None
         self._speed_clip_max = None
+        self._spec = DEFAULT_FEATURE_SPEC
 
-    def predict_effort(self, v0: float, future_speeds: Sequence[float]) -> float:
-        """現在の基準速度と先読み基準速度から符号付き努力量 [%] を返す。
+    def predict_effort(
+        self, v0: float, future_speeds: Sequence[float], past_speeds: Sequence[float]
+    ) -> float:
+        """現在・先読み・過去の基準速度から符号付き努力量 [%] を返す。
 
         Args:
             v0: 現在の基準速度 [km/h]
             future_speeds: 各ホライズン（horizons 順）の基準速度 [km/h]
+            past_speeds: 各過去ホライズン（past_horizons 順）の基準速度 [km/h]。
+                過去Δv（ランプ過渡か定常保持か）の識別に使う。
 
         Returns:
             努力量 [%]。正は名目アクセル開度、負は名目ブレーキ開度。-100.0〜100.0。
@@ -113,16 +135,18 @@ class FeedforwardController:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         p = self._params
+        spec = self._spec
 
-        # 1. 停車レジーム: 停車保持ブレーキ（多項式モデルは原点で 0 を保証しないため定数で補う。
+        # 1. 停車レジーム: 停車保持ブレーキ（学習モデルは原点で 0 を保証しないため定数で補う。
         #    負予測は後段で 0 にクランプされる）。判定は最短ホライズン（0.5 秒先）のみ:
         #    全先読み点（3 秒先まで）で判定すると発進の 3 秒前に保持ブレーキが解除され、
-        #    クリープで基準 0 に逆らって動き出す（レビュー指摘 #5）。
+        #    クリープで基準 0 に逆らって動き出す（レビュー指摘 #5）。lookahead_horizons_s は
+        #    昇順制約があるため future_speeds[0] が最短ホライズンになる。
         if v0 <= STOP_SPEED_KMH and future_speeds and future_speeds[0] <= STOP_SPEED_KMH:
             return -max(0.0, min(100.0, p.stop_brake_opening_pct))
 
-        # 学習域外の外挿を防ぐため速度を観測最高車速 cm にクリップ（多項式が域外で暴れるのを避け
-        # 学習端で飽和させる。残差は PID と包絡線ガバナが吸収する）。v0>cm のときは軌跡全体を平行
+        # 学習域外の外挿を防ぐため速度を観測最高車速 cm にクリップ（木の域外飽和も含めて
+        # 学習端で有界にする。残差は PID と包絡線ガバナが吸収する）。v0>cm のときは軌跡全体を平行
         # 移動して v0 を cm に置き、減速/加速の相対トレンド（dv＝レジーム判定の基）を保つ。単純に
         # 各点を独立クリップすると near-horizon の dv が 0 に潰れてレジームを誤判定するため。
         cm = self._speed_clip_max
@@ -131,13 +155,15 @@ class FeedforwardController:
                 shift = v0 - cm
                 v0 = cm
                 future_speeds = [f - shift for f in future_speeds]
-            # 先読みが学習域を超える分（域外への加速要求）は学習端に飽和させる
+                past_speeds = [p - shift for p in past_speeds]
+            # 学習域を超える分（域外の速度点）は学習端に飽和させる
             future_speeds = [min(f, cm) for f in future_speeds]
+            past_speeds = [min(p, cm) for p in past_speeds]
 
-        features = build_feature_row(v0, future_speeds)
-        # レジーム判定: 先読みトレンド dv_1.0 の符号（X 列順より features[0, 1+_REGIME_POS]）
-        dv_regime = float(features[0, 1 + _REGIME_POS])
-        desired_accel = dv_regime / REGIME_HORIZON_S  # km/h/s（正:加速, 負:減速）
+        features = build_feature_row(v0, future_speeds, past_speeds, spec)
+        # レジーム判定: 先読みトレンド dv_{regime_horizon_s} の符号
+        dv_regime = float(features[0, spec.regime_col()])
+        desired_accel = dv_regime / spec.regime_horizon_s  # km/h/s（正:加速, 負:減速）
 
         # 2. 両モデルを評価。負の予測はノイズとして 0。
         accel_pred = max(0.0, float(self._accel_model.predict(features)[0]))

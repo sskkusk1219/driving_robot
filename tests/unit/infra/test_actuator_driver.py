@@ -306,3 +306,75 @@ class TestIsAlarmActive:
         mock_client.read_holding_registers.return_value = _make_error_result()
         with pytest.raises(IOError):
             await driver.is_alarm_active()
+
+
+class TestTransactionInstrumentation:
+    """ストール切り分け計装（.steering/20260620-modbus-retry-cycle-stall）のテスト。"""
+
+    @pytest.mark.asyncio
+    async def test_retries_on_response_logged_as_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """pymodbus が付与する response.retries > 0 を再送検知として WARNING ログする。"""
+        driver, mock_client = _make_driver()
+        result = _make_reg_result(0x0000, 0x00FA)
+        result.retries = 2
+        mock_client.read_holding_registers.return_value = result
+
+        with caplog.at_level("WARNING", logger="src.infra.actuator_driver"):
+            await driver.read_current()
+
+        assert any(
+            "Modbus再送検知" in r.message and "retries=2" in r.message for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_retries_does_not_log_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        driver, mock_client = _make_driver()
+        result = _make_reg_result(0x0000, 0x00FA)
+        result.retries = 0
+        mock_client.read_holding_registers.return_value = result
+
+        with caplog.at_level("WARNING", logger="src.infra.actuator_driver"):
+            await driver.read_current()
+
+        assert not any("Modbus再送検知" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_mock_response_without_int_retries_does_not_crash(self) -> None:
+        """MagicMock 応答（テストダブル）は retries 属性が自動生成された Mock になるため、
+        int でない場合は 0 扱いにしてフォーマット時の例外を防ぐ（回帰防止）。
+        """
+        driver, mock_client = _make_driver()
+        mock_client.read_holding_registers.return_value = _make_reg_result(0x0000, 0x00FA)
+        current = await driver.read_current()
+        assert current == 250.0
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retries_logs_warning_and_reraises(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """全再送を使い切って pymodbus が例外を送出した場合も計装ログを残し、例外は伝播する。"""
+        driver, mock_client = _make_driver()
+        mock_client.read_holding_registers.side_effect = TimeoutError("no response")
+
+        with caplog.at_level("WARNING", logger="src.infra.actuator_driver"):
+            with pytest.raises(TimeoutError):
+                await driver.read_current()
+
+        assert any("Modbus再送上限到達" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_axis_name_appears_in_log(self, caplog: pytest.LogCaptureFixture) -> None:
+        driver = ActuatorDriver(port="/dev/ttyUSB0", slave_id=1, axis_name="accel")
+        mock_client = MagicMock()
+        mock_client.read_holding_registers = AsyncMock()
+        result = _make_reg_result(0x0000, 0x00FA)
+        result.retries = 1
+        mock_client.read_holding_registers.return_value = result
+        driver._client = mock_client
+
+        with caplog.at_level("WARNING", logger="src.infra.actuator_driver"):
+            await driver.read_current()
+
+        assert any("axis=accel" in r.message for r in caplog.records)

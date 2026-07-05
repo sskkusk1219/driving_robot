@@ -7,7 +7,10 @@ class PatternKind(StrEnum):
 
     CREEP = "creep"  # 停車保持から段階的にブレーキを緩める（解放ステップ）
     CREEP_SETTLE = "creep_settle"  # アクセル・ブレーキ 0% で車速が安定するまで待機しクリープ計測
-    # 固定アクセル開度で 0→0.9×max_speed（cap）まで加速し全車速域の加速サンプルを採る。
+    # 低いアクセル開度（不感帯が疑われる域）を無ランプで一定時間保持し、開度→応答曲線から
+    # アクセル不感帯（accel_deadband_pct）を推定するためのサンプルを採る。
+    ACCEL_DEADBAND_PROBE = "accel_deadband_probe"
+    # 固定アクセル開度で 0→0.98×max_speed（cap）まで加速し全車速域の加速サンプルを採る。
     # cap 到達/タイムアウト後はブレーキで停車まで戻す（次パターンの起点を 0 に揃える）。
     ACCEL_SWEEP = "accel_sweep"
     # 高速（cap）まで加速→固定ブレーキ開度を一定保持し定常減速を採る（加速プラトーと対称）。

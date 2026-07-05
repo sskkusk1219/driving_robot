@@ -99,8 +99,63 @@
       （`latest_learning_session_id` を train 既定対象に・session_ids 指定時はそれ優先）②coast込みに復帰**
       へ修正。`src/web/routers/drive.py`・`session_repository.py`・`deps.py`・`stubs.py` を改修。
       → 最新セッションのみ＋coast込みで **加速 R²0.923 / 減速 R²0.915**（両 ≥0.8 達成）、speed_clip_max=97.8。
-- [ ] 実機 閉ループ検証（自動走行で FF 制動）— **ユーザーのサーバ再起動＋再学習待ち**（新コード反映が必要。
-      旧 `ridge_inverse_lookahead` モデルは新コードで弾かれるため、起動後に学習走行を1回実施して新モデル生成）
+- [x] 実機再学習で R²≥0.8 を確認（poly2 モデル: 加速 R²0.916/MAE1.68・減速 R²0.925/MAE1.43）
+
+## フェーズ6-2: 精度目標 MAE≤0.5 / RMSE≤1.0 / R²≥0.8（機能4 続き・2026-07-02）
+
+> ユーザー新目標。アブレーションで poly 微調整（MAE~1.3-1.5）では届かず、
+> **GBM＋過去Δv特徴**のみ達成可能と実測 → 計画承認のうえ実装。
+
+- [x] `model_training.py`: 推定器を**単調制約付き HistGradientBoosting** に変更
+      （dv_1.0 に accel:+1 / brake:-1 の単調制約）。特徴量に**過去方向Δv**（0.5s/1.0s 前、
+      `PAST_HORIZONS_S`）を追加し 9 特徴に（ランプ過渡/定常保持の識別）。
+      `MODEL_TYPE="gbm_inverse_lookahead"`・payload に past_horizons 追加。
+- [x] `feedforward.py`: `past_horizons` プロパティ・`predict_effort(v0, future, past)` に拡張。
+      入力クリップは平行移動シフトを past にも適用。
+- [x] `drive_loop.py`: past_speeds を `_ref_speed_at(elapsed−h)` で構築し FF へ（範囲外は端点クランプ）。
+- [x] テスト更新（build_feature_row 9次元・単調制約・past_horizons・全 predict_effort 呼び出し）
+      → **763 passed / ruff OK / mypy OK**
+- [x] オフライン検証（実 train 経路・最新セッション）:
+      **加速 MAE0.295 / RMSE0.755 / R²0.995・減速 MAE0.218 / RMSE0.464 / R²0.997 — 全目標達成**。
+      推論 3.5ms/回（50ms 周期の 7%）、外挿 v0=120 有界。
+- [x] ドキュメント更新（functional-design / architecture / glossary）
+- [x] 実機: 学習走行→再学習で目標達成（in-sample）を確認。**しかし自動走行（06_WLTP_ExHi）で追従破綻**
+      → フェーズ6-3 で対応（GBM は off-manifold の巡航域で定数飽和し閉ループ不成立と判明）
+
+## フェーズ6-3: 推定器を poly2 Ridge に復帰（GBM 閉ループ破綻対応・2026-07-02）
+
+> 実走行 06_WLTP_ExHi（session 4c88b2dd）で偏差 MAE 18.3km/h・最大36.8、ref74 に対し 105.8km/h まで
+> 過加速。原因分析で「GBM は巡航域（dv=0）で速度によらず一定 7.3% を返す＝off-manifold で定数飽和」
+> と確定（詳細・比較表は design.md フェーズ6-3 参照）。ユーザー決定: **Ridge 復帰のみ（最小変更）**。
+> 過去Δv 9特徴・最新セッション学習・speed_clip_max クリップ・drive_loop の past_speeds は維持。
+> **実装は design.md フェーズ6-3 の実装設計に従うこと。**
+
+- [x] `model_training.py`: `_make_estimator()` を poly2 Pipeline に復帰
+      （`PolynomialFeatures(2, include_bias=False)` → `StandardScaler` → `Ridge(alpha=1.0)`。
+      `dv_monotonic` 引数と HistGradientBoostingRegressor import を削除、Pipeline 系 import 復活、
+      `_metrics` 型注釈を `Pipeline` に）
+- [x] `model_training.py`: `MODEL_TYPE = "poly_past_inverse_lookahead"` に変更
+      （旧7特徴 poly と GBM の両 pkl を確実に弾く新識別子。9特徴・PAST_HORIZONS_S・payload 構成は不変）
+- [x] `model_training.py`: docstring/コメントを poly 表現に戻し、GBM 不採用の理由
+      （off-manifold の巡航域で定数飽和→閉ループ破綻）をコメントで残す
+- [x] `feedforward.py`: docstring のみ更新（ロジック変更なし）
+- [x] テスト更新: `test_estimator_is_monotonic_gbm` → `test_estimator_is_polynomial_pipeline` に戻す
+      （`test_feedforward.py` の `make_model_file` docstring 内 model_type 表記も修正。他は変更不要）
+- [x] 品質チェック: `.venv/bin/pytest -m "not hardware"`（763 passed）/ `.venv/bin/ruff check`（All
+      checks passed）/ `.venv/bin/mypy`（Success: no issues found）
+- [x] オフライン検証: 最新学習セッション（b23a2fd1、2515行）で実 `train_inverse_model` 経路の再学習
+      → 加速 R²=0.895・MAE=2.895、減速 R²=0.904・MAE=1.397（poly 水準に復帰）。巡航予測（dv=0, past
+      dv=0）は 60〜100km/h で **10.90%→12.70%→10.45% の滑らかな曲線**（GBM の一定7.3%飽和が解消）
+- [x] ドキュメント更新: functional-design（FeedforwardController構造・predict_effortシグネチャに
+      past_speeds追加も反映）/ glossary / architecture の推定器記述を poly に戻し、GBM 不採用の経緯を残す
+- [ ] 実機検証: ユーザーがサーバ再起動 → 学習運転1回（新 MODEL_TYPE のため再学習必須）→
+      06_WLTP_ExHi を実走し追従（偏差・過加速なし）を確認
+
+### 残課題（次フェーズ候補・スコープ外）
+
+- 巡航データの欠如（両モデル共通）: ACCEL_SWEEP に「中間開度の巡航保持」を追加し (v0, dv≈0) の
+  定常標本を採る。120km/h 超の巡航予測（poly で ~1% と過小）の改善にも必要。
+- MAE≤0.5 目標は GBM でしか出ないが閉ループ追従を優先して poly 採用。巡航データ追加後に GBM 再評価の余地。
 
 ## フェーズ7: ドキュメント更新
 
@@ -112,9 +167,10 @@
 ## 実装後の振り返り
 
 ### 実装完了日
-2026-06-30（フェーズ1〜7 のコード/ドキュメント実装まで。フェーズ5 の実機検証は実施済み＝学習走行が
-0〜97.9km/h を約6分で完走。フェーズ6 のモデル改修も実装＋オフライン検証済み。残るは新コード反映後の
-自動走行 閉ループ確認のみ＝ユーザーのサーバ再起動待ち）
+2026-06-30〜2026-07-02（フェーズ1〜7 のコード/ドキュメント実装、フェーズ6-2 の GBM 化とその閉ループ
+破綻対応（フェーズ6-3・poly 復帰）まで完了。フェーズ5 の実機検証は実施済み＝学習走行が 0〜97.9km/h
+を約6分で完走。フェーズ6-3 もコード実装・全品質チェック・オフライン検証まで完了。残るは新コード
+反映後の自動走行 閉ループ確認のみ＝ユーザーのサーバ再起動待ち）
 
 ### 計画と実績の差分
 
@@ -139,6 +195,10 @@
 
 **技術的理由でスキップしたタスク**:
 - なし（フェーズ6 も条件成立により実装した）。
+- フェーズ6-2（GBM＋過去Δv・MAE≤0.5目標）は in-sample では全目標達成したが、実走行で閉ループが
+  破綻したため**フェーズ6-3 で推定器のみ poly2 Ridge に巻き戻し**（過去Δv 特徴量・最新セッション
+  学習・入力クリップは維持）。「実装方針の変更により不要になった」に該当し、GBM 版は不採用として
+  design.md に経緯を記録した（アーキテクチャ変更というより、実測で反証されたため撤回）。
 
 ### 学んだこと
 
@@ -155,11 +215,25 @@
 - 加速が ~30km/h で頭打ちだった主因は「低開度の早期プラトー離脱」と「6秒固定 timeout」。cap 到達
   主導に変え、開度を全域到達する数段（max の 30/50/70/100%）に再構成することで高速域を埋められる。
 
+- **in-sample/CV の指標だけでは実走行の性能を保証できない**（フェーズ6-2→6-3 の最大の教訓）。GBM は
+  MAE≤0.5/R²≥0.8 を大幅達成しつつ、学習パターン外の巡航域（off-manifold）で予測が定数に飽和し、
+  実走行モード（WLTP-ExHi）で偏差 MAE 18.3km/h・最大105.8km/h の過加速という閉ループ破綻を招いた。
+  poly Ridge は同じ外挿域でも滑らかに補間するため実用に耐えた。**指標最適化と閉ループ安定性は別軸**。
+- 過去方向Δv 特徴量（ランプ過渡/定常保持の識別）は推定器を問わず有効な改善で、GBM→poly の巻き戻し後
+  も維持した。
+
 **プロセス上の改善点**:
 - 読み取り専用の調査/アブレーションスクリプト（DB→特徴量→fit→R²/MAE）で、実装前に推定器・特徴量・
   外挿挙動を定量比較してから方針確定できた。重い改修を当て推量で始めず、データで裏付けて選べた。
+- 一方で、そのアブレーションは学習データ内の CV に留まり、実走行軌跡（別分布）での検証を経ずに
+  GBM を本番投入してしまった。**推定器変更は必ず実機の閉ループ走行で検証してから確定させる**べきだった。
 
 ### 次回への改善提案
 - 自動走行 閉ループ検証（新コード反映後）で FF 制動の実挙動を確認し、必要なら `POLY_DEGREE`・
   `RIDGE_ALPHA`・`accel_sweep_fracs`・`brake_hold_openings_pct`・各 timeout を調整する。
+- 巡航データの欠如（フェーズ6-3 の残課題）に対応する: ACCEL_SWEEP に「中間開度の巡航保持」段を
+  追加し (v0, dv≈0) の定常標本を採る。これで poly の 120km/h 超巡航予測（現状 ~1% と過小）も改善
+  でき、将来 GBM 系を再評価する際の off-manifold の穴も埋まる。
+- 今後モデル/推定器を変更する際は、in-sample・CV に加えて**実走行モードでの閉ループ追従**を
+  必須の検証ステップとして tasklist に明記する。
 - 減速 R² の受け入れ基準は coast 除外方針と整合させ、実制動 MAE/RMSE を主指標に据え直すと良い。

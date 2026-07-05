@@ -47,6 +47,12 @@ KP_MAX: float = 50.0
 KI_MIN: float = 0.0
 KI_MAX: float = 50.0
 
+# ── 先読み補償（preview_time_s）クランプ ────────────────────────────────
+# アクチュエータ〜車両系のむだ時間補償として基準軌跡を前倒しする秒数。上限は
+# FOPDT のむだ時間クランプ L_MAX_S と揃え、座標降下がそれ以上を探索しないようにする。
+PREVIEW_MIN_S: float = 0.0
+PREVIEW_MAX_S: float = L_MAX_S
+
 
 @dataclass(frozen=True)
 class FOPDT:
@@ -61,6 +67,16 @@ class FOPDT:
     k: float
     tau: float
     theta: float
+
+
+def initial_preview_from_fopdt(fopdt: FOPDT) -> float:
+    """FOPDT のむだ時間 θ を先読み補償(preview_time_s)の初期値へ変換する。
+
+    θ をそのまま [PREVIEW_MIN_S, PREVIEW_MAX_S] にクランプするだけ。SIMC ゲイン算出
+    （フィードバックループのむだ時間補償）とは独立に、基準軌跡の位相を進める側の
+    初期値として使う。
+    """
+    return max(PREVIEW_MIN_S, min(PREVIEW_MAX_S, fopdt.theta))
 
 
 def _segment_fopdt(
@@ -306,24 +322,59 @@ def tuning_cost(kpi_summary: dict[str, float]) -> float:
     )
 
 
+@dataclass(frozen=True)
+class TuningParams:
+    """座標降下が探索する4パラメータ（PID ゲイン + 先読み補償秒数）。"""
+
+    kp: float
+    ki: float
+    kd: float
+    preview_time_s: float = 0.0
+
+    @property
+    def gains(self) -> PIDGains:
+        return PIDGains(kp=self.kp, ki=self.ki, kd=self.kd)
+
+    @classmethod
+    def from_profile(cls, profile: VehicleProfile) -> TuningParams:
+        g = profile.pid_gains
+        return cls(
+            kp=g.kp,
+            ki=g.ki,
+            kd=g.kd,
+            preview_time_s=profile.dynamics_params.preview_time_s,
+        )
+
+
 class CoordinateDescentTuner:
-    """KPI コストを最小化する座標降下（コンパス探索）チューナー。
+    """KPI コストを最小化する巡回座標降下（cyclic coordinate descent）チューナー。
 
     走行（評価）はハードに依存するため本クラスからは切り離し、呼び出し元が
-    `next_candidate()` で候補ゲインを受け取り走行・コスト算出し `report()` で返す
+    `next_candidate()` で候補パラメータを受け取り走行・コスト算出し `report()` で返す
     注入式とする。これによりハード無しで収束挙動を単体テストできる。
 
-    各ラウンドで best を中心に kp/ki/kd を ±ステップ探索する。ラウンド内で改善が
-    あれば best を更新して即再センタリング、無ければステップを半減する。ステップが
-    min_step_frac 未満、または max_runs 到達で停止する。
+    kp → ki → kd → preview_time_s の順に各座標を巡回する。座標ごとにまず `+` 候補を
+    評価し、改善（cost < best_cost）すれば採用して直ちに次の座標へ進む。改善しなければ
+    `−` 候補を試し、それでも改善しなければ次の座標へ進む（残り方向は捨てる）。クランプ後
+    の値が現在の best と同値になる候補は走行させずスキップする。全座標を1巡して一度も
+    改善がなければステップを半減する。ステップが min_step_frac 未満、または max_runs
+    到達で停止する。
     """
 
+    _PARAMS: tuple[str, ...] = ("kp", "ki", "kd", "preview_time_s")
     # ステップの最小スケール（値が 0 でも動けるようにする基準量）。
-    _BASE: dict[str, float] = {"kp": 1.0, "ki": 0.1, "kd": 0.1}
+    _BASE: dict[str, float] = {"kp": 1.0, "ki": 0.1, "kd": 0.5, "preview_time_s": 0.5}
+    # 各パラメータのクランプ範囲 (min, max)。
+    _CLAMP: dict[str, tuple[float, float]] = {
+        "kp": (KP_MIN, math.inf),
+        "ki": (KI_MIN, math.inf),
+        "kd": (0.0, math.inf),
+        "preview_time_s": (PREVIEW_MIN_S, PREVIEW_MAX_S),
+    }
 
     def __init__(
         self,
-        initial: PIDGains,
+        initial: TuningParams,
         *,
         max_runs: int = 15,
         init_step_frac: float = 0.3,
@@ -335,45 +386,67 @@ class CoordinateDescentTuner:
         self._step = init_step_frac
         self._min_step = min_step_frac
         self._runs = 0
-        self._pending: list[PIDGains] = [initial]  # まずベースラインを測定
-        self._improved_this_round = False
+        self._baseline_done = False
+        self._param_idx = 0
+        self._direction_idx = 0
+        self._improved_this_cycle = False
 
-    def _gen_round(self) -> list[PIDGains]:
-        cands: list[PIDGains] = []
-        for p in ("kp", "ki", "kd"):
-            cur = getattr(self._best, p)
-            scale = abs(cur) + self._BASE[p]
-            for d in (1.0, -1.0):
-                val = max(0.0, cur + d * self._step * scale)
-                cands.append(replace(self._best, **{p: val}))
-        return cands
-
-    def next_candidate(self) -> PIDGains | None:
-        """次に評価すべき候補ゲインを返す。停止条件に達したら None。"""
+    def next_candidate(self) -> TuningParams | None:
+        """次に評価すべき候補パラメータを返す。停止条件に達したら None。"""
         if self._runs >= self._max_runs:
             return None
-        if not self._pending:
-            if not self._improved_this_round:
-                self._step *= 0.5
-                if self._step < self._min_step:
-                    return None
-            self._improved_this_round = False
-            self._pending = self._gen_round()
-        return self._pending[0]
+        if not self._baseline_done:
+            return self._best
 
-    def report(self, gains: PIDGains, cost: float) -> None:
-        """候補ゲインの走行コストを報告する。"""
+        while True:
+            if self._param_idx >= len(self._PARAMS):
+                if not self._improved_this_cycle:
+                    self._step *= 0.5
+                    if self._step < self._min_step:
+                        return None
+                self._improved_this_cycle = False
+                self._param_idx = 0
+                self._direction_idx = 0
+                continue
+            if self._direction_idx >= 2:
+                self._param_idx += 1
+                self._direction_idx = 0
+                continue
+
+            p = self._PARAMS[self._param_idx]
+            direction = (1.0, -1.0)[self._direction_idx]
+            cur = getattr(self._best, p)
+            scale = abs(cur) + self._BASE[p]
+            lo, hi = self._CLAMP[p]
+            val = max(lo, min(hi, cur + direction * self._step * scale))
+            if val == cur:
+                # クランプで best と同値になる候補は無駄走行なのでスキップ
+                self._direction_idx += 1
+                continue
+            return replace(self._best, **{p: val})
+
+    def report(self, params: TuningParams, cost: float) -> None:
+        """候補パラメータの走行コストを報告する。"""
         self._runs += 1
-        if self._pending:
-            self._pending.pop(0)
-        if cost < self._best_cost:
+        is_new_best = cost < self._best_cost
+        if is_new_best:
             self._best_cost = cost
-            self._best = gains
-            self._improved_this_round = True
-            self._pending = []  # best 更新につき現ラウンドを破棄して再センタリング
+            self._best = params
+
+        if not self._baseline_done:
+            # ベースライン測定は座標巡回に数えない（kp から通常どおり開始する）。
+            self._baseline_done = True
+            return
+
+        if is_new_best:
+            self._improved_this_cycle = True
+            self._param_idx += 1
+            self._direction_idx = 0
+        else:
+            self._direction_idx += 1
 
     @property
-    def best(self) -> PIDGains:
+    def best(self) -> TuningParams:
         return self._best
 
     @property

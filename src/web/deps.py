@@ -4,10 +4,13 @@ from typing import Protocol
 
 from fastapi import Request
 
+from src.app.learning_cycle import LearningCycleOrchestrator
 from src.app.robot_controller import LogWriterProtocol, RobotController
+from src.domain.model_training import DEFAULT_FEATURE_SPEC, FeatureSpec
+from src.infra.settings import LearningSettings
 from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
-from src.models.drive_log import DriveLog, DriveSession
+from src.models.drive_log import DriveLog, DriveSession, LearningCycle
 from src.models.driving_mode import DrivingMode
 from src.models.profile import VehicleProfile
 from src.models.time_schedule import TimeSchedule
@@ -49,6 +52,10 @@ class SessionRepoProtocol(Protocol):
         session_ids: list[str] | None = None,
         limit: int = 100_000,
     ) -> list[DriveLog]: ...
+    async def list_session_ids_for_cycle(self, cycle_id: str) -> list[str]: ...
+    async def list_cycles(
+        self, profile_id: str | None = None, limit: int = 100
+    ) -> list[LearningCycle]: ...
 
 
 class UPSMonitorProtocol(Protocol):
@@ -94,6 +101,25 @@ def get_session_repo(request: Request) -> SessionRepoProtocol:
 def get_schedule_repo(request: Request) -> ScheduleRepoProtocol:
     repo: ScheduleRepoProtocol = request.app.state.schedule_repo
     return repo
+
+
+def get_feature_spec(request: Request) -> FeatureSpec:
+    """学習時に使う特徴量構成。app.state 未設定（起動シーケンス外）時は現行9特徴を返す。"""
+    spec: FeatureSpec = getattr(request.app.state, "feature_spec", DEFAULT_FEATURE_SPEC)
+    return spec
+
+
+def get_learning_settings(request: Request) -> LearningSettings:
+    """2段階学習フローのデフォルトパラメータ。app.state 未設定時はデフォルト値を返す。"""
+    settings: LearningSettings = getattr(
+        request.app.state, "learning_settings", LearningSettings()
+    )
+    return settings
+
+
+def get_cycle_orchestrator(request: Request) -> LearningCycleOrchestrator:
+    orchestrator: LearningCycleOrchestrator = request.app.state.cycle_orchestrator
+    return orchestrator
 
 
 def get_ups_monitor(request: Request) -> UPSMonitorProtocol:

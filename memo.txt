@@ -45,6 +45,10 @@ python /home/raspi5_16gb/projects/driving_robot/scripts/check_can_2.py
       → SafetyMonitor.handle_ac_power_loss() が呼ばれます
   ケーブルを戻すと OB→OL になりますが、コールバックは発火しません（立ち上がりエッジのみ）。
 
+# SG90の動作確認
+  .venv/bin/python tests/hardware/test_servo_pca9685.py [ch]
+  @20260701-servo-pca9685-smoke-test
+  
 # 本番環境の起動
   初回のみ: DB初期化
 
@@ -141,16 +145,33 @@ claude --version
 # TODO:
 
   - ストール対策
+    /resumeで現状を確認
+    ✳ ストール対策の実機検証とMCP実装
     @/home/raspi5_16gb/projects/driving_robot/.steering/20260620-modbus-retry-cycle-stall
-    実機を使って続きを実装する
+    実機検証
+    
   - 学習運転
-    モデル精度向上
+    /resumeで現状を確認
+    ✳ feature-set-offline-evaluation
     実機確認
-    モデルがR2>0.8になるか
-    PID適合が停止してから始まるか,逸脱で非常停止がかからない
+    
+    /resumeで現状を確認
+    ✳ PID適合の追従問題と車速先読み秒数の改善
+    .steering/20260704-actuator-delay-preview-tuning
+    sonnetでコード実装
+
   - サーボモータ
     /resumeで現状を確認
     配線接続
     testコードで動くか確認
   - タイムスケジュールモード
-    実装依頼
+    /@20260701-timeschedule-mode
+    選択したら、右上のタブが選択したモードになるようにする
+    実行はすべて自動運転ページで行う
+
+  -走行モードと学習運転(将来的に)
+    走行モードはどのタイミングでDriveにするか走行モードで編集できるようにする
+    - 以下の仕様に変更
+      - スタートと同時にスタートボタンを押して、エンジン(READY)にする
+      - 走行モードに従って、決められてタイミングでDriveにする(学習運転は規定値6秒でDrive)
+      - 終了したらNにしてスタートボタンを押してIGN-OFFにしてブレーキをリリースする

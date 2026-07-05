@@ -43,6 +43,21 @@ class FeedforwardParams:
 
 
 @dataclass
+class DynamicsParams:
+    """FOPDT同定と適合走行で得た動特性パラメータ(学習成果メタデータ)。
+
+    preview_time_s は基準軌跡の時間シフト量[s]。制御用の基準サンプリングを
+    この秒数だけ前倒しし、アクチュエータ〜車両系のむだ時間を補償する。
+    0.0 で従来動作(前倒しなし)。
+    """
+
+    preview_time_s: float = 0.0
+    fopdt_k: float | None = None
+    fopdt_tau: float | None = None
+    fopdt_theta: float | None = None
+
+
+@dataclass
 class VehicleProfile:
     id: str
     name: str
@@ -57,3 +72,4 @@ class VehicleProfile:
     created_at: datetime
     updated_at: datetime
     feedforward_params: FeedforwardParams = field(default_factory=FeedforwardParams)
+    dynamics_params: DynamicsParams = field(default_factory=DynamicsParams)

@@ -6,7 +6,7 @@ from fastapi import WebSocket
 from starlette.applications import Starlette
 
 from src.models.system_state import RobotState
-from src.web.schemas import InitStepSchema, RealtimeData
+from src.web.schemas import CycleProgressSchema, InitStepSchema, RealtimeData
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,21 @@ async def broadcast_loop(app: Starlette) -> None:
         except Exception as exc:
             logger.debug("UPS 状態取得失敗: %s", exc)
 
+        cycle_progress: CycleProgressSchema | None = None
+        orchestrator = getattr(app.state, "cycle_orchestrator", None)
+        if orchestrator is not None:
+            p = orchestrator.progress
+            cycle_progress = CycleProgressSchema(
+                cycle_id=p.cycle_id,
+                phase=p.phase.value,
+                run_index=p.run_index,
+                run_total=p.run_total,
+                best_cost=p.best_cost,
+                best_preview_time_s=p.best_preview_time_s,
+                message=p.message,
+                started_at=p.started_at,
+            )
+
         data = RealtimeData(
             timestamp=datetime.now(tz=UTC).isoformat(),
             robot_state=RobotState(state.robot_state),
@@ -125,5 +140,6 @@ async def broadcast_loop(app: Starlette) -> None:
             ups_battery_pct=ups_battery_pct,
             ups_on_battery=ups_on_battery,
             init_steps=init_steps,
+            cycle_progress=cycle_progress,
         )
         await manager.broadcast(data.model_dump_json())

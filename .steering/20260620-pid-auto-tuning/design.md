@@ -182,4 +182,7 @@ tests/integration/test_web_api.py   （変更: 追記）
 
 - ブレーキ側の独立同定、Kd の解析導入、速度域別ゲインスケジューリングへ拡張可能な構造とする。
 - `tuning_cost` の重みは将来の KPI 変更に追従できるよう `kpi_monitor` 定数で正規化する。
+- 閉ループでの Kd 導入（`CoordinateDescentTuner` の巡回座標降下化 + PID 微分項への1次LPF）は
+  `.steering/20260702-pid-kd-tuning` で実装済み。SIMC 解析算出（τD=θ/2 相当）による Kd 初期値は
+  LPF 導入後の残項目として引き続き未実装。
 </content>

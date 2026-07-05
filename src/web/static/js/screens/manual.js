@@ -172,7 +172,7 @@ function ManualScreen() {
             {robotState === 'MANUAL' ? (
               <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 運転終了</Btn>
             ) : (
-              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={() => setConfirmStart(true)}>▶ 走行開始</Btn>
+              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={() => setConfirmStart(true)}>開始</Btn>
             )}
           </div>
         </div>

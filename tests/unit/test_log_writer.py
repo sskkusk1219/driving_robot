@@ -1,3 +1,4 @@
+import json
 import uuid
 from unittest.mock import AsyncMock
 
@@ -103,6 +104,32 @@ class TestLogWriterStartSession:
         positional_args = call_args[0]
         assert positional_args[4] == "learning"  # run_type = $4
 
+    @pytest.mark.asyncio
+    async def test_start_session_cycle_id_defaults_to_none(self) -> None:
+        """cycle_id 省略時は None が SQL に渡ること。"""
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer.start_session(profile_id="prof-uuid", mode_id=None, run_type="learning")
+
+        call_args = conn.execute.call_args
+        positional_args = call_args[0]
+        assert positional_args[5] is None  # cycle_id = $5
+
+    @pytest.mark.asyncio
+    async def test_start_session_passes_cycle_id(self) -> None:
+        """cycle_id 指定時にそのまま SQL へ渡ること。"""
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer.start_session(
+            profile_id="prof-uuid", mode_id=None, run_type="tuning", cycle_id="cycle-uuid-1"
+        )
+
+        call_args = conn.execute.call_args
+        positional_args = call_args[0]
+        assert positional_args[5] == "cycle-uuid-1"
+
 
 class TestLogWriterWriteLog:
     @pytest.mark.asyncio
@@ -201,6 +228,82 @@ class TestLogWriterEndSession:
             conn.execute.assert_called_once()
 
 
+class TestLogWriterStartCycle:
+    @pytest.mark.asyncio
+    async def test_start_cycle_returns_uuid_string(self) -> None:
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        cycle_id = await writer.start_cycle(profile_id="prof-uuid")
+
+        uuid.UUID(cycle_id)
+
+    @pytest.mark.asyncio
+    async def test_start_cycle_calls_execute_once(self) -> None:
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer.start_cycle(profile_id="prof-uuid")
+
+        conn.execute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_cycle_passes_profile_id(self) -> None:
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer.start_cycle(profile_id="expected-profile-id")
+
+        call_args = conn.execute.call_args
+        positional_args = call_args[0]
+        assert positional_args[2] == "expected-profile-id"
+
+
+class TestLogWriterEndCycle:
+    @pytest.mark.asyncio
+    async def test_end_cycle_calls_execute_once(self) -> None:
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer.end_cycle("cycle-uuid", "completed")
+
+        conn.execute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_end_cycle_passes_cycle_id_and_status(self) -> None:
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer.end_cycle("target-cycle", "aborted")
+
+        call_args = conn.execute.call_args
+        positional_args = call_args[0]
+        assert positional_args[1] == "target-cycle"
+        assert positional_args[2] == "aborted"
+
+    @pytest.mark.asyncio
+    async def test_end_cycle_serializes_detail_as_json(self) -> None:
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer.end_cycle("cycle-uuid", "completed", detail={"stage1": {"kp": 1.0}})
+
+        call_args = conn.execute.call_args
+        positional_args = call_args[0]
+        assert json.loads(positional_args[3]) == {"stage1": {"kp": 1.0}}
+
+    @pytest.mark.asyncio
+    async def test_end_cycle_defaults_detail_to_empty_dict(self) -> None:
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer.end_cycle("cycle-uuid", "error")
+
+        call_args = conn.execute.call_args
+        positional_args = call_args[0]
+        assert json.loads(positional_args[3]) == {}
+
+
 class TestLogWriterReapInterruptedSessions:
     @pytest.mark.asyncio
     async def test_reap_returns_count(self) -> None:
@@ -230,3 +333,17 @@ class TestLogWriterReapInterruptedSessions:
         writer = LogWriter(conn)
 
         assert await writer.reap_interrupted_sessions() == 0
+
+    @pytest.mark.asyncio
+    async def test_reap_also_closes_orphan_cycles(self) -> None:
+        """孤児 learning_cycles(status='running') も 'error' で回収すること（2回 execute）。"""
+        conn = make_conn()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        writer = LogWriter(conn)
+
+        await writer.reap_interrupted_sessions()
+
+        assert conn.execute.await_count == 2
+        cycle_sql = conn.execute.await_args_list[1][0][0]
+        assert "learning_cycles" in cycle_sql
+        assert "'error'" in cycle_sql

@@ -13,7 +13,7 @@ from src.domain.learning_drive import LearningDriveManager
 from src.infra.db import DuplicateNameError
 from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
-from src.models.drive_log import DriveLog, DriveSession
+from src.models.drive_log import DriveLog, DriveSession, LearningCycle
 from src.models.driving_mode import DrivingMode
 from src.models.profile import VehicleProfile
 from src.models.time_schedule import TimeSchedule
@@ -190,6 +190,7 @@ class InMemoryProfileRepository:
             created_at=now,
             updated_at=now,
             feedforward_params=profile.feedforward_params,
+            dynamics_params=profile.dynamics_params,
         )
         self._profiles[profile_id] = stored
         return stored
@@ -212,6 +213,7 @@ class InMemoryProfileRepository:
             created_at=self._profiles[profile.id].created_at,
             updated_at=now,
             feedforward_params=profile.feedforward_params,
+            dynamics_params=profile.dynamics_params,
         )
         self._profiles[profile.id] = updated
         return updated
@@ -293,7 +295,6 @@ class InMemoryScheduleRepository:
             pedal_points=schedule.pedal_points,
             button_events=schedule.button_events,
             total_duration=schedule.total_duration,
-            loop=schedule.loop,
             created_at=schedule.created_at,
         )
         self._schedules[schedule_id] = stored
@@ -339,4 +340,14 @@ class InMemorySessionRepository:
         session_ids: list[str] | None = None,  # noqa: ARG002
         limit: int = 100_000,  # noqa: ARG002
     ) -> list[DriveLog]:
+        return []
+
+    async def list_session_ids_for_cycle(self, cycle_id: str) -> list[str]:  # noqa: ARG002
+        return []
+
+    async def list_cycles(
+        self,
+        profile_id: str | None = None,  # noqa: ARG002
+        limit: int = 100,  # noqa: ARG002
+    ) -> list[LearningCycle]:
         return []

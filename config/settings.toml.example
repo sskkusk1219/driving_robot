@@ -66,3 +66,23 @@ log_interval_ms = 100
 [safety]
 # 走行中の過電流検知閾値 [mA]（P-CON-CB 仕様から設定）
 overcurrent_limit_ma = 3000
+
+[model]
+# 先読み逆モデルの特徴量構成（FeatureSpec）。デフォルトは現行9特徴と完全一致する。
+# 値の変更は `scripts/evaluate_feature_sets.py` によるオフライン評価の結果を
+# 確認してから行うこと（.steering/20260703-learning-process-revamp/design.md 参照）。
+lookahead_horizons_s = [0.5, 1.0, 2.0, 3.0]
+past_horizons_s = [0.5, 1.0]
+regime_horizon_s = 1.0
+include_v0_sq = true
+include_dv_regime_x_v0 = true
+accel_horizons_s = []
+
+[learning]
+# 2段階学習フロー（学習サイクル）の各段の PID 適合走行回数上限
+# stage1 は kp/ki/kd に加え先読み補償秒数(preview_time_s)も探索する4次元座標降下のため
+# 10→14 に増やしている（1巡=最大8走行、ベースライン+1巡強を確保）。
+refine_runs_stage1 = 14
+refine_runs_stage2 = 5
+# 学習運転（開ループパターン走行）完了待ちのタイムアウト [s]
+learning_timeout_s = 600.0

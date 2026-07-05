@@ -1,6 +1,8 @@
 """100ms 周期で PostgreSQL に走行ログを書き込むインフラコンポーネント。"""
 
+import json
 import uuid
+from typing import Any
 
 import asyncpg
 
@@ -24,28 +26,67 @@ class LogWriter:
         profile_id: str,
         mode_id: str | None,
         run_type: str,
+        cycle_id: str | None = None,
     ) -> str:
         """drive_sessions に INSERT し、生成したセッション ID (UUID 文字列) を返す。
 
         Args:
             profile_id: 使用する車両プロファイルの UUID 文字列
             mode_id: 走行モードの UUID 文字列（手動運転・学習運転時は None）
-            run_type: 'auto' | 'manual' | 'learning'
+            run_type: 'auto' | 'manual' | 'learning' | 'tuning'
+            cycle_id: 参加する学習サイクルの UUID 文字列（manual・通常autoは None）
         """
         session_id = str(uuid.uuid4())
         await self._conn.execute(
             """
             INSERT INTO drive_sessions
-                (id, profile_id, mode_id, run_type, started_at, status)
+                (id, profile_id, mode_id, run_type, started_at, status, cycle_id)
             VALUES
-                ($1, $2, $3, $4, NOW(), 'running')
+                ($1, $2, $3, $4, NOW(), 'running', $5)
             """,
             session_id,
             profile_id,
             mode_id,
             run_type,
+            cycle_id,
         )
         return session_id
+
+    async def start_cycle(self, profile_id: str) -> str:
+        """learning_cycles に INSERT し、生成したサイクル ID (UUID 文字列) を返す。"""
+        cycle_id = str(uuid.uuid4())
+        await self._conn.execute(
+            """
+            INSERT INTO learning_cycles
+                (id, profile_id, status, started_at, detail)
+            VALUES
+                ($1, $2, 'running', NOW(), '{}'::jsonb)
+            """,
+            cycle_id,
+            profile_id,
+        )
+        return cycle_id
+
+    async def end_cycle(
+        self, cycle_id: str, status: str, detail: dict[str, Any] | None = None
+    ) -> None:
+        """learning_cycles.ended_at / status / detail を UPDATE してサイクルを終了する。
+
+        Args:
+            cycle_id: 終了するサイクルの UUID 文字列
+            status: 'completed' | 'error' | 'aborted'
+            detail: 段階別ゲイン/コスト/モデルパス等（JSONB として保存）
+        """
+        await self._conn.execute(
+            """
+            UPDATE learning_cycles
+            SET ended_at = NOW(), status = $2, detail = $3::jsonb
+            WHERE id = $1
+            """,
+            cycle_id,
+            status,
+            json.dumps(detail if detail is not None else {}),
+        )
 
     async def write_log(self, session_id: str, data: DriveLogData) -> None:
         """drive_logs に 1 レコードを INSERT する。timestamp は DB 側 NOW() を使用。
@@ -90,13 +131,15 @@ class LogWriter:
         )
 
     async def reap_interrupted_sessions(self) -> int:
-        """起動時に取り残された未終了セッションを 'error' で閉じる。
+        """起動時に取り残された未終了セッション・学習サイクルを 'error' で閉じる。
 
         サーバ起動直後に status='running'（または ended_at IS NULL）のセッションが
         残っているのは、前回のプロセス異常終了（強制 kill / クラッシュ）で
         end_session が呼ばれなかった孤児セッションのみ。実行中の走行は存在し得ない
         ため、これらを終了済みに是正する。ended_at は記録された最後のログ時刻
         （なければ started_at）に設定し、走行時間表示を妥当にする。
+        同様に status='running' のまま残った孤児 learning_cycles も 'error' で回収する
+        （オーケストレータが走行中にプロセスが落ちたケース）。
 
         Returns:
             是正したセッション件数。
@@ -110,6 +153,13 @@ class LogWriter:
                     s.started_at
                 )
             WHERE s.ended_at IS NULL OR s.status = 'running'
+            """
+        )
+        await self._conn.execute(
+            """
+            UPDATE learning_cycles
+            SET status = 'error', ended_at = NOW()
+            WHERE status = 'running'
             """
         )
         # asyncpg は "UPDATE <n>" を返す

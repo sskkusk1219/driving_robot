@@ -84,12 +84,16 @@ src/web/
 **配置ファイル**:
 - `robot_controller.py`: メインコントローラ・状態機械
 - `session_manager.py`: 走行セッション管理
+- `training_service.py`: 運転モデル学習+PID自動適合の共通処理（`/learning/train` と学習サイクルが共有）
+- `learning_cycle.py`: 学習サイクル・オーケストレータ（2段階学習フローのフェーズ進行・中断/エラー処理）
 
 **例**:
 ```
 src/app/
 ├── robot_controller.py
-└── session_manager.py
+├── session_manager.py
+├── training_service.py
+└── learning_cycle.py
 ```
 
 ---
@@ -308,10 +312,15 @@ data/
 
 ```
 scripts/
-├── setup_db.py     # PostgreSQL DB初期化・テーブル作成
-├── setup_env.sh    # 仮想環境セットアップ・依存関係インストール
-└── start.sh        # システム起動（uvicorn + 制御ループ）
+├── setup_db.py                # PostgreSQL DB初期化・テーブル作成（冪等）
+├── setup_env.sh               # 仮想環境セットアップ・依存関係インストール
+├── start.sh                   # システム起動（uvicorn + 制御ループ）
+├── analyze_decel_fit.py       # 減速R²の原因調査（読み取り専用の分析CLI）
+└── evaluate_feature_sets.py   # FeatureSpec候補セットのオフライン評価（読み取り専用の分析CLI）
 ```
+
+分析CLI（`analyze_*` / `evaluate_*`）は読み取り専用とし、DB・モデル・設定を書き換えない。
+モジュールdocstringにusage・argparse・`asyncio.run` の規約に従う。
 
 ---
 

@@ -199,13 +199,16 @@ function Frame({ children, state = 'READY', screen = '', activeNav = '',
 // ── Box ──────────────────────────────────────────────────────
 function Box({ children, style = {}, label, dashed, thick, tint }) {
   const bg = tint !== undefined ? tint : PAPER_2;
+  // overflow はラベル(枠上端からはみ出す絶対配置)まで一緒に切り取ってしまうため、
+  // 外側の枠には適用せず内側ラッパーだけに効かせる。
+  const { overflow, ...outerStyle } = style;
   return (
     <div style={{
       border: `${thick ? 2 : 1}px ${dashed ? 'dashed' : 'solid'} ${thick ? INK_SOFT : HATCH}`,
       background: bg,
       position: 'relative',
       borderRadius: 4,
-      ...style,
+      ...outerStyle,
     }}>
       {label && (
         <div style={{
@@ -215,7 +218,9 @@ function Box({ children, style = {}, label, dashed, thick, tint }) {
           letterSpacing: '0.04em',
         }}>{label}</div>
       )}
-      {children}
+      {overflow
+        ? <div style={{ overflow, height: '100%', minHeight: 0 }}>{children}</div>
+        : children}
     </div>
   );
 }

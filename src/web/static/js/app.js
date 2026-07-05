@@ -72,6 +72,9 @@ function App() {
   const [activeProfileName, setActiveProfileName] = useState(() => lsGet('drv_profile_name', null));
   const [activeModeId, setActiveModeId] = useState(() => lsGet('drv_mode_id', null));
   const [activeModeName, setActiveModeName] = useState(() => lsGet('drv_mode_name', null));
+  // 'mode'（走行モード）| 'schedule'（タイムスケジュール）。TopBar の mode 表示と
+  // 自動運転ページでどちらの開始/停止APIを叩くかを切り替えるために使う。
+  const [activeModeKind, setActiveModeKind] = useState(() => lsGet('drv_mode_kind', 'mode'));
   const [upsLoss, setUpsLoss] = useState(false);
   const [navLock, setNavLock] = useState(false);
   const [realtimeData, setRealtimeData] = useState(INIT_REALTIME);
@@ -83,6 +86,7 @@ function App() {
   useEffect(() => { lsSet('drv_profile_name', activeProfileName); }, [activeProfileName]);
   useEffect(() => { lsSet('drv_mode_id', activeModeId); }, [activeModeId]);
   useEffect(() => { lsSet('drv_mode_name', activeModeName); }, [activeModeName]);
+  useEffect(() => { lsSet('drv_mode_kind', activeModeKind); }, [activeModeKind]);
 
   // ── System state screen override ─────────────────────────
   const [systemScreen, setSystemScreen] = useState(null);
@@ -161,6 +165,7 @@ function App() {
     activeProfileName, setActiveProfileName,
     activeModeId, setActiveModeId,
     activeModeName, setActiveModeName,
+    activeModeKind, setActiveModeKind,
     upsLoss,
     navLock, setNavLock,
     realtimeData,

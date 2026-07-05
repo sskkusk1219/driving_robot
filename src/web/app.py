@@ -19,12 +19,33 @@ from src.app.stubs import (
     _StubUPSMonitor,
     build_stub_controller,
 )
+from src.app.training_service import feature_spec_from_settings
+from src.domain.model_training import DEFAULT_FEATURE_SPEC, FeatureSpec
+from src.infra.settings import LearningSettings
 from src.web.routers import drive, modes, profiles, schedules, sessions, ups
 from src.web.ws import broadcast_loop, realtime_ws
 
 
+def _load_feature_spec_and_learning_settings() -> tuple[FeatureSpec, LearningSettings]:
+    """`config/settings.toml` から特徴量構成・学習サイクル設定を読み込む。
+
+    設定ファイルが無い開発・スタブ環境ではデフォルト値にフォールバックする
+    （本番の特徴量セット変更は config/settings.toml 経由でのみ行う）。
+    """
+    from src.infra.settings import load_settings  # noqa: PLC0415
+
+    try:
+        settings = load_settings()
+    except FileNotFoundError:
+        return DEFAULT_FEATURE_SPEC, LearningSettings()
+    return feature_spec_from_settings(settings.model), settings.learning
+
+
 async def _build_repos(app: FastAPI) -> None:
     """DB が利用可能なら DB バックエンド、そうでなければ in-memory リポジトリを設定する。"""
+    app.state.feature_spec, app.state.learning_settings = (
+        _load_feature_spec_and_learning_settings()
+    )
     db_url = os.environ.get("DATABASE_URL")
     if db_url:
         from src.infra.db import create_pool  # noqa: PLC0415
@@ -77,6 +98,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await controller.start()
     app.state.controller = controller
     app.state.ups_monitor = ups_monitor
+
+    from src.app.learning_cycle import LearningCycleOrchestrator  # noqa: PLC0415
+
+    cycle_log_writer = None
+    if app.state.db_pool is not None:
+        from src.infra.log_writer import LogWriter  # noqa: PLC0415
+
+        cycle_log_writer = LogWriter(app.state.db_pool)
+    app.state.cycle_orchestrator = LearningCycleOrchestrator(
+        controller=controller,
+        profile_repo=app.state.profile_repo,
+        session_repo=app.state.session_repo,
+        log_writer=cycle_log_writer,
+        learning_timeout_s=app.state.learning_settings.learning_timeout_s,
+    )
 
     task = asyncio.create_task(broadcast_loop(app))
     try:

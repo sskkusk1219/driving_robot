@@ -37,5 +37,4 @@ class TimeSchedule:
     pedal_points: list[PedalPoint]
     button_events: list[ButtonEvent]
     total_duration: float  # 総時間 [s]
-    loop: bool  # ループ再生の有無
     created_at: datetime

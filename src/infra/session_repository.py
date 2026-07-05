@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import asyncpg
 
-from src.models.drive_log import DriveLog, DriveSession
+from src.models.drive_log import DriveLog, DriveSession, LearningCycle
 
 
 class SessionRepository:
@@ -113,6 +114,52 @@ class SessionRepository:
                 )
         return [_row_to_log(row) for row in rows]
 
+    async def list_session_ids_for_cycle(self, cycle_id: str) -> list[str]:
+        """サイクルに参加する全セッション ID を開始日時昇順で返す。"""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id FROM drive_sessions
+                WHERE cycle_id = $1
+                ORDER BY started_at ASC
+                """,
+                uuid.UUID(cycle_id),
+            )
+        return [str(row["id"]) for row in rows]
+
+    async def list_cycles(
+        self, profile_id: str | None = None, limit: int = 100
+    ) -> list[LearningCycle]:
+        """学習サイクル一覧を開始日時降順で返す（参加セッション数を JOIN で付与）。"""
+        async with self._pool.acquire() as conn:
+            if profile_id is not None:
+                rows = await conn.fetch(
+                    """
+                    SELECT c.*, COUNT(s.id) AS session_count
+                    FROM learning_cycles c
+                    LEFT JOIN drive_sessions s ON s.cycle_id = c.id
+                    WHERE c.profile_id = $1
+                    GROUP BY c.id
+                    ORDER BY c.started_at DESC
+                    LIMIT $2
+                    """,
+                    uuid.UUID(profile_id),
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT c.*, COUNT(s.id) AS session_count
+                    FROM learning_cycles c
+                    LEFT JOIN drive_sessions s ON s.cycle_id = c.id
+                    GROUP BY c.id
+                    ORDER BY c.started_at DESC
+                    LIMIT $1
+                    """,
+                    limit,
+                )
+        return [_row_to_cycle(row) for row in rows]
+
 
 def _row_to_session(row: asyncpg.Record) -> DriveSession:
     return DriveSession(
@@ -123,6 +170,22 @@ def _row_to_session(row: asyncpg.Record) -> DriveSession:
         started_at=row["started_at"],
         ended_at=row["ended_at"],
         status=row["status"],
+        cycle_id=str(row["cycle_id"]) if row["cycle_id"] is not None else None,
+    )
+
+
+def _row_to_cycle(row: asyncpg.Record) -> LearningCycle:
+    detail = row["detail"]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    return LearningCycle(
+        id=str(row["id"]),
+        profile_id=str(row["profile_id"]),
+        status=row["status"],
+        started_at=row["started_at"],
+        ended_at=row["ended_at"],
+        detail=detail if detail is not None else {},
+        session_count=int(row["session_count"]),
     )
 
 

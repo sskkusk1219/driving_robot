@@ -27,6 +27,11 @@ DDL_STATEMENTS = [
     ALTER TABLE vehicle_profiles
         ADD COLUMN IF NOT EXISTS feedforward_params JSONB
     """,
+    # 先読み補償(preview_time_s)・FOPDT同定値(k, tau, theta)を保持する動特性パラメータ
+    """
+    ALTER TABLE vehicle_profiles
+        ADD COLUMN IF NOT EXISTS dynamics_params JSONB
+    """,
     """
     CREATE TABLE IF NOT EXISTS calibration_data (
         id              UUID PRIMARY KEY,
@@ -78,6 +83,37 @@ DDL_STATEMENTS = [
         status      TEXT NOT NULL CHECK (status IN ('running', 'completed', 'error', 'emergency'))
     )
     """,
+    # 学習サイクル（学習運転〜PID適合の全セッションを1サイクルに紐付ける）
+    """
+    CREATE TABLE IF NOT EXISTS learning_cycles (
+        id          UUID PRIMARY KEY,
+        profile_id  UUID NOT NULL REFERENCES vehicle_profiles(id),
+        status      TEXT NOT NULL CHECK (status IN ('running','completed','error','aborted')),
+        started_at  TIMESTAMPTZ NOT NULL,
+        ended_at    TIMESTAMPTZ,
+        detail      JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+    """,
+    """
+    ALTER TABLE drive_sessions
+        ADD COLUMN IF NOT EXISTS cycle_id UUID REFERENCES learning_cycles(id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_drive_sessions_cycle_id
+        ON drive_sessions (cycle_id)
+    """,
+    # run_type CHECK制約に 'tuning'(PID適合走行) を追加する。Postgres は既存 CHECK 制約を
+    # ADD CONSTRAINT IF NOT EXISTS で条件緩和できないため、旧制約を drop してから作り直す
+    # （calibration_data_profile_id_key の DO ブロックと同方針）。
+    """
+    DO $$
+    BEGIN
+        ALTER TABLE drive_sessions DROP CONSTRAINT IF EXISTS drive_sessions_run_type_check;
+        ALTER TABLE drive_sessions
+            ADD CONSTRAINT drive_sessions_run_type_check
+            CHECK (run_type IN ('auto', 'manual', 'learning', 'tuning'));
+    END $$;
+    """,
     """
     CREATE TABLE IF NOT EXISTS drive_logs (
         id                BIGSERIAL PRIMARY KEY,
@@ -102,9 +138,13 @@ DDL_STATEMENTS = [
         pedal_points   JSONB NOT NULL,
         button_events  JSONB NOT NULL,
         total_duration DOUBLE PRECISION NOT NULL,
-        loop           BOOLEAN NOT NULL DEFAULT FALSE,
         created_at     TIMESTAMPTZ NOT NULL
     )
+    """,
+    # ループ再生機能を廃止したため既存DBから loop 列を削除
+    """
+    ALTER TABLE time_schedules
+        DROP COLUMN IF EXISTS loop
     """,
     # architecture.md 定義の3インデックス
     """

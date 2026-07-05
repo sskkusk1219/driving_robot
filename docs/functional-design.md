@@ -178,7 +178,6 @@ class TimeSchedule:
     pedal_points: list[PedalPoint]    # 時系列のアクセル・ブレーキ開度
     button_events: list[ButtonEvent]  # 時系列のボタン押下イベント
     total_duration: float        # 総時間 [s]
-    loop: bool                   # ループ再生の有無
     created_at: datetime
 
 @dataclass
@@ -206,10 +205,11 @@ class DriveSession:
     id: str                      # UUID
     profile_id: str              # FK → vehicle_profiles
     mode_id: str | None          # FK → driving_modes（自動運転時）
-    run_type: str                # 'auto' | 'manual' | 'learning'
+    run_type: str                # 'auto' | 'manual' | 'learning' | 'tuning'
     started_at: datetime
     ended_at: datetime | None
     status: str                  # 'running' | 'completed' | 'error' | 'emergency'
+    cycle_id: str | None         # FK → learning_cycles（学習サイクル参加中のみ設定）
 
 # Table: drive_logs（100ms周期）
 @dataclass
@@ -225,6 +225,19 @@ class DriveLog:
     brake_pos: int               # ブレーキ位置 [pulse]
     accel_current: float         # アクセル電流値 [mA]
     brake_current: float         # ブレーキ電流値 [mA]
+
+# Table: learning_cycles
+# 学習運転〜PID適合の一連のセッションを1サイクルとして束ねる（20260703-learning-process-revamp）。
+# 学習運転開始で新サイクルが開設され（drive_sessions.cycle_id を付与）、以降の適合走行
+# （run_type='tuning'）が同一サイクルへ参加する。manual・通常autoは cycle_id=NULL のまま。
+@dataclass
+class LearningCycle:
+    id: str                      # UUID
+    profile_id: str              # FK → vehicle_profiles
+    status: str                  # 'running' | 'completed' | 'error' | 'aborted'
+    started_at: datetime
+    ended_at: datetime | None
+    detail: dict                 # JSONB。段階別ゲイン/コスト/モデルパス/メトリクス
 ```
 
 ---
@@ -235,8 +248,10 @@ class DriveLog:
 erDiagram
     vehicle_profiles ||--o{ drive_sessions : "使用"
     vehicle_profiles ||--o| calibration_data : "持つ"
+    vehicle_profiles ||--o{ learning_cycles : "使用"
     driving_modes ||--o{ drive_sessions : "使用"
     drive_sessions ||--o{ drive_logs : "記録"
+    learning_cycles ||--o{ drive_sessions : "束ねる"
 
     vehicle_profiles {
         string id PK
@@ -281,6 +296,16 @@ erDiagram
         datetime started_at
         datetime ended_at
         string status
+        string cycle_id FK
+    }
+
+    learning_cycles {
+        string id PK
+        string profile_id FK
+        string status
+        datetime started_at
+        datetime ended_at
+        json detail
     }
 
     drive_logs {
@@ -397,19 +422,23 @@ FC10 直値移動指令 (レジスタ書き込み後、自動的に移動開始)
 **責務**:
 - I2C経由でPCA9685にPWM信号を設定し、指定チャンネルのボタンサーボ（SG90）を押下／待機位置に駆動
 - ボタンの押下（待機位置 → 押下位置 → 待機位置へ復帰）を、指定した押下時間だけ保持して実行
-- 非常停止・エラー時に全チャンネルを待機位置へ復帰
+- 非常停止・エラー時に全チャンネルを待機位置へ復帰（ソフトウェア経由）
+- 非常停止時にPCA9685の`OE`端子（GPIO22接続）をHIGHにし、I2C通信を待たずハードウェアレベルで全16chのPWM出力を即遮断する（ソフトウェアフリーズ時の最終防衛線）
 
 **設計方針**:
 - `ActuatorDriver` と同様に `Protocol` ベースのインターフェースとし、非ハードウェア環境向けスタブと差し替え可能にする
 - 押下角度は全チャンネル共通のグローバル設定値（待機／押下の2ポジション）。押下時間のみ呼び出し側（タイムスケジュール）で可変
 - PCA9685のI2Cバスはアクセル・ブレーキ用のRS-485バス（Modbus RTU）と独立しており、50ms制御ループと競合しない
+- OE制御はSafetyMonitorの非常停止ディスパッチ（`trigger_emergency()`）から呼び出し、`release_all()`（ソフト経由）と並行してハード遮断も行う二重系とする
 
 ```python
 class ButtonServoDriver:
-    def __init__(i2c_address: int, pwm_freq_hz: int, rest_angle: float, press_angle: float)
+    def __init__(i2c_address: int, pwm_freq_hz: int, rest_angle: float, press_angle: float, oe_gpio: int)
     async def connect() -> None
     async def press(channel: int, duration_s: float) -> None  # 押下 → duration_s 保持 → 待機へ復帰
     async def release_all() -> None                            # 全チャンネルを待機位置へ（非常停止・エラー時）
+    def disable_outputs() -> None                              # OE=HIGHでハードウェア即遮断（非常停止時）
+    def enable_outputs() -> None                                # OE=LOWで出力復帰（初期化・復旧時）
 ```
 
 **チャンネル ⇔ ボタン マッピング**:
@@ -425,7 +454,7 @@ class ButtonServoDriver:
 | 6 | オプション_3 | 14 | オプション_11 |
 | 7 | オプション_4 | 15 | オプション_12 |
 
-**PWM諸元**: I2Cアドレス 0x40（既定）、PWM周波数 50Hz。押下角度は全チャンネル共通のグローバル設定（`config/settings.toml` の `[servo]` セクション）。
+**PWM諸元**: I2Cアドレス 0x40（既定）、PWM周波数 50Hz。押下角度は全チャンネル共通のグローバル設定（`config/settings.toml` の `[servo]` セクション）。OE端子はGPIO22（物理ピン15）に接続し、非常停止時のハードウェア遮断に使用（詳細は `docs/architecture.md` 参照）。
 
 ---
 
@@ -433,8 +462,8 @@ class ButtonServoDriver:
 
 **責務**:
 - 運転モデル（先読み型 多項式Ridge 逆モデル）から符号付き努力量を算出
-- 現在の基準車速と先読み基準車速（0.5/1.0/2.0/3.0 秒先）を入力として努力量を出力
-  （+: 名目アクセル開度 [%]、−: 名目ブレーキ開度 [%]）
+- 現在の基準車速・先読み基準車速（0.5/1.0/2.0/3.0 秒先）・過去基準車速（0.5/1.0 秒前）を
+  入力として努力量を出力（+: 名目アクセル開度 [%]、−: 名目ブレーキ開度 [%]）
 
 ```python
 class FeedforwardController:
@@ -444,20 +473,48 @@ class FeedforwardController:
     def predict_effort(
         v0: float,                       # 現在の基準車速 [km/h]
         future_speeds: Sequence[float],  # 各先読みホライズンの基準車速 [km/h]
+        past_speeds: Sequence[float],    # 各過去ホライズンの基準車速 [km/h]
     ) -> float                           # 努力量 [%]（+加速 / −制動）
 ```
 
 **運転モデル構造** (学習運転ログから生成):
-- 入力: 先読み特徴量 7 次元 `[v0, dv_0.5, dv_1.0, dv_2.0, dv_3.0, v0², dv_1.0·v0]`
-- 推定器: 完全2次多項式展開 → 標準化 → Ridge の Pipeline ×2（`PolynomialFeatures(2)`→`StandardScaler`
-  →`Ridge`）。ブレーキの「不感帯→急制動」非線形を多項式項で表現する（純線形 Ridge では減速 R² が
-  頭打ちだった）。停止時 0 の物理制約は FF 側の停車短絡・負予測クランプで担保する。
-- レジーム: dv_1.0 ≥ 0 → アクセルモデル、< 0 → ブレーキモデル（coast 含む全減速標本で学習）。
-- 学習データ: **直近に実施した学習走行セッションのみ**を使う（過去の旧データ混在を避けるため、train
-  経路が最新の learning セッションを既定対象に解決する。明示の session_ids 指定時はそれを優先）。
-- 外挿対策: 学習観測最高車速 `speed_clip_max` を保存し、推論時に v0・先読み速度を学習域へクリップ
-  （多項式の域外発散を防ぎ学習端で飽和。残差は PID・包絡線ガバナが吸収）。
-- ファイル形式: `.pkl`（model_type = "poly_inverse_lookahead"）
+- 入力: 先読み特徴量。構成は `FeatureSpec` dataclass（`src/domain/model_training.py`）で設定可能
+  （20260703-learning-process-revamp）。デフォルト `DEFAULT_FEATURE_SPEC` は従来の固定9次元と
+  完全一致: `[v0, dv_0.5, dv_1.0, dv_2.0, dv_3.0, v0², dv_1.0·v0, dv_past_0.5, dv_past_1.0]`。
+  過去方向Δv（v0 − 0.5s/1.0s 前の速度）はランプ過渡か定常保持かを識別し、「同じ先読み形状でも
+  開度が違う」曖昧さを解消する。`FeatureSpec` は先読み/過去ホライズン・レジーム判定ホライズン・
+  二次項/交互作用項の有無・加速度項（中央差分 `a_h=(v(t+h)-2v0+v(t-h))/h²`）を切替可能にし、
+  `scripts/evaluate_feature_sets.py` によるオフライン A/B 評価を可能にする。
+- **特徴量セットのオフライン評価結果（2026-07-03、実ログで実施）**: 本番デフォルトは**現行9特徴を維持**する。
+  - **加速度項（中央差分 0.5〜3.0s）・先読み点間の傾き項は不採用**: 全条件（訓練1/4セッション ×
+    holdout規定パターン/実走行モード）で改善なし〜悪化。傾き項は既存Δv特徴の線形結合のため
+    2次多項式+Ridgeでは理論上冗長で、in-sampleのみ改善しholdoutで悪化する（過学習方向）。
+    過去2.0/3.0s の速度点追加（past拡張）も悪化のみ。
+  - **短期先読み（0.1/0.2/0.3s）は訓練データが多いときのみ有効**（訓練4セッションで両holdout
+    -4〜5%、訓練1セッションでは規定パターンholdoutで+6.8%悪化）。学習サイクル運用で訓練データが
+    増えた後に再評価する。
+  - **特徴量選択より訓練データ量の効果が支配的**（baseline同士で訓練1→4セッションで-16%）。
+    holdout R²が負〜0.2に留まる主因は開ループ学習データと閉ループ配備データの分布ギャップであり、
+    学習サイクル2段目（サイクル全ログ再学習）が対処する問題そのもの。
+- 推定器: **完全2次多項式展開＋標準化＋Ridge** の Pipeline ×2。ブレーキの不感帯→急制動等の
+  非線形を多項式項（dv²・dv·v0 等の相互作用）で表現する。停止時 0 の物理制約は FF 側の
+  停車短絡・負予測クランプで担保する。
+  （一時、単調制約付き HistGradientBoosting を試したが、学習パターンに定常巡航サンプルが
+  ほぼ無いため実走行の巡航域で予測が定数に飽和し閉ループ追従が破綻。poly Ridge は同じ外挿域
+  でも滑らかに補間するため復帰した。詳細: `.steering/20260630-learning-wide-speed-range/design.md`）
+- レジーム: `FeatureSpec.regime_horizon_s` の Δv ≥ 0 → アクセルモデル、< 0 → ブレーキモデル
+  （coast 含む全減速標本で学習。既定は dv_1.0）。
+- 学習データ: 手動パス（`/learning/train`）は既定で**直近の学習走行セッションのみ**を使う
+  （`session_ids` または `cycle_id` を明示指定した場合はそれを優先）。学習サイクル
+  （`LearningCycleOrchestrator`）は2段階で学習する: 1段目は学習運転ログのみ、2段目はサイクル内
+  全ログ（学習運転+全PID適合走行）で再学習し、FF逆モデルの学習データに閉ループ走行実績を
+  取り込む（PIDゲインは2段目訓練では上書きしない）。
+- 外挿対策: 学習観測最高車速 `speed_clip_max` を保存し、推論時に v0・先読み/過去速度を学習域へ
+  クリップ（多項式の域外発散を防ぎ学習端で有界。残差は PID・包絡線ガバナが吸収）。
+- ファイル形式: `.pkl`（model_type = "poly_spec_inverse_lookahead"）。`feature_spec` を
+  plain dict で保存し、`FeedforwardController.load_model` がそれを復元して特徴構築・レジーム判定
+  に使う（モジュール定数のハードコード参照はしない）。feature_spec を持たない旧 pkl は
+  ロード時に拒否され再学習を強制する。
 
 **線形モデルで表現できない領域の補完**（FeedforwardParams 定数 + ルール）:
 1. **停車保持**: v0 ≤ 0.5km/h かつ 0.5 秒先 ≤ 0.5km/h → `-stop_brake_opening_pct`
@@ -707,11 +764,16 @@ class LearningDriveManager:
 - 同時踏み禁止: 各フェーズは片ペダルのみ非ゼロ。最終段で `enforce_pedal_exclusion` を通し、自動走行
   （PedalArbiter）と学習走行の双方で構造的に同時踏みを起こさない。
 - クリープ安定待ち（CREEP_SETTLE）: accel=brake=0 で車速が安定するまで保持しクリープ車速・加速率を採る。
+- 不感帯プローブ（ACCEL_DEADBAND_PROBE）: CREEP_SETTLE 直後・ACCEL_SWEEP 開始前に、低いアクセル開度
+  （0.5/1.0/2.0/3.0/5.0%）を無ランプ・昇順で数秒ずつ保持し、開度→応答（加速度）曲線からアクセル不感帯を
+  推定するサンプルを採る。ブレーキ不感帯は BRAKE_HOLD の低開度段（1/2/3/5%）が兼ねる。
 - 非常停止: 過電流・CAN 断・サイクル例外は非常停止。包絡超過（G/速度）は非常停止せずガバナ/能動制動で守る。
 
 **運転モデルの学習は model_training モジュールが担う**（`/drive/learning/train`）:
 - 連続走行ログから先読み 多項式Ridge 逆モデルを学習し `model_path` に保存。
-- `estimate_dynamics_params` がクリープ車速・クリープ加速率等の物理定数を推定しプロファイルへ反映。
+- `estimate_dynamics_params` がクリープ車速・クリープ加速率・アクセル/ブレーキ不感帯等の物理定数を
+  推定しプロファイルへ反映（不感帯は開度→応答曲線のオンセット検出、他は中央値。いずれもサンプル不足時は
+  既存値を保持）。
 
 ---
 
@@ -736,23 +798,60 @@ FF が名目開度を出し PID は残差（追従誤差）だけを補正する
 - 既存の自動走行経路（`start_auto_drive`／走行前チェック・非常停止経路を含む）で走行し、
   `KPIMonitor` の集計（`last_kpi_summary`）を `tuning_cost` で正規化スカラーへ写像。
 - `validate` は 1 回走行して KPI・コストを提示（API のみ）。`refine` は `CoordinateDescentTuner`（座標降下）が
-  Kp/Ki/Kd を反復探索（既定最大 15 回）し最良ゲインを保存。hard 上限違反は 100x ペナルティで
-  自動棄却、走行中の非常停止は `PidTuningAborted` で中断する。
+  Kp/Ki/Kd を反復探索（`max_runs` 指定・既定15回）し最良ゲインを保存。hard 上限違反は 100x ペナルティで
+  自動棄却、走行中の非常停止は `PidTuningAborted` で中断する。適合走行のセッションは `run_type='tuning'`
+  で記録される（通常の自動走行 `'auto'` と区別可能。20260703-learning-process-revamp で分離）。
+  `run_pid_tuning_session` は `release_on_finish`（正常完了時に停車保持ブレーキを解放するか）と
+  `on_run`（走行ごとの進捗コールバック。中断検知に使用）を受け付け、`LearningCycleOrchestrator`
+  （後述）と手動 `/pid-tune/refine` の両方から共有される。
 - **適合中は逸脱（基準車速からの乖離）による自動非常停止を無効化する**（`DriveLoop(disable_deviation_check=True)`）。
   未適合ゲインの追従誤差が逸脱しきい値を超えて非常停止すると適合自体が成立しないため。過電流・CAN 断・
   サイクルウォッチドッグ等の他の安全網は維持する。KPI 集計も従来どおり行う（コスト評価に必要）。
 
-**学習運転フロー（4 ステップ・自動連続）**: 学習運転ページ（`learning.js`）は学習走行の正常終了
-（RUNNING→READY）を契機に、①開度パターン走行 → ②モデル作成 → ③PID 初期値設定（=A の `/learning/train`）
-→ ④規定パターン走行で PID 最適化（=B の `/pid-tune/refine`）を**自動で一気通貫**実行する。④は内部で
-RUNNING→READY を繰り返すため `busyRef` で学習の再トリガーを抑止する。学習ページのグラフには基準パターン
-（ref 線）を描画せず実車速のみ表示し、規定パターン内容は文字情報で提示する。
-
 **学習終了 → 適合への橋渡し（緩減速・停止確認）**: 学習の最終パターンは惰行/減速の途中で終わり車両が
-転動したまま終わることがある。その状態で④の規定パターン（0km/h 始点）を走らせると追従誤差が大きく
+転動したまま終わることがある。その状態で規定パターン（0km/h 始点）を走らせると追従誤差が大きく
 逸脱扱いになるため、`stop_learning_drive` は READY へ遷移する前に **~0.1G の緩減速で停止を確認**してから
 停車保持ブレーキへ移行する（`_decelerate_to_stop`：閉ループでブレーキ開度を調整し車速が停車しきい値
 未満へ収束するまで待つ）。原点復帰はせず停止保持を維持し、適合セッション完了時に解放する。
+
+---
+
+### LearningCycleOrchestrator（学習サイクル・オーケストレータ）
+
+`src/app/learning_cycle.py`。WebUI の「学習サイクル開始」ボタン1操作から、学習運転〜訓練〜PID適合
+〜再学習〜PID適合の全フェーズを自動進行させる（20260703-learning-process-revamp。旧
+`learning.js` のクライアント側自動チェーン `busyRef`/`wasRunningRef` は本オーケストレータへ置き換え、
+削除済み — 残すとオーケストレーション中の READY 遷移のたびに二重発火していた）。
+
+**フェーズ**: `IDLE → ARMING → LEARNING → TRAINING_1 → REFINE_1 → TRAINING_2 → REFINE_2 →
+COMPLETED`（中断時 `ABORTED`、エラー時 `ERROR`）。
+
+1. **ARMING/LEARNING**: `arm_learning_drive` → `start_learning_drive` で学習サイクル（`learning_cycles`
+   行）を開設し `cycle_id` を採番。この2ステップは `start()` 呼び出し内で同期実行し、応答時に
+   `cycle_id` を返す（車速収束待ちで数秒かかる）。以降は非同期タスクで進行する。
+2. **TRAINING_1**: 学習運転セッションのログのみで `training_service.train_and_apply`
+   （`update_pid_gains=True`）を実行し、運転モデル + SIMC初期ゲインを算出。
+3. **REFINE_1**: 規定パターンで座標降下適合（既定 `refine_runs_stage1=10` 回）。
+   `release_on_finish=False` で停車保持ブレーキを維持したまま次フェーズへ。最良ゲインを永続化。
+4. **TRAINING_2**: サイクル内**全**セッション（学習運転+全適合走行）のログで再学習
+   （`update_pid_gains=False`。1段目の座標降下結果をSIMC値で上書きしない）。
+5. **REFINE_2**: 座標降下適合（既定 `refine_runs_stage2=5` 回）。1段目ゲインから継続し、
+   `release_on_finish=True` で完了時に原点復帰・解放。
+6. **COMPLETED**: `learning_cycles.detail` に段階別ゲイン/コスト/モデルパス/メトリクスを記録して終了。
+
+**安全不変条件**: 学習運転終了（停車保持）〜2段目適合完了までの全期間、車両は停車保持ブレーキで
+静止し続ける。例外・中断発生時は必ず `release_stop_hold`（両軸原点復帰）を実行してから
+`learning_cycles` 行をクローズする。
+
+**中断**: `abort()` は中断フラグを立て、走行中（RUNNING）なら `controller.stop()` で即座に停止させる。
+チェックポイントはフェーズ境界と PID 適合の `on_run` コールバック（次走行開始前）。中断済みサイクルの
+セッション群は有効な学習データとして残り、`cycle_id` 指定の手動再学習に使える。
+
+**進捗配信**: `CycleProgress`（phase・run_index/run_total・best_cost・message）を WebSocket の
+`cycle_progress` フィールドで100ms周期配信する（`RealtimeData.cycle_progress`）。
+
+**手動パスとの関係**: 既存の個別API（`/learning/arm`・`/learning/start`・`/learning/train`・
+`/pid-tune/refine` 等）はそのまま維持され、手動で個別フェーズを実行する経路として使える。
 
 ---
 
@@ -1006,19 +1105,58 @@ sequenceDiagram
                 end
             end
             LL->>RC: on_complete
-            RC->>HW: home_return() 両軸
+            RC->>HW: ~0.1G緩減速→停止確認→停車保持ブレーキ（_decelerate_to_stop、原点復帰はしない）
             RC->>LW: end_session(status='completed')
-            RC-->>UI: READY
-            Note over UI,LW: 以降は learning.js が自動で一気通貫実行（busyRef で再トリガー抑止）
-            UI->>RC: /learning/train（モデル作成＋PID初期値: FOPDT同定→SIMC）
-            RC-->>UI: model_path・metrics（MAE/RMSE/R²）・pid_gains
-            UI->>RC: /pid-tune/refine（規定パターン走行でPID最適化, max_runs=15）
-            loop 最大15回（座標降下）
-                RC->>HW: 規定パターン走行（上限G/最高車速厳守）→ KPI集計
-            end
-            RC->>RC: 最良ゲインを保存・反映（refresh_active_profile）
-            RC-->>UI: 最良 pid_gains・最良コスト・履歴
+            RC-->>UI: READY（停車保持のまま）
+            Note over UI,LW: 手動パスはここで終了（学習運転単体）。以降の訓練・PID適合は<br/>個別APIを都度呼ぶか、UC7の学習サイクルへ委ねる
         end
+    end
+```
+
+---
+
+### UC7: 学習サイクル（2段階学習フロー全自動）
+
+```mermaid
+sequenceDiagram
+    participant Op as オペレーター
+    participant UI as Web UI
+    participant OR as LearningCycleOrchestrator
+    participant RC as RobotController
+    participant TS as training_service
+    participant HW as アクチュエータ
+
+    Op->>UI: 「学習サイクル開始」ボタン押下→確認ポップアップ「はい」
+    UI->>OR: POST /learning-cycle/start
+    OR->>RC: arm_learning_drive() → start_learning_drive()
+    RC->>RC: learning_cycles 行を開設（cycle_id 採番）
+    OR-->>UI: 202 {cycle_id, status: "started"}（応答まで数秒。以降は非同期）
+
+    Note over OR,HW: フェーズはバックグラウンドタスクで進行。<br/>進捗は WebSocket cycle_progress で100ms周期配信
+
+    OR->>OR: LEARNING: 学習運転完了待ち（_learning_complete イベント）
+    OR->>TS: TRAINING_1: train_and_apply(学習セッション, update_pid_gains=True)
+    TS-->>OR: model_path・SIMC初期ゲイン
+    OR->>RC: REFINE_1: run_pid_tuning_session(max_runs=10, release_on_finish=False)
+    loop 最大10回（座標降下）
+        RC->>HW: 規定パターン走行（停車保持のまま次走行へ）→ KPI集計
+    end
+    OR->>OR: 最良ゲインを永続化・反映
+    OR->>TS: TRAINING_2: train_and_apply(サイクル全セッション, update_pid_gains=False)
+    TS-->>OR: 再学習モデル（1段目ゲインは上書きしない）
+    OR->>RC: REFINE_2: run_pid_tuning_session(max_runs=5, release_on_finish=True)
+    loop 最大5回（座標降下、1段目ゲインから継続）
+        RC->>HW: 規定パターン走行 → KPI集計
+    end
+    RC->>HW: 原点復帰（両軸解放）
+    OR->>OR: 最良ゲインを永続化・反映、learning_cycles.detail 記録
+    OR-->>UI: WebSocket cycle_progress: phase=COMPLETED
+
+    alt 中断（オペレーターが「中断」押下）
+        Op->>UI: 中断ボタン押下
+        UI->>OR: POST /learning-cycle/abort
+        OR->>RC: 走行中なら stop()（即座に停止）
+        OR->>OR: 次のチェックポイントで検知しABORTEDへ遷移、原点復帰
     end
 ```
 
@@ -1115,19 +1253,30 @@ Response: DriveSessionResponse
 POST /api/v1/drive/manual/stop
 Response: { "status": "ok" }
 
-# 学習運転（arm→確認→start/cancel→自動で train→pid-tune）
+# 学習運転（手動パス: arm→確認→start/cancel）
 POST /api/v1/drive/learning/arm | /start | /cancel
 POST /api/v1/drive/learning/train
-Body: { "profile_id": "uuid", "session_ids": [...]? }
+Body: { "profile_id": "uuid", "session_ids": [...]?, "cycle_id": "uuid"? }
+# session_ids 指定時はそれを優先。次に cycle_id（サイクル内全セッションで学習）。
+# いずれも無指定なら直近の学習走行セッションを既定対象にする。
 Response: TrainModelResponse { model_path, metrics{accel/brake: mae/rmse/r2/n}, pid_gains, pid_auto_tuned }
 
-# PID自動適合（規定パターン走行）
+# PID自動適合（規定パターン走行・手動パス）
 POST /api/v1/drive/pid-tune/validate   # 1回走行して KPI・コスト（API のみ）
 Body: { "profile_id": "uuid" }
 Response: { kpi_summary, cost, pid_gains }
 POST /api/v1/drive/pid-tune/refine     # 反復走行で最適化し最良ゲインを保存
 Body: { "profile_id": "uuid", "max_runs": 15 }
 Response: { pid_gains, best_cost, history }
+
+# 学習サイクル（学習運転→訓練→PID適合→再学習→PID適合を1操作で自動実行）
+POST /api/v1/drive/learning-cycle/start
+Body: { "refine_runs_stage1": 10?, "refine_runs_stage2": 5? }  # 省略時は config/settings.toml [learning] の既定値
+Response: 202 { "cycle_id": "uuid", "status": "started" }      # 409: READY以外/実行中、404: プロファイル未選択、422: 走行前チェック不合格
+POST /api/v1/drive/learning-cycle/abort
+Response: 200 { "status": "aborting" }                         # 409: 実行中でない
+GET /api/v1/drive/learning-cycle/status
+Response: CycleProgressSchema { cycle_id, phase, run_index, run_total, best_cost, message, started_at }
 ```
 
 ### プロファイル管理（`/api/v1/profiles/`）
@@ -1202,7 +1351,11 @@ POST   /api/v1/drive/schedule/stop
 
 ```
 GET    /api/v1/sessions/
-Response: list[SessionResponse]
+Response: list[SessionResponse]   # SessionResponse に cycle_id（学習サイクル参加時のみ non-null）を含む
+
+GET    /api/v1/sessions/cycles
+Response: list[CycleSummaryResponse] { id, profile_id, status, started_at, ended_at, session_count, detail }
+# ログ画面でのサイクル単位グループ表示（1サイクル=1折りたたみ項目）に使う
 
 GET    /api/v1/sessions/{session_id}
 Response: SessionResponse | 404
@@ -1227,7 +1380,16 @@ Push (100ms周期):
   "accel_opening": 42.3,
   "brake_opening": 0.0,
   "accel_current_ma": 850.0,
-  "brake_current_ma": 120.0
+  "brake_current_ma": 120.0,
+  "cycle_progress": {                 // 学習サイクル未実行時は null
+    "cycle_id": "uuid",
+    "phase": "REFINE_1",
+    "run_index": 3,
+    "run_total": 10,
+    "best_cost": 0.42,
+    "message": "PID適合を実行しています（3/10回）",
+    "started_at": "ISO8601"
+  }
 }
 ```
 

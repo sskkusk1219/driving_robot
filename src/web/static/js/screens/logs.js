@@ -1,20 +1,49 @@
 // ── Logs screen ───────────────────────────────────────────
+// セッション一覧は cycle_id でグループ表示する（1学習サイクル=1折りたたみ項目:
+// 学習運転1件+PID適合走行N件）。cycle_id が無いセッション（manual・通常auto）は
+// 従来どおりフラット表示する。
+
+const RUN_TYPE_LABEL = {
+  auto: '自動走行',
+  learning: '学習運転',
+  manual: '手動運転',
+  tuning: 'PID適合走行',
+};
+
+const CYCLE_STATUS_LABEL = {
+  running: '実行中',
+  completed: '完了',
+  error: 'エラー',
+  aborted: '中断',
+};
+
+function formatDuration(startedAt, endedAt) {
+  if (!endedAt) return '実行中';
+  const diff = Math.round((new Date(endedAt) - new Date(startedAt)) / 1000);
+  return `${Math.floor(diff / 60)} 分 ${diff % 60} 秒`;
+}
 
 function LogsScreen() {
   const { useState, useEffect, useContext } = React;
   const { apiFetch } = useContext(window.AppContext);
-  const { INK, PAPER, PAPER_2, HATCH, Btn, H2, Note } = window;
+  const { Note } = window;
 
   const [sessions, setSessions] = useState([]);
+  const [cycles, setCycles] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [logs, setLogs] = useState(null);
   const [loadingLogs, setLoadingLogs] = useState(false);
+  const [expandedCycleId, setExpandedCycleId] = useState(null);
 
   useEffect(() => { loadSessions(); }, []);
 
   async function loadSessions() {
-    const data = await apiFetch('GET', '/api/v1/sessions/');
-    if (data) setSessions(data);
+    const [sessData, cycleData] = await Promise.all([
+      apiFetch('GET', '/api/v1/sessions/'),
+      apiFetch('GET', '/api/v1/sessions/cycles'),
+    ]);
+    if (sessData) setSessions(sessData);
+    if (cycleData) setCycles(cycleData);
   }
 
   async function handleSelect(id) {
@@ -26,63 +55,131 @@ function LogsScreen() {
     if (d) setLogs(d);
   }
 
-  const RUN_TYPE_LABEL = {
-    auto: '自動走行',
-    learning: '学習運転',
-    manual: '手動運転',
-  };
-
-  function formatDuration(startedAt, endedAt) {
-    if (!endedAt) return '実行中';
-    const diff = Math.round((new Date(endedAt) - new Date(startedAt)) / 1000);
-    return `${Math.floor(diff / 60)} 分 ${diff % 60} 秒`;
+  // cycle_id を持つセッションはサイクル配下へ、持たないセッションはフラットのまま。
+  const membersByCycle = {};
+  const flatSessions = [];
+  for (const s of sessions) {
+    if (s.cycle_id) {
+      (membersByCycle[s.cycle_id] ??= []).push(s);
+    } else {
+      flatSessions.push(s);
+    }
+  }
+  for (const members of Object.values(membersByCycle)) {
+    members.sort((a, b) => new Date(a.started_at) - new Date(b.started_at));
   }
 
+  const items = [
+    ...flatSessions.map(s => ({ kind: 'session', startedAt: s.started_at, session: s })),
+    ...cycles.map(c => ({ kind: 'cycle', startedAt: c.started_at, cycle: c, members: membersByCycle[c.id] || [] })),
+  ].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+
+  const sessionRowProps = { selectedId, onSelect: handleSelect, loadingLogs, logs };
+
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', height: '100%', padding: 32 } },
-    sessions.length === 0
+    items.length === 0
       ? React.createElement(Note, null, 'セッションログがありません。')
       : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto', flex: 1, minHeight: 0 } },
-          ...sessions.map(s => {
-            const isSelected = s.id === selectedId;
-            return React.createElement('div', { key: s.id },
-              React.createElement('div', {
-                style: {
-                  padding: '14px 20px',
-                  background: PAPER_2,
-                  borderRadius: 4,
-                  border: `${isSelected ? 2.5 : 1.5}px solid ${isSelected ? INK : HATCH}`,
-                  cursor: 'pointer',
-                },
-                onClick: () => handleSelect(s.id),
-              },
-                React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
-                  React.createElement('div', { style: { flex: 1 } },
-                    React.createElement('div', { style: { fontWeight: 700, fontSize: 14, marginBottom: 2 } },
-                      `${RUN_TYPE_LABEL[s.run_type] ?? s.run_type}　${new Date(s.started_at).toLocaleString('ja-JP')}`
-                    ),
-                    React.createElement('div', { style: { fontSize: 12, color: '#666' } },
-                      `状態: ${s.status}　時間: ${formatDuration(s.started_at, s.ended_at)}`
-                    ),
-                  ),
-                  React.createElement('span', { style: { fontSize: 18, color: '#888' } }, isSelected ? '▲' : '▼'),
-                ),
-              ),
-              // Log detail panel
-              isSelected && React.createElement('div', {
-                style: { border: `1.5px solid ${HATCH}`, borderTop: 'none', padding: 20, background: PAPER_2 }
-              },
-                loadingLogs
-                  ? React.createElement('div', { style: { fontSize: 13, color: '#888' } }, '読み込み中…')
-                  : logs && logs.length > 0
-                    ? React.createElement(LogDetail, { sessionId: s.id, logs })
-                    : React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 } },
-                        React.createElement('span', { style: { fontSize: 13, color: '#888' } }, 'ログデータなし'),
-                        React.createElement(CsvDownloadButton, { sessionId: s.id }),
-                      ),
-              ),
-            );
-          }),
+          ...items.map(item => item.kind === 'session'
+            ? React.createElement(SessionRow, { key: item.session.id, s: item.session, ...sessionRowProps })
+            : React.createElement(CycleGroup, {
+                key: item.cycle.id,
+                cycle: item.cycle,
+                members: item.members,
+                expanded: expandedCycleId === item.cycle.id,
+                onToggle: () => setExpandedCycleId(prev => prev === item.cycle.id ? null : item.cycle.id),
+                ...sessionRowProps,
+              })
+          ),
         ),
+  );
+}
+
+// 1件のセッション行 + 展開時のログ詳細パネル。フラット表示・サイクル配下表示の両方で使う。
+function SessionRow({ s, selectedId, onSelect, loadingLogs, logs, nested = false }) {
+  const { INK, PAPER_2, HATCH } = window;
+  const isSelected = s.id === selectedId;
+  return React.createElement('div', { key: s.id },
+    React.createElement('div', {
+      style: {
+        padding: nested ? '10px 16px' : '14px 20px',
+        background: nested ? 'transparent' : PAPER_2,
+        borderRadius: 4,
+        border: `${isSelected ? 2.5 : 1.5}px solid ${isSelected ? INK : HATCH}`,
+        cursor: 'pointer',
+      },
+      onClick: () => onSelect(s.id),
+    },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
+        React.createElement('div', { style: { flex: 1 } },
+          React.createElement('div', { style: { fontWeight: 700, fontSize: nested ? 13 : 14, marginBottom: 2 } },
+            `${RUN_TYPE_LABEL[s.run_type] ?? s.run_type}　${new Date(s.started_at).toLocaleString('ja-JP')}`
+          ),
+          React.createElement('div', { style: { fontSize: 12, color: '#666' } },
+            `状態: ${s.status}　時間: ${formatDuration(s.started_at, s.ended_at)}`
+          ),
+        ),
+        React.createElement('span', { style: { fontSize: 18, color: '#888' } }, isSelected ? '▲' : '▼'),
+      ),
+    ),
+    // Log detail panel
+    isSelected && React.createElement('div', {
+      style: { border: `1.5px solid ${HATCH}`, borderTop: 'none', padding: 20, background: PAPER_2 }
+    },
+      loadingLogs
+        ? React.createElement('div', { style: { fontSize: 13, color: '#888' } }, '読み込み中…')
+        : logs && logs.length > 0
+          ? React.createElement(LogDetail, { sessionId: s.id, logs })
+          : React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 } },
+              React.createElement('span', { style: { fontSize: 13, color: '#888' } }, 'ログデータなし'),
+              React.createElement(CsvDownloadButton, { sessionId: s.id }),
+            ),
+    ),
+  );
+}
+
+// 学習サイクル1件=1折りたたみ項目。展開すると配下セッション（学習1+適合N）を表示する。
+function CycleGroup({ cycle, members, expanded, onToggle, selectedId, onSelect, loadingLogs, logs }) {
+  const { INK, PAPER_2, HATCH } = window;
+  const statusLabel = CYCLE_STATUS_LABEL[cycle.status] ?? cycle.status;
+  return React.createElement('div', { key: cycle.id },
+    React.createElement('div', {
+      style: {
+        padding: '14px 20px',
+        background: PAPER_2,
+        borderRadius: 4,
+        border: `${expanded ? 2.5 : 1.5}px solid ${expanded ? INK : HATCH}`,
+        cursor: 'pointer',
+      },
+      onClick: onToggle,
+    },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
+        React.createElement('div', { style: { flex: 1 } },
+          React.createElement('div', { style: { fontWeight: 700, fontSize: 14, marginBottom: 2 } },
+            React.createElement('span', {
+              style: {
+                display: 'inline-block', marginRight: 8, padding: '0 6px',
+                border: `1px solid ${INK}`, borderRadius: 3, fontSize: 11,
+              },
+            }, '学習サイクル'),
+            `${new Date(cycle.started_at).toLocaleString('ja-JP')}`
+          ),
+          React.createElement('div', { style: { fontSize: 12, color: '#666' } },
+            `状態: ${statusLabel}　時間: ${formatDuration(cycle.started_at, cycle.ended_at)}　セッション数: ${cycle.session_count}`
+          ),
+        ),
+        React.createElement('span', { style: { fontSize: 18, color: '#888' } }, expanded ? '▲' : '▼'),
+      ),
+    ),
+    expanded && React.createElement('div', {
+      style: { border: `1.5px solid ${HATCH}`, borderTop: 'none', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8 },
+    },
+      members.length === 0
+        ? React.createElement('div', { style: { fontSize: 13, color: '#888' } }, 'サイクル配下のセッションがありません。')
+        : members.map(s => React.createElement(SessionRow, {
+            key: s.id, s, selectedId, onSelect, loadingLogs, logs, nested: true,
+          })),
+    ),
   );
 }
 

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -76,9 +76,25 @@ class PIDGainsSchema(BaseModel):
     kd: float
 
 
+class DynamicsParamsSchema(BaseModel):
+    """先読み補償秒数(preview_time_s)と FOPDT 同定値(表示用)。
+
+    preview_time_s はアクチュエータ〜車両系のむだ時間補償として基準軌跡を前倒しする
+    秒数。手動微調整を許容する。fopdt_* は学習サイクルの同定結果（表示用メタデータ）。
+    """
+
+    preview_time_s: float = 0.0
+    fopdt_k: float | None = None
+    fopdt_tau: float | None = None
+    fopdt_theta: float | None = None
+
+
 class TrainModelRequest(BaseModel):
     profile_id: str
     session_ids: list[str] | None = None
+    # 指定時はサイクル内の全セッション（学習運転+全適合走行）のログで学習する。
+    # session_ids と併用時は session_ids を優先する。
+    cycle_id: str | None = None
 
 
 class TrainModelResponse(BaseModel):
@@ -88,6 +104,7 @@ class TrainModelResponse(BaseModel):
     # 学習ログから解析的に自動適合した PID ゲイン。同定不能（区間不足）なら None。
     pid_gains: PIDGainsSchema | None = None
     pid_auto_tuned: bool = False
+    dynamics_params: DynamicsParamsSchema = DynamicsParamsSchema()
 
 
 class PidValidateRequest(BaseModel):
@@ -108,11 +125,42 @@ class PidRefineRequest(BaseModel):
 
 
 class PidRefineResponse(BaseModel):
-    """閉ループ絞り込みの最良ゲインと反復履歴。"""
+    """閉ループ絞り込みの最良ゲイン・先読み補償秒数と反復履歴。"""
 
     pid_gains: PIDGainsSchema
+    preview_time_s: float = 0.0
     best_cost: float
     history: list[dict[str, float]]
+
+
+# ── Learning cycle（2段階学習フローのオーケストレーション）───────────────────────
+
+
+class CycleProgressSchema(BaseModel):
+    """学習サイクルの進捗。WebSocket(RealtimeData.cycle_progress)・status API 共通。"""
+
+    cycle_id: str | None
+    phase: str
+    run_index: int
+    run_total: int
+    best_cost: float | None
+    best_preview_time_s: float | None = None
+    message: str
+    started_at: datetime | None
+
+
+class LearningCycleStartRequest(BaseModel):
+    refine_runs_stage1: int | None = Field(default=None, ge=1, le=50)
+    refine_runs_stage2: int | None = Field(default=None, ge=1, le=50)
+
+
+class LearningCycleStartResponse(BaseModel):
+    cycle_id: str
+    status: str
+
+
+class LearningCycleAbortResponse(BaseModel):
+    status: str
 
 
 class SelectProfileRequest(BaseModel):
@@ -168,6 +216,7 @@ class RealtimeData(BaseModel):
     ups_battery_pct: float | None = None
     ups_on_battery: bool = False
     init_steps: list[InitStepSchema] = []
+    cycle_progress: CycleProgressSchema | None = None
 
 
 # ── Vehicle Profile ───────────────────────────────────────────────────────────
@@ -188,6 +237,7 @@ class ProfileCreateRequest(BaseModel):
     stop_config: StopConfigSchema
     model_path: str | None = None
     feedforward_params: FeedforwardParamsSchema | None = None
+    dynamics_params: DynamicsParamsSchema | None = None
 
     @field_validator("max_accel_opening", "max_brake_opening")
     @classmethod
@@ -214,6 +264,7 @@ class ProfileUpdateRequest(BaseModel):
     stop_config: StopConfigSchema | None = None
     model_path: str | None = None
     feedforward_params: FeedforwardParamsSchema | None = None
+    dynamics_params: DynamicsParamsSchema | None = None
 
     @field_validator("max_accel_opening", "max_brake_opening")
     @classmethod
@@ -242,6 +293,7 @@ class ProfileResponse(BaseModel):
     calibration: CalibrationDataResponse | None
     model_path: str | None
     feedforward_params: FeedforwardParamsSchema
+    dynamics_params: DynamicsParamsSchema = DynamicsParamsSchema()
     created_at: datetime
     updated_at: datetime
 
@@ -301,7 +353,6 @@ class ScheduleResponse(BaseModel):
     total_duration: float
     pedal_point_count: int
     button_event_count: int
-    loop: bool
     created_at: datetime
 
 
@@ -312,7 +363,6 @@ class ScheduleDetailResponse(BaseModel):
     pedal_points: list[PedalPointSchema]
     button_events: list[ButtonEventSchema]
     total_duration: float
-    loop: bool
     created_at: datetime
 
 
@@ -321,7 +371,6 @@ class ScheduleCreateRequest(BaseModel):
     description: str = ""
     pedal_points: list[PedalPointSchema] = Field(default_factory=list)
     button_events: list[ButtonEventSchema] = Field(default_factory=list)
-    loop: bool = False
 
     @field_validator("pedal_points")
     @classmethod
@@ -353,7 +402,6 @@ class ScheduleUpdateRequest(BaseModel):
     description: str | None = None
     pedal_points: list[PedalPointSchema] | None = None
     button_events: list[ButtonEventSchema] | None = None
-    loop: bool | None = None
 
     @field_validator("pedal_points")
     @classmethod
@@ -385,6 +433,19 @@ class SessionResponse(BaseModel):
     started_at: datetime
     ended_at: datetime | None
     status: str
+    cycle_id: str | None = None
+
+
+class CycleSummaryResponse(BaseModel):
+    """学習サイクルの一覧表示用サマリ（ログ画面のグループ表示に使う）。"""
+
+    id: str
+    profile_id: str
+    status: str
+    started_at: datetime
+    ended_at: datetime | None
+    session_count: int
+    detail: dict[str, Any]
 
 
 class LogResponse(BaseModel):

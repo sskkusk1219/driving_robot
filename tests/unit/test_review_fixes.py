@@ -180,7 +180,7 @@ class TestStartDriveEmergencyRace:
         log_writer = MagicMock()
 
         async def start_session_with_estop(
-            profile_id: str, mode_id: str | None, run_type: str
+            profile_id: str, mode_id: str | None, run_type: str, cycle_id: str | None = None
         ) -> str:
             # DB INSERT の await 中に GPIO 非常停止が割り込んだ状況を模擬
             await ctrl.emergency_stop()

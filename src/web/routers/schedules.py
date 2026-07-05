@@ -42,7 +42,6 @@ def _to_response(s: TimeSchedule) -> ScheduleResponse:
         total_duration=s.total_duration,
         pedal_point_count=len(s.pedal_points),
         button_event_count=len(s.button_events),
-        loop=s.loop,
         created_at=s.created_at,
     )
 
@@ -69,7 +68,6 @@ def _to_detail_response(s: TimeSchedule) -> ScheduleDetailResponse:
             for e in s.button_events
         ],
         total_duration=s.total_duration,
-        loop=s.loop,
         created_at=s.created_at,
     )
 
@@ -106,7 +104,6 @@ async def create_schedule(req: ScheduleCreateRequest, repo: ScheduleRepo) -> Sch
         pedal_points=pedal_points,
         button_events=button_events,
         total_duration=_total_duration(pedal_points, button_events),
-        loop=req.loop,
         created_at=datetime.now(tz=UTC),
     )
     try:
@@ -159,7 +156,6 @@ async def update_schedule(
         pedal_points=pedal_points,
         button_events=button_events,
         total_duration=_total_duration(pedal_points, button_events),
-        loop=req.loop if req.loop is not None else existing.loop,
         created_at=existing.created_at,
     )
     try:

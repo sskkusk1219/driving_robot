@@ -17,7 +17,6 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
-from src.domain.control.pedal_safety import enforce_pedal_exclusion
 from src.models.drive_log import DriveLogData
 from src.models.profile import VehicleProfile
 from src.models.system_state import RealtimeSnapshot
@@ -256,11 +255,10 @@ class ScheduleLoop:
             await self._abort_emergency()
             return
 
-        # タイムラインからペダル開度を補間 → クランプ → 同時踏み排除
+        # タイムラインからペダル開度を補間 → クランプ（同時踏みはタイムスケジュールでは許可する）
         accel_opening, brake_opening = interpolate_pedal(self._schedule.pedal_points, t)
         accel_opening = self._clamp_accel(accel_opening)
         brake_opening = self._clamp_brake(brake_opening)
-        accel_opening, brake_opening = enforce_pedal_exclusion(accel_opening, brake_opening)
         self._current_accel_opening = accel_opening
         self._current_brake_opening = brake_opening
 
@@ -321,14 +319,10 @@ class ScheduleLoop:
             )
         )
 
-        # タイムライン終端: loop なら巻き戻し、そうでなければ正常終了
+        # タイムライン終端: 正常終了
         if t >= self._schedule.total_duration:
-            if self._schedule.loop:
-                self._start_time = now
-                self._next_event_idx = 0
-            else:
-                self.stop()
-                await self._on_complete()
+            self.stop()
+            await self._on_complete()
 
     async def _drive_axis(self, driver: ActuatorDriverProtocol, pos: int) -> float:
         await driver.move_to_position(pos)

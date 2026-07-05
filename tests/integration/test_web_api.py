@@ -100,6 +100,106 @@ async def test_profiles_get_404() -> None:
     assert res.status_code == 404
 
 
+def _profile_create_payload(**overrides: object) -> dict:
+    payload: dict = {
+        "name": "Prof1",
+        "max_accel_opening": 80.0,
+        "max_brake_opening": 80.0,
+        "max_speed": 120.0,
+        "max_decel_g": 0.4,
+        "pid_gains": {"kp": 1.0, "ki": 0.1, "kd": 0.0},
+        "stop_config": {"deviation_threshold_kmh": 2.0, "deviation_duration_s": 4.0},
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_profile_put_preserves_arbiter_constants(inject_controller: MagicMock) -> None:
+    """PUT で feedforward_params の一部だけ送っても調停定数（switch_hysteresis_pct 等）が
+    デフォルトへリセットされず維持されること（旧 _ffp_to_schema/_ffp_from_schema の
+    6/11 フィールド欠落バグの回帰）。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        create_res = await c.post(
+            "/api/v1/profiles/",
+            json=_profile_create_payload(
+                feedforward_params={
+                    "creep_speed_kmh": 8.0,
+                    "switch_hysteresis_pct": 1.2,
+                    "accel_reengage_dwell_s": 0.5,
+                    "accel_rate_limit_pct_s": 150.0,
+                    "brake_rate_limit_pct_s": 250.0,
+                    "pid_output_limit_pct": 40.0,
+                },
+            ),
+        )
+        assert create_res.status_code == 201
+        profile_id = create_res.json()["id"]
+        assert create_res.json()["feedforward_params"]["switch_hysteresis_pct"] == 1.2
+
+        # 別フィールド（stop_config）だけを更新する PUT。feedforward_params は送らない。
+        put_res = await c.put(
+            f"/api/v1/profiles/{profile_id}",
+            json={"stop_config": {"deviation_threshold_kmh": 3.0, "deviation_duration_s": 5.0}},
+        )
+
+    assert put_res.status_code == 200
+    ffp = put_res.json()["feedforward_params"]
+    assert ffp["switch_hysteresis_pct"] == 1.2
+    assert ffp["accel_reengage_dwell_s"] == 0.5
+    assert ffp["accel_rate_limit_pct_s"] == 150.0
+    assert ffp["brake_rate_limit_pct_s"] == 250.0
+    assert ffp["pid_output_limit_pct"] == 40.0
+
+
+@pytest.mark.asyncio
+async def test_profile_dynamics_params_roundtrip_and_manual_preview_update(
+    inject_controller: MagicMock,
+) -> None:
+    """dynamics_params(preview_time_s・FOPDT値)が作成時に保存され、PUT で preview だけ
+    手動更新できること。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        create_res = await c.post(
+            "/api/v1/profiles/",
+            json=_profile_create_payload(
+                dynamics_params={
+                    "preview_time_s": 0.6,
+                    "fopdt_k": 0.5,
+                    "fopdt_tau": 2.0,
+                    "fopdt_theta": 0.6,
+                },
+            ),
+        )
+        assert create_res.status_code == 201
+        body = create_res.json()
+        assert body["dynamics_params"]["preview_time_s"] == 0.6
+        assert body["dynamics_params"]["fopdt_theta"] == 0.6
+        profile_id = body["id"]
+
+        put_res = await c.put(
+            f"/api/v1/profiles/{profile_id}",
+            json={"dynamics_params": {"preview_time_s": 1.1}},
+        )
+
+    assert put_res.status_code == 200
+    dyn = put_res.json()["dynamics_params"]
+    # 手動更新時は FOPDT 値もスキーマのデフォルト(None)で上書きされる仕様
+    # （同スキーマで受けて上書き可能とする設計上の想定挙動）。
+    assert dyn["preview_time_s"] == 1.1
+
+
+@pytest.mark.asyncio
+async def test_profile_created_without_dynamics_params_defaults_to_zero_preview(
+    inject_controller: MagicMock,
+) -> None:
+    """dynamics_params を指定しない作成は preview_time_s=0.0（従来動作互換）になること。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/profiles/", json=_profile_create_payload())
+
+    assert res.status_code == 201
+    assert res.json()["dynamics_params"]["preview_time_s"] == 0.0
+
+
 @pytest.mark.asyncio
 async def test_modes_list_empty() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -328,7 +428,8 @@ async def test_pid_tune_validate_409_on_invalid_state(inject_controller: MagicMo
 
 @pytest.mark.asyncio
 async def test_pid_tune_refine_saves_best_gains(inject_controller: MagicMock) -> None:
-    """PID 絞り込みが最良ゲインを保存し、履歴・最良コストを返すこと。"""
+    """PID 絞り込みが最良ゲイン・先読み補償秒数を保存し、履歴・最良コストを返すこと。"""
+    from src.domain.pid_tuning import TuningParams
     from src.models.profile import PIDGains, StopConfig, VehicleProfile
 
     prof = VehicleProfile(
@@ -339,10 +440,10 @@ async def test_pid_tune_refine_saves_best_gains(inject_controller: MagicMock) ->
         created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
     )
     await app.state.profile_repo.create(prof)
-    best = PIDGains(kp=2.5, ki=0.4, kd=0.0)
+    best = TuningParams(kp=2.5, ki=0.4, kd=0.0, preview_time_s=0.7)
     history = [
-        {"kp": 1.0, "ki": 0.1, "kd": 0.0, "cost": 3.0},
-        {"kp": 2.5, "ki": 0.4, "kd": 0.0, "cost": 1.2},
+        {"kp": 1.0, "ki": 0.1, "kd": 0.0, "preview_time_s": 0.0, "cost": 3.0},
+        {"kp": 2.5, "ki": 0.4, "kd": 0.0, "preview_time_s": 0.7, "cost": 1.2},
     ]
     inject_controller.run_pid_tuning_session = AsyncMock(return_value=(best, history))
 
@@ -357,9 +458,10 @@ async def test_pid_tune_refine_saves_best_gains(inject_controller: MagicMock) ->
     assert body["best_cost"] == 1.2
     assert len(body["history"]) == 2
     inject_controller.refresh_active_profile.assert_called_once()
-    # 最良ゲインが永続化されていること
+    # 最良ゲイン・先読み補償秒数が永続化されていること
     saved = await app.state.profile_repo.get_by_id("p1")
     assert saved.pid_gains.kp == 2.5
+    assert saved.dynamics_params.preview_time_s == pytest.approx(0.7)
 
 
 @pytest.mark.asyncio
@@ -412,7 +514,6 @@ def _schedule_payload(name: str = "sched-1") -> dict:
             {"time_s": 5.0, "accel_opening": 40.0, "brake_opening": 0.0},
         ],
         "button_events": [{"time_s": 0.5, "channel": 0, "press_duration_s": 1.0}],
-        "loop": False,
     }
 
 

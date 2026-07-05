@@ -5,10 +5,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
-from src.models.drive_log import DriveSession
+from src.models.drive_log import DriveSession, LearningCycle
 from src.utils.time import to_jst_naive
 from src.web.deps import SessionRepoProtocol, get_session_repo
-from src.web.schemas import LogResponse, SessionResponse
+from src.web.schemas import CycleSummaryResponse, LogResponse, SessionResponse
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 
@@ -37,6 +37,19 @@ def _to_response(session: DriveSession) -> SessionResponse:
         started_at=session.started_at,
         ended_at=session.ended_at,
         status=session.status,
+        cycle_id=session.cycle_id,
+    )
+
+
+def _to_cycle_response(cycle: LearningCycle) -> CycleSummaryResponse:
+    return CycleSummaryResponse(
+        id=cycle.id,
+        profile_id=cycle.profile_id,
+        status=cycle.status,
+        started_at=cycle.started_at,
+        ended_at=cycle.ended_at,
+        session_count=cycle.session_count,
+        detail=cycle.detail,
     )
 
 
@@ -44,6 +57,15 @@ def _to_response(session: DriveSession) -> SessionResponse:
 async def list_sessions(repo: SessionRepo) -> list[SessionResponse]:
     sessions = await repo.list_all()
     return [_to_response(s) for s in sessions]
+
+
+@router.get("/cycles", response_model=list[CycleSummaryResponse])
+async def list_cycles(
+    repo: SessionRepo, profile_id: str | None = None
+) -> list[CycleSummaryResponse]:
+    """学習サイクル一覧を返す（ログ画面のサイクル単位グループ表示に使う）。"""
+    cycles = await repo.list_cycles(profile_id=profile_id)
+    return [_to_cycle_response(c) for c in cycles]
 
 
 @router.get("/{session_id}", response_model=SessionResponse)

@@ -39,6 +39,8 @@ def make_manager(
     creep_steps: int = 5,
     hold_duration: float = 3.0,
     *,
+    accel_deadband_probe_pcts: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0, 5.0),
+    accel_deadband_probe_hold_s: float = 3.0,
     accel_sweep_fracs: tuple[float, ...] = (0.3, 0.5, 0.7, 1.0),
     accel_sweep_reset_brake_pct: float = 30.0,
     brake_hold_openings_pct: tuple[float, ...] = (10.0, 20.0, 30.0, 40.0),
@@ -49,6 +51,8 @@ def make_manager(
     cfg = LearningDriveConfig(
         creep_release_steps=creep_steps,
         hold_duration_s=hold_duration,
+        accel_deadband_probe_pcts=accel_deadband_probe_pcts,
+        accel_deadband_probe_hold_s=accel_deadband_probe_hold_s,
         accel_sweep_fracs=accel_sweep_fracs,
         accel_sweep_reset_brake_pct=accel_sweep_reset_brake_pct,
         brake_hold_openings_pct=brake_hold_openings_pct,
@@ -76,6 +80,7 @@ class TestGeneratePatterns:
         assert kinds == {
             PatternKind.CREEP,
             PatternKind.CREEP_SETTLE,
+            PatternKind.ACCEL_DEADBAND_PROBE,
             PatternKind.ACCEL_SWEEP,
             PatternKind.BRAKE_HOLD,
             PatternKind.COAST_DOWN,
@@ -107,8 +112,11 @@ class TestGeneratePatterns:
             assert p.brake_opening >= 0.0
 
     def test_hold_duration_uses_config(self) -> None:
+        # ACCEL_DEADBAND_PROBE は専用の hold_duration_s（accel_deadband_probe_hold_s）を持つため
+        # 汎用の hold_duration_s とは別に検証する。
         patterns = make_manager(hold_duration=2.5).generate_patterns(make_profile())
-        assert all(p.hold_duration_s == 2.5 for p in patterns)
+        non_probe = [p for p in patterns if p.kind is not PatternKind.ACCEL_DEADBAND_PROBE]
+        assert all(p.hold_duration_s == 2.5 for p in non_probe)
 
     def test_creep_release_starts_at_stop_brake_and_decreases_above_zero(self) -> None:
         profile = make_profile(stop_brake_opening_pct=20.0)
@@ -179,7 +187,69 @@ class TestAccelSweep:
         assert sweeps == []
 
 
+class TestAccelDeadbandProbe:
+    def test_probe_openings_ascending_and_match_config(self) -> None:
+        profile = make_profile(max_accel_opening=80.0)
+        probes = [
+            p.accel_opening
+            for p in make_manager(
+                accel_deadband_probe_pcts=(0.5, 1.0, 2.0, 3.0, 5.0)
+            ).generate_patterns(profile)
+            if p.kind is PatternKind.ACCEL_DEADBAND_PROBE
+        ]
+        assert probes == [0.5, 1.0, 2.0, 3.0, 5.0]
+
+    def test_probe_brake_is_zero(self) -> None:
+        profile = make_profile()
+        probes = [
+            p
+            for p in make_manager().generate_patterns(profile)
+            if p.kind is PatternKind.ACCEL_DEADBAND_PROBE
+        ]
+        assert probes
+        assert all(p.brake_opening == 0.0 for p in probes)
+
+    def test_probe_uses_dedicated_hold_duration(self) -> None:
+        profile = make_profile()
+        probes = [
+            p
+            for p in make_manager(
+                hold_duration=3.0, accel_deadband_probe_hold_s=1.5
+            ).generate_patterns(profile)
+            if p.kind is PatternKind.ACCEL_DEADBAND_PROBE
+        ]
+        assert probes
+        assert all(p.hold_duration_s == 1.5 for p in probes)
+
+    def test_probe_clamped_to_max_accel_opening(self) -> None:
+        profile = make_profile(max_accel_opening=2.0)
+        probes = [
+            p.accel_opening
+            for p in make_manager(
+                accel_deadband_probe_pcts=(0.5, 1.0, 2.0, 3.0, 5.0)
+            ).generate_patterns(profile)
+            if p.kind is PatternKind.ACCEL_DEADBAND_PROBE
+        ]
+        assert all(o <= 2.0 + 1e-9 for o in probes)
+
+    def test_zero_max_accel_yields_no_probe(self) -> None:
+        profile = make_profile(max_accel_opening=0.0)
+        probes = [
+            p
+            for p in make_manager().generate_patterns(profile)
+            if p.kind is PatternKind.ACCEL_DEADBAND_PROBE
+        ]
+        assert probes == []
+
+
 class TestBrakeHold:
+    def test_default_brake_hold_openings_include_low_values(self) -> None:
+        """既定の BRAKE_HOLD_OPENINGS_PCT に不感帯推定用の低開度が含まれること。"""
+        from src.domain.learning_drive import BRAKE_HOLD_OPENINGS_PCT
+
+        assert min(BRAKE_HOLD_OPENINGS_PCT) <= 5.0
+
+
     def test_brake_hold_sweeps_several_openings(self) -> None:
         profile = make_profile(max_brake_opening=80.0)
         brakes = sorted(
@@ -247,7 +317,7 @@ class TestCoastDown:
 
 class TestOrdering:
     def test_phases_in_expected_order(self) -> None:
-        # CREEP → CREEP_SETTLE → ACCEL_SWEEP → BRAKE_HOLD → COAST_DOWN の順
+        # CREEP → CREEP_SETTLE → ACCEL_DEADBAND_PROBE → ACCEL_SWEEP → BRAKE_HOLD → COAST_DOWN の順
         patterns = make_manager(coast_down_count=2).generate_patterns(make_profile())
         order = [p.kind for p in patterns]
         first_idx = {
@@ -255,6 +325,7 @@ class TestOrdering:
             for kind in (
                 PatternKind.CREEP,
                 PatternKind.CREEP_SETTLE,
+                PatternKind.ACCEL_DEADBAND_PROBE,
                 PatternKind.ACCEL_SWEEP,
                 PatternKind.BRAKE_HOLD,
                 PatternKind.COAST_DOWN,
@@ -263,6 +334,7 @@ class TestOrdering:
         assert (
             first_idx[PatternKind.CREEP]
             < first_idx[PatternKind.CREEP_SETTLE]
+            < first_idx[PatternKind.ACCEL_DEADBAND_PROBE]
             < first_idx[PatternKind.ACCEL_SWEEP]
             < first_idx[PatternKind.BRAKE_HOLD]
             < first_idx[PatternKind.COAST_DOWN]

@@ -26,6 +26,15 @@ LOG_EVERY_N_CYCLES: int = 2
 # pymodbus のタイムアウト×リトライ（最大十数秒）を待つ間、ペダルが最終指令位置で
 # 凍結したまま安全チェックが走らない時間を 1 秒に短縮する。
 WEDGED_CYCLE_TIMEOUT_S: float = 1.0
+# ブレーキ軸診断（.steering/20260620-modbus-retry-cycle-stall フェーズ3 試行2）:
+# move_to_position（FC16書込）直後の read_current（FC03読取）がほぼ毎サイクル初回
+# タイムアウトする現象を仮説検証するための待機。accel 軸では再現しないため timeout
+# 調整ではなく、書込→読取間の RS-485 半二重切替 / スレーブ内部処理タイミングを疑う。
+# 効果がなければ 0.0 に戻す（試行1の timeout 引き上げは無効と判明済み）。
+BRAKE_PRE_READ_DELAY_S: float = 0.01
+# サイクル内訳診断（フェーズ3 試行2後の残存軽微遅延切り分け用）: CAN 読取・軸駆動の
+# どちらが 50ms 予算超過の原因かをサイクル毎に計測し、閾値超過時のみログする。
+CYCLE_DIAG_THRESHOLD_S: float = 0.08
 # ログ書き込み保留タスクの上限。DB ストール時に 10 件/s で無制限に積み上がるのを防ぎ、
 # 10 時間連続走行のメモリとイベントループ負荷を一定に保つ（走行継続をログより優先）。
 MAX_PENDING_LOG_TASKS: int = 100
@@ -128,9 +137,17 @@ class DriveLoop:
         self._last_cycle_time: float | None = None
         # ウォッチドッグ: 前サイクル未完了による連続スキップ数
         self._consecutive_skips = 0
+        # ストール計測（.steering/20260620-modbus-retry-cycle-stall）: 連続スキップが
+        # 解消するたびに 1 件のストールとして回数・累積時間・最大継続時間を集計する。
+        self._stall_count = 0
+        self._stall_total_s = 0.0
+        self._stall_max_s = 0.0
         self._log_backlog_active = False
         # bisect 用に基準速度の時刻列を前計算（_ref_speed_at はサイクル毎に複数回呼ばれる）
         self._ref_times: list[float] = [p.time_s for p in mode.reference_speed]
+        # 先読み補償（アクチュエータ〜車両系のむだ時間補償）: 制御用の基準速度サンプリングを
+        # この秒数だけ前倒しする。KPI・逸脱判定・ログは now-frame（前倒し前）のまま評価する。
+        self._preview_s: float = max(0.0, profile.dynamics_params.preview_time_s)
         # イベントループはタスクを弱参照でしか保持しないため、GC でサイクルタスクが
         # 実行途中に破棄されないよう強参照を保持する
         self._cycle_task: asyncio.Task[None] | None = None
@@ -156,6 +173,9 @@ class DriveLoop:
         self._deviation_start = None
         self._cycle_count = 0
         self._consecutive_skips = 0
+        self._stall_count = 0
+        self._stall_total_s = 0.0
+        self._stall_max_s = 0.0
         loop = asyncio.get_running_loop()
         self._started_at = loop.time()
         loop.call_later(self._interval_s, self._schedule_next_cycle)
@@ -256,6 +276,19 @@ class DriveLoop:
         """走行中〜終了時点の KPI 集計（P95・最大偏差・符号反転率・ハード違反数）。"""
         return self._kpi.summary()
 
+    @property
+    def stall_summary(self) -> dict[str, float]:
+        """走行中〜終了時点のサイクルストール集計（回数・累積時間・最大継続時間）。
+
+        ストール＝前サイクル未完了（バス再送等）により後続サイクルが連続スキップされた
+        1 エピソード。ウォッチドッグ（非常停止）に至らず解消したものも含む。
+        """
+        return {
+            "stall_count": float(self._stall_count),
+            "stall_total_s": self._stall_total_s,
+            "stall_max_s": self._stall_max_s,
+        }
+
     def _schedule_next_cycle(self) -> None:
         if not self._running:
             return
@@ -279,6 +312,17 @@ class DriveLoop:
                 self._emergency_task.add_done_callback(_log_emergency_error_callback)
                 return
         else:
+            if self._consecutive_skips > 0:
+                stall_duration_s = self._consecutive_skips * self._interval_s
+                self._stall_count += 1
+                self._stall_total_s += stall_duration_s
+                self._stall_max_s = max(self._stall_max_s, stall_duration_s)
+                _logger.warning(
+                    "制御サイクルストール解消: 継続時間=%.2fs (累計 %d 回 / %.2fs)",
+                    stall_duration_s,
+                    self._stall_count,
+                    self._stall_total_s,
+                )
             self._consecutive_skips = 0
             self._cycle_task = asyncio.ensure_future(self._execute_one_cycle())
             self._cycle_task.add_done_callback(self._on_cycle_done)
@@ -306,6 +350,7 @@ class DriveLoop:
             return
 
         loop = asyncio.get_running_loop()
+        _cycle_t0 = loop.time()
         # 一時停止中は経過時間を凍結時点に固定し、基準速度を一定に保つ。
         # 自然完了判定もスキップして、保持区間の途中で走行が終了しないようにする。
         if self._paused:
@@ -317,9 +362,16 @@ class DriveLoop:
                 await self._on_complete()
                 return
 
+        # now-frame: KPI・逸脱判定・ログ・WS 表示はこの基準速度で評価する（前倒ししない）。
         ref_speed = self._ref_speed_at(elapsed_s)
         self._last_ref_speed = ref_speed
-        future_speeds = [self._ref_speed_at(elapsed_s + h) for h in self._ff.horizons]
+        # 制御フレーム: FF・PID はむだ時間補償のため preview_s だけ前倒しした基準速度で動く。
+        t_ctrl = elapsed_s + self._preview_s
+        ref_speed_ctrl = self._ref_speed_at(t_ctrl)
+        future_speeds = [self._ref_speed_at(t_ctrl + h) for h in self._ff.horizons]
+        # 過去方向の基準速度（過去Δv＝ランプ過渡/定常の識別）。走行開始直後（t<horizon）は
+        # _ref_speed_at が先頭点にクランプするため安全。
+        past_speeds = [self._ref_speed_at(t_ctrl - h) for h in self._ff.past_horizons]
 
         try:
             actual_speed = await self._can_reader.read_speed()
@@ -327,10 +379,15 @@ class DriveLoop:
             _logger.exception("CAN 車速取得失敗: 緊急停止")
             await self._abort_emergency()
             return
+        _cycle_t_can = loop.time()
 
         # 運転モデル未ロード（初回学習走行）では FF を 0 とし PID のみで基準を追従する。
         # 収集した連続ログから初回モデルを学習し、以降は FF+PID で精度を上げるブートストラップ。
-        ff_effort = self._ff.predict_effort(ref_speed, future_speeds) if self._ff.has_model else 0.0
+        ff_effort = (
+            self._ff.predict_effort(ref_speed_ctrl, future_speeds, past_speeds)
+            if self._ff.has_model
+            else 0.0
+        )
 
         # 計測 dt: サイクルスキップ（バス遅延）時に固定 dt のままだと微分が
         # スパイクし積分が過小評価されるため、実経過時間を PID と調停器に渡す。
@@ -339,7 +396,7 @@ class DriveLoop:
         self._last_cycle_time = now
 
         pid_u = self._pid.update(
-            ref_speed,
+            ref_speed_ctrl,
             actual_speed,
             dt=dt,
             saturated_high=self._saturated_high,
@@ -386,6 +443,20 @@ class DriveLoop:
             _logger.exception("アクチュエータ通信失敗: 緊急停止")
             await self._abort_emergency()
             return
+        _cycle_t_axes = loop.time()
+        _cycle_total = _cycle_t_axes - _cycle_t0
+        if _cycle_total > CYCLE_DIAG_THRESHOLD_S:
+            # dt（前サイクルとの実間隔）が cycle_total よりかなり大きい場合はこのサイクル
+            # 開始前の遅延（イベントループのスケジューリング待ち）が主因、cycle_total 自体が
+            # 大きく CAN/軸駆動のどちらかが突出していればそちらが主因と切り分けられる。
+            _logger.warning(
+                "サイクル内訳(閾値超): 前サイクルとの間隔dt=%.3fs "
+                "本サイクル計測合計=%.3fs（CAN読取=%.3fs 軸駆動gather=%.3fs）",
+                dt,
+                _cycle_total,
+                _cycle_t_can - _cycle_t0,
+                _cycle_t_axes - _cycle_t_can,
+            )
 
         self._last_snapshot = RealtimeSnapshot(
             actual_speed_kmh=actual_speed,
@@ -526,6 +597,8 @@ class DriveLoop:
     async def _drive_brake_axis(self, pos: int) -> float:
         """ブレーキ軸に位置指令を送り電流値を返す（同一バス上で逐次実行）。"""
         await self._brake_driver.move_to_position(pos)
+        # 診断用待機（BRAKE_PRE_READ_DELAY_S 参照）。
+        await asyncio.sleep(BRAKE_PRE_READ_DELAY_S)
         return await self._brake_driver.read_current()
 
 

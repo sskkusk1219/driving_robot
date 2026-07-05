@@ -1,8 +1,9 @@
 import asyncio
+import dataclasses
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from src.domain.control.drive_loop import DriveLoop
@@ -12,6 +13,7 @@ from src.domain.control.pid import PIDController
 from src.domain.control.schedule_loop import ScheduleLoop
 from src.domain.pid_tuning import (
     CoordinateDescentTuner,
+    TuningParams,
     build_tuning_trajectory,
     tuning_cost,
 )
@@ -21,7 +23,7 @@ from src.models.drive_log import DriveLogData, DriveSession
 from src.models.driving_mode import DrivingMode
 from src.models.learning_drive import LearningPattern
 from src.models.pre_check import PreCheckResult
-from src.models.profile import PIDGains, StopConfig, VehicleProfile
+from src.models.profile import StopConfig, VehicleProfile
 from src.models.system_state import (
     InitStep,
     InitStepStatus,
@@ -203,11 +205,23 @@ class PreCheckRunnerProtocol(Protocol):
 class LogWriterProtocol(Protocol):
     """走行セッション・ログの永続化プロトコル。LogWriter が実装する。"""
 
-    async def start_session(self, profile_id: str, mode_id: str | None, run_type: str) -> str: ...
+    async def start_session(
+        self,
+        profile_id: str,
+        mode_id: str | None,
+        run_type: str,
+        cycle_id: str | None = None,
+    ) -> str: ...
 
     async def write_log(self, session_id: str, data: DriveLogData) -> None: ...
 
     async def end_session(self, session_id: str, status: str) -> None: ...
+
+    async def start_cycle(self, profile_id: str) -> str: ...
+
+    async def end_cycle(
+        self, cycle_id: str, status: str, detail: dict[str, Any] | None = None
+    ) -> None: ...
 
 
 class LearningDriveManagerProtocol(Protocol):
@@ -241,6 +255,7 @@ class RobotController:
     _button_servo: ButtonServoProtocol | None
     _log_writer: LogWriterProtocol | None
     _active_learning_task: asyncio.Task[None] | None
+    _active_cycle_id: str | None
     _pending_calib_zero: dict[str, int | None]
     _pending_calib_full: dict[str, int | None]
     _init_steps: list[InitStep]
@@ -282,10 +297,14 @@ class RobotController:
         self._schedule_loop = None
         self._log_writer = None
         self._active_learning_task = None
+        self._active_cycle_id = None
         self._last_kpi_summary: dict[str, float] | None = None
         # 自動走行が完了（stop_auto_drive）または非常停止（emergency_stop）したら set される。
         # PID 自動適合の走行完了待ちに使う。通常 UI 経路では無害な no-op。
         self._drive_complete = asyncio.Event()
+        # 学習走行が完了（stop_learning_drive）または非常停止/停止したら set される。
+        # 学習サイクルオーケストレータの学習走行完了待ちに使う。
+        self._learning_complete = asyncio.Event()
         self._control_interval_s = control_interval_s
         self._log_every_n_cycles = log_every_n_cycles
         self._pending_calib_zero: dict[str, int | None] = {"accel": None, "brake": None}
@@ -308,12 +327,16 @@ class RobotController:
         )
 
     def select_profile(self, profile: VehicleProfile) -> None:
-        """アクティブプロファイルを設定する。STANDBY/READY 状態のみ許可。"""
+        """アクティブプロファイルを設定する。STANDBY/READY 状態のみ許可。
+
+        プロファイル切替は学習サイクルへの参加を終了させる（以降の走行は cycle_id なし）。
+        """
         if self._state not in (RobotState.STANDBY, RobotState.READY):
             raise InvalidStateTransition(
                 f"select_profile は STANDBY/READY 状態でのみ呼べます (現在: {self._state})"
             )
         self._active_profile = profile
+        self._active_cycle_id = None
         if self._pre_check_runner is not None:
             self._pre_check_runner.set_profile(profile)
         self._apply_profile_to_control_stack(profile)
@@ -386,6 +409,11 @@ class RobotController:
         """直近の走行の KPI サマリ（P95・最大偏差・符号反転率・ハード違反数）。"""
         return self._last_kpi_summary
 
+    @property
+    def active_cycle_id(self) -> str | None:
+        """現在参加中の学習サイクル ID。学習運転〜適合走行の間のみ設定される。"""
+        return self._active_cycle_id
+
     def _record_kpi_summary(self, drive_loop: DriveLoop) -> None:
         """走行終了時に KPI 集計をログへ残し、API/検証用に保持する。
 
@@ -404,6 +432,15 @@ class RobotController:
             summary["reversal_max_per_5s"],
             summary["hard_limit_violations"],
             summary["n_samples"],
+        )
+        # ストール切り分け（.steering/20260620-modbus-retry-cycle-stall）: 制御サイクルが
+        # バス再送等で連続スキップされた頻度・累積時間を走行終了時にログへ残す。
+        stall = drive_loop.stall_summary
+        _logger.info(
+            "走行ストールサマリ: 回数=%.0f 累積時間=%.2fs 最大継続時間=%.2fs",
+            stall["stall_count"],
+            stall["stall_total_s"],
+            stall["stall_max_s"],
         )
 
     @property
@@ -628,6 +665,7 @@ class RobotController:
         finally:
             await self._close_session("completed")
             self._last_normal_shutdown = True
+            self._learning_complete.set()  # 学習運転中に呼ばれた場合の完了待ちを起こす（冪等）
 
     async def shutdown(self) -> None:
         """グレースフルシャットダウン: DriveLoop を停止し、ペダル解放とサーボOFFを試みる。
@@ -706,6 +744,7 @@ class RobotController:
             # 先行呼び出しが home_return 失敗等で閉じ損ねた場合に備え、ここでも閉じる（冪等）
             await self._close_session("emergency")
             self._drive_complete.set()  # PID 自動適合の走行完了待ちを起こす（中断検知）
+            self._learning_complete.set()  # 学習サイクルオーケストレータの完了待ちを起こす（同）
             return
         self._transition(RobotState.EMERGENCY)
         # home_return（実機 Modbus）が失敗してもセッションは必ず 'emergency' で閉じる。
@@ -724,6 +763,7 @@ class RobotController:
             await self._close_session("emergency")
             self._last_normal_shutdown = False
             self._drive_complete.set()  # PID 自動適合の走行完了待ちを起こす（中断検知）
+            self._learning_complete.set()  # 学習サイクルオーケストレータの完了待ちを起こす（同）
 
     async def _dispatch_emergency(self) -> None:
         """DriveLoop 内部起因（過電流・逸脱・CAN断・サイクル例外）の非常停止を発火する。
@@ -780,9 +820,12 @@ class RobotController:
         log_writer と profile_id が揃っている場合は drive_sessions に INSERT し、
         DB 採番のセッション ID を返す（以降 write_log/end_session で同 ID を使う）。
         それ以外（DB なし・プロファイル未選択）は UUID をローカル採番し、ログは永続化しない。
+        アクティブな学習サイクルが存在すれば cycle_id を継承する（manual・通常autoは None）。
         """
         if log_writer is not None and profile_id:
-            session_id = await log_writer.start_session(profile_id, mode_id, run_type)
+            session_id = await log_writer.start_session(
+                profile_id, mode_id, run_type, cycle_id=self._active_cycle_id
+            )
             self._log_writer = log_writer
         else:
             session_id = str(uuid4())
@@ -851,6 +894,7 @@ class RobotController:
             started_at=datetime.now(tz=UTC),
             ended_at=None,
             status="running",
+            cycle_id=self._active_cycle_id,
         )
 
     async def _run_tuning_drive(
@@ -874,7 +918,9 @@ class RobotController:
         self._transition(RobotState.RUNNING)
         # mode_id=None: 規定パターンは永続化された DrivingMode ではない（drive_sessions.mode_id は
         # UUID カラムで "pid-tune" を渡すと DataError→500。学習運転と同様に None）。
-        session = await self._begin_session("auto", None, log_writer, RobotState.RUNNING)
+        # run_type="tuning": 通常自動走行（"auto"）と区別し、ログ画面・学習サイクル集計から
+        # PID 適合走行を判別可能にする。
+        session = await self._begin_session("tuning", None, log_writer, RobotState.RUNNING)
         self._build_and_start_drive_loop(
             mode,
             profile,
@@ -911,8 +957,13 @@ class RobotController:
             await self._close_session("completed")
             self._drive_complete.set()
 
-    async def _release_after_tuning(self) -> None:
-        """PID 最適化セッション終了時に停車保持ブレーキを解放（両軸原点復帰）する。"""
+    async def release_stop_hold(self) -> None:
+        """停車保持ブレーキを解放（両軸原点復帰）する。
+
+        PID 最適化セッション終了時の他、学習サイクルオーケストレータ（learning_cycle.py）が
+        フェーズ間で例外・中断が発生した際の安全網としても呼ぶ（READY で停車保持中に
+        呼んでも安全な冪等操作）。
+        """
         await asyncio.gather(
             self._accel_driver.home_return(),
             self._brake_driver.home_return(),
@@ -928,39 +979,76 @@ class RobotController:
         try:
             return await self._run_tuning_drive(profile, log_writer)
         finally:
-            await self._release_after_tuning()  # 停止保持を解放して終了
+            await self.release_stop_hold()  # 停止保持を解放して終了
 
     async def run_pid_tuning_session(
         self,
         profile: VehicleProfile,
         log_writer: LogWriterProtocol | None = None,
         max_runs: int = 15,
-    ) -> tuple[PIDGains, list[dict[str, float]]]:
+        *,
+        release_on_finish: bool = True,
+        on_run: Callable[[int, TuningParams, float], None] | None = None,
+    ) -> tuple[TuningParams, list[dict[str, float]]]:
         """規定パターンを反復走行し座標降下で KPI コストを最小化する。
 
         各走行は走行前チェックなしで停止保持状態から直接実行し、走行間も停止保持を維持する。
-        セッション完了/中断時に停車保持ブレーキを解放（原点復帰）する。
+        探索パラメータは PID ゲイン(kp, ki, kd)に加え、アクチュエータ〜車両系のむだ時間補償
+        である先読み秒数(preview_time_s)も含む4次元（TuningParams）。候補ごとに preview を
+        差し替えたプロファイルで走行する。
+
+        Args:
+            release_on_finish: 正常完了時に停車保持ブレーキを解放（原点復帰）するか。
+                False の場合、正常完了時は保持を維持したまま返す（2段階学習フローの1段目が
+                後続フェーズへ保持を引き継ぐために使う）。例外（中断・非常停止）発生時は
+                この値に関わらず必ず解放する。
+            on_run: 各走行完了ごとに (走行番号[1始まり], 候補パラメータ, コスト) を通知する
+                コールバック。呼び出し元はここで進捗更新・中断判定（例外送出）を行える。
+                送出した例外はそのまま本メソッドから伝播し、ブレーキは解放される。
 
         Returns:
-            (最良ゲイン, 反復履歴) のタプル。履歴は各走行のゲイン・コスト・KPI を含む。
-            最良ゲインは制御スタックへ反映済み（永続化は呼び出し元の責務）。
+            (最良パラメータ, 反復履歴) のタプル。履歴は各走行のゲイン・preview・コスト・KPI
+            を含む。最良ゲインは制御スタックへ反映済み（永続化は呼び出し元の責務）。
         """
         self._assert_tuning_preconditions(profile)
-        tuner = CoordinateDescentTuner(profile.pid_gains, max_runs=max_runs)
+        tuner = CoordinateDescentTuner(TuningParams.from_profile(profile), max_runs=max_runs)
         history: list[dict[str, float]] = []
         try:
+            run_index = 0
             while (cand := tuner.next_candidate()) is not None:
                 self._pid.set_gains(cand.kp, cand.ki, cand.kd)
-                kpi = await self._run_tuning_drive(profile, log_writer)
+                # 候補の preview_time_s を差し替えたプロファイルで走行する
+                # （DriveLoop は走行ごとに再構築されるため注入は自然に効く）。
+                profile_run = dataclasses.replace(
+                    profile,
+                    dynamics_params=dataclasses.replace(
+                        profile.dynamics_params, preview_time_s=cand.preview_time_s
+                    ),
+                )
+                kpi = await self._run_tuning_drive(profile_run, log_writer)
                 cost = tuning_cost(kpi)
                 tuner.report(cand, cost)
+                run_index += 1
                 history.append(
-                    {"kp": cand.kp, "ki": cand.ki, "kd": cand.kd, "cost": cost, **kpi}
+                    {
+                        "kp": cand.kp,
+                        "ki": cand.ki,
+                        "kd": cand.kd,
+                        "preview_time_s": cand.preview_time_s,
+                        "cost": cost,
+                        **kpi,
+                    }
                 )
+                if on_run is not None:
+                    on_run(run_index, cand, cost)
             best = tuner.best
             self._pid.set_gains(best.kp, best.ki, best.kd)  # 最良ゲインを制御スタックへ反映
-        finally:
-            await self._release_after_tuning()  # 停止保持を解放して終了（中断時も）
+        except Exception:
+            await self.release_stop_hold()  # 中断・エラー時は必ず解放
+            raise
+        else:
+            if release_on_finish:
+                await self.release_stop_hold()
         return best, history
 
     def _assert_tuning_preconditions(self, profile: VehicleProfile) -> None:
@@ -1265,6 +1353,10 @@ class RobotController:
         `drive_logs` に記録する（run_type='learning'）。正常完了で
         on_complete=stop_learning_drive により RUNNING→READY 遷移しセッションを
         'completed' で終了する。停止/非常停止でも LearningLoop を止めセッションを終了する。
+
+        新しい学習サイクルを開設し、以降の適合走行（PID自動適合）がこのサイクルに
+        参加できるようにする（_active_cycle_id）。log_writer が無い場合はログを永続化
+        しないためローカル UUID をサイクル ID として採番する。
         """
         if self._state != RobotState.PRE_CHECK:
             raise InvalidStateTransition(
@@ -1280,6 +1372,11 @@ class RobotController:
             self._transition(RobotState.READY)
             raise InvalidStateTransition("学習運転に必要な構成が不足しています")
 
+        self._learning_complete.clear()
+        if log_writer is not None:
+            self._active_cycle_id = await log_writer.start_cycle(profile.id)
+        else:
+            self._active_cycle_id = str(uuid4())
         session = await self._begin_session("learning", None, log_writer, RobotState.PRE_CHECK)
         self._transition(RobotState.RUNNING)
         patterns = self._learning_manager.generate_patterns(profile)
@@ -1339,7 +1436,7 @@ class RobotController:
         ことがあるため、READY へ遷移する前に ~0.1G で減速して停止を確認する（転動したまま適合の
         規定パターンを走らせると追従誤差が大きく逸脱になる）。原点復帰するとシャシダイナモ上で
         車両がクリープし、最適化開始前に再停止・走行前チェックが必要になるため原点復帰はしない。
-        停車保持ブレーキは最適化セッション完了時に解放される（_release_after_tuning）。
+        停車保持ブレーキは最適化セッション完了時に解放される（release_stop_hold）。
         """
         learning_loop = self._learning_loop
         self._learning_loop = None
@@ -1351,6 +1448,7 @@ class RobotController:
         finally:
             self._transition(RobotState.READY)
             await self._close_session("completed")
+            self._learning_complete.set()  # 学習サイクルオーケストレータの完了待ちを起こす
 
     async def _decelerate_to_stop(self, profile: VehicleProfile) -> None:
         """~0.1G の緩減速で車両を停止させ、停止を確認してから停車保持ブレーキへ移行する。

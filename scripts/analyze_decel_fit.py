@@ -21,8 +21,7 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from src.domain.model_training import (
-    _REGIME_COL,
-    FEATURE_NAMES,
+    DEFAULT_FEATURE_SPEC,
     _build_feature_matrix,
     _estimate_offsets,
     _group_by_session,
@@ -32,6 +31,9 @@ from src.infra.profile_repository import ProfileRepository
 from src.infra.session_repository import SessionRepository
 from src.infra.settings import load_settings
 from src.models.drive_log import DriveLog
+
+_REGIME_COL = DEFAULT_FEATURE_SPEC.regime_col()
+_FEATURE_NAMES = DEFAULT_FEATURE_SPEC.feature_names()
 
 
 def _fit_and_score(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
@@ -73,8 +75,10 @@ def _build_decel_samples(
         )
         brake_raw = np.array([lg.brake_opening for lg in session_logs], dtype=float)
         brake_label = np.where(brake_raw >= brake_db, brake_raw, 0.0)
-        offsets = _estimate_offsets([lg.timestamp for lg in session_logs])
-        x, idx = _build_feature_matrix(speed, offsets)
+        timestamps = [lg.timestamp for lg in session_logs]
+        offsets = _estimate_offsets(timestamps, DEFAULT_FEATURE_SPEC.lookahead_horizons_s)
+        past_offsets = _estimate_offsets(timestamps, DEFAULT_FEATURE_SPEC.past_horizons_s)
+        x, idx = _build_feature_matrix(speed, offsets, past_offsets, DEFAULT_FEATURE_SPEC)
         if len(idx) == 0:
             continue
         decel_mask = x[:, _REGIME_COL] < 0.0
@@ -82,7 +86,7 @@ def _build_decel_samples(
         y_parts.append(brake_label[idx][decel_mask])
         raw_parts.append(brake_raw[idx][decel_mask])
     if not x_parts:
-        return np.empty((0, len(FEATURE_NAMES))), np.empty(0), np.empty(0)
+        return np.empty((0, len(_FEATURE_NAMES))), np.empty(0), np.empty(0)
     return np.vstack(x_parts), np.concatenate(y_parts), np.concatenate(raw_parts)
 
 

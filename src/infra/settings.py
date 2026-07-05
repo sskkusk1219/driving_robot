@@ -58,6 +58,9 @@ class SafetySettings:
 class ServoSettings:
     """ボタンサーボ（PCA9685 + SG90）設定。押下角度は全ch共通のグローバル値。"""
 
+    # ボタンサーボ機能全体の有効フラグ。Post-MVP のため既定は無効（未接続扱い）。
+    # 有効化するには config で servo.enabled=true を設定し、PCA9685 を配線すること。
+    enabled: bool = False
     i2c_bus: int = 1
     address: int = 0x40
     pwm_freq_hz: int = 50
@@ -74,6 +77,35 @@ class UpsSettings:
 
 
 @dataclass
+class ModelSettings:
+    """先読み逆モデルの特徴量構成（FeatureSpec 相当）。デフォルトは現行9特徴と完全一致する。
+
+    値の変更は `scripts/evaluate_feature_sets.py` によるオフライン評価の結果を確認してから
+    行うこと（このファイルのデフォルト自体は変更しない。design.md 参照）。
+    """
+
+    lookahead_horizons_s: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
+    past_horizons_s: tuple[float, ...] = (0.5, 1.0)
+    regime_horizon_s: float = 1.0
+    include_v0_sq: bool = True
+    include_dv_regime_x_v0: bool = True
+    accel_horizons_s: tuple[float, ...] = ()
+
+
+@dataclass
+class LearningSettings:
+    """2段階学習フロー（学習サイクル）のデフォルトパラメータ。"""
+
+    # stage1 は kp/ki/kd に加え先読み補償秒数(preview_time_s)も探索する4次元座標降下のため
+    # 10→14 に増やしている（1巡=最大8走行、ベースライン+1巡強を確保）。
+    refine_runs_stage1: int = 14
+    refine_runs_stage2: int = 5
+    # 学習運転（開ループパターン走行）完了待ちのタイムアウト [s]。学習パターン総時間は
+    # マネージャから取得困難なため定数運用とし、余裕を持たせた値にする。
+    learning_timeout_s: float = 600.0
+
+
+@dataclass
 class AppSettings:
     serial: SerialSettings = field(default_factory=SerialSettings)
     can: CanSettings = field(default_factory=CanSettings)
@@ -84,6 +116,8 @@ class AppSettings:
     safety: SafetySettings = field(default_factory=SafetySettings)
     servo: ServoSettings = field(default_factory=ServoSettings)
     ups: UpsSettings = field(default_factory=UpsSettings)
+    model: ModelSettings = field(default_factory=ModelSettings)
+    learning: LearningSettings = field(default_factory=LearningSettings)
 
 
 def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
@@ -107,6 +141,8 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
     safety = SafetySettings(**{k: v for k, v in raw.get("safety", {}).items()})
     servo = ServoSettings(**{k: v for k, v in raw.get("servo", {}).items()})
     ups = UpsSettings(**{k: v for k, v in raw.get("ups", {}).items()})
+    model = _parse_model_settings(raw.get("model", {}))
+    learning = LearningSettings(**{k: v for k, v in raw.get("learning", {}).items()})
 
     return AppSettings(
         serial=serial,
@@ -118,4 +154,34 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
         safety=safety,
         servo=servo,
         ups=ups,
+        model=model,
+        learning=learning,
+    )
+
+
+def _parse_model_settings(raw: dict[str, object]) -> ModelSettings:
+    """`[model]` セクションを ModelSettings へ変換する。
+
+    TOML の配列は list として読み込まれるため、ホライズン系フィールドは tuple へ変換する
+    （`ModelSettings`/`FeatureSpec` は不変なタプルを前提とするため）。
+    """
+    defaults = ModelSettings()
+    lookahead = raw.get("lookahead_horizons_s")
+    past = raw.get("past_horizons_s")
+    accel = raw.get("accel_horizons_s")
+    return ModelSettings(
+        lookahead_horizons_s=(
+            tuple(lookahead) if isinstance(lookahead, list) else defaults.lookahead_horizons_s
+        ),
+        past_horizons_s=(
+            tuple(past) if isinstance(past, list) else defaults.past_horizons_s
+        ),
+        regime_horizon_s=float(raw.get("regime_horizon_s", defaults.regime_horizon_s)),  # type: ignore[arg-type]
+        include_v0_sq=bool(raw.get("include_v0_sq", defaults.include_v0_sq)),
+        include_dv_regime_x_v0=bool(
+            raw.get("include_dv_regime_x_v0", defaults.include_dv_regime_x_v0)
+        ),
+        accel_horizons_s=(
+            tuple(accel) if isinstance(accel, list) else defaults.accel_horizons_s
+        ),
     )

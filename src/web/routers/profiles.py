@@ -1,3 +1,4 @@
+from dataclasses import fields
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import uuid4
@@ -6,10 +7,17 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from src.app.robot_controller import RobotController
 from src.infra.db import DuplicateNameError
-from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
+from src.models.profile import (
+    DynamicsParams,
+    FeedforwardParams,
+    PIDGains,
+    StopConfig,
+    VehicleProfile,
+)
 from src.web.deps import ProfileRepoProtocol, get_controller, get_profile_repo
 from src.web.schemas import (
     CalibrationDataResponse,
+    DynamicsParamsSchema,
     FeedforwardParamsSchema,
     PIDGainsSchema,
     ProfileCreateRequest,
@@ -25,25 +33,20 @@ Controller = Annotated[RobotController, Depends(get_controller)]
 
 
 def _ffp_to_schema(ffp: FeedforwardParams) -> FeedforwardParamsSchema:
-    return FeedforwardParamsSchema(
-        creep_speed_kmh=ffp.creep_speed_kmh,
-        creep_rate_kmhs=ffp.creep_rate_kmhs,
-        engine_brake_decel_kmhs=ffp.engine_brake_decel_kmhs,
-        stop_brake_opening_pct=ffp.stop_brake_opening_pct,
-        brake_deadband_pct=ffp.brake_deadband_pct,
-        accel_deadband_pct=ffp.accel_deadband_pct,
-    )
+    """FeedforwardParams の全フィールドを汎用変換する（フィールド追加時も自動追随）。"""
+    return FeedforwardParamsSchema(**{f.name: getattr(ffp, f.name) for f in fields(ffp)})
 
 
 def _ffp_from_schema(s: FeedforwardParamsSchema) -> FeedforwardParams:
-    return FeedforwardParams(
-        creep_speed_kmh=s.creep_speed_kmh,
-        creep_rate_kmhs=s.creep_rate_kmhs,
-        engine_brake_decel_kmhs=s.engine_brake_decel_kmhs,
-        stop_brake_opening_pct=s.stop_brake_opening_pct,
-        brake_deadband_pct=s.brake_deadband_pct,
-        accel_deadband_pct=s.accel_deadband_pct,
-    )
+    return FeedforwardParams(**{f.name: getattr(s, f.name) for f in fields(FeedforwardParams)})
+
+
+def _dyn_to_schema(dyn: DynamicsParams) -> DynamicsParamsSchema:
+    return DynamicsParamsSchema(**{f.name: getattr(dyn, f.name) for f in fields(dyn)})
+
+
+def _dyn_from_schema(s: DynamicsParamsSchema) -> DynamicsParams:
+    return DynamicsParams(**{f.name: getattr(s, f.name) for f in fields(DynamicsParams)})
 
 
 def _to_response(p: VehicleProfile) -> ProfileResponse:
@@ -74,6 +77,7 @@ def _to_response(p: VehicleProfile) -> ProfileResponse:
         calibration=calib,
         model_path=p.model_path,
         feedforward_params=_ffp_to_schema(p.feedforward_params),
+        dynamics_params=_dyn_to_schema(p.dynamics_params),
         created_at=p.created_at,
         updated_at=p.updated_at,
     )
@@ -108,6 +112,11 @@ async def create_profile(req: ProfileCreateRequest, repo: ProfileRepo) -> Profil
             _ffp_from_schema(req.feedforward_params)
             if req.feedforward_params is not None
             else FeedforwardParams()
+        ),
+        dynamics_params=(
+            _dyn_from_schema(req.dynamics_params)
+            if req.dynamics_params is not None
+            else DynamicsParams()
         ),
     )
     try:
@@ -174,6 +183,11 @@ async def update_profile(
             _ffp_from_schema(req.feedforward_params)
             if req.feedforward_params is not None
             else existing.feedforward_params
+        ),
+        dynamics_params=(
+            _dyn_from_schema(req.dynamics_params)
+            if req.dynamics_params is not None
+            else existing.dynamics_params
         ),
     )
     updated = await repo.update(merged)

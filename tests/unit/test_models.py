@@ -1,9 +1,9 @@
 from datetime import UTC, datetime
 
 from src.models.calibration import CalibrationData
-from src.models.drive_log import DriveLog, DriveLogData, DriveSession
+from src.models.drive_log import DriveLog, DriveLogData, DriveSession, LearningCycle
 from src.models.driving_mode import DrivingMode, SpeedPoint
-from src.models.profile import PIDGains, StopConfig, VehicleProfile
+from src.models.profile import DynamicsParams, PIDGains, StopConfig, VehicleProfile
 from src.models.system_state import RobotState, SystemState
 
 NOW = datetime(2026, 4, 20, 0, 0, 0, tzinfo=UTC)
@@ -68,6 +68,48 @@ class TestVehicleProfile:
         assert p.calibration is not None
         assert p.calibration.is_valid is True
 
+    def test_dynamics_params_defaults_to_zero_preview(self) -> None:
+        """dynamics_params 省略時は preview_time_s=0.0 で従来動作互換であること。"""
+        p = make_profile()
+        assert p.dynamics_params == DynamicsParams()
+        assert p.dynamics_params.preview_time_s == 0.0
+        assert p.dynamics_params.fopdt_k is None
+
+    def test_dynamics_params_explicit(self) -> None:
+        p = VehicleProfile(
+            id="profile-uuid-2",
+            name="Aqua_2025",
+            max_accel_opening=70.0,
+            max_brake_opening=85.0,
+            max_speed=150.0,
+            max_decel_g=0.4,
+            pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
+            stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+            calibration=None,
+            model_path=None,
+            created_at=NOW,
+            updated_at=NOW,
+            dynamics_params=DynamicsParams(
+                preview_time_s=1.2, fopdt_k=2.5, fopdt_tau=0.8, fopdt_theta=0.6
+            ),
+        )
+        assert p.dynamics_params.preview_time_s == 1.2
+        assert p.dynamics_params.fopdt_theta == 0.6
+
+
+class TestDynamicsParams:
+    def test_defaults(self) -> None:
+        dyn = DynamicsParams()
+        assert dyn.preview_time_s == 0.0
+        assert dyn.fopdt_k is None
+        assert dyn.fopdt_tau is None
+        assert dyn.fopdt_theta is None
+
+    def test_explicit_values(self) -> None:
+        dyn = DynamicsParams(preview_time_s=0.9, fopdt_k=1.5, fopdt_tau=1.0, fopdt_theta=0.5)
+        assert dyn.preview_time_s == 0.9
+        assert dyn.fopdt_k == 1.5
+
 
 class TestCalibrationData:
     def test_stroke_fields(self) -> None:
@@ -131,6 +173,60 @@ class TestDriveSession:
         )
         assert session.mode_id is None
         assert session.run_type == "manual"
+
+    def test_cycle_id_defaults_to_none(self) -> None:
+        session = DriveSession(
+            id="session-uuid-3",
+            profile_id="profile-uuid-1",
+            mode_id=None,
+            run_type="learning",
+            started_at=NOW,
+            ended_at=None,
+            status="running",
+        )
+        assert session.cycle_id is None
+
+    def test_cycle_id_set(self) -> None:
+        session = DriveSession(
+            id="session-uuid-4",
+            profile_id="profile-uuid-1",
+            mode_id=None,
+            run_type="tuning",
+            started_at=NOW,
+            ended_at=None,
+            status="running",
+            cycle_id="cycle-uuid-1",
+        )
+        assert session.cycle_id == "cycle-uuid-1"
+
+
+class TestLearningCycle:
+    def test_fields(self) -> None:
+        cycle = LearningCycle(
+            id="cycle-uuid-1",
+            profile_id="profile-uuid-1",
+            status="running",
+            started_at=NOW,
+            ended_at=None,
+            detail={},
+        )
+        assert cycle.status == "running"
+        assert cycle.ended_at is None
+        assert cycle.detail == {}
+        assert cycle.session_count == 0
+
+    def test_session_count(self) -> None:
+        cycle = LearningCycle(
+            id="cycle-uuid-2",
+            profile_id="profile-uuid-1",
+            status="completed",
+            started_at=NOW,
+            ended_at=NOW,
+            detail={"stage1_gains": {"kp": 1.0}},
+            session_count=11,
+        )
+        assert cycle.session_count == 11
+        assert cycle.detail["stage1_gains"]["kp"] == 1.0
 
 
 class TestDriveLog:

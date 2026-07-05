@@ -9,12 +9,20 @@ import pytest
 
 from src.infra.profile_repository import (
     ProfileRepository,
+    _dyn_from_value,
+    _dyn_to_json,
     _ffp_from_value,
     _ffp_to_json,
     _row_to_profile,
 )
 from src.models.calibration import CalibrationData
-from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
+from src.models.profile import (
+    DynamicsParams,
+    FeedforwardParams,
+    PIDGains,
+    StopConfig,
+    VehicleProfile,
+)
 
 PROFILE_ID = str(uuid4())
 PROFILE_UUID = UUID(PROFILE_ID)
@@ -231,6 +239,7 @@ class TestFeedforwardParamsPersistence:
             "stop_config": '{"deviation_threshold_kmh": 2.0, "deviation_duration_s": 4.0}',
             "model_path": None,
             "feedforward_params": '{"creep_speed_kmh": 8.5}',
+            "dynamics_params": None,
             "created_at": datetime.now(tz=UTC),
             "updated_at": datetime.now(tz=UTC),
         }
@@ -249,11 +258,13 @@ class TestFeedforwardParamsPersistence:
             "stop_config": '{"deviation_threshold_kmh": 2.0, "deviation_duration_s": 4.0}',
             "model_path": None,
             "feedforward_params": None,
+            "dynamics_params": None,
             "created_at": datetime.now(tz=UTC),
             "updated_at": datetime.now(tz=UTC),
         }
         profile = _row_to_profile(row)
         assert profile.feedforward_params == FeedforwardParams()
+        assert profile.dynamics_params == DynamicsParams()
 
     @pytest.mark.asyncio
     async def test_create_serializes_feedforward_params(self) -> None:
@@ -279,6 +290,120 @@ class TestFeedforwardParamsPersistence:
         args = conn.execute.call_args[0]
         assert any(isinstance(a, str) and "creep_speed_kmh" in a for a in args)
         assert result.feedforward_params.creep_speed_kmh == 9.0
+
+
+class TestDynamicsParamsPersistence:
+    def test_dyn_from_value_none_returns_defaults(self) -> None:
+        assert _dyn_from_value(None) == DynamicsParams()
+
+    def test_dyn_from_value_partial_json_merges_defaults(self) -> None:
+        dyn = _dyn_from_value('{"preview_time_s": 1.2, "fopdt_theta": 0.8}')
+        assert dyn.preview_time_s == 1.2
+        assert dyn.fopdt_theta == 0.8
+        # 欠損キーはデフォルト
+        assert dyn.fopdt_k == DynamicsParams().fopdt_k
+        assert dyn.fopdt_tau == DynamicsParams().fopdt_tau
+
+    def test_dyn_from_value_accepts_dict(self) -> None:
+        dyn = _dyn_from_value({"preview_time_s": 0.5})
+        assert dyn.preview_time_s == 0.5
+
+    def test_dyn_roundtrip(self) -> None:
+        dyn = DynamicsParams(
+            preview_time_s=1.5, fopdt_k=2.0, fopdt_tau=1.1, fopdt_theta=0.7
+        )
+        assert _dyn_from_value(_dyn_to_json(dyn)) == dyn
+
+    def test_row_to_profile_parses_dynamics_params(self) -> None:
+        row = {
+            "id": PROFILE_UUID,
+            "name": "Car",
+            "max_accel_opening": 80.0,
+            "max_brake_opening": 60.0,
+            "max_speed": 120.0,
+            "max_decel_g": 0.4,
+            "pid_gains": '{"kp": 1.0, "ki": 0.0, "kd": 0.0}',
+            "stop_config": '{"deviation_threshold_kmh": 2.0, "deviation_duration_s": 4.0}',
+            "model_path": None,
+            "feedforward_params": None,
+            "dynamics_params": '{"preview_time_s": 0.9, "fopdt_theta": 0.9}',
+            "created_at": datetime.now(tz=UTC),
+            "updated_at": datetime.now(tz=UTC),
+        }
+        profile = _row_to_profile(row)
+        assert profile.dynamics_params.preview_time_s == 0.9
+        assert profile.dynamics_params.fopdt_theta == 0.9
+
+    def test_row_to_profile_null_dynamics_params_defaults(self) -> None:
+        row = {
+            "id": PROFILE_UUID,
+            "name": "Car",
+            "max_accel_opening": 80.0,
+            "max_brake_opening": 60.0,
+            "max_speed": 120.0,
+            "max_decel_g": 0.4,
+            "pid_gains": '{"kp": 1.0, "ki": 0.0, "kd": 0.0}',
+            "stop_config": '{"deviation_threshold_kmh": 2.0, "deviation_duration_s": 4.0}',
+            "model_path": None,
+            "feedforward_params": None,
+            "dynamics_params": None,
+            "created_at": datetime.now(tz=UTC),
+            "updated_at": datetime.now(tz=UTC),
+        }
+        profile = _row_to_profile(row)
+        assert profile.dynamics_params == DynamicsParams()
+
+    @pytest.mark.asyncio
+    async def test_create_serializes_dynamics_params(self) -> None:
+        pool, conn = make_mock_pool()
+        repo = ProfileRepository(pool)
+        profile = VehicleProfile(
+            id=str(uuid4()),
+            name="DynCar",
+            max_accel_opening=80.0,
+            max_brake_opening=60.0,
+            max_speed=120.0,
+            max_decel_g=0.4,
+            pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+            stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+            calibration=None,
+            model_path=None,
+            created_at=datetime.now(tz=UTC),
+            updated_at=datetime.now(tz=UTC),
+            dynamics_params=DynamicsParams(preview_time_s=1.3),
+        )
+        result = await repo.create(profile)
+        args = conn.execute.call_args[0]
+        assert any(isinstance(a, str) and "preview_time_s" in a for a in args)
+        assert result.dynamics_params.preview_time_s == 1.3
+
+    @pytest.mark.asyncio
+    async def test_update_serializes_dynamics_params(self) -> None:
+        pool, conn = make_mock_pool()
+        conn.execute.return_value = "UPDATE 1"
+        repo = ProfileRepository(pool)
+        profile = VehicleProfile(
+            id=PROFILE_ID,
+            name="DynCar",
+            max_accel_opening=80.0,
+            max_brake_opening=60.0,
+            max_speed=120.0,
+            max_decel_g=0.4,
+            pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+            stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+            calibration=None,
+            model_path=None,
+            created_at=datetime.now(tz=UTC),
+            updated_at=datetime.now(tz=UTC),
+            dynamics_params=DynamicsParams(preview_time_s=2.1, fopdt_theta=0.6),
+        )
+
+        result = await repo.update(profile)
+
+        args = conn.execute.call_args[0]
+        assert any(isinstance(a, str) and "preview_time_s" in a for a in args)
+        assert result is not None
+        assert result.dynamics_params.preview_time_s == 2.1
 
 
 class TestDeleteProfile:
