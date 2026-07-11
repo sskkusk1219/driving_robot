@@ -21,6 +21,9 @@ class _FakeWS:
     def __init__(self) -> None:
         self.sent: list[str] = []
 
+    async def accept(self) -> None:
+        pass
+
     async def send_text(self, data: str) -> None:
         self.sent.append(data)
 
@@ -130,15 +133,23 @@ async def test_broadcast_includes_cycle_progress_when_orchestrator_present(
 
     async def _ok() -> RealtimeSnapshot:
         return RealtimeSnapshot(
-            actual_speed_kmh=0.0, accel_pos=0, brake_pos=0, accel_current_ma=0.0,
+            actual_speed_kmh=0.0,
+            accel_pos=0,
+            brake_pos=0,
+            accel_current_ma=0.0,
             brake_current_ma=0.0,
         )
 
     app = _make_app(_make_controller(_ok))
     orchestrator = MagicMock()
     orchestrator.progress = CycleProgress(
-        cycle_id="cycle-1", phase=CyclePhase.REFINE_1, run_index=2, run_total=10,
-        best_cost=0.42, message="PID適合を実行しています", started_at=datetime.now(tz=UTC),
+        cycle_id="cycle-1",
+        phase=CyclePhase.REFINE_1,
+        run_index=2,
+        run_total=10,
+        best_cost=0.42,
+        message="PID適合を実行しています",
+        started_at=datetime.now(tz=UTC),
     )
     app.state.cycle_orchestrator = orchestrator
 
@@ -159,7 +170,10 @@ async def test_broadcast_cycle_progress_none_without_orchestrator(
 
     async def _ok() -> RealtimeSnapshot:
         return RealtimeSnapshot(
-            actual_speed_kmh=0.0, accel_pos=0, brake_pos=0, accel_current_ma=0.0,
+            actual_speed_kmh=0.0,
+            accel_pos=0,
+            brake_pos=0,
+            accel_current_ma=0.0,
             brake_current_ma=0.0,
         )
 
@@ -167,6 +181,106 @@ async def test_broadcast_cycle_progress_none_without_orchestrator(
     data = await _run_until_message(app, fake_connection)
 
     assert data["cycle_progress"] is None
+
+
+@pytest.mark.asyncio
+async def test_broadcast_skips_redundant_send_when_unchanged(
+    fake_connection: _FakeWS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E4 回帰テスト: timestamp 以外が不変なら再送を省略する（アイドル時の無駄な送信削減）。
+
+    同一の broadcast_loop インスタンスを継続稼働させ、値が不変のまま複数ティック
+    経過しても送信件数が 1 件目から増えないことを確認する
+    （last_payload は broadcast_loop 呼び出し毎にリセットされるため、新しいループ
+    インスタンスを作ると常に1件目が送信されてしまい検証にならない）。
+    """
+    from src.models.system_state import RealtimeSnapshot
+
+    monkeypatch.setattr(ws, "WS_BROADCAST_INTERVAL_S", 0.01)
+    ws.manager.needs_full_send = False  # 直前のテストの残留状態をリセット
+
+    async def _ok() -> RealtimeSnapshot:
+        return RealtimeSnapshot(
+            actual_speed_kmh=0.0,
+            accel_pos=0,
+            brake_pos=0,
+            accel_current_ma=0.0,
+            brake_current_ma=0.0,
+        )
+
+    app = _make_app(_make_controller(_ok))
+    task = asyncio.create_task(ws.broadcast_loop(app))
+    try:
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while not fake_connection.sent:
+            if asyncio.get_event_loop().time() > deadline:
+                raise AssertionError("broadcast_loop がメッセージを配信しなかった")
+            await asyncio.sleep(0.01)
+        # 初回送信（needs_full_send=False でも last_payload は None→値で変化するため送信される）
+        assert len(fake_connection.sent) == 1
+
+        # 値が完全に不変のまま同一ループで複数ティック経過させる
+        await asyncio.sleep(0.1)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert len(fake_connection.sent) == 1  # 追加送信は発生しない
+
+
+@pytest.mark.asyncio
+async def test_broadcast_forces_send_for_newly_connected_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E4 回帰テスト: ループ稼働中に新規接続したクライアントは、値が不変でも
+    次ティックで必ず現在値を受け取る（変更検知による送信スキップで無表示にならない）。"""
+    from src.models.system_state import RealtimeSnapshot
+
+    monkeypatch.setattr(ws, "WS_BROADCAST_INTERVAL_S", 0.01)
+
+    async def _ok() -> RealtimeSnapshot:
+        return RealtimeSnapshot(
+            actual_speed_kmh=0.0,
+            accel_pos=0,
+            brake_pos=0,
+            accel_current_ma=0.0,
+            brake_current_ma=0.0,
+        )
+
+    app = _make_app(_make_controller(_ok))
+    first = _FakeWS()
+    ws.manager._connections.append(first)  # type: ignore[arg-type]
+    second = _FakeWS()
+    try:
+        task = asyncio.create_task(ws.broadcast_loop(app))
+        try:
+            # 1件目が送信され値が安定するのを待つ（needs_full_send を消費させる）
+            deadline = asyncio.get_event_loop().time() + 2.0
+            while not first.sent:
+                if asyncio.get_event_loop().time() > deadline:
+                    raise AssertionError("初回配信がされなかった")
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.03)  # 値不変のまま数ティック経過させる
+
+            # 稼働中に新規クライアントが接続する
+            await ws.manager.connect(second)  # type: ignore[arg-type]
+            deadline = asyncio.get_event_loop().time() + 2.0
+            while not second.sent:
+                if asyncio.get_event_loop().time() > deadline:
+                    raise AssertionError("新規接続したクライアントへ配信されなかった")
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    finally:
+        ws.manager.disconnect(first)  # type: ignore[arg-type]
+        ws.manager.disconnect(second)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

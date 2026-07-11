@@ -11,8 +11,9 @@ graph TB
 
         subgraph ControlLayer["制御レイヤー (asyncio)"]
             RobotController[RobotController<br/>メインループ 50ms]
-            FFController[FeedforwardController<br/>運転モデル]
+            FFController[FeedforwardController<br/>運転モデル＋ゲインスケジュール]
             PIDController[PIDController<br/>フィードバック]
+            ILCService[ILCService<br/>反復学習補正]
             SafetyMonitor[SafetyMonitor<br/>常時監視]
         end
 
@@ -44,6 +45,7 @@ graph TB
     WebUI <-->|内部API| RobotController
     RobotController --> FFController
     RobotController --> PIDController
+    RobotController --> ILCService
     RobotController --> SafetyMonitor
     RobotController --> AccelDriver
     RobotController --> BrakeDriver
@@ -238,6 +240,21 @@ class LearningCycle:
     started_at: datetime
     ended_at: datetime | None
     detail: dict                 # JSONB。段階別ゲイン/コスト/モデルパス/メトリクス
+
+# Table: ilc_tables
+# 反復学習制御（ILC）の時刻別補正 effort を profile×mode 単位で永続化する（Stage C）。
+# 主キーは (profile_id, mode_id)。モードの基準軌跡変更・リセットで削除される。
+@dataclass
+class ILCTable:
+    profile_id: str              # FK → vehicle_profiles（複合PK）
+    mode_id: str                 # FK → driving_modes（複合PK）
+    enabled: bool                # 補正の適用・学習の有効/無効
+    iteration: int               # 学習反復回数（0=未学習）
+    dt_s: float                  # 補正グリッド周期 [s]（0.1）
+    efforts: list[float]         # JSONB。時刻別補正 effort [%]（+加速/−制動、±10%）
+    best_p95_kmh: float | None   # 最良走行 p95（発散検知の基準）
+    kpi_history: list[dict]      # JSONB。反復ごとの p95/max/reversal（収束表示用）
+    updated_at: datetime
 ```
 
 ---
@@ -249,7 +266,9 @@ erDiagram
     vehicle_profiles ||--o{ drive_sessions : "使用"
     vehicle_profiles ||--o| calibration_data : "持つ"
     vehicle_profiles ||--o{ learning_cycles : "使用"
+    vehicle_profiles ||--o{ ilc_tables : "持つ"
     driving_modes ||--o{ drive_sessions : "使用"
+    driving_modes ||--o{ ilc_tables : "持つ"
     drive_sessions ||--o{ drive_logs : "記録"
     learning_cycles ||--o{ drive_sessions : "束ねる"
 
@@ -555,19 +574,29 @@ pid_correction = Kp * error + Ki * ∫error dt + Kd * d(error)/dt
 （飽和方向への積分は停止、|Ki·∫| ≤ output_limit、出力は ±output_limit）
 ```
 
-**FF+PID出力合成とペダル調停** (DriveLoop → PedalArbiter):
+**plan+trim+ILC出力合成とペダル調停** (DriveLoop → PedalArbiter):
 ```
-# FF と PID を符号付き努力量として合成（+: 加速、−: 制動）
-effort = ff_controller.predict_effort(ref_speed, future_speeds) + pid_correction
+# 名目 effort（ペダルプラン）・トリム補正・ILC を符号付き努力量として合成（+: 加速、−: 制動）
+base_effort = plan.effort_at(elapsed_s)          # 走行開始時に焼き込んだ名目 effort（now-frame）
+phase       = plan.phase_at(elapsed_s)           # DRIVE / COAST / BRAKE / STOP_HOLD
+trim_u      = trim.update(ref_speed_pid, actual, phase=phase, gain_scale=g(v)/g_nominal)
+ilc_effort  = ilc.effort_at(elapsed_s) if ilc else 0.0  # 反復学習補正（任意・±10%）
+
+# フェーズ権限: 速い補正層が非アクティブなら向きを制限（DRIVE≥0/COAST=0/BRAKE≤0/STOP_HOLDはプラン値）
+effort = apply_phase_authority(base_effort + trim_u + ilc_effort, phase, trim.is_fast_active)
 
 # ペダルへの写像は PedalArbiter のみが行う（同時踏みは構造的に発生しない）
 out = arbiter.arbitrate(effort, dt)
 # out.accel_opening / out.brake_opening（高々一方のみ非ゼロ）
-# out.saturated_high / saturated_low → 次サイクルの PID 条件付き積分へ
+# out.saturated_high / saturated_low → 次サイクルのトリム条件付き積分へ
 ```
 
-> 旧実装（PID 補正の符号分割 + アクセル優先排他）は、FF アクセル中の減速権限喪失と
-> FF ブレーキのバンバン制御を生むため廃止した（2026-06-11 コードレビュー指摘 #1）。
+> トリム（TrimController）は偏差の大きさで凍結帯（|偏差|≤0.1・ペダルを動かさない）／低速トリム
+> （0.1〜0.5・レート制限＋量子化）／速い補正層（≥0.5・プロファイル PID×ゲインスケジュール）を切り替え、
+> 人間的な「ゆっくり少し直す」操作を機構化する。速い補正層は max≤1.0km/h の安全網。ペダルプランが
+> クリープ発進・エンジンブレーキ優先・停止中保持・不要切替排除を構造的に保証する。KPI は学習サイクルの
+> VERIFY フェーズで合格させる。プランなし（FF 未ロードのブートストラップ）は FF を毎サイクル評価し速い
+> 補正層 PID を直結する従来経路にフォールバックする。ILC は同一モード反復走行の残差補正（下記）。
 
 ---
 
@@ -608,10 +637,43 @@ class PedalArbiter:
 
 ```python
 class KPIMonitor:
-    def update(ref_kmh: float, actual_kmh: float, now_s: float) -> None  # 毎サイクル
+    def update(ref_kmh, actual_kmh, now_s, accel_opening=None) -> None  # 毎サイクル
     def summary() -> dict[str, float]
-    # {n_samples, max_abs_deviation_kmh, p95_kmh, reversal_max_per_5s, hard_limit_violations}
+    # {n_samples, max_abs_deviation_kmh, p95_kmh, reversal_max_per_5s, hard_limit_violations,
+    #  over_limit_integral_kmhs, time_over_limit_s,
+    #  accel_on_count, accel_on_per_min, pedal_travel_pct}  # ペダル活動度（ハンチング指標）
 ```
+
+`accel_opening` を渡すとアクセル ON-OFF 立ち上がり回数（ハンチング指標）を集計する。PID 自動適合の
+`tuning_cost` はこの `accel_on_per_min` にも重みを掛け、偏差 KPI を満たしても操作が過剰にハンチング
+する解を選ばないようにする（B-7）。
+
+---
+
+### ILCService（反復学習制御）
+
+**責務**:
+- 走行開始時に profile×mode の補正テーブルをロードして `ILCController` を DriveLoop に注入
+- 走行正常完了後に `drive_logs` の残差から次回の補正テーブルを学習し `ilc_tables` に永続化
+
+**フロー**:
+1. **prepare**（走行前）: `ilc_repo.get(profile, mode)` → 有効かつ efforts 非空なら `ILCController` を返す。
+   無効・未学習・失敗時は None（補正なしで走行継続。ILC は安全の前提にしない）
+2. **合成**（走行中）: DriveLoop が `ilc.effort_at(elapsed_s)` を FF+PID に加算（±10% クランプ）
+3. **learn_from_session**（走行後・正常完了のみ）: 残差 e(t)=ref−actual から
+   `u_{j+1}(t)=clip(Q(u_j(t)+L·e_j(t+Δ)), ±10%)` を計算し upsert（Q=ゼロ位相ローパス、L=0.4/fopdt_k、
+   Δ=fopdt_theta）。発散検知（今回 p95 > 最良 p95×1.2）で学習スキップ。手動/非常停止では学習しない
+
+```python
+class ILCService:
+    async def prepare(profile, mode) -> ILCController | None
+    async def learn_from_session(session_id, profile, mode, kpi_summary) -> None  # fire-and-forget
+```
+
+**WebUI（自動走行画面）**: モード選択時に ILC 状態パネルを表示する（`ILCPanel`）。反復学習 第N回・
+有効/無効・最良 p95・反復ごとの p95 収束列を表示し、有効化/無効化・リセットを操作できる（走行中は
+操作不可）。API は `GET /api/v1/drive/ilc/{profile_id}/{mode_id}` と
+`POST .../{enable|disable|reset}`。モードの基準軌跡変更（`PUT /modes/{id}`）で補正テーブルは自動リセット。
 
 ---
 
@@ -818,17 +880,27 @@ FF が名目開度を出し PID は残差（追従誤差）だけを補正する
 
 ### LearningCycleOrchestrator（学習サイクル・オーケストレータ）
 
-`src/app/learning_cycle.py`。WebUI の「学習サイクル開始」ボタン1操作から、学習運転〜訓練〜PID適合
+`src/app/learning_cycle.py`。WebUI の「学習サイクル開始」ボタンから、学習運転〜訓練〜PID適合
 〜再学習〜PID適合の全フェーズを自動進行させる（20260703-learning-process-revamp。旧
 `learning.js` のクライアント側自動チェーン `busyRef`/`wasRunningRef` は本オーケストレータへ置き換え、
 削除済み — 残すとオーケストレーション中の READY 遷移のたびに二重発火していた）。
 
+**開始フローは自動運転・学習運転単体と同じ arm→確認ポップアップ→start**（2026-07-06 修正。
+20260703 の刷新時に一時的に「ポップアップ表示 → はい で arm+start を同期実行」という誤った順序
+に退行していた — チェック未実施のままポップアップで「開始しますか？」と聞いてしまう不具合）。
+`POST /learning-cycle/arm` → `LearningCycleOrchestrator.arm()` が単独で `controller.arm_learning_drive()`
+を呼びチェックに合格したら PRE_CHECK で確認待ちにする。フロントは応答後に確認ポップアップを表示し、
+「はい」で `POST /learning-cycle/start` → `orchestrator.start()`、「いいえ」で
+`POST /learning-cycle/cancel` → `orchestrator.cancel()` を呼ぶ。
+
 **フェーズ**: `IDLE → ARMING → LEARNING → TRAINING_1 → REFINE_1 → TRAINING_2 → REFINE_2 →
 COMPLETED`（中断時 `ABORTED`、エラー時 `ERROR`）。
 
-1. **ARMING/LEARNING**: `arm_learning_drive` → `start_learning_drive` で学習サイクル（`learning_cycles`
-   行）を開設し `cycle_id` を採番。この2ステップは `start()` 呼び出し内で同期実行し、応答時に
-   `cycle_id` を返す（車速収束待ちで数秒かかる）。以降は非同期タスクで進行する。
+1. **ARMING**: `arm()`（ボタン押下、ポップアップ表示前）が `arm_learning_drive` を呼び、停車保持
+   ブレーキ踏込・車速0収束待ち・走行前チェックを行う（数秒かかる）。合格したプロファイルIDを
+   保持して PRE_CHECK で確認待ちにする。**LEARNING**: 確認ポップアップ「はい」で `start()` が
+   `start_learning_drive` を呼び学習サイクル（`learning_cycles` 行）を開設し `cycle_id` を採番、
+   応答後は非同期タスクで以降のフェーズが進行する。
 2. **TRAINING_1**: 学習運転セッションのログのみで `training_service.train_and_apply`
    （`update_pid_gains=True`）を実行し、運転モデル + SIMC初期ゲインを算出。
 3. **REFINE_1**: 規定パターンで座標降下適合（既定 `refine_runs_stage1=10` 回）。
@@ -1126,31 +1198,47 @@ sequenceDiagram
     participant TS as training_service
     participant HW as アクチュエータ
 
-    Op->>UI: 「学習サイクル開始」ボタン押下→確認ポップアップ「はい」
-    UI->>OR: POST /learning-cycle/start
-    OR->>RC: arm_learning_drive() → start_learning_drive()
-    RC->>RC: learning_cycles 行を開設（cycle_id 採番）
-    OR-->>UI: 202 {cycle_id, status: "started"}（応答まで数秒。以降は非同期）
+    Op->>UI: 「学習サイクル開始」ボタン押下
+    UI->>OR: POST /learning-cycle/arm
+    OR->>RC: arm_learning_drive()（停車保持ブレーキ踏込→車速0収束待ち→走行前チェック）
+    alt チェックNG
+        RC->>RC: ブレーキ原点復帰（home_return）→ READY
+        OR-->>UI: エラー内容表示
+    else チェックOK
+        OR-->>UI: 200 {status: "armed"}（PRE_CHECK・確認待ち）
+        UI-->>Op: 「開始しますか？」ポップアップ
+        alt いいえ
+            Op->>UI: いいえ
+            UI->>OR: POST /learning-cycle/cancel
+            OR->>RC: cancel_learning_drive()（ブレーキリリース→READY）
+        else はい
+            Op->>UI: はい
+            UI->>OR: POST /learning-cycle/start
+            OR->>RC: start_learning_drive()
+            RC->>RC: learning_cycles 行を開設（cycle_id 採番）
+            OR-->>UI: 202 {cycle_id, status: "started"}（以降は非同期）
 
-    Note over OR,HW: フェーズはバックグラウンドタスクで進行。<br/>進捗は WebSocket cycle_progress で100ms周期配信
+            Note over OR,HW: フェーズはバックグラウンドタスクで進行。<br/>進捗は WebSocket cycle_progress で100ms周期配信
 
-    OR->>OR: LEARNING: 学習運転完了待ち（_learning_complete イベント）
-    OR->>TS: TRAINING_1: train_and_apply(学習セッション, update_pid_gains=True)
-    TS-->>OR: model_path・SIMC初期ゲイン
-    OR->>RC: REFINE_1: run_pid_tuning_session(max_runs=10, release_on_finish=False)
-    loop 最大10回（座標降下）
-        RC->>HW: 規定パターン走行（停車保持のまま次走行へ）→ KPI集計
+            OR->>OR: LEARNING: 学習運転完了待ち（_learning_complete イベント）
+            OR->>TS: TRAINING_1: train_and_apply(学習セッション, update_pid_gains=True)
+            TS-->>OR: model_path・SIMC初期ゲイン
+            OR->>RC: REFINE_1: run_pid_tuning_session(max_runs=10, release_on_finish=False)
+            loop 最大10回（座標降下）
+                RC->>HW: 規定パターン走行（停車保持のまま次走行へ）→ KPI集計
+            end
+            OR->>OR: 最良ゲインを永続化・反映
+            OR->>TS: TRAINING_2: train_and_apply(サイクル全セッション, update_pid_gains=False)
+            TS-->>OR: 再学習モデル（1段目ゲインは上書きしない）
+            OR->>RC: REFINE_2: run_pid_tuning_session(max_runs=5, release_on_finish=True)
+            loop 最大5回（座標降下、1段目ゲインから継続）
+                RC->>HW: 規定パターン走行 → KPI集計
+            end
+            RC->>HW: 原点復帰（両軸解放）
+            OR->>OR: 最良ゲインを永続化・反映、learning_cycles.detail 記録
+            OR-->>UI: WebSocket cycle_progress: phase=COMPLETED
+        end
     end
-    OR->>OR: 最良ゲインを永続化・反映
-    OR->>TS: TRAINING_2: train_and_apply(サイクル全セッション, update_pid_gains=False)
-    TS-->>OR: 再学習モデル（1段目ゲインは上書きしない）
-    OR->>RC: REFINE_2: run_pid_tuning_session(max_runs=5, release_on_finish=True)
-    loop 最大5回（座標降下、1段目ゲインから継続）
-        RC->>HW: 規定パターン走行 → KPI集計
-    end
-    RC->>HW: 原点復帰（両軸解放）
-    OR->>OR: 最良ゲインを永続化・反映、learning_cycles.detail 記録
-    OR-->>UI: WebSocket cycle_progress: phase=COMPLETED
 
     alt 中断（オペレーターが「中断」押下）
         Op->>UI: 中断ボタン押下

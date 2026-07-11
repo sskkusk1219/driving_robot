@@ -9,9 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.domain.control.conversions import opening_to_position
 from src.domain.control.drive_loop import MAX_PENDING_LOG_TASKS, WEDGED_CYCLE_TIMEOUT_S, DriveLoop
-from src.domain.control.feedforward import FeedforwardController
+from src.domain.control.feedforward import FeedforwardController, GainSchedule
+from src.domain.control.pedal_plan import PedalPlan, PlanPhase
 from src.domain.control.pid import PIDController
+from src.domain.control.trim import TrimController
 from src.domain.model_training import DEFAULT_FEATURE_SPEC
 from src.models.calibration import CalibrationData
 from src.models.driving_mode import DrivingMode, SpeedPoint
@@ -22,6 +25,7 @@ from src.models.profile import (
     StopConfig,
     VehicleProfile,
 )
+from src.models.system_state import RealtimeSnapshot
 
 LOOKAHEAD_HORIZONS_S = DEFAULT_FEATURE_SPEC.lookahead_horizons_s
 PAST_HORIZONS_S = DEFAULT_FEATURE_SPEC.past_horizons_s
@@ -163,10 +167,14 @@ def _make_loop(
     log_writer: MagicMock | None = None,
     session_id: str | None = None,
     disable_deviation_check: bool = False,
+    ilc: object | None = None,
+    plan: PedalPlan | None = None,
 ) -> DriveLoop:
+    # デフォルトは plan=None＝従来経路（FF 毎サイクル＋速い補正層 PID 直結）。既存テストは
+    # この従来合成（ff_effort + pid_u）を検証する。プラン経路は plan を明示指定するテストで。
     return DriveLoop(
         ff_controller=ff or _make_ff(),
-        pid=pid or _make_pid(),
+        trim=TrimController(pid or _make_pid()),
         accel_driver=accel_driver or _make_accel_driver(),
         brake_driver=brake_driver or _make_brake_driver(),
         can_reader=can_reader or _make_can_reader(),
@@ -178,6 +186,8 @@ def _make_loop(
         log_writer=log_writer,
         session_id=session_id,
         disable_deviation_check=disable_deviation_check,
+        ilc=ilc,  # type: ignore[arg-type]
+        plan=plan,
     )
 
 
@@ -229,25 +239,23 @@ class TestRefSpeedAt:
 
 
 class TestOpeningToPosition:
+    """A1 レビュー指摘: 開度→パルス変換は src.domain.control.conversions に一本化済み。"""
+
     def test_zero_opening(self) -> None:
-        dl = _make_loop()
-        pos = dl._opening_to_position(0.0, zero_pos=100, full_pos=600)
+        pos = opening_to_position(0.0, zero_pos=100, full_pos=600)
         assert pos == 100
 
     def test_full_opening(self) -> None:
-        dl = _make_loop()
-        pos = dl._opening_to_position(100.0, zero_pos=100, full_pos=600)
+        pos = opening_to_position(100.0, zero_pos=100, full_pos=600)
         assert pos == 600
 
     def test_half_opening(self) -> None:
-        dl = _make_loop()
-        pos = dl._opening_to_position(50.0, zero_pos=100, full_pos=600)
+        pos = opening_to_position(50.0, zero_pos=100, full_pos=600)
         assert pos == 350
 
     def test_rounding(self) -> None:
-        dl = _make_loop()
         # 1/3 of stroke 300 = 100; zero=0 → 100
-        pos = dl._opening_to_position(100.0 / 3.0, zero_pos=0, full_pos=300)
+        pos = opening_to_position(100.0 / 3.0, zero_pos=0, full_pos=300)
         assert pos == 100
 
 
@@ -451,6 +459,104 @@ class TestNormalCompletion:
 
             await dl._execute_one_cycle()
 
+        assert not dl.is_running
+
+    @pytest.mark.asyncio
+    async def test_final_sample_logged_before_completion(self) -> None:
+        """完了時、停止前に末端サンプルが 1 行ログされる。
+
+        従来は完了分岐がログを書かずに return するため t=total_duration 相当のサンプルが
+        欠落していた。ref は末端値、実測系は直近 snapshot・直近指令開度を再利用する。
+        """
+        log_writer = MagicMock()
+        log_writer.write_log = AsyncMock()
+        on_complete = AsyncMock()
+        # 既定軌跡 0→60(5s)→60(10s)、total_duration=5.0 → t=5.0 の末端 ref は 60.0
+        dl = _make_loop(
+            mode=_make_mode(total_duration=5.0),
+            on_complete=on_complete,
+            log_writer=log_writer,
+            session_id="s1",
+        )
+        dl._last_snapshot = RealtimeSnapshot(
+            actual_speed_kmh=58.0,
+            accel_pos=321,
+            brake_pos=200,
+            accel_current_ma=510.0,
+            brake_current_ma=300.0,
+            captured_at=4.9,
+        )
+        dl._current_accel_opening = 12.0
+        dl._current_brake_opening = 0.0
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 10.0
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+            await asyncio.sleep(0)  # ログ書き込みタスクを走らせる
+
+        log_writer.write_log.assert_awaited_once()
+        _sid, written = log_writer.write_log.call_args[0]
+        assert written.ref_speed_kmh == pytest.approx(60.0)  # total_duration 末端値
+        assert written.actual_speed_kmh == pytest.approx(58.0)  # 直近 snapshot
+        assert written.accel_opening == pytest.approx(12.0)  # 直近指令開度
+        assert written.accel_pos == 321
+        assert written.accel_current == pytest.approx(510.0)
+        on_complete.assert_called_once()
+        assert not dl.is_running
+
+    @pytest.mark.asyncio
+    async def test_no_final_sample_when_snapshot_missing(self) -> None:
+        """`_last_snapshot` が無い状態で完了しても例外にならず、ログも書かれない。"""
+        log_writer = MagicMock()
+        log_writer.write_log = AsyncMock()
+        on_complete = AsyncMock()
+        dl = _make_loop(
+            mode=_make_mode(total_duration=5.0),
+            on_complete=on_complete,
+            log_writer=log_writer,
+            session_id="s1",
+        )
+        assert dl.last_snapshot is None
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 10.0
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+            await asyncio.sleep(0)
+
+        log_writer.write_log.assert_not_awaited()
+        on_complete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_final_sample_without_log_writer(self) -> None:
+        """log_writer が無い完了でも従来どおり例外なく終了する（回帰）。"""
+        on_complete = AsyncMock()
+        dl = _make_loop(mode=_make_mode(total_duration=5.0), on_complete=on_complete)
+        dl._last_snapshot = RealtimeSnapshot(
+            actual_speed_kmh=58.0,
+            accel_pos=321,
+            brake_pos=200,
+            accel_current_ma=510.0,
+            brake_current_ma=300.0,
+            captured_at=4.9,
+        )
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 10.0
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        on_complete.assert_called_once()
         assert not dl.is_running
 
 
@@ -704,7 +810,7 @@ class TestStartStop:
         with patch.object(asyncio, "get_running_loop") as mock_loop:
             loop_obj = MagicMock()
             loop_obj.time.return_value = 0.0
-            loop_obj.call_later = MagicMock()
+            loop_obj.call_at = MagicMock()
             mock_loop.return_value = loop_obj
             dl.start()
         assert dl.is_running
@@ -714,7 +820,7 @@ class TestStartStop:
         with patch.object(asyncio, "get_running_loop") as mock_loop:
             loop_obj = MagicMock()
             loop_obj.time.return_value = 0.0
-            loop_obj.call_later = MagicMock()
+            loop_obj.call_at = MagicMock()
             mock_loop.return_value = loop_obj
             dl.start()
         dl.stop()
@@ -725,12 +831,12 @@ class TestStartStop:
         with patch.object(asyncio, "get_running_loop") as mock_loop:
             loop_obj = MagicMock()
             loop_obj.time.return_value = 0.0
-            loop_obj.call_later = MagicMock()
+            loop_obj.call_at = MagicMock()
             mock_loop.return_value = loop_obj
             dl.start()
             dl.start()
-            # call_later は 1 回だけ呼ばれること
-            assert loop_obj.call_later.call_count == 1
+            # 絶対時刻グリッドの予約（call_at）は 1 回だけ呼ばれること
+            assert loop_obj.call_at.call_count == 1
 
     @pytest.mark.asyncio
     async def test_execute_one_cycle_noop_when_not_running(self) -> None:
@@ -756,6 +862,69 @@ class TestStartStop:
         on_complete.assert_not_called()
         on_emergency.assert_not_called()
         can_reader.read_speed.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 絶対時刻グリッドスケジューリング（ドリフト除去・catch-up バースト回避）
+# ---------------------------------------------------------------------------
+
+
+class TestAbsoluteGridScheduling:
+    def test_start_anchors_grid_at_start_time(self) -> None:
+        """start() でグリッドを開始時刻に固定し、最初のサイクルを anchor+interval に予約する。"""
+        dl = _make_loop()
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 42.0
+            mock_loop.return_value = loop_obj
+            dl.start()
+        assert dl._grid_anchor == pytest.approx(42.0)
+        assert dl._grid_tick == 1
+        target = loop_obj.call_at.call_args[0][0]
+        assert target == pytest.approx(42.0 + dl._interval_s)
+
+    def test_arm_next_cycle_targets_grid_point(self) -> None:
+        """定時発火では次 tick の絶対グリッド時刻に予約する。"""
+        dl = _make_loop()
+        dl._grid_anchor = 100.0
+        dl._grid_tick = 5
+        loop_obj = MagicMock()
+        loop_obj.time.return_value = 100.27  # tick6 の 100.30 より前（定時内）
+        dl._arm_next_cycle(loop_obj)
+        assert dl._grid_tick == 6
+        target = loop_obj.call_at.call_args[0][0]
+        assert target == pytest.approx(100.30)
+
+    def test_grid_does_not_drift_under_callback_latency(self) -> None:
+        """毎サイクルのコールバック起動遅延が累積しても予約時刻はグリッドに張り付く。
+
+        相対 call_later ではこの遅延が積もって固定周期からドリフトし、323s 走行で
+        数サイクル早く終端到達＝ログ数行欠落していた。絶対グリッドではドリフトしない。
+        """
+        dl = _make_loop()
+        dl._grid_anchor = 0.0
+        dl._grid_tick = 0
+        loop_obj = MagicMock()
+        for n in range(1, 201):
+            # 各コールバックが前グリッドから 7ms 遅れて起動する状況を模擬
+            loop_obj.time.return_value = (n - 1) * dl._interval_s + 0.007
+            dl._arm_next_cycle(loop_obj)
+            assert dl._grid_tick == n
+            target = loop_obj.call_at.call_args[0][0]
+            assert target == pytest.approx(n * dl._interval_s)
+
+    def test_late_fire_rounds_forward_without_burst(self) -> None:
+        """イベントループがグリッドを跨いで停止した場合、過去時刻に予約せず未来グリッドへ丸める。"""
+        dl = _make_loop()
+        dl._grid_anchor = 0.0
+        dl._grid_tick = 3  # 次は tick4 → 0.20 の予定
+        loop_obj = MagicMock()
+        loop_obj.time.return_value = 0.63  # 0.20 を大きく過ぎている（イベントループ停止）
+        dl._arm_next_cycle(loop_obj)
+        target = loop_obj.call_at.call_args[0][0]
+        assert target > 0.63  # 過去時刻に予約しない（catch-up バースト回避）
+        assert target == pytest.approx(0.65)  # 0.63 の次の未来グリッド
+        assert dl._grid_tick == 13
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +1021,9 @@ class TestStopDuringCycle:
         try:
             with patch.object(asyncio, "ensure_future") as mock_ensure:
                 with patch.object(asyncio, "get_running_loop") as mock_loop:
-                    mock_loop.return_value = MagicMock()
+                    loop_obj = MagicMock()
+                    loop_obj.time.return_value = 0.0  # 絶対時刻グリッドの予約に数値時刻が要る
+                    mock_loop.return_value = loop_obj
                     dl._schedule_next_cycle()
                 mock_ensure.assert_not_called()
         finally:
@@ -1081,7 +1252,7 @@ class TestKPIIntegration:
         with patch.object(asyncio, "get_running_loop") as mock_loop:
             loop_obj = MagicMock()
             loop_obj.time.return_value = 0.0
-            loop_obj.call_later = MagicMock()
+            loop_obj.call_at = MagicMock()
             mock_loop.return_value = loop_obj
             dl.start()
         assert dl.kpi_summary["n_samples"] == 0.0
@@ -1144,7 +1315,7 @@ class TestPauseResume:
         with patch.object(asyncio, "get_running_loop") as mock_loop:
             loop_obj = MagicMock()
             loop_obj.time.return_value = 0.0
-            loop_obj.call_later = MagicMock()
+            loop_obj.call_at = MagicMock()
             mock_loop.return_value = loop_obj
             dl.start()
         assert not dl.is_paused
@@ -1254,14 +1425,19 @@ class TestSnapshotFreshness:
 
 
 # ---------------------------------------------------------------------------
-# 先読み補償（preview_time_s） — アクチュエータ〜車両系のむだ時間補償
+# PID 先読み補償（pid_preview_s） — FB ループのむだ時間補償
+#
+# Stage A（KPI 対策）で preview を FF+PID 両方への前倒しから PID 専用ノブへ分離した。
+# FF は now-frame 基準で動き（先読みはモデルの horizons が担う）、PID のみ pid_preview_s
+# だけ前倒しした基準を追う。preview を FF にも掛けると FF 内蔵のむだ時間補償と二重になり
+# 実車速が基準を先行する系統偏差（KPI 違反の主因）を生むため。
 # ---------------------------------------------------------------------------
 
 
-class TestPreviewTimeCompensation:
+class TestPidPreviewCompensation:
     @pytest.mark.asyncio
-    async def test_ff_and_pid_receive_preview_shifted_reference(self) -> None:
-        """preview_time_s>0 のとき、FF・PID は前倒しした基準速度(t_ctrl)を受け取る。"""
+    async def test_ff_receives_now_frame_pid_receives_shifted(self) -> None:
+        """pid_preview_s>0 のとき、FF は now-frame、PID のみ前倒しした基準を受け取る。"""
         mode = _make_mode(
             points=[
                 SpeedPoint(time_s=0.0, speed_kmh=0.0),
@@ -1269,7 +1445,7 @@ class TestPreviewTimeCompensation:
             ],
             total_duration=10.0,
         )
-        profile = _make_profile(dynamics_params=DynamicsParams(preview_time_s=1.0))
+        profile = _make_profile(dynamics_params=DynamicsParams(pid_preview_s=1.0))
         ff = _make_ff(effort=0.0)
         pid = MagicMock(spec=PIDController)
         pid.update = MagicMock(return_value=0.0)
@@ -1284,11 +1460,41 @@ class TestPreviewTimeCompensation:
             dl._started_at = 0.0
             await dl._execute_one_cycle()
 
-        # t_ctrl = elapsed(2.0) + preview(1.0) = 3.0 → ref = 30.0（前倒しされた基準）
+        # FF: now-frame elapsed(2.0) → ref = 20.0（前倒しなし）
         ff_args = ff.predict_effort.call_args[0]
-        assert ff_args[0] == pytest.approx(30.0)
+        assert ff_args[0] == pytest.approx(20.0)
+        # PID: elapsed(2.0) + pid_preview(1.0) = 3.0 → ref = 30.0（前倒し）
         pid_args = pid.update.call_args[0]
         assert pid_args[0] == pytest.approx(30.0)
+
+    @pytest.mark.asyncio
+    async def test_ff_future_and_past_use_now_frame(self) -> None:
+        """FF の先読み/過去速度も now-frame（elapsed）基準で組まれる（pid_preview は無関係）。"""
+        mode = _make_mode(
+            points=[
+                SpeedPoint(time_s=0.0, speed_kmh=0.0),
+                SpeedPoint(time_s=10.0, speed_kmh=100.0),
+            ],
+            total_duration=10.0,
+        )
+        profile = _make_profile(dynamics_params=DynamicsParams(pid_preview_s=1.0))
+        ff = _make_ff(effort=0.0)
+        dl = _make_loop(ff=ff, mode=mode, profile=profile)
+        dl._running = True
+
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+
+        # predict_effort(ref, future_speeds, past_speeds) の future/past は elapsed=2.0 基準
+        _, future_speeds, past_speeds = ff.predict_effort.call_args[0]
+        expected_future = [min(100.0, (2.0 + h) * 10.0) for h in ff.horizons]
+        expected_past = [max(0.0, (2.0 - h) * 10.0) for h in ff.past_horizons]
+        assert future_speeds == pytest.approx(expected_future)
+        assert past_speeds == pytest.approx(expected_past)
 
     @pytest.mark.asyncio
     async def test_kpi_and_last_ref_speed_use_now_frame(self) -> None:
@@ -1300,7 +1506,7 @@ class TestPreviewTimeCompensation:
             ],
             total_duration=10.0,
         )
-        profile = _make_profile(dynamics_params=DynamicsParams(preview_time_s=1.0))
+        profile = _make_profile(dynamics_params=DynamicsParams(pid_preview_s=1.0))
         dl = _make_loop(mode=mode, profile=profile, can_reader=_make_can_reader(speed=20.0))
         dl._running = True
 
@@ -1318,8 +1524,8 @@ class TestPreviewTimeCompensation:
         assert summary["max_abs_deviation_kmh"] == pytest.approx(0.0)
 
     @pytest.mark.asyncio
-    async def test_zero_preview_matches_now_frame(self) -> None:
-        """preview_time_s=0.0（デフォルト）では制御フレームと now-frame が一致する（回帰）。"""
+    async def test_zero_preview_ff_and_pid_both_now_frame(self) -> None:
+        """pid_preview_s=0.0（デフォルト）では FF・PID とも now-frame 基準で一致する（回帰）。"""
         mode = _make_mode(
             points=[
                 SpeedPoint(time_s=0.0, speed_kmh=0.0),
@@ -1327,9 +1533,11 @@ class TestPreviewTimeCompensation:
             ],
             total_duration=10.0,
         )
-        profile = _make_profile(dynamics_params=DynamicsParams(preview_time_s=0.0))
+        profile = _make_profile(dynamics_params=DynamicsParams(pid_preview_s=0.0))
         ff = _make_ff(effort=0.0)
-        dl = _make_loop(ff=ff, mode=mode, profile=profile)
+        pid = MagicMock(spec=PIDController)
+        pid.update = MagicMock(return_value=0.0)
+        dl = _make_loop(ff=ff, pid=pid, mode=mode, profile=profile)
         dl._running = True
 
         with patch.object(asyncio, "get_running_loop") as mock_loop:
@@ -1339,12 +1547,12 @@ class TestPreviewTimeCompensation:
             dl._started_at = 0.0
             await dl._execute_one_cycle()
 
-        ff_args = ff.predict_effort.call_args[0]
-        assert ff_args[0] == pytest.approx(20.0)
+        assert ff.predict_effort.call_args[0][0] == pytest.approx(20.0)
+        assert pid.update.call_args[0][0] == pytest.approx(20.0)
 
     @pytest.mark.asyncio
-    async def test_preview_beyond_trajectory_end_clamps_safely(self) -> None:
-        """軌跡終端付近で t_ctrl が末尾を超えても終端値でクランプされ例外を起こさない。"""
+    async def test_pid_preview_beyond_trajectory_end_clamps_safely(self) -> None:
+        """PID 先読みが軌跡末尾を超えても終端値でクランプされ例外を起こさない。"""
         mode = _make_mode(
             points=[
                 SpeedPoint(time_s=0.0, speed_kmh=0.0),
@@ -1352,17 +1560,342 @@ class TestPreviewTimeCompensation:
             ],
             total_duration=10.0,
         )
-        profile = _make_profile(dynamics_params=DynamicsParams(preview_time_s=3.0))
-        ff = _make_ff(effort=0.0)
-        dl = _make_loop(ff=ff, mode=mode, profile=profile)
+        profile = _make_profile(dynamics_params=DynamicsParams(pid_preview_s=1.0))
+        pid = MagicMock(spec=PIDController)
+        pid.update = MagicMock(return_value=0.0)
+        dl = _make_loop(pid=pid, mode=mode, profile=profile)
         dl._running = True
 
         with patch.object(asyncio, "get_running_loop") as mock_loop:
             loop_obj = MagicMock()
-            loop_obj.time.return_value = 4.5  # t_ctrl = 7.5 > 5.0（軌跡末尾）
+            loop_obj.time.return_value = 4.5  # elapsed+preview = 5.5 > 5.0（軌跡末尾）
             mock_loop.return_value = loop_obj
             dl._started_at = 0.0
             await dl._execute_one_cycle()
 
-        ff_args = ff.predict_effort.call_args[0]
-        assert ff_args[0] == pytest.approx(60.0)  # 終端値でクランプ（例外なし）
+        assert pid.update.call_args[0][0] == pytest.approx(60.0)  # 終端値でクランプ（例外なし）
+
+
+# ---------------------------------------------------------------------------
+# ゲインスケジューリング（速度依存プラントゲイン正規化）— Stage B
+# ---------------------------------------------------------------------------
+
+
+class TestGainScheduling:
+    def _accel_mode(self) -> DrivingMode:
+        # 0→100 km/h の上昇ランプ（elapsed=2.0 で加速フェーズ）
+        return _make_mode(
+            points=[SpeedPoint(0.0, 0.0), SpeedPoint(10.0, 100.0)],
+            total_duration=10.0,
+        )
+
+    def _decel_mode(self) -> DrivingMode:
+        # 100→0 km/h の下降ランプ（elapsed=2.0 で減速フェーズ）
+        return _make_mode(
+            points=[SpeedPoint(0.0, 100.0), SpeedPoint(10.0, 0.0)],
+            total_duration=10.0,
+        )
+
+    def _pid_mock(self) -> MagicMock:
+        pid = MagicMock(spec=PIDController)
+        pid.update = MagicMock(return_value=0.0)
+        return pid
+
+    @pytest.mark.asyncio
+    async def test_no_schedule_passes_scale_one(self) -> None:
+        """gain_schedule が None なら gain_scale=1.0（従来動作）。"""
+        profile = _make_profile(dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_k=2.0))
+        ff = _make_ff(effort=0.0)
+        ff.gain_schedule = None
+        pid = self._pid_mock()
+        dl = _make_loop(ff=ff, pid=pid, mode=self._accel_mode(), profile=profile)
+        dl._running = True
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        assert pid.update.call_args.kwargs["gain_scale"] == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "dyn",
+        [
+            DynamicsParams(pid_preview_s=0.0, fopdt_k=None, fopdt_tau=1.0),  # k 未同定
+            DynamicsParams(pid_preview_s=0.0, fopdt_k=2.0, fopdt_tau=None),  # tau 未同定
+        ],
+    )
+    async def test_incomplete_fopdt_passes_scale_one(self, dyn: DynamicsParams) -> None:
+        """g_nominal=tau/k は k・tau 両方が必要。片方欠落なら g_nominal=None → gain_scale=1.0。"""
+        profile = _make_profile(dynamics_params=dyn)
+        ff = _make_ff(effort=0.0)
+        ff.gain_schedule = GainSchedule(
+            speeds=(0.0, 120.0), accel_gains=(1.0, 1.0), brake_gains=(1.0, 1.0)
+        )
+        pid = self._pid_mock()
+        dl = _make_loop(ff=ff, pid=pid, mode=self._accel_mode(), profile=profile)
+        dl._running = True
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        assert pid.update.call_args.kwargs["gain_scale"] == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_accel_phase_uses_accel_gain(self) -> None:
+        """加速フェーズでは accel_gain を使う。scale=clamp(g/g_nominal)。"""
+        # g_nominal = fopdt_tau/fopdt_k = 1.0/2.0 = 0.5、accel_gain=0.6 → scale = 1.2（範囲内）
+        profile = _make_profile(
+            dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_k=2.0, fopdt_tau=1.0)
+        )
+        ff = _make_ff(effort=0.0)
+        ff.gain_schedule = GainSchedule(
+            speeds=(0.0, 120.0), accel_gains=(0.6, 0.6), brake_gains=(0.1, 0.1)
+        )
+        pid = self._pid_mock()
+        dl = _make_loop(
+            ff=ff, pid=pid, mode=self._accel_mode(), profile=profile,
+            can_reader=_make_can_reader(speed=20.0),
+        )
+        dl._running = True
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        assert pid.update.call_args.kwargs["gain_scale"] == pytest.approx(1.2)
+
+    @pytest.mark.asyncio
+    async def test_accel_gain_clamps_to_upper_max(self) -> None:
+        """ブースト上限 1.5（B-8-3）: g/g_nominal=2.0 でも scale は 1.5 にクランプされる。"""
+        # g_nominal=0.5、accel_gain=1.0 → 比 2.0 → 上限 1.5 にクランプ
+        profile = _make_profile(
+            dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_k=2.0, fopdt_tau=1.0)
+        )
+        ff = _make_ff(effort=0.0)
+        ff.gain_schedule = GainSchedule(
+            speeds=(0.0, 120.0), accel_gains=(1.0, 1.0), brake_gains=(0.1, 0.1)
+        )
+        pid = self._pid_mock()
+        dl = _make_loop(
+            ff=ff, pid=pid, mode=self._accel_mode(), profile=profile,
+            can_reader=_make_can_reader(speed=20.0),
+        )
+        dl._running = True
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        assert pid.update.call_args.kwargs["gain_scale"] == pytest.approx(1.5)
+
+    @pytest.mark.asyncio
+    async def test_decel_phase_uses_brake_gain_and_clamps(self) -> None:
+        """減速フェーズでは brake_gain を使い、下限 0.5 にクランプされる。"""
+        # g_nominal=tau/k=0.5、brake_gain=0.1 → 0.1/0.5=0.2 → clamp 下限 0.5
+        profile = _make_profile(
+            dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_k=2.0, fopdt_tau=1.0)
+        )
+        ff = _make_ff(effort=0.0)
+        ff.gain_schedule = GainSchedule(
+            speeds=(0.0, 120.0), accel_gains=(1.0, 1.0), brake_gains=(0.1, 0.1)
+        )
+        pid = self._pid_mock()
+        dl = _make_loop(
+            ff=ff, pid=pid, mode=self._decel_mode(), profile=profile,
+            can_reader=_make_can_reader(speed=80.0),
+        )
+        dl._running = True
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        assert pid.update.call_args.kwargs["gain_scale"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# ILC 補正 effort の合成（Stage C）
+# ---------------------------------------------------------------------------
+
+
+class TestILCEffortSynthesis:
+    """FF+PID に加えて ILC 補正 effort が調停器へ渡ることを検証する。"""
+
+    async def _run_one_cycle_capturing_effort(self, dl: DriveLoop, t: float = 0.0) -> float:
+        """1 サイクル実行し、調停器 arbitrate に渡された合成 effort を返す。"""
+        captured: dict[str, float] = {}
+        real_arbitrate = dl._arbiter.arbitrate
+
+        def spy(effort: float, dt: float):  # type: ignore[no-untyped-def]
+            captured["effort"] = effort
+            return real_arbitrate(effort, dt)
+
+        with (
+            patch.object(asyncio, "get_running_loop") as mock_loop,
+            patch.object(dl._arbiter, "arbitrate", side_effect=spy),
+        ):
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = t
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        return captured["effort"]
+
+    @pytest.mark.asyncio
+    async def test_ilc_effort_added_to_synthesis(self) -> None:
+        """ILC 補正が FF+PID に加算されて調停器に渡る（ff=30, pid=0, ilc=+5 → 35）。"""
+        from src.domain.control.ilc import ILCController, ILCTable
+
+        ff = _make_ff(effort=30.0)
+        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
+        ilc = ILCController(ILCTable(efforts=[5.0, 5.0], dt_s=10.0))  # 全域 +5%
+        dl = _make_loop(ff=ff, pid=pid, ilc=ilc)
+        effort = await self._run_one_cycle_capturing_effort(dl)
+        assert effort == pytest.approx(35.0)
+
+    @pytest.mark.asyncio
+    async def test_none_ilc_is_full_regression(self) -> None:
+        """ilc=None なら合成は従来どおり FF+PID のみ（ff=30, pid=0 → 30）。"""
+        ff = _make_ff(effort=30.0)
+        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
+        dl = _make_loop(ff=ff, pid=pid, ilc=None)
+        effort = await self._run_one_cycle_capturing_effort(dl)
+        assert effort == pytest.approx(30.0)
+
+    @pytest.mark.asyncio
+    async def test_ilc_effort_sampled_at_now_frame(self) -> None:
+        """ILC は elapsed_s（now-frame）で参照される（t=5s で該当補正が入る）。"""
+        from src.domain.control.ilc import ILCController, ILCTable
+
+        ff = _make_ff(effort=0.0)
+        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
+        # efforts: t=0→0, t=5→8, t=10→0（グリッド 5s）。t=5 では 8% が入る。
+        ilc = ILCController(ILCTable(efforts=[0.0, 8.0, 0.0], dt_s=5.0))
+        dl = _make_loop(ff=ff, pid=pid, ilc=ilc)
+        effort = await self._run_one_cycle_capturing_effort(dl, t=5.0)
+        assert effort == pytest.approx(8.0)
+
+
+# ---------------------------------------------------------------------------
+# プラン＋トリム経路（新アーキテクチャ）
+# ---------------------------------------------------------------------------
+
+
+def _uniform_plan(effort: float, phase: PlanPhase, n: int = 400, dt: float = 0.1) -> PedalPlan:
+    """一様な effort/phase のプラン（テスト用）。n×dt 秒をカバーする。"""
+    return PedalPlan(dt_s=dt, efforts=[effort] * n, phases=[phase] * n)
+
+
+class TestPlanPathSynthesis:
+    """プランありの経路で FF を毎サイクル評価せず plan+trim+ilc を合成することを検証する。"""
+
+    async def _run_cycle_capturing(self, dl: DriveLoop, t: float = 2.0) -> float:
+        captured: dict[str, float] = {}
+        real = dl._arbiter.arbitrate
+
+        def spy(effort: float, dt: float):  # type: ignore[no-untyped-def]
+            captured["effort"] = effort
+            return real(effort, dt)
+
+        with (
+            patch.object(asyncio, "get_running_loop") as mock_loop,
+            patch.object(dl._arbiter, "arbitrate", side_effect=spy),
+        ):
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = t
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        return captured["effort"]
+
+    @pytest.mark.asyncio
+    async def test_plan_effort_used_and_ff_not_called(self) -> None:
+        """プランありなら FF.predict_effort は呼ばれず、plan.effort_at が名目 effort になる。"""
+        ff = _make_ff(effort=99.0)  # 呼ばれたら 99 が混じるはず
+        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
+        # 偏差 0（actual=ref）でトリムは 0。plan effort=20 のみが渡る。
+        mode = _make_mode(
+            points=[SpeedPoint(0.0, 60.0), SpeedPoint(10.0, 60.0)], total_duration=10.0
+        )
+        plan = _uniform_plan(20.0, PlanPhase.DRIVE)
+        dl = _make_loop(
+            ff=ff, pid=pid, mode=mode, can_reader=_make_can_reader(speed=60.0), plan=plan
+        )
+        effort = await self._run_cycle_capturing(dl)
+        assert effort == pytest.approx(20.0)
+        ff.predict_effort.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ilc_added_in_plan_path(self) -> None:
+        """プラン経路でも ILC 補正が加算される（plan=20, trim=0, ilc=+5 → 25）。"""
+        from src.domain.control.ilc import ILCController, ILCTable
+
+        ff = _make_ff(effort=0.0)
+        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
+        mode = _make_mode(
+            points=[SpeedPoint(0.0, 60.0), SpeedPoint(10.0, 60.0)], total_duration=10.0
+        )
+        plan = _uniform_plan(20.0, PlanPhase.DRIVE)
+        ilc = ILCController(ILCTable(efforts=[5.0, 5.0], dt_s=10.0))
+        dl = _make_loop(
+            ff=ff, pid=pid, mode=mode, can_reader=_make_can_reader(speed=60.0), plan=plan, ilc=ilc
+        )
+        effort = await self._run_cycle_capturing(dl)
+        assert effort == pytest.approx(25.0)
+
+
+class TestPhaseAuthority:
+    """_apply_phase_authority: フェーズ権限クランプと速い補正層の無権限化を検証する。"""
+
+    def _loop(self, fast_active: bool = False) -> DriveLoop:
+        dl = _make_loop(plan=_uniform_plan(0.0, PlanPhase.DRIVE))
+        dl._trim._fast_active = fast_active
+        return dl
+
+    def test_drive_clamps_brake_direction(self) -> None:
+        dl = self._loop()
+        # DRIVE で合成が負（ブレーキ）→ 0 にクランプ、制動側飽和フラグ
+        effort, ch, cl = dl._apply_phase_authority(1.0, -3.0, 0.0, PlanPhase.DRIVE)
+        assert effort == 0.0
+        assert cl is True and ch is False
+
+    def test_drive_keeps_positive(self) -> None:
+        dl = self._loop()
+        effort, ch, cl = dl._apply_phase_authority(2.0, 1.0, 0.5, PlanPhase.DRIVE)
+        assert effort == pytest.approx(3.5)
+        assert ch is False and cl is False
+
+    def test_brake_clamps_accel_direction(self) -> None:
+        dl = self._loop()
+        effort, ch, cl = dl._apply_phase_authority(-1.0, 3.0, 0.0, PlanPhase.BRAKE)
+        assert effort == 0.0
+        assert ch is True and cl is False
+
+    def test_coast_zero(self) -> None:
+        dl = self._loop()
+        effort, ch, cl = dl._apply_phase_authority(5.0, 2.0, 1.0, PlanPhase.COAST)
+        assert effort == 0.0
+        assert ch is True and cl is True
+
+    def test_stop_hold_uses_plan_only(self) -> None:
+        dl = self._loop()
+        # STOP_HOLD は base（プランの停車保持）のみ、トリム/ILC を無効化
+        effort, ch, cl = dl._apply_phase_authority(-19.2, 5.0, 3.0, PlanPhase.STOP_HOLD)
+        assert effort == pytest.approx(-19.2)
+        assert ch is True and cl is True
+
+    def test_fast_active_bypasses_authority(self) -> None:
+        dl = self._loop(fast_active=True)
+        # 速い補正層アクティブなら DRIVE でもブレーキ方向を通す（max≤1.0 安全網）
+        effort, ch, cl = dl._apply_phase_authority(1.0, -3.0, 0.0, PlanPhase.DRIVE)
+        assert effort == pytest.approx(-2.0)
+        assert ch is False and cl is False

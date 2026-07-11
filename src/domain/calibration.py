@@ -13,6 +13,13 @@ CALIB_CURRENT_SPIKE_RATIO = 1.5
 CALIB_MIN_STROKE_PULSE = 1000
 CALIB_MAX_STROKE_PULSE = 10000
 CALIB_MAX_SEARCH_PULSE = 50000
+# 自由移動中（接触前）に想定される電流の上限目安 [mA]。ベースライン確定時点でこれを
+# 超えていたら、既に接触した状態でベースラインを取ってしまいスパイク検出（相対比較）が
+# 効かなくなっていると判断し、探索を中断する（要実機調整）。
+CALIB_MAX_BASELINE_CURRENT_MA = 800.0
+# 探索中の絶対電流上限 [mA]。相対スパイク検出が働かない場合でも、この値を超えたら
+# 機構保護のため即座に中断する（SafetyMonitor の走行中過電流閾値と同値）。
+CALIB_MAX_SEARCH_CURRENT_MA = 3000.0
 
 
 class CalibrationActuatorProtocol(Protocol):
@@ -38,10 +45,16 @@ class CalibrationConfig:
     min_stroke_pulse: int = field(default=CALIB_MIN_STROKE_PULSE)
     max_stroke_pulse: int = field(default=CALIB_MAX_STROKE_PULSE)
     max_search_pulse: int = field(default=CALIB_MAX_SEARCH_PULSE)
+    max_baseline_current_ma: float = field(default=CALIB_MAX_BASELINE_CURRENT_MA)
+    max_search_current_ma: float = field(default=CALIB_MAX_SEARCH_CURRENT_MA)
 
 
 class CalibrationDetectionError(Exception):
     """接触点またはフル位置を検出できなかった場合に送出。"""
+
+
+class CalibrationCancelled(Exception):
+    """emergency_stop 等でキャリブレーション実行中にキャンセルされた場合に送出。"""
 
 
 class CalibrationManager:
@@ -63,6 +76,15 @@ class CalibrationManager:
         self._brake_driver = brake_driver
         self._config = config if config is not None else CalibrationConfig()
         self._profile_repo = profile_repo
+        self._cancel_event = asyncio.Event()
+
+    def cancel(self) -> None:
+        """進行中のキャリブレーション探索を中断させる（emergency_stop から呼ぶ想定）。
+
+        次回 run_calibration() 開始時にクリアされるので、実行中でなくても安全に呼べる
+        （冪等）。
+        """
+        self._cancel_event.set()
 
     async def run_calibration(self, profile_id: str) -> CalibrationResult:
         """両軸のゼロフルキャリブレーションを順番に実行し、バリデーション済みの結果を返す。
@@ -70,6 +92,7 @@ class CalibrationManager:
         バリデーション成功時かつ profile_repo が注入されている場合、
         profile_id のプロファイルへ CalibrationData を永続化する。
         """
+        self._cancel_event.clear()
         try:
             accel_zero = await self._detect_zero(self._accel_driver)
             accel_full = await self._detect_full(self._accel_driver, accel_zero)
@@ -78,7 +101,7 @@ class CalibrationManager:
             brake_zero = await self._detect_zero(self._brake_driver)
             brake_full = await self._detect_full(self._brake_driver, brake_zero)
             await self._brake_driver.home_return()
-        except CalibrationDetectionError as e:
+        except (CalibrationDetectionError, CalibrationCancelled) as e:
             return CalibrationResult(success=False, data=None, error_message=str(e))
 
         data = CalibrationData(
@@ -163,10 +186,21 @@ class CalibrationManager:
         pos = start_pos
 
         while pos - start_pos < self._config.max_search_pulse:
+            if self._cancel_event.is_set():
+                raise CalibrationCancelled("キャリブレーションが中断されました（非常停止）")
             pos += self._config.move_step_pulse
             await driver.move_to_position(pos)
             await asyncio.sleep(self._config.step_interval_s)
             current = await driver.read_current()
+
+            # 絶対電流上限: 相対スパイク検出（下記）が効かない状況でも機構保護のため
+            # 即座に中断する（D2 レビュー指摘）。
+            if current > self._config.max_search_current_ma:
+                raise CalibrationDetectionError(
+                    f"探索中に電流上限({self._config.max_search_current_ma:.0f}mA)を"
+                    f"超過しました (pos={pos}, current={current:.1f}mA): 機構保護のため中断します"
+                )
+
             window.append(current)
 
             if len(window) < self._config.current_window:
@@ -178,6 +212,14 @@ class CalibrationManager:
                 # baseline = 最初のウィンドウ平均（自由移動中の基準電流）として確定する。
                 # このフレームはまだ接触前の安定した値を記録しているため判定をスキップし、
                 # 次のフレーム以降でスパイク判定を開始する（保守的な設計）。
+                # ただしこの時点で既に電流が高い場合、開始位置が既に接触済みであり
+                # 以降のスパイク判定（相対比較）が機能しない（D2 レビュー指摘）。
+                if avg > self._config.max_baseline_current_ma:
+                    raise CalibrationDetectionError(
+                        f"自由移動中のベースライン電流({avg:.1f}mA)が想定上限"
+                        f"({self._config.max_baseline_current_ma:.0f}mA)を超えています: "
+                        "既に接触している可能性があるため中断します"
+                    )
                 baseline = avg
                 continue
 

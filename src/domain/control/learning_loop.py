@@ -21,6 +21,18 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Protocol
 
+from src.domain.control.base_loop import (
+    MAX_PENDING_LOG_TASKS,
+    WEDGED_CYCLE_TIMEOUT_S,
+    CycleLoopBase,
+    LogWriterProtocol,
+)
+from src.domain.control.conversions import (
+    G_TO_KMHS,
+    VEHICLE_STOP_SPEED_KMH,
+    clamp_opening,
+    opening_to_position,
+)
 from src.domain.control.pedal_safety import enforce_pedal_exclusion
 from src.models.drive_log import DriveLogData
 from src.models.learning_drive import LearningPattern, PatternKind
@@ -30,10 +42,8 @@ from src.models.system_state import RealtimeSnapshot
 _logger = logging.getLogger(__name__)
 
 LEARNING_LOOP_INTERVAL_S: float = 0.1  # 100ms 周期（drive_logs の記録間隔に一致）
-WEDGED_CYCLE_TIMEOUT_S: float = 1.0
-MAX_PENDING_LOG_TASKS: int = 100
-STOP_SPEED_KMH: float = 0.5  # これ未満を「停車」とみなす
-G_TO_KMHS: float = 9.81 * 3.6  # 1G を km/h/s へ換算
+# これ未満を「停車」とみなす。src.domain.control.conversions の共通定数を使う（A2 レビュー指摘）。
+STOP_SPEED_KMH: float = VEHICLE_STOP_SPEED_KMH
 
 
 class _Phase(Enum):
@@ -44,6 +54,7 @@ class _Phase(Enum):
     COAST = auto()  # 中間: accel=brake=0 で惰行（エンジンブレーキ＋走行抵抗の減速率を計測）
     DRIVE_BRAKE = auto()  # 後半: アクセル解放しブレーキをランプで踏み込み減速・停車
     BRAKE_HOLD = auto()  # 定常ブレーキ: 固定ブレーキ開度をランプ後一定保持して定常減速を記録
+    CRUISE_TRIM = auto()  # cap 到達後に微小アクセル開度を保持し高速域×微小開度を採取
     DONE = auto()  # 全パターン完了
 
 
@@ -76,6 +87,15 @@ class LearningLoopConfig:
     # 頭打ちした場合や、実車の加速がガバナ上限Gより緩い場合の予算上限として timeout を設ける。
     # 高開度（ガバナ加速 0.98×max_decel_g）で cap 到達に要する時間＋十分なマージンを見込む。
     accel_full_range_timeout_s: float = field(default=20.0)
+    # 予測的 cap 離脱の先読み時間 [s]。アクセル解放後も車両応答遅れ（むだ時間θ＋時定数τ相当）の
+    # 間は惰性で車速が伸び max_speed を超過する（実機で 70% 踏込・13.8km/h/s のとき +16km/h の
+    # オーバーシュートを観測）。現在の平滑加速度 × この時間だけ cap の手前で離脱して超過を防ぐ。
+    overspeed_lead_s: float = field(default=1.2)
+    # オーバースピード回復（過速度デバウンス成立 → DRIVE_BRAKE）で実際に踏むブレーキ開度の下限。
+    # パターン自身の brake_opening（COAST_DOWN は 0.0）に関わらずこの値以上を踏むことで、
+    # 「回復のため DRIVE_BRAKE に入ったのにブレーキ0%のまま」を防ぐ（ACCEL_SWEEP_RESET_BRAKE_PCT
+    # と同じ「中庸＝過G にならず素早く停車」の考え方）。
+    overspeed_recovery_brake_pct: float = field(default=30.0)
     # コースト（惰行）: COAST_DOWN が coast_down_stop_speed_kmh まで惰行（速度全域の減速カーブ）。
     # timeout でも前進する（予算上限）。
     coast_down_stop_speed_kmh: float = field(default=5.0)
@@ -107,20 +127,14 @@ class SafetyCheckProtocol(Protocol):
     def check_overcurrent(self, current_ma: float, axis: str) -> bool: ...
 
 
-class LogWriterProtocol(Protocol):
-    async def write_log(self, session_id: str, data: DriveLogData) -> None: ...
+class LearningLoop(CycleLoopBase):
+    """開度パターンを開ループ実行し連続ログを記録するドメインコンポーネント。
 
+    サイクル実行のライフサイクル・ウォッチドッグ・ログ書込バックログ管理は
+    CycleLoopBase（DriveLoop/ScheduleLoop と共通）に委譲する。
+    """
 
-def _log_emergency_error_callback(task: asyncio.Task[None]) -> None:
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        _logger.error("学習ループの非常停止コールバックで例外", exc_info=exc)
-
-
-class LearningLoop:
-    """開度パターンを開ループ実行し連続ログを記録するドメインコンポーネント。"""
+    _cycle_label = "学習サイクル"
 
     def __init__(
         self,
@@ -137,17 +151,19 @@ class LearningLoop:
         interval_s: float = LEARNING_LOOP_INTERVAL_S,
         config: LearningLoopConfig | None = None,
     ) -> None:
+        super().__init__(
+            interval_s=interval_s,
+            on_complete=on_complete,
+            on_emergency=on_emergency,
+            log_writer=log_writer,
+            session_id=session_id,
+        )
         self._accel_driver = accel_driver
         self._brake_driver = brake_driver
         self._can_reader = can_reader
         self._profile = profile
         self._patterns = patterns
         self._safety_check = safety_check
-        self._on_complete = on_complete
-        self._on_emergency = on_emergency
-        self._log_writer = log_writer
-        self._session_id = session_id
-        self._interval_s = interval_s
         self._config = config if config is not None else LearningLoopConfig()
 
         self._max_decel_kmhs = max(profile.max_decel_g * G_TO_KMHS, 0.0)
@@ -155,49 +171,34 @@ class LearningLoop:
         self._g_limit_kmhs = self._max_decel_kmhs * self._config.g_limit_frac
         self._accel_speed_cap = profile.max_speed * self._config.accel_speed_cap_frac
 
-        self._running = False
         self._pattern_idx = 0
         self._phase = _Phase.MEASURE
         self._phase_started_at: float | None = None
         self._prev_speed: float | None = None
         self._prev_time: float | None = None
-        self._current_accel_opening = 0.0
-        self._current_brake_opening = 0.0
-        self._consecutive_skips = 0
         self._skip_count = 0  # 過速度・過G の連続成立サイクル数（ノイズ デバウンス用）
         self._stable_count = 0  # クリープ安定待ちの「安定」連続サイクル数
-        self._stable_since: float | None = None  # プラトー/コースト安定が始まった時刻（ジッタ堅牢）
         # 包絡線ガバナの開度上限（None=未発動）。加速G/減速G が上限に達したら踏み増しを止める
         self._accel_gov_cap: float | None = None
         self._brake_gov_cap: float | None = None
+        # 過速度デバウンス成立で DRIVE_BRAKE に入った（能動的な減速回復）ことを示すフラグ。
+        # パターンの brake_opening が 0.0（COAST_DOWN 等）でも回復用の実効ブレーキ開度を使う。
+        self._overspeed_recovery = False
         # 平滑加速度算出用の (時刻, 車速) 履歴（CAN ノイズで G を誤判定しないため）
         self._speed_hist: deque[tuple[float, float]] = deque()
         # 直近指令位置（時間指定移動の距離算出に使う。指令開度が変化した時のみ移動を発行）
         self._accel_pos_cmd = 0
         self._brake_pos_cmd = 0
-        self._log_backlog_active = False
 
-        self._cycle_task: asyncio.Task[None] | None = None
-        self._emergency_task: asyncio.Task[None] | None = None
-        self._complete_task: asyncio.Task[None] | None = None
-        self._pending_log_tasks: set[asyncio.Task[None]] = set()
-        self._last_snapshot: RealtimeSnapshot | None = None
-
-    # ── ライフサイクル ──────────────────────────────────────────────
-    def start(self) -> None:
-        """ループを開始する。既に実行中なら何もしない。"""
-        if self._running:
-            return
-        self._running = True
+    def _reset_for_start(self) -> None:
         self._pattern_idx = 0
         self._prev_speed = None
         self._prev_time = None
-        self._consecutive_skips = 0
         self._skip_count = 0
         self._stable_count = 0
-        self._stable_since = None
         self._accel_gov_cap = None
         self._brake_gov_cap = None
+        self._overspeed_recovery = False
         self._speed_hist.clear()
         # 直近指令位置を初期化（accel=原点、brake=保持ブレーキ位置）
         calib = self._profile.calibration
@@ -207,7 +208,7 @@ class LearningLoop:
                 self._profile.feedforward_params.stop_brake_opening_pct,
                 self._profile.max_brake_opening,
             )
-            self._brake_pos_cmd = self._opening_to_position(
+            self._brake_pos_cmd = opening_to_position(
                 hold_pct, calib.brake_zero_pos, calib.brake_full_pos
             )
         else:
@@ -215,93 +216,11 @@ class LearningLoop:
             self._brake_pos_cmd = 0
         self._phase = self._initial_phase(0)
         self._phase_started_at = None
-        loop = asyncio.get_running_loop()
-        loop.call_later(self._interval_s, self._schedule_next_cycle)
-
-    def stop(self) -> None:
-        """ループを停止する。進行中サイクルは書き込み前に中断される。"""
-        self._running = False
-
-    async def stop_and_join(self, timeout_s: float = 2.0) -> None:
-        """停止し、進行中のサイクルタスク完了を待つ。home_return 前に必ず呼ぶ。
-
-        on_complete/on_emergency はサイクルタスク内から await されるため、その経路から
-        本メソッドが呼ばれると自タスクを join しようとして wait_for がタイムアウト→自タスクを
-        cancel し、呼び出し元（stop_learning_drive 等）の後続 await（home_return）が
-        CancelledError で中断される。`current_task() is サイクルタスク` のときは既にサイクルが
-        終了処理中のため join 不要として即 return する。
-        """
-        self.stop()
-        task = self._cycle_task
-        if task is None or task.done() or task is asyncio.current_task():
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout_s)
-        except TimeoutError:
-            _logger.warning(
-                "進行中の学習サイクルが %.1fs 以内に完了せずキャンセルします", timeout_s
-            )
-            task.cancel()
-        except Exception:
-            pass
-
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
-    @property
-    def current_accel_opening(self) -> float:
-        return self._current_accel_opening
-
-    @property
-    def current_brake_opening(self) -> float:
-        return self._current_brake_opening
 
     @property
     def current_ref_speed(self) -> float | None:
         """学習運転は基準速度を持たないため常に None。"""
         return None
-
-    @property
-    def last_snapshot(self) -> RealtimeSnapshot | None:
-        return self._last_snapshot
-
-    # ── スケジューリング（DriveLoop と同方式）────────────────────────
-    def _schedule_next_cycle(self) -> None:
-        if not self._running:
-            return
-        if self._cycle_task is not None and not self._cycle_task.done():
-            self._consecutive_skips += 1
-            wedged_s = self._consecutive_skips * self._interval_s
-            _logger.warning(
-                "前回の学習サイクルが %.0fms 以内に完了せずスキップ", self._interval_s * 1000
-            )
-            if wedged_s >= WEDGED_CYCLE_TIMEOUT_S:
-                _logger.error("学習サイクルが %.1fs 以上完了していません: 非常停止します", wedged_s)
-                self.stop()
-                self._emergency_task = asyncio.ensure_future(self._on_emergency())
-                self._emergency_task.add_done_callback(_log_emergency_error_callback)
-                return
-        else:
-            self._consecutive_skips = 0
-            self._cycle_task = asyncio.ensure_future(self._execute_one_cycle())
-            self._cycle_task.add_done_callback(self._on_cycle_done)
-        asyncio.get_running_loop().call_later(self._interval_s, self._schedule_next_cycle)
-
-    def _on_cycle_done(self, task: asyncio.Task[None]) -> None:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is None:
-            return
-        _logger.error("学習サイクルで未捕捉例外: 非常停止します", exc_info=exc)
-        self.stop()
-        self._emergency_task = asyncio.ensure_future(self._on_emergency())
-        self._emergency_task.add_done_callback(_log_emergency_error_callback)
-
-    async def _abort_emergency(self) -> None:
-        self.stop()
-        await self._on_emergency()
 
     # ── 1 サイクル ─────────────────────────────────────────────────
     async def _execute_one_cycle(self) -> None:
@@ -347,12 +266,8 @@ class LearningLoop:
             return
 
         # 指令開度に対応する位置（ログ＝滑らかな連続軌跡。指令が変化した時のみ時間指定移動を発行）
-        accel_pos = self._opening_to_position(
-            accel_opening, calib.accel_zero_pos, calib.accel_full_pos
-        )
-        brake_pos = self._opening_to_position(
-            brake_opening, calib.brake_zero_pos, calib.brake_full_pos
-        )
+        accel_pos = opening_to_position(accel_opening, calib.accel_zero_pos, calib.accel_full_pos)
+        brake_pos = opening_to_position(brake_opening, calib.brake_zero_pos, calib.brake_full_pos)
 
         # CAN await 中に stop が入った場合は位置指令を送らない
         if not self._running:
@@ -409,11 +324,13 @@ class LearningLoop:
     def _initial_phase(self, idx: int) -> _Phase:
         if idx >= len(self._patterns):
             return _Phase.DONE
-        # ACCEL_SWEEP / BRAKE_HOLD / COAST_DOWN は加速から始める。CREEP 系は固定開度の MEASURE。
+        # ACCEL_SWEEP / BRAKE_HOLD / COAST_DOWN / CRUISE_TRIM は加速から始める。
+        # CREEP 系は固定開度の MEASURE。
         if self._patterns[idx].kind in (
             PatternKind.ACCEL_SWEEP,
             PatternKind.BRAKE_HOLD,
             PatternKind.COAST_DOWN,
+            PatternKind.CRUISE_TRIM,
         ):
             return _Phase.DRIVE_ACCEL
         return _Phase.MEASURE
@@ -434,18 +351,25 @@ class LearningLoop:
             )
             if self._accel_gov_cap is not None:
                 ramped = min(ramped, self._accel_gov_cap)  # 包絡線ガバナ（上限G）の踏み増し停止
-            return self._clamp_accel(ramped), 0.0
+            return clamp_opening(ramped, self._profile.max_accel_opening), 0.0
         if self._phase is _Phase.COAST:
             # 惰行: 両ペダル 0（エンジンブレーキ＋走行抵抗の自然減速を計測）
             return 0.0, 0.0
+        if self._phase is _Phase.CRUISE_TRIM:
+            # cap 到達後の微小開度保持: trim_opening を無ランプで一定保持（ブレーキ 0）。
+            trim = clamp_opening(pattern.trim_opening, self._profile.max_accel_opening)
+            return trim, 0.0
         if self._phase in (_Phase.DRIVE_BRAKE, _Phase.BRAKE_HOLD):
             # ブレーキをランプで踏み込み目標開度へ。ramp 完了後は一定保持（BRAKE_HOLD の定常区間）。
-            ramped = pattern.brake_opening * self._ramp_fraction(
-                elapsed, self._config.brake_ramp_time_s
-            )
+            # オーバースピード回復時はパターンの brake_opening（COAST_DOWN 等は 0.0）に関わらず
+            # 回復用の下限開度以上を踏む（そうしないと回復のはずが無ブレーキで再加速してしまう）。
+            target_brake = pattern.brake_opening
+            if self._phase is _Phase.DRIVE_BRAKE and self._overspeed_recovery:
+                target_brake = max(target_brake, self._config.overspeed_recovery_brake_pct)
+            ramped = target_brake * self._ramp_fraction(elapsed, self._config.brake_ramp_time_s)
             if self._brake_gov_cap is not None:
                 ramped = min(ramped, self._brake_gov_cap)  # 包絡線ガバナ（上限減速G）
-            return 0.0, self._clamp_brake(ramped)
+            return 0.0, clamp_opening(ramped, self._profile.max_brake_opening)
         # MEASURE（CREEP の段階リリース・CREEP_SETTLE の 0/0）
         return pattern.accel_opening, pattern.brake_opening
 
@@ -483,6 +407,10 @@ class LearningLoop:
                 self._advance_pattern(now)
             return
 
+        if self._phase is _Phase.CRUISE_TRIM:
+            self._advance_cruise_trim(pattern, speed, elapsed, now)
+            return
+
         if self._phase is _Phase.MEASURE and pattern.kind is PatternKind.CREEP_SETTLE:
             self._advance_creep_settle(elapsed, accel_kmhs, now)
             return
@@ -500,9 +428,11 @@ class LearningLoop:
         """加速区間: 上限G をガバナで守りつつ、cap 到達主導で次フェーズへ離脱する。
 
         - max_speed 超過（デバウンス）→ DRIVE_BRAKE で能動的に減速して復帰（惰行では戻らないため）。
-        - `max_speed × accel_speed_cap_frac`（cap）到達 or timeout → 種別ごとの次フェーズへ。
-          ACCEL_SWEEP → DRIVE_BRAKE（停車復帰）、BRAKE_HOLD → BRAKE_HOLD（定常ブレーキ保持）、
-          COAST_DOWN → COAST（惰行）。低開度が cap 未満で頭打ちした場合は timeout が離脱を担う。
+        - 予測的 cap 離脱: `cap − max(0, 平滑加速度) × overspeed_lead_s` 到達 or timeout → 種別
+          ごとの次フェーズへ。アクセルを解放しても応答遅れの間は惰性で車速が伸びるため、加速度に
+          応じて cap の手前で離脱し max_speed 超過を防ぐ（B-7-5）。加速がほぼ 0（プラトー）なら
+          しきい値は cap と一致し従来と同じ。ACCEL_SWEEP → DRIVE_BRAKE（停車復帰）、BRAKE_HOLD →
+          BRAKE_HOLD（定常ブレーキ保持）、COAST_DOWN → COAST（惰行）。低開度が頭打ちなら timeout。
         - 加速方向の上限G は `_update_governor` が踏み増しを止めて守る（ここでは離脱要因にしない）。
           プラトー早期離脱は行わない（cap まで加速を伸ばし全車速域を採取するため）。
         """
@@ -512,10 +442,12 @@ class LearningLoop:
         else:
             self._skip_count = 0
         if self._skip_count >= cfg.skip_consecutive_required:
-            self._enter_phase(_Phase.DRIVE_BRAKE, now)  # overspeed → 能動的に減速復帰
+            # overspeed → 能動的に減速復帰（回復用ブレーキ下限を適用）
+            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
             return
 
-        if speed >= self._accel_speed_cap or elapsed >= cfg.accel_full_range_timeout_s:
+        exit_speed = self._accel_speed_cap - max(0.0, accel_kmhs) * cfg.overspeed_lead_s
+        if speed >= exit_speed or elapsed >= cfg.accel_full_range_timeout_s:
             self._enter_phase(self._phase_after_accel(pattern), now)
 
     @staticmethod
@@ -525,6 +457,8 @@ class LearningLoop:
             return _Phase.DRIVE_BRAKE  # リセットブレーキで停車へ戻す
         if pattern.kind is PatternKind.BRAKE_HOLD:
             return _Phase.BRAKE_HOLD  # 固定ブレーキを保持して定常減速を記録
+        if pattern.kind is PatternKind.CRUISE_TRIM:
+            return _Phase.CRUISE_TRIM  # 微小アクセル開度を保持して高速域応答を採取
         return _Phase.COAST  # COAST_DOWN: 惰行
 
     def _advance_coast(
@@ -538,9 +472,30 @@ class LearningLoop:
         """
         cfg = self._config
         if speed > self._profile.max_speed:
-            self._enter_phase(_Phase.DRIVE_BRAKE, now)
+            # overspeed → 能動的に減速復帰（回復用ブレーキ下限を適用）
+            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
             return
         if speed <= cfg.coast_down_stop_speed_kmh or elapsed >= cfg.coast_timeout_s:
+            self._advance_pattern(now)
+
+    def _advance_cruise_trim(
+        self, pattern: LearningPattern, speed: float, elapsed: float, now: float
+    ) -> None:
+        """微小アクセル開度を保持し、高速域×微小開度の応答を採取する（B-7-2）。
+
+        trim_opening は小さいため通常は惰性で減速しつつ高速域を掃引する。hold_duration_s 経過
+        または低速まで落ちたら次パターンへ。万一 trim が加速側に働いて速度が cap 以上へ戻る場合は
+        過速度前に離脱する（アクセルは微小なので次パターンへ進めば解放され能動減速は不要）。
+        max_speed 超は安全網として能動減速（DRIVE_BRAKE）へ回す。
+        """
+        cfg = self._config
+        if speed > self._profile.max_speed:
+            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
+            return
+        if speed >= self._accel_speed_cap:
+            self._advance_pattern(now)  # cap 以上へ戻った（trim が加速側）→ 過速度前に離脱
+            return
+        if elapsed >= pattern.hold_duration_s or speed <= cfg.coast_down_stop_speed_kmh:
             self._advance_pattern(now)
 
     def _advance_creep_settle(self, elapsed: float, accel_kmhs: float, now: float) -> None:
@@ -565,14 +520,14 @@ class LearningLoop:
         self._pattern_idx += 1
         self._enter_phase(self._initial_phase(self._pattern_idx), now)
 
-    def _enter_phase(self, phase: _Phase, now: float) -> None:
+    def _enter_phase(self, phase: _Phase, now: float, *, overspeed_recovery: bool = False) -> None:
         self._phase = phase
         self._phase_started_at = now
         self._skip_count = 0
         self._stable_count = 0
-        self._stable_since = None
         self._accel_gov_cap = None
         self._brake_gov_cap = None
+        self._overspeed_recovery = overspeed_recovery
 
     def _update_governor(self, accel_kmhs: float) -> None:
         """包絡線ガバナ: 加速/減速G が上限を超えたら指令開度の踏み増しを止め、なお超過なら下げる。
@@ -622,12 +577,6 @@ class LearningLoop:
         # _speed_hist の末尾が現在サンプル
         cur = self._speed_hist[-1][1] if self._speed_hist else self._prev_speed
         return (cur - self._prev_speed) / dt
-
-    def _clamp_accel(self, opening_pct: float) -> float:
-        return max(0.0, min(opening_pct, self._profile.max_accel_opening))
-
-    def _clamp_brake(self, opening_pct: float) -> float:
-        return max(0.0, min(opening_pct, self._profile.max_brake_opening))
 
     # ── 補助 ───────────────────────────────────────────────────────
     def _move_duration(self) -> float:
@@ -681,31 +630,16 @@ class LearningLoop:
         await driver.move_to_position_timed(target_pos, current_pos, duration_s)
         return await driver.read_current()
 
-    def _opening_to_position(self, opening_pct: float, zero_pos: int, full_pos: int) -> int:
-        return zero_pos + round((full_pos - zero_pos) * opening_pct / 100.0)
 
-    def _enqueue_log_write(self, data: DriveLogData) -> None:
-        if self._log_writer is None or self._session_id is None:
-            return
-        if len(self._pending_log_tasks) >= MAX_PENDING_LOG_TASKS:
-            if not self._log_backlog_active:
-                self._log_backlog_active = True
-                _logger.warning(
-                    "学習ログ書き込みが %d 件滞留: 解消まで記録をスキップします",
-                    MAX_PENDING_LOG_TASKS,
-                )
-            return
-        if self._log_backlog_active:
-            self._log_backlog_active = False
-            _logger.info("学習ログ書き込みの滞留が解消しました")
-        task = asyncio.ensure_future(self._log_writer.write_log(self._session_id, data))
-        self._pending_log_tasks.add(task)
-        task.add_done_callback(self._on_log_write_done)
-
-    def _on_log_write_done(self, task: asyncio.Task[None]) -> None:
-        self._pending_log_tasks.discard(task)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            _logger.error("学習ログ書き込みエラー (走行継続)", exc_info=exc)
+__all__ = [
+    "LEARNING_LOOP_INTERVAL_S",
+    "MAX_PENDING_LOG_TASKS",
+    "STOP_SPEED_KMH",
+    "WEDGED_CYCLE_TIMEOUT_S",
+    "ActuatorDriverProtocol",
+    "CANReaderProtocol",
+    "LearningLoop",
+    "LearningLoopConfig",
+    "LogWriterProtocol",
+    "SafetyCheckProtocol",
+]

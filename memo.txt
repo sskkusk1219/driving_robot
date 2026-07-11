@@ -149,16 +149,6 @@ claude --version
     ✳ ストール対策の実機検証とMCP実装
     @/home/raspi5_16gb/projects/driving_robot/.steering/20260620-modbus-retry-cycle-stall
     実機検証
-    
-  - 学習運転
-    /resumeで現状を確認
-    ✳ feature-set-offline-evaluation
-    実機確認
-    
-    /resumeで現状を確認
-    ✳ PID適合の追従問題と車速先読み秒数の改善
-    .steering/20260704-actuator-delay-preview-tuning
-    sonnetでコード実装
 
   - サーボモータ
     /resumeで現状を確認
@@ -175,3 +165,22 @@ claude --version
       - スタートと同時にスタートボタンを押して、エンジン(READY)にする
       - 走行モードに従って、決められてタイミングでDriveにする(学習運転は規定値6秒でDrive)
       - 終了したらNにしてスタートボタンを押してIGN-OFFにしてブレーキをリリースする
+
+  
+  - KPI達成とペダルハンチングの改善
+    ✳ pedal-architecture-steering-plan
+    実機確認
+  
+  - 学習運転で1回目の学習運転を終了するときに減速するときのペダル開度がUIに表示されない
+  
+  - 自動運転ページで一時停止を教えたときの挙動\
+    軌跡が進んでしまっている
+    @docs/result/2026-07-09 184331.png
+    実機確認
+
+  - ログページ
+    学習サイクルの中に自動走行が存在してしまっている
+    "学習サイクル2026/7/9 17:49:59"
+    "自動走行　2026/7/9 18:15:15"このログは自動走行単体で存在すべき
+
+  - 実走行データを読み込ませて滑らかなペダル操作ができる制御を考えてもらう

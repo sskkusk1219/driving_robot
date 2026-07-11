@@ -65,7 +65,8 @@ class NutUPSMonitor:
         self._prev_on_battery: bool = False
         self._ac_loss_callbacks: list[AsyncCallback] = []
         self._polling_task: asyncio.Task[None] | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
+        # AC断コールバックタスクへの強参照（GC によるタスク消失防止。gpio_monitor と同様）。
+        self._callback_tasks: set[asyncio.Task[None]] = set()
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -104,7 +105,6 @@ class NutUPSMonitor:
 
     async def start_polling(self) -> None:
         """ポーリングループを asyncio.Task として起動する。"""
-        self._loop = asyncio.get_event_loop()
         # 初回ポーリングを即座に実行してキャッシュを初期化
         await self._poll_once()
         self._polling_task = asyncio.create_task(self._polling_loop(), name="ups_monitor_poll")
@@ -138,8 +138,9 @@ class NutUPSMonitor:
     async def _poll_once(self) -> None:
         """NUT に接続して battery.charge と ups.status を取得しキャッシュを更新する。"""
         try:
-            battery_str = await self._nut_get_var("battery.charge")
-            status_str = await self._nut_get_var("ups.status")
+            values = await self._nut_get_vars(["battery.charge", "ups.status"])
+            battery_str = values["battery.charge"]
+            status_str = values["ups.status"]
 
             battery_pct = float(battery_str)
             on_battery = _STATUS_ON_BATTERY in status_str.split()
@@ -168,8 +169,12 @@ class NutUPSMonitor:
             self._nut_available = False
             # キャッシュは保持したまま（一時的な接続断を許容）
 
-    async def _nut_get_var(self, var_name: str) -> str:
-        """NUT socket プロトコルで指定変数の値を取得する。
+    async def _nut_get_vars(self, var_names: list[str]) -> dict[str, str]:
+        """NUT socket プロトコルで複数変数の値を1接続にまとめて取得する。
+
+        以前は変数毎に接続・LOGOUTしており、5秒毎のポーリングで NUT デーモンへの
+        TCP 接続を2回張って2回 LOGOUT していた。1接続内で順に GET VAR を発行し、
+        全変数取得後に1回だけ LOGOUT する（E6 レビュー指摘）。
 
         NUT プロトコル:
             → GET VAR <ups_name> <var_name>\\n
@@ -181,13 +186,24 @@ class NutUPSMonitor:
             asyncio.open_connection(self._host, self._port),
             timeout=_CONNECT_TIMEOUT_S,
         )
+        values: dict[str, str] = {}
         try:
-            cmd = f"GET VAR {self._ups_name} {var_name}\n"
-            writer.write(cmd.encode())
-            await writer.drain()
+            for var_name in var_names:
+                cmd = f"GET VAR {self._ups_name} {var_name}\n"
+                writer.write(cmd.encode())
+                await writer.drain()
 
-            line_bytes = await asyncio.wait_for(reader.readline(), timeout=_NUT_LINE_TIMEOUT_S)
-            line = line_bytes.decode().strip()
+                line_bytes = await asyncio.wait_for(reader.readline(), timeout=_NUT_LINE_TIMEOUT_S)
+                line = line_bytes.decode().strip()
+
+                if line.startswith("ERR"):
+                    raise RuntimeError(f"NUT エラー ({var_name}): {line}")
+
+                # VAR apcups battery.charge "95"  → "95"
+                parts = line.split('"')
+                if len(parts) < 2:
+                    raise RuntimeError(f"NUT レスポンスが不正 ({var_name}): {line!r}")
+                values[var_name] = parts[1]
 
             writer.write(b"LOGOUT\n")
             await writer.drain()
@@ -198,19 +214,26 @@ class NutUPSMonitor:
             except Exception:
                 pass
 
-        if line.startswith("ERR"):
-            raise RuntimeError(f"NUT エラー ({var_name}): {line}")
-
-        # VAR apcups battery.charge "95"  → "95"
-        parts = line.split('"')
-        if len(parts) < 2:
-            raise RuntimeError(f"NUT レスポンスが不正 ({var_name}): {line!r}")
-        return parts[1]
+        return values
 
     def _fire_callbacks(self) -> None:
-        """登録済みの AC断コールバックをイベントループに投入する。"""
-        if self._loop is None or not self._loop.is_running():
-            logger.error("イベントループが実行中でないため AC断コールバックを投入できません")
-            return
+        """登録済みの AC断コールバックを起動する。
+
+        _poll_once はイベントループ自身のタスク（_polling_loop）から呼ばれるため、
+        別スレッド向けの run_coroutine_threadsafe は不要かつ誤用（GPIOMonitor の
+        割り込みハンドラのような別スレッドコンテキストではない）。asyncio.ensure_future
+        で起動し、例外を無音で握り潰さないよう done-callback でログに記録する
+        （I4 レビュー指摘）。
+        """
         for cb in self._ac_loss_callbacks:
-            asyncio.run_coroutine_threadsafe(cb(), self._loop)
+            task = asyncio.ensure_future(cb())
+            self._callback_tasks.add(task)
+            task.add_done_callback(self._on_callback_done)
+
+    def _on_callback_done(self, task: asyncio.Task[None]) -> None:
+        self._callback_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("AC断コールバックが失敗しました", exc_info=exc)

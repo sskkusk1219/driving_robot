@@ -83,6 +83,11 @@ class TestConnect:
                 with pytest.raises(FileNotFoundError):
                     await reader.connect()
 
+        # I6 回帰テスト: DBC 読み込みは Bus オープンより先に行うため、DBC が無い場合は
+        # can.Bus が一切呼ばれず、ハンドルがリークしない（reader._bus も None のまま）。
+        mock_loop.run_in_executor.assert_not_called()
+        assert reader._bus is None
+
 
 class TestReadSpeed:
     @pytest.mark.asyncio

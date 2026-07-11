@@ -15,6 +15,8 @@ from src.domain.safety_monitor import SafetyMonitor
 from src.models.profile import PIDGains, StopConfig, VehicleProfile
 from src.models.system_state import RobotState
 from tests.unit.test_robot_controller import (
+    _calibrated_profile,
+    _make_mode,
     advance_to_ready,
     make_accel_driver,
     make_brake_driver,
@@ -174,7 +176,7 @@ class TestStartDriveEmergencyRace:
         """_open_session の await 中に非常停止 → DriveLoop を起動せず中断すること。"""
         ctrl = make_controller()
         await ctrl.start()
-        ctrl.select_profile(_make_profile())
+        ctrl.select_profile(_calibrated_profile())
         await ctrl.initialize()
 
         log_writer = MagicMock()
@@ -190,7 +192,9 @@ class TestStartDriveEmergencyRace:
         log_writer.end_session = AsyncMock()
 
         with pytest.raises(InvalidStateTransition):
-            await ctrl.start_auto_drive("mode-1", log_writer=log_writer)
+            await ctrl.start_auto_drive(
+                "mode-1", mode=_make_mode(), profile=_calibrated_profile(), log_writer=log_writer
+            )
 
         assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
         assert ctrl._drive_loop is None

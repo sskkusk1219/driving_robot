@@ -7,6 +7,7 @@ from fastapi import Request
 from src.app.learning_cycle import LearningCycleOrchestrator
 from src.app.robot_controller import LogWriterProtocol, RobotController
 from src.domain.model_training import DEFAULT_FEATURE_SPEC, FeatureSpec
+from src.infra.ilc_repository import ILCRecord
 from src.infra.settings import LearningSettings
 from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
@@ -58,6 +59,13 @@ class SessionRepoProtocol(Protocol):
     ) -> list[LearningCycle]: ...
 
 
+class ILCRepoProtocol(Protocol):
+    async def get(self, profile_id: str, mode_id: str) -> ILCRecord | None: ...
+    async def reset(self, profile_id: str, mode_id: str) -> None: ...
+    async def reset_for_mode(self, mode_id: str) -> None: ...
+    async def set_enabled(self, profile_id: str, mode_id: str, enabled: bool) -> None: ...
+
+
 class UPSMonitorProtocol(Protocol):
     async def get_status(self) -> UPSStatus: ...
 
@@ -103,6 +111,11 @@ def get_schedule_repo(request: Request) -> ScheduleRepoProtocol:
     return repo
 
 
+def get_ilc_repo(request: Request) -> ILCRepoProtocol:
+    repo: ILCRepoProtocol = request.app.state.ilc_repo
+    return repo
+
+
 def get_feature_spec(request: Request) -> FeatureSpec:
     """学習時に使う特徴量構成。app.state 未設定（起動シーケンス外）時は現行9特徴を返す。"""
     spec: FeatureSpec = getattr(request.app.state, "feature_spec", DEFAULT_FEATURE_SPEC)
@@ -111,9 +124,7 @@ def get_feature_spec(request: Request) -> FeatureSpec:
 
 def get_learning_settings(request: Request) -> LearningSettings:
     """2段階学習フローのデフォルトパラメータ。app.state 未設定時はデフォルト値を返す。"""
-    settings: LearningSettings = getattr(
-        request.app.state, "learning_settings", LearningSettings()
-    )
+    settings: LearningSettings = getattr(request.app.state, "learning_settings", LearningSettings())
     return settings
 
 

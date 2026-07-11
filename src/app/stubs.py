@@ -8,9 +8,11 @@ from uuid import uuid4
 
 from src.app.robot_controller import RobotController
 from src.domain.control.feedforward import FeedforwardController
+from src.domain.control.ilc import ILCTable
 from src.domain.control.pid import PIDController
 from src.domain.learning_drive import LearningDriveManager
 from src.infra.db import DuplicateNameError
+from src.infra.ilc_repository import ILCRecord
 from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession, LearningCycle
@@ -305,8 +307,7 @@ class InMemoryScheduleRepository:
             return None
         # 別レコードとの名称重複を DB と同様に弾く
         if any(
-            s.name == schedule.name and sid != schedule.id
-            for sid, s in self._schedules.items()
+            s.name == schedule.name and sid != schedule.id for sid, s in self._schedules.items()
         ):
             raise DuplicateNameError(f"スケジュール名 {schedule.name!r} は既に使用されています")
         self._schedules[schedule.id] = schedule
@@ -351,3 +352,59 @@ class InMemorySessionRepository:
         limit: int = 100,  # noqa: ARG002
     ) -> list[LearningCycle]:
         return []
+
+
+class InMemoryILCRepository:
+    """DB なし環境用の in-memory ILC リポジトリ（profile×mode をキーに保持）。"""
+
+    def __init__(self) -> None:
+        self._records: dict[tuple[str, str], ILCRecord] = {}
+
+    async def get(self, profile_id: str, mode_id: str) -> ILCRecord | None:
+        return self._records.get((profile_id, mode_id))
+
+    async def upsert(
+        self,
+        profile_id: str,
+        mode_id: str,
+        table: ILCTable,
+        kpi_history: list[dict[str, object]],
+    ) -> None:
+        prev = self._records.get((profile_id, mode_id))
+        enabled = prev.enabled if prev is not None else True
+        self._records[(profile_id, mode_id)] = ILCRecord(
+            profile_id=profile_id,
+            mode_id=mode_id,
+            enabled=enabled,
+            table=table,
+            kpi_history=list(kpi_history),
+            updated_at=datetime.now(tz=UTC),
+        )
+
+    async def reset(self, profile_id: str, mode_id: str) -> None:
+        self._records.pop((profile_id, mode_id), None)
+
+    async def reset_for_mode(self, mode_id: str) -> None:
+        for key in [k for k in self._records if k[1] == mode_id]:
+            del self._records[key]
+
+    async def set_enabled(self, profile_id: str, mode_id: str, enabled: bool) -> None:
+        prev = self._records.get((profile_id, mode_id))
+        if prev is not None:
+            self._records[(profile_id, mode_id)] = ILCRecord(
+                profile_id=profile_id,
+                mode_id=mode_id,
+                enabled=enabled,
+                table=prev.table,
+                kpi_history=prev.kpi_history,
+                updated_at=datetime.now(tz=UTC),
+            )
+        else:
+            self._records[(profile_id, mode_id)] = ILCRecord(
+                profile_id=profile_id,
+                mode_id=mode_id,
+                enabled=enabled,
+                table=ILCTable(),
+                kpi_history=[],
+                updated_at=datetime.now(tz=UTC),
+            )

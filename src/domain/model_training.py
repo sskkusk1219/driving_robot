@@ -43,6 +43,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
+from src.domain.control.conversions import VEHICLE_STOP_SPEED_KMH
 from src.domain.learning_drive import LearningDataError
 from src.models.drive_log import DriveLog
 from src.models.profile import FeedforwardParams, VehicleProfile
@@ -62,8 +63,8 @@ DEFAULT_DT_S: float = 0.1  # ログ周期が推定できない場合のフォー
 MIN_SAMPLES_FOR_TRAINING: int = 20  # 全レジーム合計の最小サンプル数
 MIN_REGIME_SAMPLES: int = 8  # 各モデル（アクセル/ブレーキ）の最小サンプル数
 
-# 物理定数推定用
-STOP_SPEED_KMH: float = 0.5  # これ以下を「停車」とみなす（FF predict でも使用）
+# 物理定数推定用。src.domain.control.conversions の共通定数を使う（A2 レビュー指摘）。
+STOP_SPEED_KMH: float = VEHICLE_STOP_SPEED_KMH  # これ以下を「停車」とみなす（FF predict でも使用）
 CREEP_STEADY_TOL_KMHS: float = 0.3  # クリープ定常判定の |加速度| しきい値
 MIN_OBS_SAMPLES: int = 5  # 各定数を上書きするのに必要な最小観測サンプル数
 
@@ -487,7 +488,9 @@ def estimate_dynamics_params(logs: list[DriveLog], current: FeedforwardParams) -
 
         dv = np.diff(speed) / dt  # i→i+1 の加速度 [km/h/s]（長さ n-1）
         sp = speed[:-1]  # dv に揃えた始点速度
-        pedal_off = (accel[:-1] < accel_db) & (brake[:-1] < brake_db)
+        # deadband_pct 以下は「ペダルオフ」とみなす。strict < だと deadband=0.0
+        # （合法値）のとき常に False になり物理定数推定が無音で全滅する（D5 レビュー指摘）。
+        pedal_off = (accel[:-1] <= accel_db) & (brake[:-1] <= brake_db)
 
         # 停車保持ブレーキ: 停車中にかけているブレーキ開度
         m_stop = (speed < STOP_SPEED_KMH) & (brake >= brake_db)
@@ -506,11 +509,11 @@ def estimate_dynamics_params(logs: list[DriveLog], current: FeedforwardParams) -
         creep_rates.extend(dv[m_rate].tolist())
 
         # 不感帯推定用スキャンサンプル: 他ペダルオフ・探索上限以下の開度域で開度→応答を収集
-        m_accel_scan = (brake[:-1] < brake_db) & (accel[:-1] <= DEADBAND_SCAN_MAX_PCT)
+        m_accel_scan = (brake[:-1] <= brake_db) & (accel[:-1] <= DEADBAND_SCAN_MAX_PCT)
         accel_scan_openings.extend(accel[:-1][m_accel_scan].tolist())
         accel_scan_dv.extend(dv[m_accel_scan].tolist())
 
-        m_brake_scan = (accel[:-1] < accel_db) & (brake[:-1] <= DEADBAND_SCAN_MAX_PCT)
+        m_brake_scan = (accel[:-1] <= accel_db) & (brake[:-1] <= DEADBAND_SCAN_MAX_PCT)
         brake_scan_openings.extend(brake[:-1][m_brake_scan].tolist())
         brake_scan_decel.extend((-dv[m_brake_scan]).tolist())
 

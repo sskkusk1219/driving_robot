@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.domain.calibration import (
+    CalibrationCancelled,
     CalibrationConfig,
     CalibrationDetectionError,
     CalibrationManager,
@@ -268,6 +269,75 @@ class TestProbeContact:
         # (探索距離不足で CalibrationDetectionError)
         with pytest.raises(CalibrationDetectionError):
             await manager._probe_contact(manager._accel_driver, start_pos=0)
+
+    @pytest.mark.asyncio
+    async def test_contaminated_baseline_raises_before_hard_stop(self) -> None:
+        """D2 回帰テスト: 開始位置が既に接触済み（ベースライン自体が高電流）の場合、
+        相対スパイク判定に頼らず即座に中断する（max_search_pulse まで押し込まない）。"""
+        # 最初のウィンドウ（3サンプル）から既に高電流 → baseline 確定時点で中断するはず
+        currents = [900.0, 900.0, 900.0] + [900.0] * 50
+        cfg = CalibrationConfig(
+            move_step_pulse=1000,
+            step_interval_s=0.0,
+            current_window=3,
+            current_spike_ratio=1.5,
+            min_stroke_pulse=500,
+            max_stroke_pulse=20000,
+            max_search_pulse=30000,
+            max_baseline_current_ma=800.0,
+        )
+        manager = CalibrationManager(
+            accel_driver=MockActuatorDriver(currents),
+            brake_driver=MockActuatorDriver([]),
+            config=cfg,
+        )
+        with pytest.raises(CalibrationDetectionError, match="ベースライン電流"):
+            await manager._probe_contact(manager._accel_driver, start_pos=0)
+        # 3ステップ（ウィンドウが埋まった時点）で中断し、それ以上は押し込んでいない
+        assert len(manager._accel_driver.positions_commanded) <= 3  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_absolute_overcurrent_aborts_search(self) -> None:
+        """D2 回帰テスト: 相対スパイク比が満たされなくても絶対電流上限超過で即座に中断する。"""
+        currents = [100.0, 100.0, 100.0, 3500.0] + [100.0] * 50
+        cfg = CalibrationConfig(
+            move_step_pulse=1000,
+            step_interval_s=0.0,
+            current_window=3,
+            current_spike_ratio=1.5,
+            min_stroke_pulse=500,
+            max_stroke_pulse=20000,
+            max_search_pulse=30000,
+            max_search_current_ma=3000.0,
+        )
+        manager = CalibrationManager(
+            accel_driver=MockActuatorDriver(currents),
+            brake_driver=MockActuatorDriver([]),
+            config=cfg,
+        )
+        with pytest.raises(CalibrationDetectionError, match="電流上限"):
+            await manager._probe_contact(manager._accel_driver, start_pos=0)
+
+    @pytest.mark.asyncio
+    async def test_cancel_aborts_probe_in_progress(self) -> None:
+        """W6 回帰テスト: cancel() を呼ぶと探索ループが CalibrationCancelled で中断する
+        （emergency_stop からの割り込みを模擬）。"""
+        currents = [100.0] * 100
+        manager, accel, _ = make_manager(accel_currents=currents, brake_currents=[])
+        manager.cancel()  # 探索開始前にキャンセル済み（emergency_stop が先に発火したケース）
+        with pytest.raises(CalibrationCancelled):
+            await manager._probe_contact(accel, start_pos=0)
+
+    @pytest.mark.asyncio
+    async def test_run_calibration_returns_failure_result_on_cancel(self) -> None:
+        """cancel() 起因の CalibrationCancelled は run_calibration() 内で捕捉され、
+        失敗の CalibrationResult として返る（例外は外へ伝播しない）。"""
+        currents = [100.0] * 100
+        manager, _, _ = make_manager(accel_currents=currents, brake_currents=[])
+        manager.cancel()
+        result = await manager.run_calibration(profile_id="p1")
+        assert result.success is False
+        assert result.data is None
 
 
 # ---------------------------------------------------------------------------

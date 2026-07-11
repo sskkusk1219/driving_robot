@@ -69,10 +69,10 @@ class TestVehicleProfile:
         assert p.calibration.is_valid is True
 
     def test_dynamics_params_defaults_to_zero_preview(self) -> None:
-        """dynamics_params 省略時は preview_time_s=0.0 で従来動作互換であること。"""
+        """dynamics_params 省略時は pid_preview_s=0.0 で従来動作互換であること。"""
         p = make_profile()
         assert p.dynamics_params == DynamicsParams()
-        assert p.dynamics_params.preview_time_s == 0.0
+        assert p.dynamics_params.pid_preview_s == 0.0
         assert p.dynamics_params.fopdt_k is None
 
     def test_dynamics_params_explicit(self) -> None:
@@ -90,24 +90,24 @@ class TestVehicleProfile:
             created_at=NOW,
             updated_at=NOW,
             dynamics_params=DynamicsParams(
-                preview_time_s=1.2, fopdt_k=2.5, fopdt_tau=0.8, fopdt_theta=0.6
+                pid_preview_s=1.2, fopdt_k=2.5, fopdt_tau=0.8, fopdt_theta=0.6
             ),
         )
-        assert p.dynamics_params.preview_time_s == 1.2
+        assert p.dynamics_params.pid_preview_s == 1.2
         assert p.dynamics_params.fopdt_theta == 0.6
 
 
 class TestDynamicsParams:
     def test_defaults(self) -> None:
         dyn = DynamicsParams()
-        assert dyn.preview_time_s == 0.0
+        assert dyn.pid_preview_s == 0.0
         assert dyn.fopdt_k is None
         assert dyn.fopdt_tau is None
         assert dyn.fopdt_theta is None
 
     def test_explicit_values(self) -> None:
-        dyn = DynamicsParams(preview_time_s=0.9, fopdt_k=1.5, fopdt_tau=1.0, fopdt_theta=0.5)
-        assert dyn.preview_time_s == 0.9
+        dyn = DynamicsParams(pid_preview_s=0.9, fopdt_k=1.5, fopdt_tau=1.0, fopdt_theta=0.5)
+        assert dyn.pid_preview_s == 0.9
         assert dyn.fopdt_k == 1.5
 
 

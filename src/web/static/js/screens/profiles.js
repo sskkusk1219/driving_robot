@@ -67,7 +67,7 @@ function ProfilesScreen() {
         deviation_duration_s: p.stop_config?.deviation_duration_s ?? 4.0,
       },
       model_path: null,
-      dynamics_params: { preview_time_s: p.dynamics_params?.preview_time_s ?? 0.0 },
+      dynamics_params: { pid_preview_s: p.dynamics_params?.pid_preview_s ?? 0.0 },
     };
     const r = await apiFetch('POST', '/api/v1/profiles/', payload);
     if (r) {
@@ -300,7 +300,7 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
     stop_brake_opening_pct: initial?.feedforward_params?.stop_brake_opening_pct ?? 20.0,
     brake_deadband_pct: initial?.feedforward_params?.brake_deadband_pct ?? 1.0,
     accel_deadband_pct: initial?.feedforward_params?.accel_deadband_pct ?? 1.0,
-    preview_time_s: initial?.dynamics_params?.preview_time_s ?? 0.0,
+    pid_preview_s: initial?.dynamics_params?.pid_preview_s ?? 0.0,
   });
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
@@ -328,7 +328,7 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
         accel_deadband_pct: Number(form.accel_deadband_pct),
       },
       dynamics_params: {
-        preview_time_s: Number(form.preview_time_s),
+        pid_preview_s: Number(form.pid_preview_s),
         // FOPDT同定値は学習サイクルが書き込む表示用メタデータ。フォーム保存で消さないよう
         // 既存値をそのまま送り返す（本フォームに編集UIはない）。
         fopdt_k: initial?.dynamics_params?.fopdt_k ?? null,
@@ -425,12 +425,12 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
           ),
         ),
 
-        // 先読み（アクチュエータ〜車両系のむだ時間補償。PID自動適合で自動算出／手動調整可）
-        React.createElement(Box, { label: '先読み', style: { padding: 14 } },
+        // PID先読み（FBループのむだ時間補償。PID自動適合で自動算出／手動調整可。FFはnow-frame）
+        React.createElement(Box, { label: 'PID先読み', style: { padding: 14 } },
           React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-            inp('先読み補償時間 [s]', 'preview_time_s', { type: 'number', mono: true }),
+            inp('PID先読み補償 [s]', 'pid_preview_s', { type: 'number', mono: true }),
             React.createElement('div', { style: { fontSize: 12, color: INK_SOFT, lineHeight: 1.4 } },
-              'PID自動適合（学習サイクル）で自動算出されます。'
+              'PIDフィードバックのみ前倒しします（FFはnow-frame）。PID自動適合（学習サイクル）で自動算出されます。'
             ),
             React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, fontSize: 13 } },
               React.createElement('div', null, 'K: ', React.createElement('b', null, initial?.dynamics_params?.fopdt_k ?? '—')),

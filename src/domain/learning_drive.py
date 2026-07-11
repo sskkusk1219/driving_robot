@@ -34,6 +34,13 @@ BRAKE_HOLD_ACCEL_PCT: float = 70.0
 COAST_DOWN_COUNT: int = 3  # 専用コーストダウン本数（速度全域の減速カーブ計測）
 COAST_DOWN_ACCEL_PCT: float = 70.0  # コーストダウンの加速アクセル開度（cap まで上げる標準値）
 
+# 高速巡航トリム（CRUISE_TRIM）: cap まで加速後にアクセルを微小開度へ落として保持し、
+# 高速域（125-140km/h）× 微小開度（1〜5%）の応答を採る。WLTP 巡航帯のモデルデータ欠損を
+# stage1（学習運転のみ）の時点で埋める（B-7-2）。cap まで上げる加速開度は COAST_DOWN と同じ。
+CRUISE_TRIM_ACCEL_PCT: float = 70.0
+CRUISE_TRIM_OPENINGS_PCT: tuple[float, ...] = (1.5, 3.0)  # 保持する微小アクセル開度（2本）
+CRUISE_TRIM_HOLD_S: float = 8.0  # 各トリム保持時間（惰性減速で高速域を掃引する長さ）
+
 
 class LearningDataError(Exception):
     """ログが不足・不正でモデル構築できない場合に送出。"""
@@ -51,6 +58,9 @@ class LearningDriveConfig:
     brake_hold_accel_pct: float = field(default=BRAKE_HOLD_ACCEL_PCT)
     coast_down_count: int = field(default=COAST_DOWN_COUNT)
     coast_down_accel_pct: float = field(default=COAST_DOWN_ACCEL_PCT)
+    cruise_trim_accel_pct: float = field(default=CRUISE_TRIM_ACCEL_PCT)
+    cruise_trim_openings_pct: tuple[float, ...] = field(default=CRUISE_TRIM_OPENINGS_PCT)
+    cruise_trim_hold_s: float = field(default=CRUISE_TRIM_HOLD_S)
 
 
 class LearningDriveManager:
@@ -77,6 +87,9 @@ class LearningDriveManager:
              定常減速を記録する（加速側プラトー保持と対称）。低開度4段はブレーキ不感帯推定を兼ねる。
           6. コーストダウン（COAST_DOWN）数本: アクセルで加速→ブレーキ無しで低速まで惰行し、
              エンジンブレーキ＋走行抵抗の減速率を速度全域で計測する
+          7. 高速巡航トリム（CRUISE_TRIM）数本: cap まで加速→アクセルを微小開度（1〜5%）へ
+             落として保持し、高速域（125-140km/h）× 微小開度の応答を採る。WLTP 巡航帯の
+             モデルデータ欠損を stage1（学習運転のみ）の時点で埋める（B-7-2）。
 
         いずれも車両プロファイルの最大開度を超えないようにスケール・クランプする。
         """
@@ -163,6 +176,24 @@ class LearningDriveManager:
                         accel_opening=coast_accel,
                         brake_opening=0.0,
                         hold_duration_s=hold,
+                    )
+                )
+
+        # 7. 高速巡航トリム（cap まで加速→微小アクセル開度を保持し高速域×微小開度を採取）。
+        #    WLTP 巡航帯（125-140km/h×1〜5%）のモデルデータ欠損を埋める（B-7-2）。
+        trim_accel = min(self._config.cruise_trim_accel_pct, profile.max_accel_opening)
+        if trim_accel > 0.0:
+            for trim_pct in self._config.cruise_trim_openings_pct:
+                trim = min(max(trim_pct, 0.0), profile.max_accel_opening)
+                if trim <= 0.0:
+                    continue
+                patterns.append(
+                    LearningPattern(
+                        kind=PatternKind.CRUISE_TRIM,
+                        accel_opening=trim_accel,
+                        brake_opening=0.0,
+                        hold_duration_s=self._config.cruise_trim_hold_s,
+                        trim_opening=trim,
                     )
                 )
 

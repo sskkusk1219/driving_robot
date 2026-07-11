@@ -27,6 +27,9 @@ SEND_TIMEOUT_S = 0.5
 class ConnectionManager:
     def __init__(self) -> None:
         self._connections: list[WebSocket] = []
+        # 新規接続時に True にする。broadcast_loop の変更検知スキップ（E4）を1回だけ
+        # バイパスし、接続直後のクライアントが値変化まで無表示にならないようにする。
+        self.needs_full_send = True
 
     @property
     def has_connections(self) -> bool:
@@ -35,6 +38,7 @@ class ConnectionManager:
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
         self._connections.append(ws)
+        self.needs_full_send = True
 
     def disconnect(self, ws: WebSocket) -> None:
         if ws in self._connections:
@@ -74,6 +78,10 @@ async def realtime_ws(ws: WebSocket) -> None:
 
 
 async def broadcast_loop(app: Starlette) -> None:
+    # 直近送信したペイロード（timestamp 除外）。値が完全に不変なら再送を省略し、アイドル中の
+    # 無駄な JSON 直列化・全クライアント送信を避ける（E4 レビュー指摘）。状態変化（EMERGENCY
+    # 遷移等）は必ず内容差として検知されるため、安全に関わる更新の遅延は発生しない。
+    last_payload: tuple[object, ...] | None = None
     while True:
         await asyncio.sleep(WS_BROADCAST_INTERVAL_S)
         if not manager.has_connections:
@@ -115,17 +123,26 @@ async def broadcast_loop(app: Starlette) -> None:
         cycle_progress: CycleProgressSchema | None = None
         orchestrator = getattr(app.state, "cycle_orchestrator", None)
         if orchestrator is not None:
-            p = orchestrator.progress
-            cycle_progress = CycleProgressSchema(
-                cycle_id=p.cycle_id,
-                phase=p.phase.value,
-                run_index=p.run_index,
-                run_total=p.run_total,
-                best_cost=p.best_cost,
-                best_preview_time_s=p.best_preview_time_s,
-                message=p.message,
-                started_at=p.started_at,
-            )
+            cycle_progress = CycleProgressSchema.model_validate(orchestrator.progress)
+
+        # timestamp を除いた内容で変化検知する（送信スキップ判定専用。実送信は下の RealtimeData）。
+        payload = (
+            state.robot_state,
+            actual_speed,
+            controller.current_ref_speed,
+            accel_opening,
+            brake_opening,
+            accel_current,
+            brake_current,
+            ups_battery_pct,
+            ups_on_battery,
+            tuple((s.key, s.status) for s in init_steps),
+            cycle_progress.model_dump_json() if cycle_progress is not None else None,
+        )
+        if payload == last_payload and not manager.needs_full_send:
+            continue
+        last_payload = payload
+        manager.needs_full_send = False
 
         data = RealtimeData(
             timestamp=datetime.now(tz=UTC).isoformat(),

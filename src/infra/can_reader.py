@@ -64,6 +64,20 @@ class CANReader:
 
         loop = asyncio.get_event_loop()
 
+        # DBC のロードは Bus オープンより先に行う。Bus オープン後に失敗すると Bus
+        # ハンドルがクローズされずリークし、single_handle のチャネルが占有されたまま
+        # 残ってしまう（次回接続がハンドル不足で失敗し得る）ため、失敗し得る処理を
+        # 先に済ませておく（I6 レビュー指摘）。
+        if self._dbc_path is not None:
+            if not self._dbc_path.exists():
+                raise FileNotFoundError(f"DBC ファイルが見つかりません: {self._dbc_path}")
+            import cantools
+
+            self._db = cantools.database.load_file(str(self._dbc_path))
+            logger.info("DBC ロード完了: %s", self._dbc_path)
+        else:
+            logger.warning("DBC ファイル未指定。read_speed() は NotImplementedError を送出します。")
+
         # Kvaser の一部デバイスは canSetAcceptanceFilter が未実装 (Error Code -32) のため
         # Bus 初期化時に can.kvaser ロガーが error を出力する。機能には影響しないので抑制する。
         _kvaser_log = logging.getLogger("can.kvaser")
@@ -84,16 +98,6 @@ class CANReader:
             )
         finally:
             _kvaser_log.setLevel(_prev_level)
-
-        if self._dbc_path is not None:
-            if not self._dbc_path.exists():
-                raise FileNotFoundError(f"DBC ファイルが見つかりません: {self._dbc_path}")
-            import cantools
-
-            self._db = cantools.database.load_file(str(self._dbc_path))
-            logger.info("DBC ロード完了: %s", self._dbc_path)
-        else:
-            logger.warning("DBC ファイル未指定。read_speed() は NotImplementedError を送出します。")
 
         # イベント駆動型受信: Notifier がバックグラウンドスレッドでフレームを受け取り
         # AsyncBufferedReader のキューに積み、常駐コンシューマが最新車速をキャッシュする

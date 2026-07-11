@@ -27,7 +27,7 @@ DDL_STATEMENTS = [
     ALTER TABLE vehicle_profiles
         ADD COLUMN IF NOT EXISTS feedforward_params JSONB
     """,
-    # 先読み補償(preview_time_s)・FOPDT同定値(k, tau, theta)を保持する動特性パラメータ
+    # PID先読み補償(pid_preview_s)・FOPDT同定値(k, tau, theta)を保持する動特性パラメータ
     """
     ALTER TABLE vehicle_profiles
         ADD COLUMN IF NOT EXISTS dynamics_params JSONB
@@ -145,6 +145,22 @@ DDL_STATEMENTS = [
     """
     ALTER TABLE time_schedules
         DROP COLUMN IF EXISTS loop
+    """,
+    # 反復学習制御（ILC）テーブル: profile×mode 単位で時刻別補正 effort を永続化する。
+    # 同一モードの反復走行で残差を学習し、次回走行に補正として適用する（Stage C）。
+    """
+    CREATE TABLE IF NOT EXISTS ilc_tables (
+        profile_id  UUID NOT NULL REFERENCES vehicle_profiles(id) ON DELETE CASCADE,
+        mode_id     UUID NOT NULL REFERENCES driving_modes(id) ON DELETE CASCADE,
+        enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+        iteration   INTEGER NOT NULL,
+        dt_s        DOUBLE PRECISION NOT NULL,
+        efforts     JSONB NOT NULL,
+        best_p95_kmh DOUBLE PRECISION,
+        kpi_history JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at  TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (profile_id, mode_id)
+    )
     """,
     # architecture.md 定義の3インデックス
     """

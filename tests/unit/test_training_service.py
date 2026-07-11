@@ -178,7 +178,8 @@ class TestTrainAndApplyUpdatePidGainsFlag:
         controller = FakeController()
 
         monkeypatch.setattr(
-            "src.app.training_service.identify_fopdt", lambda logs, profile: None  # noqa: ARG005
+            "src.app.training_service.identify_fopdt",
+            lambda logs, profile: None,  # noqa: ARG005
         )
 
         result = await train_and_apply(
@@ -199,7 +200,7 @@ class TestTrainAndApplyDynamicsParams:
     async def test_fopdt_success_sets_preview_and_fopdt_values(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """FOPDT同定成功時、preview_time_s=θ(クランプ後)・fopdt_k/tau/theta が設定される。"""
+        """FOPDT同定成功時、pid_preview_s=0.0（θ 前倒し廃止）・fopdt_k/tau/theta が設定される。"""
         profile = make_profile()
         profile_repo = FakeProfileRepo(profile)
         session_repo = FakeSessionRepo([make_log()])
@@ -223,12 +224,13 @@ class TestTrainAndApplyDynamicsParams:
             update_pid_gains=True,
         )
 
-        assert result.dynamics_params.preview_time_s == pytest.approx(0.8)
+        # Stage A: pid_preview_s は θ に依らず 0.0（二重補償回避）。θ は fopdt_theta へ。
+        assert result.dynamics_params.pid_preview_s == pytest.approx(0.0)
         assert result.dynamics_params.fopdt_k == pytest.approx(0.5)
         assert result.dynamics_params.fopdt_tau == pytest.approx(2.0)
         assert result.dynamics_params.fopdt_theta == pytest.approx(0.8)
         assert profile_repo.updated is not None
-        assert profile_repo.updated.dynamics_params.preview_time_s == pytest.approx(0.8)
+        assert profile_repo.updated.dynamics_params.pid_preview_s == pytest.approx(0.0)
 
     @pytest.mark.asyncio
     async def test_update_pid_gains_false_keeps_existing_dynamics_params(
@@ -236,7 +238,7 @@ class TestTrainAndApplyDynamicsParams:
     ) -> None:
         """update_pid_gains=False（2段目の再学習）では dynamics_params を保持する。"""
         existing_dyn = DynamicsParams(
-            preview_time_s=1.1, fopdt_k=0.6, fopdt_tau=1.5, fopdt_theta=0.7
+            pid_preview_s=1.1, fopdt_k=0.6, fopdt_tau=1.5, fopdt_theta=0.7
         )
         profile = make_profile()
         profile.dynamics_params = existing_dyn
@@ -265,7 +267,7 @@ class TestTrainAndApplyDynamicsParams:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """区間不足で FOPDT 同定できない場合は既存の dynamics_params を保持する。"""
-        existing_dyn = DynamicsParams(preview_time_s=0.9, fopdt_theta=0.9)
+        existing_dyn = DynamicsParams(pid_preview_s=0.9, fopdt_theta=0.9)
         profile = make_profile()
         profile.dynamics_params = existing_dyn
         profile_repo = FakeProfileRepo(profile)
@@ -273,7 +275,8 @@ class TestTrainAndApplyDynamicsParams:
         controller = FakeController()
 
         monkeypatch.setattr(
-            "src.app.training_service.identify_fopdt", lambda logs, profile: None  # noqa: ARG005
+            "src.app.training_service.identify_fopdt",
+            lambda logs, profile: None,  # noqa: ARG005
         )
 
         result = await train_and_apply(

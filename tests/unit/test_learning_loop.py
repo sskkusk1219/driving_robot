@@ -101,6 +101,18 @@ def _coast_down_pattern(accel: float = 50.0, hold: float = 0.0) -> LearningPatte
     )
 
 
+def _cruise_trim_pattern(
+    accel: float = 70.0, trim: float = 2.0, hold: float = 8.0
+) -> LearningPattern:
+    return LearningPattern(
+        kind=PatternKind.CRUISE_TRIM,
+        accel_opening=accel,
+        brake_opening=0.0,
+        hold_duration_s=hold,
+        trim_opening=trim,
+    )
+
+
 def _make_loop(
     *,
     accel_driver: MagicMock | None = None,
@@ -235,6 +247,64 @@ class TestSkipSafety:
         assert loop._phase is _Phase.DRIVE_BRAKE  # 惰行では戻らないので能動的に制動
 
     @pytest.mark.asyncio
+    async def test_overspeed_in_coast_enters_drive_brake_with_recovery_flag(self) -> None:
+        """COAST_DOWN の惰行中に過速度が成立した場合も DRIVE_BRAKE へ遷移し、
+        オーバースピード回復フラグが立つ（D1: ブレーキ0%のまま再加速するのを防ぐ前提）。"""
+        loop = _make_loop(
+            profile=_make_profile(max_speed=100.0),
+            can_reader=_make_can(speed=150.0),
+            patterns=[_coast_down_pattern(hold=100.0)],
+            config=LearningLoopConfig(coast_timeout_s=100.0),
+        )
+        with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
+            loop._running = True
+            loop._phase = _Phase.COAST
+            loop._phase_started_at = 0.0
+            await loop._execute_one_cycle()
+        assert loop._phase is _Phase.DRIVE_BRAKE
+        assert loop._overspeed_recovery is True
+
+    @pytest.mark.asyncio
+    async def test_overspeed_recovery_commands_nonzero_brake_for_coast_down(self) -> None:
+        """D1 回帰テスト: COAST_DOWN パターン（brake_opening=0.0）でも、オーバースピード
+        回復中の DRIVE_BRAKE はブレーキ0%のままにならず回復用の下限開度を踏む。"""
+        loop = _make_loop(
+            can_reader=_make_can(speed=95.0),  # まだ走行中（停車判定に掛からない）
+            patterns=[_coast_down_pattern(hold=100.0)],
+            config=LearningLoopConfig(brake_ramp_time_s=0.0),  # 即時に目標開度へ
+        )
+        with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
+            loop._running = True
+            loop._phase = _Phase.DRIVE_BRAKE
+            loop._phase_started_at = 0.0
+            loop._overspeed_recovery = True
+            await loop._execute_one_cycle()
+        assert loop.current_accel_opening == 0.0
+        assert loop.current_brake_opening == pytest.approx(
+            loop._config.overspeed_recovery_brake_pct
+        )
+        assert loop.current_brake_opening > 0.0
+
+    @pytest.mark.asyncio
+    async def test_normal_drive_brake_for_coast_down_stays_zero_without_recovery_flag(
+        self,
+    ) -> None:
+        """回復フラグが立っていない通常の DRIVE_BRAKE では COAST_DOWN のブレーキ0%のまま
+        （回復用下限は overspeed_recovery のときのみ適用される）。"""
+        loop = _make_loop(
+            can_reader=_make_can(speed=95.0),
+            patterns=[_coast_down_pattern(hold=100.0)],
+            config=LearningLoopConfig(brake_ramp_time_s=0.0),
+        )
+        with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
+            loop._running = True
+            loop._phase = _Phase.DRIVE_BRAKE
+            loop._phase_started_at = 0.0
+            loop._overspeed_recovery = False
+            await loop._execute_one_cycle()
+        assert loop.current_brake_opening == 0.0
+
+    @pytest.mark.asyncio
     async def test_over_g_in_accel_does_not_exit(self) -> None:
         """加速方向の過G（踏み始めの強い加速）は離脱要因にしない（cap 到達まで保持する）。"""
         loop = _make_loop(
@@ -283,9 +353,7 @@ class TestSkipSafety:
             profile=_make_profile(max_speed=100.0),
             can_reader=_make_can(speed=92.0),  # キャップ 90 を超えた（まだ max_speed 未満）
             patterns=[_accel_sweep_pattern(hold=100.0)],
-            config=LearningLoopConfig(
-                accel_speed_cap_frac=0.9, accel_full_range_timeout_s=100.0
-            ),
+            config=LearningLoopConfig(accel_speed_cap_frac=0.9, accel_full_range_timeout_s=100.0),
         )
         with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
             loop._running = True
@@ -336,9 +404,7 @@ class TestSkipSafety:
             profile=_make_profile(max_speed=100.0),
             can_reader=_make_can(speed=92.0),  # キャップ 90 超
             patterns=[_coast_down_pattern(hold=100.0)],
-            config=LearningLoopConfig(
-                accel_speed_cap_frac=0.9, accel_full_range_timeout_s=100.0
-            ),
+            config=LearningLoopConfig(accel_speed_cap_frac=0.9, accel_full_range_timeout_s=100.0),
         )
         with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
             loop._running = True
@@ -354,9 +420,7 @@ class TestSkipSafety:
             profile=_make_profile(max_speed=100.0),
             can_reader=_make_can(speed=92.0),
             patterns=[_brake_hold_pattern(hold=100.0)],
-            config=LearningLoopConfig(
-                accel_speed_cap_frac=0.9, accel_full_range_timeout_s=100.0
-            ),
+            config=LearningLoopConfig(accel_speed_cap_frac=0.9, accel_full_range_timeout_s=100.0),
         )
         with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
             loop._running = True
@@ -593,6 +657,206 @@ class TestSkipSafety:
 
 
 # ---------------------------------------------------------------------------
+# 予測的 cap 離脱（B-7-5: 最高車速オーバー是正）
+# ---------------------------------------------------------------------------
+
+
+class TestPredictiveCapExit:
+    """加速度に応じて cap の手前で離脱し、応答遅れ中の惰性オーバーシュートを防ぐ。"""
+
+    def _accel_loop(self, lead_s: float) -> LearningLoop:
+        # cap = 100 × 0.9 = 90。lead_s と加速度から離脱しきい値 = 90 − accel×lead_s。
+        loop = _make_loop(
+            profile=_make_profile(max_speed=100.0),
+            patterns=[_accel_sweep_pattern(hold=100.0)],
+            config=LearningLoopConfig(
+                accel_speed_cap_frac=0.9,
+                accel_full_range_timeout_s=100.0,
+                overspeed_lead_s=lead_s,
+            ),
+        )
+        loop._phase = _Phase.DRIVE_ACCEL
+        loop._phase_started_at = 0.0
+        return loop
+
+    def test_exits_below_cap_when_accelerating(self) -> None:
+        """加速中は cap−accel×lead で離脱する（10km/h/s・lead1.2 → しきい値78）。"""
+        loop = self._accel_loop(lead_s=1.2)
+        # 78 未満は継続、78 以上で離脱
+        loop._advance_drive_accel(
+            loop._patterns[0], speed=77.0, accel_kmhs=10.0, elapsed=0.0, now=0.0
+        )
+        assert loop._phase is _Phase.DRIVE_ACCEL
+        loop._advance_drive_accel(
+            loop._patterns[0], speed=79.0, accel_kmhs=10.0, elapsed=0.0, now=0.0
+        )
+        assert loop._phase is _Phase.DRIVE_BRAKE
+
+    def test_lead_zero_exits_only_at_cap(self) -> None:
+        """lead=0 は従来どおり cap 到達（90）でのみ離脱する。"""
+        loop = self._accel_loop(lead_s=0.0)
+        loop._advance_drive_accel(
+            loop._patterns[0], speed=89.0, accel_kmhs=10.0, elapsed=0.0, now=0.0
+        )
+        assert loop._phase is _Phase.DRIVE_ACCEL  # 加速度が高くてもしきい値は cap のまま
+        loop._advance_drive_accel(
+            loop._patterns[0], speed=90.0, accel_kmhs=10.0, elapsed=0.0, now=0.0
+        )
+        assert loop._phase is _Phase.DRIVE_BRAKE
+
+    def test_plateau_threshold_equals_cap(self) -> None:
+        """加速≈0（プラトー）ではしきい値が cap と一致し従来挙動を保つ。"""
+        loop = self._accel_loop(lead_s=1.2)
+        loop._advance_drive_accel(
+            loop._patterns[0], speed=89.5, accel_kmhs=0.0, elapsed=0.0, now=0.0
+        )
+        assert loop._phase is _Phase.DRIVE_ACCEL
+
+    @pytest.mark.asyncio
+    async def test_accel_peak_stays_within_max_speed(self) -> None:
+        """一次遅れプラント上で加速→惰行させ、ピーク車速が max_speed を超えないことを検証。
+
+        アクセル解放後も応答遅れ（tau）の間は惰性で車速が伸びる。予測的 cap 離脱が無い
+        （lead=0）場合はピークが max_speed を超えるが、既定 lead では超えないことを対比で示す。
+        """
+        max_peak_default = await self._simulate_peak(lead_s=1.2)
+        max_peak_no_lead = await self._simulate_peak(lead_s=0.0)
+        assert max_peak_default <= 140.0, f"予測離脱ありでも超過: {max_peak_default:.1f}"
+        assert max_peak_no_lead > 140.0, f"lead=0 で超過を再現できていない: {max_peak_no_lead:.1f}"
+
+    async def _simulate_peak(self, lead_s: float) -> float:
+        """一次遅れ加速プラントを COAST_DOWN パターンで走らせ最大車速を返す。"""
+        dt = 0.1
+        tau = 1.0  # 加速応答の時定数 [s]（実機 fopdt_tau≈1.0 相当）
+        accel_gain = 0.2  # km/h/s per %（70% ≈ 14km/h/s ≈ ガバナ上限 0.98×0.4G）
+        state = {"v": 0.0, "a": 0.0}
+
+        async def read_speed() -> float:
+            return state["v"]
+
+        can = MagicMock()
+        can.read_speed = AsyncMock(side_effect=read_speed)
+        loop = _make_loop(
+            profile=_make_profile(max_speed=140.0, max_decel_g=0.4),
+            can_reader=can,
+            patterns=[_coast_down_pattern(accel=70.0, hold=100.0)],
+            config=LearningLoopConfig(
+                accel_ramp_time_s=1.0,
+                accel_full_range_timeout_s=100.0,
+                coast_timeout_s=100.0,
+                overspeed_lead_s=lead_s,
+            ),
+        )
+        loop._running = True
+        loop._reset_for_start()
+        loop._phase = _Phase.DRIVE_ACCEL
+        loop._phase_started_at = 0.0
+
+        peak = 0.0
+        t = 0.0
+        for _ in range(400):  # 40s 上限
+            with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(t)):
+                await loop._execute_one_cycle()
+            # プラント更新: 指令開度から目標加速度を作り一次遅れで追従
+            target_a = accel_gain * loop.current_accel_opening
+            state["a"] += (dt / (tau + dt)) * (target_a - state["a"])
+            state["v"] = max(0.0, state["v"] + state["a"] * dt)
+            peak = max(peak, state["v"])
+            t += dt
+            if loop._phase is _Phase.COAST and state["v"] < 5.0:
+                break
+        return peak
+
+
+# ---------------------------------------------------------------------------
+# 高速巡航トリム（B-7-2: cap→微小開度保持で高速域×微小開度を採取）
+# ---------------------------------------------------------------------------
+
+
+class TestCruiseTrim:
+    @pytest.mark.asyncio
+    async def test_reaches_cap_transitions_to_cruise_trim(self) -> None:
+        """CRUISE_TRIM は cap 到達で CRUISE_TRIM フェーズ（微小開度保持）へ移る。"""
+        loop = _make_loop(
+            profile=_make_profile(max_speed=100.0),
+            can_reader=_make_can(speed=92.0),  # cap 90 超
+            patterns=[_cruise_trim_pattern(hold=100.0)],
+            config=LearningLoopConfig(
+                accel_speed_cap_frac=0.9, accel_full_range_timeout_s=100.0, overspeed_lead_s=0.0
+            ),
+        )
+        with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
+            loop._running = True
+            loop._phase = _Phase.DRIVE_ACCEL
+            loop._phase_started_at = 0.0
+            await loop._execute_one_cycle()
+        assert loop._phase is _Phase.CRUISE_TRIM
+
+    @pytest.mark.asyncio
+    async def test_holds_trim_opening(self) -> None:
+        """CRUISE_TRIM フェーズは微小アクセル開度を保持しブレーキ 0。"""
+        loop = _make_loop(
+            can_reader=_make_can(speed=95.0),
+            patterns=[_cruise_trim_pattern(trim=2.5, hold=100.0)],
+        )
+        with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
+            loop._running = True
+            loop._phase = _Phase.CRUISE_TRIM
+            loop._phase_started_at = 0.0
+            await loop._execute_one_cycle()
+        assert loop.current_accel_opening == pytest.approx(2.5)
+        assert loop.current_brake_opening == 0.0
+
+    @pytest.mark.asyncio
+    async def test_advances_after_hold_duration(self) -> None:
+        """hold_duration 経過で次パターンへ進む。"""
+        loop = _make_loop(
+            can_reader=_make_can(speed=95.0),
+            patterns=[_cruise_trim_pattern(hold=2.0), _accel_sweep_pattern()],
+        )
+        with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(2.5)):
+            loop._running = True
+            loop._phase = _Phase.CRUISE_TRIM
+            loop._phase_started_at = 0.0  # elapsed=2.5 >= 2.0
+            loop._pattern_idx = 0
+            await loop._execute_one_cycle()
+        assert loop._pattern_idx == 1
+
+    @pytest.mark.asyncio
+    async def test_exits_before_overspeed_when_climbing_past_cap(self) -> None:
+        """trim が加速側に働き cap 以上へ戻ったら過速度前に離脱する（安全）。"""
+        loop = _make_loop(
+            profile=_make_profile(max_speed=100.0),
+            can_reader=_make_can(speed=91.0),  # cap 90 以上へ戻った（trim が加速側）
+            patterns=[_cruise_trim_pattern(hold=100.0), _accel_sweep_pattern()],
+            config=LearningLoopConfig(accel_speed_cap_frac=0.9),
+        )
+        with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
+            loop._running = True
+            loop._phase = _Phase.CRUISE_TRIM
+            loop._phase_started_at = 0.0
+            loop._pattern_idx = 0
+            await loop._execute_one_cycle()
+        assert loop._pattern_idx == 1  # cap 前に離脱
+
+    @pytest.mark.asyncio
+    async def test_max_speed_exceed_enters_recovery_brake(self) -> None:
+        """max_speed 超は安全網として能動減速（DRIVE_BRAKE・回復ブレーキ）へ回す。"""
+        loop = _make_loop(
+            profile=_make_profile(max_speed=100.0),
+            can_reader=_make_can(speed=101.0),  # max_speed 超
+            patterns=[_cruise_trim_pattern(hold=100.0)],
+        )
+        with patch.object(asyncio, "get_running_loop", return_value=_patch_loop_time(0.0)):
+            loop._running = True
+            loop._phase = _Phase.CRUISE_TRIM
+            loop._phase_started_at = 0.0
+            await loop._execute_one_cycle()
+        assert loop._phase is _Phase.DRIVE_BRAKE
+        assert loop._overspeed_recovery is True
+
+
+# ---------------------------------------------------------------------------
 # 完了・開度公開・フェーズ
 # ---------------------------------------------------------------------------
 
@@ -613,6 +877,33 @@ class TestStopAndJoin:
         assert loop._running is False
         current = asyncio.current_task()
         assert current is not None and not current.cancelled()
+
+
+class TestStallTracking:
+    """S1 回帰テスト: CycleLoopBase 統合により LearningLoop でもストール計測が有効になる
+    （旧実装は DriveLoop のみで計測していた）。"""
+
+    @pytest.mark.asyncio
+    async def test_stall_summary_accumulates_on_resolved_skip(self) -> None:
+        loop = _make_loop()
+        loop._running = True
+        loop._consecutive_skips = 3
+
+        loop._schedule_next_cycle()  # 前タスクなし → 正常起動＝直前のストールが解消
+        try:
+            summary = loop.stall_summary
+            assert summary["stall_count"] == 1.0
+            assert summary["stall_total_s"] == pytest.approx(3 * loop._interval_s)
+            assert summary["stall_max_s"] == pytest.approx(3 * loop._interval_s)
+        finally:
+            loop.stop()
+            assert loop._cycle_task is not None
+            await loop._cycle_task
+
+    def test_stall_summary_is_zero_before_any_stall(self) -> None:
+        loop = _make_loop()
+        summary = loop.stall_summary
+        assert summary == {"stall_count": 0.0, "stall_total_s": 0.0, "stall_max_s": 0.0}
 
 
 class TestCompletionAndState:

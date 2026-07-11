@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 
+from src.infra.db import DuplicateNameError
 from src.infra.profile_repository import (
     ProfileRepository,
     _dyn_from_value,
@@ -297,21 +299,27 @@ class TestDynamicsParamsPersistence:
         assert _dyn_from_value(None) == DynamicsParams()
 
     def test_dyn_from_value_partial_json_merges_defaults(self) -> None:
-        dyn = _dyn_from_value('{"preview_time_s": 1.2, "fopdt_theta": 0.8}')
-        assert dyn.preview_time_s == 1.2
+        dyn = _dyn_from_value('{"pid_preview_s": 1.2, "fopdt_theta": 0.8}')
+        assert dyn.pid_preview_s == 1.2
         assert dyn.fopdt_theta == 0.8
         # 欠損キーはデフォルト
         assert dyn.fopdt_k == DynamicsParams().fopdt_k
         assert dyn.fopdt_tau == DynamicsParams().fopdt_tau
 
     def test_dyn_from_value_accepts_dict(self) -> None:
-        dyn = _dyn_from_value({"preview_time_s": 0.5})
-        assert dyn.preview_time_s == 0.5
+        dyn = _dyn_from_value({"pid_preview_s": 0.5})
+        assert dyn.pid_preview_s == 0.5
+
+    def test_legacy_preview_time_s_key_ignored_defaults_to_zero(self) -> None:
+        """Stage A 改名前 DB の旧キー preview_time_s は未知フィールドとして無視され、
+        pid_preview_s は既定 0.0 に補完される（マイグレーション不要の暗黙リセット）。
+        θ は別途 fopdt_theta として保持されるので情報は失われない。"""
+        dyn = _dyn_from_value('{"preview_time_s": 0.5, "fopdt_theta": 0.5}')
+        assert dyn.pid_preview_s == 0.0  # 旧キーは無視され既定に落ちる
+        assert dyn.fopdt_theta == 0.5  # θ は保持される
 
     def test_dyn_roundtrip(self) -> None:
-        dyn = DynamicsParams(
-            preview_time_s=1.5, fopdt_k=2.0, fopdt_tau=1.1, fopdt_theta=0.7
-        )
+        dyn = DynamicsParams(pid_preview_s=1.5, fopdt_k=2.0, fopdt_tau=1.1, fopdt_theta=0.7)
         assert _dyn_from_value(_dyn_to_json(dyn)) == dyn
 
     def test_row_to_profile_parses_dynamics_params(self) -> None:
@@ -326,12 +334,12 @@ class TestDynamicsParamsPersistence:
             "stop_config": '{"deviation_threshold_kmh": 2.0, "deviation_duration_s": 4.0}',
             "model_path": None,
             "feedforward_params": None,
-            "dynamics_params": '{"preview_time_s": 0.9, "fopdt_theta": 0.9}',
+            "dynamics_params": '{"pid_preview_s": 0.9, "fopdt_theta": 0.9}',
             "created_at": datetime.now(tz=UTC),
             "updated_at": datetime.now(tz=UTC),
         }
         profile = _row_to_profile(row)
-        assert profile.dynamics_params.preview_time_s == 0.9
+        assert profile.dynamics_params.pid_preview_s == 0.9
         assert profile.dynamics_params.fopdt_theta == 0.9
 
     def test_row_to_profile_null_dynamics_params_defaults(self) -> None:
@@ -370,12 +378,12 @@ class TestDynamicsParamsPersistence:
             model_path=None,
             created_at=datetime.now(tz=UTC),
             updated_at=datetime.now(tz=UTC),
-            dynamics_params=DynamicsParams(preview_time_s=1.3),
+            dynamics_params=DynamicsParams(pid_preview_s=1.3),
         )
         result = await repo.create(profile)
         args = conn.execute.call_args[0]
-        assert any(isinstance(a, str) and "preview_time_s" in a for a in args)
-        assert result.dynamics_params.preview_time_s == 1.3
+        assert any(isinstance(a, str) and "pid_preview_s" in a for a in args)
+        assert result.dynamics_params.pid_preview_s == 1.3
 
     @pytest.mark.asyncio
     async def test_update_serializes_dynamics_params(self) -> None:
@@ -395,15 +403,42 @@ class TestDynamicsParamsPersistence:
             model_path=None,
             created_at=datetime.now(tz=UTC),
             updated_at=datetime.now(tz=UTC),
-            dynamics_params=DynamicsParams(preview_time_s=2.1, fopdt_theta=0.6),
+            dynamics_params=DynamicsParams(pid_preview_s=2.1, fopdt_theta=0.6),
         )
 
         result = await repo.update(profile)
 
         args = conn.execute.call_args[0]
-        assert any(isinstance(a, str) and "preview_time_s" in a for a in args)
+        assert any(isinstance(a, str) and "pid_preview_s" in a for a in args)
         assert result is not None
-        assert result.dynamics_params.preview_time_s == 2.1
+        assert result.dynamics_params.pid_preview_s == 2.1
+
+
+class TestUpdateProfile:
+    @pytest.mark.asyncio
+    async def test_update_converts_unique_violation_to_duplicate_name_error(self) -> None:
+        """I5 回帰テスト: update 時の一意制約違反を DuplicateNameError（→409）に変換する
+        （create は既に変換済みだが update だけ未変換で 500 になっていたバグの回帰）。"""
+        pool, conn = make_mock_pool()
+        conn.execute.side_effect = asyncpg.UniqueViolationError("duplicate key")
+        repo = ProfileRepository(pool)
+        profile = VehicleProfile(
+            id=PROFILE_ID,
+            name="既存プロファイル名",
+            max_accel_opening=80.0,
+            max_brake_opening=60.0,
+            max_speed=120.0,
+            max_decel_g=0.4,
+            pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+            stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+            calibration=None,
+            model_path=None,
+            created_at=datetime.now(tz=UTC),
+            updated_at=datetime.now(tz=UTC),
+        )
+
+        with pytest.raises(DuplicateNameError):
+            await repo.update(profile)
 
 
 class TestDeleteProfile:

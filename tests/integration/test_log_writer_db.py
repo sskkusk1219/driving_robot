@@ -82,8 +82,9 @@ async def test_start_session_inserts_row(db_conn: asyncpg.Connection) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_write_log_inserts_row(db_conn: asyncpg.Connection) -> None:
-    """write_log が drive_logs にレコードを INSERT すること。"""
+async def test_write_log_inserts_row_after_flush(db_conn: asyncpg.Connection) -> None:
+    """write_log はバッファリングのみ行い、フラッシュ後に drive_logs へ INSERT されること
+    （E5: 1サンプル=1INSERTのDBラウンドトリップ削減のためバッチ書き込みに変更）。"""
     writer = LogWriter(db_conn)
     session_id = await writer.start_session(
         profile_id=DUMMY_PROFILE_ID,
@@ -102,12 +103,44 @@ async def test_write_log_inserts_row(db_conn: asyncpg.Connection) -> None:
     )
 
     await writer.write_log(session_id, data)
+    await writer._flush_log_buffer()
 
     row = await db_conn.fetchrow("SELECT * FROM drive_logs WHERE session_id = $1", session_id)
     assert row is not None
     assert row["actual_speed_kmh"] == pytest.approx(59.5)
     assert row["accel_opening"] == pytest.approx(42.0)
     assert row["ref_speed_kmh"] == pytest.approx(60.0)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_write_log_row_appears_after_end_session_flush(
+    db_conn: asyncpg.Connection,
+) -> None:
+    """E5 回帰テスト: フラッシュ間隔未達のまま end_session してもサンプルが失われないこと。"""
+    writer = LogWriter(db_conn)
+    session_id = await writer.start_session(
+        profile_id=DUMMY_PROFILE_ID,
+        mode_id=None,
+        run_type="auto",
+    )
+    data = DriveLogData(
+        ref_speed_kmh=60.0,
+        actual_speed_kmh=59.5,
+        accel_opening=42.0,
+        brake_opening=0.0,
+        accel_pos=1500,
+        brake_pos=0,
+        accel_current=850.0,
+        brake_current=120.0,
+    )
+
+    await writer.write_log(session_id, data)
+    await writer.end_session(session_id, "completed")
+
+    row = await db_conn.fetchrow("SELECT * FROM drive_logs WHERE session_id = $1", session_id)
+    assert row is not None
+    assert row["actual_speed_kmh"] == pytest.approx(59.5)
 
 
 @pytest.mark.integration

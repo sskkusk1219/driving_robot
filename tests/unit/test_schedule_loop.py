@@ -10,6 +10,8 @@ import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from src.domain.control.schedule_loop import (
     WEDGED_CYCLE_TIMEOUT_S,
     ScheduleLoop,
@@ -150,6 +152,39 @@ async def test_cycle_drives_actuators_with_interpolated_opening() -> None:
     m["brake"].move_to_position.assert_awaited_once_with(200)
 
 
+async def test_cycle_skips_move_to_position_when_opening_unchanged() -> None:
+    """E3 回帰テスト: 補間位置が前サイクルと同じ軸は move_to_position を省略し電流のみ読む
+    （learning_loop.py と同方式で無駄な書込を避ける）。"""
+    pts = [
+        PedalPoint(time_s=0.0, accel_opening=50.0, brake_opening=0.0),
+        PedalPoint(time_s=10.0, accel_opening=50.0, brake_opening=0.0),
+    ]
+    loop, m = _make_loop(_make_schedule(pedal_points=pts, total_duration=20.0))
+    _set_t(loop, 1.0)
+    await loop._execute_one_cycle()
+    m["accel"].move_to_position.assert_awaited_once_with(350)
+
+    m["accel"].move_to_position.reset_mock()
+    _set_t(loop, 2.0)  # 開度は一定(50%)なので指令位置は変化しない
+    await loop._execute_one_cycle()
+    m["accel"].move_to_position.assert_not_awaited()
+    m["accel"].read_current.assert_awaited()
+
+
+async def test_bisect_interpolation_matches_pure_function_across_segments() -> None:
+    """E2 回帰テスト: bisect ベースの _interpolate_pedal_at が線形走査の interpolate_pedal と
+    複数区間にわたって一致する（前計算した時刻列のインデックスがずれていないことを確認）。"""
+    pts = [
+        PedalPoint(time_s=0.0, accel_opening=0.0, brake_opening=0.0),
+        PedalPoint(time_s=2.0, accel_opening=40.0, brake_opening=0.0),
+        PedalPoint(time_s=5.0, accel_opening=40.0, brake_opening=0.0),
+        PedalPoint(time_s=8.0, accel_opening=0.0, brake_opening=30.0),
+    ]
+    loop, _m = _make_loop(_make_schedule(pedal_points=pts, total_duration=8.0))
+    for t in [0.0, 1.0, 2.0, 3.5, 5.0, 6.5, 8.0, 9.0]:
+        assert loop._interpolate_pedal_at(t) == interpolate_pedal(pts, t)
+
+
 async def test_cycle_fires_due_button_events() -> None:
     events = [ButtonEvent(time_s=1.0, channel=3, press_duration_s=0.5)]
     loop, m = _make_loop(_make_schedule(button_events=events))
@@ -168,15 +203,16 @@ async def test_cycle_does_not_fire_future_button_events() -> None:
     m["button"].press.assert_not_awaited()
 
 
-async def test_simultaneous_pedal_press_is_not_excluded() -> None:
-    """タイムスケジュールはアクセル・ブレーキの同時踏みを許可する(排他しない)。"""
+async def test_simultaneous_pedal_press_is_excluded() -> None:
+    """D3 回帰テスト: 補間結果が同時に非ゼロでも enforce_pedal_exclusion で排他される
+    （機構保護のため同時踏みは常に禁止。大きい方＝ブレーキが優先で残る）。"""
     pts = [PedalPoint(time_s=0.0, accel_opening=30.0, brake_opening=40.0)]
     loop, m = _make_loop(_make_schedule(pedal_points=pts, total_duration=10.0))
     _set_t(loop, 0.0)
     await loop._execute_one_cycle()
-    assert loop.current_accel_opening == 30.0
+    assert loop.current_accel_opening == 0.0
     assert loop.current_brake_opening == 40.0
-    m["accel"].move_to_position.assert_awaited_once_with(100 + round(500 * 0.3))
+    m["accel"].move_to_position.assert_awaited_once_with(100)
     m["brake"].move_to_position.assert_awaited_once_with(200 + round(500 * 0.4))
 
 
@@ -280,6 +316,31 @@ async def test_start_then_stop_and_join_lifecycle() -> None:
     assert loop.is_running is True
     await loop.stop_and_join()  # 進行中サイクルタスクが無いので即 return
     assert loop.is_running is False
+
+
+async def test_stall_summary_accumulates_on_resolved_skip() -> None:
+    """S1 回帰テスト: CycleLoopBase 統合により ScheduleLoop でもストール計測が有効になる
+    （旧実装は DriveLoop のみで計測していた）。"""
+    loop, _m = _make_loop(_make_schedule())
+    loop._running = True
+    loop._consecutive_skips = 3
+
+    loop._schedule_next_cycle()  # 前タスクなし → 正常起動＝直前のストールが解消
+    try:
+        summary = loop.stall_summary
+        assert summary["stall_count"] == 1.0
+        assert summary["stall_total_s"] == pytest.approx(3 * loop._interval_s)
+        assert summary["stall_max_s"] == pytest.approx(3 * loop._interval_s)
+    finally:
+        loop.stop()
+        assert loop._cycle_task is not None
+        await loop._cycle_task
+
+
+def test_stall_summary_is_zero_before_any_stall() -> None:
+    loop, _m = _make_loop(_make_schedule())
+    summary = loop.stall_summary
+    assert summary == {"stall_count": 0.0, "stall_total_s": 0.0, "stall_max_s": 0.0}
 
 
 async def test_button_events_fire_in_time_order() -> None:

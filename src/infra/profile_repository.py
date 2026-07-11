@@ -24,43 +24,55 @@ from src.models.profile import (
 logger = logging.getLogger(__name__)
 
 
-def _ffp_from_value(value: object) -> FeedforwardParams:
-    """JSONB 値（str/dict/None）を FeedforwardParams に変換する。欠損キーはデフォルト。"""
+def _dataclass_from_jsonb(cls: type[Any], value: object) -> Any:  # noqa: ANN401
+    """JSONB 値（str/dict/None）を dataclass に変換する汎用ヘルパー。
+
+    旧レコードに存在しないキー（後から追加したフィールド）はデフォルトで補完する。
+    全フィールドがデフォルト値を持つ dataclass（FeedforwardParams/DynamicsParams 等）
+    専用。FeedforwardParams/DynamicsParams で共通だった変換ロジックを一本化する
+    （S7 レビュー指摘）。
+    """
     data: dict[str, Any]
     if isinstance(value, str):
         data = json.loads(value)
     elif isinstance(value, dict):
         data = value
     else:
-        return FeedforwardParams()
-    defaults = FeedforwardParams()
-    # 旧レコードに存在しないキー（後から追加した調停定数等）はデフォルトで補完する
-    kwargs = {
-        f.name: data.get(f.name, getattr(defaults, f.name)) for f in fields(FeedforwardParams)
-    }
-    return FeedforwardParams(**kwargs)
+        return cls()
+    defaults = cls()
+    kwargs = {f.name: data.get(f.name, getattr(defaults, f.name)) for f in fields(cls)}
+    return cls(**kwargs)
+
+
+def _dataclass_to_json(obj: Any) -> str:  # noqa: ANN401
+    """dataclass を JSON 文字列へ変換する汎用ヘルパー（S7/S8 レビュー指摘）。"""
+    return json.dumps({f.name: getattr(obj, f.name) for f in fields(obj)})
+
+
+def _ffp_from_value(value: object) -> FeedforwardParams:
+    """JSONB 値（str/dict/None）を FeedforwardParams に変換する。欠損キーはデフォルト。"""
+    return _dataclass_from_jsonb(FeedforwardParams, value)
 
 
 def _ffp_to_json(ffp: FeedforwardParams) -> str:
-    return json.dumps({f.name: getattr(ffp, f.name) for f in fields(FeedforwardParams)})
+    return _dataclass_to_json(ffp)
 
 
 def _dyn_from_value(value: object) -> DynamicsParams:
     """JSONB 値（str/dict/None）を DynamicsParams に変換する。欠損キーはデフォルト。"""
-    data: dict[str, Any]
-    if isinstance(value, str):
-        data = json.loads(value)
-    elif isinstance(value, dict):
-        data = value
-    else:
-        return DynamicsParams()
-    defaults = DynamicsParams()
-    kwargs = {f.name: data.get(f.name, getattr(defaults, f.name)) for f in fields(DynamicsParams)}
-    return DynamicsParams(**kwargs)
+    return _dataclass_from_jsonb(DynamicsParams, value)
 
 
 def _dyn_to_json(dyn: DynamicsParams) -> str:
-    return json.dumps({f.name: getattr(dyn, f.name) for f in fields(DynamicsParams)})
+    return _dataclass_to_json(dyn)
+
+
+def _pid_to_json(pid: PIDGains) -> str:
+    return _dataclass_to_json(pid)
+
+
+def _stop_to_json(stop: StopConfig) -> str:
+    return _dataclass_to_json(stop)
 
 
 def _row_to_profile(row: asyncpg.Record) -> VehicleProfile:
@@ -133,15 +145,8 @@ class ProfileRepository:
         """プロファイルを新規作成する。"""
         now = datetime.now(tz=UTC)
         profile_id = profile.id if profile.id else str(uuid.uuid4())
-        pid_json = json.dumps(
-            {"kp": profile.pid_gains.kp, "ki": profile.pid_gains.ki, "kd": profile.pid_gains.kd}
-        )
-        stop_json = json.dumps(
-            {
-                "deviation_threshold_kmh": profile.stop_config.deviation_threshold_kmh,
-                "deviation_duration_s": profile.stop_config.deviation_duration_s,
-            }
-        )
+        pid_json = _pid_to_json(profile.pid_gains)
+        stop_json = _stop_to_json(profile.stop_config)
         ffp_json = _ffp_to_json(profile.feedforward_params)
         dyn_json = _dyn_to_json(profile.dynamics_params)
         async with self._pool.acquire() as conn:
@@ -194,47 +199,46 @@ class ProfileRepository:
     async def update(self, profile: VehicleProfile) -> VehicleProfile | None:
         """プロファイルを更新する。存在しない場合は None。"""
         now = datetime.now(tz=UTC)
-        pid_json = json.dumps(
-            {"kp": profile.pid_gains.kp, "ki": profile.pid_gains.ki, "kd": profile.pid_gains.kd}
-        )
-        stop_json = json.dumps(
-            {
-                "deviation_threshold_kmh": profile.stop_config.deviation_threshold_kmh,
-                "deviation_duration_s": profile.stop_config.deviation_duration_s,
-            }
-        )
+        pid_json = _pid_to_json(profile.pid_gains)
+        stop_json = _stop_to_json(profile.stop_config)
         ffp_json = _ffp_to_json(profile.feedforward_params)
         dyn_json = _dyn_to_json(profile.dynamics_params)
         async with self._pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE vehicle_profiles SET
-                    name = $2,
-                    max_accel_opening = $3,
-                    max_brake_opening = $4,
-                    max_speed = $5,
-                    max_decel_g = $6,
-                    pid_gains = $7::jsonb,
-                    stop_config = $8::jsonb,
-                    model_path = $9,
-                    feedforward_params = $10::jsonb,
-                    dynamics_params = $11::jsonb,
-                    updated_at = $12
-                WHERE id = $1
-                """,
-                uuid.UUID(profile.id),
-                profile.name,
-                profile.max_accel_opening,
-                profile.max_brake_opening,
-                profile.max_speed,
-                profile.max_decel_g,
-                pid_json,
-                stop_json,
-                profile.model_path,
-                ffp_json,
-                dyn_json,
-                now,
-            )
+            try:
+                result = await conn.execute(
+                    """
+                    UPDATE vehicle_profiles SET
+                        name = $2,
+                        max_accel_opening = $3,
+                        max_brake_opening = $4,
+                        max_speed = $5,
+                        max_decel_g = $6,
+                        pid_gains = $7::jsonb,
+                        stop_config = $8::jsonb,
+                        model_path = $9,
+                        feedforward_params = $10::jsonb,
+                        dynamics_params = $11::jsonb,
+                        updated_at = $12
+                    WHERE id = $1
+                    """,
+                    uuid.UUID(profile.id),
+                    profile.name,
+                    profile.max_accel_opening,
+                    profile.max_brake_opening,
+                    profile.max_speed,
+                    profile.max_decel_g,
+                    pid_json,
+                    stop_json,
+                    profile.model_path,
+                    ffp_json,
+                    dyn_json,
+                    now,
+                )
+            except asyncpg.UniqueViolationError as e:
+                # create と同じ変換（I5 レビュー指摘: update だけ未変換で 500 になっていた）
+                raise DuplicateNameError(
+                    f"プロファイル名 {profile.name!r} は既に使用されています"
+                ) from e
         if str(result) == "UPDATE 0":
             return None
         return VehicleProfile(

@@ -1,5 +1,7 @@
+import bisect
 import pickle
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -11,6 +13,67 @@ from src.domain.model_training import (
     build_feature_row,
 )
 from src.models.profile import FeedforwardParams
+
+# ── 速度依存プラントゲイン（ゲインスケジューリング）─────────────────────────
+# g(v) = ∂(ペダル開度[%]) / ∂(目標加速度[km/h/s]) を FF モデルの局所勾配から求めた値のクランプ。
+# 単位は %/(km/h/s)。公称値 g_nominal = fopdt_tau/fopdt_k（同オーダー）を基準に比を取るため、
+# 生の局所勾配レンジ（実測 0.5〜3 程度、モデルにより外れも）を有界にする下限・上限。
+_GAIN_MIN: float = 0.05
+_GAIN_MAX: float = 5.0
+# 局所勾配を測る目標加速度の摂動 [km/h/s]。定加速度マニフォールド（future_h=v+a·h）上で
+# a=±この値の差分から ∂開度/∂a を算出する。学習運転の過渡（数 km/h/s）内の中庸値。
+_GAIN_ACCEL_PROBE_KMHS: float = 0.5
+
+
+def _moving_average_3(ys: Sequence[float]) -> list[float]:
+    """3点移動平均（端点は自分＋隣接1点）。局所勾配ノイズを平滑化する。"""
+    n = len(ys)
+    if n <= 2:
+        return list(ys)
+    out = [0.0] * n
+    for i in range(n):
+        lo = max(0, i - 1)
+        hi = min(n, i + 2)
+        window = ys[lo:hi]
+        out[i] = sum(window) / len(window)
+    return out
+
+
+def _interp_sorted(x: float, xs: Sequence[float], ys: Sequence[float]) -> float:
+    """昇順 xs 上の (xs, ys) を x で線形補間する。範囲外は端点クランプ。"""
+    if not xs:
+        return 1.0
+    if x <= xs[0]:
+        return ys[0]
+    if x >= xs[-1]:
+        return ys[-1]
+    i = bisect.bisect_right(xs, x)
+    x0, x1 = xs[i - 1], xs[i]
+    y0, y1 = ys[i - 1], ys[i]
+    if x1 == x0:
+        return y0
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+
+
+@dataclass(frozen=True)
+class GainSchedule:
+    """速度依存プラントゲイン g(v)（加速側・制動側）のテーブル。
+
+    PID 出力の正規化に使う。速度が上がるとプラントゲイン（開度あたりの加速）が変わるため、
+    固定ゲイン PID は高速域で振動・低速域で応答不足になる。各速度で「目標加速を 1 単位
+    増やすのに必要な開度」= 逆ゲイン g(v) を FF モデルから抽出し、公称点との比で PID の
+    実効ゲインを速度域で一定に保つ。加速フェーズは accel、減速フェーズは brake 側を使う。
+    """
+
+    speeds: tuple[float, ...]
+    accel_gains: tuple[float, ...]
+    brake_gains: tuple[float, ...]
+
+    def accel_gain_at(self, v: float) -> float:
+        return _interp_sorted(v, self.speeds, self.accel_gains)
+
+    def brake_gain_at(self, v: float) -> float:
+        return _interp_sorted(v, self.speeds, self.brake_gains)
 
 
 class _Regressor(Protocol):
@@ -40,6 +103,9 @@ class FeedforwardController:
         self._params: FeedforwardParams = FeedforwardParams()
         # 特徴量構成。load_model でロード済み pkl の feature_spec に置き換わる。
         self._spec: FeatureSpec = DEFAULT_FEATURE_SPEC
+        # 速度依存プラントゲイン表（ゲインスケジューリング）。プロファイル選択時に
+        # rebuild_gain_schedule で構築し、走行中は補間参照する。未構築/未ロード時 None。
+        self._gain_schedule: GainSchedule | None = None
 
     @property
     def horizons(self) -> tuple[float, ...]:
@@ -113,6 +179,19 @@ class FeedforwardController:
         self._brake_model = None
         self._speed_clip_max = None
         self._spec = DEFAULT_FEATURE_SPEC
+        self._gain_schedule = None
+
+    @property
+    def gain_schedule(self) -> GainSchedule | None:
+        """速度依存プラントゲイン表（未構築/モデル未ロード時 None）。"""
+        return self._gain_schedule
+
+    def rebuild_gain_schedule(self, v_max: float, step: float = 5.0) -> None:
+        """速度依存プラントゲイン表を再構築する。プロファイル/モデル適用時に呼ぶ。
+
+        モデル未ロード時は None にリセットする（ゲインスケジューリング無効＝scale 1.0）。
+        """
+        self._gain_schedule = self.build_gain_schedule(v_max, step)
 
     def predict_effort(
         self, v0: float, future_speeds: Sequence[float], past_speeds: Sequence[float]
@@ -197,3 +276,70 @@ class FeedforwardController:
         # 不感帯処理は FF 単体では行わない: FF+PID 合成後の最終指令に対して
         # PedalArbiter が逆補償する（FF 側で切り捨てると合成値が死帯に落ちる。指摘 #11）。
         return max(-100.0, min(100.0, effort))
+
+    def _accel_features(self, v: float, a: float) -> Any:  # noqa: ANN401
+        """速度 v・一定加速度 a [km/h/s] の定加速度マニフォールド上の特徴行を組む。
+
+        future_h = v + a·h、past_h = v − a·h とする（＝「一定加速度 a で走行中」という、
+        学習運転に実在する軌跡）。これにより dv_h = a·h・過去Δv が互いに整合し、共線でない
+        現実的な勾配 ∂開度/∂a が得られる。旧実装の「全ホライズン一律 dv=±const」は
+        「一瞬で +const して以後停滞」という学習データに無い off-manifold 点を突き、
+        共線な dv 特徴群の回帰勾配が信頼できなかった（B-6 是正）。
+
+        速度は学習域（speed_clip_max）にクリップし、負値は 0 に丸めて域外外挿を避ける。
+        """
+        cm = self._speed_clip_max
+        v_eff = v if cm is None else min(v, cm)
+        future = [v_eff + a * h for h in self._spec.lookahead_horizons_s]
+        past = [v_eff - a * h for h in self._spec.past_horizons_s]
+        future = [max(0.0, f if cm is None else min(f, cm)) for f in future]
+        past = [max(0.0, p if cm is None else min(p, cm)) for p in past]
+        return build_feature_row(v_eff, future, past, self._spec)
+
+    def build_gain_schedule(self, v_max: float, step: float = 5.0) -> GainSchedule | None:
+        """速度依存プラントゲイン g(v)（加速側・制動側）を FF モデルから抽出して返す。
+
+        各速度 v で定加速度 a=±probe を与えた差分から
+        g_accel(v) = ∂(accel開度)/∂a、g_brake(v) = ∂(brake開度)/∂(−a) を求め（単位 %/(km/h/s)）、
+        [_GAIN_MIN, _GAIN_MAX] にクランプ・3点移動平均で平滑化する。モデル未ロード時は None。
+
+        グリッド上限は `speed_clip_max − max_horizon·probe` 手前に制限する。これを超えると
+        +probe の先読み速度が学習域上限にクリップされて勾配が人工的に潰れるため（B-6 是正）。
+        表を超える速度は補間の端点クランプで最終ゲインを流用する。
+
+        プロファイル選択時に一度だけ計算し、走行中は補間参照するだけにする（20Hz 制御の
+        ホットパスでモデル推論を避ける）。
+        """
+        if self._accel_model is None or self._brake_model is None:
+            return None
+
+        a_probe = _GAIN_ACCEL_PROBE_KMHS
+        cm = self._speed_clip_max
+        max_h = max(self._spec.lookahead_horizons_s)
+        grid_max = v_max if cm is None else min(v_max, cm - max_h * a_probe)
+        grid_max = max(grid_max, step)  # 最低でも 0 と step の 2 点は作る
+        speeds = [
+            float(s)
+            for s in range(0, int(grid_max) + int(step), int(step))
+            if s <= grid_max
+        ]
+        accel_raw: list[float] = []
+        brake_raw: list[float] = []
+        for v in speeds:
+            base_a = max(0.0, float(self._accel_model.predict(self._accel_features(v, 0.0))[0]))
+            up_a = max(0.0, float(self._accel_model.predict(self._accel_features(v, a_probe))[0]))
+            g_a = (up_a - base_a) / a_probe
+            accel_raw.append(min(_GAIN_MAX, max(_GAIN_MIN, g_a)))
+
+            base_b = max(0.0, float(self._brake_model.predict(self._accel_features(v, 0.0))[0]))
+            dn_b = max(0.0, float(self._brake_model.predict(self._accel_features(v, -a_probe))[0]))
+            g_b = (dn_b - base_b) / a_probe
+            brake_raw.append(min(_GAIN_MAX, max(_GAIN_MIN, g_b)))
+
+        accel_sm = _moving_average_3(accel_raw)
+        brake_sm = _moving_average_3(brake_raw)
+        return GainSchedule(
+            speeds=tuple(speeds),
+            accel_gains=tuple(accel_sm),
+            brake_gains=tuple(brake_sm),
+        )

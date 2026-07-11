@@ -96,10 +96,23 @@ class ModelSettings:
 class LearningSettings:
     """2段階学習フロー（学習サイクル）のデフォルトパラメータ。"""
 
-    # stage1 は kp/ki/kd に加え先読み補償秒数(preview_time_s)も探索する4次元座標降下のため
+    # stage1 は kp/ki/kd に加え PID 先読み補償秒数(pid_preview_s)も探索する4次元座標降下のため
     # 10→14 に増やしている（1巡=最大8走行、ベースライン+1巡強を確保）。
     refine_runs_stage1: int = 14
-    refine_runs_stage2: int = 5
+    # stage2 は連続コスト（超過積分）で勾配探索するため予算を増やして4座標を十分に
+    # 探索させる（Stage B: 5→12）。規定パターンは短いので追加コストは小さい。
+    refine_runs_stage2: int = 12
+    # REFINE_2 の評価走行を本番モード（学習サイクル対象モード）の代表区間で行うか。
+    # 既定 False: 学習サイクルは規定パターン（build_tuning_trajectory）で適合する。
+    # ゲインスケジューリング（速度依存プラントゲイン正規化）により規定パターンで適合した
+    # ゲインは高速域にも転移するため、本番モード適合は必須ではない。True にすると
+    # 対象モード指定時に本番代表区間（build_tuning_trajectory_from_mode）で評価する。
+    # standalone の /pid-tune/refine は mode_id 指定で本設定に依らず本番モード適合できる。
+    tuning_on_target_mode: bool = False
+    # VERIFY フェーズ（検証専用パターンでの KPI 合格確認）の最大走行本数。KPI 合格で早期終了、
+    # 不合格ならモデル再学習＋プラン再構築して再走行し、この本数で打ち切る（打ち切り時は
+    # WARNING 付きで完了）。1 本 ≈ 検証パターン約 4 分＋再学習。
+    verify_runs_max: int = 5
     # 学習運転（開ループパターン走行）完了待ちのタイムアウト [s]。学習パターン総時間は
     # マネージャから取得困難なため定数運用とし、余裕を持たせた値にする。
     learning_timeout_s: float = 600.0
@@ -173,15 +186,11 @@ def _parse_model_settings(raw: dict[str, object]) -> ModelSettings:
         lookahead_horizons_s=(
             tuple(lookahead) if isinstance(lookahead, list) else defaults.lookahead_horizons_s
         ),
-        past_horizons_s=(
-            tuple(past) if isinstance(past, list) else defaults.past_horizons_s
-        ),
+        past_horizons_s=(tuple(past) if isinstance(past, list) else defaults.past_horizons_s),
         regime_horizon_s=float(raw.get("regime_horizon_s", defaults.regime_horizon_s)),  # type: ignore[arg-type]
         include_v0_sq=bool(raw.get("include_v0_sq", defaults.include_v0_sq)),
         include_dv_regime_x_v0=bool(
             raw.get("include_dv_regime_x_v0", defaults.include_dv_regime_x_v0)
         ),
-        accel_horizons_s=(
-            tuple(accel) if isinstance(accel, list) else defaults.accel_horizons_s
-        ),
+        accel_horizons_s=(tuple(accel) if isinstance(accel, list) else defaults.accel_horizons_s),
     )

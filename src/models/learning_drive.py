@@ -17,6 +17,10 @@ class PatternKind(StrEnum):
     BRAKE_HOLD = "brake_hold"
     # アクセルで加速→ブレーキ無しで低速まで惰行（エンジンブレーキ減速率を計測）
     COAST_DOWN = "coast_down"
+    # 高速（cap）まで加速→アクセルを微小開度（trim_opening）へ落として一定保持し、高速域×
+    # 微小開度の応答（惰性減速しつつ）を採る。WLTP 巡航帯（125-140km/h×1〜5%）のモデルデータ
+    # 欠損を埋めるための専用パターン（B-7-2）。cap 超過は防ぐため速度が cap に戻れば離脱する。
+    CRUISE_TRIM = "cruise_trim"
 
 
 @dataclass(frozen=True)
@@ -27,9 +31,13 @@ class LearningPattern:
     速度プラトーや上限に達しない場合に当該パターンを打ち切る最大保持時間。
     ACCEL_SWEEP は accel_opening（加速の目標）と brake_opening（停車復帰のリセットブレーキ）、
     BRAKE_HOLD は accel_opening（cap まで上げる加速）と brake_opening（保持する定常ブレーキ）。
+    CRUISE_TRIM は accel_opening（cap まで上げる加速）と trim_opening（cap 到達後に保持する
+    微小アクセル開度）を使う。
     """
 
     kind: PatternKind
     accel_opening: float
     brake_opening: float
     hold_duration_s: float
+    # CRUISE_TRIM 専用: cap 到達後に保持する微小アクセル開度 [%]（他パターンでは未使用で 0.0）。
+    trim_opening: float = 0.0

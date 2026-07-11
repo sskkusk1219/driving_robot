@@ -6,21 +6,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from src.app.learning_cycle import CycleBusyError, LearningCycleOrchestrator
 from src.app.robot_controller import (
     EmergencyStillActive,
-    InvalidStateTransition,
     LogWriterProtocol,
-    PidTuningAborted,
-    PreCheckFailed,
     RobotController,
 )
 from src.app.training_service import train_and_apply
 from src.domain.learning_drive import LearningDataError
 from src.domain.model_training import FeatureSpec
-from src.domain.pid_tuning import tuning_cost
+from src.domain.pid_tuning import build_tuning_trajectory_from_mode, tuning_cost
 from src.infra.settings import LearningSettings
 from src.models.calibration import CalibrationResult
 from src.models.drive_log import DriveSession
 from src.models.system_state import RobotState
 from src.web.deps import (
+    ILCRepoProtocol,
     ModeRepoProtocol,
     ProfileRepoProtocol,
     ScheduleRepoProtocol,
@@ -28,6 +26,7 @@ from src.web.deps import (
     get_controller,
     get_cycle_orchestrator,
     get_feature_spec,
+    get_ilc_repo,
     get_learning_settings,
     get_log_writer,
     get_mode_repo,
@@ -43,6 +42,7 @@ from src.web.schemas import (
     DriveSessionResponse,
     DynamicsParamsSchema,
     FeedforwardParamsSchema,
+    ILCStatusResponse,
     JogRequest,
     JogResponse,
     LearningCycleAbortResponse,
@@ -67,15 +67,7 @@ Controller = Annotated[RobotController, Depends(get_controller)]
 
 
 def _to_session_response(session: DriveSession) -> DriveSessionResponse:
-    return DriveSessionResponse(
-        id=session.id,
-        profile_id=session.profile_id,
-        mode_id=session.mode_id,
-        run_type=session.run_type,
-        started_at=session.started_at,
-        ended_at=session.ended_at,
-        status=session.status,
-    )
+    return DriveSessionResponse.model_validate(session)
 
 
 def _to_calibration_result_response(result: CalibrationResult) -> CalibrationResultResponse:
@@ -111,10 +103,7 @@ async def get_status(controller: Controller) -> SystemStateResponse:
 
 @router.post("/initialize", status_code=200)
 async def initialize(controller: Controller) -> dict[str, str]:
-    try:
-        await controller.initialize()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await controller.initialize()
     return {"status": "ok"}
 
 
@@ -126,12 +115,7 @@ async def arm_drive(controller: Controller) -> dict[str, str]:
     確認待ち（PRE_CHECK）にする。フロントは確認ポップアップを表示し、「はい」で
     /start、「いいえ」で /cancel を呼ぶ（学習運転と同じ arm フロー）。
     """
-    try:
-        await controller.arm_auto_drive()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except PreCheckFailed as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    await controller.arm_auto_drive()
     return {"status": "armed"}
 
 
@@ -141,10 +125,7 @@ async def cancel_drive(controller: Controller) -> dict[str, str]:
 
     arm でかけた保持ブレーキをリリースする。セッションは未開始のためログは残らない。
     """
-    try:
-        await controller.cancel_auto_drive()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await controller.cancel_auto_drive()
     return {"status": "cancelled"}
 
 
@@ -166,14 +147,9 @@ async def start_drive(
         # 起動しない／DB の FK 違反で 500 になるため、状態遷移前に拒否する。
         raise HTTPException(status_code=404, detail=f"走行モード {req.mode_id!r} が見つかりません")
     profile = controller.get_active_profile()
-    try:
-        session = await controller.start_auto_drive(
-            req.mode_id, mode=mode, profile=profile, log_writer=log_writer
-        )
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except PreCheckFailed as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    session = await controller.start_auto_drive(
+        req.mode_id, mode=mode, profile=profile, log_writer=log_writer
+    )
     return _to_session_response(session)
 
 
@@ -184,38 +160,26 @@ async def pause_drive(controller: Controller) -> dict[str, str]:
     基準速度タイムラインを凍結し、一時停止した瞬間の目標車速を保持して走り続ける。
     フロントの「一時停止」ボタンから呼ぶ。
     """
-    try:
-        await controller.pause_auto_drive()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await controller.pause_auto_drive()
     return {"status": "paused"}
 
 
 @router.post("/resume", status_code=200)
 async def resume_drive(controller: Controller) -> dict[str, str]:
     """一時停止中の自動走行を再開する。PAUSED → RUNNING。フロントの「走行再開」ボタンから呼ぶ。"""
-    try:
-        await controller.resume_auto_drive()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await controller.resume_auto_drive()
     return {"status": "running"}
 
 
 @router.post("/stop", status_code=200)
 async def stop_drive(controller: Controller) -> dict[str, str]:
-    try:
-        await controller.stop()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await controller.stop()
     return {"status": "ok"}
 
 
 @router.post("/emergency", status_code=200)
 async def emergency_stop(controller: Controller) -> dict[str, str]:
-    try:
-        await controller.emergency_stop()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await controller.emergency_stop()
     return {"status": "ok"}
 
 
@@ -226,17 +190,12 @@ async def reset_emergency(controller: Controller) -> dict[str, str]:
     except EmergencyStillActive as e:
         # 物理スイッチ未解除。423 Locked で「まだ解除できない」ことを表す。
         raise HTTPException(status_code=423, detail=str(e)) from e
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
     return {"status": "ok"}
 
 
 @router.post("/calibrate", response_model=CalibrationResultResponse)
 async def run_calibration(controller: Controller) -> CalibrationResultResponse:
-    try:
-        result = await controller.run_calibration()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    result = await controller.run_calibration()
     return _to_calibration_result_response(result)
 
 
@@ -245,7 +204,7 @@ async def calib_jog(req: JogRequest, controller: Controller) -> JogResponse:
     """キャリブレーション中に軸をジョグ移動する。READY から CALIBRATING へ自動遷移。"""
     try:
         pos = await controller.jog_axis(req.axis, req.step)
-    except (InvalidStateTransition, ValueError) as e:
+    except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     return JogResponse(position=pos)
 
@@ -255,7 +214,7 @@ async def calib_home(req: AxisRequest, controller: Controller) -> JogResponse:
     """キャリブレーション中に軸を原点復帰する。READY から CALIBRATING へ自動遷移。"""
     try:
         pos = await controller.home_axis(req.axis)
-    except (InvalidStateTransition, ValueError) as e:
+    except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     return JogResponse(position=pos)
 
@@ -265,7 +224,7 @@ async def calib_set_zero(req: AxisRequest, controller: Controller) -> JogRespons
     """現在位置をゼロ点として記録する。CALIBRATING 状態でのみ呼べる。"""
     try:
         pos = await controller.calib_set_zero(req.axis)
-    except (InvalidStateTransition, ValueError) as e:
+    except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     return JogResponse(position=pos)
 
@@ -275,7 +234,7 @@ async def calib_set_full(req: AxisRequest, controller: Controller) -> JogRespons
     """現在位置をフル点として記録する。CALIBRATING 状態でのみ呼べる。"""
     try:
         pos = await controller.calib_set_full(req.axis)
-    except (InvalidStateTransition, ValueError) as e:
+    except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     return JogResponse(position=pos)
 
@@ -283,10 +242,7 @@ async def calib_set_full(req: AxisRequest, controller: Controller) -> JogRespons
 @router.post("/calib/save", response_model=CalibrationResultResponse)
 async def save_calibration(controller: Controller) -> CalibrationResultResponse:
     """手動設定したゼロ/フル点でキャリブレーションを保存する。CALIBRATING → READY。"""
-    try:
-        result = await controller.save_manual_calibration()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    result = await controller.save_manual_calibration()
     return _to_calibration_result_response(result)
 
 
@@ -295,7 +251,7 @@ async def manual_jog(req: JogRequest, controller: Controller) -> JogResponse:
     """手動運転中に軸をジョグ移動する。MANUAL 状態でのみ呼べる。"""
     try:
         pos = await controller.jog_axis(req.axis, req.step)
-    except (InvalidStateTransition, ValueError) as e:
+    except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     return JogResponse(position=pos)
 
@@ -305,7 +261,7 @@ async def manual_home(req: AxisRequest, controller: Controller) -> JogResponse:
     """手動運転中に軸を原点復帰する。MANUAL 状態でのみ呼べる。"""
     try:
         pos = await controller.home_axis(req.axis)
-    except (InvalidStateTransition, ValueError) as e:
+    except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     return JogResponse(position=pos)
 
@@ -315,21 +271,13 @@ async def start_manual(
     controller: Controller,
     log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
 ) -> DriveSessionResponse:
-    try:
-        session = await controller.start_manual(log_writer=log_writer)
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except PreCheckFailed as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    session = await controller.start_manual(log_writer=log_writer)
     return _to_session_response(session)
 
 
 @router.post("/manual/stop", status_code=200)
 async def stop_manual(controller: Controller) -> dict[str, str]:
-    try:
-        await controller.stop_manual()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await controller.stop_manual()
     return {"status": "ok"}
 
 
@@ -341,12 +289,7 @@ async def arm_learning_drive(controller: Controller) -> dict[str, str]:
     確認待ち（PRE_CHECK）にする。フロントは確認ポップアップを表示し、「はい」で
     /learning/start、「いいえ」で /learning/cancel を呼ぶ。
     """
-    try:
-        await controller.arm_learning_drive()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except PreCheckFailed as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    await controller.arm_learning_drive()
     return {"status": "armed"}
 
 
@@ -360,12 +303,7 @@ async def start_learning_drive(
     開度パターン列を LearningLoop で開ループ実行し、走行ログを `drive_logs` に
     連続記録する（DB 利用時）。
     """
-    try:
-        session = await controller.start_learning_drive(log_writer=log_writer)
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except PreCheckFailed as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    session = await controller.start_learning_drive(log_writer=log_writer)
     return _to_session_response(session)
 
 
@@ -375,10 +313,7 @@ async def cancel_learning_drive(controller: Controller) -> dict[str, str]:
 
     arm でかけた保持ブレーキをリリースする。セッションは未開始のためログは残らない。
     """
-    try:
-        await controller.cancel_learning_drive()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await controller.cancel_learning_drive()
     return {"status": "cancelled"}
 
 
@@ -454,31 +389,10 @@ async def train_learning_model(
     return TrainModelResponse(
         model_path=result.model_path,
         metrics=result.metrics,
-        feedforward_params=FeedforwardParamsSchema(
-            creep_speed_kmh=result.feedforward_params.creep_speed_kmh,
-            creep_rate_kmhs=result.feedforward_params.creep_rate_kmhs,
-            engine_brake_decel_kmhs=result.feedforward_params.engine_brake_decel_kmhs,
-            stop_brake_opening_pct=result.feedforward_params.stop_brake_opening_pct,
-            brake_deadband_pct=result.feedforward_params.brake_deadband_pct,
-            accel_deadband_pct=result.feedforward_params.accel_deadband_pct,
-            switch_hysteresis_pct=result.feedforward_params.switch_hysteresis_pct,
-            accel_reengage_dwell_s=result.feedforward_params.accel_reengage_dwell_s,
-            accel_rate_limit_pct_s=result.feedforward_params.accel_rate_limit_pct_s,
-            brake_rate_limit_pct_s=result.feedforward_params.brake_rate_limit_pct_s,
-            pid_output_limit_pct=result.feedforward_params.pid_output_limit_pct,
-        ),
-        pid_gains=PIDGainsSchema(
-            kp=result.pid_gains.kp,
-            ki=result.pid_gains.ki,
-            kd=result.pid_gains.kd,
-        ),
+        feedforward_params=FeedforwardParamsSchema.model_validate(result.feedforward_params),
+        pid_gains=PIDGainsSchema.model_validate(result.pid_gains),
         pid_auto_tuned=result.pid_auto_tuned,
-        dynamics_params=DynamicsParamsSchema(
-            preview_time_s=result.dynamics_params.preview_time_s,
-            fopdt_k=result.dynamics_params.fopdt_k,
-            fopdt_tau=result.dynamics_params.fopdt_tau,
-            fopdt_theta=result.dynamics_params.fopdt_theta,
-        ),
+        dynamics_params=DynamicsParamsSchema.model_validate(result.dynamics_params),
     )
 
 
@@ -495,14 +409,7 @@ async def pid_tune_validate(
         raise HTTPException(
             status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
         )
-    try:
-        kpi = await controller.run_pid_validation(profile, log_writer)
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except PreCheckFailed as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
-    except PidTuningAborted as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    kpi = await controller.run_pid_validation(profile, log_writer)
     return PidValidateResponse(
         kpi_summary=kpi,
         cost=tuning_cost(kpi),
@@ -517,34 +424,37 @@ async def pid_tune_refine(
     req: PidRefineRequest,
     controller: Controller,
     profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
+    mode_repo: Annotated[ModeRepoProtocol, Depends(get_mode_repo)],
     log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
 ) -> PidRefineResponse:
-    """規定パターンを反復走行し座標降下で PID を絞り込み、最良ゲインを保存する。"""
+    """規定パターン（または指定モード代表区間）を反復走行し座標降下で PID を絞り込む。"""
     profile = await profile_repo.get_by_id(req.profile_id)
     if profile is None:
         raise HTTPException(
             status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
         )
-    try:
-        best, history = await controller.run_pid_tuning_session(
-            profile, log_writer, max_runs=req.max_runs
-        )
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except PreCheckFailed as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
-    except PidTuningAborted as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    # mode_id 指定時は本番モードの代表区間で評価する（適合結果の転移性向上）。
+    tuning_mode = None
+    if req.mode_id is not None:
+        mode = await mode_repo.get_by_id(req.mode_id)
+        if mode is None:
+            raise HTTPException(
+                status_code=404, detail=f"モード {req.mode_id!r} が見つかりません"
+            )
+        tuning_mode = build_tuning_trajectory_from_mode(mode)
+    best, history = await controller.run_pid_tuning_session(
+        profile, log_writer, max_runs=req.max_runs, mode=tuning_mode
+    )
 
-    # 最良ゲイン・先読み補償秒数を永続化し、アクティブプロファイルの制御スタックへ反映する。
+    # 最良ゲイン・PID 先読み補償秒数を永続化し、アクティブプロファイルの制御スタックへ反映する。
     profile.pid_gains = best.gains
-    profile.dynamics_params = replace(profile.dynamics_params, preview_time_s=best.preview_time_s)
+    profile.dynamics_params = replace(profile.dynamics_params, pid_preview_s=best.pid_preview_s)
     updated = await profile_repo.update(profile)
     controller.refresh_active_profile(updated if updated is not None else profile)
 
     return PidRefineResponse(
         pid_gains=PIDGainsSchema(kp=best.kp, ki=best.ki, kd=best.kd),
-        preview_time_s=best.preview_time_s,
+        pid_preview_s=best.pid_preview_s,
         best_cost=min((h["cost"] for h in history), default=0.0),
         history=history,
     )
@@ -564,32 +474,22 @@ async def start_schedule_drive(
     try:
         schedule = await schedule_repo.get_by_id(req.schedule_id)
     except ValueError as e:
-        raise HTTPException(
-            status_code=400, detail="schedule_id が UUID 形式ではありません"
-        ) from e
+        raise HTTPException(status_code=400, detail="schedule_id が UUID 形式ではありません") from e
     if schedule is None:
         raise HTTPException(
             status_code=404, detail=f"スケジュール {req.schedule_id!r} が見つかりません"
         )
     profile = controller.get_active_profile()
-    try:
-        session = await controller.start_schedule_drive(
-            schedule, profile=profile, log_writer=log_writer
-        )
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except PreCheckFailed as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    session = await controller.start_schedule_drive(
+        schedule, profile=profile, log_writer=log_writer
+    )
     return _to_session_response(session)
 
 
 @router.post("/schedule/stop", status_code=200)
 async def stop_schedule_drive(controller: Controller) -> dict[str, str]:
     """タイムスケジュール走行を停止する。RUNNING → READY。"""
-    try:
-        await controller.stop_schedule_drive()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await controller.stop_schedule_drive()
     return {"status": "ok"}
 
 
@@ -610,57 +510,59 @@ async def select_profile(
 
 
 def _to_cycle_progress_schema(orchestrator: LearningCycleOrchestrator) -> CycleProgressSchema:
-    p = orchestrator.progress
-    return CycleProgressSchema(
-        cycle_id=p.cycle_id,
-        phase=p.phase.value,
-        run_index=p.run_index,
-        run_total=p.run_total,
-        best_cost=p.best_cost,
-        best_preview_time_s=p.best_preview_time_s,
-        message=p.message,
-        started_at=p.started_at,
-    )
+    return CycleProgressSchema.model_validate(orchestrator.progress)
+
+
+@router.post("/learning-cycle/arm", status_code=200)
+async def arm_learning_cycle(
+    controller: Controller,
+    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
+) -> dict[str, str]:
+    """学習サイクルを準備する(自動運転と同じ arm フロー)。READY → PRE_CHECK。
+
+    停車保持ブレーキ踏込・車速0収束待ち・走行前チェックを実施し、合格したら確認待ち
+    (PRE_CHECK)にする。フロントは確認ポップアップを表示し、「はい」で
+    /learning-cycle/start、「いいえ」で /learning-cycle/cancel を呼ぶ。
+    """
+    profile = controller.get_active_profile()
+    if profile is None:
+        raise HTTPException(status_code=404, detail="プロファイルが選択されていません")
+    try:
+        await orchestrator.arm(profile.id)
+    except CycleBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return {"status": "armed"}
+
+
+@router.post("/learning-cycle/cancel", status_code=200)
+async def cancel_learning_cycle(
+    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
+) -> dict[str, str]:
+    """arm 済みの学習サイクルを中止する(確認ポップアップ「いいえ」)。PRE_CHECK → READY。"""
+    await orchestrator.cancel()
+    return {"status": "cancelled"}
 
 
 @router.post("/learning-cycle/start", response_model=LearningCycleStartResponse, status_code=202)
 async def start_learning_cycle(
     req: LearningCycleStartRequest,
-    controller: Controller,
     orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
     learning_settings: Annotated[LearningSettings, Depends(get_learning_settings)],
     feature_spec: Annotated[FeatureSpec, Depends(get_feature_spec)],
 ) -> LearningCycleStartResponse:
-    """学習サイクル(学習運転→訓練→PID適合→再学習→PID適合)を1操作で開始する。
+    """arm 済みの学習サイクル(学習運転→訓練→PID適合→再学習→PID適合)を開始する
+    (確認ポップアップ「はい」)。
 
-    学習運転の準備(arm)〜開始までを同期的に実行するため、応答まで数秒(車速収束待ち)かかる。
     以降のフェーズはバックグラウンドで進行し、進捗は `GET /learning-cycle/status` または
     WebSocket(`cycle_progress`)で参照する。
     """
-    state = controller.get_system_state().robot_state
-    if state != RobotState.READY:
-        raise HTTPException(
-            status_code=409,
-            detail=f"学習サイクルは READY 状態でのみ開始できます (現在: {state})",
-        )
-    profile = controller.get_active_profile()
-    if profile is None:
-        raise HTTPException(status_code=404, detail="プロファイルが選択されていません")
-
     stage1 = req.refine_runs_stage1 or learning_settings.refine_runs_stage1
     stage2 = req.refine_runs_stage2 or learning_settings.refine_runs_stage2
-    try:
-        cycle_id = await orchestrator.start(
-            profile.id, stage1, stage2, feature_spec=feature_spec
-        )
-    except CycleBusyError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except PreCheckFailed as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    cycle_id = await orchestrator.start(
+        stage1, stage2, feature_spec=feature_spec, target_mode_id=req.target_mode_id
+    )
     return LearningCycleStartResponse(cycle_id=cycle_id, status="started")
 
 
@@ -669,10 +571,7 @@ async def abort_learning_cycle(
     orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
 ) -> LearningCycleAbortResponse:
     """実行中の学習サイクルを中断する。実行中でない場合は 409。"""
-    try:
-        await orchestrator.abort()
-    except InvalidStateTransition as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    await orchestrator.abort()
     return LearningCycleAbortResponse(status="aborting")
 
 
@@ -681,3 +580,59 @@ async def get_learning_cycle_status(
     orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
 ) -> CycleProgressSchema:
     return _to_cycle_progress_schema(orchestrator)
+
+
+# ── ILC（反復学習制御） ────────────────────────────────────────────────
+ILCRepo = Annotated[ILCRepoProtocol, Depends(get_ilc_repo)]
+
+
+def _to_ilc_status(profile_id: str, mode_id: str, rec: object | None) -> ILCStatusResponse:
+    """ILCRecord（または None）を状態レスポンスへ写像する。未学習は既定値。"""
+    if rec is None:
+        return ILCStatusResponse(
+            profile_id=profile_id,
+            mode_id=mode_id,
+            enabled=True,  # 未登録は既定で有効（走行完了時に学習開始）
+            iteration=0,
+            has_table=False,
+            best_p95_kmh=None,
+            kpi_history=[],
+        )
+    table = rec.table  # type: ignore[attr-defined]
+    return ILCStatusResponse(
+        profile_id=profile_id,
+        mode_id=mode_id,
+        enabled=rec.enabled,  # type: ignore[attr-defined]
+        iteration=table.iteration,
+        has_table=bool(table.efforts),
+        best_p95_kmh=table.best_p95_kmh,
+        kpi_history=list(rec.kpi_history),  # type: ignore[attr-defined]
+    )
+
+
+@router.get("/ilc/{profile_id}/{mode_id}", response_model=ILCStatusResponse)
+async def get_ilc_status(profile_id: str, mode_id: str, ilc_repo: ILCRepo) -> ILCStatusResponse:
+    """profile×mode の ILC 状態（反復回数・有効フラグ・最良p95・履歴）を返す。"""
+    rec = await ilc_repo.get(profile_id, mode_id)
+    return _to_ilc_status(profile_id, mode_id, rec)
+
+
+@router.post("/ilc/{profile_id}/{mode_id}/enable", response_model=ILCStatusResponse)
+async def enable_ilc(profile_id: str, mode_id: str, ilc_repo: ILCRepo) -> ILCStatusResponse:
+    """ILC を有効化する。"""
+    await ilc_repo.set_enabled(profile_id, mode_id, True)
+    return _to_ilc_status(profile_id, mode_id, await ilc_repo.get(profile_id, mode_id))
+
+
+@router.post("/ilc/{profile_id}/{mode_id}/disable", response_model=ILCStatusResponse)
+async def disable_ilc(profile_id: str, mode_id: str, ilc_repo: ILCRepo) -> ILCStatusResponse:
+    """ILC を無効化する（補正を適用せず学習もしない）。"""
+    await ilc_repo.set_enabled(profile_id, mode_id, False)
+    return _to_ilc_status(profile_id, mode_id, await ilc_repo.get(profile_id, mode_id))
+
+
+@router.post("/ilc/{profile_id}/{mode_id}/reset", response_model=ILCStatusResponse)
+async def reset_ilc(profile_id: str, mode_id: str, ilc_repo: ILCRepo) -> ILCStatusResponse:
+    """補正テーブルを削除して反復 0 からやり直す。"""
+    await ilc_repo.reset(profile_id, mode_id)
+    return _to_ilc_status(profile_id, mode_id, await ilc_repo.get(profile_id, mode_id))

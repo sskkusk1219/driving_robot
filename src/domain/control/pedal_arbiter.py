@@ -38,10 +38,15 @@ class PedalArbiter:
         params: FeedforwardParams,
         max_accel_opening: float,
         max_brake_opening: float,
+        nominal_dt_s: float = 0.05,
     ) -> None:
         self._params = params
         self._max_accel = max(0.0, max_accel_opening)
         self._max_brake = max(0.0, max_brake_opening)
+        # レートリミットに使う dt の基準周期。バスストール等でサイクルがスキップされた後の
+        # 大きな dt をそのまま使うと 1 サイクルで大きくペダルが動いてしまうため、
+        # PIDController と同じ方式（公称周期の 0.5〜4 倍）にクランプする（D6 レビュー指摘）。
+        self._nominal_dt_s = max(0.0, nominal_dt_s)
         self._time_s = 0.0
         self._last_accel_opening = 0.0
         self._last_brake_opening = 0.0
@@ -63,7 +68,13 @@ class PedalArbiter:
             dt: 前サイクルからの経過時間 [s]（レートリミットとディレイに使用）
         """
         p = self._params
-        dt = max(0.0, dt)
+        if dt <= 0.0:
+            dt = self._nominal_dt_s
+        elif self._nominal_dt_s > 0.0:
+            # スケジューラジッタ・サイクルスキップ（バスストール復帰）の外れ値を抑える。
+            # クランプしないと復帰後の大きな dt がレートリミットの上限 (rate_pct_s * dt) を
+            # 押し上げ、1 サイクルでペダルが最大速度で動いてしまう。
+            dt = max(0.5 * self._nominal_dt_s, min(4.0 * self._nominal_dt_s, dt))
         self._time_s += dt
 
         # 1. ペダル選択（ヒステリシス）: ±h の帯内は惰行。帯内で努力量の符号が
@@ -94,6 +105,9 @@ class PedalArbiter:
             applied = min(applied, self._max_accel)
             if applied < requested:
                 saturated_high = True
+            # 微小変化は前回開度を保持（サーボの震えと ON-OFF チャタを抑える・B-7-3）。
+            if abs(applied - self._last_accel_opening) < max(0.0, p.accel_min_step_pct):
+                applied = self._last_accel_opening
             accel, brake = applied, 0.0
         elif pedal == "brake":
             requested = self._apply_deadband(-effort, p.brake_deadband_pct)
@@ -103,9 +117,15 @@ class PedalArbiter:
             applied = min(applied, self._max_brake)
             if applied < requested:
                 saturated_low = True
+            # ブレーキ選択時はアクセルを即 0 解放（同時踏み禁止・減速権限を最優先）。
             accel, brake = 0.0, applied
         else:
-            accel, brake = 0.0, 0.0
+            # 惰行: アクセルからの遷移は即 0 解放せず解放レートで漸減する（B-7-3）。定常巡航で
+            # 努力量がヒステリシス帯を跨ぐたびに即 0 解放されると ON-OFF パルスになり、実機で
+            # 高速域 36回/min のハンチングを生む。1〜2サイクルの惰行では accel を残し滑らかに保つ。
+            # ブレーキは惰行では踏んでいないため 0。
+            accel = self._release_accel(self._last_accel_opening, p.accel_release_rate_pct_s, dt)
+            brake = 0.0
 
         # 非選択ペダルは即座に解放する（レート制限しない）。解放を遅らせると
         # 切替の過渡で両ペダルが同時に非ゼロになるため。
@@ -144,3 +164,17 @@ class PedalArbiter:
         if requested > previous + max_step:
             return previous + max_step
         return requested
+
+    @staticmethod
+    def _release_accel(previous: float, rate_pct_s: float, dt: float) -> float:
+        """惰行遷移時のアクセル解放を rate_pct_s [%/s] で 0 へ漸減する（B-7-3）。
+
+        rate_pct_s<=0 は即 0 解放（従来挙動）。dt<=0 は前回値を保持。
+        """
+        if previous <= 0.0:
+            return 0.0
+        if rate_pct_s <= 0.0:
+            return 0.0
+        if dt <= 0.0:
+            return previous
+        return max(0.0, previous - rate_pct_s * dt)

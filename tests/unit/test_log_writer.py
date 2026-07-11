@@ -11,6 +11,7 @@ from src.models.drive_log import DriveLogData
 def make_conn() -> AsyncMock:
     conn = AsyncMock()
     conn.execute = AsyncMock()
+    conn.executemany = AsyncMock()
     return conn
 
 
@@ -132,43 +133,48 @@ class TestLogWriterStartSession:
 
 
 class TestLogWriterWriteLog:
+    """E5: write_log はバッファに追加するのみで、フラッシュ（executemany）は
+    LOG_FLUSH_INTERVAL_S 経過後または明示的な _flush_log_buffer 呼び出しで発生する。"""
+
     @pytest.mark.asyncio
-    async def test_write_log_calls_execute_once(self) -> None:
-        """write_log が conn.execute を1回呼ぶこと。"""
+    async def test_write_log_does_not_call_db_immediately(self) -> None:
+        """write_log 単体では conn.execute/executemany を呼ばない（バッファリングのみ）。"""
         conn = make_conn()
         writer = LogWriter(conn)
 
         await writer.write_log("session-uuid", sample_log_data())
 
-        conn.execute.assert_called_once()
+        conn.execute.assert_not_called()
+        conn.executemany.assert_not_called()
+        assert len(writer._log_buffer) == 1
 
     @pytest.mark.asyncio
-    async def test_write_log_passes_session_id(self) -> None:
-        """write_log が session_id を $1 に渡すこと。"""
+    async def test_flush_passes_session_id(self) -> None:
+        """フラッシュ時に session_id が行の $1 として executemany に渡ること。"""
         conn = make_conn()
         writer = LogWriter(conn)
 
         await writer.write_log("my-session-id", sample_log_data())
+        await writer._flush_log_buffer()
 
-        call_args = conn.execute.call_args
-        positional_args = call_args[0]
-        assert positional_args[1] == "my-session-id"
+        rows = conn.executemany.call_args[0][1]
+        assert rows[0][0] == "my-session-id"
 
     @pytest.mark.asyncio
-    async def test_write_log_passes_actual_speed(self) -> None:
-        """write_log が actual_speed_kmh を SQL に渡すこと。"""
+    async def test_flush_passes_actual_speed(self) -> None:
+        """フラッシュ時に actual_speed_kmh が行に含まれること。"""
         conn = make_conn()
         writer = LogWriter(conn)
         data = sample_log_data()
 
         await writer.write_log("session-uuid", data)
+        await writer._flush_log_buffer()
 
-        call_args = conn.execute.call_args
-        positional_args = call_args[0]
-        assert positional_args[3] == data.actual_speed_kmh  # actual_speed_kmh = $3
+        rows = conn.executemany.call_args[0][1]
+        assert rows[0][3] == data.actual_speed_kmh  # actual_speed_kmh = $4（$2 に timestamp）
 
     @pytest.mark.asyncio
-    async def test_write_log_passes_none_ref_speed(self) -> None:
+    async def test_flush_passes_none_ref_speed(self) -> None:
         """ref_speed_kmh が None の場合、そのまま渡すこと。"""
         conn = make_conn()
         writer = LogWriter(conn)
@@ -176,13 +182,69 @@ class TestLogWriterWriteLog:
         data.ref_speed_kmh = None
 
         await writer.write_log("session-uuid", data)
+        await writer._flush_log_buffer()
 
-        call_args = conn.execute.call_args
-        positional_args = call_args[0]
-        assert positional_args[2] is None  # ref_speed_kmh = $2
+        rows = conn.executemany.call_args[0][1]
+        assert rows[0][2] is None  # ref_speed_kmh = $3
+
+    @pytest.mark.asyncio
+    async def test_flush_with_empty_buffer_does_not_call_db(self) -> None:
+        """バッファが空の場合、フラッシュしても executemany は呼ばれない。"""
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer._flush_log_buffer()
+
+        conn.executemany.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multiple_writes_batch_into_single_flush(self) -> None:
+        """複数回の write_log が1回の executemany にまとめられること（往復削減、E5 指摘）。"""
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        for _ in range(5):
+            await writer.write_log("session-uuid", sample_log_data())
+        await writer._flush_log_buffer()
+
+        conn.executemany.assert_called_once()
+        rows = conn.executemany.call_args[0][1]
+        assert len(rows) == 5
+
+    @pytest.mark.asyncio
+    async def test_write_log_auto_flushes_after_interval_elapsed(self) -> None:
+        """LOG_FLUSH_INTERVAL_S 経過後の write_log 呼び出しで自動フラッシュされること。"""
+        from src.infra.log_writer import LOG_FLUSH_INTERVAL_S
+
+        conn = make_conn()
+        writer = LogWriter(conn)
+
+        await writer.write_log("session-uuid", sample_log_data())
+        conn.executemany.assert_not_called()
+        # 直前のフラッシュ時刻を過去へずらし、間隔経過を模擬する
+        assert writer._last_flush_at is not None
+        writer._last_flush_at -= LOG_FLUSH_INTERVAL_S + 0.1
+
+        await writer.write_log("session-uuid", sample_log_data())
+
+        conn.executemany.assert_called_once()
+        rows = conn.executemany.call_args[0][1]
+        assert len(rows) == 2
 
 
 class TestLogWriterEndSession:
+    @pytest.mark.asyncio
+    async def test_end_session_flushes_pending_log_buffer_first(self) -> None:
+        """E5 回帰テスト: フラッシュ間隔未達でもセッション終了時にバッファが失われないこと。"""
+        conn = make_conn()
+        writer = LogWriter(conn)
+        await writer.write_log("session-uuid", sample_log_data())
+
+        await writer.end_session("session-uuid", "completed")
+
+        conn.executemany.assert_called_once()
+        assert writer._log_buffer == []
+
     @pytest.mark.asyncio
     async def test_end_session_calls_execute_once(self) -> None:
         """end_session が conn.execute を1回呼ぶこと。"""

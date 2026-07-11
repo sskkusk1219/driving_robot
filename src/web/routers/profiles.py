@@ -6,7 +6,6 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
 
 from src.app.robot_controller import RobotController
-from src.infra.db import DuplicateNameError
 from src.models.profile import (
     DynamicsParams,
     FeedforwardParams,
@@ -32,17 +31,8 @@ ProfileRepo = Annotated[ProfileRepoProtocol, Depends(get_profile_repo)]
 Controller = Annotated[RobotController, Depends(get_controller)]
 
 
-def _ffp_to_schema(ffp: FeedforwardParams) -> FeedforwardParamsSchema:
-    """FeedforwardParams の全フィールドを汎用変換する（フィールド追加時も自動追随）。"""
-    return FeedforwardParamsSchema(**{f.name: getattr(ffp, f.name) for f in fields(ffp)})
-
-
 def _ffp_from_schema(s: FeedforwardParamsSchema) -> FeedforwardParams:
     return FeedforwardParams(**{f.name: getattr(s, f.name) for f in fields(FeedforwardParams)})
-
-
-def _dyn_to_schema(dyn: DynamicsParams) -> DynamicsParamsSchema:
-    return DynamicsParamsSchema(**{f.name: getattr(dyn, f.name) for f in fields(dyn)})
 
 
 def _dyn_from_schema(s: DynamicsParamsSchema) -> DynamicsParams:
@@ -76,8 +66,8 @@ def _to_response(p: VehicleProfile) -> ProfileResponse:
         ),
         calibration=calib,
         model_path=p.model_path,
-        feedforward_params=_ffp_to_schema(p.feedforward_params),
-        dynamics_params=_dyn_to_schema(p.dynamics_params),
+        feedforward_params=FeedforwardParamsSchema.model_validate(p.feedforward_params),
+        dynamics_params=DynamicsParamsSchema.model_validate(p.dynamics_params),
         created_at=p.created_at,
         updated_at=p.updated_at,
     )
@@ -119,10 +109,7 @@ async def create_profile(req: ProfileCreateRequest, repo: ProfileRepo) -> Profil
             else DynamicsParams()
         ),
     )
-    try:
-        created = await repo.create(profile)
-    except DuplicateNameError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    created = await repo.create(profile)
     return _to_response(created)
 
 

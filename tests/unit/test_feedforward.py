@@ -6,7 +6,12 @@ import numpy as np
 import pytest
 from sklearn.linear_model import Ridge
 
-from src.domain.control.feedforward import FeedforwardController
+from src.domain.control.feedforward import (
+    _GAIN_ACCEL_PROBE_KMHS,
+    _GAIN_MAX,
+    _GAIN_MIN,
+    FeedforwardController,
+)
 from src.domain.model_training import DEFAULT_FEATURE_SPEC, MODEL_TYPE, FeatureSpec
 from src.models.profile import FeedforwardParams
 
@@ -392,3 +397,109 @@ class TestFeedforwardControllerParams:
         # 強い減速予見 → ブレーキ予測 0.05*60=3% は不感帯 10% 未満でもそのまま返す
         effort = ff.predict_effort(60.0, [50.0, 40.0, 20.0, 0.0], _past(60.0))
         assert effort == pytest.approx(-3.0)
+
+
+class TestBuildGainSchedule:
+    """Stage B: 速度依存プラントゲイン表を FF モデルの局所勾配から抽出する。"""
+
+    @staticmethod
+    def _coef(**name_to_val: float) -> list[float]:
+        """feature名→係数の指定から係数ベクトルを作る（キーの _ は . に読み替える）。"""
+        coef = [0.0] * N_FEATURES
+        for key, val in name_to_val.items():
+            name = key.replace("dv_0_5", "dv_0.5").replace("dv_1_0", "dv_1.0")
+            coef[FEATURE_NAMES.index(name)] = val
+        return coef
+
+    def test_no_model_returns_none(self) -> None:
+        ff = FeedforwardController()
+        assert ff.build_gain_schedule(v_max=100.0) is None
+        assert ff.gain_schedule is None
+
+    def test_constant_accel_gradient(self, tmp_path: Path) -> None:
+        """dv_1.0 係数のみ 0.2 のモデル → g_accel(v)=0.2（速度非依存, 平滑化後も一定）。"""
+        path = make_model_file(
+            tmp_path, accel_coef=self._coef(dv_1_0=0.2), speed_clip_max=None
+        )
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        sched = ff.build_gain_schedule(v_max=100.0, step=5.0)
+        assert sched is not None
+        assert all(g == pytest.approx(0.2, abs=1e-6) for g in sched.accel_gains)
+
+    def test_zero_gradient_clamped_to_min(self, tmp_path: Path) -> None:
+        """既定モデル（v0 係数のみ）は dv 勾配 0 → _GAIN_MIN にクランプされる。"""
+        path = make_model_file(tmp_path, speed_clip_max=None)
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        sched = ff.build_gain_schedule(v_max=60.0)
+        assert sched is not None
+        assert all(g == pytest.approx(_GAIN_MIN) for g in sched.accel_gains)
+
+    def test_large_gradient_clamped_to_max(self, tmp_path: Path) -> None:
+        accel_coef = [0.0] * N_FEATURES
+        accel_coef[FEATURE_NAMES.index("dv_1.0")] = 10.0  # g=10 → clamp 1.0
+        path = make_model_file(tmp_path, accel_coef=accel_coef, speed_clip_max=None)
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        sched = ff.build_gain_schedule(v_max=40.0)
+        assert sched is not None
+        assert all(g == pytest.approx(_GAIN_MAX) for g in sched.accel_gains)
+
+    def test_brake_gradient_from_negative_dv(self, tmp_path: Path) -> None:
+        """dv_1.0 係数 −0.3 のブレーキモデル → g_brake(v)=0.3（定減速度 −a 方向の勾配）。"""
+        brake_coef = [0.0] * N_FEATURES
+        brake_coef[FEATURE_NAMES.index("v0")] = 0.3  # 予測を非負に保つ土台
+        brake_coef[FEATURE_NAMES.index("dv_1.0")] = -0.3
+        path = make_model_file(tmp_path, brake_coef=brake_coef, speed_clip_max=None)
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        sched = ff.build_gain_schedule(v_max=80.0)
+        assert sched is not None
+        # 低速端は future の 0 丸めで勾配が変わり、3点移動平均で1格子点分ズレが波及する。
+        # 標準的な速度域（v>=10）では純粋な線形勾配 0.3 になる。
+        for v, g in zip(sched.speeds, sched.brake_gains, strict=False):
+            if v >= 10.0:
+                assert g == pytest.approx(0.3, abs=1e-6)
+
+    def test_speed_dependent_gradient(self, tmp_path: Path) -> None:
+        """dv1_x_v0 係数で g(v) が速度依存になる: g(v)=0.1+0.002·v（端点以外は厳密）。"""
+        accel_coef = [0.0] * N_FEATURES
+        accel_coef[FEATURE_NAMES.index("dv_1.0")] = 0.1
+        accel_coef[FEATURE_NAMES.index("dv1_x_v0")] = 0.002
+        path = make_model_file(tmp_path, accel_coef=accel_coef, speed_clip_max=None)
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        sched = ff.build_gain_schedule(v_max=100.0, step=5.0)
+        assert sched is not None
+        # 内部点は3点移動平均でも線形関数なら不変（等間隔サンプル）
+        for v, g in zip(sched.speeds[1:-1], sched.accel_gains[1:-1], strict=False):
+            assert g == pytest.approx(0.1 + 0.002 * v, abs=1e-6)
+
+    def test_rebuild_and_unload(self, tmp_path: Path) -> None:
+        accel_coef = [0.0] * N_FEATURES
+        accel_coef[FEATURE_NAMES.index("dv_1.0")] = 0.2
+        path = make_model_file(tmp_path, accel_coef=accel_coef, speed_clip_max=None)
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        ff.rebuild_gain_schedule(v_max=50.0)
+        assert ff.gain_schedule is not None
+        ff.unload_model()
+        assert ff.gain_schedule is None
+
+    def test_probe_constant_is_positive(self) -> None:
+        assert _GAIN_ACCEL_PROBE_KMHS > 0.0
+
+    def test_grid_excludes_clip_boundary(self, tmp_path: Path) -> None:
+        """speed_clip_max 近傍は +probe の先読みがクリップされ勾配が潰れるため、グリッド上限は
+        speed_clip_max − max_horizon·a_probe 手前に制限される（超過速度は補間端点クランプ）。"""
+        accel_coef = [0.0] * N_FEATURES
+        accel_coef[FEATURE_NAMES.index("dv_1.0")] = 0.2
+        path = make_model_file(tmp_path, accel_coef=accel_coef, speed_clip_max=100.0)
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        sched = ff.build_gain_schedule(v_max=140.0, step=5.0)
+        assert sched is not None
+        # 100 − 3.0·0.5 = 98.5 → 最大格子点は 95。クリップ域(100超)を含まず v_max(140)にも達しない。
+        assert max(sched.speeds) <= 100.0 - 3.0 * _GAIN_ACCEL_PROBE_KMHS
+        assert max(sched.speeds) < 140.0

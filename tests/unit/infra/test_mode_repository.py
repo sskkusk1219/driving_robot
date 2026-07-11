@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 
+from src.infra.db import DuplicateNameError
 from src.infra.mode_repository import ModeRepository
 from src.models.driving_mode import DrivingMode, SpeedPoint
 
@@ -62,6 +64,20 @@ class TestModeRepositoryCreate:
         result = await repo.create(mode)
 
         assert result.id != ""
+
+
+class TestModeRepositoryUpdate:
+    @pytest.mark.asyncio
+    async def test_update_converts_unique_violation_to_duplicate_name_error(self) -> None:
+        """I5 回帰テスト: update 時の一意制約違反を DuplicateNameError（→409）に変換する
+        （create は既に変換済みだが update だけ未変換で 500 になっていたバグの回帰）。"""
+        pool, conn = make_mock_pool()
+        conn.execute.side_effect = asyncpg.UniqueViolationError("duplicate key")
+        repo = ModeRepository(pool)
+        mode = make_mode(name="既存モード名", mode_id=MODE_ID)
+
+        with pytest.raises(DuplicateNameError):
+            await repo.update(mode)
 
 
 class TestModeRepositoryDelete:

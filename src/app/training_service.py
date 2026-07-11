@@ -115,10 +115,12 @@ async def train_and_apply(
             if new_gains != profile.pid_gains:
                 profile.pid_gains = new_gains
                 pid_auto_tuned = True
-            # 先読み補償(preview_time_s)の初期値としてθを設定する。SIMC ゲイン自体は
-            # θフルのまま計算済み（ループのむだ時間は不変のため割り引かない）。
+            # PID 先読み補償(pid_preview_s)は 0.0 から始める（initial_preview_from_fopdt は
+            # 常に 0.0 を返す）。FF が θ のむだ時間補償を構造的に内蔵するため、ここで θ を
+            # 前倒し初期値にすると二重補償となり系統偏差を生む。θ は fopdt_theta に保存し、
+            # 必要な FB 側むだ時間補償は座標降下が pid_preview_s を探索して決める。
             profile.dynamics_params = DynamicsParams(
-                preview_time_s=initial_preview_from_fopdt(fopdt),
+                pid_preview_s=initial_preview_from_fopdt(fopdt),
                 fopdt_k=fopdt.k,
                 fopdt_tau=fopdt.tau,
                 fopdt_theta=fopdt.theta,

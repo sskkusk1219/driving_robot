@@ -8,11 +8,20 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
+from src.domain.control.base_loop import (
+    MAX_PENDING_LOG_TASKS,
+    WEDGED_CYCLE_TIMEOUT_S,
+    CycleLoopBase,
+    LogWriterProtocol,
+)
+from src.domain.control.conversions import opening_to_position
 from src.domain.control.feedforward import FeedforwardController
+from src.domain.control.ilc import ILCController
 from src.domain.control.kpi_monitor import KPIMonitor
 from src.domain.control.pedal_arbiter import PedalArbiter
+from src.domain.control.pedal_plan import PedalPlan, PlanPhase
 from src.domain.control.pedal_safety import enforce_pedal_exclusion
-from src.domain.control.pid import PIDController
+from src.domain.control.trim import TrimController
 from src.models.drive_log import DriveLogData
 from src.models.driving_mode import DrivingMode
 from src.models.profile import VehicleProfile
@@ -22,22 +31,27 @@ _logger = logging.getLogger(__name__)
 
 CONTROL_LOOP_INTERVAL_S: float = 0.05
 LOG_EVERY_N_CYCLES: int = 2
-# サイクルウォッチドッグ: 前サイクル未完了によるスキップがこの時間続いたら非常停止する。
-# pymodbus のタイムアウト×リトライ（最大十数秒）を待つ間、ペダルが最終指令位置で
-# 凍結したまま安全チェックが走らない時間を 1 秒に短縮する。
-WEDGED_CYCLE_TIMEOUT_S: float = 1.0
-# ブレーキ軸診断（.steering/20260620-modbus-retry-cycle-stall フェーズ3 試行2）:
-# move_to_position（FC16書込）直後の read_current（FC03読取）がほぼ毎サイクル初回
-# タイムアウトする現象を仮説検証するための待機。accel 軸では再現しないため timeout
-# 調整ではなく、書込→読取間の RS-485 半二重切替 / スレーブ内部処理タイミングを疑う。
-# 効果がなければ 0.0 に戻す（試行1の timeout 引き上げは無効と判明済み）。
-BRAKE_PRE_READ_DELAY_S: float = 0.01
+# ゲインスケジューリング: 速い補正層の実効ゲイン正規化係数 scale = clamp(g(v)/g_nominal, MIN, MAX)。
+# 極端なプラントゲイン比でも不安定化しないよう比を有界にする。ブースト上限は 1.5 に抑える
+# （B-8-3 移管）: むだ時間 θ 起因の安定限界はプラントゲイン正規化では消えないため、上限 3.0
+# だと高速域で実効 kp が過大になる（実機 2026-07-10: scale3.0×kp3.91=11.7 が SIMC 適正 1.6 の
+# 約7倍で 1Hz リミットサイクル＝ペダルシーソーを生んだ）。減衰側 0.5 は不確かな帯で弱める安全側。
+_GAIN_SCALE_MIN: float = 0.5
+_GAIN_SCALE_MAX: float = 1.5
+# 基準速度が減速トレンドかを判定するしきい値 [km/h]（最短ホライズン先の基準 − 現基準）。
+# これ未満なら減速フェーズとみなし制動側プラントゲインを使う。
+_GAIN_DECEL_TREND_KMH: float = -0.1
+# 軸診断（.steering/20260620-modbus-retry-cycle-stall フェーズ3）:
+# move_to_position（FC16書込）直後の read_current（FC03読取）が初回タイムアウトする
+# 現象への対策。timeout 調整では解決せず（試行1で無効と判明済み）、書込→読取間の
+# RS-485 半二重切替 / スレーブ内部処理タイミングを疑い待機を挿入したところ有効だった
+# （試行2、brake 軸）。試行2後の残存軽微遅延（52件）をサイクル内訳診断で切り分けた
+# ところ、頻度は低いが accel 軸でも同じ機構（書込直後の読取で初回応答欠落）が起きて
+# いたと判明したため、accel 軸にも同じ待機を適用する（試行3）。
+AXIS_PRE_READ_DELAY_S: float = 0.01
 # サイクル内訳診断（フェーズ3 試行2後の残存軽微遅延切り分け用）: CAN 読取・軸駆動の
 # どちらが 50ms 予算超過の原因かをサイクル毎に計測し、閾値超過時のみログする。
 CYCLE_DIAG_THRESHOLD_S: float = 0.08
-# ログ書き込み保留タスクの上限。DB ストール時に 10 件/s で無制限に積み上がるのを防ぎ、
-# 10 時間連続走行のメモリとイベントループ負荷を一定に保つ（走行継続をログより優先）。
-MAX_PENDING_LOG_TASKS: int = 100
 
 
 class ActuatorDriverProtocol(Protocol):
@@ -56,22 +70,23 @@ class SafetyCheckProtocol(Protocol):
     def check_deviation(self, ref: float, actual: float, duration: float) -> bool: ...
 
 
-class LogWriterProtocol(Protocol):
-    async def write_log(self, session_id: str, data: DriveLogData) -> None: ...
-
-
-class DriveLoop:
+class DriveLoop(CycleLoopBase):
     """50ms 制御ループを管理するドメインコンポーネント。
 
     start() でループを開始し、stop() または on_complete/on_emergency コールバックで停止する。
-    asyncio.sleep を使わず call_later でスケジューリングすることでジッタを ±5ms 以内に抑制する。
+    asyncio.sleep を使わず、開始時刻基準の絶対時刻グリッド（call_at）でスケジューリングすることで
+    ジッタを ±5ms 以内に抑えつつ、相対 call_later のドリフト（終端でのログ末尾欠落）を防ぐ。
 
     制御構成: FF（純粋フィードフォワード）と PID（誤差補正）を符号付き努力量として合成し、
     PedalArbiter がペダルへ写像する。アクセル・ブレーキの排他はこの写像の構造的性質であり、
     調停層の飽和フラグを PID の条件付き積分へ返してワインドアップを防ぐ。
+
+    サイクル実行のライフサイクル・ウォッチドッグ・ログ書込バックログ管理は
+    CycleLoopBase（LearningLoop/ScheduleLoop と共通）に委譲する。
     """
 
-    _running: bool
+    _cycle_label = "制御サイクル"
+
     _paused: bool
     _paused_elapsed: float
     _started_at: float
@@ -81,7 +96,7 @@ class DriveLoop:
     def __init__(
         self,
         ff_controller: FeedforwardController,
-        pid: PIDController,
+        trim: TrimController,
         accel_driver: ActuatorDriverProtocol,
         brake_driver: ActuatorDriverProtocol,
         can_reader: CANReaderProtocol,
@@ -95,39 +110,49 @@ class DriveLoop:
         interval_s: float = CONTROL_LOOP_INTERVAL_S,
         log_every_n_cycles: int = LOG_EVERY_N_CYCLES,
         disable_deviation_check: bool = False,
+        ilc: ILCController | None = None,
+        plan: PedalPlan | None = None,
     ) -> None:
+        super().__init__(
+            interval_s=interval_s,
+            on_complete=on_complete,
+            on_emergency=on_emergency,
+            log_writer=log_writer,
+            session_id=session_id,
+        )
         self._ff = ff_controller
-        self._pid = pid
+        # 閉ループ補正はトリム（凍結帯／低速トリム／速い補正層）が担う。速い補正層が
+        # プロファイルの PID を内包する。
+        self._trim = trim
+        # ペダル操作計画（走行開始時にオフライン生成）。None なら従来経路（FF を毎サイクル
+        # 評価し速い補正層を直結）へフォールバックする＝モデル未ロードのブートストラップ互換。
+        self._plan = plan
+        # 反復学習制御（ILC）の時刻別補正 effort。None なら補正なし（Stage C 性能向上手段で
+        # あり安全の前提にしない）。FF+PID に加算する第3の effort 項として合成する。
+        self._ilc = ilc
         self._accel_driver = accel_driver
         self._brake_driver = brake_driver
         self._can_reader = can_reader
         self._profile = profile
         self._mode = mode
         self._safety_check = safety_check
-        self._on_complete = on_complete
-        self._on_emergency = on_emergency
-        self._log_writer = log_writer
-        self._session_id = session_id
-        self._interval_s = interval_s
         self._log_every_n_cycles = log_every_n_cycles
         # 逸脱（基準車速からの乖離）による自動非常停止を無効化するか。PID 自動適合では
         # 未適合ゲインの追従誤差が逸脱しきい値を超えて非常停止し、適合自体が成立しなく
         # なるため True にする。過電流・CAN 断・ウォッチドッグ等の安全網は維持される。
         self._disable_deviation_check = disable_deviation_check
 
-        self._running = False
         self._paused = False
         self._paused_elapsed = 0.0
         self._started_at = 0.0
         self._cycle_count = 0
         self._deviation_start = None
-        self._current_accel_opening: float = 0.0
-        self._current_brake_opening: float = 0.0
         # FF+PID 合成後のペダル写像と振動抑制を担う調停器。プロファイル定数で構成する。
         self._arbiter = PedalArbiter(
             profile.feedforward_params,
             max_accel_opening=profile.max_accel_opening,
             max_brake_opening=profile.max_brake_opening,
+            nominal_dt_s=interval_s,
         )
         self._kpi = KPIMonitor()
         # 調停の飽和フラグ。次サイクルの PID 条件付き積分（アンチワインドアップ）に渡す。
@@ -135,36 +160,32 @@ class DriveLoop:
         self._saturated_low = False
         # PID/調停の計測 dt 用。サイクルスキップ時に微分スパイクを起こさない。
         self._last_cycle_time: float | None = None
-        # ウォッチドッグ: 前サイクル未完了による連続スキップ数
-        self._consecutive_skips = 0
-        # ストール計測（.steering/20260620-modbus-retry-cycle-stall）: 連続スキップが
-        # 解消するたびに 1 件のストールとして回数・累積時間・最大継続時間を集計する。
-        self._stall_count = 0
-        self._stall_total_s = 0.0
-        self._stall_max_s = 0.0
-        self._log_backlog_active = False
         # bisect 用に基準速度の時刻列を前計算（_ref_speed_at はサイクル毎に複数回呼ばれる）
         self._ref_times: list[float] = [p.time_s for p in mode.reference_speed]
-        # 先読み補償（アクチュエータ〜車両系のむだ時間補償）: 制御用の基準速度サンプリングを
-        # この秒数だけ前倒しする。KPI・逸脱判定・ログは now-frame（前倒し前）のまま評価する。
-        self._preview_s: float = max(0.0, profile.dynamics_params.preview_time_s)
-        # イベントループはタスクを弱参照でしか保持しないため、GC でサイクルタスクが
-        # 実行途中に破棄されないよう強参照を保持する
-        self._cycle_task: asyncio.Task[None] | None = None
-        self._emergency_task: asyncio.Task[None] | None = None
-        self._pending_log_tasks: set[asyncio.Task[None]] = set()
-        # WS 配信用のサイクル計測値キャッシュ（走行中の追加 Modbus/CAN 読み取りを回避）
-        self._last_snapshot: RealtimeSnapshot | None = None
+        # PID 先読み補償: PID フィードバックが参照する基準速度サンプリングのみを
+        # この秒数だけ前倒しし、FB ループのむだ時間を補償する。FF は now-frame で動き、
+        # 先読みはモデルの horizons 特徴量が担う（FF への前倒しは二重補償となり、
+        # 実車速が基準を先行する系統偏差を生むため行わない）。KPI・逸脱判定・ログも
+        # now-frame（前倒し前）で評価する。
+        self._pid_preview_s: float = max(0.0, profile.dynamics_params.pid_preview_s)
         self._last_ref_speed: float | None = None
+        # ゲインスケジューリングの公称逆ゲイン g_nominal = fopdt_tau/fopdt_k [%/(km/h/s)]。
+        # FOPDT の初期加速応答は開度ステップ Δu に対し k/τ·Δu [km/h/s] なので、その逆数
+        # τ/k が「単位加速度あたりの開度」= GainSchedule の g(v) と同じ次元になる（B-6 是正:
+        # 旧 1/fopdt_k は定常ゲイン逆数 [%/(km/h)] で probe の過渡勾配と次元不整合だった）。
+        # この点で scale=1 になる。fopdt 未同定なら無効（scale=1 固定）。
+        fopdt_k = profile.dynamics_params.fopdt_k
+        fopdt_tau = profile.dynamics_params.fopdt_tau
+        self._g_nominal: float | None = (
+            fopdt_tau / fopdt_k
+            if fopdt_k is not None and fopdt_k > 0.0 and fopdt_tau is not None and fopdt_tau > 0.0
+            else None
+        )
 
-    def start(self) -> None:
-        """制御ループを開始する。既に実行中の場合は何もしない。"""
-        if self._running:
-            return
-        self._running = True
+    def _reset_for_start(self) -> None:
         self._paused = False
         self._paused_elapsed = 0.0
-        self._pid.reset()
+        self._trim.reset()
         self._arbiter.reset()
         self._kpi = KPIMonitor()
         self._saturated_high = False
@@ -172,17 +193,8 @@ class DriveLoop:
         self._last_cycle_time = None
         self._deviation_start = None
         self._cycle_count = 0
-        self._consecutive_skips = 0
-        self._stall_count = 0
-        self._stall_total_s = 0.0
-        self._stall_max_s = 0.0
         loop = asyncio.get_running_loop()
         self._started_at = loop.time()
-        loop.call_later(self._interval_s, self._schedule_next_cycle)
-
-    def stop(self) -> None:
-        """制御ループを停止する。進行中のサイクルはアクチュエータ書き込み前に中断される。"""
-        self._running = False
 
     def pause(self) -> None:
         """走行を一時停止する。基準速度タイムライン（経過時間の進行）を凍結する。
@@ -216,56 +228,6 @@ class DriveLoop:
     def is_paused(self) -> bool:
         return self._paused
 
-    async def stop_and_join(self, timeout_s: float = 2.0) -> None:
-        """停止し、進行中のサイクルタスクの完了を待つ。
-
-        非常停止・正常停止で home_return を開始する前に必ず await すること。
-        飛行中の位置指令（move_to_position の await 中）と原点復帰シーケンスが
-        同一軸のバスでインターリーブし、非常停止中にペダル指令が再適用されるのを防ぐ
-        （コードレビュー 2026-06-11 指摘 #6）。
-
-        タイムアウト時はタスクをキャンセルする（バスが完全に固まっている場合、
-        非常停止をこれ以上遅延させない）。
-
-        on_complete（stop_auto_drive）はサイクルタスク内から await されるため、その経路から
-        本メソッドが呼ばれると自タスクを join しようとして wait_for がタイムアウト→自タスクを
-        cancel し、呼び出し元の後続 await（home_return）が CancelledError で中断される。
-        `current_task() is サイクルタスク` のときは既にサイクルが終了処理中のため join 不要として
-        即 return する（正常完了で約2秒ハング＋原点未復帰になるのを防ぐ）。
-        """
-        self.stop()
-        task = self._cycle_task
-        if task is None or task.done() or task is asyncio.current_task():
-            return
-        try:
-            # shield: タイムアウトしてもサイクルタスク自体は cancel せず明示的に扱う
-            await asyncio.wait_for(asyncio.shield(task), timeout_s)
-        except TimeoutError:
-            _logger.warning(
-                "進行中の制御サイクルが %.1fs 以内に完了せずキャンセルします", timeout_s
-            )
-            task.cancel()
-        except Exception:
-            # サイクル内の例外は _on_cycle_done が回収・処理済み（ここでは無視してよい）
-            pass
-
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
-    @property
-    def current_accel_opening(self) -> float:
-        return self._current_accel_opening
-
-    @property
-    def current_brake_opening(self) -> float:
-        return self._current_brake_opening
-
-    @property
-    def last_snapshot(self) -> RealtimeSnapshot | None:
-        """直近サイクルの計測値。WS 配信が走行中の追加バス読み取りを避けるために使う。"""
-        return self._last_snapshot
-
     @property
     def current_ref_speed(self) -> float | None:
         """直近サイクルの基準車速 [km/h]。未実行時は None。"""
@@ -275,75 +237,6 @@ class DriveLoop:
     def kpi_summary(self) -> dict[str, float]:
         """走行中〜終了時点の KPI 集計（P95・最大偏差・符号反転率・ハード違反数）。"""
         return self._kpi.summary()
-
-    @property
-    def stall_summary(self) -> dict[str, float]:
-        """走行中〜終了時点のサイクルストール集計（回数・累積時間・最大継続時間）。
-
-        ストール＝前サイクル未完了（バス再送等）により後続サイクルが連続スキップされた
-        1 エピソード。ウォッチドッグ（非常停止）に至らず解消したものも含む。
-        """
-        return {
-            "stall_count": float(self._stall_count),
-            "stall_total_s": self._stall_total_s,
-            "stall_max_s": self._stall_max_s,
-        }
-
-    def _schedule_next_cycle(self) -> None:
-        if not self._running:
-            return
-        # 重複実行ガード: 前サイクルが未完了（バス遅延等）の場合は新サイクルを起動しない。
-        # 並行サイクルは古い位置指令が新しい指令を上書きする危険があるためスキップする。
-        if self._cycle_task is not None and not self._cycle_task.done():
-            self._consecutive_skips += 1
-            wedged_s = self._consecutive_skips * self._interval_s
-            _logger.warning(
-                "前回の制御サイクルが %.0fms 以内に完了せずスキップ", self._interval_s * 1000
-            )
-            # ウォッチドッグ: スキップが続く間は安全チェック（逸脱・過電流）が一切走らず
-            # ペダルが最終指令位置で保持され続けるため、上限で非常停止に倒す。
-            if wedged_s >= WEDGED_CYCLE_TIMEOUT_S:
-                _logger.error(
-                    "制御サイクルが %.1fs 以上完了していません: ウォッチドッグ非常停止します",
-                    wedged_s,
-                )
-                self.stop()
-                self._emergency_task = asyncio.ensure_future(self._on_emergency())
-                self._emergency_task.add_done_callback(_log_emergency_error_callback)
-                return
-        else:
-            if self._consecutive_skips > 0:
-                stall_duration_s = self._consecutive_skips * self._interval_s
-                self._stall_count += 1
-                self._stall_total_s += stall_duration_s
-                self._stall_max_s = max(self._stall_max_s, stall_duration_s)
-                _logger.warning(
-                    "制御サイクルストール解消: 継続時間=%.2fs (累計 %d 回 / %.2fs)",
-                    stall_duration_s,
-                    self._stall_count,
-                    self._stall_total_s,
-                )
-            self._consecutive_skips = 0
-            self._cycle_task = asyncio.ensure_future(self._execute_one_cycle())
-            self._cycle_task.add_done_callback(self._on_cycle_done)
-        asyncio.get_running_loop().call_later(self._interval_s, self._schedule_next_cycle)
-
-    def _on_cycle_done(self, task: asyncio.Task[None]) -> None:
-        """サイクルタスクの未捕捉例外を回収する。黙殺すると安全チェック抜けが見えなくなる。"""
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is None:
-            return
-        _logger.error("制御サイクルで未捕捉例外: 緊急停止します", exc_info=exc)
-        self.stop()
-        self._emergency_task = asyncio.ensure_future(self._on_emergency())
-        self._emergency_task.add_done_callback(_log_emergency_error_callback)
-
-    async def _abort_emergency(self) -> None:
-        """ループを停止して非常停止コールバックを呼ぶ。サイクル内の異常検知から使う。"""
-        self.stop()
-        await self._on_emergency()
 
     async def _execute_one_cycle(self) -> None:
         if not self._running:
@@ -358,20 +251,23 @@ class DriveLoop:
         else:
             elapsed_s = loop.time() - self._started_at
             if elapsed_s >= self._mode.total_duration:
+                # 完了分岐はログを書かずに return するため、t=total_duration 相当の
+                # サンプルが構造的に欠落し最終ログが t≈total_duration−0.1s になっていた。
+                # 停止前に末端状態を 1 行だけ記録してから終了する（新規バス通信は行わない）。
+                self._log_final_sample()
                 self.stop()
                 await self._on_complete()
                 return
 
-        # now-frame: KPI・逸脱判定・ログ・WS 表示はこの基準速度で評価する（前倒ししない）。
+        # now-frame: KPI・逸脱判定・ログ・WS 表示・名目 effort はこの基準速度で評価する。
         ref_speed = self._ref_speed_at(elapsed_s)
         self._last_ref_speed = ref_speed
-        # 制御フレーム: FF・PID はむだ時間補償のため preview_s だけ前倒しした基準速度で動く。
-        t_ctrl = elapsed_s + self._preview_s
-        ref_speed_ctrl = self._ref_speed_at(t_ctrl)
-        future_speeds = [self._ref_speed_at(t_ctrl + h) for h in self._ff.horizons]
-        # 過去方向の基準速度（過去Δv＝ランプ過渡/定常の識別）。走行開始直後（t<horizon）は
-        # _ref_speed_at が先頭点にクランプするため安全。
-        past_speeds = [self._ref_speed_at(t_ctrl - h) for h in self._ff.past_horizons]
+        # 先読みは now-frame からのモデル horizons が担う（前倒しは二重補償になるため行わない）。
+        future_speeds = [self._ref_speed_at(elapsed_s + h) for h in self._ff.horizons]
+        past_speeds = [self._ref_speed_at(elapsed_s - h) for h in self._ff.past_horizons]
+        # 制御フレーム: 速い補正層のみ FB ループのむだ時間補償として pid_preview_s だけ
+        # 前倒しした基準速度を追う（pid_preview_s=0 なら now-frame と一致）。
+        ref_speed_pid = self._ref_speed_at(elapsed_s + self._pid_preview_s)
 
         try:
             actual_speed = await self._can_reader.read_speed()
@@ -381,34 +277,75 @@ class DriveLoop:
             return
         _cycle_t_can = loop.time()
 
-        # 運転モデル未ロード（初回学習走行）では FF を 0 とし PID のみで基準を追従する。
-        # 収集した連続ログから初回モデルを学習し、以降は FF+PID で精度を上げるブートストラップ。
-        ff_effort = (
-            self._ff.predict_effort(ref_speed_ctrl, future_speeds, past_speeds)
-            if self._ff.has_model
-            else 0.0
-        )
-
         # 計測 dt: サイクルスキップ（バス遅延）時に固定 dt のままだと微分が
-        # スパイクし積分が過小評価されるため、実経過時間を PID と調停器に渡す。
+        # スパイクし積分が過小評価されるため、実経過時間を制御層と調停器に渡す。
         now = loop.time()
         dt = self._interval_s if self._last_cycle_time is None else now - self._last_cycle_time
         self._last_cycle_time = now
 
-        pid_u = self._pid.update(
-            ref_speed_ctrl,
-            actual_speed,
-            dt=dt,
-            saturated_high=self._saturated_high,
-            saturated_low=self._saturated_low,
-        )
+        # ゲインスケジューリング: 実車速でのプラントゲイン g(v) を公称値との比にして速い補正層を
+        # 正規化する。減速トレンド（基準が下降）では制動側、それ以外は駆動側の g を使う。
+        gain_scale = self._gain_scale(actual_speed, ref_speed, future_speeds)
 
-        # FF と PID を符号付き努力量として合成し、ペダルへの写像は調停器に一任する。
-        # 旧実装（PID の符号分割 + アクセル優先排他）は FF アクセル中の減速権限喪失と
-        # FF ブレーキのバンバン制御を生んでいた（コードレビュー 2026-06-11 指摘 #1）。
-        arb_out = self._arbiter.arbitrate(ff_effort + pid_u, dt)
-        self._saturated_high = arb_out.saturated_high
-        self._saturated_low = arb_out.saturated_low
+        # ILC 補正 effort（反復学習）: 同一モード反復走行で蓄積した時刻別残差補正を now-frame で
+        # 加える。テーブル未ロード時は 0。名目 effort と同じ符号付き努力量として合成する。
+        ilc_effort = self._ilc.effort_at(elapsed_s) if self._ilc is not None else 0.0
+
+        if self._plan is not None:
+            # プラン＋トリム経路: 名目 effort は走行開始時に焼き込んだ plan.effort_at（FF を
+            # 毎サイクル評価しない）。トリムが偏差の大きさで凍結／低速／速い補正層を切り替え、
+            # フェーズ権限で操作の向きを制限する（人間的なペダルワーク）。
+            base_effort = self._plan.effort_at(elapsed_s)
+            phase = self._plan.phase_at(elapsed_s)
+            trim_u = self._trim.update(
+                ref_speed_pid,
+                actual_speed,
+                dt,
+                phase=phase,
+                saturated_high=self._saturated_high,
+                saturated_low=self._saturated_low,
+                gain_scale=gain_scale,
+            )
+            # フェーズ権限: 速い補正層が非アクティブなら向きをクランプ（DRIVE はブレーキに
+            # 落とさない・COAST は踏まない・BRAKE はアクセルに跳ねない・STOP_HOLD はプランの
+            # 停車保持に委ねる）。速い補正層アクティブ（偏差 0.5km/h 超）は無権限＝max≤1.0 の
+            # 安全網。削った向きは飽和フラグへ反映し次サイクルのトリム積分を止める。
+            effort, clamp_high, clamp_low = self._apply_phase_authority(
+                base_effort, trim_u, ilc_effort, phase
+            )
+            if _logger.isEnabledFor(logging.DEBUG):
+                _logger.debug(
+                    "plan t=%.2fs: base=%+.2f trim=%+.2f ilc=%+.2f phase=%s",
+                    elapsed_s,
+                    base_effort,
+                    trim_u,
+                    ilc_effort,
+                    phase,
+                )
+        else:
+            # プランなし（モデル未ロードのブートストラップ）: 従来経路。FF を毎サイクル評価し、
+            # 速い補正層 PID を直結（トリム 3 層・フェーズ権限を通さない）＝完全回帰。
+            base_effort = (
+                self._ff.predict_effort(ref_speed, future_speeds, past_speeds)
+                if self._ff.has_model
+                else 0.0
+            )
+            pid_u = self._trim.fast_pid.update(
+                ref_speed_pid,
+                actual_speed,
+                dt=dt,
+                saturated_high=self._saturated_high,
+                saturated_low=self._saturated_low,
+                gain_scale=gain_scale,
+            )
+            effort = base_effort + pid_u + ilc_effort
+            clamp_high = clamp_low = False
+
+        # 名目 effort とトリム・ILC を符号付き努力量として合成し、ペダルへの写像は調停器に一任。
+        arb_out = self._arbiter.arbitrate(effort, dt)
+        # フェーズ権限で削った向きも飽和として次サイクルのトリムへ返す（積分ワインドアップ防止）。
+        self._saturated_high = arb_out.saturated_high or clamp_high
+        self._saturated_low = arb_out.saturated_low or clamp_low
         # 調停器は構造的に排他（高々一方のみ非ゼロ）だが、最終段でも同時踏み禁止を強制する保険
         accel_opening, brake_opening = enforce_pedal_exclusion(
             arb_out.accel_opening, arb_out.brake_opening
@@ -422,12 +359,8 @@ class DriveLoop:
             await self._abort_emergency()
             return
 
-        accel_pos = self._opening_to_position(
-            accel_opening, calib.accel_zero_pos, calib.accel_full_pos
-        )
-        brake_pos = self._opening_to_position(
-            brake_opening, calib.brake_zero_pos, calib.brake_full_pos
-        )
+        accel_pos = opening_to_position(accel_opening, calib.accel_zero_pos, calib.accel_full_pos)
+        brake_pos = opening_to_position(brake_opening, calib.brake_zero_pos, calib.brake_full_pos)
 
         # CAN 読み取りの await 中に stop()/非常停止が入った場合、
         # ここで中断しないと EMERGENCY 後の home_return と競合する位置指令を送ってしまう。
@@ -482,7 +415,13 @@ class DriveLoop:
         # 集計しないと KPI 違反が観測できない（指摘 #7）。
         # 一時停止中は保持区間のサンプルで KPI を汚さないため集計しない。
         if not self._paused:
-            self._kpi.update(ref_speed, actual_speed, loop.time())
+            self._kpi.update(
+                ref_speed,
+                actual_speed,
+                loop.time(),
+                accel_opening=self._current_accel_opening,
+                brake_opening=self._current_brake_opening,
+            )
 
         # PID 自動適合中は逸脱による非常停止を行わない（未適合ゲインの追従誤差で
         # 適合が成立しなくなるため）。他の安全網（過電流・CAN 断・ウォッチドッグ）は維持。
@@ -530,33 +469,85 @@ class DriveLoop:
                 )
             )
 
-    def _enqueue_log_write(self, data: DriveLogData) -> None:
-        """ログ書き込みタスクを上限付きで起動する。滞留時はログを捨てて走行を優先する。"""
-        assert self._log_writer is not None and self._session_id is not None
-        if len(self._pending_log_tasks) >= MAX_PENDING_LOG_TASKS:
-            if not self._log_backlog_active:
-                self._log_backlog_active = True
-                _logger.warning(
-                    "ログ書き込みが %d 件滞留: 解消まで走行ログをスキップします (DB 遅延の疑い)",
-                    MAX_PENDING_LOG_TASKS,
-                )
-            return
-        if self._log_backlog_active:
-            self._log_backlog_active = False
-            _logger.info("ログ書き込みの滞留が解消しました")
-        task = asyncio.ensure_future(self._log_writer.write_log(self._session_id, data))
-        # GC によるタスク消失防止のため完了まで強参照を保持する
-        self._pending_log_tasks.add(task)
-        task.add_done_callback(self._on_log_write_done)
+    def _log_final_sample(self) -> None:
+        """走行完了時、停止前に末端状態を 1 行だけログする（新規バス通信は行わない）。
 
-    def _on_log_write_done(self, task: asyncio.Task[None]) -> None:
-        """ログ書き込みタスクの参照を解放し、例外をログに記録する。走行は継続する。"""
-        self._pending_log_tasks.discard(task)
-        if task.cancelled():
+        基準速度は total_duration 時点の末端値（WLTP_ExHi なら 0.0）、実測系（実車速・
+        位置・電流）は直近サイクルの `_last_snapshot` を、開度は直近の指令値を再利用する。
+        これにより、従来欠落していた t=total_duration 相当のサンプルを補い、ログ時間軸を
+        モード全長までカバーさせる。snapshot 未取得（初回サイクル即完了など）ならスキップする。
+        書き込みは既存の `_enqueue_log_write`（上限・例外処理を再利用）に委ね、失敗しても
+        `_on_complete` を妨げない。
+        """
+        if self._log_writer is None or self._session_id is None or self._last_snapshot is None:
             return
-        exc = task.exception()
-        if exc is not None:
-            _logger.error("ログ書き込みエラー (走行継続)", exc_info=exc)
+        snap = self._last_snapshot
+        self._enqueue_log_write(
+            DriveLogData(
+                ref_speed_kmh=self._ref_speed_at(self._mode.total_duration),
+                actual_speed_kmh=snap.actual_speed_kmh,
+                accel_opening=self._current_accel_opening,
+                brake_opening=self._current_brake_opening,
+                accel_pos=snap.accel_pos,
+                brake_pos=snap.brake_pos,
+                accel_current=snap.accel_current_ma,
+                brake_current=snap.brake_current_ma,
+            )
+        )
+
+    def _apply_phase_authority(
+        self,
+        base_effort: float,
+        trim_u: float,
+        ilc_effort: float,
+        phase: PlanPhase | None,
+    ) -> tuple[float, bool, bool]:
+        """フェーズ権限を適用した合成 effort と、クランプで削った向きの飽和フラグを返す。
+
+        プランなし（phase=None）または速い補正層アクティブ時は権限を課さず素の合成を返す
+        （偏差 0.5km/h 超では max≤1.0 を守るため向きを制限しない安全網）。プランありで速い層が
+        非アクティブなら、フェーズが許す向きへ合成 effort をクランプする:
+          - DRIVE     : effort<0（ブレーキ）を 0 に（アクセル調整のみ）→ 制動側クランプ
+          - COAST     : effort を 0 に（踏まない）→ 両側クランプ
+          - BRAKE     : effort>0（アクセル）を 0 に（制動のみ）→ 加速側クランプ
+          - STOP_HOLD : プランの停車保持（base_effort）に委ね、トリム・ILC を無効化
+        """
+        total = base_effort + trim_u + ilc_effort
+        if phase is None or self._trim.is_fast_active:
+            return total, False, False
+        if phase == PlanPhase.STOP_HOLD:
+            # 停車保持はプランが支配。トリム/ILC を切る（両側とも積分を止める）。
+            return base_effort, True, True
+        if phase == PlanPhase.DRIVE:
+            if total < 0.0:
+                return 0.0, False, True  # ブレーキ方向を削った＝制動側飽和
+            return total, False, False
+        if phase == PlanPhase.BRAKE:
+            if total > 0.0:
+                return 0.0, True, False  # アクセル方向を削った＝加速側飽和
+            return total, False, False
+        # COAST: 踏まない
+        return 0.0, True, True
+
+    def _gain_scale(
+        self, actual_speed: float, ref_speed: float, future_speeds: list[float]
+    ) -> float:
+        """速度依存プラントゲイン正規化係数 scale = clamp(g(v)/g_nominal, MIN, MAX) を返す。
+
+        ゲインスケジュール未構築（モデル未ロード）または fopdt_k 未同定なら 1.0（従来動作）。
+        基準速度が減速トレンド（最短ホライズン先が現基準より低い）なら制動側 g を、それ以外は
+        駆動側 g を使う。ref ベースの判定なので計測ノイズでチャタリングしない。
+        """
+        schedule = self._ff.gain_schedule
+        if schedule is None or self._g_nominal is None:
+            return 1.0
+        ref_trend = (future_speeds[0] - ref_speed) if future_speeds else 0.0
+        if ref_trend < _GAIN_DECEL_TREND_KMH:
+            g = schedule.brake_gain_at(actual_speed)
+        else:
+            g = schedule.accel_gain_at(actual_speed)
+        scale = g / self._g_nominal
+        return max(_GAIN_SCALE_MIN, min(_GAIN_SCALE_MAX, scale))
 
     def _ref_speed_at(self, t_s: float) -> float:
         """経過時間 [s] における基準車速 [km/h] を線形補間で返す。範囲外は端点値でクランプ。
@@ -585,27 +576,29 @@ class DriveLoop:
         t_frac = (t_s - p0.time_s) / dt
         return p0.speed_kmh + t_frac * (p1.speed_kmh - p0.speed_kmh)
 
-    def _opening_to_position(self, opening_pct: float, zero_pos: int, full_pos: int) -> int:
-        """開度 [%] をアクチュエータ位置 [pulse] に変換する。"""
-        return zero_pos + round((full_pos - zero_pos) * opening_pct / 100.0)
-
     async def _drive_accel_axis(self, pos: int) -> float:
         """アクセル軸に位置指令を送り電流値を返す（同一バス上で逐次実行）。"""
         await self._accel_driver.move_to_position(pos)
+        # 書込直後の読取での初回応答欠落対策（AXIS_PRE_READ_DELAY_S 参照）。
+        await asyncio.sleep(AXIS_PRE_READ_DELAY_S)
         return await self._accel_driver.read_current()
 
     async def _drive_brake_axis(self, pos: int) -> float:
         """ブレーキ軸に位置指令を送り電流値を返す（同一バス上で逐次実行）。"""
         await self._brake_driver.move_to_position(pos)
-        # 診断用待機（BRAKE_PRE_READ_DELAY_S 参照）。
-        await asyncio.sleep(BRAKE_PRE_READ_DELAY_S)
+        # 書込直後の読取での初回応答欠落対策（AXIS_PRE_READ_DELAY_S 参照）。
+        await asyncio.sleep(AXIS_PRE_READ_DELAY_S)
         return await self._brake_driver.read_current()
 
 
-def _log_emergency_error_callback(task: asyncio.Task[None]) -> None:
-    """非常停止コールバックタスクの例外をログに記録する（黙殺防止）。"""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        _logger.error("非常停止コールバックが失敗しました", exc_info=exc)
+__all__ = [
+    "CONTROL_LOOP_INTERVAL_S",
+    "LOG_EVERY_N_CYCLES",
+    "MAX_PENDING_LOG_TASKS",
+    "WEDGED_CYCLE_TIMEOUT_S",
+    "ActuatorDriverProtocol",
+    "CANReaderProtocol",
+    "DriveLoop",
+    "LogWriterProtocol",
+    "SafetyCheckProtocol",
+]

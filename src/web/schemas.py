@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.models.system_state import InitStepStatus, RobotState
 
@@ -44,6 +44,8 @@ class StartDriveRequest(BaseModel):
 
 
 class DriveSessionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     profile_id: str
     mode_id: str | None
@@ -56,34 +58,47 @@ class DriveSessionResponse(BaseModel):
 class FeedforwardParamsSchema(BaseModel):
     """Ridge 逆FFモデルを補う車両物理定数。デフォルトは AT 標準値。"""
 
+    model_config = ConfigDict(from_attributes=True)
+
     creep_speed_kmh: float = 7.0
     creep_rate_kmhs: float = 0.5
     engine_brake_decel_kmhs: float = 1.0
     stop_brake_opening_pct: float = 20.0
-    brake_deadband_pct: float = 1.0
-    accel_deadband_pct: float = 1.0
+    # 0.0（不感帯なし）は合法値。ge=0 のみで、負値のみ弾く
+    # （D5 レビュー指摘: model_training/pid_tuning は 0.0 を正しく扱えるよう修正済み）。
+    brake_deadband_pct: float = Field(default=1.0, ge=0.0)
+    accel_deadband_pct: float = Field(default=1.0, ge=0.0)
     # ペダル調停（PedalArbiter）定数
     switch_hysteresis_pct: float = 0.5
     accel_reengage_dwell_s: float = 0.3
     accel_rate_limit_pct_s: float = 200.0
     brake_rate_limit_pct_s: float = 300.0
     pid_output_limit_pct: float = 50.0
+    # 惰行遷移時のアクセル解放レート [%/s]（B-7-3。ON-OFF ハンチング抑制）
+    accel_release_rate_pct_s: float = Field(default=10.0, ge=0.0)
+    # アクセル開度の量子化しきい値 [%]（B-7-3。微小変動でサーボを震わせない）
+    accel_min_step_pct: float = Field(default=0.2, ge=0.0)
 
 
 class PIDGainsSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     kp: float
     ki: float
     kd: float
 
 
 class DynamicsParamsSchema(BaseModel):
-    """先読み補償秒数(preview_time_s)と FOPDT 同定値(表示用)。
+    """PID 先読み補償秒数(pid_preview_s)と FOPDT 同定値(表示用)。
 
-    preview_time_s はアクチュエータ〜車両系のむだ時間補償として基準軌跡を前倒しする
-    秒数。手動微調整を許容する。fopdt_* は学習サイクルの同定結果（表示用メタデータ）。
+    pid_preview_s は PID フィードバックのみに適用する基準軌跡の前倒し秒数。FF は
+    now-frame で動くため、この値は FB ループのむだ時間補償に限定される。手動微調整を
+    許容する。fopdt_* は学習サイクルの同定結果（表示用メタデータ）。
     """
 
-    preview_time_s: float = 0.0
+    model_config = ConfigDict(from_attributes=True)
+
+    pid_preview_s: float = 0.0
     fopdt_k: float | None = None
     fopdt_tau: float | None = None
     fopdt_theta: float | None = None
@@ -122,13 +137,15 @@ class PidValidateResponse(BaseModel):
 class PidRefineRequest(BaseModel):
     profile_id: str
     max_runs: int = Field(default=15, ge=1, le=50)
+    # 指定時は本番モードの代表区間で評価走行する（適合結果の転移性向上）。None なら規定パターン。
+    mode_id: str | None = None
 
 
 class PidRefineResponse(BaseModel):
-    """閉ループ絞り込みの最良ゲイン・先読み補償秒数と反復履歴。"""
+    """閉ループ絞り込みの最良ゲイン・PID 先読み補償秒数と反復履歴。"""
 
     pid_gains: PIDGainsSchema
-    preview_time_s: float = 0.0
+    pid_preview_s: float = 0.0
     best_cost: float
     history: list[dict[str, float]]
 
@@ -139,12 +156,14 @@ class PidRefineResponse(BaseModel):
 class CycleProgressSchema(BaseModel):
     """学習サイクルの進捗。WebSocket(RealtimeData.cycle_progress)・status API 共通。"""
 
+    model_config = ConfigDict(from_attributes=True)
+
     cycle_id: str | None
     phase: str
     run_index: int
     run_total: int
     best_cost: float | None
-    best_preview_time_s: float | None = None
+    best_pid_preview_s: float | None = None
     message: str
     started_at: datetime | None
 
@@ -152,6 +171,8 @@ class CycleProgressSchema(BaseModel):
 class LearningCycleStartRequest(BaseModel):
     refine_runs_stage1: int | None = Field(default=None, ge=1, le=50)
     refine_runs_stage2: int | None = Field(default=None, ge=1, le=50)
+    # 指定時は REFINE_2 をこの本番モードの代表区間で評価する（tuning_on_target_mode 有効時）。
+    target_mode_id: str | None = None
 
 
 class LearningCycleStartResponse(BaseModel):
@@ -223,6 +244,8 @@ class RealtimeData(BaseModel):
 
 
 class StopConfigSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     deviation_threshold_kmh: float
     deviation_duration_s: float
 
@@ -340,6 +363,30 @@ class PedalPointSchema(BaseModel):
     brake_opening: float = Field(ge=0.0, le=100.0)
 
 
+def _reject_simultaneous_pedal_press(points: list[PedalPointSchema]) -> None:
+    """アクセル・ブレーキが同時に非ゼロとなる区間を reject する。
+
+    機構保護のため同時踏みは常に禁止（pedal_safety.enforce_pedal_exclusion 参照）。
+    線形補間区間 [p0, p1] は「アクセルが区間全体で0」または「ブレーキが区間全体で0」の
+    いずれかでない限り、区間内のどこかで両ペダルが同時に非ゼロになり得る（両端で
+    片方だけ非ゼロが入れ替わるクロスオーバーのケースを含む）。
+    """
+    for p in points:
+        if p.accel_opening > 0.0 and p.brake_opening > 0.0:
+            raise ValueError(
+                f"pedal_points の time_s={p.time_s} でアクセルとブレーキが同時に"
+                "非ゼロです（同時踏みは禁止）"
+            )
+    for p0, p1 in zip(points, points[1:], strict=False):
+        accel_zero_segment = p0.accel_opening == 0.0 and p1.accel_opening == 0.0
+        brake_zero_segment = p0.brake_opening == 0.0 and p1.brake_opening == 0.0
+        if not accel_zero_segment and not brake_zero_segment:
+            raise ValueError(
+                f"pedal_points の time_s={p0.time_s}〜{p1.time_s} の区間でアクセル・"
+                "ブレーキが同時に非ゼロとなる可能性があります（同時踏みは禁止）"
+            )
+
+
 class ButtonEventSchema(BaseModel):
     time_s: float = Field(ge=0.0)
     channel: int = Field(ge=0, le=15)
@@ -374,21 +421,18 @@ class ScheduleCreateRequest(BaseModel):
 
     @field_validator("pedal_points")
     @classmethod
-    def _pedal_points_monotonic(
-        cls, v: list[PedalPointSchema]
-    ) -> list[PedalPointSchema]:
+    def _pedal_points_monotonic(cls, v: list[PedalPointSchema]) -> list[PedalPointSchema]:
         prev = -1.0
         for p in v:
             if p.time_s <= prev:
                 raise ValueError("pedal_points の time_s は単調増加である必要があります")
             prev = p.time_s
+        _reject_simultaneous_pedal_press(v)
         return v
 
     @field_validator("button_events")
     @classmethod
-    def _button_events_sorted(
-        cls, v: list[ButtonEventSchema]
-    ) -> list[ButtonEventSchema]:
+    def _button_events_sorted(cls, v: list[ButtonEventSchema]) -> list[ButtonEventSchema]:
         prev = -1.0
         for e in v:
             if e.time_s < prev:
@@ -415,6 +459,7 @@ class ScheduleUpdateRequest(BaseModel):
             if p.time_s <= prev:
                 raise ValueError("pedal_points の time_s は単調増加である必要があります")
             prev = p.time_s
+        _reject_simultaneous_pedal_press(v)
         return v
 
 
@@ -467,3 +512,15 @@ class LogResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class ILCStatusResponse(BaseModel):
+    """反復学習制御（ILC）の状態。自動走行画面のモード選択時に表示する。"""
+
+    profile_id: str
+    mode_id: str
+    enabled: bool
+    iteration: int  # これまでの学習反復回数（0=未学習）
+    has_table: bool  # 補正テーブルが存在するか（efforts が非空）
+    best_p95_kmh: float | None  # これまでの最良走行 p95
+    kpi_history: list[dict[str, object]] = []  # 反復ごとの p95/max/reversal 履歴（収束表示用）

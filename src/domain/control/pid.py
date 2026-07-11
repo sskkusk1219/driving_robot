@@ -46,6 +46,7 @@ class PIDController:
         *,
         saturated_high: bool = False,
         saturated_low: bool = False,
+        gain_scale: float = 1.0,
     ) -> float:
         """偏差を入力してPID出力を返す。
 
@@ -55,6 +56,12 @@ class PIDController:
             dt: 前回更新からの計測経過時間 [s]。None なら公称周期を使う。
             saturated_high: 前サイクルで正方向（加速側）の出力が飽和していた
             saturated_low: 前サイクルで負方向（制動側）の出力が飽和していた
+            gain_scale: 速度依存プラントゲイン正規化係数（>0）。P/I/D 合成出力を一律に
+                この係数で乗算する。プラントゲインが速度で大きく変わる（高速域は開度あたりの
+                加速が小さい）ため、FF モデルの局所勾配から求めた比で PID の実効ゲインを
+                速度域で一定に保ち、高速域の振動・低速域の応答不足を抑える。1.0 で従来動作。
+                積分器は誤差単位のまま保持し、積分クランプのみスケール整合させる（緩変化する
+                スケールに対して安全）。
         """
         if dt is None or dt <= 0.0:
             dt_eff = self._dt
@@ -62,6 +69,7 @@ class PIDController:
             # スケジューラジッタ・サイクルスキップの外れ値を抑える
             dt_eff = max(0.5 * self._dt, min(4.0 * self._dt, dt))
 
+        scale = gain_scale if gain_scale > 0.0 else 1.0
         error = setpoint - measurement
         # 飽和方向へ誤差が押している間は積分しない（ワインドアップ防止）
         pushing_into_saturation = (error > 0.0 and saturated_high) or (
@@ -70,13 +78,14 @@ class PIDController:
         if not pushing_into_saturation:
             self._integral += error * dt_eff
             if self._ki > 0.0:
-                integral_limit = self._output_limit / self._ki
+                # 出力段で scale を掛けるため、I 項単独の出力上限は output_limit/(ki*scale)。
+                integral_limit = self._output_limit / (self._ki * scale)
                 self._integral = max(-integral_limit, min(integral_limit, self._integral))
 
         d_raw = (error - self._prev_error) / dt_eff
         self._prev_error = error
         self._d_filt += (d_raw - self._d_filt) * dt_eff / (DERIV_FILTER_TAU_S + dt_eff)
-        output = self._kp * error + self._ki * self._integral + self._kd * self._d_filt
+        output = scale * (self._kp * error + self._ki * self._integral + self._kd * self._d_filt)
         return max(-self._output_limit, min(self._output_limit, output))
 
     def reset(self) -> None:

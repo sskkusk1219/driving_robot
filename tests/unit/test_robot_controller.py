@@ -1,3 +1,5 @@
+import asyncio
+import dataclasses
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,7 +10,10 @@ from src.app.robot_controller import (
     InvalidStateTransition,
     RobotController,
 )
+from src.domain.control.feedforward import FeedforwardController
 from src.domain.control.pid import PIDController
+from src.models.calibration import CalibrationData
+from src.models.driving_mode import DrivingMode, SpeedPoint
 from src.models.profile import PIDGains, StopConfig, VehicleProfile
 from src.models.system_state import InitStepStatus, RobotState
 
@@ -59,6 +64,61 @@ def make_stop_config() -> StopConfig:
     return StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0)
 
 
+def make_ff_controller() -> MagicMock:
+    ff = MagicMock(spec=FeedforwardController)
+    ff.has_model = False
+    return ff
+
+
+def make_safety_check() -> MagicMock:
+    safety = MagicMock()
+    safety.check_overcurrent = MagicMock(return_value=False)
+    safety.check_deviation = MagicMock(return_value=False)
+    safety.set_stop_config = MagicMock()
+    return safety
+
+
+def _calibrated_profile() -> VehicleProfile:
+    calib = CalibrationData(
+        accel_zero_pos=100,
+        accel_full_pos=5100,
+        accel_stroke=5000,
+        brake_zero_pos=200,
+        brake_full_pos=5200,
+        brake_stroke=5000,
+        calibrated_at=datetime.now(tz=UTC),
+        is_valid=True,
+    )
+    return VehicleProfile(
+        id="p1",
+        name="t",
+        max_accel_opening=80.0,
+        max_brake_opening=80.0,
+        max_speed=100.0,
+        max_decel_g=0.4,
+        pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=calib,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
+    )
+
+
+def _make_mode(mode_id: str = "mode-1") -> DrivingMode:
+    """start_auto_drive の precondition（W4）を満たすための最小限の走行モード。"""
+    points = [SpeedPoint(time_s=0.0, speed_kmh=0.0), SpeedPoint(time_s=10.0, speed_kmh=0.0)]
+    return DrivingMode(
+        id=mode_id,
+        name="TestMode",
+        description="",
+        reference_speed=points,
+        total_duration=10.0,
+        max_speed=100.0,
+        created_at=datetime.now(tz=UTC),
+    )
+
+
 def make_controller(last_normal_shutdown: bool = True) -> RobotController:
     return RobotController(
         accel_driver=make_accel_driver(),
@@ -67,6 +127,8 @@ def make_controller(last_normal_shutdown: bool = True) -> RobotController:
         safety_monitor=make_safety_monitor(),
         pid=make_pid(),
         last_normal_shutdown=last_normal_shutdown,
+        ff_controller=make_ff_controller(),
+        safety_check=make_safety_check(),
     )
 
 
@@ -202,7 +264,11 @@ class TestStop:
     async def test_stop_from_running_transitions_to_ready(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         await ctrl.stop()
         assert ctrl.get_system_state().robot_state == RobotState.READY
 
@@ -210,7 +276,11 @@ class TestStop:
     async def test_stop_from_running_calls_home_return_and_servo_off(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         ctrl._accel_driver.home_return.reset_mock()  # type: ignore[attr-defined]
         ctrl._brake_driver.home_return.reset_mock()  # type: ignore[attr-defined]
         await ctrl.stop()
@@ -224,7 +294,11 @@ class TestStop:
         ctrl = make_controller(last_normal_shutdown=False)
         await ctrl.start()
         await ctrl.initialize()
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         await ctrl.stop()
         assert ctrl._last_normal_shutdown is True
 
@@ -232,7 +306,11 @@ class TestStop:
     async def test_stop_clears_session_id(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         await ctrl.stop()
         assert ctrl.get_system_state().active_session_id is None
 
@@ -251,13 +329,53 @@ class TestStop:
         await ctrl.stop()
         assert ctrl.get_system_state().robot_state == RobotState.READY
 
+    @pytest.mark.asyncio
+    async def test_stop_does_not_transition_to_ready_until_home_return_completes(self) -> None:
+        """W3 回帰テスト: home_return/servo_off が完了するまで READY へ遷移しない。
+
+        先に READY へ遷移すると、home_return がまだ飛行中のうちに次の arm/走行が
+        READY を見て受理され、後から完了する home_return がブレーキ保持等を
+        上書きしてしまう。"""
+        import asyncio
+
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
+        assert ctrl.get_system_state().robot_state == RobotState.RUNNING
+
+        release_gate = asyncio.Event()
+
+        async def blocking_home_return() -> None:
+            await release_gate.wait()
+
+        ctrl._accel_driver.home_return = AsyncMock(side_effect=blocking_home_return)
+        ctrl._brake_driver.home_return = AsyncMock(side_effect=blocking_home_return)
+
+        stop_task = asyncio.ensure_future(ctrl.stop())
+        await asyncio.sleep(0)  # stop() が home_return 待ちに入るまで進める
+
+        # home_return が完了していない間は READY へ遷移していない（= 次の arm を受理しない）
+        assert ctrl.get_system_state().robot_state == RobotState.RUNNING
+
+        release_gate.set()
+        await stop_task
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
 
 class TestEmergencyStop:
     @pytest.mark.asyncio
     async def test_emergency_stop_from_running(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         await ctrl.emergency_stop()
         assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY
 
@@ -308,7 +426,11 @@ class TestEmergencyStop:
     async def test_emergency_stop_calls_home_return_on_both_axes(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         ctrl._accel_driver.home_return.reset_mock()  # type: ignore[attr-defined]
         ctrl._brake_driver.home_return.reset_mock()  # type: ignore[attr-defined]
         await ctrl.emergency_stop()
@@ -337,7 +459,11 @@ class TestEmergencyStop:
     async def test_emergency_stop_clears_session_id(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         await ctrl.emergency_stop()
         assert ctrl.get_system_state().active_session_id is None
 
@@ -368,7 +494,12 @@ class TestEmergencyStop:
         log_writer.start_session = AsyncMock(return_value="sess-1")
         log_writer.write_log = AsyncMock()
         log_writer.end_session = AsyncMock()
-        await ctrl.start_auto_drive(mode_id="mode-1", log_writer=log_writer)
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+            log_writer=log_writer,
+        )
         ctrl._accel_driver.home_return = AsyncMock(  # type: ignore[attr-defined]
             side_effect=RuntimeError("Modbus desync")
         )
@@ -391,7 +522,12 @@ class TestEmergencyStop:
         log_writer.start_session = AsyncMock(return_value="sess-2")
         log_writer.write_log = AsyncMock()
         log_writer.end_session = AsyncMock()
-        await ctrl.start_auto_drive(mode_id="mode-1", log_writer=log_writer)
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+            log_writer=log_writer,
+        )
         ctrl._accel_driver.home_return = AsyncMock(  # type: ignore[attr-defined]
             side_effect=RuntimeError("Modbus desync")
         )
@@ -484,7 +620,11 @@ class TestRunCalibration:
     async def test_run_calibration_from_running_raises(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         with pytest.raises(InvalidStateTransition):
             await ctrl.run_calibration()
 
@@ -541,6 +681,34 @@ class TestRunCalibration:
 
         assert ctrl.get_system_state().robot_state == RobotState.READY
         assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_emergency_during_calibration_does_not_raise_and_cancels_manager(self) -> None:
+        """W6 回帰テスト: キャリブレーション中の emergency_stop は
+        CalibrationManager.cancel() を呼び、run_calibration の finally は
+        EMERGENCY を READY で上書きしない（InvalidStateTransition を送出しない）。"""
+        from src.models.calibration import CalibrationResult
+
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+
+        mock_manager = AsyncMock()
+        cancel_calls: list[bool] = []
+        mock_manager.cancel = MagicMock(side_effect=lambda: cancel_calls.append(True))
+
+        async def fake_run_calibration(profile_id: str) -> CalibrationResult:
+            # 探索の途中で emergency_stop が割り込んだことを模擬する
+            await ctrl.emergency_stop()
+            return CalibrationResult(success=False, data=None, error_message="中断されました")
+
+        mock_manager.run_calibration = fake_run_calibration
+        ctrl._calibration_manager = mock_manager  # type: ignore[assignment]
+
+        result = await ctrl.run_calibration()  # 例外を送出しないこと
+
+        assert result.success is False
+        assert ctrl.get_system_state().robot_state == RobotState.EMERGENCY  # 上書きされない
+        assert cancel_calls == [True]
 
 
 class TestSaveManualCalibration:
@@ -658,14 +826,22 @@ class TestStartAutoDrive:
     async def test_start_auto_drive_transitions_to_running(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         assert ctrl.get_system_state().robot_state == RobotState.RUNNING
 
     @pytest.mark.asyncio
     async def test_start_auto_drive_returns_session_with_mode_id(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        session = await ctrl.start_auto_drive(mode_id="mode-1")
+        session = await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         assert session.mode_id == "mode-1"
         assert session.run_type == "auto"
         assert session.status == "running"
@@ -674,16 +850,62 @@ class TestStartAutoDrive:
     async def test_start_auto_drive_sets_active_session_id(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        session = await ctrl.start_auto_drive(mode_id="mode-1")
+        session = await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         assert ctrl.get_system_state().active_session_id == session.id
 
     @pytest.mark.asyncio
     async def test_start_auto_drive_from_running_raises(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         with pytest.raises(InvalidStateTransition):
-            await ctrl.start_auto_drive(mode_id="mode-2")
+            await ctrl.start_auto_drive(
+                mode_id="mode-2",
+                mode=_make_mode(),
+                profile=_calibrated_profile(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_missing_profile_rejected_before_transitioning_to_running(self) -> None:
+        """W4 回帰テスト: profile が None のまま開始しようとすると、RUNNING へ遷移
+        する前に拒否される（ファントム RUNNING を防ぐ）。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.start_auto_drive(mode_id="mode-1", mode=_make_mode(), profile=None)
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+        assert ctrl.get_system_state().active_session_id is None
+        assert ctrl._drive_loop is None
+
+    @pytest.mark.asyncio
+    async def test_missing_mode_rejected_before_transitioning_to_running(self) -> None:
+        """W4 回帰テスト: mode が None のまま開始しようとすると RUNNING へ遷移する前に
+        拒否される。"""
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.start_auto_drive(mode_id="mode-1", mode=None, profile=_calibrated_profile())
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+
+    @pytest.mark.asyncio
+    async def test_missing_ff_controller_rejected_before_transitioning_to_running(self) -> None:
+        """W4 回帰テスト: ff_controller 未配線でも RUNNING へ遷移する前に拒否される。"""
+        ctrl = make_controller()
+        ctrl._ff_controller = None
+        await advance_to_ready(ctrl)
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.start_auto_drive(
+                mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
+            )
+        assert ctrl.get_system_state().robot_state == RobotState.READY
 
 
 class TestStopAutoDrive:
@@ -691,7 +913,11 @@ class TestStopAutoDrive:
     async def test_stop_auto_drive_transitions_to_ready(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         await ctrl.stop_auto_drive()
         assert ctrl.get_system_state().robot_state == RobotState.READY
 
@@ -699,7 +925,11 @@ class TestStopAutoDrive:
     async def test_stop_auto_drive_clears_session(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         await ctrl.stop_auto_drive()
         assert ctrl.get_system_state().active_session_id is None
 
@@ -716,7 +946,11 @@ class TestPauseResumeAutoDrive:
     async def test_pause_auto_drive_transitions_running_to_paused(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         ctrl._drive_loop = MagicMock()  # テストでは start で実ループは生成されない
         await ctrl.pause_auto_drive()
         assert ctrl.get_system_state().robot_state == RobotState.PAUSED
@@ -726,7 +960,11 @@ class TestPauseResumeAutoDrive:
     async def test_resume_auto_drive_transitions_paused_to_running(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         ctrl._drive_loop = MagicMock()
         await ctrl.pause_auto_drive()
         await ctrl.resume_auto_drive()
@@ -744,7 +982,11 @@ class TestPauseResumeAutoDrive:
     async def test_resume_auto_drive_from_running_raises(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         ctrl._drive_loop = MagicMock()
         with pytest.raises(InvalidStateTransition):
             await ctrl.resume_auto_drive()
@@ -753,7 +995,11 @@ class TestPauseResumeAutoDrive:
     async def test_stop_from_paused_transitions_to_ready(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         ctrl._drive_loop = MagicMock()
         ctrl._drive_loop.stop_and_join = AsyncMock()
         ctrl._drive_loop.kpi_summary = {"n_samples": 0.0}
@@ -808,7 +1054,11 @@ class TestStopManual:
     async def test_stop_manual_from_running_raises(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         with pytest.raises(InvalidStateTransition):
             await ctrl.stop_manual()
 
@@ -972,6 +1222,47 @@ class TestGetRealtimeData:
         with pytest.raises(RuntimeError):
             await ctrl.get_realtime_data()
 
+    @pytest.mark.asyncio
+    async def test_idle_reads_are_cached_within_ttl(self) -> None:
+        """E1 回帰テスト: アイドル時（制御ループ非動作中）は IDLE_SNAPSHOT_TTL_S 以内の
+        再呼び出しでハードウェアを再読み取りしない（WS 10Hz によるジョグ/キャリブレーション
+        操作の遅延を防ぐ）。"""
+        ctrl = make_controller()
+        ctrl._can_reader.read_speed = AsyncMock(return_value=60.0)  # type: ignore[attr-defined]
+        ctrl._accel_driver.read_position = AsyncMock(return_value=100)  # type: ignore[attr-defined]
+        ctrl._brake_driver.read_position = AsyncMock(return_value=200)  # type: ignore[attr-defined]
+        ctrl._accel_driver.read_current = AsyncMock(return_value=1500.0)  # type: ignore[attr-defined]
+        ctrl._brake_driver.read_current = AsyncMock(return_value=2000.0)  # type: ignore[attr-defined]
+
+        first = await ctrl.get_realtime_data()
+        second = await ctrl.get_realtime_data()
+
+        assert second is first
+        ctrl._can_reader.read_speed.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_idle_cache_refreshes_after_ttl_expires(self) -> None:
+        from src.app.robot_controller import IDLE_SNAPSHOT_TTL_S
+
+        ctrl = make_controller()
+        ctrl._can_reader.read_speed = AsyncMock(return_value=60.0)  # type: ignore[attr-defined]
+        ctrl._accel_driver.read_position = AsyncMock(return_value=100)  # type: ignore[attr-defined]
+        ctrl._brake_driver.read_position = AsyncMock(return_value=200)  # type: ignore[attr-defined]
+        ctrl._accel_driver.read_current = AsyncMock(return_value=1500.0)  # type: ignore[attr-defined]
+        ctrl._brake_driver.read_current = AsyncMock(return_value=2000.0)  # type: ignore[attr-defined]
+
+        await ctrl.get_realtime_data()
+        assert ctrl._idle_snapshot is not None
+        # キャッシュを TTL 超過扱いに書き換える
+        ctrl._idle_snapshot = dataclasses.replace(
+            ctrl._idle_snapshot,
+            captured_at=ctrl._idle_snapshot.captured_at - (IDLE_SNAPSHOT_TTL_S + 0.1),
+        )
+
+        await ctrl.get_realtime_data()
+
+        assert ctrl._can_reader.read_speed.await_count == 2  # type: ignore[attr-defined]
+
 
 class TestPreCheckIntegration:
     """走行前チェックと RobotController の統合テスト。"""
@@ -1010,7 +1301,11 @@ class TestPreCheckIntegration:
     async def test_start_auto_drive_without_pre_check_runner_transitions_to_running(self) -> None:
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         assert ctrl.get_system_state().robot_state == RobotState.RUNNING
 
     @pytest.mark.asyncio
@@ -1018,7 +1313,11 @@ class TestPreCheckIntegration:
         ctrl = make_controller()
         ctrl._pre_check_runner = self.make_passing_pre_check_runner()  # type: ignore[assignment]
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         assert ctrl.get_system_state().robot_state == RobotState.RUNNING
 
     @pytest.mark.asyncio
@@ -1029,7 +1328,11 @@ class TestPreCheckIntegration:
         ctrl._pre_check_runner = self.make_failing_pre_check_runner()  # type: ignore[assignment]
         await advance_to_ready(ctrl)
         with pytest.raises(PreCheckFailed) as exc_info:
-            await ctrl.start_auto_drive(mode_id="mode-1")
+            await ctrl.start_auto_drive(
+                mode_id="mode-1",
+                mode=_make_mode(),
+                profile=_calibrated_profile(),
+            )
         assert exc_info.value.result is not None
         assert not exc_info.value.result.passed
 
@@ -1041,7 +1344,11 @@ class TestPreCheckIntegration:
         ctrl._pre_check_runner = self.make_failing_pre_check_runner()  # type: ignore[assignment]
         await advance_to_ready(ctrl)
         with pytest.raises(PreCheckFailed):
-            await ctrl.start_auto_drive(mode_id="mode-1")
+            await ctrl.start_auto_drive(
+                mode_id="mode-1",
+                mode=_make_mode(),
+                profile=_calibrated_profile(),
+            )
         assert ctrl.get_system_state().robot_state == RobotState.READY
 
     @pytest.mark.asyncio
@@ -1102,7 +1409,11 @@ class TestShutdown:
 
         ctrl = make_controller()
         await advance_to_ready(ctrl)
-        await ctrl.start_auto_drive(mode_id="mode-1")
+        await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
 
         mock_loop = MagicMock()
         mock_loop.stop_and_join = AsyncMock()
@@ -1460,6 +1771,36 @@ class TestStopLearningDrive:
         assert positions[-1] == 1000
         ctrl._brake_driver.home_return.assert_not_called()  # type: ignore[attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_bridge_deceleration_exposes_brake_opening_for_ui(self) -> None:
+        """橋渡し減速中は current_openings が指令ブレーキ開度を返す（UI 表示用）。
+
+        減速はループ停止後に走るため、以前は current_openings が (0,0) を返し
+        減速中のブレーキ開度が UI に出なかった（回帰防止）。
+        """
+        ctrl, profile = await _arm_ready_learning_controller()
+        ctrl._active_profile = profile  # type: ignore[assignment]
+        ctrl._state = RobotState.RUNNING
+        ctrl._can_reader.read_speed = AsyncMock(side_effect=[10.0, 5.0, 0.0])  # type: ignore[attr-defined]
+
+        # 各ブレーキ指令時点の current_openings を記録する
+        openings_seen: list[tuple[float, float]] = []
+        orig_move = ctrl._brake_driver.move_to_position
+
+        async def rec_move(pos: int) -> None:
+            await orig_move(pos)
+            openings_seen.append(ctrl.current_openings)
+
+        ctrl._brake_driver.move_to_position = AsyncMock(side_effect=rec_move)  # type: ignore[method-assign]
+
+        await ctrl.stop_learning_drive()
+
+        # 減速中の少なくとも1点でブレーキ開度が UI に見えている（accel は常に 0）
+        assert any(brake > 0.0 for _, brake in openings_seen)
+        assert all(accel == 0.0 for accel, _ in openings_seen)
+        # READY 遷移後は橋渡し表示を終了し (0,0) へ戻す
+        assert ctrl.current_openings == (0.0, 0.0)
+
 
 class TestArmAutoDrive:
     """arm_auto_drive() の状態遷移とブレーキ保持（学習運転 arm と共通実装）。"""
@@ -1546,7 +1887,11 @@ class TestStartAutoDriveAfterArm:
     async def test_start_after_arm_transitions_to_running(self) -> None:
         ctrl, _ = await _arm_ready_learning_controller()
         await ctrl.arm_auto_drive()
-        session = await ctrl.start_auto_drive(mode_id="mode-1")
+        session = await ctrl.start_auto_drive(
+            mode_id="mode-1",
+            mode=_make_mode(),
+            profile=_calibrated_profile(),
+        )
         assert ctrl.get_system_state().robot_state == RobotState.RUNNING
         assert session.run_type == "auto"
         assert ctrl.get_system_state().active_session_id == session.id
@@ -1612,23 +1957,6 @@ def _make_patterns() -> object:
     ]
 
 
-def _make_mode() -> object:
-    from src.models.driving_mode import DrivingMode, SpeedPoint  # noqa: PLC0415
-
-    return DrivingMode(
-        id="mode-uuid-1",
-        name="LogMode",
-        description="",
-        reference_speed=[
-            SpeedPoint(time_s=0.0, speed_kmh=0.0),
-            SpeedPoint(time_s=5.0, speed_kmh=60.0),
-        ],
-        total_duration=5.0,
-        max_speed=60.0,
-        created_at=datetime.now(tz=UTC),
-    )
-
-
 def _make_controller_for_logging() -> RobotController:
     """ff_controller / safety_check / learning_manager を備えた、DriveLoop を起動できる構成。"""
     from src.domain.control.feedforward import FeedforwardController  # noqa: PLC0415
@@ -1637,6 +1965,8 @@ def _make_controller_for_logging() -> RobotController:
     accel.move_to_position = AsyncMock()
     brake = make_brake_driver()
     brake.move_to_position = AsyncMock()
+    ff = MagicMock(spec=FeedforwardController)
+    ff.has_model = False  # ペダルプランを生成せず従来経路（plan=None）で DriveLoop を起動
     learning_manager = MagicMock()
     learning_manager.generate_patterns = MagicMock(return_value=_make_patterns())
     return RobotController(
@@ -1646,7 +1976,7 @@ def _make_controller_for_logging() -> RobotController:
         safety_monitor=make_safety_monitor(),
         pid=make_pid(),
         last_normal_shutdown=True,
-        ff_controller=MagicMock(spec=FeedforwardController),
+        ff_controller=ff,
         safety_check=MagicMock(),
         learning_manager=learning_manager,  # type: ignore[arg-type]
     )
@@ -1758,8 +2088,11 @@ class TestActiveCycleIdWiring:
         assert ctrl._active_cycle_id == "cycle-1"
 
         def fake_build(
-            mode: object, profile: object, lw: object,
-            session_id: object, on_complete: object = None,
+            mode: object,
+            profile: object,
+            lw: object,
+            session_id: object,
+            on_complete: object = None,
             disable_deviation_check: bool = False,
         ) -> None:
             ctrl._state = RobotState.READY
@@ -2181,23 +2514,6 @@ class TestKpiSummaryRecording:
         assert ctrl.last_kpi_summary == {"n_samples": 10.0}
 
 
-def _calibrated_profile() -> VehicleProfile:
-    from src.models.calibration import CalibrationData
-
-    calib = CalibrationData(
-        accel_zero_pos=100, accel_full_pos=5100, accel_stroke=5000,
-        brake_zero_pos=200, brake_full_pos=5200, brake_stroke=5000,
-        calibrated_at=datetime.now(tz=UTC), is_valid=True,
-    )
-    return VehicleProfile(
-        id="p1", name="t", max_accel_opening=80.0, max_brake_opening=80.0,
-        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
-        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
-        calibration=calib, model_path=None,
-        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
-    )
-
-
 class TestPidTuningOrchestration:
     @pytest.mark.asyncio
     async def test_validation_requires_ready_state(self) -> None:
@@ -2210,11 +2526,41 @@ class TestPidTuningOrchestration:
         ctrl = make_controller()
         ctrl._state = RobotState.READY
         prof = _calibrated_profile()
-        uncalibrated = VehicleProfile(
-            **{**prof.__dict__, "calibration": None}
-        )
+        uncalibrated = VehicleProfile(**{**prof.__dict__, "calibration": None})
         with pytest.raises(InvalidStateTransition):
             await ctrl.run_pid_validation(uncalibrated)
+
+    @pytest.mark.asyncio
+    async def test_validation_restores_active_profile_gains_afterward(self) -> None:
+        """A4 回帰テスト: 検証走行後、ライブ PID は検証対象プロファイルのゲインではなく
+        アクティブプロファイルのゲインに戻る（両者が異なる場合の乖離防止）。"""
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        active_prof = _calibrated_profile()
+        ctrl._active_profile = active_prof
+        other_prof = dataclasses.replace(
+            active_prof, id="other", pid_gains=PIDGains(kp=9.0, ki=0.9, kd=0.0)
+        )
+
+        async def fake_drive(
+            profile: object, log_writer: object, mode: object = None
+        ) -> dict[str, float]:
+            return {
+                "n_samples": 10.0,
+                "p95_kmh": 0.1,
+                "max_abs_deviation_kmh": 0.2,
+                "reversal_max_per_5s": 0.0,
+                "hard_limit_violations": 0.0,
+            }
+
+        ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
+
+        await ctrl.run_pid_validation(other_prof)
+
+        # 検証中は other_prof のゲイン(9.0)を使ったはずだが、終了後は
+        # アクティブプロファイル(active_prof)のゲインに戻っている
+        assert ctrl._pid._kp == pytest.approx(active_prof.pid_gains.kp)
+        assert ctrl._pid._kp != pytest.approx(other_prof.pid_gains.kp)
 
     @pytest.mark.asyncio
     async def test_tuning_session_drives_runs_and_applies_best(self) -> None:
@@ -2223,13 +2569,18 @@ class TestPidTuningOrchestration:
         prof = _calibrated_profile()
 
         # _run_tuning_drive をモックし、kp が大きいほど良い（コスト低い）KPI を返す。
-        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+        async def fake_drive(
+            profile: object, log_writer: object, mode: object = None
+        ) -> dict[str, float]:
             kp = ctrl._pid._kp  # 直近に set_gains された候補
             # p95 が kp とともに改善する単調なダミー応答
             p95 = max(0.05, 1.0 - 0.1 * kp)
             return {
-                "n_samples": 500.0, "p95_kmh": p95, "max_abs_deviation_kmh": p95 * 2,
-                "reversal_max_per_5s": 1.0, "hard_limit_violations": 0.0,
+                "n_samples": 500.0,
+                "p95_kmh": p95,
+                "max_abs_deviation_kmh": p95 * 2,
+                "reversal_max_per_5s": 1.0,
+                "hard_limit_violations": 0.0,
             }
 
         ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
@@ -2238,36 +2589,70 @@ class TestPidTuningOrchestration:
 
         assert len(history) >= 2
         assert best.kp >= prof.pid_gains.kp  # kp を上げる方向に改善している
-        # 最良ゲインが制御スタックへ反映されている
-        assert ctrl._pid._kp == pytest.approx(best.kp)
+
+    @pytest.mark.asyncio
+    async def test_tuning_session_restores_active_profile_gains_not_best(self) -> None:
+        """A4 回帰テスト: 探索終了後、ライブ PID は best ではなくアクティブプロファイルの
+        ゲインへ戻る（呼び出し元が persist+refresh するまで best を保持し続けない。
+        ライブ PID と永続 VehicleProfile の二重所有権を解消する）。"""
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        prof = _calibrated_profile()
+        ctrl._active_profile = prof  # 探索対象と同一プロファイルがアクティブ
+
+        async def fake_drive(
+            profile: object, log_writer: object, mode: object = None
+        ) -> dict[str, float]:
+            kp = ctrl._pid._kp
+            p95 = max(0.05, 1.0 - 0.1 * kp)
+            return {
+                "n_samples": 500.0,
+                "p95_kmh": p95,
+                "max_abs_deviation_kmh": p95 * 2,
+                "reversal_max_per_5s": 1.0,
+                "hard_limit_violations": 0.0,
+            }
+
+        ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
+
+        best, _ = await ctrl.run_pid_tuning_session(prof, None, max_runs=12)
+
+        assert best.kp > prof.pid_gains.kp  # 探索は改善している
+        # ライブ PID は best ではなく、アクティブプロファイル（未永続化）のゲインに戻る
+        assert ctrl._pid._kp == pytest.approx(prof.pid_gains.kp)
 
     @pytest.mark.asyncio
     async def test_tuning_session_injects_candidate_preview_into_drive_profile(self) -> None:
-        """候補の preview_time_s が差し替えられたプロファイルで各走行が実行される。"""
+        """候補の pid_preview_s が差し替えられたプロファイルで各走行が実行される。"""
         ctrl = make_controller()
         ctrl._state = RobotState.READY
         prof = _calibrated_profile()
         seen_previews: list[float] = []
 
-        async def fake_drive(profile: VehicleProfile, log_writer: object) -> dict[str, float]:
-            seen_previews.append(profile.dynamics_params.preview_time_s)
-            preview = profile.dynamics_params.preview_time_s
-            cost_p95 = max(0.05, 1.0 - abs(preview - 1.0))
+        async def fake_drive(
+            profile: VehicleProfile, log_writer: object, mode: object = None
+        ) -> dict[str, float]:
+            seen_previews.append(profile.dynamics_params.pid_preview_s)
+            preview = profile.dynamics_params.pid_preview_s
+            cost_p95 = max(0.05, 1.0 - abs(preview - 0.75))
             return {
-                "n_samples": 500.0, "p95_kmh": cost_p95, "max_abs_deviation_kmh": cost_p95 * 2,
-                "reversal_max_per_5s": 1.0, "hard_limit_violations": 0.0,
+                "n_samples": 500.0,
+                "p95_kmh": cost_p95,
+                "max_abs_deviation_kmh": cost_p95 * 2,
+                "reversal_max_per_5s": 1.0,
+                "hard_limit_violations": 0.0,
             }
 
         ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
 
         best, history = await ctrl.run_pid_tuning_session(prof, None, max_runs=12)
 
-        # 元プロファイルの preview_time_s(0.0)以外の値も走行に渡っている
+        # 元プロファイルの pid_preview_s(0.0)以外の値も走行に渡っている
         assert any(p != 0.0 for p in seen_previews)
-        assert best.preview_time_s in seen_previews
-        assert all("preview_time_s" in h for h in history)
+        assert best.pid_preview_s in seen_previews
+        assert all("pid_preview_s" in h for h in history)
         # 呼び出し元の元プロファイルは不変（dataclasses.replace で新規オブジェクトを渡す）
-        assert prof.dynamics_params.preview_time_s == 0.0
+        assert prof.dynamics_params.pid_preview_s == 0.0
 
     @pytest.mark.asyncio
     async def test_tuning_drive_aborts_on_emergency(self) -> None:
@@ -2279,8 +2664,11 @@ class TestPidTuningOrchestration:
         prof = ctrl._active_profile
 
         def fake_build(
-            mode: object, profile: object, log_writer: object,
-            session_id: object, on_complete: object = None,
+            mode: object,
+            profile: object,
+            log_writer: object,
+            session_id: object,
+            on_complete: object = None,
             disable_deviation_check: bool = False,
         ) -> None:
             # 走行開始直後に非常停止が発火したのを模擬
@@ -2291,6 +2679,70 @@ class TestPidTuningOrchestration:
 
         with pytest.raises(PidTuningAborted):
             await ctrl._run_tuning_drive(prof, None)
+
+    @pytest.mark.asyncio
+    async def test_manual_stop_during_tuning_drive_raises_aborted_not_success(self) -> None:
+        """W2 回帰テスト: チューニング走行中に手動 stop() が割り込んだ場合も、
+        状態が READY に戻るだけの「正常完了」とは区別して PidTuningAborted を送出する
+        （さもないと不完全な走行の KPI を正常完了として採用してしまう）。"""
+        import asyncio
+
+        from src.app.robot_controller import PidTuningAborted
+
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        ctrl._active_profile = _calibrated_profile()
+        prof = ctrl._active_profile
+
+        def fake_build(
+            mode: object,
+            profile: object,
+            log_writer: object,
+            session_id: object,
+            on_complete: object = None,
+            disable_deviation_check: bool = False,
+        ) -> None:
+            # DriveLoop を起動せず、代わりに手動 stop() が割り込んだことを模擬する
+            asyncio.ensure_future(ctrl.stop())
+
+        ctrl._build_and_start_drive_loop = fake_build  # type: ignore[assignment]
+
+        with pytest.raises(PidTuningAborted):
+            await ctrl._run_tuning_drive(prof, None)
+
+    @pytest.mark.asyncio
+    async def test_run_pid_validation_skips_release_stop_hold_when_manually_stopped(self) -> None:
+        """W2 回帰テスト: 手動 stop() が既に home_return 済みの場合、
+        release_stop_hold を二重に送出しない（干渉防止）。"""
+        import asyncio
+
+        from src.app.robot_controller import PidTuningAborted
+
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        ctrl._active_profile = _calibrated_profile()
+        prof = ctrl._active_profile
+
+        def fake_build(
+            mode: object,
+            profile: object,
+            log_writer: object,
+            session_id: object,
+            on_complete: object = None,
+            disable_deviation_check: bool = False,
+        ) -> None:
+            asyncio.ensure_future(ctrl.stop())
+
+        ctrl._build_and_start_drive_loop = fake_build  # type: ignore[assignment]
+        ctrl._accel_driver.home_return.reset_mock()  # type: ignore[attr-defined]
+        ctrl._brake_driver.home_return.reset_mock()  # type: ignore[attr-defined]
+
+        with pytest.raises(PidTuningAborted):
+            await ctrl.run_pid_validation(prof)
+
+        # stop() 内で1回 home_return が呼ばれ、release_stop_hold からは呼ばれない（二重防止）
+        assert ctrl._accel_driver.home_return.call_count == 1  # type: ignore[attr-defined]
+        assert ctrl._brake_driver.home_return.call_count == 1  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_tuning_drive_starts_without_precheck(self) -> None:
@@ -2304,8 +2756,11 @@ class TestPidTuningOrchestration:
         ctrl._pre_check_runner.run = AsyncMock()
 
         def fake_build(
-            mode: object, profile: object, log_writer: object,
-            session_id: object, on_complete: object = None,
+            mode: object,
+            profile: object,
+            log_writer: object,
+            session_id: object,
+            on_complete: object = None,
             disable_deviation_check: bool = False,
         ) -> None:
             # 走行完了を模擬（停止保持して READY へ）
@@ -2318,8 +2773,45 @@ class TestPidTuningOrchestration:
         kpi = await ctrl._run_tuning_drive(prof, None)
 
         assert kpi["n_samples"] == 100.0
-        ctrl.arm_auto_drive.assert_not_called()       # arm しない
+        ctrl.arm_auto_drive.assert_not_called()  # arm しない
         ctrl._pre_check_runner.run.assert_not_called()  # 走行前チェックしない
+
+    @pytest.mark.asyncio
+    async def test_tuning_drive_transitions_directly_ready_to_running(self) -> None:
+        """A3 回帰テスト: READY→RUNNING は状態機械の第一級遷移として直接行われ、
+        PRE_CHECK を経由する空遷移ではない。"""
+        ctrl = make_controller()
+        ctrl._state = RobotState.READY
+        ctrl._active_profile = _calibrated_profile()
+        prof = ctrl._active_profile
+
+        def fake_build(
+            mode: object,
+            profile: object,
+            log_writer: object,
+            session_id: object,
+            on_complete: object = None,
+            disable_deviation_check: bool = False,
+        ) -> None:
+            ctrl._state = RobotState.READY
+            ctrl._last_kpi_summary = {"n_samples": 1.0}
+            ctrl._drive_complete.set()
+
+        ctrl._build_and_start_drive_loop = fake_build  # type: ignore[assignment]
+
+        transitions: list[RobotState] = []
+        original_transition = ctrl._transition
+
+        def spy_transition(new_state: RobotState) -> None:
+            transitions.append(new_state)
+            original_transition(new_state)
+
+        ctrl._transition = spy_transition  # type: ignore[method-assign]
+
+        await ctrl._run_tuning_drive(prof, None)
+
+        assert transitions.count(RobotState.PRE_CHECK) == 0
+        assert transitions.count(RobotState.RUNNING) == 1
 
     @pytest.mark.asyncio
     async def test_tuning_drive_opens_session_with_null_mode_id(self) -> None:
@@ -2334,8 +2826,11 @@ class TestPidTuningOrchestration:
         log_writer.end_session = AsyncMock()
 
         def fake_build(
-            mode: object, profile: object, lw: object,
-            session_id: object, on_complete: object = None,
+            mode: object,
+            profile: object,
+            lw: object,
+            session_id: object,
+            on_complete: object = None,
             disable_deviation_check: bool = False,
         ) -> None:
             ctrl._state = RobotState.READY
@@ -2360,8 +2855,11 @@ class TestPidTuningOrchestration:
         captured: dict[str, object] = {}
 
         def fake_build(
-            mode: object, profile: object, lw: object,
-            session_id: object, on_complete: object = None,
+            mode: object,
+            profile: object,
+            lw: object,
+            session_id: object,
+            on_complete: object = None,
             disable_deviation_check: bool = False,
         ) -> None:
             captured["disable_deviation_check"] = disable_deviation_check
@@ -2385,10 +2883,15 @@ class TestReleaseOnFinishAndOnRun:
         ctrl._state = RobotState.READY
         prof = _calibrated_profile()
 
-        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+        async def fake_drive(
+            profile: object, log_writer: object, mode: object = None
+        ) -> dict[str, float]:
             return {
-                "n_samples": 500.0, "p95_kmh": 0.05, "max_abs_deviation_kmh": 0.1,
-                "reversal_max_per_5s": 0.0, "hard_limit_violations": 0.0,
+                "n_samples": 500.0,
+                "p95_kmh": 0.05,
+                "max_abs_deviation_kmh": 0.1,
+                "reversal_max_per_5s": 0.0,
+                "hard_limit_violations": 0.0,
             }
 
         ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
@@ -2403,10 +2906,15 @@ class TestReleaseOnFinishAndOnRun:
         ctrl._state = RobotState.READY
         prof = _calibrated_profile()
 
-        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+        async def fake_drive(
+            profile: object, log_writer: object, mode: object = None
+        ) -> dict[str, float]:
             return {
-                "n_samples": 500.0, "p95_kmh": 0.05, "max_abs_deviation_kmh": 0.1,
-                "reversal_max_per_5s": 0.0, "hard_limit_violations": 0.0,
+                "n_samples": 500.0,
+                "p95_kmh": 0.05,
+                "max_abs_deviation_kmh": 0.1,
+                "reversal_max_per_5s": 0.0,
+                "hard_limit_violations": 0.0,
             }
 
         ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
@@ -2421,7 +2929,9 @@ class TestReleaseOnFinishAndOnRun:
         ctrl._state = RobotState.READY
         prof = _calibrated_profile()
 
-        async def failing_drive(profile: object, log_writer: object) -> dict[str, float]:
+        async def failing_drive(
+            profile: object, log_writer: object, mode: object = None
+        ) -> dict[str, float]:
             raise RuntimeError("boom")
 
         ctrl._run_tuning_drive = failing_drive  # type: ignore[assignment]
@@ -2438,12 +2948,17 @@ class TestReleaseOnFinishAndOnRun:
         prof = _calibrated_profile()
         calls: list[tuple[int, object, float]] = []
 
-        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+        async def fake_drive(
+            profile: object, log_writer: object, mode: object = None
+        ) -> dict[str, float]:
             kp = ctrl._pid._kp
             p95 = max(0.05, 1.0 - 0.1 * kp)
             return {
-                "n_samples": 500.0, "p95_kmh": p95, "max_abs_deviation_kmh": p95 * 2,
-                "reversal_max_per_5s": 1.0, "hard_limit_violations": 0.0,
+                "n_samples": 500.0,
+                "p95_kmh": p95,
+                "max_abs_deviation_kmh": p95 * 2,
+                "reversal_max_per_5s": 1.0,
+                "hard_limit_violations": 0.0,
             }
 
         ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
@@ -2462,10 +2977,15 @@ class TestReleaseOnFinishAndOnRun:
         ctrl._state = RobotState.READY
         prof = _calibrated_profile()
 
-        async def fake_drive(profile: object, log_writer: object) -> dict[str, float]:
+        async def fake_drive(
+            profile: object, log_writer: object, mode: object = None
+        ) -> dict[str, float]:
             return {
-                "n_samples": 500.0, "p95_kmh": 0.05, "max_abs_deviation_kmh": 0.1,
-                "reversal_max_per_5s": 0.0, "hard_limit_violations": 0.0,
+                "n_samples": 500.0,
+                "p95_kmh": 0.05,
+                "max_abs_deviation_kmh": 0.1,
+                "reversal_max_per_5s": 0.0,
+                "hard_limit_violations": 0.0,
             }
 
         ctrl._run_tuning_drive = fake_drive  # type: ignore[assignment]
@@ -2549,6 +3069,18 @@ class TestScheduleDrive:
         await ctrl.stop_schedule_drive()  # クリーンアップ
 
     @pytest.mark.asyncio
+    async def test_missing_profile_rejected_before_transitioning_to_running(self) -> None:
+        """W4 回帰テスト: profile が None のまま開始しようとすると RUNNING へ遷移する
+        前に拒否される（ファントム RUNNING を防ぐ）。"""
+        ctrl, button = _make_controller_with_button_servo()
+        await advance_to_ready(ctrl)
+        with pytest.raises(InvalidStateTransition):
+            await ctrl.start_schedule_drive(_make_time_schedule(), profile=None)
+        assert ctrl.get_system_state().robot_state == RobotState.READY
+        assert ctrl.get_system_state().active_session_id is None
+        assert ctrl._schedule_loop is None
+
+    @pytest.mark.asyncio
     async def test_start_schedule_runs_precheck_with_button_flag(self) -> None:
         from src.models.pre_check import PreCheckResult  # noqa: PLC0415
 
@@ -2613,3 +3145,108 @@ class TestScheduleDrive:
         await advance_to_ready(ctrl)
         await ctrl.shutdown()
         button.release_all.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# ILC 配線（Stage C: prepare で補正ロード・正常完了で学習）
+# ---------------------------------------------------------------------------
+
+
+def _make_controller_with_ilc() -> tuple[RobotController, AsyncMock]:
+    from src.domain.control.ilc import ILCController, ILCTable
+
+    ilc_service = AsyncMock()
+    # prepare は補正コントローラを返す（sentinel）。learn_from_session は AsyncMock。
+    ilc_service.prepare = AsyncMock(return_value=ILCController(ILCTable(efforts=[1.0, 1.0])))
+    ilc_service.learn_from_session = AsyncMock()
+    ctrl = RobotController(
+        accel_driver=make_accel_driver(),
+        brake_driver=make_brake_driver(),
+        can_reader=make_can_reader(),
+        safety_monitor=make_safety_monitor(),
+        pid=make_pid(),
+        last_normal_shutdown=True,
+        ff_controller=make_ff_controller(),
+        safety_check=make_safety_check(),
+        ilc_service=ilc_service,
+    )
+    return ctrl, ilc_service
+
+
+class TestILCWiring:
+    @pytest.mark.asyncio
+    async def test_prepare_result_passed_to_drive_loop(self) -> None:
+        """start_auto_drive が prepare の ILCController を DriveLoop に渡す。"""
+        ctrl, ilc_service = _make_controller_with_ilc()
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(
+            mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
+        )
+        ilc_service.prepare.assert_awaited_once()
+        assert ctrl._drive_loop is not None
+        assert ctrl._drive_loop._ilc is ilc_service.prepare.return_value
+
+    @pytest.mark.asyncio
+    async def test_natural_completion_triggers_learning(self) -> None:
+        """DriveLoop の正常完了コールバックで learn_from_session が起動する。"""
+        ctrl, ilc_service = _make_controller_with_ilc()
+        await advance_to_ready(ctrl)
+        session = await ctrl.start_auto_drive(
+            mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
+        )
+        # DriveLoop 自然完了と同じく on_complete を呼ぶ
+        on_complete = ctrl._drive_loop._on_complete  # type: ignore[union-attr]
+        await on_complete()
+        await asyncio.sleep(0)  # fire-and-forget タスクを走らせる
+        ilc_service.learn_from_session.assert_awaited_once()
+        assert ilc_service.learn_from_session.await_args.args[0] == session.id
+
+    @pytest.mark.asyncio
+    async def test_manual_stop_does_not_learn(self) -> None:
+        """手動停止（stop）では learn_from_session を呼ばない。"""
+        ctrl, ilc_service = _make_controller_with_ilc()
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(
+            mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
+        )
+        await ctrl.stop()
+        await asyncio.sleep(0)
+        ilc_service.learn_from_session.assert_not_awaited()
+
+
+class TestPedalPlanBuild:
+    """_build_pedal_plan: FF モデルの有無でプラン生成／None を切り替える（P-5）。"""
+
+    def test_returns_none_when_no_model(self) -> None:
+        ctrl = make_controller()  # make_ff_controller は has_model=False
+        plan = ctrl._build_pedal_plan(_make_mode(), _calibrated_profile())
+        assert plan is None
+
+    def test_returns_none_when_ff_controller_absent(self) -> None:
+        ctrl = make_controller()
+        ctrl._ff_controller = None
+        assert ctrl._build_pedal_plan(_make_mode(), _calibrated_profile()) is None
+
+    def test_builds_plan_when_model_loaded(self) -> None:
+        from src.domain.control.pedal_plan import PedalPlan
+
+        ctrl = make_controller()
+        ff = MagicMock(spec=FeedforwardController)
+        ff.has_model = True
+        ctrl._ff_controller = ff
+        sentinel = PedalPlan()
+        with pytest.MonkeyPatch.context() as mp:
+            called: dict[str, object] = {}
+
+            def fake_build(mode, ffc, params, **kw):  # type: ignore[no-untyped-def]
+                called["mode"] = mode
+                called["ff"] = ffc
+                return sentinel
+
+            mp.setattr("src.app.robot_controller.PedalPlanner.build", staticmethod(fake_build))
+            mode = _make_mode()
+            profile = _calibrated_profile()
+            plan = ctrl._build_pedal_plan(mode, profile)
+        assert plan is sentinel
+        assert called["mode"] is mode
+        assert called["ff"] is ff

@@ -108,16 +108,35 @@ asyncio イベントループ
 
 **50ms制御ループの実装方針**:
 - `asyncio.create_task()` + `asyncio.sleep(0.05)` ではなく
-- `asyncio.get_event_loop().run_forever()` + `loop.call_later(0.05, ...)` を使用
+- 開始時刻を基準にした絶対時刻グリッド（`loop.call_at(_grid_anchor + n×0.05, ...)`）でサイクルを予約する。
+  相対 `loop.call_later(0.05, ...)` はコールバック起動遅延が毎周期累積して固定周期からドリフトし、
+  走行終端に早く到達してログ末尾が数行欠落するため。発火がグリッドを跨いで遅れた場合は
+  catch-up バースト発火を避け次の未来グリッドへ丸める（1 tick=50ms のスキップ計数の意味を保つ）。
 - アクチュエータへの2軸同時送信は `asyncio.gather()` で並列実行
 
 **2系統の制御ループ**:
-- **DriveLoop（閉ループ・50ms）**: 自動走行・手動操作・基準速度追従。FF（先読み 多項式Ridge 逆モデル）と
-  PID 補正を符号付き努力量として合成し PedalArbiter でペダルへ写像する。
+- **DriveLoop（閉ループ・50ms）**: 自動走行・手動操作・基準速度追従。人間的なペダルワークを実現する
+  「ペダルプラン＋トリム」構成で、名目 effort（プラン）・トリム補正・ILC 補正を符号付き努力量として
+  合成（`plan + trim + ilc`）し PedalArbiter でペダルへ写像する。
+  - **ペダルプラン（PedalPlanner/PedalPlan）**: 走行開始時に基準軌跡全体から DRIVE/COAST/BRAKE/
+    STOP_HOLD のフェーズ列と名目 effort をオフライン生成（FF をオフライン一括評価＋ゼロ位相ローパスで
+    平滑化）。クリープ発進・エンジンブレーキ優先・停止中ブレーキ保持・不要な踏み替え排除を構造的に保証。
+  - **トリム制御（TrimController）**: 偏差の大きさで 3 層に切替。|偏差|≤0.1km/h は凍結（ペダルを動かさ
+    ない）、0.1〜0.5km/h は低速トリム（レート制限＋量子化）、≥0.5km/h は速い補正層（プロファイルの
+    PID×ゲインスケジュール）＝max≤1.0km/h を初回走行から守る安全網。フェーズ権限で操作の向きを制限
+    する（速い補正層アクティブ時は無権限＝安全網）。
+  - 名目 effort・速い補正層とも基準速度は now-frame で評価し、先読みはモデルの horizons が担う。速い
+    補正層のみ `pid_preview_s`（既定 0.0）だけ前倒し可。ゲインスケジューリング（FF 局所勾配
+    g(v)/g_nominal、ブースト上限 1.5）で速度依存プラントゲインを正規化する。
+  - **プランなし経路**（FF モデル未ロードのブートストラップ）は従来どおり FF を毎サイクル評価し速い
+    補正層 PID を直結する（完全回帰）。
+  - KPI は学習サイクルの **VERIFY フェーズ**（登録全モードを包絡する検証専用パターンを ILC 無効で走行し
+    p95≤0.2/max≤1.0/反転≤1 を確認、不合格なら再学習して再走行・上限あり）で合格させ、サイクル完了後の
+    最初の自動運転から満足する。ILC はモード別の任意強化（本番自動走行の正常完了で学習）。
 - **LearningLoop（開ループ・100ms）**: 学習運転。固定の開度パターンを開ループで指令し、走行全体を
   連続した (実車速, 開度) 軌跡として `drive_logs` に記録する。コントローラ（FF/PID）に依存しないため
   運転モデル未学習の初期状態でも開度軸を端から端まで励起でき、逆モデルのブートストラップに適する。
-  call_later スケジューリング・サイクルスキップ ウォッチドッグ・ログ滞留制御は DriveLoop と共通方針。
+  絶対時刻グリッドスケジューリング・サイクルスキップ ウォッチドッグ・ログ滞留制御は DriveLoop と共通方針。
   安全は2段階（過速度・過G はパターンスキップ／過電流・通信断は非常停止）。
 
 ---
@@ -134,6 +153,7 @@ asyncio イベントループ
 | アクティブ走行ログ | PostgreSQL | drive_logs テーブル | 3ヶ月 |
 | アーカイブログ | 外付けUSB SSD | CSV + gzip圧縮 | 容量80%まで |
 | 運転モデル | ファイル (`.pkl`) | numpy/pickle形式 | プロファイルに紐づく |
+| ILC 補正テーブル | PostgreSQL | ilc_tables（profile×mode、efforts JSONB） | モード軌跡変更でリセット |
 | システム状態（シャットダウン時） | ファイル | JSON | 起動時に参照 |
 
 ### バックアップ戦略
@@ -178,12 +198,18 @@ driving_robot/
 │   │   ├── robot_controller.py
 │   │   ├── training_service.py    # 運転モデル学習+PID自動適合（ルーターから抽出）
 │   │   ├── learning_cycle.py      # 学習サイクル・オーケストレータ（2段階学習フロー）
+│   │   ├── ilc_service.py         # ILC 補正ロード（走行前）・残差学習（走行後）
 │   │   └── session_manager.py
 │   ├── domain/               # ドメインレイヤー
 │   │   ├── control/
-│   │   │   ├── feedforward.py
-│   │   │   ├── pid.py
-│   │   │   ├── drive_loop.py      # 閉ループ FF+PID（自動/手動）
+│   │   │   ├── feedforward.py     # 逆FFモデル＋ゲインスケジューリング g(v)
+│   │   │   ├── pid.py             # gain_scale 正規化つき PID（速い補正層の部品）
+│   │   │   ├── pedal_plan.py      # ペダル操作計画（フェーズ列＋名目effort・走行前生成）
+│   │   │   ├── trim.py            # トリム制御（凍結帯／低速トリム／速い補正層の3層）
+│   │   │   ├── pedal_arbiter.py   # 符号付き努力量→ペダル開度（振動抑制・解放平滑化）
+│   │   │   ├── kpi_monitor.py     # 追従KPI＋ペダル活動度＋不要切替の実行時計測
+│   │   │   ├── ilc.py             # 反復学習制御（ILCTable/Controller/Learner）
+│   │   │   ├── drive_loop.py      # 閉ループ plan+trim+ilc（自動/手動）
 │   │   │   └── learning_loop.py   # 開ループ実行ループ（学習運転）
 │   │   ├── calibration.py
 │   │   ├── learning_drive.py      # 学習運転の開度パターン生成
@@ -192,6 +218,7 @@ driving_robot/
 │   │   └── safety_monitor.py
 │   ├── infra/                # インフラレイヤー
 │   │   ├── actuator_driver.py
+│   │   ├── ilc_repository.py      # ilc_tables（profile×mode）の永続化
 │   │   ├── can_reader.py
 │   │   ├── gpio_monitor.py
 │   │   ├── log_writer.py
@@ -432,8 +459,12 @@ Raspberry Pi 5 (16GB)
 
 #### 学習サイクル・オーケストレーション（LearningCycleOrchestrator、20260703-learning-process-revamp）
 
-上記の手動パスを2段階に拡張し、WebUI 1操作（`POST /learning-cycle/start`）で自動進行させる
-（`src/app/learning_cycle.py`）。学習運転→訓練→PID適合(10回)→**サイクル全ログで再学習**
+上記の手動パスを2段階に拡張し、WebUI「学習サイクル開始」ボタンで自動進行させる
+（`src/app/learning_cycle.py`）。開始は自動運転・学習運転単体と同じ **arm→確認ポップアップ→start**
+の3エンドポイント（`POST /learning-cycle/arm` → 確認ポップアップ → `POST /learning-cycle/start`。
+「いいえ」は `POST /learning-cycle/cancel`）で、ポップアップ表示前に停車保持ブレーキ踏込・車速0
+収束待ち・走行前チェックを完了させる（2026-07-06 修正: 刷新時に一度ポップアップ表示後に
+arm+start を同期実行する誤った順序に退行していたのを是正）。学習運転→訓練→PID適合(10回)→**サイクル全ログで再学習**
 （ゲイン上書きなし）→PID適合(5回、1段目ゲインから継続)。フェーズ間は停車保持ブレーキを
 維持し続け（`run_pid_tuning_session(release_on_finish=False)`）、2段目完了または
 中断・エラー時にのみ原点復帰で解放する。進捗（フェーズ・走行回数・最良コスト）は
@@ -446,6 +477,24 @@ Raspberry Pi 5 (16GB)
 > 精度の主なボトルネックは開ループ学習データと閉ループ配備データの分布ギャップ（holdout R²が
 > 負〜0.2）であることを確認した。サイクル全ログ（学習+閉ループ適合走行）での再学習はこのギャップを
 > 直接埋める設計であり、特徴量チューニングより優先する。
+
+#### 反復学習制御（ILC、20260707-kpi-speed-tracking-fix Stage C）
+
+FF+PID では消せない「同一モード反復走行の再現性ある残差」（停止移行の系統偏差など）を、走行ごとに
+時刻別補正 effort テーブルとして学習し次回走行に適用する（`src/domain/control/ilc.py`、profile×mode 単位
+で `ilc_tables` に永続化）。
+
+- **走行前**: `ILCService.prepare(profile, mode)` が補正テーブルをロードし `ILCController` を DriveLoop に
+  注入する。無効・未学習・ロード失敗時は None で補正なし（ILC は性能向上手段であり安全の前提にしない）。
+- **走行中**: `ilc_effort = table.effort_at(elapsed_s)` を now-frame で参照し `ff+pid+ilc` に合成。振幅は
+  ±10% にクランプ（暴走の機構的制限）。
+- **走行後（正常完了のみ）**: `robot_controller._finish_auto_drive_with_ilc` が停止処理（ログ flush 込み）後に
+  `learn_from_session` を fire-and-forget 起動。`drive_logs` の残差 e_j(t)=ref−actual から
+  `u_{j+1}(t)=clip(Q(u_j(t)+L·e_j(t+Δ)), ±amp)` を計算（Q=ゼロ位相ローパス、L=0.4/fopdt_k、Δ=fopdt_theta）。
+  発散検知（今回 p95 > 最良 p95×1.2）時は学習をスキップしテーブルを据え置く。手動停止・非常停止は
+  この経路を通らないため学習しない。
+- **無効化条件**: モードの基準軌跡変更（`PUT /modes/{id}`）で `ilc_repo.reset_for_mode`。WebUI 自動走行画面
+  でモード選択時に反復回数・最良 p95・収束履歴を表示し、有効/無効トグルとリセットを操作できる。
 
 ---
 

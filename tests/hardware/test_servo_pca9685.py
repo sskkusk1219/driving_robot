@@ -149,9 +149,7 @@ class _Pca9685:
     def set_angle(self, channel: int, angle: float) -> None:
         """角度[deg] を SG90 のパルス幅に変換して出力する。"""
         angle = max(_ANGLE_MIN, min(_ANGLE_MAX, angle))
-        pulse_us = _MIN_PULSE_US + (_MAX_PULSE_US - _MIN_PULSE_US) * (
-            angle / _ANGLE_MAX
-        )
+        pulse_us = _MIN_PULSE_US + (_MAX_PULSE_US - _MIN_PULSE_US) * (angle / _ANGLE_MAX)
         # 1 周期 = 1e6 / freq [us] を 4096 分割
         period_us = 1_000_000.0 / _PWM_FREQ_HZ
         count = int(round(pulse_us / period_us * 4096.0))

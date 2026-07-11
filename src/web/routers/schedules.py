@@ -10,7 +10,6 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from src.infra.db import DuplicateNameError
 from src.models.time_schedule import ButtonEvent, PedalPoint, TimeSchedule
 from src.web.deps import ScheduleRepoProtocol, get_schedule_repo
 from src.web.schemas import (
@@ -106,10 +105,7 @@ async def create_schedule(req: ScheduleCreateRequest, repo: ScheduleRepo) -> Sch
         total_duration=_total_duration(pedal_points, button_events),
         created_at=datetime.now(tz=UTC),
     )
-    try:
-        created = await repo.create(schedule)
-    except DuplicateNameError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    created = await repo.create(schedule)
     return _to_detail_response(created)
 
 
@@ -158,10 +154,7 @@ async def update_schedule(
         total_duration=_total_duration(pedal_points, button_events),
         created_at=existing.created_at,
     )
-    try:
-        updated = await repo.update(merged)
-    except DuplicateNameError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    updated = await repo.update(merged)
     if updated is None:
         raise HTTPException(
             status_code=404, detail=f"スケジュール {schedule_id!r} が見つかりません"

@@ -1,8 +1,9 @@
 // ── Learning drive screen ─────────────────────────────────
 // Reuses DriveMonitorScreen。「開始」ボタンは学習運転単体ではなく学習サイクル
 // 全体（学習運転→訓練→PID適合→再学習→PID適合）をサーバー側オーケストレータ
-// （LearningCycleOrchestrator）に1操作で委譲する（confirmOnly: true により、
-// driveArmPath は使わず確認ポップアップのみ表示 → learning-cycle/start を叩く）。
+// （LearningCycleOrchestrator）に委譲する。自動運転と同じ arm → 確認ポップアップ →
+// start のフロー（driveArmPath/driveCancelPath）を使い、ポップアップ表示前に
+// 停車ブレーキ踏込・走行前チェック・車速0確認を完了させる。
 // 進捗は WebSocket の cycle_progress で配信され、resultPanel と busyLabel に表示する。
 // busy（cycleActive）中はフェーズが READY に戻る訓練段階でも「開始」を再表示
 // させず、常に中断ボタンを出す（DriveMonitorScreen 側で robotState より busy を優先）。
@@ -64,6 +65,7 @@ function LearningScreen() {
     REFINE_1: 'PID適合を実行中(1段目)…',
     TRAINING_2: 'サイクル全ログで再学習中(2段目)…',
     REFINE_2: 'PID適合を実行中(2段目)…',
+    VERIFY: '検証走行でKPIを確認中…',
     COMPLETED: '学習サイクルが完了しました',
     ERROR: '学習サイクルでエラーが発生しました',
     ABORTED: '学習サイクルを中断しました',
@@ -87,7 +89,7 @@ function LearningScreen() {
           {cycleProgress.best_cost != null && (
             <div style={{ color: INK_MUTE, marginTop: 2 }}>
               最良コスト {fmt(cycleProgress.best_cost)}
-              {cycleProgress.best_preview_time_s != null && ` / 先読み補償 ${cycleProgress.best_preview_time_s.toFixed(2)}s`}
+              {cycleProgress.best_pid_preview_s != null && ` / PID先読み補償 ${cycleProgress.best_pid_preview_s.toFixed(2)}s`}
             </div>
           )}
           {patternText && (cyclePhase === 'REFINE_1' || cyclePhase === 'REFINE_2') && (
@@ -106,7 +108,8 @@ function LearningScreen() {
         screenTitle: '学習運転',
         driveStartPath: '/api/v1/drive/learning-cycle/start',
         driveStartBody: {},
-        confirmOnly: true,
+        driveArmPath: '/api/v1/drive/learning-cycle/arm',
+        driveCancelPath: '/api/v1/drive/learning-cycle/cancel',
         confirmStartMessage: '開始しますか？',
         startedToastMessage: '学習サイクルを開始しました',
         busy: cycleActive,

@@ -6,12 +6,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from src.app.robot_controller import InvalidStateTransition, PidTuningAborted, PreCheckFailed
 from src.app.stubs import (
+    InMemoryILCRepository,
     InMemoryModeRepository,
     InMemoryProfileRepository,
     InMemoryScheduleRepository,
@@ -21,6 +23,7 @@ from src.app.stubs import (
 )
 from src.app.training_service import feature_spec_from_settings
 from src.domain.model_training import DEFAULT_FEATURE_SPEC, FeatureSpec
+from src.infra.db import DuplicateNameError
 from src.infra.settings import LearningSettings
 from src.web.routers import drive, modes, profiles, schedules, sessions, ups
 from src.web.ws import broadcast_loop, realtime_ws
@@ -43,12 +46,11 @@ def _load_feature_spec_and_learning_settings() -> tuple[FeatureSpec, LearningSet
 
 async def _build_repos(app: FastAPI) -> None:
     """DB が利用可能なら DB バックエンド、そうでなければ in-memory リポジトリを設定する。"""
-    app.state.feature_spec, app.state.learning_settings = (
-        _load_feature_spec_and_learning_settings()
-    )
+    app.state.feature_spec, app.state.learning_settings = _load_feature_spec_and_learning_settings()
     db_url = os.environ.get("DATABASE_URL")
     if db_url:
         from src.infra.db import create_pool  # noqa: PLC0415
+        from src.infra.ilc_repository import ILCRepository  # noqa: PLC0415
         from src.infra.mode_repository import ModeRepository  # noqa: PLC0415
         from src.infra.profile_repository import ProfileRepository  # noqa: PLC0415
         from src.infra.schedule_repository import ScheduleRepository  # noqa: PLC0415
@@ -60,6 +62,7 @@ async def _build_repos(app: FastAPI) -> None:
         app.state.mode_repo = ModeRepository(pool)
         app.state.session_repo = SessionRepository(pool)
         app.state.schedule_repo = ScheduleRepository(pool)
+        app.state.ilc_repo = ILCRepository(pool)
 
         # 前回プロセスの異常終了で 'running' のまま残った孤児セッションを是正する。
         from src.infra.log_writer import LogWriter  # noqa: PLC0415
@@ -75,6 +78,7 @@ async def _build_repos(app: FastAPI) -> None:
         app.state.mode_repo = InMemoryModeRepository()
         app.state.session_repo = InMemorySessionRepository()
         app.state.schedule_repo = InMemoryScheduleRepository()
+        app.state.ilc_repo = InMemoryILCRepository()
 
 
 @asynccontextmanager
@@ -112,6 +116,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         session_repo=app.state.session_repo,
         log_writer=cycle_log_writer,
         learning_timeout_s=app.state.learning_settings.learning_timeout_s,
+        mode_repo=app.state.mode_repo,
+        tuning_on_target_mode=app.state.learning_settings.tuning_on_target_mode,
+        verify_runs_max=app.state.learning_settings.verify_runs_max,
     )
 
     task = asyncio.create_task(broadcast_loop(app))
@@ -136,12 +143,40 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# app レベル例外ハンドラ: 各ルーターで同一の try/except を28箇所以上コピペしていた
+# （InvalidStateTransition→409 / PreCheckFailed→422 / PidTuningAborted→409 /
+# DuplicateNameError→409）のを一本化する。ハンドラ登録漏れが起きないため、新規
+# エンドポイントがこれらの例外を捕まえ忘れても 500 にならない（S4/W1 レビュー指摘）。
+@app.exception_handler(InvalidStateTransition)
+async def _invalid_state_transition_handler(
+    request: Request, exc: InvalidStateTransition
+) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(PreCheckFailed)
+async def _pre_check_failed_handler(request: Request, exc: PreCheckFailed) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(PidTuningAborted)
+async def _pid_tuning_aborted_handler(request: Request, exc: PidTuningAborted) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(DuplicateNameError)
+async def _duplicate_name_error_handler(request: Request, exc: DuplicateNameError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
 app.include_router(drive.router)
 app.include_router(profiles.router)
 app.include_router(modes.router)
 app.include_router(schedules.router)
 app.include_router(sessions.router)
 app.include_router(ups.router)
+
 
 class _NoCacheStaticMiddleware(BaseHTTPMiddleware):
     """/static 配下に `Cache-Control: no-cache` を付与する。
@@ -150,9 +185,7 @@ class _NoCacheStaticMiddleware(BaseHTTPMiddleware):
     UI（JS/CSS）を更新した際に古いキャッシュが使われ続ける事故を防ぐ。
     """
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
         if request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache, must-revalidate"

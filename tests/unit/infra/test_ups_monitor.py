@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -11,8 +12,8 @@ from src.infra.ups_monitor import NutUPSMonitor, UPSStatus
 
 
 class _FakeStreamReader:
-    def __init__(self, response: str) -> None:
-        self._lines = iter([response.encode()])
+    def __init__(self, responses: list[str]) -> None:
+        self._lines = iter([r.encode() for r in responses])
 
     async def readline(self) -> bytes:
         return next(self._lines)
@@ -35,54 +36,75 @@ class _FakeStreamWriter:
         pass
 
 
-def _make_fake_connection(response: str):
-    reader = _FakeStreamReader(response)
+def _make_fake_connection(responses: list[str]):
+    reader = _FakeStreamReader(responses)
     writer = _FakeStreamWriter()
     return reader, writer
 
 
-# ── _nut_get_var のパーステスト ────────────────────────────────────────────────
+# ── _nut_get_vars のパーステスト ───────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_nut_get_var_parses_battery_charge() -> None:
+async def test_nut_get_vars_parses_battery_charge() -> None:
     """battery.charge の正常レスポンスを正しくパースする。"""
     monitor = NutUPSMonitor(ups_name="apcups")
 
     async def fake_open_connection(host: str, port: int):
-        return _make_fake_connection('VAR apcups battery.charge "95"\n')
+        return _make_fake_connection(['VAR apcups battery.charge "95"\n'])
 
     with patch("asyncio.open_connection", fake_open_connection):
-        result = await monitor._nut_get_var("battery.charge")
+        result = await monitor._nut_get_vars(["battery.charge"])
 
-    assert result == "95"
+    assert result == {"battery.charge": "95"}
 
 
 @pytest.mark.asyncio
-async def test_nut_get_var_parses_ups_status_ol() -> None:
+async def test_nut_get_vars_parses_ups_status_ol() -> None:
     """ups.status の OL CHRG レスポンスを正しくパースする。"""
     monitor = NutUPSMonitor(ups_name="apcups")
 
     async def fake_open_connection(host: str, port: int):
-        return _make_fake_connection('VAR apcups ups.status "OL CHRG"\n')
+        return _make_fake_connection(['VAR apcups ups.status "OL CHRG"\n'])
 
     with patch("asyncio.open_connection", fake_open_connection):
-        result = await monitor._nut_get_var("ups.status")
+        result = await monitor._nut_get_vars(["ups.status"])
 
-    assert result == "OL CHRG"
+    assert result == {"ups.status": "OL CHRG"}
 
 
 @pytest.mark.asyncio
-async def test_nut_get_var_raises_on_err_response() -> None:
+async def test_nut_get_vars_raises_on_err_response() -> None:
     """NUT が ERR を返した場合に RuntimeError を送出する。"""
     monitor = NutUPSMonitor(ups_name="apcups")
 
     async def fake_open_connection(host: str, port: int):
-        return _make_fake_connection("ERR VAR-NOT-SUPPORTED\n")
+        return _make_fake_connection(["ERR VAR-NOT-SUPPORTED\n"])
 
     with patch("asyncio.open_connection", fake_open_connection):
         with pytest.raises(RuntimeError, match="NUT エラー"):
-            await monitor._nut_get_var("battery.charge")
+            await monitor._nut_get_vars(["battery.charge"])
+
+
+@pytest.mark.asyncio
+async def test_nut_get_vars_fetches_both_vars_over_single_connection() -> None:
+    """E6 回帰テスト: 複数変数を1接続（1回の open_connection）でまとめて取得すること
+    （旧実装は変数毎に接続・LOGOUTしていた）。"""
+    monitor = NutUPSMonitor(ups_name="apcups")
+    connect_calls = 0
+
+    async def fake_open_connection(host: str, port: int):
+        nonlocal connect_calls
+        connect_calls += 1
+        return _make_fake_connection(
+            ['VAR apcups battery.charge "88"\n', 'VAR apcups ups.status "OL"\n']
+        )
+
+    with patch("asyncio.open_connection", fake_open_connection):
+        result = await monitor._nut_get_vars(["battery.charge", "ups.status"])
+
+    assert connect_calls == 1
+    assert result == {"battery.charge": "88", "ups.status": "OL"}
 
 
 # ── AC断コールバックのエッジ検知テスト ─────────────────────────────────────────
@@ -92,7 +114,6 @@ async def test_nut_get_var_raises_on_err_response() -> None:
 async def test_ac_loss_callback_fires_on_ol_to_ob_transition() -> None:
     """OL → OB 遷移（立ち上がりエッジ）でのみコールバックが発火する。"""
     monitor = NutUPSMonitor(ups_name="apcups")
-    monitor._loop = asyncio.get_event_loop()
     monitor._prev_on_battery = False  # 初期状態: AC通電中
 
     callback_count = 0
@@ -106,27 +127,65 @@ async def test_ac_loss_callback_fires_on_ol_to_ob_transition() -> None:
     # OL → OB 遷移: コールバックが1回発火すること
     call_count = 0
 
-    async def fake_get_var(var_name: str) -> str:
+    async def fake_get_vars(var_names: list[str]) -> dict[str, str]:
         nonlocal call_count
         call_count += 1
-        if "battery.charge" in var_name:
-            return "50"
-        return "OB"  # On Battery
+        return {"battery.charge": "50", "ups.status": "OB"}  # On Battery
 
-    monitor._nut_get_var = fake_get_var  # type: ignore[method-assign]
+    monitor._nut_get_vars = fake_get_vars  # type: ignore[method-assign]
 
     await monitor._poll_once()
 
-    # run_coroutine_threadsafe はテスト環境では直接呼べないため、_fire_callbacks を直接テスト
     assert monitor._cached_on_battery is True
     assert monitor._prev_on_battery is True
+
+
+@pytest.mark.asyncio
+async def test_fire_callbacks_runs_registered_callback() -> None:
+    """I4 回帰テスト: run_coroutine_threadsafe ではなく、実行中のイベントループ上で
+    ensure_future によりコールバックが実際に実行される。"""
+    monitor = NutUPSMonitor(ups_name="apcups")
+    ran = False
+
+    async def on_ac_loss() -> None:
+        nonlocal ran
+        ran = True
+
+    monitor.register_ac_loss_callback(on_ac_loss)
+    monitor._fire_callbacks()
+    # タスク本体の実行と done-callback（強参照の解放）はループの別イテレーションになるため
+    # 2回 yield する。
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert ran is True
+    assert monitor._callback_tasks == set()  # 完了後は強参照が解放される
+
+
+@pytest.mark.asyncio
+async def test_fire_callbacks_logs_failure_without_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I4 回帰テスト: コールバックの例外は無音で消えず done-callback でログに記録される。"""
+    monitor = NutUPSMonitor(ups_name="apcups")
+
+    async def failing_callback() -> None:
+        raise RuntimeError("callback boom")
+
+    monitor.register_ac_loss_callback(failing_callback)
+    with caplog.at_level(logging.ERROR):
+        monitor._fire_callbacks()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert monitor._callback_tasks == set()
+    assert "AC断コールバックが失敗しました" in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_ac_loss_callback_does_not_fire_if_already_on_battery() -> None:
     """OB → OB（継続中）ではコールバックが発火しない。"""
     monitor = NutUPSMonitor(ups_name="apcups")
-    monitor._loop = asyncio.get_event_loop()
     monitor._prev_on_battery = True  # 既にバッテリー運転中
 
     fired = False
@@ -137,12 +196,10 @@ async def test_ac_loss_callback_does_not_fire_if_already_on_battery() -> None:
 
     monitor.register_ac_loss_callback(on_ac_loss)
 
-    async def fake_get_var(var_name: str) -> str:
-        if "battery.charge" in var_name:
-            return "45"
-        return "OB"
+    async def fake_get_vars(var_names: list[str]) -> dict[str, str]:
+        return {"battery.charge": "45", "ups.status": "OB"}
 
-    monitor._nut_get_var = fake_get_var  # type: ignore[method-assign]
+    monitor._nut_get_vars = fake_get_vars  # type: ignore[method-assign]
 
     await monitor._poll_once()
 
@@ -153,7 +210,6 @@ async def test_ac_loss_callback_does_not_fire_if_already_on_battery() -> None:
 async def test_ac_loss_callback_does_not_fire_on_ob_to_ol() -> None:
     """OB → OL（復電）ではコールバックが発火しない。"""
     monitor = NutUPSMonitor(ups_name="apcups")
-    monitor._loop = asyncio.get_event_loop()
     monitor._prev_on_battery = True  # バッテリー運転中から
 
     fired = False
@@ -164,12 +220,10 @@ async def test_ac_loss_callback_does_not_fire_on_ob_to_ol() -> None:
 
     monitor.register_ac_loss_callback(on_ac_loss)
 
-    async def fake_get_var(var_name: str) -> str:
-        if "battery.charge" in var_name:
-            return "90"
-        return "OL CHRG"  # 復電
+    async def fake_get_vars(var_names: list[str]) -> dict[str, str]:
+        return {"battery.charge": "90", "ups.status": "OL CHRG"}  # 復電
 
-    monitor._nut_get_var = fake_get_var  # type: ignore[method-assign]
+    monitor._nut_get_vars = fake_get_vars  # type: ignore[method-assign]
 
     await monitor._poll_once()
 
@@ -188,10 +242,10 @@ async def test_poll_once_keeps_cache_on_connection_failure() -> None:
     monitor._cached_on_battery = False
     monitor._nut_available = True
 
-    async def fake_get_var_raises(var_name: str) -> str:
+    async def fake_get_vars_raises(var_names: list[str]) -> dict[str, str]:
         raise ConnectionRefusedError("NUT に接続できません")
 
-    monitor._nut_get_var = fake_get_var_raises  # type: ignore[method-assign]
+    monitor._nut_get_vars = fake_get_vars_raises  # type: ignore[method-assign]
 
     await monitor._poll_once()
 

@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 
 from src.app.robot_controller import InvalidStateTransition, RobotController
 from src.app.stubs import (
+    InMemoryILCRepository,
     InMemoryModeRepository,
     InMemoryProfileRepository,
     InMemoryScheduleRepository,
@@ -73,6 +74,7 @@ def inject_controller() -> MagicMock:
     app.state.mode_repo = InMemoryModeRepository()
     app.state.session_repo = InMemorySessionRepository()
     app.state.schedule_repo = InMemoryScheduleRepository()
+    app.state.ilc_repo = InMemoryILCRepository()
     app.state.db_pool = None
     return ctrl
 
@@ -153,17 +155,49 @@ async def test_profile_put_preserves_arbiter_constants(inject_controller: MagicM
 
 
 @pytest.mark.asyncio
+async def test_profile_deadband_zero_is_accepted(inject_controller: MagicMock) -> None:
+    """D5 回帰テスト: brake/accel_deadband_pct=0.0（不感帯なし、合法値）は 201 で作成できる。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/profiles/",
+            json=_profile_create_payload(
+                feedforward_params={
+                    "brake_deadband_pct": 0.0,
+                    "accel_deadband_pct": 0.0,
+                },
+            ),
+        )
+    assert res.status_code == 201
+    ffp = res.json()["feedforward_params"]
+    assert ffp["brake_deadband_pct"] == 0.0
+    assert ffp["accel_deadband_pct"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_profile_negative_deadband_returns_422(inject_controller: MagicMock) -> None:
+    """負の deadband_pct は不正値として reject する。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(
+            "/api/v1/profiles/",
+            json=_profile_create_payload(
+                feedforward_params={"brake_deadband_pct": -1.0},
+            ),
+        )
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_profile_dynamics_params_roundtrip_and_manual_preview_update(
     inject_controller: MagicMock,
 ) -> None:
-    """dynamics_params(preview_time_s・FOPDT値)が作成時に保存され、PUT で preview だけ
+    """dynamics_params(pid_preview_s・FOPDT値)が作成時に保存され、PUT で pid_preview だけ
     手動更新できること。"""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         create_res = await c.post(
             "/api/v1/profiles/",
             json=_profile_create_payload(
                 dynamics_params={
-                    "preview_time_s": 0.6,
+                    "pid_preview_s": 0.6,
                     "fopdt_k": 0.5,
                     "fopdt_tau": 2.0,
                     "fopdt_theta": 0.6,
@@ -172,32 +206,32 @@ async def test_profile_dynamics_params_roundtrip_and_manual_preview_update(
         )
         assert create_res.status_code == 201
         body = create_res.json()
-        assert body["dynamics_params"]["preview_time_s"] == 0.6
+        assert body["dynamics_params"]["pid_preview_s"] == 0.6
         assert body["dynamics_params"]["fopdt_theta"] == 0.6
         profile_id = body["id"]
 
         put_res = await c.put(
             f"/api/v1/profiles/{profile_id}",
-            json={"dynamics_params": {"preview_time_s": 1.1}},
+            json={"dynamics_params": {"pid_preview_s": 1.1}},
         )
 
     assert put_res.status_code == 200
     dyn = put_res.json()["dynamics_params"]
     # 手動更新時は FOPDT 値もスキーマのデフォルト(None)で上書きされる仕様
     # （同スキーマで受けて上書き可能とする設計上の想定挙動）。
-    assert dyn["preview_time_s"] == 1.1
+    assert dyn["pid_preview_s"] == 1.1
 
 
 @pytest.mark.asyncio
 async def test_profile_created_without_dynamics_params_defaults_to_zero_preview(
     inject_controller: MagicMock,
 ) -> None:
-    """dynamics_params を指定しない作成は preview_time_s=0.0（従来動作互換）になること。"""
+    """dynamics_params を指定しない作成は pid_preview_s=0.0（従来動作互換）になること。"""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         res = await c.post("/api/v1/profiles/", json=_profile_create_payload())
 
     assert res.status_code == 201
-    assert res.json()["dynamics_params"]["preview_time_s"] == 0.0
+    assert res.json()["dynamics_params"]["pid_preview_s"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -237,14 +271,26 @@ async def test_sessions_logs_csv_download() -> None:
 
     started = datetime(2026, 6, 16, 5, 36, 49, tzinfo=UTC)
     session = DriveSession(
-        id="sess-1", profile_id="p1", mode_id=None, run_type="learning",
-        started_at=started, ended_at=None, status="error",
+        id="sess-1",
+        profile_id="p1",
+        mode_id=None,
+        run_type="learning",
+        started_at=started,
+        ended_at=None,
+        status="error",
     )
     log = DriveLog(
-        id=1, session_id="sess-1", timestamp=started,
-        ref_speed_kmh=10.0, actual_speed_kmh=9.5,
-        accel_opening=12.0, brake_opening=0.0,
-        accel_pos=100, brake_pos=0, accel_current=300.0, brake_current=0.0,
+        id=1,
+        session_id="sess-1",
+        timestamp=started,
+        ref_speed_kmh=10.0,
+        actual_speed_kmh=9.5,
+        accel_opening=12.0,
+        brake_opening=0.0,
+        accel_pos=100,
+        brake_pos=0,
+        accel_current=300.0,
+        brake_current=0.0,
     )
 
     class _Repo:
@@ -313,11 +359,18 @@ async def test_learning_train_returns_auto_tuned_pid(inject_controller: MagicMoc
     from src.models.profile import PIDGains, StopConfig, VehicleProfile
 
     prof = VehicleProfile(
-        id="p1", name="Train", max_accel_opening=80.0, max_brake_opening=80.0,
-        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
+        id="p1",
+        name="Train",
+        max_accel_opening=80.0,
+        max_brake_opening=80.0,
+        max_speed=100.0,
+        max_decel_g=0.4,
+        pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
         stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
-        calibration=None, model_path=None,
-        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+        calibration=None,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
     )
     await app.state.profile_repo.create(prof)
 
@@ -328,19 +381,39 @@ async def test_learning_train_returns_auto_tuned_pid(inject_controller: MagicMoc
         i = 0
         for _ in range(60):  # 加速保持（FOPDT 区間 + アクセルレジーム）
             speed = min(80.0, speed + 1.5)
-            out.append(DriveLog(
-                id=i, session_id=session_id, timestamp=t0 + timedelta(seconds=0.1 * i),
-                ref_speed_kmh=None, actual_speed_kmh=speed, accel_opening=40.0,
-                brake_opening=0.0, accel_pos=0, brake_pos=0, accel_current=0.0, brake_current=0.0,
-            ))
+            out.append(
+                DriveLog(
+                    id=i,
+                    session_id=session_id,
+                    timestamp=t0 + timedelta(seconds=0.1 * i),
+                    ref_speed_kmh=None,
+                    actual_speed_kmh=speed,
+                    accel_opening=40.0,
+                    brake_opening=0.0,
+                    accel_pos=0,
+                    brake_pos=0,
+                    accel_current=0.0,
+                    brake_current=0.0,
+                )
+            )
             i += 1
         for _ in range(60):  # 減速（ブレーキレジーム）
             speed = max(0.0, speed - 1.5)
-            out.append(DriveLog(
-                id=i, session_id=session_id, timestamp=t0 + timedelta(seconds=0.1 * i),
-                ref_speed_kmh=None, actual_speed_kmh=speed, accel_opening=0.0,
-                brake_opening=30.0, accel_pos=0, brake_pos=0, accel_current=0.0, brake_current=0.0,
-            ))
+            out.append(
+                DriveLog(
+                    id=i,
+                    session_id=session_id,
+                    timestamp=t0 + timedelta(seconds=0.1 * i),
+                    ref_speed_kmh=None,
+                    actual_speed_kmh=speed,
+                    accel_opening=0.0,
+                    brake_opening=30.0,
+                    accel_pos=0,
+                    brake_pos=0,
+                    accel_current=0.0,
+                    brake_current=0.0,
+                )
+            )
             i += 1
         return out
 
@@ -375,16 +448,28 @@ async def test_pid_tune_validate_returns_kpi_and_cost(inject_controller: MagicMo
     from src.models.profile import PIDGains, StopConfig, VehicleProfile
 
     prof = VehicleProfile(
-        id="p1", name="Val", max_accel_opening=80.0, max_brake_opening=80.0,
-        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=2.0, ki=0.5, kd=0.0),
+        id="p1",
+        name="Val",
+        max_accel_opening=80.0,
+        max_brake_opening=80.0,
+        max_speed=100.0,
+        max_decel_g=0.4,
+        pid_gains=PIDGains(kp=2.0, ki=0.5, kd=0.0),
         stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
-        calibration=None, model_path=None,
-        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+        calibration=None,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
     )
     await app.state.profile_repo.create(prof)
     inject_controller.run_pid_validation = AsyncMock(
-        return_value={"n_samples": 500.0, "p95_kmh": 0.15, "max_abs_deviation_kmh": 0.4,
-                      "reversal_max_per_5s": 1.0, "hard_limit_violations": 0.0}
+        return_value={
+            "n_samples": 500.0,
+            "p95_kmh": 0.15,
+            "max_abs_deviation_kmh": 0.4,
+            "reversal_max_per_5s": 1.0,
+            "hard_limit_violations": 0.0,
+        }
     )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -410,11 +495,18 @@ async def test_pid_tune_validate_409_on_invalid_state(inject_controller: MagicMo
     from src.models.profile import PIDGains, StopConfig, VehicleProfile
 
     prof = VehicleProfile(
-        id="p1", name="Val", max_accel_opening=80.0, max_brake_opening=80.0,
-        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=2.0, ki=0.5, kd=0.0),
+        id="p1",
+        name="Val",
+        max_accel_opening=80.0,
+        max_brake_opening=80.0,
+        max_speed=100.0,
+        max_decel_g=0.4,
+        pid_gains=PIDGains(kp=2.0, ki=0.5, kd=0.0),
         stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
-        calibration=None, model_path=None,
-        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+        calibration=None,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
     )
     await app.state.profile_repo.create(prof)
     inject_controller.run_pid_validation = AsyncMock(
@@ -433,17 +525,24 @@ async def test_pid_tune_refine_saves_best_gains(inject_controller: MagicMock) ->
     from src.models.profile import PIDGains, StopConfig, VehicleProfile
 
     prof = VehicleProfile(
-        id="p1", name="Ref", max_accel_opening=80.0, max_brake_opening=80.0,
-        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
+        id="p1",
+        name="Ref",
+        max_accel_opening=80.0,
+        max_brake_opening=80.0,
+        max_speed=100.0,
+        max_decel_g=0.4,
+        pid_gains=PIDGains(kp=1.0, ki=0.1, kd=0.0),
         stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
-        calibration=None, model_path=None,
-        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+        calibration=None,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
     )
     await app.state.profile_repo.create(prof)
-    best = TuningParams(kp=2.5, ki=0.4, kd=0.0, preview_time_s=0.7)
+    best = TuningParams(kp=2.5, ki=0.4, kd=0.0, pid_preview_s=0.7)
     history = [
-        {"kp": 1.0, "ki": 0.1, "kd": 0.0, "preview_time_s": 0.0, "cost": 3.0},
-        {"kp": 2.5, "ki": 0.4, "kd": 0.0, "preview_time_s": 0.7, "cost": 1.2},
+        {"kp": 1.0, "ki": 0.1, "kd": 0.0, "pid_preview_s": 0.0, "cost": 3.0},
+        {"kp": 2.5, "ki": 0.4, "kd": 0.0, "pid_preview_s": 0.7, "cost": 1.2},
     ]
     inject_controller.run_pid_tuning_session = AsyncMock(return_value=(best, history))
 
@@ -458,10 +557,40 @@ async def test_pid_tune_refine_saves_best_gains(inject_controller: MagicMock) ->
     assert body["best_cost"] == 1.2
     assert len(body["history"]) == 2
     inject_controller.refresh_active_profile.assert_called_once()
-    # 最良ゲイン・先読み補償秒数が永続化されていること
+    # 最良ゲイン・PID 先読み補償秒数が永続化されていること
     saved = await app.state.profile_repo.get_by_id("p1")
     assert saved.pid_gains.kp == 2.5
-    assert saved.dynamics_params.preview_time_s == pytest.approx(0.7)
+    assert saved.dynamics_params.pid_preview_s == pytest.approx(0.7)
+
+
+@pytest.mark.asyncio
+async def test_select_profile_returns_409_on_invalid_state(inject_controller: MagicMock) -> None:
+    """W1 回帰テスト: STANDBY/READY 以外で select-profile を呼ぶと 409 を返す
+    （app レベル例外ハンドラ導入前は未捕捉の InvalidStateTransition で 500 になっていた）。"""
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile
+
+    prof = VehicleProfile(
+        id="p1",
+        name="Sel",
+        max_accel_opening=80.0,
+        max_brake_opening=80.0,
+        max_speed=100.0,
+        max_decel_g=0.4,
+        pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
+    )
+    await app.state.profile_repo.create(prof)
+    inject_controller.select_profile = MagicMock(
+        side_effect=InvalidStateTransition("select_profile は STANDBY/READY 状態でのみ呼べます")
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/select-profile", json={"profile_id": "p1"})
+    assert res.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -568,6 +697,32 @@ async def test_schedule_non_monotonic_pedal_points_returns_422() -> None:
 
 
 @pytest.mark.asyncio
+async def test_schedule_simultaneous_pedal_point_returns_422() -> None:
+    """D3 回帰テスト: 単一ポイントでアクセル・ブレーキが同時に非ゼロなら reject する。"""
+    payload = _schedule_payload("both-nonzero")
+    payload["pedal_points"] = [
+        {"time_s": 0.0, "accel_opening": 30.0, "brake_opening": 20.0},
+    ]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/schedules/", json=payload)
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_schedule_crossover_pedal_segment_returns_422() -> None:
+    """D3 回帰テスト: 各ポイント単体は排他でも、区間内でクロスオーバーし両ペダルが
+    同時に非ゼロになり得る補間区間は reject する。"""
+    payload = _schedule_payload("crossover")
+    payload["pedal_points"] = [
+        {"time_s": 0.0, "accel_opening": 50.0, "brake_opening": 0.0},
+        {"time_s": 10.0, "accel_opening": 0.0, "brake_opening": 50.0},
+    ]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/schedules/", json=payload)
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_schedule_invalid_channel_returns_422() -> None:
     payload = _schedule_payload("badch")
     payload["button_events"] = [{"time_s": 0.0, "channel": 99, "press_duration_s": 1.0}]
@@ -600,3 +755,54 @@ async def test_schedule_drive_start_unknown_id_returns_404() -> None:
             json={"schedule_id": "00000000-0000-0000-0000-000000000000"},
         )
     assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# ILC（反復学習制御）エンドポイント
+# ---------------------------------------------------------------------------
+
+_ILC_PID = "11111111-1111-1111-1111-111111111111"
+_ILC_MID = "22222222-2222-2222-2222-222222222222"
+
+
+@pytest.mark.asyncio
+async def test_ilc_status_defaults_when_unlearned() -> None:
+    """未学習の profile×mode は iteration=0・enabled=true・has_table=false。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.get(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["iteration"] == 0
+    assert body["enabled"] is True
+    assert body["has_table"] is False
+
+
+@pytest.mark.asyncio
+async def test_ilc_disable_then_enable_roundtrip() -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}/disable")
+        assert res.status_code == 200
+        assert res.json()["enabled"] is False
+        # 永続化されている
+        res = await c.get(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}")
+        assert res.json()["enabled"] is False
+        res = await c.post(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}/enable")
+        assert res.json()["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_ilc_reset_clears_table() -> None:
+    from src.domain.control.ilc import ILCTable
+
+    # 事前に学習済みテーブルを仕込む
+    await app.state.ilc_repo.upsert(
+        _ILC_PID, _ILC_MID, ILCTable(efforts=[1.0, 2.0], dt_s=0.1, iteration=3), [{"p95_kmh": 0.2}]
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.get(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}")
+        assert res.json()["iteration"] == 3
+        assert res.json()["has_table"] is True
+        res = await c.post(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}/reset")
+        assert res.status_code == 200
+        assert res.json()["iteration"] == 0
+        assert res.json()["has_table"] is False

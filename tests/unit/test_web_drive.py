@@ -701,18 +701,135 @@ async def test_learning_cycle_status_returns_idle_by_default() -> None:
 
 
 @pytest.mark.asyncio
-async def test_learning_cycle_start_returns_202_with_cycle_id(
-    stub_controller: MagicMock,
-) -> None:
+async def test_learning_cycle_arm_ok(stub_controller: MagicMock) -> None:
+    """学習サイクル arm: 200 で status='armed'、profile.id で orchestrator.arm が呼ばれること。"""
     from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
 
     stub_controller.get_active_profile.return_value = VehicleProfile(
-        id="p1", name="t", max_accel_opening=80.0, max_brake_opening=80.0,
-        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        id="p1",
+        name="t",
+        max_accel_opening=80.0,
+        max_brake_opening=80.0,
+        max_speed=100.0,
+        max_decel_g=0.4,
+        pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
         stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
-        calibration=None, model_path=None,
-        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
+        calibration=None,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
     )
+    app.state.controller = stub_controller
+
+    orchestrator = MagicMock()
+    orchestrator.arm = AsyncMock()
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/arm")
+    assert res.status_code == 200
+    assert res.json()["status"] == "armed"
+    orchestrator.arm.assert_awaited_once_with("p1")
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_arm_no_active_profile_returns_404(
+    stub_controller: MagicMock,
+) -> None:
+    stub_controller.get_active_profile.return_value = None
+    app.state.controller = stub_controller
+    app.state.cycle_orchestrator = MagicMock()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/arm")
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_arm_invalid_state_returns_409(stub_controller: MagicMock) -> None:
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
+
+    stub_controller.get_active_profile.return_value = VehicleProfile(
+        id="p1",
+        name="t",
+        max_accel_opening=80.0,
+        max_brake_opening=80.0,
+        max_speed=100.0,
+        max_decel_g=0.4,
+        pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
+    )
+    app.state.controller = stub_controller
+    orchestrator = MagicMock()
+    orchestrator.arm = AsyncMock(side_effect=InvalidStateTransition("READY 以外不可"))
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/arm")
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_arm_busy_returns_409(stub_controller: MagicMock) -> None:
+    from src.app.learning_cycle import CycleBusyError  # noqa: PLC0415
+    from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
+
+    stub_controller.get_active_profile.return_value = VehicleProfile(
+        id="p1",
+        name="t",
+        max_accel_opening=80.0,
+        max_brake_opening=80.0,
+        max_speed=100.0,
+        max_decel_g=0.4,
+        pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
+        calibration=None,
+        model_path=None,
+        created_at=datetime.now(tz=UTC),
+        updated_at=datetime.now(tz=UTC),
+    )
+    app.state.controller = stub_controller
+    orchestrator = MagicMock()
+    orchestrator.arm = AsyncMock(side_effect=CycleBusyError("実行中"))
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/arm")
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_cancel_ok() -> None:
+    orchestrator = MagicMock()
+    orchestrator.cancel = AsyncMock()
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/cancel")
+    assert res.status_code == 200
+    assert res.json()["status"] == "cancelled"
+    orchestrator.cancel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_cancel_invalid_state_returns_409() -> None:
+    orchestrator = MagicMock()
+    orchestrator.cancel = AsyncMock(side_effect=InvalidStateTransition("arm 後のみ可"))
+    app.state.cycle_orchestrator = orchestrator
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.post("/api/v1/drive/learning-cycle/cancel")
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_learning_cycle_start_returns_202_with_cycle_id(
+    stub_controller: MagicMock,
+) -> None:
     app.state.controller = stub_controller
 
     orchestrator = MagicMock()
@@ -727,50 +844,17 @@ async def test_learning_cycle_start_returns_202_with_cycle_id(
     assert res.status_code == 202
     assert res.json() == {"cycle_id": "cycle-abc", "status": "started"}
     orchestrator.start.assert_awaited_once()
-    assert orchestrator.start.await_args.args[0] == "p1"
-    assert orchestrator.start.await_args.args[1] == 3
-    assert orchestrator.start.await_args.args[2] == 2
+    assert orchestrator.start.await_args.args[0] == 3
+    assert orchestrator.start.await_args.args[1] == 2
 
 
 @pytest.mark.asyncio
-async def test_learning_cycle_start_not_ready_returns_409(stub_controller: MagicMock) -> None:
-    ctrl = _make_stub_controller(state=RobotState.STANDBY)
-    app.state.controller = ctrl
-    app.state.cycle_orchestrator = MagicMock()
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        res = await c.post("/api/v1/drive/learning-cycle/start", json={})
-    assert res.status_code == 409
-
-
-@pytest.mark.asyncio
-async def test_learning_cycle_start_no_active_profile_returns_404(
-    stub_controller: MagicMock,
-) -> None:
-    stub_controller.get_active_profile.return_value = None
-    app.state.controller = stub_controller
-    app.state.cycle_orchestrator = MagicMock()
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        res = await c.post("/api/v1/drive/learning-cycle/start", json={})
-    assert res.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_learning_cycle_start_busy_returns_409(stub_controller: MagicMock) -> None:
-    from src.app.learning_cycle import CycleBusyError  # noqa: PLC0415
-    from src.models.profile import PIDGains, StopConfig, VehicleProfile  # noqa: PLC0415
-
-    stub_controller.get_active_profile.return_value = VehicleProfile(
-        id="p1", name="t", max_accel_opening=80.0, max_brake_opening=80.0,
-        max_speed=100.0, max_decel_g=0.4, pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
-        stop_config=StopConfig(deviation_threshold_kmh=2.0, deviation_duration_s=4.0),
-        calibration=None, model_path=None,
-        created_at=datetime.now(tz=UTC), updated_at=datetime.now(tz=UTC),
-    )
+async def test_learning_cycle_start_not_armed_returns_409(stub_controller: MagicMock) -> None:
     app.state.controller = stub_controller
     orchestrator = MagicMock()
-    orchestrator.start = AsyncMock(side_effect=CycleBusyError("実行中"))
+    orchestrator.start = AsyncMock(
+        side_effect=InvalidStateTransition("学習サイクルの開始には先に arm() が必要です")
+    )
     app.state.cycle_orchestrator = orchestrator
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:

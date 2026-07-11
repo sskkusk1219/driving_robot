@@ -17,7 +17,7 @@ def _write_toml(content: str) -> Path:
 
 class TestModelSettingsDefaults:
     def test_missing_model_section_uses_defaults(self) -> None:
-        path = _write_toml("[serial]\naccel_port = \"/dev/ttyUSB0\"\n")
+        path = _write_toml('[serial]\naccel_port = "/dev/ttyUSB0"\n')
         settings = load_settings(path)
         assert settings.model == ModelSettings()
 
@@ -54,9 +54,7 @@ class TestModelSettingsParsing:
         assert settings.model.lookahead_horizons_s == (0.5, 1.0, 2.0, 3.0)
 
     def test_include_flags_parsed(self) -> None:
-        path = _write_toml(
-            "[model]\ninclude_v0_sq = false\ninclude_dv_regime_x_v0 = false\n"
-        )
+        path = _write_toml("[model]\ninclude_v0_sq = false\ninclude_dv_regime_x_v0 = false\n")
         settings = load_settings(path)
         assert settings.model.include_v0_sq is False
         assert settings.model.include_dv_regime_x_v0 is False
@@ -64,11 +62,12 @@ class TestModelSettingsParsing:
 
 class TestLearningSettings:
     def test_missing_section_uses_defaults(self) -> None:
-        path = _write_toml("[serial]\naccel_port = \"/dev/ttyUSB0\"\n")
+        path = _write_toml('[serial]\naccel_port = "/dev/ttyUSB0"\n')
         settings = load_settings(path)
         assert settings.learning == LearningSettings()
         assert settings.learning.refine_runs_stage1 == 14
-        assert settings.learning.refine_runs_stage2 == 5
+        assert settings.learning.refine_runs_stage2 == 12
+        assert settings.learning.tuning_on_target_mode is False
 
     def test_custom_values_parsed(self) -> None:
         path = _write_toml(

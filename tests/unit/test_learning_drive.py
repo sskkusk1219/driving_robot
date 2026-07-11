@@ -74,9 +74,7 @@ class TestGeneratePatterns:
         assert len(patterns) > 0
 
     def test_contains_expected_kinds(self) -> None:
-        kinds = {
-            p.kind for p in make_manager(coast_down_count=3).generate_patterns(make_profile())
-        }
+        kinds = {p.kind for p in make_manager(coast_down_count=3).generate_patterns(make_profile())}
         assert kinds == {
             PatternKind.CREEP,
             PatternKind.CREEP_SETTLE,
@@ -84,6 +82,7 @@ class TestGeneratePatterns:
             PatternKind.ACCEL_SWEEP,
             PatternKind.BRAKE_HOLD,
             PatternKind.COAST_DOWN,
+            PatternKind.CRUISE_TRIM,
         }
 
     def test_exactly_one_creep_settle_with_zero_openings(self) -> None:
@@ -112,16 +111,23 @@ class TestGeneratePatterns:
             assert p.brake_opening >= 0.0
 
     def test_hold_duration_uses_config(self) -> None:
-        # ACCEL_DEADBAND_PROBE は専用の hold_duration_s（accel_deadband_probe_hold_s）を持つため
-        # 汎用の hold_duration_s とは別に検証する。
+        # ACCEL_DEADBAND_PROBE / CRUISE_TRIM は専用の保持時間を持つため汎用 hold_duration_s
+        # とは別に検証する。
         patterns = make_manager(hold_duration=2.5).generate_patterns(make_profile())
-        non_probe = [p for p in patterns if p.kind is not PatternKind.ACCEL_DEADBAND_PROBE]
-        assert all(p.hold_duration_s == 2.5 for p in non_probe)
+        generic = [
+            p
+            for p in patterns
+            if p.kind not in (PatternKind.ACCEL_DEADBAND_PROBE, PatternKind.CRUISE_TRIM)
+        ]
+        assert all(p.hold_duration_s == 2.5 for p in generic)
 
     def test_creep_release_starts_at_stop_brake_and_decreases_above_zero(self) -> None:
         profile = make_profile(stop_brake_opening_pct=20.0)
-        creep = [p.brake_opening for p in make_manager(creep_steps=5).generate_patterns(profile)
-                 if p.kind is PatternKind.CREEP]
+        creep = [
+            p.brake_opening
+            for p in make_manager(creep_steps=5).generate_patterns(profile)
+            if p.kind is PatternKind.CREEP
+        ]
         assert creep[0] == 20.0  # 停車保持ブレーキから開始
         assert creep[-1] > 0.0  # 0 は CREEP_SETTLE が担うため解放ステップは > 0 で終わる
         assert creep == sorted(creep, reverse=True)  # 単調減少
@@ -165,7 +171,8 @@ class TestAccelSweep:
         # ACCEL_SWEEP は停車復帰用のリセットブレーキ（>0）を持つ
         profile = make_profile(max_brake_opening=80.0)
         sweeps = [
-            p for p in make_manager(accel_sweep_reset_brake_pct=30.0).generate_patterns(profile)
+            p
+            for p in make_manager(accel_sweep_reset_brake_pct=30.0).generate_patterns(profile)
             if p.kind is PatternKind.ACCEL_SWEEP
         ]
         assert sweeps
@@ -181,7 +188,8 @@ class TestAccelSweep:
     def test_zero_max_accel_yields_no_accel_sweep(self) -> None:
         profile = make_profile(max_accel_opening=0.0)
         sweeps = [
-            p for p in make_manager().generate_patterns(profile)
+            p
+            for p in make_manager().generate_patterns(profile)
             if p.kind is PatternKind.ACCEL_SWEEP
         ]
         assert sweeps == []
@@ -249,7 +257,6 @@ class TestBrakeHold:
 
         assert min(BRAKE_HOLD_OPENINGS_PCT) <= 5.0
 
-
     def test_brake_hold_sweeps_several_openings(self) -> None:
         profile = make_profile(max_brake_opening=80.0)
         brakes = sorted(
@@ -274,7 +281,8 @@ class TestBrakeHold:
         # cap まで上げる加速開度を持ち、max_accel でクランプされる
         profile = make_profile(max_accel_opening=60.0)
         holds = [
-            p for p in make_manager(brake_hold_accel_pct=70.0).generate_patterns(profile)
+            p
+            for p in make_manager(brake_hold_accel_pct=70.0).generate_patterns(profile)
             if p.kind is PatternKind.BRAKE_HOLD
         ]
         assert holds
@@ -285,8 +293,7 @@ class TestBrakeHold:
         # cap まで上げられないなら BRAKE_HOLD は生成しない
         profile = make_profile(max_accel_opening=0.0)
         holds = [
-            p for p in make_manager().generate_patterns(profile)
-            if p.kind is PatternKind.BRAKE_HOLD
+            p for p in make_manager().generate_patterns(profile) if p.kind is PatternKind.BRAKE_HOLD
         ]
         assert holds == []
 
@@ -305,19 +312,59 @@ class TestCoastDown:
 
     def test_coast_down_accel_clamped_to_max(self) -> None:
         profile = make_profile(max_accel_opening=30.0)
-        coast = [p for p in make_manager(coast_down_count=2, coast_down_accel_pct=70.0)
-                 .generate_patterns(profile) if p.kind is PatternKind.COAST_DOWN]
+        coast = [
+            p
+            for p in make_manager(coast_down_count=2, coast_down_accel_pct=70.0).generate_patterns(
+                profile
+            )
+            if p.kind is PatternKind.COAST_DOWN
+        ]
         assert all(p.accel_opening == 30.0 for p in coast)
 
     def test_coast_down_count_zero_yields_none(self) -> None:
-        coast = [p for p in make_manager(coast_down_count=0).generate_patterns(make_profile())
-                 if p.kind is PatternKind.COAST_DOWN]
+        coast = [
+            p
+            for p in make_manager(coast_down_count=0).generate_patterns(make_profile())
+            if p.kind is PatternKind.COAST_DOWN
+        ]
         assert coast == []
+
+
+class TestCruiseTrim:
+    """B-7-2: 高速巡航トリム（cap まで加速→微小開度保持で高速域×微小開度を採取）。"""
+
+    def test_cruise_trim_patterns_generated(self) -> None:
+        patterns = make_manager().generate_patterns(make_profile())
+        trims = [p for p in patterns if p.kind is PatternKind.CRUISE_TRIM]
+        assert len(trims) == 2  # 既定 CRUISE_TRIM_OPENINGS_PCT=(1.5, 3.0)
+        for p in trims:
+            assert p.accel_opening == 70.0  # cap まで上げる加速
+            assert p.brake_opening == 0.0
+            assert 0.0 < p.trim_opening <= 5.0  # 微小開度
+            assert p.hold_duration_s == 8.0  # 専用の保持時間
+
+    def test_cruise_trim_openings_match_config(self) -> None:
+        trims = [
+            p
+            for p in make_manager().generate_patterns(make_profile())
+            if p.kind is PatternKind.CRUISE_TRIM
+        ]
+        assert sorted(p.trim_opening for p in trims) == [1.5, 3.0]
+
+    def test_cruise_trim_accel_clamped_to_max(self) -> None:
+        profile = make_profile(max_accel_opening=40.0)
+        trims = [
+            p
+            for p in make_manager().generate_patterns(profile)
+            if p.kind is PatternKind.CRUISE_TRIM
+        ]
+        assert all(p.accel_opening == 40.0 for p in trims)
 
 
 class TestOrdering:
     def test_phases_in_expected_order(self) -> None:
-        # CREEP → CREEP_SETTLE → ACCEL_DEADBAND_PROBE → ACCEL_SWEEP → BRAKE_HOLD → COAST_DOWN の順
+        # CREEP → CREEP_SETTLE → ACCEL_DEADBAND_PROBE → ACCEL_SWEEP → BRAKE_HOLD → COAST_DOWN
+        # → CRUISE_TRIM の順
         patterns = make_manager(coast_down_count=2).generate_patterns(make_profile())
         order = [p.kind for p in patterns]
         first_idx = {
@@ -329,6 +376,7 @@ class TestOrdering:
                 PatternKind.ACCEL_SWEEP,
                 PatternKind.BRAKE_HOLD,
                 PatternKind.COAST_DOWN,
+                PatternKind.CRUISE_TRIM,
             )
         }
         assert (
@@ -338,4 +386,5 @@ class TestOrdering:
             < first_idx[PatternKind.ACCEL_SWEEP]
             < first_idx[PatternKind.BRAKE_HOLD]
             < first_idx[PatternKind.COAST_DOWN]
+            < first_idx[PatternKind.CRUISE_TRIM]
         )

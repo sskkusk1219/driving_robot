@@ -187,3 +187,39 @@ class TestPIDMeasuredDt:
         pid = PIDController(kp=0.0, ki=1.0, kd=0.0, dt=DT)
         output = pid.update(setpoint=60.0, measurement=50.0)
         assert output == pytest.approx(0.5)
+
+
+class TestPIDGainScale:
+    """Stage B: 速度依存プラントゲイン正規化係数 gain_scale。"""
+
+    def test_scale_multiplies_p_output(self) -> None:
+        pid = PIDController(kp=2.0, ki=0.0, kd=0.0, dt=DT, output_limit=500.0)
+        base = pid.update(setpoint=10.0, measurement=0.0)  # error=10 → 20
+        pid.reset()
+        scaled = pid.update(setpoint=10.0, measurement=0.0, gain_scale=1.5)
+        assert base == pytest.approx(20.0)
+        assert scaled == pytest.approx(30.0)  # 1.5 * 20
+
+    def test_scale_one_is_regression(self) -> None:
+        pid_a = PIDController(kp=1.5, ki=0.3, kd=0.2, dt=DT, output_limit=500.0)
+        pid_b = PIDController(kp=1.5, ki=0.3, kd=0.2, dt=DT, output_limit=500.0)
+        for m in (0.0, 3.0, 7.0, 6.0):
+            a = pid_a.update(setpoint=10.0, measurement=m)
+            b = pid_b.update(setpoint=10.0, measurement=m, gain_scale=1.0)
+            assert a == pytest.approx(b)
+
+    def test_nonpositive_scale_falls_back_to_one(self) -> None:
+        pid = PIDController(kp=2.0, ki=0.0, kd=0.0, dt=DT, output_limit=500.0)
+        out = pid.update(setpoint=10.0, measurement=0.0, gain_scale=0.0)
+        assert out == pytest.approx(20.0)  # scale<=0 → 1.0
+
+    def test_integral_clamp_scales_with_gain(self) -> None:
+        """I 項単独出力の上限は output_limit/(ki*scale)。scale=2 なら integral 上限は半分。"""
+        pid = PIDController(kp=0.0, ki=2.0, kd=0.0, dt=DT, output_limit=10.0)
+        for _ in range(1000):
+            pid.update(setpoint=100.0, measurement=0.0, gain_scale=2.0)
+        # integral は output_limit/(ki*scale) = 10/(2*2) = 2.5 にクランプされ、
+        # 出力は scale*ki*integral = 2*2*2.5 = 10.0（= output_limit）で頭打ち。
+        assert pid._integral == pytest.approx(2.5)
+        out = pid.update(setpoint=100.0, measurement=0.0, gain_scale=2.0)
+        assert out == pytest.approx(10.0)

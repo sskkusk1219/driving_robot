@@ -135,9 +135,14 @@ class TestBuildFeatureRow:
             accel_horizons_s=(0.2,),
         )
         assert spec.feature_names() == [
-            "v0", "dv_0.1", "dv_0.2", "dv_0.3",
-            "v0_sq", "dv1_x_v0",
-            "dv_past_0.1", "dv_past_0.2",
+            "v0",
+            "dv_0.1",
+            "dv_0.2",
+            "dv_0.3",
+            "v0_sq",
+            "dv1_x_v0",
+            "dv_past_0.1",
+            "dv_past_0.2",
             "accel_0.2",
         ]
 
@@ -404,6 +409,20 @@ class TestEstimateDynamicsParams:
         assert new.engine_brake_decel_kmhs == pytest.approx(1.0, abs=0.2)
         assert new.creep_rate_kmhs == pytest.approx(0.5, abs=0.2)
 
+    def test_deadband_zero_still_estimates_pedal_off_constants(self) -> None:
+        """D5 回帰テスト: accel/brake_deadband_pct=0.0（合法値）でも strict < の
+        falsy-zero でクリープ/エンジンブレーキ推定が全滅しない。"""
+        n = 12
+        creep = _flat_session("s_creep", [6.0] * n, 0.0, 0.0)  # クリープ定常 6km/h
+        coast = _flat_session("s_coast", [60.0 - 0.1 * i for i in range(n)], 0.0, 0.0)  # -1km/h/s
+
+        new = estimate_dynamics_params(
+            creep + coast, FeedforwardParams(accel_deadband_pct=0.0, brake_deadband_pct=0.0)
+        )
+
+        assert new.creep_speed_kmh == pytest.approx(6.0, abs=0.5)
+        assert new.engine_brake_decel_kmhs == pytest.approx(1.0, abs=0.2)
+
     def test_deadbands_keep_current_when_no_probe_data(self) -> None:
         """不感帯プローブ域(低開度の意図的保持)のサンプルが無いログでは既存値を保持する。
 
@@ -471,12 +490,8 @@ class TestEstimateOnsetDeadbandPct:
         """応答ありのビンでもサンプル数不足ならスキップされ、次の十分なビンで検出される。"""
         few = DEADBAND_MIN_BIN_SAMPLES - 1
         enough = DEADBAND_MIN_BIN_SAMPLES
-        openings = np.concatenate(
-            [np.full(enough, 0.0), np.full(few, 3.0), np.full(enough, 5.0)]
-        )
-        response = np.concatenate(
-            [np.zeros(enough), np.full(few, 9.0), np.full(enough, 9.0)]
-        )
+        openings = np.concatenate([np.full(enough, 0.0), np.full(few, 3.0), np.full(enough, 5.0)])
+        response = np.concatenate([np.zeros(enough), np.full(few, 9.0), np.full(enough, 9.0)])
         # bin(3.0) はサンプル不足でスキップされ、bin(5.0) で検出される
         assert _estimate_onset_deadband_pct(openings, response) == pytest.approx(5.0)
 

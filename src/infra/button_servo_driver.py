@@ -183,14 +183,38 @@ class ButtonServoDriver:
             return False
 
     async def press(self, channel: int, duration_s: float) -> None:
-        """指定チャンネルを押下角へ動かし duration_s 保持してから待機角へ戻す。"""
+        """指定チャンネルを押下角へ動かし duration_s 保持してから待機角へ戻す。
+
+        待機中のキャンセルや解放時の I2C エラーでボタンを押したまま放置しないよう、
+        解放（待機角への復帰）は try/finally で必ず試みる（I1 レビュー指摘）。
+        """
         if not CH_MIN <= channel <= CH_MAX:
             raise ValueError(f"channel は {CH_MIN}-{CH_MAX} で指定してください: {channel}")
         if self._bus is None:
             raise RuntimeError("connect() を先に呼んでください")
         await asyncio.to_thread(self._set_angle, channel, self._press_angle)
-        await asyncio.sleep(max(0.0, duration_s))
-        await asyncio.to_thread(self._set_angle, channel, self._rest_angle)
+        try:
+            await asyncio.sleep(max(0.0, duration_s))
+        finally:
+            # shield: press() 自体がキャンセルされても解放処理は打ち切らない
+            # （キャンセルが再度伝播しても解放タスクはバックグラウンドで完了を試みる）。
+            await asyncio.shield(self._release_channel(channel))
+
+    async def _release_channel(self, channel: int) -> None:
+        """指定チャンネルを待機角へ戻す。1回失敗したら1回だけリトライし、
+        それでも失敗したらログのみ残す（呼び出し元の finally/キャンセル経路を止めない）。"""
+        for attempt in range(2):
+            try:
+                await asyncio.to_thread(self._set_angle, channel, self._rest_angle)
+                return
+            except OSError:
+                if attempt == 0:
+                    continue
+                _logger.exception(
+                    "ボタンサーボの解放に失敗しました (channel=%d): "
+                    "押下状態のまま残っている可能性があります",
+                    channel,
+                )
 
     async def release_all(self) -> None:
         """全チャンネルを待機角へ戻す（非常停止・エラー時の安全動作）。

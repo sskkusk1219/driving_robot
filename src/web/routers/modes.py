@@ -7,14 +7,14 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
-from src.infra.db import DuplicateNameError
 from src.models.driving_mode import DrivingMode, SpeedPoint
-from src.web.deps import ModeRepoProtocol, get_mode_repo
+from src.web.deps import ILCRepoProtocol, ModeRepoProtocol, get_ilc_repo, get_mode_repo
 from src.web.schemas import ModeDetailResponse, ModeResponse, ModeUpdateRequest, SpeedPointSchema
 
 router = APIRouter(prefix="/api/v1/modes", tags=["modes"])
 
 ModeRepo = Annotated[ModeRepoProtocol, Depends(get_mode_repo)]
+ILCRepo = Annotated[ILCRepoProtocol, Depends(get_ilc_repo)]
 
 
 def _to_response(m: DrivingMode) -> ModeResponse:
@@ -145,10 +145,7 @@ async def upload_mode(
         max_speed=max_speed,
         created_at=datetime.now(tz=UTC),
     )
-    try:
-        created = await repo.create(mode)
-    except DuplicateNameError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    created = await repo.create(mode)
     return _to_response(created)
 
 
@@ -168,10 +165,15 @@ async def replace_mode(
     mode_id: str,
     repo: ModeRepo,
     file: UploadFile,
+    ilc_repo: ILCRepo,
     name: Annotated[str, Form()] = "",
     description: Annotated[str, Form()] = "",
 ) -> ModeResponse:
-    """基準車速 CSV を再アップロードして走行モードを差し替える。"""
+    """基準車速 CSV を再アップロードして走行モードを差し替える。
+
+    基準軌跡が変わると ILC の時刻別補正テーブルは無効（別の走行軌跡の残差）になるため、
+    このモードの ILC テーブルを全プロファイルぶんリセットする。
+    """
     try:
         existing = await repo.get_by_id(mode_id)
     except ValueError:
@@ -201,6 +203,7 @@ async def replace_mode(
     updated = await repo.update(merged)
     if updated is None:
         raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
+    await ilc_repo.reset_for_mode(mode_id)  # 軌跡変更で ILC 補正は無効
     return _to_response(updated)
 
 

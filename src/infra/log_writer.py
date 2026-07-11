@@ -2,11 +2,26 @@
 
 import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
 
 from src.models.drive_log import DriveLogData
+
+# drive_logs バッファのフラッシュ間隔 [s]。1サンプル=1INSERT=1プール接続取得だと
+# 10件/s・10時間走行で36万往復のDBラウンドトリップが発生するため、この間隔ごとに
+# executemany でまとめて書き込む（E5 レビュー指摘）。
+LOG_FLUSH_INTERVAL_S: float = 0.5
+
+_INSERT_LOG_SQL = """
+    INSERT INTO drive_logs
+        (session_id, timestamp, ref_speed_kmh, actual_speed_kmh,
+         accel_opening, brake_opening, accel_pos, brake_pos,
+         accel_current, brake_current)
+    VALUES
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+"""
 
 
 class LogWriter:
@@ -16,10 +31,17 @@ class LogWriter:
     各操作（start_session / write_log / end_session）ごとに Pool.execute が
     接続を都度取得・解放するため、Web 駆動で寿命が不定な走行セッションに適合する。
     単一 Connection を渡した場合は呼び出し元が接続寿命を管理する。
+
+    write_log は即座に INSERT せず、LOG_FLUSH_INTERVAL_S 毎にバッファをまとめて
+    executemany する（E5 レビュー指摘）。timestamp はサンプル取得時刻をアプリ側
+    （write_log 呼び出し時）で記録する。バッチ内で SQL の NOW() を使うと、同一
+    トランザクション内の全行が同じ時刻になり時系列としての意味を失うため。
     """
 
     def __init__(self, conn: asyncpg.Connection | asyncpg.Pool) -> None:
         self._conn = conn
+        self._log_buffer: list[tuple[Any, ...]] = []
+        self._last_flush_at: float | None = None
 
     async def start_session(
         self,
@@ -89,37 +111,51 @@ class LogWriter:
         )
 
     async def write_log(self, session_id: str, data: DriveLogData) -> None:
-        """drive_logs に 1 レコードを INSERT する。timestamp は DB 側 NOW() を使用。
+        """drive_logs へ書き込むサンプルをバッファに追加する。
 
-        100ms 周期で呼ばれることを前提とし、5ms 以内の完了を目標とする。
+        100ms 周期で呼ばれることを前提とする。即座に INSERT せず、
+        LOG_FLUSH_INTERVAL_S 毎にバッファをまとめて executemany する（E5 レビュー指摘）。
         """
-        await self._conn.execute(
-            """
-            INSERT INTO drive_logs
-                (session_id, timestamp, ref_speed_kmh, actual_speed_kmh,
-                 accel_opening, brake_opening, accel_pos, brake_pos,
-                 accel_current, brake_current)
-            VALUES
-                ($1, NOW(), $2, $3, $4, $5, $6, $7, $8, $9)
-            """,
-            session_id,
-            data.ref_speed_kmh,
-            data.actual_speed_kmh,
-            data.accel_opening,
-            data.brake_opening,
-            data.accel_pos,
-            data.brake_pos,
-            data.accel_current,
-            data.brake_current,
+        now = datetime.now(tz=UTC)
+        self._log_buffer.append(
+            (
+                session_id,
+                now,
+                data.ref_speed_kmh,
+                data.actual_speed_kmh,
+                data.accel_opening,
+                data.brake_opening,
+                data.accel_pos,
+                data.brake_pos,
+                data.accel_current,
+                data.brake_current,
+            )
         )
+        if self._last_flush_at is None:
+            self._last_flush_at = now.timestamp()
+        elif now.timestamp() - self._last_flush_at >= LOG_FLUSH_INTERVAL_S:
+            await self._flush_log_buffer()
+
+    async def _flush_log_buffer(self) -> None:
+        """バッファ中の drive_logs サンプルをまとめて INSERT する。空なら何もしない。"""
+        self._last_flush_at = datetime.now(tz=UTC).timestamp()
+        if not self._log_buffer:
+            return
+        rows = self._log_buffer
+        self._log_buffer = []
+        await self._conn.executemany(_INSERT_LOG_SQL, rows)
 
     async def end_session(self, session_id: str, status: str) -> None:
         """drive_sessions.ended_at と status を UPDATE してセッションを終了する。
+
+        バッファに残っている drive_logs サンプルを先にフラッシュしてから終了する
+        （フラッシュ間隔未達のまま走行終了しても最後のサンプルが失われないようにする）。
 
         Args:
             session_id: 終了するセッションの UUID 文字列
             status: 'completed' | 'error' | 'emergency'
         """
+        await self._flush_log_buffer()
         await self._conn.execute(
             """
             UPDATE drive_sessions

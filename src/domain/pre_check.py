@@ -6,12 +6,14 @@
 
 from typing import Protocol
 
+from src.domain.control.conversions import VEHICLE_STOP_SPEED_KMH
 from src.models.pre_check import PreCheckItemResult, PreCheckResult
 from src.models.profile import VehicleProfile
 
 HOME_POSITION_TOLERANCE_PULSE: int = 10
 UPS_MIN_BATTERY_PCT: float = 20.0
-STOPPED_SPEED_THRESHOLD_KMH: float = 0.5  # これ未満を「停車中」とみなす
+# これ未満を「停車中」とみなす。src.domain.control.conversions の共通定数を使う（A2 レビュー指摘）。
+STOPPED_SPEED_THRESHOLD_KMH: float = VEHICLE_STOP_SPEED_KMH
 
 # チェック項目名（exclude 指定や結果参照に使う）
 ITEM_COMMUNICATION = "通信確認"

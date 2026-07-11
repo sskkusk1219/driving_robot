@@ -1,3 +1,68 @@
+// ── ILC（反復学習制御）状態パネル ─────────────────────────
+// profile×mode の学習反復回数・最良p95・有効トグル・リセット・収束履歴を表示する。
+function ILCPanel({ profileId, modeId, robotState }) {
+  const { useState, useEffect, useContext } = React;
+  const { apiFetch } = useContext(window.AppContext);
+  const { INK, INK_SOFT, Btn } = window;
+  const [status, setStatus] = useState(null);
+
+  const base = `/api/v1/drive/ilc/${profileId}/${modeId}`;
+  const refresh = () => {
+    if (!profileId || !modeId) return;
+    apiFetch('GET', base).then(d => { if (d) setStatus(d); });
+  };
+  // マウント時・profile/mode 変更時、および走行終了（READY 復帰）で反復回数を取り込む。
+  useEffect(() => { refresh(); }, [profileId, modeId]);
+  useEffect(() => { if (robotState === 'READY') refresh(); }, [robotState]);
+
+  if (!status) return null;
+
+  const toggle = async () => {
+    const path = status.enabled ? `${base}/disable` : `${base}/enable`;
+    const d = await apiFetch('POST', path);
+    if (d) setStatus(d);
+  };
+  const reset = async () => {
+    const d = await apiFetch('POST', `${base}/reset`);
+    if (d) { setStatus(d); window.showToast('ILC 補正をリセットしました', 'success'); }
+  };
+
+  const hist = (status.kpi_history || []).slice(-6);
+  const p95 = status.best_p95_kmh;
+  const disabled = robotState === 'RUNNING' || robotState === 'PAUSED';
+
+  return (
+    <div style={{ marginTop: 6, paddingTop: 6, borderTop: `1px solid ${window.HATCH}`, fontSize: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ color: INK_SOFT }}>反復学習</span>
+        <span style={{ color: INK, fontWeight: 600 }}>第{status.iteration}回</span>
+        <span style={{ color: status.enabled ? '#68d468' : INK_SOFT }}>
+          {status.enabled ? '有効' : '無効'}
+        </span>
+        <span style={{ color: INK_SOFT, marginLeft: 'auto' }}>
+          {p95 != null ? `最良p95 ${p95.toFixed(2)}` : '未学習'}
+        </span>
+      </div>
+      {hist.length > 0 && (
+        <div style={{ color: INK_SOFT, marginTop: 3, fontFamily: 'monospace', fontSize: 11 }}>
+          p95: {hist.map(h => (h.p95_kmh != null ? h.p95_kmh.toFixed(2) : '—')).join(' → ')}
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 6, marginTop: 5 }}>
+        <Btn disabled={disabled} style={{ flex: 1, fontSize: 11, padding: '3px 6px' }} onClick={toggle}>
+          {status.enabled ? '無効化' : '有効化'}
+        </Btn>
+        <Btn disabled={disabled || (status.iteration === 0 && !status.has_table)}
+             style={{ flex: 1, fontSize: 11, padding: '3px 6px' }} onClick={reset}>
+          リセット
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+window.ILCPanel = ILCPanel;
+
 // ── Auto-drive monitor screen ─────────────────────────────
 // AutoDriveD layout: 3-axis graph + BigSpeed + session info + stop
 
@@ -11,7 +76,7 @@ function DriveMonitorScreen({
   startedToastMessage = '走行を開始しました',
 }) {
   const { useState, useEffect, useContext, useRef } = React;
-  const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeModeKind, robotState, setNavLock } = useContext(window.AppContext);
+  const { apiFetch, realtimeData, realtimeBuf, activeProfileId, activeModeId, activeModeName, activeModeKind, robotState, setNavLock } = useContext(window.AppContext);
   const { INK, INK_SOFT, PAPER, PAPER_2, HATCH, Box, Btn, Row, BigSpeed } = window;
 
   const [modeDetail, setModeDetail] = useState(null);
@@ -135,9 +200,13 @@ function DriveMonitorScreen({
 
   const buf = realtimeBuf.current;
   const driveStart = driveStartTimeRef.current;
-  // axis 2 (開度) は走行後のバッファデータのみ
+  // axis 2 (開度) は走行後のバッファデータのみ。
+  // 一時停止中は基準タイムラインと同じく実測波形も凍結する。制御ループは止まらず WS
+  // テレメトリは届き続けるため、これを含めると波形がプレイヘッドより右（未来）へ伸び続け、
+  // かつ 300 点スライスの枠を食って左側の履歴が押し出される。停止開始以降の点は除外する。
+  const pausedNow = pauseStartRef.current !== null;
   const recent = driveStart
-    ? buf.filter(d => d.ts >= driveStart).slice(-300)
+    ? buf.filter(d => d.ts >= driveStart && !(pausedNow && d.ts > pauseStartRef.current)).slice(-300)
     : [];
 
   // Graph constants
@@ -182,12 +251,21 @@ function DriveMonitorScreen({
 
   function getRefSpeedAtTime(elapsedS) {
     if (refProfile.length === 0 || elapsedS < 0) return null;
-    let speed = refProfile[0].speed_kmh;
-    for (const p of refProfile) {
-      if (p.time_s <= elapsedS) speed = p.speed_kmh;
-      else break;
+    if (elapsedS <= refProfile[0].time_s) return refProfile[0].speed_kmh;
+    const last = refProfile[refProfile.length - 1];
+    if (elapsedS >= last.time_s) return last.speed_kmh;
+
+    // 制御側(drive_loop.py の _ref_speed_at)と同じ線形補間で滑らかに表示する
+    let lo = 0, hi = refProfile.length - 1;
+    while (lo < hi - 1) {
+      const mid = (lo + hi) >> 1;
+      if (refProfile[mid].time_s <= elapsedS) lo = mid; else hi = mid;
     }
-    return speed;
+    const p0 = refProfile[lo];
+    const p1 = refProfile[hi];
+    const span = p1.time_s - p0.time_s;
+    const frac = span > 0 ? (elapsedS - p0.time_s) / span : 0;
+    return p0.speed_kmh + (p1.speed_kmh - p0.speed_kmh) * frac;
   }
 
   // Axis 1: 30秒ウィンドウ・中央固定プレイヘッド（時間軸基準）
@@ -199,9 +277,19 @@ function DriveMonitorScreen({
   const windowEndS   = nowS + HALF_S;
 
   const toFrac = elapsedS => (elapsedS - windowStartS) / WINDOW_S;
+  // WS テレメトリの壁時計 ts を「走行経過秒」へ変換する。nowS・基準・進捗マーカーは累積
+  // 一時停止時間を差し引いた走行経過秒で動くため、実測波形も同じ軸に載せないと、一時停止を
+  // 挟むたびに波形だけが停止時間分だけ右へずれてしまう。停止区間の点は凍結時点へクランプする。
+  const toDriveElapsedS = ts => {
+    let pausedMs = pausedAccumMsRef.current;
+    if (pauseStartRef.current !== null && ts > pauseStartRef.current) {
+      pausedMs += ts - pauseStartRef.current;
+    }
+    return (ts - driveStart - pausedMs) / 1000;
+  };
   // 画面外(frac<0)の古い点は左端への山積みを避けるため除外する
   const onScreen = (d, key, max, h) => {
-    const frac = toFrac((d.ts - driveStart) / 1000);
+    const frac = toFrac(toDriveElapsedS(d.ts));
     return frac >= 0 && frac <= 1
       ? { x: toXFull(frac), y: toY(d[key], max, h) }
       : null;
@@ -386,6 +474,11 @@ function DriveMonitorScreen({
                 {resultPanel}
               </div>
             )}
+            {/* ILC 状態: mode ベース自動走行かつ profile/mode 選択時のみ（schedule 除く） */}
+            {showModeAxis && activeProfileId && activeModeId && activeModeKind !== 'schedule' &&
+              React.createElement(window.ILCPanel, {
+                profileId: activeProfileId, modeId: activeModeId, robotState,
+              })}
           </Box>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
             {busy ? (

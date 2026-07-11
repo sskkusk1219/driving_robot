@@ -91,20 +91,26 @@ class ModeRepository:
             [{"time_s": p.time_s, "speed_kmh": p.speed_kmh} for p in mode.reference_speed]
         )
         async with self._pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE driving_modes
-                SET name = $1, description = $2, reference_speed = $3::jsonb,
-                    total_duration = $4, max_speed = $5
-                WHERE id = $6
-                """,
-                mode.name,
-                mode.description,
-                ref_speed_json,
-                mode.total_duration,
-                mode.max_speed,
-                uuid.UUID(mode.id),
-            )
+            try:
+                result = await conn.execute(
+                    """
+                    UPDATE driving_modes
+                    SET name = $1, description = $2, reference_speed = $3::jsonb,
+                        total_duration = $4, max_speed = $5
+                    WHERE id = $6
+                    """,
+                    mode.name,
+                    mode.description,
+                    ref_speed_json,
+                    mode.total_duration,
+                    mode.max_speed,
+                    uuid.UUID(mode.id),
+                )
+            except asyncpg.UniqueViolationError as e:
+                # create と同じ変換（I5 レビュー指摘: update だけ未変換で 500 になっていた）
+                raise DuplicateNameError(
+                    f"走行モード名 {mode.name!r} は既に使用されています"
+                ) from e
         if str(result) == "UPDATE 0":
             return None
         return mode

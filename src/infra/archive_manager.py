@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import gzip
 import logging
@@ -39,7 +40,7 @@ class ArchiveManager:
         起動時・走行終了時に呼び出す（定期実行は行わない）。
         """
         db_path = await self._get_pg_data_path()
-        usage = self._check_storage_usage(db_path)
+        usage = await asyncio.to_thread(self._check_storage_usage, db_path)
         if usage >= self._settings.storage_limit_pct:
             logger.info(
                 "Storage usage %.1f%% >= %.1f%%, starting archive.",
@@ -52,7 +53,7 @@ class ArchiveManager:
 
     async def _archive_old_sessions(self) -> None:
         """保持日数を超えたセッションをCSV+gzip圧縮してUSB SSDへ移行し、DBから削除する。"""
-        self._usb_path.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(self._usb_path.mkdir, parents=True, exist_ok=True)
 
         cutoff = datetime.now(tz=UTC) - timedelta(days=self._settings.active_log_days)
         sessions = await self._conn.fetch(
@@ -74,7 +75,7 @@ class ArchiveManager:
             started_at: datetime = session["started_at"]
             await self._archive_session(session_id, started_at)
 
-        self._cleanup_usb_ssd_if_needed()
+        await asyncio.to_thread(self._cleanup_usb_ssd_if_needed)
 
     async def _archive_session(self, session_id: str, started_at: datetime) -> None:
         """単一セッションをCSV+gzip圧縮して移行し、DBから削除する。"""
@@ -90,10 +91,27 @@ class ArchiveManager:
             session_id,
         )
 
+        if not rows:
+            # drive_logs が既に空（前回中断で drive_logs だけ削除済みのままセッション行が
+            # 残っているケース等）。ここで 0 行の CSV を書き出すと、決定的なファイル名
+            # ({session_id}_{started_at}.csv.gz) により過去の正常なアーカイブを上書きして
+            # 恒久的にデータを失うため、書き出しをスキップしてセッション行だけ掃除する
+            # （I3 レビュー指摘）。
+            logger.warning(
+                "Session %s has no drive_logs rows; skipping CSV export to avoid "
+                "overwriting an existing archive, cleaning up session row only.",
+                session_id,
+            )
+            await self._delete_session_from_db(session_id)
+            return
+
         filename = f"{session_id}_{to_jst_naive(started_at).strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = self._usb_path / filename
-        self._export_to_csv(rows, csv_path)
-        gz_path = self._compress(csv_path)
+        # CSV書き出し・gzip圧縮・disk_usage はブロッキング I/O のため、大量アーカイブ時に
+        # イベントループ（WS/HTTP/緊急停止コルーチン）を凍結させないよう別スレッドへ
+        # オフロードする（I2 レビュー指摘）。
+        await asyncio.to_thread(self._export_to_csv, rows, csv_path)
+        gz_path = await asyncio.to_thread(self._compress, csv_path)
         logger.info("Archived session %s → %s", session_id, gz_path)
 
         await self._delete_session_from_db(session_id)
@@ -149,15 +167,22 @@ class ArchiveManager:
             logger.warning("USB SSD usage %.1f%%, deleted oldest archive: %s", usage, oldest.name)
 
     async def _delete_session_from_db(self, session_id: str) -> None:
-        """drive_logs → drive_sessions の順にレコードを削除する（FK制約順）。"""
-        await self._conn.execute(
-            "DELETE FROM drive_logs WHERE session_id = $1",
-            session_id,
-        )
-        await self._conn.execute(
-            "DELETE FROM drive_sessions WHERE id = $1",
-            session_id,
-        )
+        """drive_logs → drive_sessions の順に、単一トランザクションで削除する（FK制約順）。
+
+        トランザクション無しだと片方の DELETE だけ成功した状態でプロセスが中断され得り、
+        次回の再アーカイブが「drive_logs 無し・drive_sessions あり」の中途半端な状態を
+        検出できず、決定的なファイル名により既存の正常なアーカイブを上書きしてしまう
+        （I3 レビュー指摘）。
+        """
+        async with self._conn.transaction():
+            await self._conn.execute(
+                "DELETE FROM drive_logs WHERE session_id = $1",
+                session_id,
+            )
+            await self._conn.execute(
+                "DELETE FROM drive_sessions WHERE id = $1",
+                session_id,
+            )
 
     async def _get_pg_data_path(self) -> Path:
         """PostgreSQL データディレクトリのパスを取得する。"""
