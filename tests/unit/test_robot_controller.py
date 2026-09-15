@@ -666,6 +666,42 @@ class TestRunCalibration:
         assert result.data is calib_data
 
     @pytest.mark.asyncio
+    async def test_run_calibration_success_updates_active_profile(self) -> None:
+        """回帰テスト: キャリブレーション成功時に in-memory アクティブプロファイルへ反映する。
+
+        DB だけ更新して in-memory を放置すると、新規プロファイルでキャリブレーション直後の
+        arm が profile.calibration is None で 409（走行に必要な構成が不足）になる。"""
+        from src.models.calibration import CalibrationData, CalibrationResult
+
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        profile = _calibrated_profile()
+        profile.calibration = None  # 新規プロファイル（未キャリブレーション）を模擬
+        ctrl.select_profile(profile)
+
+        calib_data = CalibrationData(
+            accel_zero_pos=100,
+            accel_full_pos=5100,
+            accel_stroke=5000,
+            brake_zero_pos=200,
+            brake_full_pos=5200,
+            brake_stroke=5000,
+            calibrated_at=datetime.now(tz=UTC),
+            is_valid=True,
+        )
+        mock_manager = AsyncMock()
+        mock_manager.run_calibration = AsyncMock(
+            return_value=CalibrationResult(success=True, data=calib_data, error_message=None)
+        )
+        ctrl._calibration_manager = mock_manager  # type: ignore[assignment]
+
+        await ctrl.run_calibration()
+
+        active = ctrl.get_active_profile()
+        assert active is not None
+        assert active.calibration is calib_data
+
+    @pytest.mark.asyncio
     async def test_run_calibration_state_returns_to_ready_after_manager_failure(self) -> None:
         from src.models.calibration import CalibrationResult
 
@@ -750,6 +786,44 @@ class TestSaveManualCalibration:
         ctrl._brake_driver.home_return.assert_awaited_once()  # type: ignore[attr-defined]
         assert result.success is True
         assert ctrl.get_system_state().robot_state == RobotState.READY
+
+    @pytest.mark.asyncio
+    async def test_save_manual_calibration_success_updates_active_profile(self) -> None:
+        """回帰テスト: 手動キャリブレーション保存成功時に in-memory アクティブプロファイルへ
+        反映する。反映しないと新規プロファイルでキャリブレーション直後の arm が
+        profile.calibration is None で 409（走行に必要な構成が不足）になる。"""
+        from src.models.calibration import CalibrationData, CalibrationResult
+
+        ctrl = make_controller()
+        await advance_to_ready(ctrl)
+        profile = _calibrated_profile()
+        profile.calibration = None  # 新規プロファイル（未キャリブレーション）を模擬
+        ctrl.select_profile(profile)
+        await ctrl.jog_axis("accel", 100)  # READY → CALIBRATING
+        ctrl._pending_calib_zero = {"accel": 100, "brake": 200}
+        ctrl._pending_calib_full = {"accel": 5100, "brake": 5200}
+
+        calib_data = CalibrationData(
+            accel_zero_pos=100,
+            accel_full_pos=5100,
+            accel_stroke=5000,
+            brake_zero_pos=200,
+            brake_full_pos=5200,
+            brake_stroke=5000,
+            calibrated_at=datetime.now(tz=UTC),
+            is_valid=True,
+        )
+        mock_manager = AsyncMock()
+        mock_manager.save_manual = AsyncMock(
+            return_value=CalibrationResult(success=True, data=calib_data, error_message=None)
+        )
+        ctrl._calibration_manager = mock_manager  # type: ignore[assignment]
+
+        await ctrl.save_manual_calibration()
+
+        active = ctrl.get_active_profile()
+        assert active is not None
+        assert active.calibration is calib_data
 
     @pytest.mark.asyncio
     async def test_save_manual_calibration_failure_stays_calibrating_without_home(self) -> None:
@@ -2094,6 +2168,7 @@ class TestActiveCycleIdWiring:
             session_id: object,
             on_complete: object = None,
             disable_deviation_check: bool = False,
+            plan: object = None,
         ) -> None:
             ctrl._state = RobotState.READY
             ctrl._last_kpi_summary = {"n_samples": 1.0}
@@ -2543,7 +2618,8 @@ class TestPidTuningOrchestration:
         )
 
         async def fake_drive(
-            profile: object, log_writer: object, mode: object = None
+            profile: object, log_writer: object, mode: object = None,
+            **_kw: object,
         ) -> dict[str, float]:
             return {
                 "n_samples": 10.0,
@@ -2570,7 +2646,8 @@ class TestPidTuningOrchestration:
 
         # _run_tuning_drive をモックし、kp が大きいほど良い（コスト低い）KPI を返す。
         async def fake_drive(
-            profile: object, log_writer: object, mode: object = None
+            profile: object, log_writer: object, mode: object = None,
+            **_kw: object,
         ) -> dict[str, float]:
             kp = ctrl._pid._kp  # 直近に set_gains された候補
             # p95 が kp とともに改善する単調なダミー応答
@@ -2601,7 +2678,8 @@ class TestPidTuningOrchestration:
         ctrl._active_profile = prof  # 探索対象と同一プロファイルがアクティブ
 
         async def fake_drive(
-            profile: object, log_writer: object, mode: object = None
+            profile: object, log_writer: object, mode: object = None,
+            **_kw: object,
         ) -> dict[str, float]:
             kp = ctrl._pid._kp
             p95 = max(0.05, 1.0 - 0.1 * kp)
@@ -2630,7 +2708,8 @@ class TestPidTuningOrchestration:
         seen_previews: list[float] = []
 
         async def fake_drive(
-            profile: VehicleProfile, log_writer: object, mode: object = None
+            profile: VehicleProfile, log_writer: object, mode: object = None,
+            **_kw: object,
         ) -> dict[str, float]:
             seen_previews.append(profile.dynamics_params.pid_preview_s)
             preview = profile.dynamics_params.pid_preview_s
@@ -2670,6 +2749,7 @@ class TestPidTuningOrchestration:
             session_id: object,
             on_complete: object = None,
             disable_deviation_check: bool = False,
+            plan: object = None,
         ) -> None:
             # 走行開始直後に非常停止が発火したのを模擬
             ctrl._state = RobotState.EMERGENCY
@@ -2701,6 +2781,7 @@ class TestPidTuningOrchestration:
             session_id: object,
             on_complete: object = None,
             disable_deviation_check: bool = False,
+            plan: object = None,
         ) -> None:
             # DriveLoop を起動せず、代わりに手動 stop() が割り込んだことを模擬する
             asyncio.ensure_future(ctrl.stop())
@@ -2730,6 +2811,7 @@ class TestPidTuningOrchestration:
             session_id: object,
             on_complete: object = None,
             disable_deviation_check: bool = False,
+            plan: object = None,
         ) -> None:
             asyncio.ensure_future(ctrl.stop())
 
@@ -2762,6 +2844,7 @@ class TestPidTuningOrchestration:
             session_id: object,
             on_complete: object = None,
             disable_deviation_check: bool = False,
+            plan: object = None,
         ) -> None:
             # 走行完了を模擬（停止保持して READY へ）
             ctrl._state = RobotState.READY
@@ -2792,6 +2875,7 @@ class TestPidTuningOrchestration:
             session_id: object,
             on_complete: object = None,
             disable_deviation_check: bool = False,
+            plan: object = None,
         ) -> None:
             ctrl._state = RobotState.READY
             ctrl._last_kpi_summary = {"n_samples": 1.0}
@@ -2832,6 +2916,7 @@ class TestPidTuningOrchestration:
             session_id: object,
             on_complete: object = None,
             disable_deviation_check: bool = False,
+            plan: object = None,
         ) -> None:
             ctrl._state = RobotState.READY
             ctrl._last_kpi_summary = {"n_samples": 1.0}
@@ -2861,6 +2946,7 @@ class TestPidTuningOrchestration:
             session_id: object,
             on_complete: object = None,
             disable_deviation_check: bool = False,
+            plan: object = None,
         ) -> None:
             captured["disable_deviation_check"] = disable_deviation_check
             ctrl._state = RobotState.READY
@@ -2884,7 +2970,8 @@ class TestReleaseOnFinishAndOnRun:
         prof = _calibrated_profile()
 
         async def fake_drive(
-            profile: object, log_writer: object, mode: object = None
+            profile: object, log_writer: object, mode: object = None,
+            **_kw: object,
         ) -> dict[str, float]:
             return {
                 "n_samples": 500.0,
@@ -2907,7 +2994,8 @@ class TestReleaseOnFinishAndOnRun:
         prof = _calibrated_profile()
 
         async def fake_drive(
-            profile: object, log_writer: object, mode: object = None
+            profile: object, log_writer: object, mode: object = None,
+            **_kw: object,
         ) -> dict[str, float]:
             return {
                 "n_samples": 500.0,
@@ -2930,7 +3018,8 @@ class TestReleaseOnFinishAndOnRun:
         prof = _calibrated_profile()
 
         async def failing_drive(
-            profile: object, log_writer: object, mode: object = None
+            profile: object, log_writer: object, mode: object = None,
+            **_kw: object,
         ) -> dict[str, float]:
             raise RuntimeError("boom")
 
@@ -2949,7 +3038,8 @@ class TestReleaseOnFinishAndOnRun:
         calls: list[tuple[int, object, float]] = []
 
         async def fake_drive(
-            profile: object, log_writer: object, mode: object = None
+            profile: object, log_writer: object, mode: object = None,
+            **_kw: object,
         ) -> dict[str, float]:
             kp = ctrl._pid._kp
             p95 = max(0.05, 1.0 - 0.1 * kp)
@@ -2978,7 +3068,8 @@ class TestReleaseOnFinishAndOnRun:
         prof = _calibrated_profile()
 
         async def fake_drive(
-            profile: object, log_writer: object, mode: object = None
+            profile: object, log_writer: object, mode: object = None,
+            **_kw: object,
         ) -> dict[str, float]:
             return {
                 "n_samples": 500.0,
@@ -3148,17 +3239,19 @@ class TestScheduleDrive:
 
 
 # ---------------------------------------------------------------------------
-# ILC 配線（Stage C: prepare で補正ロード・正常完了で学習）
+# プラン学習配線（prepare で保存プランロード・正常完了で update_from_session）
 # ---------------------------------------------------------------------------
 
 
-def _make_controller_with_ilc() -> tuple[RobotController, AsyncMock]:
-    from src.domain.control.ilc import ILCController, ILCTable
-
-    ilc_service = AsyncMock()
-    # prepare は補正コントローラを返す（sentinel）。learn_from_session は AsyncMock。
-    ilc_service.prepare = AsyncMock(return_value=ILCController(ILCTable(efforts=[1.0, 1.0])))
-    ilc_service.learn_from_session = AsyncMock()
+def _make_controller_with_plan_service(
+    saved_plan: object | None,
+) -> tuple[RobotController, AsyncMock]:
+    plan_service = AsyncMock()
+    # prepare は保存プラン（sentinel）または None を返す。update_from_session は AsyncMock。
+    plan_service.prepare = AsyncMock(return_value=saved_plan)
+    plan_service.update_from_session = AsyncMock()
+    ff = make_ff_controller()
+    ff.has_model = True  # 完了フックが base_plan を生成できるように
     ctrl = RobotController(
         accel_driver=make_accel_driver(),
         brake_driver=make_brake_driver(),
@@ -3166,52 +3259,155 @@ def _make_controller_with_ilc() -> tuple[RobotController, AsyncMock]:
         safety_monitor=make_safety_monitor(),
         pid=make_pid(),
         last_normal_shutdown=True,
-        ff_controller=make_ff_controller(),
+        ff_controller=ff,
         safety_check=make_safety_check(),
-        ilc_service=ilc_service,
+        plan_service=plan_service,
     )
-    return ctrl, ilc_service
+    return ctrl, plan_service
 
 
-class TestILCWiring:
+def _sentinel_plan() -> object:
+    from src.domain.control.pedal_plan import PedalPlan, PlanPhase
+
+    return PedalPlan(dt_s=0.1, efforts=[1.0, 1.0], phases=[PlanPhase.DRIVE, PlanPhase.DRIVE])
+
+
+class TestPlanWiring:
     @pytest.mark.asyncio
     async def test_prepare_result_passed_to_drive_loop(self) -> None:
-        """start_auto_drive が prepare の ILCController を DriveLoop に渡す。"""
-        ctrl, ilc_service = _make_controller_with_ilc()
+        """start_auto_drive が prepare の保存プランを DriveLoop に渡す。"""
+        saved = _sentinel_plan()
+        ctrl, plan_service = _make_controller_with_plan_service(saved)
         await advance_to_ready(ctrl)
         await ctrl.start_auto_drive(
             mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
         )
-        ilc_service.prepare.assert_awaited_once()
+        plan_service.prepare.assert_awaited_once()
         assert ctrl._drive_loop is not None
-        assert ctrl._drive_loop._ilc is ilc_service.prepare.return_value
+        assert ctrl._drive_loop._plan is saved
 
     @pytest.mark.asyncio
-    async def test_natural_completion_triggers_learning(self) -> None:
-        """DriveLoop の正常完了コールバックで learn_from_session が起動する。"""
-        ctrl, ilc_service = _make_controller_with_ilc()
+    async def test_no_saved_plan_uses_ff_derived(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """prepare が None なら FF 由来プランを生成して DriveLoop に渡す。"""
+        base = _sentinel_plan()
+        ctrl, plan_service = _make_controller_with_plan_service(None)
+        monkeypatch.setattr(
+            "src.app.robot_controller.PedalPlanner.build",
+            staticmethod(lambda *a, **k: base),
+        )
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(
+            mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
+        )
+        assert ctrl._drive_loop is not None
+        assert ctrl._drive_loop._plan is base
+
+    @pytest.mark.asyncio
+    async def test_natural_completion_triggers_update(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DriveLoop の正常完了コールバックで update_from_session が起動する。"""
+        saved = _sentinel_plan()
+        base = _sentinel_plan()
+        ctrl, plan_service = _make_controller_with_plan_service(saved)
+        monkeypatch.setattr(
+            "src.app.robot_controller.PedalPlanner.build",
+            staticmethod(lambda *a, **k: base),
+        )
         await advance_to_ready(ctrl)
         session = await ctrl.start_auto_drive(
             mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
         )
-        # DriveLoop 自然完了と同じく on_complete を呼ぶ
         on_complete = ctrl._drive_loop._on_complete  # type: ignore[union-attr]
         await on_complete()
         await asyncio.sleep(0)  # fire-and-forget タスクを走らせる
-        ilc_service.learn_from_session.assert_awaited_once()
-        assert ilc_service.learn_from_session.await_args.args[0] == session.id
+        plan_service.update_from_session.assert_awaited_once()
+        call = plan_service.update_from_session.await_args
+        assert call.args[0] == session.id
+        # used_plan（走行に使ったプラン）と base_plan が渡る
+        assert call.args[4] is saved  # used_plan
+        assert call.args[5] is base  # base_plan
 
     @pytest.mark.asyncio
     async def test_manual_stop_does_not_learn(self) -> None:
-        """手動停止（stop）では learn_from_session を呼ばない。"""
-        ctrl, ilc_service = _make_controller_with_ilc()
+        """手動停止（stop）では update_from_session を呼ばない。"""
+        ctrl, plan_service = _make_controller_with_plan_service(_sentinel_plan())
         await advance_to_ready(ctrl)
         await ctrl.start_auto_drive(
             mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
         )
         await ctrl.stop()
         await asyncio.sleep(0)
-        ilc_service.learn_from_session.assert_not_awaited()
+        plan_service.update_from_session.assert_not_awaited()
+
+
+class TestPlanLearningDrive:
+    """run_plan_learning_drive: 保存プランで走行 → update_from_session を await 完了。"""
+
+    @pytest.mark.asyncio
+    async def test_prepares_plan_and_updates_after_drive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        saved = _sentinel_plan()
+        base = _sentinel_plan()
+        ctrl, plan_service = _make_controller_with_plan_service(saved)
+        monkeypatch.setattr(
+            "src.app.robot_controller.PedalPlanner.build",
+            staticmethod(lambda *a, **k: base),
+        )
+        await advance_to_ready(ctrl)
+        mode = _make_mode(mode_id="sys-verify")
+        profile = _calibrated_profile()
+        kpi = {"n_samples": 100.0, "p95_kmh": 0.1}
+        captured: dict[str, object] = {}
+
+        async def fake_run_tuning(
+            prof: object, lw: object, m: object = None, *,
+            plan: object = None, session_mode_id: object = None,
+        ) -> dict[str, float]:
+            captured["plan"] = plan
+            captured["session_mode_id"] = session_mode_id
+            ctrl._active_drive_plan = plan if plan is not None else base  # type: ignore[assignment]
+            ctrl._last_tuning_session_id = "sess-plan-1"
+            return kpi
+
+        monkeypatch.setattr(ctrl, "_run_tuning_drive", fake_run_tuning)
+
+        result = await ctrl.run_plan_learning_drive(profile, mode, None)
+
+        assert result == kpi
+        plan_service.prepare.assert_awaited_once()
+        assert captured["plan"] is saved  # 保存プランで走行
+        assert captured["session_mode_id"] == "sys-verify"  # 永続システムモード id
+        plan_service.update_from_session.assert_awaited_once()
+        call = plan_service.update_from_session.await_args
+        assert call.args[0] == "sess-plan-1"  # session_id
+        assert call.args[4] is saved  # used_plan（走行に使ったプラン）
+        assert call.args[5] is base  # base_plan（再生成した FF 由来基準）
+
+    @pytest.mark.asyncio
+    async def test_skips_update_when_bootstrap_plan_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ブートストラップ（used_plan None）ではプラン更新をスキップする。"""
+        ctrl, plan_service = _make_controller_with_plan_service(None)
+        # base_plan も None（モデル未ロード相当）にする
+        monkeypatch.setattr(ctrl, "_build_pedal_plan", lambda *a, **k: None)
+        await advance_to_ready(ctrl)
+
+        async def fake_run_tuning(
+            prof: object, lw: object, m: object = None, *,
+            plan: object = None, session_mode_id: object = None,
+        ) -> dict[str, float]:
+            ctrl._active_drive_plan = None
+            ctrl._last_tuning_session_id = "sess-plan-2"
+            return {"n_samples": 100.0, "p95_kmh": 0.1}
+
+        monkeypatch.setattr(ctrl, "_run_tuning_drive", fake_run_tuning)
+
+        await ctrl.run_plan_learning_drive(_calibrated_profile(), _make_mode(), None)
+
+        plan_service.update_from_session.assert_not_awaited()
 
 
 class TestPedalPlanBuild:
@@ -3250,3 +3446,51 @@ class TestPedalPlanBuild:
         assert plan is sentinel
         assert called["mode"] is mode
         assert called["ff"] is ff
+
+
+class TestNoOfflinePretrain:
+    """事前最適化の撤去（2026-07-23）: 保存プラン無しの走行は FF 由来プランをそのまま使う。
+
+    FOPDT を絶対モデルとして誤用した事前最適化が実機 VERIFY を p95 3.54→6.05 に悪化させた
+    ため撤去した（`_build_pedal_plan` の docstring 参照）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_ff_plan_passed_to_drive_loop_unmodified(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base = _sentinel_plan()
+        ctrl, _plan_service = _make_controller_with_plan_service(None)
+        monkeypatch.setattr(
+            "src.app.robot_controller.PedalPlanner.build",
+            staticmethod(lambda *a, **k: base),
+        )
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(
+            mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
+        )
+        assert ctrl._drive_loop is not None
+        assert ctrl._drive_loop._plan is base
+
+    @pytest.mark.asyncio
+    async def test_used_and_base_plan_are_the_same_ff_plan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """保存プラン無しの走行では used_plan と base_plan がどちらも FF 由来プラン。"""
+        base = _sentinel_plan()
+        ctrl, plan_service = _make_controller_with_plan_service(None)
+        monkeypatch.setattr(
+            "src.app.robot_controller.PedalPlanner.build",
+            staticmethod(lambda *a, **k: base),
+        )
+        await advance_to_ready(ctrl)
+        await ctrl.start_auto_drive(
+            mode_id="mode-1", mode=_make_mode(), profile=_calibrated_profile()
+        )
+        on_complete = ctrl._drive_loop._on_complete  # type: ignore[union-attr]
+        await on_complete()
+        await asyncio.sleep(0)
+        plan_service.update_from_session.assert_awaited_once()
+        call = plan_service.update_from_session.await_args
+        assert call.args[4] is base  # used_plan
+        assert call.args[5] is base  # base_plan

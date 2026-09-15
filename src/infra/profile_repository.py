@@ -40,7 +40,15 @@ def _dataclass_from_jsonb(cls: type[Any], value: object) -> Any:  # noqa: ANN401
     else:
         return cls()
     defaults = cls()
-    kwargs = {f.name: data.get(f.name, getattr(defaults, f.name)) for f in fields(cls)}
+    kwargs: dict[str, Any] = {}
+    for f in fields(cls):
+        default = getattr(defaults, f.name)
+        v = data.get(f.name, default)
+        # JSON 配列は list で戻るため、デフォルトが tuple のフィールド（惰行減速カーブ等）は
+        # tuple へ正規化する（等価比較・イミュータビリティを dataclass 定義どおりに保つ）。
+        if isinstance(default, tuple) and isinstance(v, list):
+            v = tuple(v)
+        kwargs[f.name] = v
     return cls(**kwargs)
 
 
@@ -284,6 +292,12 @@ class ProfileRepository:
                 )
                 await conn.execute(
                     "DELETE FROM drive_sessions WHERE profile_id = $1",
+                    pid,
+                )
+                # learning_cycles は drive_sessions.cycle_id から参照されるため、
+                # drive_sessions 削除後でないと消せない
+                await conn.execute(
+                    "DELETE FROM learning_cycles WHERE profile_id = $1",
                     pid,
                 )
                 await conn.execute(

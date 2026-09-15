@@ -1,12 +1,15 @@
 ---
 name: glossary-creation
 description: 用語集を作成するための詳細ガイドとテンプレート。用語集作成時にのみ使用。
-allowed-tools: Read, Write
+allowed-tools: Read, Write, Edit
 ---
 
 # 用語集作成スキル
 
 このスキルは、プロジェクト固有の用語と技術用語を体系的に定義するための詳細ガイドです。
+
+> **本プロジェクトの技術スタック**: Python 3.13 + FastAPI + PostgreSQL 15（Raspberry Pi 5）。
+> ガイド/テンプレート内のコード例（TypeScript/npm等）は汎用サンプルです。本プロジェクトのドキュメントではPython/FastAPI/PostgreSQLに読み替えてください。
 
 ## 前提条件
 

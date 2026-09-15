@@ -4,6 +4,7 @@ import dataclasses
 import math
 from datetime import UTC, datetime, timedelta
 
+import numpy as np
 import pytest
 
 from src.domain.pid_tuning import (
@@ -13,11 +14,13 @@ from src.domain.pid_tuning import (
     PID_PREVIEW_MAX_S,
     CoordinateDescentTuner,
     TuningParams,
+    _segment_theta_xcorr,
     build_tuning_trajectory,
     build_tuning_trajectory_from_mode,
     compute_pid_gains_simc,
     identify_fopdt,
     initial_preview_from_fopdt,
+    smooth_theta,
     tuning_cost,
 )
 from src.models.drive_log import DriveLog
@@ -133,6 +136,105 @@ class TestIdentifyFopdt:
         pedals = [(30.0, 0.0)] * 80
         logs = _build_logs(pedals, speeds)
         assert identify_fopdt(logs, make_profile()) is None
+
+
+def _stepped_pedal_logs(
+    theta: float, *, pre_n: int = 20, hold_n: int = 60, session_id: str = "s1"
+) -> tuple[list[DriveLog], list[tuple[int, int]]]:
+    """ペダルオフ→踏み込みの立ち上がりを含むログと、アクセル区間の (start, end) を返す。
+
+    `_segment_theta_xcorr` は区間開始より手前まで遡ってステップ入力そのものを見るため、
+    テストデータにも「踏む前」の区間が要る（`_make_identifiable_logs` は開度が最初から
+    一定なので相互相関の入力が平坦になる）。
+    """
+    k, tau = 0.6, 2.0
+    pedals: list[tuple[float, float]] = []
+    speeds: list[float] = []
+    bounds: list[tuple[int, int]] = []
+    for hold in (30.0, 40.0):
+        v0 = speeds[-1] if speeds else 0.0
+        pedals += [(0.0, 0.0)] * pre_n
+        speeds += [v0] * pre_n
+        start = len(speeds)
+        pedals += [(hold, 0.0)] * hold_n
+        speeds += _step_speeds(u=hold, k=k, tau=tau, theta=theta, v0=v0, n=hold_n)
+        bounds.append((start, len(speeds)))
+    return _build_logs(pedals, speeds, session_id=session_id), bounds
+
+
+class TestSegmentThetaXcorr:
+    """θ の相互相関同定（アクセル開度 × 加速度応答のピーク lag）。"""
+
+    @pytest.mark.parametrize("theta", [0.3, 0.5, 0.8])
+    def test_recovers_known_delay(self, theta: float) -> None:
+        logs, bounds = _stepped_pedal_logs(theta)
+        speed = [lg.actual_speed_kmh for lg in logs]
+        accel = [lg.accel_opening for lg in logs]
+        start, end = bounds[1]
+        got = _segment_theta_xcorr(
+            np.array(speed), np.array(accel), DT_S, start, end
+        )
+        assert got is not None
+        # 分解能は dt（0.1s）刻み。平滑窓ぶんの偏りを見込んで ±0.2s で判定する。
+        assert got == pytest.approx(theta, abs=0.2)
+
+    def test_flat_opening_returns_none(self) -> None:
+        """開度が一定の窓では相関が定義できない（std=0）ので None を返す。"""
+        speed = np.linspace(0.0, 20.0, 60)
+        accel = np.full(60, 30.0)
+        assert _segment_theta_xcorr(speed, accel, DT_S, 0, 60) is None
+
+    def test_short_window_returns_none(self) -> None:
+        speed = np.linspace(0.0, 2.0, 5)
+        accel = np.array([0.0, 0.0, 30.0, 30.0, 30.0])
+        assert _segment_theta_xcorr(speed, accel, DT_S, 2, 5) is None
+
+
+class TestIdentifyFopdtThetaSource:
+    def test_uses_xcorr_when_enough_segments(self) -> None:
+        """踏み込みの立ち上がりが 2 区間ぶんあれば相互相関の θ が採用される。"""
+        theta = 0.5
+        logs, _ = _stepped_pedal_logs(theta)
+        fopdt = identify_fopdt(logs, make_profile())
+        assert fopdt is not None
+        assert fopdt.theta == pytest.approx(theta, abs=0.2)
+
+    def test_falls_back_to_onset_when_xcorr_unavailable(self) -> None:
+        """開度が最初から一定＝相互相関が使えないログでも従来どおり同定できる。"""
+        fopdt = identify_fopdt(_make_identifiable_logs(0.6, 2.0, 0.3), make_profile())
+        assert fopdt is not None
+        assert fopdt.theta >= 0.0
+
+
+class TestSmoothTheta:
+    def test_first_identification_passes_through(self) -> None:
+        assert smooth_theta(None, 0.6) == pytest.approx(0.6)
+        assert smooth_theta(0.0, 0.6) == pytest.approx(0.6)
+
+    def test_blends_toward_new_value(self) -> None:
+        got = smooth_theta(0.4, 0.8)
+        assert 0.4 < got < 0.8
+
+    def test_limits_per_cycle_swing(self) -> None:
+        """実機の実測列（相互相関）で連続サイクル比が 1.2 未満に収まること。
+
+        θ は FB ロバスト上限・プラン前倒し・ILC リードを同時に決めるため、1 サイクルで
+        2〜3.5 倍動くこと自体が害になる（引き継ぎ20260909.md 4-②）。
+        """
+        observed = [0.21, 0.47, 0.43, 0.51, 0.60]
+        theta: float | None = None
+        smoothed: list[float] = []
+        for value in observed:
+            theta = smooth_theta(theta, value)
+            smoothed.append(theta)
+        # 初回はシード（そのまま通す）なので、2 本目以降の連続比を見る。
+        ratios = [
+            max(a, b) / min(a, b)
+            for a, b in zip(smoothed[1:], smoothed[2:], strict=False)
+        ]
+        assert max(ratios) < 1.2
+        # 生の同定値は 2.9 倍動いている＝ならしが効いていることの対比。
+        assert max(observed) / min(observed) > 2.5
 
 
 class TestComputePidGainsSimc:
@@ -311,6 +413,27 @@ class TestBuildVerificationTrajectory:
         prof.max_speed = 140.0
         mode = build_verification_trajectory(self._modes(), prof, budget_s=180.0)
         assert mode.total_duration <= 180.0 + 1e-6
+
+    def test_smaller_budget_actually_shortens_duration(self) -> None:
+        """budget_s を下げると総尺が実際に縮む（2026-09-08 回帰テスト）。
+
+        旧実装は保持時間の床判定 `hold >= _VERIFY_STOP_HOLD_S` が通常の巡航保持
+        （_VERIFY_CRUISE_HOLD_S=7.0 >= _VERIFY_STOP_HOLD_S=6.0）まで誤って 4s に
+        床上げしており、budget_s をいくら下げても ramp_total 以上は圧縮できなかった
+        （実測: 180→130 でも総尺 191.5s のまま不変）。床は最高速巡航・停止保持の
+        該当セグメントのみに適用し、通常の巡航保持は budget に応じて自由に圧縮する。
+        """
+        from src.domain.pid_tuning import build_verification_trajectory
+
+        prof = make_profile()
+        prof.max_speed = 140.0
+        wide = build_verification_trajectory(self._modes(), prof, budget_s=180.0)
+        narrow = build_verification_trajectory(self._modes(), prof, budget_s=90.0)
+        assert narrow.total_duration < wide.total_duration - 10.0
+        # 速度域の被覆（最高速到達・完全停止経由）は縮めても維持される。
+        speeds = [p.speed_kmh for p in narrow.reference_speed]
+        assert max(speeds) >= 130.0 - 2.0
+        assert any(s < 0.5 for s in speeds[1:-1])
 
 
 class TestBuildTuningTrajectoryFromMode:

@@ -1,5 +1,10 @@
 # プロセスガイド (Process Guide)
 
+> **⚠️ 注意（本プロジェクト固有）**: このガイドは汎用テンプレート由来です（Git Flow・TypeScript例）。
+> 本プロジェクトの開発プロセスは `docs/development-guidelines.md` を正とします
+> （ブランチ戦略は main + feature/fix、品質チェックは pytest / ruff / mypy）。
+> このファイルは文書構成の参考としてのみ使用してください。
+
 ## 基本原則
 
 ### 1. 具体例を豊富に含める

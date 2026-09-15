@@ -20,6 +20,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 研究開発用ハーネス（tests/research/）専用。設定 YAML の読み込みと結果のグラフ出力。
+# pyyaml は apt パッケージ (python3-yaml) 経由でも解決される（lgpio と同じ扱い）。
+research = [
+    "pyyaml>=6.0",
+    "matplotlib>=3.8.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

@@ -94,6 +94,24 @@ class PIDController:
         self._prev_error = 0.0
         self._d_filt = 0.0
 
+    def bleed_integral(self, factor: float) -> None:
+        """積分器を factor 倍に減衰する（0≤factor≤1、部分ブリード）。
+
+        偏差の符号反転時に呼ぶ（TrimController）。持続偏差で溜まった積分を全消去せず
+        比例縮小することで、反転直後も残留補正が滑らかに減衰し段差（バンプ）を避けつつ、
+        逆符号側へのオーバーシュート持続を短縮する。
+        """
+        self._integral *= factor
+
+    def reset_integral(self) -> None:
+        """積分器のみリセットする（前回偏差・微分フィルタは保持＝微分キックを起こさない）。
+
+        プランのフェーズ切替時に使う。前フェーズで蓄積した積分は「そのフェーズのプラン誤差の
+        補償」であり、フェーズが変わるとプラン effort も不連続に変わるため持ち越すと切替頭で
+        踏み抜く（実機 sample_004: BRAKE 中に +28% 相当が溜まり DRIVE 切替で +9.4km/h
+        オーバーシュート）。"""
+        self._integral = 0.0
+
     def set_gains(self, kp: float, ki: float, kd: float) -> None:
         """ゲインを更新し内部状態をリセットする。プロファイル選択時に呼ぶ。"""
         self._kp = kp

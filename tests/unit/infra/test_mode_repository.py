@@ -9,8 +9,22 @@ import asyncpg
 import pytest
 
 from src.infra.db import DuplicateNameError
-from src.infra.mode_repository import ModeRepository
+from src.infra.mode_repository import RESERVED_SYSTEM_MODE_NAME, ModeRepository
 from src.models.driving_mode import DrivingMode, SpeedPoint
+
+
+def make_row(*, name: str = "M1", is_system: bool = False) -> dict:
+    """asyncpg.Record 相当（dict でも _row_to_mode は動作する）。"""
+    return {
+        "id": MODE_UUID,
+        "name": name,
+        "description": "",
+        "reference_speed": '[{"time_s": 0.0, "speed_kmh": 0.0}]',
+        "total_duration": 10.0,
+        "max_speed": 60.0,
+        "created_at": datetime.now(tz=UTC),
+        "is_system": is_system,
+    }
 
 MODE_ID = str(uuid4())
 MODE_UUID = UUID(MODE_ID)
@@ -140,3 +154,64 @@ class TestModeRepositoryListAll:
         result = await repo.list_all()
 
         assert result == []
+
+    @pytest.mark.asyncio
+    async def test_list_all_excludes_system_modes(self) -> None:
+        """list_all はシステムモードを除外するクエリを発行する。"""
+        pool, conn = make_mock_pool()
+        conn.fetch.return_value = []
+        repo = ModeRepository(pool)
+
+        await repo.list_all()
+
+        sql = conn.fetch.call_args[0][0]
+        assert "is_system = FALSE" in sql
+
+
+class TestModeRepositorySystemMode:
+    @pytest.mark.asyncio
+    async def test_get_by_id_reads_is_system(self) -> None:
+        """get_by_id はフィルタせず is_system を DrivingMode に反映する。"""
+        pool, conn = make_mock_pool()
+        conn.fetchrow.return_value = make_row(name="__verify_pattern__", is_system=True)
+        repo = ModeRepository(pool)
+
+        result = await repo.get_by_id(MODE_ID)
+
+        assert result is not None
+        assert result.is_system is True
+        # get_by_id は is_system でフィルタしない（システムモードも取得可）
+        assert "is_system" not in conn.fetchrow.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_upsert_system_mode_forces_reserved_name_and_flag(self) -> None:
+        """upsert_system_mode は予約名・is_system=TRUE を強制し、返り行を DrivingMode 化する。"""
+        pool, conn = make_mock_pool()
+        conn.fetchrow.return_value = make_row(name=RESERVED_SYSTEM_MODE_NAME, is_system=True)
+        repo = ModeRepository(pool)
+        # 呼び出し側の name は無視され、予約名で永続化される
+        mode = make_mode(name="ignored")
+
+        result = await repo.upsert_system_mode(mode)
+
+        assert result.name == RESERVED_SYSTEM_MODE_NAME
+        assert result.is_system is True
+        sql, *params = conn.fetchrow.call_args[0]
+        assert "ON CONFLICT (name) DO UPDATE" in sql
+        assert RESERVED_SYSTEM_MODE_NAME in params  # name パラメータは予約名
+
+    @pytest.mark.asyncio
+    async def test_upsert_system_mode_accepts_non_uuid_synthetic_id(self) -> None:
+        """回帰: build_verification_trajectory が渡す合成 id（"verify" 等・非UUID）でも
+        UUID パースで落ちず、INSERT 候補 id は新規採番される（id は ON CONFLICT が保持）。"""
+        pool, conn = make_mock_pool()
+        conn.fetchrow.return_value = make_row(name=RESERVED_SYSTEM_MODE_NAME, is_system=True)
+        repo = ModeRepository(pool)
+        mode = make_mode(name="verify", mode_id="verify")  # ← 非UUID id
+
+        result = await repo.upsert_system_mode(mode)  # 例外を送出しない
+
+        assert result.is_system is True
+        # 渡した候補 id は新規 UUID（合成 "verify" ではない）
+        candidate_id = conn.fetchrow.call_args[0][1]
+        assert isinstance(candidate_id, UUID)

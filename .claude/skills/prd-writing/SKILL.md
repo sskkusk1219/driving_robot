@@ -8,6 +8,9 @@ allowed-tools: Read, Write
 
 このスキルは、高品質なプロダクト要求定義書(PRD)を作成するための詳細ガイドです。
 
+> **本プロジェクトの技術スタック**: Python 3.13 + FastAPI + PostgreSQL 15（Raspberry Pi 5）。
+> ガイド/テンプレート内の例（CLIツール/TypeScript等）は汎用サンプルです。本プロジェクトのPRD更新時は既存の `docs/product-requirements.md` の構造と用語を正としてください。
+
 ## 前提条件
 
 PRD作成を開始する前に、以下が完了している必要があります:

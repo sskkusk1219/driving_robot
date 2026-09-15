@@ -18,7 +18,12 @@ from src.domain.model_training import (
     estimate_dynamics_params,
     train_inverse_model,
 )
-from src.domain.pid_tuning import compute_pid_gains_simc, identify_fopdt, initial_preview_from_fopdt
+from src.domain.pid_tuning import (
+    compute_pid_gains_simc,
+    identify_fopdt,
+    initial_preview_from_fopdt,
+    smooth_theta,
+)
 from src.infra.settings import ModelSettings
 from src.models.drive_log import DriveLog
 from src.models.profile import DynamicsParams, FeedforwardParams, PIDGains, VehicleProfile
@@ -103,6 +108,12 @@ async def train_and_apply(
 
     # 観測可能な物理定数のみログから推定して上書き（不足項目は既存値を保持）
     new_params = await asyncio.to_thread(estimate_dynamics_params, logs, profile.feedforward_params)
+    # **同定より前に**プロファイルへ反映する。identify_fopdt はブレーキ不感帯を、
+    # compute_pid_gains_simc は robust_kp_at 経由でペダルゲイン曲線 k'(v) を profile から読むため、
+    # 代入が後だと「今回同定した曲線」ではなく旧値で SIMC を計算してしまう。ペダルゲイン曲線が
+    # 初めて同定されたサイクルでは SIMC が自己制御系 FOPDT のフォールバック経路へ落ち、
+    # 正しいゲインが 1 サイクル遅れて効いていた。
+    profile.feedforward_params = new_params
 
     pid_auto_tuned = False
     if update_pid_gains:
@@ -119,15 +130,18 @@ async def train_and_apply(
             # 常に 0.0 を返す）。FF が θ のむだ時間補償を構造的に内蔵するため、ここで θ を
             # 前倒し初期値にすると二重補償となり系統偏差を生む。θ は fopdt_theta に保存し、
             # 必要な FB 側むだ時間補償は座標降下が pid_preview_s を探索して決める。
+            # θ は前回値との EMA でならす（smooth_theta 参照）。同定を相互相関へ替えても
+            # サイクル間の差が残り、θ に反比例する FB 権限が毎回 2〜3.5 倍変わっていた。
             profile.dynamics_params = DynamicsParams(
                 pid_preview_s=initial_preview_from_fopdt(fopdt),
                 fopdt_k=fopdt.k,
                 fopdt_tau=fopdt.tau,
-                fopdt_theta=fopdt.theta,
+                fopdt_theta=smooth_theta(
+                    profile.dynamics_params.fopdt_theta, fopdt.theta
+                ),
             )
 
     profile.model_path = model_path
-    profile.feedforward_params = new_params
     updated = await profile_repo.update(profile)
 
     # 学習結果をアクティブプロファイルの制御スタックへ即時反映する。

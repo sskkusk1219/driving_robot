@@ -62,10 +62,11 @@ function LearningScreen() {
     ARMING: '学習運転を準備中…',
     LEARNING: '学習運転を実行中…',
     TRAINING_1: '運転モデルを学習中(1段目)…',
-    REFINE_1: 'PID適合を実行中(1段目)…',
+    REFINE_1: 'PID粗適合を実行中…',
     TRAINING_2: 'サイクル全ログで再学習中(2段目)…',
-    REFINE_2: 'PID適合を実行中(2段目)…',
     VERIFY: '検証走行でKPIを確認中…',
+    PLAN_LEARN: 'プラン学習を実行中…',
+    REFINE_FINAL: 'PID仕上げを実行中…',
     COMPLETED: '学習サイクルが完了しました',
     ERROR: '学習サイクルでエラーが発生しました',
     ABORTED: '学習サイクルを中断しました',
@@ -84,7 +85,16 @@ function LearningScreen() {
             {cycleProgress.run_total > 0 && `（${cycleProgress.run_index}/${cycleProgress.run_total}回）`}
           </div>
           {cycleProgress.message && (
-            <div style={{ color: INK_MUTE, marginTop: 2 }}>{cycleProgress.message}</div>
+            <div
+              style={{
+                color: cyclePhase === 'COMPLETED' && cycleProgress.message.includes('警告')
+                  ? STATE_TINT.ERROR.text
+                  : INK_MUTE,
+                marginTop: 2,
+              }}
+            >
+              {cycleProgress.message}
+            </div>
           )}
           {cycleProgress.best_cost != null && (
             <div style={{ color: INK_MUTE, marginTop: 2 }}>
@@ -92,7 +102,7 @@ function LearningScreen() {
               {cycleProgress.best_pid_preview_s != null && ` / PID先読み補償 ${cycleProgress.best_pid_preview_s.toFixed(2)}s`}
             </div>
           )}
-          {patternText && (cyclePhase === 'REFINE_1' || cyclePhase === 'REFINE_2') && (
+          {patternText && (cyclePhase === 'REFINE_1' || cyclePhase === 'REFINE_FINAL') && (
             <div style={{ color: INK_MUTE, marginTop: 2 }}>{patternText}</div>
           )}
         </div>

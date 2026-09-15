@@ -1,5 +1,9 @@
 # 実装ガイド (Implementation Guide)
 
+> **⚠️ 注意（本プロジェクト固有）**: このガイドは汎用テンプレート由来で、コード例はTypeScript/JavaScriptです。
+> 本プロジェクトは **Python 3.13** であり、実装時の規約は `docs/development-guidelines.md` を正とします。
+> このファイルは「ガイドライン文書に含めるべき観点（型・命名・エラーハンドリング・テスト等）」の構成参考としてのみ使用してください。
+
 ## TypeScript/JavaScript 規約
 
 ### 型定義

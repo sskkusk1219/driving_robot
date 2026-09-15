@@ -40,7 +40,7 @@ class TestClampOpening:
 
 class TestSharedConstants:
     def test_vehicle_stop_speed_kmh_value(self) -> None:
-        assert VEHICLE_STOP_SPEED_KMH == 0.5
+        assert VEHICLE_STOP_SPEED_KMH == 0.02
 
     def test_g_to_kmhs_value(self) -> None:
         assert G_TO_KMHS == 9.81 * 3.6

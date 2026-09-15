@@ -72,6 +72,12 @@ DDL_STATEMENTS = [
         created_at      TIMESTAMPTZ NOT NULL
     )
     """,
+    # システムモード（学習サイクルが内部生成する網羅検証パターン）フラグ。
+    # is_system=TRUE の行はユーザー向けモード一覧（list_all）から除外し、WebUI の
+    # 編集・削除も拒否する。プラン学習の保存先（pedal_plans の FK）として永続化する。
+    """
+    ALTER TABLE driving_modes ADD COLUMN IF NOT EXISTS is_system BOOLEAN NOT NULL DEFAULT FALSE
+    """,
     """
     CREATE TABLE IF NOT EXISTS drive_sessions (
         id          UUID PRIMARY KEY,
@@ -129,6 +135,22 @@ DDL_STATEMENTS = [
         brake_current     DOUBLE PRECISION NOT NULL
     )
     """,
+    # effort 内訳（エピソード型プラン学習）: 自動走行のみ非 NULL。プラン名目 effort・トリム
+    # 補正・フェーズ権限クランプ後の applied effort・フェーズを記録する（トリム寄与率＝PID
+    # フィードバック量の可観測化、プラン更新の実効 effort ソース）。学習運転・スケジュール走行・
+    # 旧セッションは NULL。既存DBへは本 ALTER で列追加（デプロイ時に setup_db 実行が必須）。
+    """
+    ALTER TABLE drive_logs ADD COLUMN IF NOT EXISTS plan_effort_pct DOUBLE PRECISION
+    """,
+    """
+    ALTER TABLE drive_logs ADD COLUMN IF NOT EXISTS trim_effort_pct DOUBLE PRECISION
+    """,
+    """
+    ALTER TABLE drive_logs ADD COLUMN IF NOT EXISTS applied_effort_pct DOUBLE PRECISION
+    """,
+    """
+    ALTER TABLE drive_logs ADD COLUMN IF NOT EXISTS phase TEXT
+    """,
     # タイムスケジュール（統合タイムライン）: ペダル開度とボタンイベントを1エンティティで管理
     """
     CREATE TABLE IF NOT EXISTS time_schedules (
@@ -146,21 +168,30 @@ DDL_STATEMENTS = [
     ALTER TABLE time_schedules
         DROP COLUMN IF EXISTS loop
     """,
-    # 反復学習制御（ILC）テーブル: profile×mode 単位で時刻別補正 effort を永続化する。
-    # 同一モードの反復走行で残差を学習し、次回走行に補正として適用する（Stage C）。
+    # エピソード型プラン学習の保存プラン: profile×mode 単位で、次回走行に使う候補プラン
+    # （efforts＋phases）と最良 reward を出した走行のプラン（best_efforts）・reward 履歴・
+    # 生成に使った FF モデルパスを永続化する。走行後に実効 effort＋残差から更新し、reward が
+    # 改善したときだけ採用する（ILC の後継。ilc_tables は下で DROP）。
     """
-    CREATE TABLE IF NOT EXISTS ilc_tables (
-        profile_id  UUID NOT NULL REFERENCES vehicle_profiles(id) ON DELETE CASCADE,
-        mode_id     UUID NOT NULL REFERENCES driving_modes(id) ON DELETE CASCADE,
-        enabled     BOOLEAN NOT NULL DEFAULT TRUE,
-        iteration   INTEGER NOT NULL,
-        dt_s        DOUBLE PRECISION NOT NULL,
-        efforts     JSONB NOT NULL,
-        best_p95_kmh DOUBLE PRECISION,
-        kpi_history JSONB NOT NULL DEFAULT '[]'::jsonb,
-        updated_at  TIMESTAMPTZ NOT NULL,
+    CREATE TABLE IF NOT EXISTS pedal_plans (
+        profile_id    UUID NOT NULL REFERENCES vehicle_profiles(id) ON DELETE CASCADE,
+        mode_id       UUID NOT NULL REFERENCES driving_modes(id) ON DELETE CASCADE,
+        enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+        iteration     INTEGER NOT NULL,
+        dt_s          DOUBLE PRECISION NOT NULL,
+        efforts       JSONB NOT NULL,
+        phases        JSONB NOT NULL,
+        best_efforts  JSONB NOT NULL,
+        best_reward   DOUBLE PRECISION,
+        reward_history JSONB NOT NULL DEFAULT '[]'::jsonb,
+        model_path    TEXT,
+        updated_at    TIMESTAMPTZ NOT NULL,
         PRIMARY KEY (profile_id, mode_id)
     )
+    """,
+    # 旧 ILC テーブルは廃止（エピソード型プラン学習へ移行）。旧行は新更新則で無意味なため DROP。
+    """
+    DROP TABLE IF EXISTS ilc_tables
     """,
     # architecture.md 定義の3インデックス
     """

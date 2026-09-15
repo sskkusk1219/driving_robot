@@ -1,12 +1,15 @@
 ---
 name: architecture-design
 description: アーキテクチャ設計書を作成するための詳細ガイドとテンプレート。アーキテクチャ設計時にのみ使用。
-allowed-tools: Read, Write
+allowed-tools: Read, Write, Edit
 ---
 
 # アーキテクチャ設計スキル
 
 このスキルは、高品質なアーキテクチャ設計書を作成するための詳細ガイドです。
+
+> **本プロジェクトの技術スタック**: Python 3.13 + FastAPI + PostgreSQL 15（Raspberry Pi 5）。
+> ガイド/テンプレート内のコード例（TypeScript/npm等）は汎用サンプルです。本プロジェクトのドキュメントではPython/FastAPI/PostgreSQLに読み替えてください。
 
 ## 前提条件
 

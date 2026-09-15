@@ -39,6 +39,12 @@ class DriveLog:
     brake_pos: int
     accel_current: float
     brake_current: float
+    # effort 内訳（エピソード型プラン学習）。自動走行のみ非 None。学習運転・スケジュール走行・
+    # 旧セッションは None（後方互換）。applied はフェーズ権限クランプ後・調停器前の合成値。
+    plan_effort_pct: float | None = None
+    trim_effort_pct: float | None = None
+    applied_effort_pct: float | None = None
+    phase: str | None = None
 
 
 @dataclass
@@ -53,3 +59,9 @@ class DriveLogData:
     brake_pos: int
     accel_current: float
     brake_current: float
+    # effort 内訳（プラン学習・トリム寄与率の可観測化）。デフォルト None で学習運転・
+    # スケジュール走行は無変更（それらの LogWriter 呼び出しは既存のまま通る）。
+    plan_effort_pct: float | None = None
+    trim_effort_pct: float | None = None
+    applied_effort_pct: float | None = None
+    phase: str | None = None

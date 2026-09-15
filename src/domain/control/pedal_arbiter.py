@@ -147,6 +147,9 @@ class PedalArbiter:
 
         死帯内の微小指令はペダルを動かしても力が出ず、PID 積分器の巻き上げと
         その後の段付き応答（lurch）を招くため、0 か deadband 以上に丸める。
+
+        pedal_plan.snap_efforts_to_deadband がプラン合成側で同一規則を適用する
+        （プランと実効値を一致させるため）。この規則を変更したら両方を同期すること。
         """
         db = max(0.0, deadband_pct)
         if db == 0.0:

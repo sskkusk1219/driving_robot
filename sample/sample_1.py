@@ -63,26 +63,35 @@ def pcon_control():
 
         # 4. 絶対位置移動 (50.00mmの位置へ移動) [11], [12]
         # 9900H〜9908Hを一括書き込み
-        target_mm = 10.00
+        target_mm = 40.00
+        zero_mm = 0.00
         speed_mms = 100.00
         p_high, p_low = convert_to_32bit(target_mm * 100) # 0.01mm単位 [13]
+        p_high_z, p_low_z = convert_to_32bit(zero_mm * 100) # 0.01mm単位 [13]
+
         v_high, v_low = convert_to_32bit(speed_mms * 100) # 0.01mm/s単位 [14]
         
         # ペイロード: PCMD(2), INP(2), VCMD(2), ACMD(1), PPOW(1), CTLF(1)
         # CTLF 0x0000 = 絶対位置移動 [15]
         payload = [p_high, p_low, 0, 10, v_high, v_low, 30, 0, 0x0000]
-        client.write_registers(address=0x9900, values=payload, device_id=SLAVE_ID)
-        print(f"絶対移動: {target_mm}mmへ")
-        time.sleep(1)
+        payload_zero = [p_high_z, p_low_z, 0, 10, v_high, v_low, 30, 0, 0x0000]
+
+        for _ in range(500):
+
+            client.write_registers(address=0x9900, values=payload, device_id=SLAVE_ID)
+            time.sleep(0.05)
+            client.write_registers(address=0x9900, values=payload_zero, device_id=SLAVE_ID)
+            # print(f"絶対移動: {target_mm}mmへ")
+            time.sleep(2)
 
         # 5. 相対位置移動 (現在位置から+10.00mm移動) [15], [16]
         # CTLFのビット3(INC)を1に設定 (0x0008)
-        relative_mm = 10.00
-        p_high, p_low = convert_to_32bit(relative_mm * 100) # +10mm
-        payload_rel = [p_high, p_low, 0, 10, v_high, v_low, 30, 0, 0x0008]
-        client.write_registers(address=0x9900, values=payload_rel, device_id=SLAVE_ID)
-        print(f"相対移動: +{relative_mm}mm")
-        time.sleep(1)
+        # relative_mm = 10.00
+        # p_high, p_low = convert_to_32bit(relative_mm * 100) # +10mm
+        # payload_rel = [p_high, p_low, 0, 10, v_high, v_low, 30, 0, 0x0008]
+        # client.write_registers(address=0x9900, values=payload_rel, device_id=SLAVE_ID)
+        # print(f"相対移動: +{relative_mm}mm")
+        # time.sleep(1)
 
         # 6. 現在位置、電流値、エラーの監視 (9000H〜) [17], [18]
         print("\n--- 監視開始 (5回) ---")

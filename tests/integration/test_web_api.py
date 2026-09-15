@@ -8,13 +8,14 @@ from httpx import ASGITransport, AsyncClient
 
 from src.app.robot_controller import InvalidStateTransition, RobotController
 from src.app.stubs import (
-    InMemoryILCRepository,
     InMemoryModeRepository,
+    InMemoryPedalPlanRepository,
     InMemoryProfileRepository,
     InMemoryScheduleRepository,
     InMemorySessionRepository,
 )
 from src.models.drive_log import DriveSession
+from src.models.driving_mode import DrivingMode
 from src.models.system_state import RobotState, SystemState
 from src.web.app import app
 
@@ -74,7 +75,7 @@ def inject_controller() -> MagicMock:
     app.state.mode_repo = InMemoryModeRepository()
     app.state.session_repo = InMemorySessionRepository()
     app.state.schedule_repo = InMemoryScheduleRepository()
-    app.state.ilc_repo = InMemoryILCRepository()
+    app.state.plan_repo = InMemoryPedalPlanRepository()
     app.state.db_pool = None
     return ctrl
 
@@ -155,6 +156,102 @@ async def test_profile_put_preserves_arbiter_constants(inject_controller: MagicM
 
 
 @pytest.mark.asyncio
+async def test_profile_put_partial_ffp_preserves_learned_curve(
+    inject_controller: MagicMock,
+) -> None:
+    """PUT が feedforward_params の一部フィールドだけを含む場合（WebUI フォームの実挙動）、
+    送信されなかった学習済みフィールド（惰行減速カーブ）が消えないこと。
+
+    2026-07-15 実機回帰: フォーム保存（6項目のみ送信）でスキーマ既定値 `()` に丸められ、
+    coast_accel が定数フォールバック → 緩減速 COAST 誤分類 → effort=0 強制の原因になった。
+    """
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        create_res = await c.post(
+            "/api/v1/profiles/",
+            json=_profile_create_payload(
+                feedforward_params={
+                    "engine_brake_decel_kmhs": 1.6,
+                    "coast_decel_speeds_kmh": [15.0, 25.0, 35.0],
+                    "coast_decel_kmhs": [1.6, 2.5, 3.1],
+                },
+            ),
+        )
+        assert create_res.status_code == 201
+        profile_id = create_res.json()["id"]
+
+        # WebUI フォームが送る6項目のみの部分ペイロード
+        put_res = await c.put(
+            f"/api/v1/profiles/{profile_id}",
+            json={
+                "feedforward_params": {
+                    "creep_speed_kmh": 6.0,
+                    "creep_rate_kmhs": 0.4,
+                    "engine_brake_decel_kmhs": 1.8,
+                    "stop_brake_opening_pct": 25.0,
+                    "brake_deadband_pct": 5.0,
+                    "accel_deadband_pct": 1.5,
+                }
+            },
+        )
+
+    assert put_res.status_code == 200
+    ffp = put_res.json()["feedforward_params"]
+    # 送信フィールドは更新される
+    assert ffp["engine_brake_decel_kmhs"] == 1.8
+    assert ffp["creep_speed_kmh"] == 6.0
+    # 非送信の学習済みカーブは保持される
+    assert ffp["coast_decel_speeds_kmh"] == [15.0, 25.0, 35.0]
+    assert ffp["coast_decel_kmhs"] == [1.6, 2.5, 3.1]
+
+
+@pytest.mark.asyncio
+async def test_profile_put_explicit_curve_overwrites_and_clears(
+    inject_controller: MagicMock,
+) -> None:
+    """coast_decel_* を明示送信した場合は上書きされ、空リストの明示送信はクリアになること
+    （送信有無 model_fields_set による判別のもう半面）。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        create_res = await c.post(
+            "/api/v1/profiles/",
+            json=_profile_create_payload(
+                feedforward_params={
+                    "coast_decel_speeds_kmh": [15.0, 25.0],
+                    "coast_decel_kmhs": [1.6, 2.5],
+                },
+            ),
+        )
+        assert create_res.status_code == 201
+        profile_id = create_res.json()["id"]
+
+        overwrite_res = await c.put(
+            f"/api/v1/profiles/{profile_id}",
+            json={
+                "feedforward_params": {
+                    "coast_decel_speeds_kmh": [20.0, 40.0],
+                    "coast_decel_kmhs": [2.0, 3.3],
+                }
+            },
+        )
+        assert overwrite_res.status_code == 200
+        assert overwrite_res.json()["feedforward_params"]["coast_decel_kmhs"] == [2.0, 3.3]
+
+        clear_res = await c.put(
+            f"/api/v1/profiles/{profile_id}",
+            json={
+                "feedforward_params": {
+                    "coast_decel_speeds_kmh": [],
+                    "coast_decel_kmhs": [],
+                }
+            },
+        )
+
+    assert clear_res.status_code == 200
+    ffp = clear_res.json()["feedforward_params"]
+    assert ffp["coast_decel_speeds_kmh"] == []
+    assert ffp["coast_decel_kmhs"] == []
+
+
+@pytest.mark.asyncio
 async def test_profile_deadband_zero_is_accepted(inject_controller: MagicMock) -> None:
     """D5 回帰テスト: brake/accel_deadband_pct=0.0（不感帯なし、合法値）は 201 で作成できる。"""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -217,9 +314,11 @@ async def test_profile_dynamics_params_roundtrip_and_manual_preview_update(
 
     assert put_res.status_code == 200
     dyn = put_res.json()["dynamics_params"]
-    # 手動更新時は FOPDT 値もスキーマのデフォルト(None)で上書きされる仕様
-    # （同スキーマで受けて上書き可能とする設計上の想定挙動）。
     assert dyn["pid_preview_s"] == 1.1
+    # フィールド単位マージ: 非送信の FOPDT 同定値は保持される（2026-07-16 仕様変更。
+    # 旧仕様はスキーマ既定値 None で上書きだったが、学習済み値の消失源だった）。
+    assert dyn["fopdt_theta"] == 0.6
+    assert dyn["fopdt_k"] == 0.5
 
 
 @pytest.mark.asyncio
@@ -240,6 +339,48 @@ async def test_modes_list_empty() -> None:
         res = await c.get("/api/v1/modes/")
     assert res.status_code == 200
     assert res.json() == []
+
+
+def _make_verify_pattern_mode() -> DrivingMode:
+    from src.models.driving_mode import SpeedPoint
+
+    return DrivingMode(
+        id="",
+        name="ignored",
+        description="網羅検証パターン",
+        reference_speed=[SpeedPoint(0.0, 0.0), SpeedPoint(10.0, 60.0)],
+        total_duration=10.0,
+        max_speed=60.0,
+        created_at=datetime.now(tz=UTC),
+    )
+
+
+@pytest.mark.asyncio
+async def test_modes_list_excludes_system_mode() -> None:
+    """システムモード（検証パターン）はモード一覧に現れない。"""
+    sys_mode = await app.state.mode_repo.upsert_system_mode(_make_verify_pattern_mode())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.get("/api/v1/modes/")
+    assert res.status_code == 200
+    assert all(m["id"] != sys_mode.id for m in res.json())
+
+
+@pytest.mark.asyncio
+async def test_system_mode_patch_rejected() -> None:
+    """システムモードの編集（PATCH）は 409 で拒否される。"""
+    sys_mode = await app.state.mode_repo.upsert_system_mode(_make_verify_pattern_mode())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.patch(f"/api/v1/modes/{sys_mode.id}", json={"name": "hacked"})
+    assert res.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_system_mode_delete_rejected() -> None:
+    """システムモードの削除は 409 で拒否される。"""
+    sys_mode = await app.state.mode_repo.upsert_system_mode(_make_verify_pattern_mode())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        res = await c.delete(f"/api/v1/modes/{sys_mode.id}")
+    assert res.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -758,51 +899,58 @@ async def test_schedule_drive_start_unknown_id_returns_404() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ILC（反復学習制御）エンドポイント
+# エピソード型プラン学習エンドポイント
 # ---------------------------------------------------------------------------
 
-_ILC_PID = "11111111-1111-1111-1111-111111111111"
-_ILC_MID = "22222222-2222-2222-2222-222222222222"
+_PLAN_PID = "11111111-1111-1111-1111-111111111111"
+_PLAN_MID = "22222222-2222-2222-2222-222222222222"
 
 
 @pytest.mark.asyncio
-async def test_ilc_status_defaults_when_unlearned() -> None:
-    """未学習の profile×mode は iteration=0・enabled=true・has_table=false。"""
+async def test_plan_status_defaults_when_unlearned() -> None:
+    """未学習の profile×mode は iteration=0・enabled=true・has_plan=false。"""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        res = await c.get(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}")
+        res = await c.get(f"/api/v1/drive/plan/{_PLAN_PID}/{_PLAN_MID}")
     assert res.status_code == 200
     body = res.json()
     assert body["iteration"] == 0
     assert body["enabled"] is True
-    assert body["has_table"] is False
+    assert body["has_plan"] is False
 
 
 @pytest.mark.asyncio
-async def test_ilc_disable_then_enable_roundtrip() -> None:
+async def test_plan_disable_then_enable_roundtrip() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        res = await c.post(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}/disable")
+        res = await c.post(f"/api/v1/drive/plan/{_PLAN_PID}/{_PLAN_MID}/disable")
         assert res.status_code == 200
         assert res.json()["enabled"] is False
         # 永続化されている
-        res = await c.get(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}")
+        res = await c.get(f"/api/v1/drive/plan/{_PLAN_PID}/{_PLAN_MID}")
         assert res.json()["enabled"] is False
-        res = await c.post(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}/enable")
+        res = await c.post(f"/api/v1/drive/plan/{_PLAN_PID}/{_PLAN_MID}/enable")
         assert res.json()["enabled"] is True
 
 
 @pytest.mark.asyncio
-async def test_ilc_reset_clears_table() -> None:
-    from src.domain.control.ilc import ILCTable
+async def test_plan_reset_clears_plan() -> None:
+    from src.domain.control.pedal_plan import PedalPlan, PlanPhase
 
-    # 事前に学習済みテーブルを仕込む
-    await app.state.ilc_repo.upsert(
-        _ILC_PID, _ILC_MID, ILCTable(efforts=[1.0, 2.0], dt_s=0.1, iteration=3), [{"p95_kmh": 0.2}]
+    # 事前に学習済みプランを仕込む
+    await app.state.plan_repo.upsert(
+        _PLAN_PID,
+        _PLAN_MID,
+        PedalPlan(dt_s=0.1, efforts=[1.0, 2.0], phases=[PlanPhase.DRIVE, PlanPhase.DRIVE]),
+        iteration=3,
+        best_efforts=[1.0, 2.0],
+        best_reward=-0.5,
+        reward_history=[{"iteration": 3, "reward": -0.5}],
+        model_path="/models/x.pkl",
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        res = await c.get(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}")
+        res = await c.get(f"/api/v1/drive/plan/{_PLAN_PID}/{_PLAN_MID}")
         assert res.json()["iteration"] == 3
-        assert res.json()["has_table"] is True
-        res = await c.post(f"/api/v1/drive/ilc/{_ILC_PID}/{_ILC_MID}/reset")
+        assert res.json()["has_plan"] is True
+        res = await c.post(f"/api/v1/drive/plan/{_PLAN_PID}/{_PLAN_MID}/reset")
         assert res.status_code == 200
         assert res.json()["iteration"] == 0
-        assert res.json()["has_table"] is False
+        assert res.json()["has_plan"] is False

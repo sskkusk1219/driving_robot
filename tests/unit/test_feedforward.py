@@ -286,6 +286,27 @@ class TestFeedforwardControllerPredictEffort:
         end = ff.predict_effort(v0, [v0 - 1.0, v0 - 2.0, v0 - 4.0, v0 - 6.0], _past(v0))
         assert end == pytest.approx(0.0)
 
+    def test_taper_uses_coast_decel_curve_when_identified(self, tmp_path: Path) -> None:
+        """T8: 惰行減速カーブ同定済みなら、テーパ判定の基準はその速度での補間値になる。
+
+        sample_004 実機の故障: 定数 eng=1.6 では 50km/h の -2.0km/h/s 要求がブレーキモデルへ
+        誤送された。実惰行が -4.0 の車ではアクセルを半分残すのが正しい（テーパ 1-2/4=0.5）。
+        """
+        path = make_model_file(tmp_path)
+        ff = FeedforwardController()
+        ff.load_model(str(path))
+        ff.set_params(
+            FeedforwardParams(
+                engine_brake_decel_kmhs=1.6,  # 旧定数（カーブがあれば使われない）
+                coast_decel_speeds_kmh=(20.0, 100.0),
+                coast_decel_kmhs=(4.0, 4.0),  # 実惰行 -4.0 km/h/s の強エンブレ車
+            )
+        )
+        v0 = 50.0
+        # dv@1.0 = -2.0 → 定数 1.6 ならブレーキ行きだった要求が、カーブ 4.0 でテーパに乗る
+        effort = ff.predict_effort(v0, [v0 - 1.0, v0 - 2.0, v0 - 4.0, v0 - 6.0], _past(v0))
+        assert effort == pytest.approx(0.5 * 50.0 * (1.0 - 2.0 / 4.0))  # 正のスロットル
+
     def test_predict_clamps_to_100(self, tmp_path: Path) -> None:
         path = make_model_file(tmp_path, accel_coef=[1000.0] + [0.0] * (N_FEATURES - 1))
         ff = FeedforwardController()

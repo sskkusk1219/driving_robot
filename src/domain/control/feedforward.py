@@ -12,7 +12,7 @@ from src.domain.model_training import (
     FeatureSpec,
     build_feature_row,
 )
-from src.models.profile import FeedforwardParams
+from src.models.profile import FeedforwardParams, coast_decel_at
 
 # ── 速度依存プラントゲイン（ゲインスケジューリング）─────────────────────────
 # g(v) = ∂(ペダル開度[%]) / ∂(目標加速度[km/h/s]) を FF モデルの局所勾配から求めた値のクランプ。
@@ -262,7 +262,10 @@ class FeedforwardController:
             else:
                 effort = accel_pred
         elif v0 >= p.creep_speed_kmh:
-            eng = p.engine_brake_decel_kmhs
+            # 惰行減速の基準は速度依存カーブ（同定済みなら補間、未同定は定数）。単一定数だと
+            # 実惰行が強い速度域の緩減速がブレーキモデルへ誤送され、フェーズ分類（同じ基準線）
+            # と併せて減速区間の effort 符号が真逆になる（sample_004 実機 p95=4.05 の主因）。
+            eng = coast_decel_at(p, v0)
             if eng > 0.0 and (-desired_accel) <= eng:
                 # 惰行で届く緩減速: スロットルテーパ（dv=0 で accel_pred、-eng で 0）
                 effort = accel_pred * (1.0 - (-desired_accel) / eng)

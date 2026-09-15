@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -66,6 +67,7 @@ def _make_profile(
     deviation_duration: float = 4.0,
     ffp: FeedforwardParams | None = None,
     dynamics_params: DynamicsParams | None = None,
+    pid_gains: PIDGains | None = None,
 ) -> VehicleProfile:
     return VehicleProfile(
         id="profile-1",
@@ -74,7 +76,7 @@ def _make_profile(
         max_brake_opening=max_brake,
         max_speed=120.0,
         max_decel_g=0.5,
-        pid_gains=PIDGains(kp=1.0, ki=0.0, kd=0.0),
+        pid_gains=pid_gains if pid_gains is not None else PIDGains(kp=1.0, ki=0.0, kd=0.0),
         stop_config=StopConfig(
             deviation_threshold_kmh=deviation_threshold,
             deviation_duration_s=deviation_duration,
@@ -167,7 +169,6 @@ def _make_loop(
     log_writer: MagicMock | None = None,
     session_id: str | None = None,
     disable_deviation_check: bool = False,
-    ilc: object | None = None,
     plan: PedalPlan | None = None,
 ) -> DriveLoop:
     # デフォルトは plan=None＝従来経路（FF 毎サイクル＋速い補正層 PID 直結）。既存テストは
@@ -186,7 +187,6 @@ def _make_loop(
         log_writer=log_writer,
         session_id=session_id,
         disable_deviation_check=disable_deviation_check,
-        ilc=ilc,  # type: ignore[arg-type]
         plan=plan,
     )
 
@@ -1695,6 +1695,112 @@ class TestGainScheduling:
         assert pid.update.call_args.kwargs["gain_scale"] == pytest.approx(1.5)
 
     @pytest.mark.asyncio
+    async def test_dead_time_cap_clamps_gain_scale(self) -> None:
+        """むだ時間安定キャップ: 過大 kp では gain_scale が積分系 SIMC 上限へクランプされる。"""
+        # ペダルゲイン 0.5 km/h/s per %（全速度一定）、theta=0.5、tau_c_factor=1.5
+        #   → theta+tau_c = 1.25、Kc = 1/(0.5*1.25) = 1.6、cap = Kc/kp = 1.6/5.0 = 0.32
+        # g_nominal = 1/0.5 = 2.0、schedule accel_gain=2.4 → 素の scale = 1.2
+        #   → min(1.2, 0.32) = 0.32
+        ffp = replace(
+            FAST_ARBITER_PARAMS,
+            pedal_gain_speeds_kmh=(0.0, 120.0),
+            accel_gain_kmhs_per_pct=(0.5, 0.5),
+            brake_gain_kmhs_per_pct=(0.5, 0.5),
+        )
+        profile = _make_profile(
+            ffp=ffp,
+            dynamics_params=DynamicsParams(
+                pid_preview_s=0.0, fopdt_k=2.0, fopdt_tau=1.0, fopdt_theta=0.5
+            ),
+            pid_gains=PIDGains(kp=5.0, ki=0.0, kd=0.0),
+        )
+        ff = _make_ff(effort=0.0)
+        ff.gain_schedule = GainSchedule(
+            speeds=(0.0, 120.0), accel_gains=(2.4, 2.4), brake_gains=(2.4, 2.4)
+        )
+        pid = self._pid_mock()
+        dl = _make_loop(
+            ff=ff, pid=pid, mode=self._accel_mode(), profile=profile,
+            can_reader=_make_can_reader(speed=20.0),
+        )
+        dl._running = True
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        assert pid.update.call_args.kwargs["gain_scale"] == pytest.approx(0.32)
+
+    @pytest.mark.asyncio
+    async def test_cap_varies_with_speed(self) -> None:
+        """ロバスト上限は速度ごとに評価される（旧実装は起動時 1 回の定数だった）。
+
+        ペダルゲインが速度で 2 倍変わるカーブを与え、同じプロファイルでも実車速が違えば
+        gain_scale の上限が変わることを確認する（実機 9eee549b: 駆動側 0.22〜0.51、
+        制動側 0.10〜1.06 と速度域で 5〜10 倍変わるのに上限が固定だった）。
+        """
+        ffp = replace(
+            FAST_ARBITER_PARAMS,
+            pedal_gain_speeds_kmh=(0.0, 100.0),
+            accel_gain_kmhs_per_pct=(0.5, 1.0),
+            brake_gain_kmhs_per_pct=(0.5, 1.0),
+        )
+        profile = _make_profile(
+            ffp=ffp,
+            dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_theta=0.5),
+            pid_gains=PIDGains(kp=5.0, ki=0.0, kd=0.0),
+        )
+        scales = []
+        for speed in (0.0, 100.0):
+            ff = _make_ff(effort=0.0)
+            ff.gain_schedule = GainSchedule(
+                speeds=(0.0, 120.0), accel_gains=(2.4, 2.4), brake_gains=(2.4, 2.4)
+            )
+            pid = self._pid_mock()
+            dl = _make_loop(
+                ff=ff, pid=pid, mode=self._accel_mode(), profile=profile,
+                can_reader=_make_can_reader(speed=speed),
+            )
+            dl._running = True
+            with patch.object(asyncio, "get_running_loop") as mock_loop:
+                loop_obj = MagicMock()
+                loop_obj.time.return_value = 2.0
+                mock_loop.return_value = loop_obj
+                dl._started_at = 0.0
+                await dl._execute_one_cycle()
+            scales.append(pid.update.call_args.kwargs["gain_scale"])
+        # k'=0.5 → Kc=1.6 → cap=0.32 / k'=1.0 → Kc=0.8 → cap=0.16
+        assert scales[0] == pytest.approx(0.32)
+        assert scales[1] == pytest.approx(0.16)
+
+    @pytest.mark.asyncio
+    async def test_no_dead_time_cap_without_theta(self) -> None:
+        """fopdt_theta 未同定なら cap=inf でクランプされない（従来動作）。"""
+        # theta 無しなら過大 kp でも scale はスケジュール値 1.2 のまま
+        profile = _make_profile(
+            dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_k=2.0, fopdt_tau=1.0),
+            pid_gains=PIDGains(kp=5.0, ki=0.0, kd=0.0),
+        )
+        ff = _make_ff(effort=0.0)
+        ff.gain_schedule = GainSchedule(
+            speeds=(0.0, 120.0), accel_gains=(0.6, 0.6), brake_gains=(0.1, 0.1)
+        )
+        pid = self._pid_mock()
+        dl = _make_loop(
+            ff=ff, pid=pid, mode=self._accel_mode(), profile=profile,
+            can_reader=_make_can_reader(speed=20.0),
+        )
+        dl._running = True
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        assert pid.update.call_args.kwargs["gain_scale"] == pytest.approx(1.2)
+
+    @pytest.mark.asyncio
     async def test_decel_phase_uses_brake_gain_and_clamps(self) -> None:
         """減速フェーズでは brake_gain を使い、下限 0.5 にクランプされる。"""
         # g_nominal=tau/k=0.5、brake_gain=0.1 → 0.1/0.5=0.2 → clamp 下限 0.5
@@ -1721,71 +1827,7 @@ class TestGainScheduling:
 
 
 # ---------------------------------------------------------------------------
-# ILC 補正 effort の合成（Stage C）
-# ---------------------------------------------------------------------------
-
-
-class TestILCEffortSynthesis:
-    """FF+PID に加えて ILC 補正 effort が調停器へ渡ることを検証する。"""
-
-    async def _run_one_cycle_capturing_effort(self, dl: DriveLoop, t: float = 0.0) -> float:
-        """1 サイクル実行し、調停器 arbitrate に渡された合成 effort を返す。"""
-        captured: dict[str, float] = {}
-        real_arbitrate = dl._arbiter.arbitrate
-
-        def spy(effort: float, dt: float):  # type: ignore[no-untyped-def]
-            captured["effort"] = effort
-            return real_arbitrate(effort, dt)
-
-        with (
-            patch.object(asyncio, "get_running_loop") as mock_loop,
-            patch.object(dl._arbiter, "arbitrate", side_effect=spy),
-        ):
-            loop_obj = MagicMock()
-            loop_obj.time.return_value = t
-            mock_loop.return_value = loop_obj
-            dl._running = True
-            dl._started_at = 0.0
-            await dl._execute_one_cycle()
-        return captured["effort"]
-
-    @pytest.mark.asyncio
-    async def test_ilc_effort_added_to_synthesis(self) -> None:
-        """ILC 補正が FF+PID に加算されて調停器に渡る（ff=30, pid=0, ilc=+5 → 35）。"""
-        from src.domain.control.ilc import ILCController, ILCTable
-
-        ff = _make_ff(effort=30.0)
-        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
-        ilc = ILCController(ILCTable(efforts=[5.0, 5.0], dt_s=10.0))  # 全域 +5%
-        dl = _make_loop(ff=ff, pid=pid, ilc=ilc)
-        effort = await self._run_one_cycle_capturing_effort(dl)
-        assert effort == pytest.approx(35.0)
-
-    @pytest.mark.asyncio
-    async def test_none_ilc_is_full_regression(self) -> None:
-        """ilc=None なら合成は従来どおり FF+PID のみ（ff=30, pid=0 → 30）。"""
-        ff = _make_ff(effort=30.0)
-        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
-        dl = _make_loop(ff=ff, pid=pid, ilc=None)
-        effort = await self._run_one_cycle_capturing_effort(dl)
-        assert effort == pytest.approx(30.0)
-
-    @pytest.mark.asyncio
-    async def test_ilc_effort_sampled_at_now_frame(self) -> None:
-        """ILC は elapsed_s（now-frame）で参照される（t=5s で該当補正が入る）。"""
-        from src.domain.control.ilc import ILCController, ILCTable
-
-        ff = _make_ff(effort=0.0)
-        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
-        # efforts: t=0→0, t=5→8, t=10→0（グリッド 5s）。t=5 では 8% が入る。
-        ilc = ILCController(ILCTable(efforts=[0.0, 8.0, 0.0], dt_s=5.0))
-        dl = _make_loop(ff=ff, pid=pid, ilc=ilc)
-        effort = await self._run_one_cycle_capturing_effort(dl, t=5.0)
-        assert effort == pytest.approx(8.0)
-
-
-# ---------------------------------------------------------------------------
-# プラン＋トリム経路（新アーキテクチャ）
+# プラン＋トリム経路（2 層合成・ILC 独立層は廃止）
 # ---------------------------------------------------------------------------
 
 
@@ -1795,7 +1837,7 @@ def _uniform_plan(effort: float, phase: PlanPhase, n: int = 400, dt: float = 0.1
 
 
 class TestPlanPathSynthesis:
-    """プランありの経路で FF を毎サイクル評価せず plan+trim+ilc を合成することを検証する。"""
+    """プランありの経路で FF を毎サイクル評価せず plan+trim を合成することを検証する。"""
 
     async def _run_cycle_capturing(self, dl: DriveLoop, t: float = 2.0) -> float:
         captured: dict[str, float] = {}
@@ -1835,22 +1877,72 @@ class TestPlanPathSynthesis:
         ff.predict_effort.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_ilc_added_in_plan_path(self) -> None:
-        """プラン経路でも ILC 補正が加算される（plan=20, trim=0, ilc=+5 → 25）。"""
-        from src.domain.control.ilc import ILCController, ILCTable
-
+    async def test_effort_breakdown_recorded(self) -> None:
+        """plan/trim/applied/phase の内訳が直近値として保持される（ログ・KPI・プラン学習用）。"""
         ff = _make_ff(effort=0.0)
         pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
         mode = _make_mode(
             points=[SpeedPoint(0.0, 60.0), SpeedPoint(10.0, 60.0)], total_duration=10.0
         )
         plan = _uniform_plan(20.0, PlanPhase.DRIVE)
-        ilc = ILCController(ILCTable(efforts=[5.0, 5.0], dt_s=10.0))
         dl = _make_loop(
-            ff=ff, pid=pid, mode=mode, can_reader=_make_can_reader(speed=60.0), plan=plan, ilc=ilc
+            ff=ff, pid=pid, mode=mode, can_reader=_make_can_reader(speed=60.0), plan=plan
+        )
+        await self._run_cycle_capturing(dl)
+        assert dl._last_plan_effort == pytest.approx(20.0)
+        assert dl._last_trim_effort == pytest.approx(0.0)
+        assert dl._last_applied_effort == pytest.approx(20.0)
+        assert dl._last_phase == "drive"
+
+    @pytest.mark.asyncio
+    async def test_applied_is_post_phase_clamp(self) -> None:
+        """applied はフェーズ権限クランプ後の値（COAST 区間の名目 20% は 0 にクランプされる）。"""
+        ff = _make_ff(effort=0.0)
+        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
+        mode = _make_mode(
+            points=[SpeedPoint(0.0, 60.0), SpeedPoint(10.0, 60.0)], total_duration=10.0
+        )
+        # プランが名目 +20% を置いても COAST では踏まない → applied=0。
+        plan = _uniform_plan(20.0, PlanPhase.COAST)
+        dl = _make_loop(
+            ff=ff, pid=pid, mode=mode, can_reader=_make_can_reader(speed=60.0), plan=plan
         )
         effort = await self._run_cycle_capturing(dl)
-        assert effort == pytest.approx(25.0)
+        assert effort == pytest.approx(0.0)
+        assert dl._last_applied_effort == pytest.approx(0.0)
+        assert dl._last_phase == "coast"
+
+    @pytest.mark.asyncio
+    async def test_phase_change_notifies_trim(self) -> None:
+        """フェーズ切替でトリムへ notify_phase_change（補正持ち越しクリア）が通知される。
+
+        T8: BRAKE 中に蓄積した積分補正を DRIVE 切替頭へ持ち越すと踏み抜く
+        （sample_004 実機で +9.4km/h オーバーシュート）ためのワインドアップ対策。
+        """
+        ff = _make_ff(effort=0.0)
+        pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
+        mode = _make_mode(
+            points=[SpeedPoint(0.0, 60.0), SpeedPoint(10.0, 60.0)], total_duration=10.0
+        )
+        # 前半 BRAKE・後半 DRIVE のプラン（t=2.0 は BRAKE、t=6.0 は DRIVE）
+        n, dt = 100, 0.1
+        plan = PedalPlan(
+            dt_s=dt,
+            efforts=[0.0] * n,
+            phases=[PlanPhase.BRAKE] * (n // 2) + [PlanPhase.DRIVE] * (n // 2),
+        )
+        dl = _make_loop(
+            ff=ff, pid=pid, mode=mode, can_reader=_make_can_reader(speed=60.0), plan=plan
+        )
+        with patch.object(dl._trim, "notify_phase_change") as notify:
+            await self._run_cycle_capturing(dl, t=2.0)  # BRAKE（初回・通知なし）
+            notify.assert_not_called()
+            await self._run_cycle_capturing(dl, t=3.0)  # BRAKE 継続（通知なし）
+            notify.assert_not_called()
+            await self._run_cycle_capturing(dl, t=6.0)  # BRAKE→DRIVE（通知）
+            notify.assert_called_once()
+            await self._run_cycle_capturing(dl, t=7.0)  # DRIVE 継続（追加通知なし）
+            notify.assert_called_once()
 
 
 class TestPhaseAuthority:
@@ -1864,38 +1956,504 @@ class TestPhaseAuthority:
     def test_drive_clamps_brake_direction(self) -> None:
         dl = self._loop()
         # DRIVE で合成が負（ブレーキ）→ 0 にクランプ、制動側飽和フラグ
-        effort, ch, cl = dl._apply_phase_authority(1.0, -3.0, 0.0, PlanPhase.DRIVE)
+        effort, ch, cl = dl._apply_phase_authority(1.0, -3.0, PlanPhase.DRIVE)
         assert effort == 0.0
         assert cl is True and ch is False
 
     def test_drive_keeps_positive(self) -> None:
         dl = self._loop()
-        effort, ch, cl = dl._apply_phase_authority(2.0, 1.0, 0.5, PlanPhase.DRIVE)
-        assert effort == pytest.approx(3.5)
+        effort, ch, cl = dl._apply_phase_authority(2.0, 1.0, PlanPhase.DRIVE)
+        assert effort == pytest.approx(3.0)
         assert ch is False and cl is False
 
     def test_brake_clamps_accel_direction(self) -> None:
         dl = self._loop()
-        effort, ch, cl = dl._apply_phase_authority(-1.0, 3.0, 0.0, PlanPhase.BRAKE)
+        # BRAKE で合成が正（アクセル）→ 0 にクランプ、加速側飽和フラグ
+        effort, ch, cl = dl._apply_phase_authority(-1.0, 3.0, PlanPhase.BRAKE)
         assert effort == 0.0
         assert ch is True and cl is False
 
     def test_coast_zero(self) -> None:
         dl = self._loop()
-        effort, ch, cl = dl._apply_phase_authority(5.0, 2.0, 1.0, PlanPhase.COAST)
+        effort, ch, cl = dl._apply_phase_authority(5.0, 2.0, PlanPhase.COAST)
         assert effort == 0.0
         assert ch is True and cl is True
 
     def test_stop_hold_uses_plan_only(self) -> None:
         dl = self._loop()
-        # STOP_HOLD は base（プランの停車保持）のみ、トリム/ILC を無効化
-        effort, ch, cl = dl._apply_phase_authority(-19.2, 5.0, 3.0, PlanPhase.STOP_HOLD)
+        # STOP_HOLD は base（プランの停車保持）のみ、トリムを無効化
+        effort, ch, cl = dl._apply_phase_authority(-19.2, 5.0, PlanPhase.STOP_HOLD)
         assert effort == pytest.approx(-19.2)
         assert ch is True and cl is True
 
     def test_fast_active_bypasses_authority(self) -> None:
         dl = self._loop(fast_active=True)
         # 速い補正層アクティブなら DRIVE でもブレーキ方向を通す（max≤1.0 安全網）
-        effort, ch, cl = dl._apply_phase_authority(1.0, -3.0, 0.0, PlanPhase.DRIVE)
+        effort, ch, cl = dl._apply_phase_authority(1.0, -3.0, PlanPhase.DRIVE)
         assert effort == pytest.approx(-2.0)
         assert ch is False and cl is False
+
+
+class TestMinEffectiveBrake:
+    """_apply_min_effective_brake（2026-07-16）: 不感帯デッドゾーンの制動指令を −db へ
+
+    引き上げる。7/15 実走で applied −0.9〜−1.8% が brake_deadband=6% の丸めで
+    brake_opening=0 になり、減速コーナーの偏差が +1.7km/h まで成長した対策。
+    """
+
+    def _loop(self, fast_active: bool = True, db: float = 6.0) -> DriveLoop:
+        dl = _make_loop(plan=_uniform_plan(0.0, PlanPhase.BRAKE))
+        dl._trim._fast_active = fast_active
+        dl._brake_deadband_pct = db
+        return dl
+
+    def test_escalates_dead_zone_command_to_edge(self) -> None:
+        dl = self._loop()
+        # 超過速度（actual 51 > ref 50）でデッドゾーン内の制動 −1.8% → −6% へ
+        assert dl._apply_min_effective_brake(-1.8, 51.0, 50.0, PlanPhase.BRAKE) == -6.0
+
+    def test_escalates_in_drive_phase_too(self) -> None:
+        # 速い補正層アクティブ時は無権限（安全網）なので DRIVE でも引き上げる
+        dl = self._loop()
+        assert dl._apply_min_effective_brake(-0.5, 52.0, 50.0, PlanPhase.DRIVE) == -6.0
+
+    def test_no_escalation_when_fast_inactive(self) -> None:
+        # 偏差が小さい（速い補正層非アクティブ）なら現状維持（微小トリムを尊重）
+        dl = self._loop(fast_active=False)
+        assert dl._apply_min_effective_brake(-1.8, 50.3, 50.0, PlanPhase.BRAKE) == -1.8
+
+    def test_no_escalation_when_under_speed(self) -> None:
+        # 速度不足（actual < ref）で制動を強めるのは逆効果 → 現状維持
+        dl = self._loop()
+        assert dl._apply_min_effective_brake(-1.8, 49.0, 50.0, PlanPhase.BRAKE) == -1.8
+
+    def test_no_escalation_outside_dead_zone(self) -> None:
+        dl = self._loop()
+        # 既に不感帯以深（調停器がそのまま max(db,|e|) に丸める）→ 現状維持
+        assert dl._apply_min_effective_brake(-7.5, 51.0, 50.0, PlanPhase.BRAKE) == -7.5
+        # 正 effort（アクセル）は対象外
+        assert dl._apply_min_effective_brake(2.0, 51.0, 50.0, PlanPhase.BRAKE) == 2.0
+        # ちょうど 0 は対象外（制動意図なし）
+        assert dl._apply_min_effective_brake(0.0, 51.0, 50.0, PlanPhase.BRAKE) == 0.0
+
+    def test_no_escalation_in_stop_hold(self) -> None:
+        # 停車保持はプランの保持 effort が支配（干渉しない）
+        dl = self._loop()
+        assert (
+            dl._apply_min_effective_brake(-1.8, 1.0, 0.0, PlanPhase.STOP_HOLD) == -1.8
+        )
+
+    def test_no_escalation_when_deadband_zero(self) -> None:
+        dl = self._loop(db=0.0)
+        assert dl._apply_min_effective_brake(-1.8, 51.0, 50.0, PlanPhase.BRAKE) == -1.8
+
+
+# ---------------------------------------------------------------------------
+# フィードバック入力ローパス（_filtered_feedback）
+# ---------------------------------------------------------------------------
+
+
+class TestFeedbackLowpass:
+    """基準・実車速へ同一ローパスを掛け、ランプ追従で定常偏差を作らないこと（2026-09-09）。
+
+    初版は実車速だけを遅らせており、ランプ中に「勾配 × TAU」の偏差が恒久的に残った
+    （実機 3ca20d43: +2.0km/h/s 区間で実偏差 -0.43km/h、-5.0km/h/s 区間で +1.06km/h）。
+    """
+
+    @staticmethod
+    def _loop() -> DriveLoop:
+        return _make_loop()
+
+    def test_ramp_tracking_leaves_no_steady_error(self) -> None:
+        dl = self._loop()
+        dt = 0.1
+        rate = 2.0  # km/h/s
+        ref = actual = 0.0
+        err = 0.0
+        for _ in range(200):  # 20s＝時定数 0.25s の 80 倍
+            ref += rate * dt
+            actual = ref  # 完全追従（実偏差 0）
+            ref_fb, act_fb = dl._filtered_feedback(ref, actual, dt)
+            err = ref_fb - act_fb
+        assert abs(err) < 1e-9
+
+    def test_steep_ramp_also_leaves_no_steady_error(self) -> None:
+        dl = self._loop()
+        dt = 0.1
+        rate = -5.0
+        ref = 120.0
+        err = 0.0
+        for _ in range(200):
+            ref += rate * dt
+            ref_fb, act_fb = dl._filtered_feedback(ref, ref, dt)
+            err = ref_fb - act_fb
+        assert abs(err) < 1e-9
+
+    def test_measurement_noise_is_still_attenuated(self) -> None:
+        """実車速側のノイズは従来どおり減衰する（フィルタの目的は維持）。"""
+        dl = self._loop()
+        dt = 0.1
+        noise = [0.3, -0.3] * 50
+        errs = []
+        for k, nz in enumerate(noise):
+            ref_fb, act_fb = dl._filtered_feedback(60.0, 60.0 + nz, dt)
+            if k > 10:
+                errs.append(abs(ref_fb - act_fb))
+        assert max(errs) < 0.3  # 生値なら 0.3 が素通しする
+
+    def test_first_sample_uses_raw_values(self) -> None:
+        dl = self._loop()
+        assert dl._filtered_feedback(50.0, 48.0, 0.1) == (50.0, 48.0)
+
+    def test_reset_clears_filter_state(self) -> None:
+        dl = self._loop()
+        dl._filtered_feedback(50.0, 48.0, 0.1)
+        dl._ref_speed_filt = None
+        dl._actual_speed_filt = None
+        assert dl._filtered_feedback(10.0, 9.0, 0.1) == (10.0, 9.0)
+
+
+class TestPlanDeadTimeLead:
+    """プラン（FF）のむだ時間前倒し（PLAN_LEAD_THETA_FACTOR）。
+
+    基準軌跡の要求加速度がステップ変化するコーナーでは、ペダルが θ 秒遅れて効くぶん
+    「加速度段差 × θ」の誤差が原理的に発生する（実機 9eee549b t=146s: 7km/h/s の段差に
+    θ=0.5s で 3.5km/h、実測ピーク −4.21km/h）。フィードバックは誤差が出てからしか動けない
+    ので、プラン側の前倒しでしか消せない。pid_preview_s（FB 側）とは別物。
+    """
+
+    def _ramp_plan(self) -> PedalPlan:
+        """effort が時刻に比例して増えるプラン（シフト量が effort に現れる）。"""
+        n = 400
+        return PedalPlan(
+            dt_s=0.1,
+            efforts=[float(i) for i in range(n)],
+            phases=[PlanPhase.DRIVE] * n,
+        )
+
+    async def _effort_at_cycle(self, theta: float | None, t: float = 2.0) -> float:
+        profile = _make_profile(
+            dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_theta=theta)
+        )
+        mode = _make_mode(
+            points=[SpeedPoint(0.0, 60.0), SpeedPoint(40.0, 60.0)], total_duration=40.0
+        )
+        dl = _make_loop(
+            ff=_make_ff(effort=0.0),
+            pid=PIDController(kp=0.0, ki=0.0, kd=0.0),
+            mode=mode,
+            profile=profile,
+            can_reader=_make_can_reader(speed=60.0),
+            plan=self._ramp_plan(),
+        )
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = t
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        return float(dl._last_plan_effort)
+
+    @pytest.mark.asyncio
+    async def test_no_theta_keeps_now_frame(self) -> None:
+        """θ 未同定なら前倒し 0＝従来の now-frame（elapsed=2.0s → effort 20）。"""
+        assert await self._effort_at_cycle(None) == pytest.approx(20.0)
+
+    @pytest.mark.asyncio
+    async def test_plan_is_advanced_by_theta_factor(self) -> None:
+        """θ=0.5 なら 0.5×0.4=0.2s 前倒し（elapsed=2.0s → プラン t=2.2s → effort 22）。"""
+        assert await self._effort_at_cycle(0.5) == pytest.approx(22.0)
+
+    @pytest.mark.asyncio
+    async def test_lead_is_capped(self) -> None:
+        """過補償を避けるため前倒しは PLAN_LEAD_MAX_S で頭打ちになる。"""
+        # θ=5.0 なら素の前倒しは 4.0s だが、上限 0.5s → プラン t=2.5s → effort 25
+        assert await self._effort_at_cycle(5.0) == pytest.approx(25.0)
+
+    @pytest.mark.asyncio
+    async def test_effort_and_phase_shift_together(self) -> None:
+        """effort と phase を同じ時刻から取る（ずれるとフェーズ権限が向きを誤って削る）。
+
+        踏み増し方向（COAST 0% → DRIVE +10%）なので前倒しが効く。elapsed=2.0 で
+        0.2s 先の DRIVE(+10) を読み、フェーズも drive になってクランプされない。
+        """
+        n = 400
+        efforts = [0.0 if i * 0.1 < 2.15 else 10.0 for i in range(n)]
+        phases = [PlanPhase.COAST if i * 0.1 < 2.15 else PlanPhase.DRIVE for i in range(n)]
+        profile = _make_profile(
+            dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_theta=0.5)
+        )
+        mode = _make_mode(
+            points=[SpeedPoint(0.0, 60.0), SpeedPoint(40.0, 60.0)], total_duration=40.0
+        )
+        dl = _make_loop(
+            ff=_make_ff(effort=0.0),
+            pid=PIDController(kp=0.0, ki=0.0, kd=0.0),
+            mode=mode,
+            profile=profile,
+            can_reader=_make_can_reader(speed=60.0),
+            plan=PedalPlan(dt_s=0.1, efforts=efforts, phases=phases),
+        )
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        assert dl._last_phase == "drive"
+        assert dl._last_plan_effort == pytest.approx(10.0)
+        assert dl._last_applied_effort == pytest.approx(10.0)
+
+
+class TestDirectionalPlanLead:
+    """向き別のむだ時間前倒し（DriveLoop._plan_at_directional）。
+
+    前倒しは踏み増し方向にだけ掛ける。折返し点（effort の符号が変わる点）と解放方向で
+    前倒しすると「基準がまだ加速を要求しているのにアクセルを抜く」真逆の操作になり、
+    実機 5ac4f31d では単独で最大偏差 −5.14km/h（max の記録）を作っていた
+    （docs/Problem/引き継ぎ20260909.md 4-③）。
+    """
+
+    async def _plan_effort(
+        self, efforts: list[float], phases: list[PlanPhase]
+    ) -> tuple[float, str]:
+        profile = _make_profile(
+            dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_theta=0.5)
+        )
+        mode = _make_mode(
+            points=[SpeedPoint(0.0, 60.0), SpeedPoint(40.0, 60.0)], total_duration=40.0
+        )
+        dl = _make_loop(
+            ff=_make_ff(effort=0.0),
+            pid=PIDController(kp=0.0, ki=0.0, kd=0.0),
+            mode=mode,
+            profile=profile,
+            can_reader=_make_can_reader(speed=60.0),
+            plan=PedalPlan(dt_s=0.1, efforts=efforts, phases=phases),
+        )
+        with patch.object(asyncio, "get_running_loop") as mock_loop:
+            loop_obj = MagicMock()
+            loop_obj.time.return_value = 2.0
+            mock_loop.return_value = loop_obj
+            dl._running = True
+            dl._started_at = 0.0
+            await dl._execute_one_cycle()
+        return float(dl._last_plan_effort), str(dl._last_phase)
+
+    @pytest.mark.asyncio
+    async def test_push_harder_uses_lead(self) -> None:
+        """踏み増し（同符号で絶対値が増える）方向は従来どおり 0.2s 前倒しする。"""
+        n = 400
+        efforts = [10.0 if i * 0.1 < 2.15 else 20.0 for i in range(n)]
+        effort, _ = await self._plan_effort(efforts, [PlanPhase.DRIVE] * n)
+        assert effort == pytest.approx(20.0)
+
+    @pytest.mark.asyncio
+    async def test_release_does_not_use_lead(self) -> None:
+        """抜き（絶対値が減る）方向は前倒ししない＝now-frame の 20% を保つ。"""
+        n = 400
+        efforts = [20.0 if i * 0.1 < 2.15 else 10.0 for i in range(n)]
+        effort, _ = await self._plan_effort(efforts, [PlanPhase.DRIVE] * n)
+        assert effort == pytest.approx(20.0)
+
+    @pytest.mark.asyncio
+    async def test_apex_sign_crossing_does_not_use_lead(self) -> None:
+        """軌跡頂点（DRIVE→BRAKE の符号反転）では前倒しを 0 にする。
+
+        これが最大逸脱の第1要因だったエピソード（実機 t=144-148）の縮図。旧実装は
+        0.2s 先の BRAKE 側を読み、基準がまだ加速要求中なのにアクセルを抜いていた。
+        """
+        n = 400
+        efforts = [15.0 if i * 0.1 < 2.15 else -5.0 for i in range(n)]
+        phases = [PlanPhase.DRIVE if i * 0.1 < 2.15 else PlanPhase.BRAKE for i in range(n)]
+        effort, phase = await self._plan_effort(efforts, phases)
+        assert effort == pytest.approx(15.0)
+        assert phase == "drive"
+
+    @pytest.mark.asyncio
+    async def test_brake_push_harder_uses_lead(self) -> None:
+        """制動側でも踏み増し（−5 → −15）なら前倒しする（向きの対称性）。"""
+        n = 400
+        efforts = [-5.0 if i * 0.1 < 2.15 else -15.0 for i in range(n)]
+        effort, _ = await self._plan_effort(efforts, [PlanPhase.BRAKE] * n)
+        assert effort == pytest.approx(-15.0)
+
+    def test_lead_is_tapered_near_fold(self) -> None:
+        """折返し点に近づくほど前倒し量が連続的に 0 へ絞られる。
+
+        二値の切り替えにすると effort が 0 を跨ぐ瞬間に指令が跳ぶ（ペダルが「パチン」と
+        動く）。連続性そのものが要件なので、距離に対して線形であることを確かめる。
+        """
+        n = 400
+        efforts = [15.0 if i * 0.1 < 10.0 else -5.0 for i in range(n)]
+        phases = [PlanPhase.DRIVE if i * 0.1 < 10.0 else PlanPhase.BRAKE for i in range(n)]
+        profile = _make_profile(
+            dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_theta=0.5)
+        )
+        dl = _make_loop(
+            ff=_make_ff(effort=0.0),
+            pid=PIDController(kp=0.0, ki=0.0, kd=0.0),
+            mode=_make_mode(
+                points=[SpeedPoint(0.0, 60.0), SpeedPoint(40.0, 60.0)], total_duration=40.0
+            ),
+            profile=profile,
+            can_reader=_make_can_reader(speed=60.0),
+            plan=PedalPlan(dt_s=0.1, efforts=efforts, phases=phases),
+        )
+        assert dl._plan_lead_s == pytest.approx(0.2)  # θ=0.5 × 0.4
+        # 折返しは t=10.0s。遠方では満額、近づくと線形に減り、折返し点で 0。
+        assert dl._plan_lead_at(5.0) == pytest.approx(0.2)
+        assert dl._plan_lead_at(9.9) == pytest.approx(0.1)
+        assert dl._plan_lead_at(10.0) == pytest.approx(0.0)
+        assert dl._plan_lead_at(10.1) == pytest.approx(0.1)
+        assert dl._plan_lead_at(10.2) == pytest.approx(0.2)
+
+    def test_no_fold_keeps_full_lead(self) -> None:
+        """折返しが無いプラン（単調なランプ）では前倒しを絞らない。"""
+        n = 100
+        dl = _make_loop(
+            ff=_make_ff(effort=0.0),
+            pid=PIDController(kp=0.0, ki=0.0, kd=0.0),
+            mode=_make_mode(
+                points=[SpeedPoint(0.0, 60.0), SpeedPoint(40.0, 60.0)], total_duration=40.0
+            ),
+            profile=_make_profile(
+                dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_theta=0.5)
+            ),
+            can_reader=_make_can_reader(speed=60.0),
+            plan=PedalPlan(
+                dt_s=0.1,
+                efforts=[float(i) for i in range(n)],
+                phases=[PlanPhase.DRIVE] * n,
+            ),
+        )
+        assert dl._plan_fold_times == []
+        assert dl._plan_lead_at(5.0) == pytest.approx(0.2)
+
+
+class TestGainSideSelection:
+    """ゲインスケジュールの向き判定（DriveLoop._is_accel_side）。
+
+    ロバスト上限 Kc = 1/(k'(v)·(θ+τc)) の k' は「今動いているペダル」のゲインでなければ
+    安定余裕の見積りにならない。旧実装は基準速度のトレンドで決めており、減速区間では
+    プランが惰行でアクセルを当てている最中でも制動側（Kc 0.27〜0.36）が選ばれていた。
+    """
+
+    def _loop(self) -> object:
+        return _make_loop(
+            ff=_make_ff(effort=0.0),
+            pid=PIDController(kp=1.0, ki=0.0, kd=0.0),
+            mode=_make_mode(
+                points=[SpeedPoint(0.0, 60.0), SpeedPoint(40.0, 60.0)], total_duration=40.0
+            ),
+            profile=_make_profile(
+                dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_theta=0.5)
+            ),
+            can_reader=_make_can_reader(speed=60.0),
+        )
+
+    def test_accel_pedal_selects_drive_side(self) -> None:
+        dl = self._loop()
+        dl._last_applied_effort = 12.0
+        assert dl._is_accel_side(60.0, 58.0, [59.0]) is True
+
+    def test_brake_pedal_selects_brake_side(self) -> None:
+        dl = self._loop()
+        dl._last_applied_effort = -12.0
+        assert dl._is_accel_side(60.0, 62.0, [59.0]) is False
+
+    def test_decelerating_reference_but_accel_pedal_selects_drive_side(self) -> None:
+        """減速中でもアクセルを当てているなら駆動側を選ぶ（旧実装との差そのもの）。"""
+        dl = self._loop()
+        dl._last_applied_effort = 4.0
+        # 基準は下降トレンド（旧実装なら制動側になっていた）
+        assert dl._is_accel_side(60.0, 61.0, [55.0]) is True
+
+    def test_deadband_keeps_previous_side(self) -> None:
+        """どちらのペダルも動いていない帯では前回の向きを保つ（チャタ防止）。"""
+        dl = self._loop()
+        dl._last_applied_effort = -12.0
+        assert dl._is_accel_side(60.0, 62.0, [59.0]) is False
+        dl._last_applied_effort = 0.1  # 不感帯 0.5% の内側
+        assert dl._is_accel_side(60.0, 60.0, [59.0]) is False
+
+    def test_seeds_from_reference_trend_on_first_call(self) -> None:
+        """初回かつ不感帯内なら従来どおり基準トレンドで決める。"""
+        dl = self._loop()
+        dl._last_applied_effort = 0.0
+        assert dl._is_accel_side(60.0, 60.0, [55.0]) is False
+        dl2 = self._loop()
+        dl2._last_applied_effort = 0.0
+        assert dl2._is_accel_side(60.0, 60.0, [65.0]) is True
+
+
+class TestBrakeDeadbandHandling:
+    """ブレーキ不感帯 5% の扱い（優先B）。
+
+    制動 effort は物理的に {0} ∪ [db, ∞) しか取れず、1 段目が 45km/h で 2.4km/h/s ある。
+    KPI 許容 0.4km/h に対して粗すぎるため、(a) 減速中の微調整はアクセル側で行い、
+    (b) 1 段を入れると行き過ぎが確定する場面では入れない。
+    """
+
+    def _params(self) -> FeedforwardParams:
+        return FeedforwardParams(
+            brake_deadband_pct=5.0,
+            accel_deadband_pct=0.5,
+            pedal_gain_speeds_kmh=(20.0, 45.0, 75.0),
+            accel_gain_kmhs_per_pct=(0.40, 0.334, 0.30),
+            brake_gain_kmhs_per_pct=(0.30, 0.476, 1.066),
+        )
+
+    def _loop(self, theta: float | None = 0.5) -> object:
+        return _make_loop(
+            ff=_make_ff(effort=0.0),
+            pid=PIDController(kp=1.0, ki=0.0, kd=0.0),
+            mode=_make_mode(
+                points=[SpeedPoint(0.0, 60.0), SpeedPoint(40.0, 60.0)], total_duration=40.0
+            ),
+            profile=_make_profile(
+                ffp=self._params(),
+                dynamics_params=DynamicsParams(pid_preview_s=0.0, fopdt_theta=theta),
+            ),
+            can_reader=_make_can_reader(speed=45.0),
+        )
+
+    def test_brake_phase_allows_low_accel_when_short(self) -> None:
+        """BRAKE フェーズでも速度が足りなければ低開度アクセルを通す（上限 5%）。"""
+        dl = self._loop()
+        effort, high, low = dl._apply_phase_authority(-2.0, 5.0, PlanPhase.BRAKE, 0.4)
+        assert effort == pytest.approx(3.0)
+        assert (high, low) == (False, False)
+
+    def test_brake_phase_caps_accel_assist(self) -> None:
+        dl = self._loop()
+        effort, high, _ = dl._apply_phase_authority(0.0, 9.0, PlanPhase.BRAKE, 0.4)
+        assert effort == pytest.approx(5.0)
+        assert high is True  # 上限で削った＝加速側飽和
+
+    def test_brake_phase_blocks_accel_when_overspeed(self) -> None:
+        """超過しているのにアクセルへ跳ねるのは従来どおり禁止。"""
+        dl = self._loop()
+        effort, high, _ = dl._apply_phase_authority(0.0, 4.0, PlanPhase.BRAKE, -0.4)
+        assert effort == pytest.approx(0.0)
+        assert high is True
+
+    def test_escalation_skipped_when_one_step_overshoots(self) -> None:
+        """1 段で消える量より超過が小さいなら引き上げない（行き過ぎが確定するため）。
+
+        45km/h・db=5%・θ=0.5s なら 1 段が θ の間に消す速度は 0.476×5×0.5 = 1.19km/h。
+        超過 0.6km/h はそれ未満なので、不感帯以下のまま惰行させる。
+        """
+        dl = self._loop()
+        assert dl._escalation_pays_off(0.6, 45.0) is False
+
+    def test_escalation_applied_when_overspeed_is_large(self) -> None:
+        dl = self._loop()
+        assert dl._escalation_pays_off(2.4, 45.0) is True
+
+    def test_escalation_falls_back_when_theta_unknown(self) -> None:
+        """θ 未同定なら判定できないので従来動作（常に引き上げ）。"""
+        dl = self._loop(theta=None)
+        assert dl._escalation_pays_off(0.1, 45.0) is True

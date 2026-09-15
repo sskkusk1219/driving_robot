@@ -18,9 +18,10 @@ _INSERT_LOG_SQL = """
     INSERT INTO drive_logs
         (session_id, timestamp, ref_speed_kmh, actual_speed_kmh,
          accel_opening, brake_opening, accel_pos, brake_pos,
-         accel_current, brake_current)
+         accel_current, brake_current,
+         plan_effort_pct, trim_effort_pct, applied_effort_pct, phase)
     VALUES
-        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 """
 
 
@@ -129,6 +130,10 @@ class LogWriter:
                 data.brake_pos,
                 data.accel_current,
                 data.brake_current,
+                data.plan_effort_pct,
+                data.trim_effort_pct,
+                data.applied_effort_pct,
+                data.phase,
             )
         )
         if self._last_flush_at is None:

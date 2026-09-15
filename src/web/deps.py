@@ -7,7 +7,7 @@ from fastapi import Request
 from src.app.learning_cycle import LearningCycleOrchestrator
 from src.app.robot_controller import LogWriterProtocol, RobotController
 from src.domain.model_training import DEFAULT_FEATURE_SPEC, FeatureSpec
-from src.infra.ilc_repository import ILCRecord
+from src.infra.pedal_plan_repository import PedalPlanRecord
 from src.infra.settings import LearningSettings
 from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
@@ -59,8 +59,8 @@ class SessionRepoProtocol(Protocol):
     ) -> list[LearningCycle]: ...
 
 
-class ILCRepoProtocol(Protocol):
-    async def get(self, profile_id: str, mode_id: str) -> ILCRecord | None: ...
+class PlanRepoProtocol(Protocol):
+    async def get(self, profile_id: str, mode_id: str) -> PedalPlanRecord | None: ...
     async def reset(self, profile_id: str, mode_id: str) -> None: ...
     async def reset_for_mode(self, mode_id: str) -> None: ...
     async def set_enabled(self, profile_id: str, mode_id: str, enabled: bool) -> None: ...
@@ -111,8 +111,8 @@ def get_schedule_repo(request: Request) -> ScheduleRepoProtocol:
     return repo
 
 
-def get_ilc_repo(request: Request) -> ILCRepoProtocol:
-    repo: ILCRepoProtocol = request.app.state.ilc_repo
+def get_plan_repo(request: Request) -> PlanRepoProtocol:
+    repo: PlanRepoProtocol = request.app.state.plan_repo
     return repo
 
 

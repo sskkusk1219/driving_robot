@@ -188,6 +188,37 @@ class TestLogWriterWriteLog:
         assert rows[0][2] is None  # ref_speed_kmh = $3
 
     @pytest.mark.asyncio
+    async def test_flush_includes_effort_breakdown(self) -> None:
+        """プラン学習の effort 内訳（plan/trim/applied/phase）が $11〜$14 に載ること。"""
+        conn = make_conn()
+        writer = LogWriter(conn)
+        data = sample_log_data()
+        data.plan_effort_pct = 18.0
+        data.trim_effort_pct = 1.5
+        data.applied_effort_pct = 19.5
+        data.phase = "drive"
+
+        await writer.write_log("session-uuid", data)
+        await writer._flush_log_buffer()
+
+        rows = conn.executemany.call_args[0][1]
+        assert rows[0][10] == 18.0  # plan_effort_pct = $11
+        assert rows[0][11] == 1.5  # trim_effort_pct = $12
+        assert rows[0][12] == 19.5  # applied_effort_pct = $13
+        assert rows[0][13] == "drive"  # phase = $14
+
+    @pytest.mark.asyncio
+    async def test_flush_effort_breakdown_defaults_none(self) -> None:
+        """内訳未指定（学習運転・スケジュール走行）では NULL が渡ること（後方互換）。"""
+        conn = make_conn()
+        writer = LogWriter(conn)
+        await writer.write_log("session-uuid", sample_log_data())
+        await writer._flush_log_buffer()
+        rows = conn.executemany.call_args[0][1]
+        assert rows[0][10] is None
+        assert rows[0][13] is None
+
+    @pytest.mark.asyncio
     async def test_flush_with_empty_buffer_does_not_call_db(self) -> None:
         """バッファが空の場合、フラッシュしても executemany は呼ばれない。"""
         conn = make_conn()

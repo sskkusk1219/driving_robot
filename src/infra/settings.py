@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 
@@ -12,6 +12,61 @@ class SerialSettings:
     accel_port: str = "/dev/ttyUSB0"
     brake_port: str = "/dev/ttyUSB1"
     baud_rate: int = 38400
+    # Modbus 応答待ち [s]。仕様（MODBUS 4-2）の Tout = To + α + (10·Bprt/Kbr) は
+    # 38400bps・α=5ms で 12.2〜12.4ms。旧既定 0.3s はその約 24 倍で、再送 3 回を含めた
+    # 最悪ブロックが 4×0.3=1.2s となり base_loop.WEDGED_CYCLE_TIMEOUT_S=1.0s を超えていた
+    # ＝**単発の再送上限到達が必ずウォッチドッグ非常停止を起こす**構造だった。
+    # 実機で観測されているのは「初回は応答が来ず（欠落）、再送は数十ms で成功する」
+    # パターンなので、短いタイムアウトで早く再送に入るほうが速い。仕様値の 4 倍の
+    # マージンを取って 0.05s（4 試行で 0.2s < 1.0s）とする。
+    timeout_s: float = 0.05
+    # 再送回数。MODBUS 4-2「リトライは、必ず設定してください」Nrt=3。
+    retries: int = 3
+
+
+# RCP6-ROD の最低速度算出式の分母（MJ3751-2Q 1.2.1 の注意書き）:
+#   最低速度〔mm/s〕＝ リード長〔mm〕÷ 800 ÷ 0.001〔秒〕＝ リード長 ÷ 0.8
+# 「最低速度以下の速度は設定しないでください。設定した速度では動きません」と明記されている。
+_RCP6_MIN_SPEED_LEAD_DIVISOR: float = 0.8
+
+
+@dataclass
+class ActuatorAxisSettings:
+    """1 軸ぶんのアクチュエータ機体仕様（docs/manuals/RCP6-ROD(MJ3751-2Q).pdf 由来）。
+
+    最高速度・最低速度・加減速度別可搬質量は**すべてリード長に依存する**ため、型式と
+    リード長をここに記録して actuator_driver がそれを参照する。lead_mm=0（未記入）なら
+    ドライバはリード長非依存の保守的な既定値にフォールバックする。
+    """
+
+    # 実機ラベルの型式（例: RCP6-RA6R-WA-42P-6-100-P3-M-MT）。参照用で制御には使わない。
+    model: str = ""
+    # ボールねじリード長 [mm]。型式の「モーター種類-リード-ストローク」の中央の数字。
+    # 最低速度（= lead_mm / 0.8）の算出に使う。0 なら未記入。
+    lead_mm: float = 0.0
+    # ストローク [mm]（型式末尾側の数字）。参照用。
+    stroke_mm: float = 0.0
+    # 運用上の最高速度 [mm/s]。仕様の「速度の制限」表（水平/垂直の小さい方）から取る。
+    # PCON-CB パラメーター No.152「高出力化設定」が無効の場合の値を入れておくと、
+    # 設定に関わらず安全側になる。
+    max_speed_mm_s: float = 100.0
+    # 運用上の最大加減速度 [G]。仕様の「加減速度別可搬質量」表で運用速度域の可搬質量が
+    # ペダル反力を上回る範囲に収めること（MJ3751-2Q 1.2.2 の注意:「加減速度は、許容値
+    # 以上の設定は行わないでください」）。
+    max_accel_g: float = 0.3
+
+    @property
+    def min_speed_mm_s(self) -> float | None:
+        """仕様式によるこの軸の最低速度 [mm/s]。lead_mm 未記入なら None。"""
+        if self.lead_mm <= 0.0:
+            return None
+        return self.lead_mm / _RCP6_MIN_SPEED_LEAD_DIVISOR
+
+
+@dataclass
+class ActuatorSettings:
+    accel: ActuatorAxisSettings = field(default_factory=ActuatorAxisSettings)
+    brake: ActuatorAxisSettings = field(default_factory=ActuatorAxisSettings)
 
 
 @dataclass
@@ -94,33 +149,49 @@ class ModelSettings:
 
 @dataclass
 class LearningSettings:
-    """2段階学習フロー（学習サイクル）のデフォルトパラメータ。"""
+    """学習サイクルのデフォルトパラメータ（30 分目標の時間予算で調整済み）。"""
 
-    # stage1 は kp/ki/kd に加え PID 先読み補償秒数(pid_preview_s)も探索する4次元座標降下のため
-    # 10→14 に増やしている（1巡=最大8走行、ベースライン+1巡強を確保）。
-    refine_runs_stage1: int = 14
-    # stage2 は連続コスト（超過積分）で勾配探索するため予算を増やして4座標を十分に
-    # 探索させる（Stage B: 5→12）。規定パターンは短いので追加コストは小さい。
-    refine_runs_stage2: int = 12
-    # REFINE_2 の評価走行を本番モード（学習サイクル対象モード）の代表区間で行うか。
-    # 既定 False: 学習サイクルは規定パターン（build_tuning_trajectory）で適合する。
-    # ゲインスケジューリング（速度依存プラントゲイン正規化）により規定パターンで適合した
-    # ゲインは高速域にも転移するため、本番モード適合は必須ではない。True にすると
-    # 対象モード指定時に本番代表区間（build_tuning_trajectory_from_mode）で評価する。
-    # standalone の /pid-tune/refine は mode_id 指定で本設定に依らず本番モード適合できる。
-    tuning_on_target_mode: bool = False
-    # VERIFY フェーズ（検証専用パターンでの KPI 合格確認）の最大走行本数。KPI 合格で早期終了、
-    # 不合格ならモデル再学習＋プラン再構築して再走行し、この本数で打ち切る（打ち切り時は
-    # WARNING 付きで完了）。1 本 ≈ 検証パターン約 4 分＋再学習。
-    verify_runs_max: int = 5
+    # REFINE_1（PID 粗適合）の走行本数。REFINE_F が最終適合を担う完走型フロー
+    # （2026-07-14）では粗適合はゲイン概算のみでよいため 5→3 に削減。
+    # 2026-09-08: ProblemReport_20260908 の時間短縮（34.2分→20分以内）で 3→2 に削減。
+    # ゲイン概算が目的で TRAINING_2 後の PLAN_LEARN が主戦場のため、本数減の影響は小さい。
+    refine_runs_stage1: int = 2
+    # VERIFY フェーズ（網羅検証パターンでの走行）の走行本数。
+    # 2026-09-08: ProblemReport_20260908 の時間短縮で 1→0（フェーズ廃止）。VERIFY は FF 由来
+    # プランのみで走るため p95 が構造的な床（実機 3.1 前後）に達して飽和し、続く PLAN_LEARN の
+    # 初回走行と役割が重複していた（実機 2026-09-07 サイクルでは VERIFY p95=2.22 → PLAN_LEARN
+    # 1本目 p95=1.74 と PLAN_LEARN の方が既に上回っていた）。モデル確定はそのまま
+    # TRAINING_2 が担い、PLAN_LEARN 初回走行が実質の初回検証を兼ねる。
+    verify_runs: int = 0
+    # 網羅検証パターン（システムモード）の目標長 [s]。PLAN_LEARN（VERIFY 廃止後の唯一の
+    # 利用元）で使う。時間予算のため 180→130（2026-09-08）。速度域の被覆（0〜最高速・
+    # 加速/巡航/減速）は pid_tuning.py の保持時間の床で維持したまま短縮する。
+    verify_pattern_budget_s: float = 130.0
+    # PLAN_LEARN フェーズ（KPI 未達でも無条件実行）の最大走行本数。0 でフェーズスキップ。
+    # 2026-09-08: ProblemReport_20260908 の時間短縮で 8→4。REFINE_FINAL 廃止（下記）により
+    # 時間予算をこちらへ回す。最終結果は best 走行を採用する（learning_cycle.py 参照）ため、
+    # 本数減で「悪い最終走行が採用される」リスクは生じない。
+    plan_learn_runs_max: int = 4
+    # PLAN_LEARN 早期打ち切りの reward 改善幅しきい値。KPI 合格で即打ち切り、または改善幅 <
+    # この値（改善なし）が PLAN_LEARN_PATIENCE 回連続で収束打ち切り（2026-07-16: 旧 1 発判定は
+    # reward の走行間ばらつき ±5 程度で単調改善中でも誤発動した）。
+    plan_learn_reward_epsilon: float = 1.0
+    # REFINE_F（PID 仕上げ・収束プラン凍結の座標降下）の走行本数。
+    # 2026-09-08: ProblemReport_20260908 の時間短縮で 3→0（フェーズ廃止）。実機 2026-09-07
+    # サイクルでは 9.6分かけて p95 を 3.34→2.66 にしただけで、PLAN_LEARN 1本目の 1.74 より
+    # 悪い状態で終わっていた（learning_cycle.py の best 採用修正後は尚更、プラン固定後の
+    # PID 微調整より PLAN_LEARN の反復本数を増やす方が期待値が高い）。0 でフェーズスキップ。
+    refine_final_runs: int = 0
     # 学習運転（開ループパターン走行）完了待ちのタイムアウト [s]。学習パターン総時間は
-    # マネージャから取得困難なため定数運用とし、余裕を持たせた値にする。
-    learning_timeout_s: float = 600.0
+    # マネージャから取得困難なため定数運用とし、余裕を持たせた値にする。コーストダウン完走化
+    # （coast_timeout_s 6→90s）で学習運転が ≈6.5→9分に延びたため 600→900 に拡大。
+    learning_timeout_s: float = 900.0
 
 
 @dataclass
 class AppSettings:
     serial: SerialSettings = field(default_factory=SerialSettings)
+    actuator: ActuatorSettings = field(default_factory=ActuatorSettings)
     can: CanSettings = field(default_factory=CanSettings)
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
     gpio: GpioSettings = field(default_factory=GpioSettings)
@@ -146,6 +217,7 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
         raw = tomllib.load(f)
 
     serial = SerialSettings(**{k: v for k, v in raw.get("serial", {}).items()})
+    actuator = _parse_actuator_settings(raw.get("actuator", {}))
     can = CanSettings(**{k: v for k, v in raw.get("can", {}).items()})
     database = DatabaseSettings(**{k: v for k, v in raw.get("database", {}).items()})
     gpio = GpioSettings(**{k: v for k, v in raw.get("gpio", {}).items()})
@@ -155,10 +227,16 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
     servo = ServoSettings(**{k: v for k, v in raw.get("servo", {}).items()})
     ups = UpsSettings(**{k: v for k, v in raw.get("ups", {}).items()})
     model = _parse_model_settings(raw.get("model", {}))
-    learning = LearningSettings(**{k: v for k, v in raw.get("learning", {}).items()})
+    # 学習セクションは廃止フィールド（refine_runs_stage2 / tuning_on_target_mode）が既存の
+    # config に残っていても起動を止めないよう、既知フィールドのみ取り込む。
+    _learning_fields = {f.name for f in fields(LearningSettings)}
+    learning = LearningSettings(
+        **{k: v for k, v in raw.get("learning", {}).items() if k in _learning_fields}
+    )
 
     return AppSettings(
         serial=serial,
+        actuator=actuator,
         can=can,
         database=database,
         gpio=gpio,
@@ -170,6 +248,22 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
         model=model,
         learning=learning,
     )
+
+
+def _parse_actuator_settings(raw: dict[str, object]) -> ActuatorSettings:
+    """`[actuator.accel]` / `[actuator.brake]` を ActuatorSettings へ変換する。
+
+    セクションごと未記入でも既定値で起動できるようにする（型式が判明していない現場でも
+    従来どおり動く）。未知キーは読み捨てる。
+    """
+    known = {f.name for f in fields(ActuatorAxisSettings)}
+
+    def _axis(section: object) -> ActuatorAxisSettings:
+        if not isinstance(section, dict):
+            return ActuatorAxisSettings()
+        return ActuatorAxisSettings(**{k: v for k, v in section.items() if k in known})
+
+    return ActuatorSettings(accel=_axis(raw.get("accel")), brake=_axis(raw.get("brake")))
 
 
 def _parse_model_settings(raw: dict[str, object]) -> ModelSettings:

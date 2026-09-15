@@ -13,8 +13,8 @@ from starlette.responses import Response
 
 from src.app.robot_controller import InvalidStateTransition, PidTuningAborted, PreCheckFailed
 from src.app.stubs import (
-    InMemoryILCRepository,
     InMemoryModeRepository,
+    InMemoryPedalPlanRepository,
     InMemoryProfileRepository,
     InMemoryScheduleRepository,
     InMemorySessionRepository,
@@ -50,8 +50,8 @@ async def _build_repos(app: FastAPI) -> None:
     db_url = os.environ.get("DATABASE_URL")
     if db_url:
         from src.infra.db import create_pool  # noqa: PLC0415
-        from src.infra.ilc_repository import ILCRepository  # noqa: PLC0415
         from src.infra.mode_repository import ModeRepository  # noqa: PLC0415
+        from src.infra.pedal_plan_repository import PedalPlanRepository  # noqa: PLC0415
         from src.infra.profile_repository import ProfileRepository  # noqa: PLC0415
         from src.infra.schedule_repository import ScheduleRepository  # noqa: PLC0415
         from src.infra.session_repository import SessionRepository  # noqa: PLC0415
@@ -62,7 +62,7 @@ async def _build_repos(app: FastAPI) -> None:
         app.state.mode_repo = ModeRepository(pool)
         app.state.session_repo = SessionRepository(pool)
         app.state.schedule_repo = ScheduleRepository(pool)
-        app.state.ilc_repo = ILCRepository(pool)
+        app.state.plan_repo = PedalPlanRepository(pool)
 
         # 前回プロセスの異常終了で 'running' のまま残った孤児セッションを是正する。
         from src.infra.log_writer import LogWriter  # noqa: PLC0415
@@ -78,7 +78,7 @@ async def _build_repos(app: FastAPI) -> None:
         app.state.mode_repo = InMemoryModeRepository()
         app.state.session_repo = InMemorySessionRepository()
         app.state.schedule_repo = InMemoryScheduleRepository()
-        app.state.ilc_repo = InMemoryILCRepository()
+        app.state.plan_repo = InMemoryPedalPlanRepository()
 
 
 @asynccontextmanager
@@ -117,8 +117,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log_writer=cycle_log_writer,
         learning_timeout_s=app.state.learning_settings.learning_timeout_s,
         mode_repo=app.state.mode_repo,
-        tuning_on_target_mode=app.state.learning_settings.tuning_on_target_mode,
-        verify_runs_max=app.state.learning_settings.verify_runs_max,
+        verify_runs=app.state.learning_settings.verify_runs,
+        verify_pattern_budget_s=app.state.learning_settings.verify_pattern_budget_s,
+        plan_learn_runs_max=app.state.learning_settings.plan_learn_runs_max,
+        plan_learn_reward_epsilon=app.state.learning_settings.plan_learn_reward_epsilon,
+        refine_final_runs=app.state.learning_settings.refine_final_runs,
     )
 
     task = asyncio.create_task(broadcast_loop(app))

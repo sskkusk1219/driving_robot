@@ -1,12 +1,12 @@
-// ── ILC（反復学習制御）状態パネル ─────────────────────────
-// profile×mode の学習反復回数・最良p95・有効トグル・リセット・収束履歴を表示する。
-function ILCPanel({ profileId, modeId, robotState }) {
+// ── プラン学習（エピソード型方策改善）状態パネル ─────────────────────────
+// profile×mode の学習反復回数・最良reward・有効トグル・リセット・reward 収束履歴を表示する。
+function PlanPanel({ profileId, modeId, robotState }) {
   const { useState, useEffect, useContext } = React;
   const { apiFetch } = useContext(window.AppContext);
   const { INK, INK_SOFT, Btn } = window;
   const [status, setStatus] = useState(null);
 
-  const base = `/api/v1/drive/ilc/${profileId}/${modeId}`;
+  const base = `/api/v1/drive/plan/${profileId}/${modeId}`;
   const refresh = () => {
     if (!profileId || !modeId) return;
     apiFetch('GET', base).then(d => { if (d) setStatus(d); });
@@ -24,35 +24,35 @@ function ILCPanel({ profileId, modeId, robotState }) {
   };
   const reset = async () => {
     const d = await apiFetch('POST', `${base}/reset`);
-    if (d) { setStatus(d); window.showToast('ILC 補正をリセットしました', 'success'); }
+    if (d) { setStatus(d); window.showToast('保存プランをリセットしました', 'success'); }
   };
 
-  const hist = (status.kpi_history || []).slice(-6);
-  const p95 = status.best_p95_kmh;
+  const hist = (status.reward_history || []).slice(-6);
+  const reward = status.best_reward;
   const disabled = robotState === 'RUNNING' || robotState === 'PAUSED';
 
   return (
     <div style={{ marginTop: 6, paddingTop: 6, borderTop: `1px solid ${window.HATCH}`, fontSize: 12 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ color: INK_SOFT }}>反復学習</span>
+        <span style={{ color: INK_SOFT }}>プラン学習</span>
         <span style={{ color: INK, fontWeight: 600 }}>第{status.iteration}回</span>
         <span style={{ color: status.enabled ? '#68d468' : INK_SOFT }}>
           {status.enabled ? '有効' : '無効'}
         </span>
         <span style={{ color: INK_SOFT, marginLeft: 'auto' }}>
-          {p95 != null ? `最良p95 ${p95.toFixed(2)}` : '未学習'}
+          {reward != null ? `最良reward ${reward.toFixed(3)}` : '未学習'}
         </span>
       </div>
       {hist.length > 0 && (
         <div style={{ color: INK_SOFT, marginTop: 3, fontFamily: 'monospace', fontSize: 11 }}>
-          p95: {hist.map(h => (h.p95_kmh != null ? h.p95_kmh.toFixed(2) : '—')).join(' → ')}
+          reward: {hist.map(h => (h.reward != null ? h.reward.toFixed(2) : '—')).join(' → ')}
         </div>
       )}
       <div style={{ display: 'flex', gap: 6, marginTop: 5 }}>
         <Btn disabled={disabled} style={{ flex: 1, fontSize: 11, padding: '3px 6px' }} onClick={toggle}>
           {status.enabled ? '無効化' : '有効化'}
         </Btn>
-        <Btn disabled={disabled || (status.iteration === 0 && !status.has_table)}
+        <Btn disabled={disabled || (status.iteration === 0 && !status.has_plan)}
              style={{ flex: 1, fontSize: 11, padding: '3px 6px' }} onClick={reset}>
           リセット
         </Btn>
@@ -61,7 +61,7 @@ function ILCPanel({ profileId, modeId, robotState }) {
   );
 }
 
-window.ILCPanel = ILCPanel;
+window.PlanPanel = PlanPanel;
 
 // ── Auto-drive monitor screen ─────────────────────────────
 // AutoDriveD layout: 3-axis graph + BigSpeed + session info + stop
@@ -474,9 +474,9 @@ function DriveMonitorScreen({
                 {resultPanel}
               </div>
             )}
-            {/* ILC 状態: mode ベース自動走行かつ profile/mode 選択時のみ（schedule 除く） */}
+            {/* プラン学習状態: mode ベース自動走行かつ profile/mode 選択時のみ（schedule 除く） */}
             {showModeAxis && activeProfileId && activeModeId && activeModeKind !== 'schedule' &&
-              React.createElement(window.ILCPanel, {
+              React.createElement(window.PlanPanel, {
                 profileId: activeProfileId, modeId: activeModeId, robotState,
               })}
           </Box>

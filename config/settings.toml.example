@@ -14,7 +14,50 @@ accel_port = "/dev/actuator_accel"
 # ブレーキアクチュエータ
 brake_port = "/dev/actuator_brake"
 # Modbus RTU ボーレート（P-CON-CB 実機確認値）
+# 仕様上は 230400 まで選択可（MODBUS 2-1）。38400 は PCON-CB の工場出荷時既定値。
 baud_rate = 38400
+# Modbus 応答待ち [s]。仕様式（MODBUS 4-2）では 38400bps で約 12.4ms。
+# 4 試行の合計が base_loop.WEDGED_CYCLE_TIMEOUT_S=1.0s を超えないこと
+# （旧既定 0.3s は 4 試行 1.2s で、再送上限到達が必ず非常停止を起こしていた）。
+timeout_s = 0.05
+# 再送回数（MODBUS 4-2「リトライは、必ず設定してください」Nrt=3）
+retries = 3
+
+# ── アクチュエータ機体仕様（docs/manuals/RCP6-ROD(MJ3751-2Q).pdf より） ──────────
+# 最高速度・最低速度・加減速度別可搬質量は**すべてリード長に依存する**ため、実機ラベルの
+# 型式を型番展開してここに記録する。型式の読み方（MJ3751-2Q 1.1 型式構成）:
+#   RCP6 - RA6R - WA - 42P - 6 - 100 - P3 - M - MT
+#   シリーズ  タイプ  エンコーダー  モーター  リード  ストローク  コントローラー  ケーブル  オプション
+#   RA6R/RA7R = ロッドタイプ・モーター折返し / WA = バッテリーレスアブソ
+#   42P/56P = モーター 42□/56□ / P3 = PCON-CB / M = ケーブル 5m
+#   MT = モーター上折返し, ML = モーター左折返し
+#
+# min_speed（＝ lead_mm ÷ 0.8）はコード側で算出する（infra/actuator_driver.min_speed_for_lead）。
+# 仕様の注意書き:「最低速度以下の速度は設定しないでください。設定した速度では動きません」
+#
+# max_speed_mm_s は「速度の制限」表（1.2.1・モーター折返しタイプ）の**高出力設定無効時**の
+# 値を入れている。高出力設定は PCON-CB パラメーター No.152 で、出荷時は**有効**（有効時は
+# accel 450 / brake 水平420・垂直350 mm/s）。無効側の値にしておけば設定によらず安全側。
+#
+# max_accel_g は「加減速度別可搬質量」表（1.2.2）の運用速度域で十分な可搬質量が残る値。
+# 100mm/s では accel 0.3G→40kg / brake 0.3G→50kg（高出力設定無効・水平）。
+# 注意:「加減速度は、許容値以上の設定は行わないでください」
+
+[actuator.accel]
+# アクセルペダル用
+model = "RCP6-RA6R-WA-42P-6-100-P3-M-MT"
+lead_mm = 6.0        # → 最低速度 7.5 mm/s
+stroke_mm = 100.0
+max_speed_mm_s = 250.0  # 高出力設定無効時（有効時は 450）
+max_accel_g = 0.3
+
+[actuator.brake]
+# ブレーキペダル用
+model = "RCP6-RA7R-WA-56P-8-100-P3-M-ML"
+lead_mm = 8.0        # → 最低速度 10.0 mm/s
+stroke_mm = 100.0
+max_speed_mm_s = 210.0  # 高出力設定無効時（有効時は 水平420 / 垂直350）
+max_accel_g = 0.3
 
 [can]
 # python-can インターフェース名
@@ -79,10 +122,24 @@ include_dv_regime_x_v0 = true
 accel_horizons_s = []
 
 [learning]
-# 2段階学習フロー（学習サイクル）の各段の PID 適合走行回数上限
-# stage1 は kp/ki/kd に加え先読み補償秒数(preview_time_s)も探索する4次元座標降下のため
-# 10→14 に増やしている（1巡=最大8走行、ベースライン+1巡強を確保）。
-refine_runs_stage1 = 14
-refine_runs_stage2 = 5
+# 学習サイクル（学習運転→訓練→PID粗適合→再学習→プラン学習→PID仕上げ）のフェーズ別パラメータ。
+# 2026-09-08 ProblemReport_20260908 対応: 34.2分→20分以内の時間短縮と KPI 未達の是正で
+# src/infra/settings.py の LearningSettings 既定値と揃えた（旧 refine_runs_stage2 /
+# tuning_on_target_mode は廃止済みフィールドで、指定しても読み捨てられる）。
+
+# REFINE_1（PID 粗適合）の走行本数。REFINE_F 廃止に伴い粗適合はゲイン概算のみでよいため 2。
+refine_runs_stage1 = 2
+# VERIFY フェーズ（網羅検証パターンでの走行）の走行本数。0 でフェーズ廃止（PLAN_LEARN
+# 初回走行が実質の初回検証を兼ねる）。
+verify_runs = 0
+# 網羅検証パターン（システムモード）の目標長 [s]。PLAN_LEARN で使う。
+verify_pattern_budget_s = 130.0
+# PLAN_LEARN フェーズ（KPI 未達でも無条件実行）の最大走行本数。0 でフェーズスキップ。
+# 最終結果は本数内の best 走行を採用する（learning_cycle.py）。
+plan_learn_runs_max = 4
+# PLAN_LEARN 早期打ち切りの reward 改善幅しきい値。
+plan_learn_reward_epsilon = 1.0
+# REFINE_F（PID 仕上げ・収束プラン凍結の座標降下）の走行本数。0 でフェーズ廃止。
+refine_final_runs = 0
 # 学習運転（開ループパターン走行）完了待ちのタイムアウト [s]
-learning_timeout_s = 600.0
+learning_timeout_s = 900.0

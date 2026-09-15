@@ -839,13 +839,13 @@ async def test_learning_cycle_start_returns_202_with_cycle_id(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         res = await c.post(
             "/api/v1/drive/learning-cycle/start",
-            json={"refine_runs_stage1": 3, "refine_runs_stage2": 2},
+            json={"refine_runs_stage1": 3},
         )
     assert res.status_code == 202
     assert res.json() == {"cycle_id": "cycle-abc", "status": "started"}
     orchestrator.start.assert_awaited_once()
+    # REFINE_2 廃止により start() は refine_runs_stage1 のみを受け取る
     assert orchestrator.start.await_args.args[0] == 3
-    assert orchestrator.start.await_args.args[1] == 2
 
 
 @pytest.mark.asyncio

@@ -155,6 +155,25 @@ class CANReader:
             if self._first_frame is not None:
                 self._first_frame.set()
 
+    @property
+    def latest_updated_at(self) -> float | None:
+        """最後に Speed フレームでキャッシュを更新した時刻（`loop.time()` 基準の単調時計）。
+
+        まだ 1 フレームも受けていなければ None。**壁時計ではない**ので絶対時刻としては
+        使えず、フレーム間隔の測定にだけ使うこと。
+
+        `read_speed` は補間も外挿もせず最新値をそのまま返すため、実効更新レートが制御周期
+        より遅いと車速が階段状に見える。120km/h プラトーで観測されている 0.57Hz・
+        std 0.57-0.72km/h の鋸歯が「制御が作ったもの」か「車速信号そのものの性質」かを
+        切り分けるには受信時刻が要るが、drive_logs.timestamp は LogWriter が書き込み時に
+        打つ値（＝制御ループのサンプリング時刻）でフレーム到着時刻ではない。
+        DBC にも送信周期の属性が無いので、静的には周期が分からない
+        （docs/Problem/引き継ぎ20260909.md 優先E）。
+
+        用途: scripts/record_can_speed.py（ペダル無操作での定常記録）。
+        """
+        return None if self._latest_speed is None else self._latest_at
+
     async def read_speed(self) -> float:
         """キャッシュされた最新の車速 [km/h] を返す。
 

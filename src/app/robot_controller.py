@@ -9,10 +9,10 @@ from uuid import uuid4
 from src.domain.control.conversions import G_TO_KMHS, VEHICLE_STOP_SPEED_KMH, opening_to_position
 from src.domain.control.drive_loop import DriveLoop
 from src.domain.control.feedforward import FeedforwardController
-from src.domain.control.ilc import ILCController
 from src.domain.control.learning_loop import LearningLoop
 from src.domain.control.pedal_plan import PedalPlan, PedalPlanner
 from src.domain.control.pid import PIDController
+from src.domain.control.reward import reward_score
 from src.domain.control.schedule_loop import ScheduleLoop
 from src.domain.control.trim import TrimController
 from src.domain.pid_tuning import (
@@ -250,23 +250,33 @@ class LearningDriveManagerProtocol(Protocol):
         ...
 
 
-class ILCServiceProtocol(Protocol):
-    """反復学習制御サービスのプロトコル（Stage C）。"""
+class PlanServiceProtocol(Protocol):
+    """エピソード型プラン学習サービスのプロトコル（ILCService の後継）。"""
 
     async def prepare(
         self, profile: VehicleProfile, mode: DrivingMode
-    ) -> ILCController | None:
-        """走行開始時に補正テーブルをロードして ILCController を返す（無ければ None）。"""
+    ) -> PedalPlan | None:
+        """走行開始時に保存プランをロードして返す（無ければ None＝FF 由来プラン）。"""
         ...
 
-    async def learn_from_session(
+    async def update_from_session(
         self,
         session_id: str,
         profile: VehicleProfile,
         mode: DrivingMode,
         kpi_summary: dict[str, float],
+        used_plan: PedalPlan,
+        base_plan: PedalPlan,
     ) -> None:
-        """走行正常完了後に残差から次回テーブルを学習する。"""
+        """走行正常完了後に reward 判定してプランを更新する。"""
+        ...
+
+    async def reset_for_mode(self, mode_id: str) -> None:
+        """指定モードの保存プランを全プロファイルぶん削除する（基準軌跡の変更時）。"""
+        ...
+
+    async def freeze_to_best(self, profile_id: str, mode_id: str) -> None:
+        """保存プランを記録済みの最良プラン（best_efforts）へ明示的に確定する。"""
         ...
 
 
@@ -288,7 +298,7 @@ class RobotController:
     _pre_check_runner: PreCheckRunnerProtocol | None
     _calibration_manager: CalibrationManagerProtocol | None
     _learning_manager: LearningDriveManagerProtocol | None
-    _ilc_service: ILCServiceProtocol | None
+    _plan_service: PlanServiceProtocol | None
     _learning_loop: LearningLoop | None
     _drive_loop: DriveLoop | None
     _schedule_loop: ScheduleLoop | None
@@ -314,7 +324,7 @@ class RobotController:
         calibration_manager: CalibrationManagerProtocol | None = None,
         learning_manager: LearningDriveManagerProtocol | None = None,
         button_servo: ButtonServoProtocol | None = None,
-        ilc_service: ILCServiceProtocol | None = None,
+        plan_service: PlanServiceProtocol | None = None,
         control_interval_s: float = 0.05,
         log_every_n_cycles: int = 2,
     ) -> None:
@@ -336,7 +346,9 @@ class RobotController:
         self._calibration_manager = calibration_manager
         self._learning_manager = learning_manager
         self._button_servo = button_servo
-        self._ilc_service = ilc_service
+        self._plan_service = plan_service
+        # 直近の走行に実際に使ったペダルプラン（プラン学習の used_plan）。完了フックが参照。
+        self._active_drive_plan: PedalPlan | None = None
         self._drive_loop = None
         self._learning_loop = None
         self._schedule_loop = None
@@ -344,6 +356,9 @@ class RobotController:
         self._active_learning_task = None
         self._active_cycle_id = None
         self._last_kpi_summary: dict[str, float] | None = None
+        # 直近の適合走行（_run_tuning_drive）で開設したセッション id。プラン学習フェーズが
+        # 走行後に update_from_session へ渡す（走行ログを読むのに必要）。
+        self._last_tuning_session_id: str | None = None
         # 自動走行が完了（stop_auto_drive）または非常停止（emergency_stop）したら set される。
         # PID 自動適合の走行完了待ちに使う。通常 UI 経路では無害な no-op。
         self._drive_complete = asyncio.Event()
@@ -486,7 +501,7 @@ class RobotController:
     def _record_kpi_summary(self, drive_loop: DriveLoop) -> None:
         """走行終了時に KPI 集計をログへ残し、API/検証用に保持する。
 
-        プライマリー KPI（P95 0.2km/h・最大 1.0km/h・符号反転 ≤1/5s）は逸脱自動停止より
+        プライマリー KPI（P95 0.4km/h・最大 1.0km/h・符号反転 ≤1/5s）は逸脱自動停止より
         厳しく、走行が「正常完了」しても violated であり得るため必ず記録する（指摘 #7）。
         """
         summary = drive_loop.kpi_summary
@@ -501,6 +516,18 @@ class RobotController:
             summary["reversal_max_per_5s"],
             summary["hard_limit_violations"],
             summary["n_samples"],
+        )
+        # プラン学習の可観測化: トリム寄与率（＝PID フィードバック量の指標。走るたびに縮むのが
+        # 狙い）と reward を残す。effort 内訳が無い走行（ブートストラップ）では trim_share=0。
+        _logger.info(
+            "走行 effort サマリ: トリム寄与率=%.3f reward=%+.4f "
+            "(plan_rms=%.2f trim_rms=%.2f effort変化率RMS=%.2f%%/s フェーズ逸脱=%.3f%%)",
+            summary.get("trim_share", 0.0),
+            reward_score(summary),
+            summary.get("plan_rms_pct", 0.0),
+            summary.get("trim_rms_pct", 0.0),
+            summary.get("effort_rate_rms_pct_s", 0.0),
+            summary.get("phase_violation_pct", 0.0),
         )
         # ストール切り分け（.steering/20260620-modbus-retry-cycle-stall）: 制御サイクルが
         # バス再送等で連続スキップされた頻度・累積時間を走行終了時にログへ残す。
@@ -885,9 +912,11 @@ class RobotController:
         self._transition(RobotState.CALIBRATING)
         try:
             if self._calibration_manager is not None:
-                return await self._calibration_manager.run_calibration(
+                result = await self._calibration_manager.run_calibration(
                     profile_id=self._active_profile.id if self._active_profile else ""
                 )
+                self._apply_calibration_to_active_profile(result)
+                return result
             return CalibrationResult(
                 success=False, data=None, error_message="キャリブレーション未設定"
             )
@@ -990,6 +1019,9 @@ class RobotController:
         profile: VehicleProfile,
         log_writer: LogWriterProtocol | None,
         mode: DrivingMode | None = None,
+        *,
+        plan: PedalPlan | None = None,
+        session_mode_id: str | None = None,
     ) -> dict[str, float]:
         """規定パターン（または指定モードの代表区間）を 1 回走行し KPI サマリを返す。
 
@@ -1001,6 +1033,11 @@ class RobotController:
         mode を指定するとその DrivingMode をそのまま走行する（本番モードの代表区間を渡す
         用途）。None なら従来の規定パターン（build_tuning_trajectory）を使う。
 
+        plan を渡すとその保存プラン＋トリムで走行する（プラン学習・PID 仕上げ用）。None なら
+        _build_and_start_drive_loop が FF 由来プランを生成する（従来の適合走行・検証走行）。
+        session_mode_id を渡すと drive_sessions.mode_id にそれを記録する（永続システムモードで
+        走るプラン学習用。規定パターン走行は None＝従来どおり）。
+
         完了（_stop_tuning_drive で _drive_complete set）または非常停止まで待つ。
         非常停止・タイムアウト時は PidTuningAborted を送出する。
         """
@@ -1010,11 +1047,14 @@ class RobotController:
         # READY → RUNNING（直接遷移）。車両は停止保持済みのため PreCheckRunner は実行しない
         # （A3 レビュー指摘: 以前は PRE_CHECK を経由する空遷移で状態機械を形式的に満たしていた）。
         self._transition(RobotState.RUNNING)
-        # mode_id=None: 規定パターンは永続化された DrivingMode ではない（drive_sessions.mode_id は
-        # UUID カラムで "pid-tune" を渡すと DataError→500。学習運転と同様に None）。
-        # run_type="tuning": 通常自動走行（"auto"）と区別し、ログ画面・学習サイクル集計から
-        # PID 適合走行を判別可能にする。
-        session = await self._begin_session("tuning", None, log_writer, RobotState.RUNNING)
+        # mode_id: 規定パターンは永続化された DrivingMode ではないため None（drive_sessions.mode_id
+        # は UUID FK で "pid-tune" 等を渡すと DataError→500）。プラン学習は永続システムモードで
+        # 走るため session_mode_id にその id を渡せる。run_type="tuning": 通常自動走行（"auto"）と
+        # 区別し、ログ画面・学習サイクル集計から PID 適合／プラン学習走行を判別可能にする。
+        session = await self._begin_session(
+            "tuning", session_mode_id, log_writer, RobotState.RUNNING
+        )
+        self._last_tuning_session_id = session.id
         self._build_and_start_drive_loop(
             drive_mode,
             profile,
@@ -1022,6 +1062,7 @@ class RobotController:
             session.id,
             on_complete=self._stop_tuning_drive,
             disable_deviation_check=True,  # 適合中は逸脱で非常停止しない
+            plan=plan,
         )
         timeout = drive_mode.total_duration + _PID_TUNING_DRIVE_TIMEOUT_MARGIN_S
         try:
@@ -1123,6 +1164,7 @@ class RobotController:
         release_on_finish: bool = True,
         on_run: Callable[[int, TuningParams, float], None] | None = None,
         mode: DrivingMode | None = None,
+        plan: PedalPlan | None = None,
     ) -> tuple[TuningParams, list[dict[str, float]]]:
         """規定パターン（または指定モード）を反復走行し座標降下で KPI コストを最小化する。
 
@@ -1141,6 +1183,9 @@ class RobotController:
                 送出した例外はそのまま本メソッドから伝播し、ブレーキは解放される。
             mode: 各候補の評価走行に使う DrivingMode。None なら従来の規定パターン。本番モードの
                 代表区間（build_tuning_trajectory_from_mode）を渡すと適合結果の転移性が上がる。
+            plan: 全候補走行で共有する凍結プラン（PID 仕上げ REFINE_F 用）。None なら
+                _build_and_start_drive_loop が FF 由来プランを生成する（従来動作）。全走行を
+                同一プランで固定することで座標降下のゲイン候補間比較（同一条件比較）が成立する。
 
         Returns:
             (最良パラメータ, 反復履歴) のタプル。履歴は各走行のゲイン・preview・コスト・KPI
@@ -1164,7 +1209,7 @@ class RobotController:
                         profile.dynamics_params, pid_preview_s=cand.pid_preview_s
                     ),
                 )
-                kpi = await self._run_tuning_drive(profile_run, log_writer, mode)
+                kpi = await self._run_tuning_drive(profile_run, log_writer, mode, plan=plan)
                 cost = tuning_cost(kpi)
                 tuner.report(cand, cost)
                 run_index += 1
@@ -1202,12 +1247,98 @@ class RobotController:
         """検証専用パターンを 1 回走行し KPI サマリを返す（VERIFY フェーズ用）。
 
         停車保持状態から直接走行し、終了後も停車保持を維持する（学習サイクルが VERIFY 内で
-        再学習・再走行するため）。ILC は渡さない（無効）＝任意の登録モード初回走行の成績を
-        予測する。プラン＋トリムは _build_and_start_drive_loop が構築する。逸脱チェックは無効。
+        再学習・再走行するため）。保存プランは渡さない（prepare 非配線）＝常に FF 由来プランで
+        走り、任意の登録モード初回走行（保存プランなし）の成績を予測する。プラン＋トリムは
+        _build_and_start_drive_loop が構築する。逸脱チェックは無効。
         正常完了時のみ KPI を返し、中断・非常停止時は PidTuningAborted を送出する。
         """
         self._assert_tuning_preconditions(profile)
         return await self._run_tuning_drive(profile, log_writer, mode)
+
+    async def run_plan_learning_drive(
+        self,
+        profile: VehicleProfile,
+        mode: DrivingMode,
+        log_writer: LogWriterProtocol | None = None,
+    ) -> dict[str, float]:
+        """網羅パターン（システムモード）を保存プラン＋トリムで 1 回走行し、プラン学習を
+        完了させて KPI サマリを返す（学習サイクルの PLAN_LEARN フェーズ用）。
+
+        検証走行（run_verification_drive）との差分:
+          (1) plan_service.prepare の保存プランで走る（初回＝レコード無しは FF 由来プラン）
+          (2) 走行後に update_from_session を **await 完了** する（次走行が更新後プランを
+              prepare で拾うため、自動運転の fire-and-forget と異なり完了を待つ）
+        ゲインはプロファイル現行値に固定（座標降下しない）。停止保持から直接走行し、終了後も
+        保持を維持する（_run_tuning_drive と同じ）。正常完了時のみ KPI を返し、中断・非常停止時は
+        PidTuningAborted を送出する。plan_service 未配線・モデル未ロードなら FF 由来プランで走り
+        プラン更新はスキップする。
+        """
+        self._assert_tuning_preconditions(profile)
+        g = profile.pid_gains
+        self._pid.set_gains(g.kp, g.ki, g.kd)
+        try:
+            saved_plan = (
+                await self._plan_service.prepare(profile, mode)
+                if self._plan_service is not None
+                else None
+            )
+            kpi = await self._run_tuning_drive(
+                profile, log_writer, mode, plan=saved_plan, session_mode_id=mode.id
+            )
+        finally:
+            self._restore_active_profile_gains()
+        # 走行に実際に使ったプラン（saved_plan or FF 由来）と、現行 FF モデルで再生成した基準
+        # プランでプランを更新する。次走行が更新後プランを prepare で拾う。
+        if self._plan_service is not None and self._last_tuning_session_id is not None:
+            used_plan = self._active_drive_plan
+            base_plan = self._build_pedal_plan(mode, profile)
+            if (
+                used_plan is not None
+                and used_plan.efforts
+                and base_plan is not None
+                and base_plan.efforts
+            ):
+                await self._plan_service.update_from_session(
+                    self._last_tuning_session_id, profile, mode, kpi, used_plan, base_plan
+                )
+        return kpi
+
+    async def get_saved_plan(
+        self, profile: VehicleProfile, mode: DrivingMode
+    ) -> PedalPlan | None:
+        """保存プラン（プラン学習の現行プラン）をロードして返す。
+
+        REFINE_F（PID 仕上げ）が全候補走行で凍結するプランの取得に使う。plan_service
+        未配線・レコードなしなら None（run_pid_tuning_session は FF 由来プランへ
+        フォールバックする）。
+        """
+        if self._plan_service is None:
+            return None
+        return await self._plan_service.prepare(profile, mode)
+
+    async def reset_saved_plans_for_mode(self, mode_id: str) -> None:
+        """指定モードの保存プランを全プロファイルぶん削除する。
+
+        基準軌跡が変わったモード（網羅パターンの再生成を含む）では、旧軌跡で獲得した
+        best_reward にロールバック機構が固着するため、履歴ごと削除して学習をやり直す。
+        plan_service 未配線なら何もしない。
+        """
+        if self._plan_service is None:
+            return
+        await self._plan_service.reset_for_mode(mode_id)
+
+    async def freeze_saved_plan_to_best(
+        self, profile: VehicleProfile, mode: DrivingMode
+    ) -> None:
+        """保存プランを最良（best_efforts）へ明示的に確定する。
+
+        PLAN_LEARN フェーズ終了時に呼ぶ想定。ACCEPT/EXPLORE 走行後の候補プランは次回探索用
+        であり最良と一致しないことがあるため、フェーズを抜けた時点で最良へ揃える。
+        plan_service 未配線なら何もしない。
+        """
+        if self._plan_service is None:
+            return
+        await self._plan_service.freeze_to_best(profile.id, mode.id)
 
     def _assert_tuning_preconditions(self, profile: VehicleProfile) -> None:
         """PID 自動適合の前提（READY 状態・キャリブレーション済み）を検証する。"""
@@ -1256,7 +1387,7 @@ class RobotController:
         session_id: str,
         on_complete: Callable[[], Awaitable[None]] | None = None,
         disable_deviation_check: bool = False,
-        ilc: ILCController | None = None,
+        plan: PedalPlan | None = None,
     ) -> None:
         """mode / profile / ff_controller / safety_check が揃っていれば DriveLoop を起動する。
 
@@ -1280,10 +1411,14 @@ class RobotController:
                 "DriveLoop の起動に必要な構成（走行モード・プロファイル・キャリブレーション・"
                 "フィードフォワード制御・安全チェック）が不足しています"
             )
-        # ペダルプランを走行開始時にオフライン生成する（プラン＋トリム構成）。FF モデル未ロード
-        # （初回学習走行のブートストラップ）では None にし、DriveLoop は従来経路へフォールバック
-        # する。適合走行・検証走行も同じ経路なので本番と同じ操作分布で走る。
-        plan = self._build_pedal_plan(mode, profile)
+        # 保存プラン（プラン学習の prepare 結果）が渡されればそれを使い、無ければ走行開始時に
+        # FF 由来プランをオフライン生成する（プラン＋トリム構成）。FF モデル未ロード（初回学習
+        # 走行のブートストラップ）では None になり、DriveLoop は従来経路へフォールバックする。
+        # 適合走行・検証走行は保存プランを渡さないので常に FF 由来プランで走る（本番と同分布）。
+        if plan is None:
+            plan = self._build_pedal_plan(mode, profile)
+        # 走行に実際に使ったプラン（プラン学習の used_plan）。完了フックが参照する。
+        self._active_drive_plan = plan
         self._drive_loop = DriveLoop(
             ff_controller=self._ff_controller,
             trim=self._trim,
@@ -1300,7 +1435,6 @@ class RobotController:
             interval_s=self._control_interval_s,
             log_every_n_cycles=self._log_every_n_cycles,
             disable_deviation_check=disable_deviation_check,
-            ilc=ilc,
             plan=plan,
         )
         self._drive_loop.start()
@@ -1308,7 +1442,18 @@ class RobotController:
     def _build_pedal_plan(
         self, mode: DrivingMode, profile: VehicleProfile
     ) -> PedalPlan | None:
-        """走行開始時にペダルプランを生成する。FF モデル未ロード時は None（従来経路）。"""
+        """FF 由来のペダルプランを生成する。FF モデル未ロード時は None（従来経路）。
+
+        保存プランが無い走行の実プランであり、同時にプラン学習（update_from_session）の
+        base_plan（Δlimit クランプの基準）でもある。
+
+        **オフライン事前最適化は行わない**（2026-07-23 撤去）。FF 逆モデルが本システムで
+        唯一の絶対モデルであり、ここで得られる effort がオフラインでの最良推定になる。
+        FOPDT は加速区間の増分ゲイン（PID 整定用の小信号近似）でしかなく、それでプランを
+        「最適化」すると粗いモデルの誤差を転写して必ず悪化する（実機 7/23: VERIFY p95
+        3.54→6.05、プランの 12.7% が Δlimit に張り付き制動が消失）。走行しない限り残差は
+        得られないため、現有情報でのオフライン事前最適化は原理的に成立しない。
+        """
         if self._ff_controller is None or not self._ff_controller.has_model:
             return None
         return PedalPlanner.build(mode, self._ff_controller, profile.feedforward_params)
@@ -1333,48 +1478,57 @@ class RobotController:
         「ファントム RUNNING」になる（W4 レビュー指摘）。
         """
         self._assert_auto_drive_preconditions(mode, profile)
-        # ILC 補正テーブルのロード（走行前）。失敗・無効・未学習なら None で補正なし。
-        ilc: ILCController | None = None
-        if self._ilc_service is not None and mode is not None and profile is not None:
-            ilc = await self._ilc_service.prepare(profile, mode)
+        # 保存プランのロード（走行前）。失敗・無効・空なら None で FF 由来プラン
+        # （モデル再学習をまたいでも保存プランは引き継ぐ。plan_service 参照）。
+        saved_plan: PedalPlan | None = None
+        if self._plan_service is not None and mode is not None and profile is not None:
+            saved_plan = await self._plan_service.prepare(profile, mode)
         if self._state == RobotState.PRE_CHECK:
             session = await self._begin_session("auto", mode_id, log_writer, RobotState.PRE_CHECK)
             self._transition(RobotState.RUNNING)
         else:
             await self._run_pre_check_and_transition(RobotState.RUNNING)
             session = await self._begin_session("auto", mode_id, log_writer, RobotState.RUNNING)
-        # 正常完了時のみ ILC 学習を起こすため、on_complete を専用ラッパにする（手動停止・
-        # 非常停止はこの経路を通らないので学習しない）。ILC 未構成なら従来どおり stop_auto_drive。
+        # 正常完了時のみプラン学習を起こすため、on_complete を専用ラッパにする（手動停止・
+        # 非常停止はこの経路を通らないので学習しない）。サービス未構成なら従来の stop_auto_drive。
         on_complete: Callable[[], Awaitable[None]] | None = None
-        if self._ilc_service is not None and mode is not None and profile is not None:
+        if self._plan_service is not None and mode is not None and profile is not None:
             captured_profile, captured_mode, captured_sid = profile, mode, session.id
 
             async def _auto_complete() -> None:
-                await self._finish_auto_drive_with_ilc(
+                await self._finish_auto_drive_with_plan_update(
                     captured_sid, captured_profile, captured_mode
                 )
 
             on_complete = _auto_complete
         self._build_and_start_drive_loop(
-            mode, profile, log_writer, session.id, on_complete=on_complete, ilc=ilc
+            mode, profile, log_writer, session.id, on_complete=on_complete, plan=saved_plan
         )
         return session
 
-    async def _finish_auto_drive_with_ilc(
+    async def _finish_auto_drive_with_plan_update(
         self, session_id: str, profile: VehicleProfile, mode: DrivingMode
     ) -> None:
-        """自動走行の正常完了コールバック: 停止処理の後に ILC 学習を fire-and-forget 起動する。
+        """自動走行の正常完了コールバック: 停止処理の後にプラン学習を fire-and-forget 起動する。
 
         stop_auto_drive がセッションを 'completed' でクローズ＝ログをフラッシュしてから、
-        記録済みの KPI サマリで学習タスクを起こす。学習の例外は走行停止に伝播させない。
+        記録済みの KPI サマリと今回走行に使ったプラン（used_plan）・再生成した FF 由来
+        基準プラン（base_plan）で更新タスクを起こす。プランが使われなかった走行
+        （ブートストラップ）や FF モデル未ロード時は学習しない。例外は走行停止に伝播させない。
         """
+        used_plan = self._active_drive_plan
         await self.stop_auto_drive()
-        if self._ilc_service is None:
+        if self._plan_service is None or used_plan is None or not used_plan.efforts:
+            return
+        base_plan = self._build_pedal_plan(mode, profile)
+        if base_plan is None or not base_plan.efforts:
             return
         kpi = dict(self._last_kpi_summary) if self._last_kpi_summary else {}
-        ilc_service = self._ilc_service
+        plan_service = self._plan_service
         asyncio.ensure_future(
-            ilc_service.learn_from_session(session_id, profile, mode, kpi)
+            plan_service.update_from_session(
+                session_id, profile, mode, kpi, used_plan, base_plan
+            )
         )
 
     async def stop_auto_drive(self) -> None:
@@ -1868,7 +2022,18 @@ class RobotController:
         if not result.success:
             # 失敗時は CALIBRATING を維持してリトライ可能にする（原点復帰しない）
             return result
+        self._apply_calibration_to_active_profile(result)
         # 成功時のみ両軸を原点復帰してペダルを解放し、READY へ遷移する
         await self._home_both()
         self._transition(RobotState.READY)
         return result
+
+    def _apply_calibration_to_active_profile(self, result: CalibrationResult) -> None:
+        """キャリブレーション成功時、結果をメモリ上のアクティブプロファイルへ反映する。
+
+        DB（calibration_data）だけ更新して in-memory を放置すると、キャリブレーション
+        直後の arm が profile.calibration is None で 409 になる（新規プロファイルで
+        キャリブレーション後すぐ学習運転を開始すると再現。再選択・再起動まで走行不能）。
+        """
+        if result.success and result.data is not None and self._active_profile is not None:
+            self._active_profile.calibration = result.data

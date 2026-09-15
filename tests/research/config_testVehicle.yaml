@@ -1,0 +1,216 @@
+# =====================================================================
+# テスト用車両プロファイル（研究開発用）
+#   docs/Problem/ProblemReport_20260910.md の手順 0〜10 が参照する
+#   パラメータを 1 ファイルにまとめたもの。**ユーザーが直接編集してよい**。
+#
+#   使い方:
+#     .venv/bin/python -m tests.research.main --list        # 手順一覧
+#     .venv/bin/python -m tests.research.main --upto 0      # 手順0（設定検証）
+#
+#   注意:
+#   - コメントは手順 2/4/6/8 の自動保存でも保持される（値の行だけ書き換える）。
+#   - リストは 1 行の flow 形式（[a, b, c]）で書くこと。複数行の "- a" 形式は
+#     自動保存が拒否する。
+#   - ハードウェア設定（シリアルポート・CAN・GPIO）は本番と共通の
+#     config/settings.toml を読む。ここには置かない。
+#   - 開度の定義: 0% = 原点復帰位置（0 pulse）、100% = ストローク限界（9500 pulse）。
+#     本番のキャリブレーションは使わない。原点からペダルに触れるまでの隙間と
+#     ペダルの遊びは不感帯（feedforward.*_deadband_pct）に含まれる。
+# =====================================================================
+
+# ── 車両（本番 VehicleProfile 相当） ─────────────────────────────────
+vehicle:
+  name: test_vehicle              # プロファイル名（結果ファイル名に使う）
+  max_speed_kmh: 180.0            # 最高速 [km/h]
+  max_decel_g: 0.4                # 最大減速G [G]
+  max_accel_opening_pct: 80.0     # アクセル開度上限 [%]（機構保護）
+  max_brake_opening_pct: 80.0     # ブレーキ開度上限 [%]（機構保護）
+  stop_deviation_threshold_kmh: 2.0  # 異常停止判定の偏差しきい値 [km/h]
+  stop_deviation_duration_s: 9999     # 上記が続いたら停止 [s]
+
+# ── Feedforward（手順 2 で同定して自動保存される） ───────────────────
+feedforward:
+  # C1~C6のモデル候補(C1:ベース,C4:V0実測値,C5:過去&V0実測,C6:C1+テーブル,)
+  # candidate と model_path は必ず組で書き換えてください。C6にC1のモデルを組み合わせると、走り出す前にエラーで止まります
+  candidate: C1
+  # 2次多項式 Ridge 逆モデル（本番 src/domain/model_training.py と同型）の保存先
+  model_path: tests/research/results/models/test_vehicle_20260914_221700.pkl
+  # 停車〜クリープ域（滑らかなモデルで表現できないため定数で補う）
+  creep_speed_kmh: 4.966  # クリープで到達する車速 [km/h]
+  creep_rate_kmhs: 0.19  # クリープ加速率 [km/h/s]
+  stop_brake_opening_pct: 28.95  # 停車保持ブレーキ開度 [%]（手順 2-0 で「停止確認開度＋マージン」を自動保存）
+  # 惰行（ペダル未操作）減速量。カーブが空なら下の定数を使う
+  engine_brake_decel_kmhs: 9.05  # 惰行減速量の代表値（正値）[km/h/s]
+  coast_decel_speeds_kmh: [5.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 105.0, 115.0, 125.0]  # 惰行カーブ 速度グリッド [km/h]（昇順）
+  coast_decel_kmhs: [2.275, 4.395, 6.28, 8.135, 9.02, 9.2, 9.2, 9.2, 9.2, 9.2, 9.57, 10.1, 10.8]  # 各速度での惰行減速量（正値）[km/h/s]
+  # ペダルゲイン（開度1%あたり惰行から何 km/h/s 変わるか。どちらも正値）
+  pedal_gain_speeds_kmh: [5.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 105.0, 115.0, 125.0, 135.0]  # 速度グリッド [km/h]（昇順）
+  accel_gain_kmhs_per_pct: [11.2306, 3.96263, 3.24219, 2.07537, 1.834, 1.46251, 1.35157, 1.31992, 1.34069, 1.36351, 1.3628, 1.37954, 1.27026, 1.2681]  # アクセル側ゲイン [km/h/s per %]
+  brake_gain_kmhs_per_pct: [0.144889, 0.465127, 1.2319, 1.93502, 2.73678, 3.5147, 3.76995, 3.85, 3.86, 3.85333, 3.97742, 3.97742, 3.97742, 3.97742]  # ブレーキ側ゲイン [km/h/s per %]
+  # 不感帯（遊び。原点からペダルに触れるまでの隙間を含む）。手順 2-0 で実測して自動保存
+  accel_deadband_pct: 10.0  # アクセル不感帯 [%]
+  brake_deadband_pct: 12.63  # ブレーキ不感帯 [%]
+
+# ── PID（手順 4/6/8 で適合して自動保存される） ───────────────────────
+pid:
+  kp: 0.0  # 比例ゲイン [%/(km/h)]（手順4で適合）
+  ki: 0.0                         # 積分ゲイン [%/(km/h·s)]（手順6で適合）
+  kd: 0.0                         # 微分ゲイン [%·s/(km/h)]（手順8で適合）
+  output_limit_pct: 50.0          # PID出力の権限上限 [%]（FFの補助に留める）
+  integral_limit_pct: 20.0        # 積分項の上限 [%]（第2段階 anti-windup）
+  derivative_filter_hz: 5.0       # 微分項のローパス [Hz]（0で無効）
+
+# ── ペダル調停（第1段階は全て無効。手順5「deadzone/rate limit」で有効化） ──
+arbiter:
+  enable_deadband_compensation: false  # 不感帯ぶんを上乗せするか
+  enable_rate_limit: false             # 開度変化率を制限するか
+  enable_hysteresis: false             # アクセル/ブレーキ切替ヒステリシス
+  switch_hysteresis_pct: 0.5           # 切替ヒステリシス半幅 [%]
+  accel_rate_limit_pct_s: 200.0        # アクセル開度レートリミット [%/s]
+  brake_rate_limit_pct_s: 300.0        # ブレーキ開度レートリミット [%/s]
+  accel_reengage_dwell_s: 0.3          # ブレーキ解放後のアクセル再踏込ディレイ [s]
+  accel_release_rate_pct_s: 10.0       # 惰行遷移でアクセルを戻すレート [%/s]
+  accel_min_step_pct: 0.2              # アクセル開度の量子化しきい値 [%]
+
+# ── 制御周期 ─────────────────────────────────────────────────────────
+control:
+  loop_interval_ms: 50            # 制御ループ周期 [ms]（本番と同じ）
+  log_interval_ms: 100            # ログ記録周期 [ms]（loop の整数倍にすること）
+  can_max_speed_age_s: 0.2        # CAN車速の許容鮮度 [s]。超えたら異常
+
+# ── 走行モード（DB の driving_modes の name で指定） ─────────────────
+modes:
+  wltp_mode_name: "01_WLTP_Low,Mid,Hi,ExHi"  # 手順 3/5/7/9 のモード走行（1800s）
+  tuning_mode_name: "__verify_pattern__"     # 手順 4/6/8 のPID適合用パターン
+  # モード走行レポートの区間別集計（WLTP の区間名と境界 [s]。境界は区間名より 1 つ少ない）
+  segment_names: [Low, Mid, High, ExHi]
+  segment_bounds_s: [589.0, 1022.0, 1477.0]
+
+# ── モード走行（手順 3/5/7/9） ───────────────────────────────────────
+mode_drive:
+  # 減速G ガバナー（安全網）: 実測減速度（0.4s の傾き）が vehicle.max_decel_g × 0.98 以上になったら
+  # ブレーキ開度をその時点で頭打ちにし、超えている間は 1 周期ごとに governor_reduce_step_pct ずつ下げる。
+  # FF 指令が頭打ちより浅くなったら解除。作動した時間はレポートに出す（FF の純粋な結果を変えうるため）。
+  # WLTP の減速は最大約 0.15G なので、FF が妥当なら作動しない
+  decel_governor: true
+  governor_reduce_step_pct: 2.0   # 超えている間 1 周期ごとに下げる量 [%]
+  # 使っていないペダルの待機位置 = 不感帯（feedforward.*_deadband_pct）− standby_margin_pct。
+  # 0% から不感帯までの空走をなくし、ガバナーの 0% への大きな引き戻しもなくす（2026-09-13 急ブレーキ対策 1）
+  pedal_standby: true
+  standby_margin_pct: 2.0         # 探索値は 1 刻み深く出る・日によって 0.5% 動くため 2%（アクセル 8.00% / ブレーキ 11.16%）
+
+# ── PID 適合（手順 4/6/8） ───────────────────────────────────────────
+tuning:
+  max_runs: 10                    # 1ゲインあたりの最大走行本数
+  kp_search_range: [0.5, 8.0]     # Kp 探索範囲 [%/(km/h)]
+  ki_search_range: [0.0, 2.0]     # Ki 探索範囲
+  kd_search_range: [0.0, 1.0]     # Kd 探索範囲
+  select_metric: p95_kmh          # 採用基準（p95_kmh / max_abs_kmh）
+
+# ── 学習運転（手順 2 の閉ループパターン走行） ────────────────────────
+learning:
+  timeout_s: 1800.0               # 走行完了待ちのタイムアウト [s]（A3・A4 で約 1020s の見積り。900s は記録だけ。本番へ移すときに削る。2026-09-14 定速階段（段2）でスタブが1200sに収まらず1400sへ。2026-09-15 実機で1400s超え→1800sにしたが、原因は max_speed_kmh 180 の残りによる DRIVE_ACCEL 延長（160 km/h 張り付き）。140 では1088s。余裕として1800のまま）
+  coast_timeout_s: 90.0           # コーストダウン 1 本の上限 [s]
+  # ペダルの固定開度は「手順 2-0 で測った不感帯 + offset」[%]（昇順）。本番の開度はキャリブレーション
+  # 前提の絶対値で、原点から測ると遊びの中に入る（ブレーキ 1〜10%・巡航トリム 1.5/3.0% は惰行と同じだった）
+  accel_deadband_probe_offsets_pct: [0.5, 1.0, 2.0, 3.0, 5.0]  # アクセル不感帯プローブ（クリープ中に各 3s 保持。本番 0.5〜5%）
+  cruise_trim_offsets_pct: [1.0, 2.0, 3.0]  # 高速巡航トリム（cap まで加速後に保持。本番 1.5/3.0%）
+  brake_hold_offsets_pct: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]  # 定常ブレーキ（cap から保持。本番 1〜40%）
+  # 研究側で本番のパターン列に足す段（A2・A5。空リストなら足さない）
+  accel_sweep_add_offsets_pct: [2.0, 5.0, 8.0]  # ACCEL_SWEEP を追加（本番の上限×0.3/0.5/0.7/1.0 に加えて、不感帯+offset で cap まで）
+  brake_hold_low_offsets_pct: [0.5, 2.0, 4.0]   # BRAKE_HOLD を追加（brake_hold_low_start_kmh まで上げてから保持）
+  brake_hold_low_start_kmh: 60.0                # その BRAKE_HOLD の保持を始める車速 [km/h]
+  # A3 トリム階段（空リストなら足さない）: 各車速まで 70% で上げ、不感帯 + offset をこの順（降順）に各 step_s 保持。
+  # cap に達したら次の段へ下げ、最後の段は保持を続ける。cap 始まりは行き過ぎ（実測 +12 km/h）を見込んで 120
+  trim_stair_start_kmh: [120.0, 90.0, 50.0]     # 階段を始める車速 [km/h]
+  trim_stair_offsets_pct: [8.0, 5.0, 2.0]       # 各段のアクセル = 不感帯 + offset [%]
+  trim_stair_step_s: 8.0                        # 1 段の保持 [s]
+  # A4 低速 × 高ブレーキ（空リストなら足さない）: 不感帯 + accel_offset で start_kmh まで上げ、ブレーキを停車まで保持
+  brake_hold_hard_offsets_pct: [7.0, 17.0, 27.0, 37.0]  # ブレーキ = 不感帯 + offset [%]（≈20/30/40/50%）
+  brake_hold_hard_start_kmh: 20.0               # 保持を始める車速 [km/h]
+  brake_hold_hard_accel_offset_pct: 8.0         # 加速のアクセル = 不感帯 + offset [%]（70% だと 20 km/h を大きく行き過ぎる）
+  # 2026-09-14 定速階段（段2。空リストなら足さない）: トリム階段の後、各車速を弱い PI で保持する。
+  # 50 km/h 以上に定速保持の状態が無く FF モデルの定速予測がずれていた対策（docs/memo.md 参照）
+  cruise_hold_speeds_kmh: [30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0]  # 保持する車速 [km/h]（昇順）
+  cruise_hold_settle_tol_kmh: 1.0               # 「保持できた」とみなす速度偏差の許容幅 [km/h]
+  cruise_hold_settle_s: 3.0                     # 許容幅に連続でこの秒数いたら保持タイマー開始 [s]
+  cruise_hold_hold_s: 8.0                       # 保持タイマー開始後、この秒数記録したら次の車速へ [s]
+  cruise_hold_step_timeout_s: 30.0              # 1 車速あたりの打ち切り（保持できなくても次へ）[s]
+  # PI ゲイン: 実測の感度（手順3 の 110〜140 km/h で約 1.3〜2 km/h/s per %）で時定数が数秒になる値。
+  # レートを絞って実開度が指令に追従できる速さ（手順3 の実測遅れ ≈0.1s）に保つ
+  cruise_hold_kp: 0.3                           # 比例ゲイン [%/(km/h)]
+  cruise_hold_ki: 0.05                          # 積分ゲイン [%/(km/h・s)]
+  cruise_hold_max_rate_pct_per_s: 1.0           # 1 周期あたりの開度変化量の上限 [%/s]
+  cruise_hold_initial_offset_pct: 7.0           # 初期開度 = アクセル不感帯 + この値 [%]
+  # ペダルゲイン推定に使うサンプル: 開度 ≥ 不感帯 + この値 [%]（本番は 5%。ブレーキは +5% ≈ 0.38G で採れない）
+  accel_gain_min_offset_pct: 0.5
+  brake_gain_min_offset_pct: 0.5
+
+# ── ペダル探索（手順 2-0。不感帯と停車保持開度を車速応答で測る） ────────
+#   クリープ中に 1 刻みずつ踏み、待ち時間の平均車速が基準から margin 以上動いたら「効き始め」。
+#   ブレーキはそのまま停車まで刻み、停止確認開度 + stop_hold_margin_pct で停車保持する。
+pedal_search:
+  step_mm: 0.5                    # 1 刻みの移動量 [mm]（0.5mm = 50 pulse ≈ 0.53%。走行前チェックも共通）
+  dwell_s: 1.0                    # 1 刻みごとの待ち（この間の平均車速で判定。走行前チェックも共通）[s]
+  onset_margin_kmh: 0.3           # 基準車速から何 km/h 動いたら反応とみなすか（減速中は踏み増さない判定にも使う）
+  confirm_count: 2                # 反応が何刻み連続したら確定するか
+  creep_stable_kmh: 0.2           # クリープ安定: 3s 平均の変化がこれ未満 [km/h]
+  creep_min_speed_kmh: 1.0        # クリープ安定: 平均車速がこれ以上 [km/h]
+  creep_timeout_s: 90.0           # クリープ安定待ちの上限 [s]
+  accel_max_pct: 20.0             # アクセル探索の上限 [%]（ここまで反応が無ければエラー）
+  brake_max_pct: 50.0             # ブレーキ探索・走行前チェックの上限 [%]（ここまで停車しなければエラー）
+  stop_hold_margin_pct: 10.0      # 停車保持 = 停止確認開度 + この値 [%]
+
+# ── 走行後の緩減速（手順 2 のパターン走行の後。停車保持まで） ────────────
+#   ブレーキ不感帯 − approach_margin_pct までは最高速度で動かし（減速は出ない）、そこから
+#   step_mm 踏む → dwell_s 待つ → 直近 slope_window_s の車速の傾きで減速度を判定する。
+#   目標 − margin 未満なら 1 刻み踏み増し、release_above_g を超えたときだけ 1 刻み戻す。
+#   踏み増しの上限は feedforward.stop_brake_opening_pct（停車保持開度）。
+decel_stop:
+  target_decel_g: 0.2             # 目標減速度 [G]
+  press_margin_g: 0.02            # 目標 − これ 未満なら踏み増す [G]
+  release_above_g: 0.3            # これを超えたときだけ 1 刻み戻す [G]（vehicle.max_decel_g 以下）
+  step_mm: 0.5                    # 1 刻みの移動量 [mm]（0.5mm ≈ 0.53%）
+  dwell_s: 1.0                    # 1 刻みごとの待ち [s]（ブレーキ→減速の遅れ 0.3〜1.0s より長く）
+  slope_window_s: 1.0             # 減速度を出す車速の傾きの窓 [s]
+  approach_margin_pct: 1.0        # ブレーキ不感帯の何 % 手前まで最高速度で動かすか [%]
+  timeout_s: 60.0                 # これを超えても停車しなければエラー [s]
+
+# ── KPI（product-requirements.md のプライマリーKPI。合否判定に使う） ──
+kpi:
+  max_abs_deviation_kmh: 1.0      # 最大逸脱（例外なし）[km/h]
+  p95_deviation_kmh: 0.4          # 偏差 p95 [km/h]
+  reversal_band_kmh: 0.3          # 符号反転を数える偏差の振幅しきい値 [km/h]
+  reversal_window_s: 5.0          # 反転回数を数える窓 [s]
+  reversal_limit_per_window: 1.0  # 窓あたりの反転回数上限
+
+# ── 手順 1（初期化）と走行前チェックの実施項目（false でスキップ） ─────────
+#   false にした項目は実行も判定もせず [SKIP] と表示する。安全装置を外すことになるので注意。
+checks:
+  # 手順 1（初期化）。接続は全操作の前提のため切替対象外（常に実行）
+  init_servo_comm: true        # Modbus 操作権(PMSL)有効化＋現在位置読み出し（false だと実機で指令が効かない恐れ）
+  init_clear_errors: true      # アラームリセット＋残留確認
+  init_servo_on: true          # サーボON（false だとアクチュエータが動かない）
+  init_can: true               # CAN 通信チェック（車速読み出し）
+  init_ups: false              # UPS 通信チェック（NUT 監視開始＋残量 >= 20%）。false なら UPS を監視しない
+  init_home_return: true       # 原点復帰＋位置確認（false だと開度 0% の基準が保証されない。危険）
+  # 走行前チェック（踏込前・踏込後の両方に効く）
+  pre_communication: true      # 通信確認
+  pre_servo_state: true        # サーボ状態（アラーム）
+  pre_profile: true            # プロファイル
+  pre_ups: false               # UPS残量（init_ups: false のときは true にできない）
+  pre_actuator_position: true  # アクチュエータ位置（踏込前のみ）
+  pre_brake_stop: true         # ブレーキを踏んで停止確認（false だと踏まずに現在位置で続行。危険）
+  pre_vehicle_stopped: true    # 車速確認 0 km/h（踏込後のみ）
+
+# ── 出力 ─────────────────────────────────────────────────────────────
+output:
+  results_dir: tests/research/results   # CSV・図・レポートの保存先
+  csv_interval_s: 0.1                   # CSV のサンプリング間隔 [s]
+  plot: true                            # matplotlib で図を出すか
+  print_interval_s: 1.0                 # ターミナルへの進捗 print 間隔 [s]
+
+# ── 参照する本番設定 ─────────────────────────────────────────────────
+hardware:
+  settings_path: config/settings.toml   # シリアル/CAN/GPIO 設定（本番と共通）
+  database_url: postgresql://localhost/driving_robot  # モード・ログ参照先

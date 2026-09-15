@@ -347,7 +347,7 @@ class TestCheckVehicleStopped:
 
     @pytest.mark.asyncio
     async def test_speed_check_pass_just_below_threshold(self) -> None:
-        runner = make_runner(can_speed=0.4)
+        runner = make_runner(can_speed=0.01)
         result = await runner.run()
         speed_item = next(i for i in result.items if i.item_name == "車速確認")
         assert speed_item.passed is True

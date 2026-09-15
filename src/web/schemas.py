@@ -63,6 +63,17 @@ class FeedforwardParamsSchema(BaseModel):
     creep_speed_kmh: float = 7.0
     creep_rate_kmhs: float = 0.5
     engine_brake_decel_kmhs: float = 1.0
+    # 惰行減速カーブ（速度依存・学習運転のコーストダウンから同定）。空=未同定で
+    # engine_brake_decel_kmhs 定数へフォールバック。FeedforwardParams と同名フィールド必須
+    # （routers/profiles.py の _ffp_from_schema が全 dataclass フィールドを getattr する）。
+    coast_decel_speeds_kmh: tuple[float, ...] = ()
+    coast_decel_kmhs: tuple[float, ...] = ()
+    # ペダルゲイン曲線（速度依存・学習運転から同定）。空=未同定でモデル出力のみを使う。
+    # 緩減速域（アクセルを踏みながら減速）の effort を解析的に出すのに使う
+    # （pedal_plan.analytic_efforts）。FeedforwardParams と同名フィールド必須。
+    pedal_gain_speeds_kmh: tuple[float, ...] = ()
+    accel_gain_kmhs_per_pct: tuple[float, ...] = ()
+    brake_gain_kmhs_per_pct: tuple[float, ...] = ()
     stop_brake_opening_pct: float = 20.0
     # 0.0（不感帯なし）は合法値。ge=0 のみで、負値のみ弾く
     # （D5 レビュー指摘: model_training/pid_tuning は 0.0 を正しく扱えるよう修正済み）。
@@ -169,10 +180,8 @@ class CycleProgressSchema(BaseModel):
 
 
 class LearningCycleStartRequest(BaseModel):
+    # PID 粗適合（REFINE_1）の走行本数。未指定なら LearningSettings の既定を使う。
     refine_runs_stage1: int | None = Field(default=None, ge=1, le=50)
-    refine_runs_stage2: int | None = Field(default=None, ge=1, le=50)
-    # 指定時は REFINE_2 をこの本番モードの代表区間で評価する（tuning_on_target_mode 有効時）。
-    target_mode_id: str | None = None
 
 
 class LearningCycleStartResponse(BaseModel):
@@ -514,13 +523,13 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
-class ILCStatusResponse(BaseModel):
-    """反復学習制御（ILC）の状態。自動走行画面のモード選択時に表示する。"""
+class PlanStatusResponse(BaseModel):
+    """エピソード型プラン学習の状態。自動走行画面のモード選択時に表示する（ILC の後継）。"""
 
     profile_id: str
     mode_id: str
     enabled: bool
     iteration: int  # これまでの学習反復回数（0=未学習）
-    has_table: bool  # 補正テーブルが存在するか（efforts が非空）
-    best_p95_kmh: float | None  # これまでの最良走行 p95
-    kpi_history: list[dict[str, object]] = []  # 反復ごとの p95/max/reversal 履歴（収束表示用）
+    has_plan: bool  # 保存プランが存在するか（efforts が非空）
+    best_reward: float | None  # これまでの最良走行 reward
+    reward_history: list[dict[str, object]] = []  # 反復ごとの reward/p95/採否 履歴（収束表示用）

@@ -1,4 +1,4 @@
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import uuid4
@@ -37,6 +37,31 @@ def _ffp_from_schema(s: FeedforwardParamsSchema) -> FeedforwardParams:
 
 def _dyn_from_schema(s: DynamicsParamsSchema) -> DynamicsParams:
     return DynamicsParams(**{f.name: getattr(s, f.name) for f in fields(DynamicsParams)})
+
+
+def _ffp_merged(existing: FeedforwardParams, s: FeedforwardParamsSchema) -> FeedforwardParams:
+    """クライアントが明示送信したフィールドのみ既存値へ上書きする（更新用）。
+
+    WebUI のフォームは編集可能な項目だけを送るため、スキーマ既定値で欠損を埋めて
+    丸ごと置換すると、学習サイクルが同定した非フォーム項目（惰行減速カーブ
+    coast_decel_speeds_kmh / coast_decel_kmhs 等）が消える（2026-07-15 実機で発生）。
+    model_fields_set（リクエストボディに実際に含まれたキー）で送信有無を判別し、
+    明示送信された空タプルはクリアとして尊重する。
+    """
+    names = {f.name for f in fields(FeedforwardParams)}
+    overrides = {n: getattr(s, n) for n in s.model_fields_set if n in names}
+    return replace(existing, **overrides)
+
+
+def _dyn_merged(existing: DynamicsParams, s: DynamicsParamsSchema) -> DynamicsParams:
+    """クライアントが明示送信したフィールドのみ既存値へ上書きする（更新用）。
+
+    fopdt_* は学習サイクルが書き込む同定値。_ffp_merged と同じ理由でフィールド単位に
+    マージする（フォーム側の「既存値を送り返す」対処に依存しない）。
+    """
+    names = {f.name for f in fields(DynamicsParams)}
+    overrides = {n: getattr(s, n) for n in s.model_fields_set if n in names}
+    return replace(existing, **overrides)
 
 
 def _to_response(p: VehicleProfile) -> ProfileResponse:
@@ -167,12 +192,12 @@ async def update_profile(
         created_at=existing.created_at,
         updated_at=existing.updated_at,
         feedforward_params=(
-            _ffp_from_schema(req.feedforward_params)
+            _ffp_merged(existing.feedforward_params, req.feedforward_params)
             if req.feedforward_params is not None
             else existing.feedforward_params
         ),
         dynamics_params=(
-            _dyn_from_schema(req.dynamics_params)
+            _dyn_merged(existing.dynamics_params, req.dynamics_params)
             if req.dynamics_params is not None
             else existing.dynamics_params
         ),

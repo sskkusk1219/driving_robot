@@ -18,18 +18,18 @@ from src.models.calibration import CalibrationResult
 from src.models.drive_log import DriveSession
 from src.models.system_state import RobotState
 from src.web.deps import (
-    ILCRepoProtocol,
     ModeRepoProtocol,
+    PlanRepoProtocol,
     ProfileRepoProtocol,
     ScheduleRepoProtocol,
     SessionRepoProtocol,
     get_controller,
     get_cycle_orchestrator,
     get_feature_spec,
-    get_ilc_repo,
     get_learning_settings,
     get_log_writer,
     get_mode_repo,
+    get_plan_repo,
     get_profile_repo,
     get_schedule_repo,
     get_session_repo,
@@ -42,7 +42,6 @@ from src.web.schemas import (
     DriveSessionResponse,
     DynamicsParamsSchema,
     FeedforwardParamsSchema,
-    ILCStatusResponse,
     JogRequest,
     JogResponse,
     LearningCycleAbortResponse,
@@ -53,6 +52,7 @@ from src.web.schemas import (
     PidRefineResponse,
     PidValidateRequest,
     PidValidateResponse,
+    PlanStatusResponse,
     SelectProfileRequest,
     StartDriveRequest,
     StartScheduleRequest,
@@ -559,10 +559,7 @@ async def start_learning_cycle(
     WebSocket(`cycle_progress`)で参照する。
     """
     stage1 = req.refine_runs_stage1 or learning_settings.refine_runs_stage1
-    stage2 = req.refine_runs_stage2 or learning_settings.refine_runs_stage2
-    cycle_id = await orchestrator.start(
-        stage1, stage2, feature_spec=feature_spec, target_mode_id=req.target_mode_id
-    )
+    cycle_id = await orchestrator.start(stage1, feature_spec=feature_spec)
     return LearningCycleStartResponse(cycle_id=cycle_id, status="started")
 
 
@@ -582,57 +579,57 @@ async def get_learning_cycle_status(
     return _to_cycle_progress_schema(orchestrator)
 
 
-# ── ILC（反復学習制御） ────────────────────────────────────────────────
-ILCRepo = Annotated[ILCRepoProtocol, Depends(get_ilc_repo)]
+# ── エピソード型プラン学習 ────────────────────────────────────────────────
+PlanRepo = Annotated[PlanRepoProtocol, Depends(get_plan_repo)]
 
 
-def _to_ilc_status(profile_id: str, mode_id: str, rec: object | None) -> ILCStatusResponse:
-    """ILCRecord（または None）を状態レスポンスへ写像する。未学習は既定値。"""
+def _to_plan_status(profile_id: str, mode_id: str, rec: object | None) -> PlanStatusResponse:
+    """PedalPlanRecord（または None）を状態レスポンスへ写像する。未学習は既定値。"""
     if rec is None:
-        return ILCStatusResponse(
+        return PlanStatusResponse(
             profile_id=profile_id,
             mode_id=mode_id,
             enabled=True,  # 未登録は既定で有効（走行完了時に学習開始）
             iteration=0,
-            has_table=False,
-            best_p95_kmh=None,
-            kpi_history=[],
+            has_plan=False,
+            best_reward=None,
+            reward_history=[],
         )
-    table = rec.table  # type: ignore[attr-defined]
-    return ILCStatusResponse(
+    plan = rec.plan  # type: ignore[attr-defined]
+    return PlanStatusResponse(
         profile_id=profile_id,
         mode_id=mode_id,
         enabled=rec.enabled,  # type: ignore[attr-defined]
-        iteration=table.iteration,
-        has_table=bool(table.efforts),
-        best_p95_kmh=table.best_p95_kmh,
-        kpi_history=list(rec.kpi_history),  # type: ignore[attr-defined]
+        iteration=rec.iteration,  # type: ignore[attr-defined]
+        has_plan=bool(plan.efforts),
+        best_reward=rec.best_reward,  # type: ignore[attr-defined]
+        reward_history=list(rec.reward_history),  # type: ignore[attr-defined]
     )
 
 
-@router.get("/ilc/{profile_id}/{mode_id}", response_model=ILCStatusResponse)
-async def get_ilc_status(profile_id: str, mode_id: str, ilc_repo: ILCRepo) -> ILCStatusResponse:
-    """profile×mode の ILC 状態（反復回数・有効フラグ・最良p95・履歴）を返す。"""
-    rec = await ilc_repo.get(profile_id, mode_id)
-    return _to_ilc_status(profile_id, mode_id, rec)
+@router.get("/plan/{profile_id}/{mode_id}", response_model=PlanStatusResponse)
+async def get_plan_status(profile_id: str, mode_id: str, plan_repo: PlanRepo) -> PlanStatusResponse:
+    """profile×mode のプラン学習状態（反復回数・有効フラグ・最良reward・履歴）を返す。"""
+    rec = await plan_repo.get(profile_id, mode_id)
+    return _to_plan_status(profile_id, mode_id, rec)
 
 
-@router.post("/ilc/{profile_id}/{mode_id}/enable", response_model=ILCStatusResponse)
-async def enable_ilc(profile_id: str, mode_id: str, ilc_repo: ILCRepo) -> ILCStatusResponse:
-    """ILC を有効化する。"""
-    await ilc_repo.set_enabled(profile_id, mode_id, True)
-    return _to_ilc_status(profile_id, mode_id, await ilc_repo.get(profile_id, mode_id))
+@router.post("/plan/{profile_id}/{mode_id}/enable", response_model=PlanStatusResponse)
+async def enable_plan(profile_id: str, mode_id: str, plan_repo: PlanRepo) -> PlanStatusResponse:
+    """プラン学習を有効化する。"""
+    await plan_repo.set_enabled(profile_id, mode_id, True)
+    return _to_plan_status(profile_id, mode_id, await plan_repo.get(profile_id, mode_id))
 
 
-@router.post("/ilc/{profile_id}/{mode_id}/disable", response_model=ILCStatusResponse)
-async def disable_ilc(profile_id: str, mode_id: str, ilc_repo: ILCRepo) -> ILCStatusResponse:
-    """ILC を無効化する（補正を適用せず学習もしない）。"""
-    await ilc_repo.set_enabled(profile_id, mode_id, False)
-    return _to_ilc_status(profile_id, mode_id, await ilc_repo.get(profile_id, mode_id))
+@router.post("/plan/{profile_id}/{mode_id}/disable", response_model=PlanStatusResponse)
+async def disable_plan(profile_id: str, mode_id: str, plan_repo: PlanRepo) -> PlanStatusResponse:
+    """プラン学習を無効化する（保存プランを適用せず学習もしない）。"""
+    await plan_repo.set_enabled(profile_id, mode_id, False)
+    return _to_plan_status(profile_id, mode_id, await plan_repo.get(profile_id, mode_id))
 
 
-@router.post("/ilc/{profile_id}/{mode_id}/reset", response_model=ILCStatusResponse)
-async def reset_ilc(profile_id: str, mode_id: str, ilc_repo: ILCRepo) -> ILCStatusResponse:
-    """補正テーブルを削除して反復 0 からやり直す。"""
-    await ilc_repo.reset(profile_id, mode_id)
-    return _to_ilc_status(profile_id, mode_id, await ilc_repo.get(profile_id, mode_id))
+@router.post("/plan/{profile_id}/{mode_id}/reset", response_model=PlanStatusResponse)
+async def reset_plan(profile_id: str, mode_id: str, plan_repo: PlanRepo) -> PlanStatusResponse:
+    """保存プランを削除し、次回は FF 由来プランから学習をやり直す。"""
+    await plan_repo.reset(profile_id, mode_id)
+    return _to_plan_status(profile_id, mode_id, await plan_repo.get(profile_id, mode_id))

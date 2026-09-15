@@ -43,19 +43,21 @@ class TestMaxDeviation:
 
 
 class TestSignReversal:
+    """符号反転は ±SIGN_REVERSAL_AMPLITUDE_KMH(0.3) を両側で超えた往復のみ数える。"""
+
     def test_oscillation_counted_in_window(self) -> None:
         """0.5 秒ごとに偏差符号が反転する系列 → 5 秒窓で多数の反転を検出。"""
         mon = KPIMonitor()
         t = 0.0
-        for i in range(20):  # 10 秒間、0.5 秒ごとに ±0.3 を交互
-            dev = 0.3 if i % 2 == 0 else -0.3
+        for i in range(20):  # 10 秒間、0.5 秒ごとに ±0.5 を交互
+            dev = 0.5 if i % 2 == 0 else -0.5
             for _ in range(10):  # 0.5 秒 = 10 サイクル
                 mon.update(50.0, 50.0 + dev, t)
                 t += DT
         assert mon.summary()["reversal_max_per_5s"] >= 8
 
     def test_noise_floor_suppresses_tiny_chatter(self) -> None:
-        """±0.03 km/h（ノイズフロア内）のチャタは反転としてカウントしない。"""
+        """±0.03 km/h（振幅しきい値未満）のチャタは反転としてカウントしない。"""
         mon = KPIMonitor()
         t = 0.0
         for i in range(200):
@@ -64,20 +66,34 @@ class TestSignReversal:
             t += DT
         assert mon.summary()["reversal_max_per_5s"] == 0.0
 
+    def test_measurement_noise_amplitude_not_counted(self) -> None:
+        """CAN 車速の実測ノイズ相当（±0.25km/h）のゼロクロスは数えない（2026-09-09）。
+
+        旧しきい値 0.05 では、追従が良く偏差がノイズに埋もれるほど反転回数が増える
+        という逆立ちした指標になっていた（実機 3ca20d43: 最大反転は 120km/h 巡航で発生）。
+        """
+        mon = KPIMonitor()
+        t = 0.0
+        for i in range(200):
+            dev = 0.25 if i % 2 == 0 else -0.25
+            mon.update(50.0, 50.0 + dev, t)
+            t += DT
+        assert mon.summary()["reversal_max_per_5s"] == 0.0
+
     def test_single_crossing_counts_once(self) -> None:
         mon = KPIMonitor()
         for i in range(10):
-            mon.update(50.0, 50.2, i * DT)
+            mon.update(50.0, 50.5, i * DT)
         for i in range(10, 20):
-            mon.update(50.0, 49.8, i * DT)
+            mon.update(50.0, 49.5, i * DT)
         assert mon.summary()["reversal_max_per_5s"] == 1.0
 
     def test_old_reversals_fall_out_of_window(self) -> None:
         """5 秒より古い反転は窓から外れる（10 時間走行でも deque が成長しない）。"""
         mon = KPIMonitor()
-        mon.update(50.0, 50.2, 0.0)
-        mon.update(50.0, 49.8, 0.1)  # 反転1
-        mon.update(50.0, 50.2, 10.0)  # 反転2（窓外の反転1 は落ちる）
+        mon.update(50.0, 50.5, 0.0)
+        mon.update(50.0, 49.5, 0.1)  # 反転1
+        mon.update(50.0, 50.5, 10.0)  # 反転2（窓外の反転1 は落ちる）
         assert len(mon._reversal_times) == 1
 
 
@@ -158,6 +174,15 @@ class TestSummary:
             "pedal_travel_pct",
             "pedal_switch_count",
             "pedal_switch_per_min",
+            "effort_rate_rms_pct_s",
+            "plan_rms_pct",
+            "trim_rms_pct",
+            "trim_share",
+            "phase_violation_pct",
+            "accel_reversals_per_min",
+            "brake_reversals_per_min",
+            "accel_rate_p95_pct_s",
+            "brake_rate_p95_pct_s",
         }
 
 
@@ -258,3 +283,153 @@ class TestPedalSwitch:
         s = mon.summary()
         assert s["pedal_switch_count"] == 1.0
         assert s["pedal_switch_per_min"] == pytest.approx(1.0 / (0.3 / 60.0), rel=1e-6)
+
+
+class TestEffortMetrics:
+    """effort 内訳（プラン学習の報酬・トリム寄与率）の逐次集計。"""
+
+    def test_no_effort_data_yields_zero(self) -> None:
+        """effort 引数を渡さなければ新メトリクスは 0（後方互換）。"""
+        mon = KPIMonitor()
+        for i in range(20):
+            mon.update(50.0, 50.0, i * DT)
+        s = mon.summary()
+        assert s["effort_rate_rms_pct_s"] == 0.0
+        assert s["plan_rms_pct"] == 0.0
+        assert s["trim_rms_pct"] == 0.0
+        assert s["trim_share"] == 0.0
+        assert s["phase_violation_pct"] == 0.0
+
+    def test_constant_applied_effort_has_zero_rate(self) -> None:
+        """applied が一定なら変化率 RMS は 0（開度一定＝滑らか）。"""
+        mon = KPIMonitor()
+        for i in range(20):
+            mon.update(50.0, 50.0, i * 0.1, applied_effort_pct=10.0, phase="drive")
+        assert mon.summary()["effort_rate_rms_pct_s"] == pytest.approx(0.0)
+
+    def test_effort_rate_rms_of_ramp(self) -> None:
+        """毎サイクル +1%（0.1s 刻み）＝ 10 %/s の一定変化率 → RMS ≈ 10。"""
+        mon = KPIMonitor()
+        for i in range(50):
+            mon.update(50.0, 50.0, i * 0.1, applied_effort_pct=float(i), phase="drive")
+        assert mon.summary()["effort_rate_rms_pct_s"] == pytest.approx(10.0, rel=1e-3)
+
+    def test_plan_trim_rms_and_share(self) -> None:
+        """plan=±10, trim=±5 の一定振幅 → RMS=10/5, trim_share=0.5。"""
+        mon = KPIMonitor()
+        for i in range(20):
+            plan = 10.0 if i % 2 == 0 else -10.0
+            trim = 5.0 if i % 2 == 0 else -5.0
+            mon.update(
+                50.0,
+                50.0,
+                i * 0.1,
+                plan_effort_pct=plan,
+                trim_effort_pct=trim,
+                applied_effort_pct=plan + trim,
+                phase="drive",
+            )
+        s = mon.summary()
+        assert s["plan_rms_pct"] == pytest.approx(10.0)
+        assert s["trim_rms_pct"] == pytest.approx(5.0)
+        assert s["trim_share"] == pytest.approx(0.5)
+
+    def test_phase_violation_only_in_coast(self) -> None:
+        """COAST 区間で踏んだ量だけ逸脱に計上。DRIVE で正 effort は逸脱 0。"""
+        mon = KPIMonitor()
+        t = 0.0
+        # DRIVE で +8%（フェーズどおり＝逸脱なし）を 1 秒
+        for _ in range(10):
+            mon.update(50.0, 50.0, t, applied_effort_pct=8.0, phase="drive")
+            t += 0.1
+        # COAST で +8%（踏んではいけない＝逸脱）を 1 秒
+        for _ in range(10):
+            mon.update(50.0, 50.0, t, applied_effort_pct=8.0, phase="coast")
+            t += 0.1
+        s = mon.summary()
+        # 逸脱積分 ≈ 8%×1s、duration ≈ 1.9s → phase_violation ≈ 8/1.9
+        assert s["phase_violation_pct"] == pytest.approx(8.0 / 1.9, rel=0.05)
+
+    def test_phase_violation_zero_when_following_authority(self) -> None:
+        """フェーズ権限どおり（DRIVE=正・BRAKE=負・COAST=0・STOP=保持）なら逸脱 0。"""
+        mon = KPIMonitor()
+        t = 0.0
+        for applied, phase in [(8.0, "drive"), (0.0, "coast"), (-8.0, "brake"), (-3.0, "stop")]:
+            for _ in range(10):
+                mon.update(50.0, 50.0, t, applied_effort_pct=applied, phase=phase)
+                t += 0.1
+        assert mon.summary()["phase_violation_pct"] == pytest.approx(0.0)
+
+
+class TestPedalSmoothness:
+    """滑らかさ指標（2026-09-08 追加）: 開度の向き反転回数・変化率 p95。"""
+
+    def test_no_pedal_data_yields_zero(self) -> None:
+        mon = KPIMonitor()
+        for i in range(20):
+            mon.update(50.0, 50.0, i * DT)
+        s = mon.summary()
+        assert s["accel_reversals_per_min"] == 0.0
+        assert s["brake_reversals_per_min"] == 0.0
+        assert s["accel_rate_p95_pct_s"] == 0.0
+        assert s["brake_rate_p95_pct_s"] == 0.0
+
+    def test_counts_direction_reversals(self) -> None:
+        """開度が増加→減少→増加と向きを変えるたびに反転を数える。"""
+        mon = KPIMonitor()
+        dt = 0.1
+        # 0→5(増)→10(増、同方向)→3(減、反転1)→8(増、反転2)
+        seq = [0.0, 5.0, 10.0, 3.0, 8.0]
+        for i, op in enumerate(seq):
+            mon.update(50.0, 50.0, i * dt, accel_opening=op)
+        assert mon.summary()["accel_reversals_per_min"] == pytest.approx(
+            2.0 / (0.4 / 60.0), rel=1e-6
+        )
+
+    def test_reversal_noise_floor_ignores_tiny_changes(self) -> None:
+        """0.05% 未満の微小変化は向き反転として数えない。"""
+        mon = KPIMonitor()
+        dt = 0.1
+        seq = [5.0, 5.02, 4.98, 5.01]  # すべて |Δ|<0.05
+        for i, op in enumerate(seq):
+            mon.update(50.0, 50.0, i * dt, accel_opening=op)
+        assert mon.summary()["accel_reversals_per_min"] == 0.0
+
+    def test_accel_and_brake_reversals_are_independent(self) -> None:
+        mon = KPIMonitor()
+        dt = 0.1
+        # accel: 0→5→0 (反転1) / brake: 0→0→8 (反転なし)
+        seq = [(0.0, 0.0), (5.0, 0.0), (0.0, 8.0)]
+        for i, (a, b) in enumerate(seq):
+            mon.update(50.0, 50.0, i * dt, accel_opening=a, brake_opening=b)
+        s = mon.summary()
+        assert s["accel_reversals_per_min"] == pytest.approx(1.0 / (0.2 / 60.0), rel=1e-6)
+        assert s["brake_reversals_per_min"] == 0.0
+
+    def test_rate_p95_reflects_fast_changes(self) -> None:
+        """大半が緩やかな変化で一部だけ急な変化 → p95 は急な変化側に寄る。"""
+        mon = KPIMonitor()
+        dt = 0.1
+        t = 0.0
+        prev = 0.0
+        # 緩やかな変化を19回（+1%/0.1s=10%/s）
+        for _ in range(19):
+            prev += 1.0
+            mon.update(50.0, 50.0, t, accel_opening=prev)
+            t += dt
+        # 急な変化を1回（+30%/0.1s=300%/s）
+        prev += 30.0
+        mon.update(50.0, 50.0, t, accel_opening=prev)
+        s = mon.summary()
+        assert s["accel_rate_p95_pct_s"] >= 290.0
+
+    def test_rate_p95_low_for_gentle_ramp(self) -> None:
+        """一定の緩やかな変化率なら p95 もその値近辺に収まる。"""
+        mon = KPIMonitor()
+        dt = 0.1
+        prev = 0.0
+        for i in range(30):
+            prev += 0.3  # 3%/s
+            mon.update(50.0, 50.0, i * dt, accel_opening=prev)
+        s = mon.summary()
+        assert s["accel_rate_p95_pct_s"] == pytest.approx(3.0, abs=1.0)

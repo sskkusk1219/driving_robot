@@ -442,6 +442,47 @@ class TestEstimateDynamicsParams:
         new = estimate_dynamics_params(logs, current)
         assert new == current
 
+
+def _coast_down_session(session_id: str, v_start: float, v_stop: float) -> list[DriveLog]:
+    """速度依存の惰行減速（v≥70: -1.5, v<70: -3.0 km/h/s）でコーストダウンする合成ログ。"""
+    t0 = datetime.now(tz=UTC)
+    logs: list[DriveLog] = []
+    v = v_start
+    i = 0
+    while v > v_stop:
+        logs.append(_log(session_id, i, t0, v, accel_open=0.0, brake_open=0.0))
+        decel = 1.5 if v >= 70.0 else 3.0
+        v -= decel * DT_S
+        i += 1
+    return logs
+
+
+class TestCoastDecelCurve:
+    def test_estimates_speed_dependent_curve(self) -> None:
+        """コーストダウン完走ログから速度依存の惰行減速カーブが同定される（T8 実機再現）。
+
+        sample_004 実機の故障: 低速惰行(-3)が高速(-1.5)より強いのに、単一定数近似が
+        高速値のみで低速の緩減速を BRAKE と誤分類していた。カーブは両域を捉える。
+        """
+        from src.models.profile import coast_decel_at
+
+        logs = _coast_down_session("s_coast", 130.0, 6.0)
+        new = estimate_dynamics_params(logs, FeedforwardParams())
+
+        assert len(new.coast_decel_speeds_kmh) >= 2
+        assert len(new.coast_decel_speeds_kmh) == len(new.coast_decel_kmhs)
+        # 高速域 ≈1.5、低速域 ≈3.0（実機 45km/h 相当の照会で低速値が返る）
+        assert coast_decel_at(new, 100.0) == pytest.approx(1.5, abs=0.3)
+        assert coast_decel_at(new, 45.0) == pytest.approx(3.0, abs=0.3)
+
+    def test_short_coast_keeps_existing_curve(self) -> None:
+        """高速域数 km/h しか惰行しない旧ログ（coast_timeout=6s 相当）では有効ビンが 1 個
+        以下でカーブ未同定 → 既存カーブ（ここでは空）を保持し定数フォールバックのまま。"""
+        logs = _coast_down_session("s_short", 130.0, 126.0)  # 130→126 のみ（旧タイムアウト相当）
+        new = estimate_dynamics_params(logs, FeedforwardParams())
+        assert new.coast_decel_speeds_kmh == ()
+        assert new.coast_decel_kmhs == ()
+
     def test_estimates_accel_and_brake_deadband_with_sufficient_probe_data(self) -> None:
         """低開度保持プローブ相当のデータから不感帯境界(ビン下端)を推定する。"""
         n = 12

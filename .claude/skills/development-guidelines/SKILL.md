@@ -47,26 +47,25 @@ allowed-tools: Read, Write, Edit
 docs/development-guidelines.md
 ```
 
+## ⚠️ 本プロジェクトでの注意
+
+**このスキルの `./guides/` は汎用テンプレート由来で、コード例はTypeScript/JavaScript、ブランチ戦略はGit Flow前提で書かれています。**
+
+本プロジェクトは **Python 3.13 + FastAPI + PostgreSQL 15（Raspberry Pi）** です。
+**コード実装時の規約は `docs/development-guidelines.md`（Python規約・pytest/ruff/mypy・main+featureブランチ）を正としてください。**
+このスキルのガイドは、`docs/development-guidelines.md` を新規作成・改訂する際の「構成の参考」としてのみ使用します。
+
 ## クイックリファレンス
 
 ### コード実装時
-コード実装時のルールと規約: ./guides/implementation.md
-
-含まれる内容:
-- TypeScript/JavaScript規約
-- 型定義・命名規則
-- 関数設計とエラーハンドリング
-- コメント規約
-- セキュリティとパフォーマンス
-- テストコード実装
-- リファクタリング手法
+**必ず `docs/development-guidelines.md` を参照**（./guides/implementation.md はTS例の汎用参考資料であり、実装時には使わない）
 
 ### 開発プロセスの参照／策定時
-Git運用、テスト戦略、コードレビュー: ./guides/process.md
+ガイドライン文書の構成参考: ./guides/process.md
 
-含まれる内容:
+含まれる内容（汎用例）:
 - 基本原則（具体例の重要性、理由説明）
-- Git運用ルール（Git Flow ブランチ戦略）
+- Git運用ルール（汎用例はGit Flow。本プロジェクトは main + feature/fix ブランチ）
 - コミットメッセージとPRプロセス
 - テスト戦略（ピラミッドとカバレッジ）
 - コードレビューのプロセス
@@ -79,20 +78,17 @@ Git運用、テスト戦略、コードレビュー: ./guides/process.md
 ## 使用シーン別ガイド
 
 ### 新規開発時
-1. ./guides/implementation.md で命名規則・コーディング規約を確認
-2. ./guides/process.md でブランチ戦略・PR処理を確認
-3. テストを先に書く（TDD）
+1. `docs/development-guidelines.md` で命名規則・コーディング規約・ブランチ戦略を確認
+2. テストを先に書く（TDD）
 
 ### コードレビュー時
-- ./guides/process.md の「コードレビュープロセス」を参照
-- ./guides/implementation.md で規約違反がないか確認
+- `docs/development-guidelines.md` のレビュー観点・規約に照らして確認
 
 ### テスト設計時
-- ./guides/process.md の「テスト戦略」（ピラミッド、カバレッジ）
-- ./guides/implementation.md の「テストコード」（実装パターン）
+- `docs/development-guidelines.md` の「テスト戦略」（ピラミッド、カバレッジ、pytestパターン）
 
 ### リリース準備時
-- ./guides/process.md の「Git運用ルール」（main へのマージ方針）
+- `docs/development-guidelines.md` の「Git運用ルール」
 - コミットメッセージが Conventional Commits に従っているか確認
 
 ## チェックリスト
@@ -100,9 +96,9 @@ Git運用、テスト戦略、コードレビュー: ./guides/process.md
 - [ ] コーディング規約が具体例付きで定義されている
 - [ ] 命名規則が明確である（言語別・プロジェクト固有）
 - [ ] エラーハンドリングの方針が定義されている
-- [ ] ブランチ戦略が決まっている（Git Flow推奨）
-- [ ] コミットメッセージ規約が明確である
+- [ ] ブランチ戦略が決まっている（本プロジェクト: main + feature/fix ブランチ）
+- [ ] コミットメッセージ規約が明確である（Conventional Commits）
 - [ ] PRテンプレートが用意されている
 - [ ] テストの種類とカバレッジ目標が設定されている
 - [ ] コードレビュープロセスが定義されている
-- [ ] CI/CDパイプラインが構築されている
+- [ ] 品質チェック手順が定義されている（pytest / ruff / mypy をコミット前に実行）

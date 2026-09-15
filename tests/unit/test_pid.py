@@ -162,6 +162,33 @@ class TestPIDAntiWindup:
         assert out_after_reversal < 10.0
 
 
+class TestPIDBleedIntegral:
+    """bleed_integral（符号反転時の部分ブリード、F3 対策）。"""
+
+    def test_bleed_scales_integral(self) -> None:
+        pid = PIDController(kp=0.0, ki=1.0, kd=0.0, dt=DT)
+        pid.update(setpoint=100.0, measurement=0.0)  # integral=100*DT
+        before = pid._integral
+        pid.bleed_integral(0.3)
+        assert pid._integral == pytest.approx(before * 0.3)
+
+    def test_bleed_factor_zero_clears_integral(self) -> None:
+        pid = PIDController(kp=0.0, ki=1.0, kd=0.0, dt=DT)
+        pid.update(setpoint=100.0, measurement=0.0)
+        pid.bleed_integral(0.0)
+        assert pid._integral == pytest.approx(0.0)
+
+    def test_bleed_preserves_prev_error_and_d_filt(self) -> None:
+        """微分キックを起こさないよう prev_error・微分フィルタは変えない。"""
+        pid = PIDController(kp=0.0, ki=1.0, kd=1.0, dt=DT)
+        pid.update(setpoint=100.0, measurement=0.0)
+        prev_error_before = pid._prev_error
+        d_filt_before = pid._d_filt
+        pid.bleed_integral(0.5)
+        assert pid._prev_error == pytest.approx(prev_error_before)
+        assert pid._d_filt == pytest.approx(d_filt_before)
+
+
 class TestPIDMeasuredDt:
     def test_measured_dt_used_for_derivative(self) -> None:
         """計測 dt を渡すと微分(フィルタ入力)が実経過時間で計算される（スキップ時のスパイク防止）"""

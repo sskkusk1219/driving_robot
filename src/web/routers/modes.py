@@ -8,13 +8,25 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
 from src.models.driving_mode import DrivingMode, SpeedPoint
-from src.web.deps import ILCRepoProtocol, ModeRepoProtocol, get_ilc_repo, get_mode_repo
+from src.web.deps import ModeRepoProtocol, PlanRepoProtocol, get_mode_repo, get_plan_repo
 from src.web.schemas import ModeDetailResponse, ModeResponse, ModeUpdateRequest, SpeedPointSchema
 
 router = APIRouter(prefix="/api/v1/modes", tags=["modes"])
 
 ModeRepo = Annotated[ModeRepoProtocol, Depends(get_mode_repo)]
-ILCRepo = Annotated[ILCRepoProtocol, Depends(get_ilc_repo)]
+PlanRepo = Annotated[PlanRepoProtocol, Depends(get_plan_repo)]
+
+
+def _reject_if_system(mode: DrivingMode) -> None:
+    """システムモード（網羅検証パターン）への編集・削除を拒否する。
+
+    学習サイクルが内部生成・管理する内部リソースであり、ユーザー操作の対象ではない
+    （list_all にも現れない）。編集・削除は 409 で拒否する。
+    """
+    if mode.is_system:
+        raise HTTPException(
+            status_code=409, detail="システムモード（検証パターン）は編集・削除できません"
+        )
 
 
 def _to_response(m: DrivingMode) -> ModeResponse:
@@ -165,14 +177,14 @@ async def replace_mode(
     mode_id: str,
     repo: ModeRepo,
     file: UploadFile,
-    ilc_repo: ILCRepo,
+    plan_repo: PlanRepo,
     name: Annotated[str, Form()] = "",
     description: Annotated[str, Form()] = "",
 ) -> ModeResponse:
     """基準車速 CSV を再アップロードして走行モードを差し替える。
 
-    基準軌跡が変わると ILC の時刻別補正テーブルは無効（別の走行軌跡の残差）になるため、
-    このモードの ILC テーブルを全プロファイルぶんリセットする。
+    基準軌跡が変わると学習済みの保存プラン（別の走行軌跡から学習）は無効になるため、
+    このモードの保存プランを全プロファイルぶんリセットする。
     """
     try:
         existing = await repo.get_by_id(mode_id)
@@ -180,6 +192,7 @@ async def replace_mode(
         raise HTTPException(status_code=400, detail="mode_id が UUID 形式ではありません")
     if existing is None:
         raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
+    _reject_if_system(existing)
 
     _MAX_CSV_BYTES = 10 * 1024 * 1024
     content = await file.read()
@@ -203,7 +216,7 @@ async def replace_mode(
     updated = await repo.update(merged)
     if updated is None:
         raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
-    await ilc_repo.reset_for_mode(mode_id)  # 軌跡変更で ILC 補正は無効
+    await plan_repo.reset_for_mode(mode_id)  # 軌跡変更で保存プランは無効
     return _to_response(updated)
 
 
@@ -215,6 +228,7 @@ async def update_mode(mode_id: str, req: ModeUpdateRequest, repo: ModeRepo) -> M
         raise HTTPException(status_code=400, detail="mode_id が UUID 形式ではありません")
     if existing is None:
         raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
+    _reject_if_system(existing)
     merged = DrivingMode(
         id=existing.id,
         name=req.name if req.name is not None else existing.name,
@@ -233,8 +247,12 @@ async def update_mode(mode_id: str, req: ModeUpdateRequest, repo: ModeRepo) -> M
 @router.delete("/{mode_id}", status_code=204)
 async def delete_mode(mode_id: str, repo: ModeRepo) -> None:
     try:
-        deleted = await repo.delete(mode_id)
+        existing = await repo.get_by_id(mode_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="mode_id が UUID 形式ではありません")
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
+    _reject_if_system(existing)
+    deleted = await repo.delete(mode_id)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")

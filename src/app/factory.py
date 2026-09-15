@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
-from src.app.ilc_service import ILCService
+from src.app.plan_service import PedalPlanService
 from src.app.robot_controller import (
     ActuatorDriverProtocol,
     ButtonServoProtocol,
@@ -27,7 +27,7 @@ from src.infra.button_servo_driver import ButtonServoDriver
 from src.infra.can_reader import CANReader
 from src.infra.db import create_pool
 from src.infra.gpio_monitor import GPIOMonitor
-from src.infra.ilc_repository import ILCRepository
+from src.infra.pedal_plan_repository import PedalPlanRepository
 from src.infra.profile_repository import ProfileRepository
 from src.infra.session_repository import SessionRepository
 from src.infra.settings import AppSettings
@@ -107,13 +107,19 @@ async def build_real_controller(
             port=settings.serial.accel_port,
             slave_id=1,
             baud_rate=settings.serial.baud_rate,
+            timeout=settings.serial.timeout_s,
+            retries=settings.serial.retries,
             axis_name="accel",
+            lead_mm=settings.actuator.accel.lead_mm,
         )
         brake_driver = ActuatorDriver(
             port=settings.serial.brake_port,
             slave_id=1,  # 各軸が独立した RS-485 バスを持つため両軸とも slave_id=1
             baud_rate=settings.serial.baud_rate,
+            timeout=settings.serial.timeout_s,
+            retries=settings.serial.retries,
             axis_name="brake",
+            lead_mm=settings.actuator.brake.lead_mm,
         )
         can_reader = CANReader(
             interface=settings.can.interface,
@@ -162,9 +168,10 @@ async def build_real_controller(
 
     pool = await create_pool(settings.database.dsn)
     profile_repo = ProfileRepository(pool)
-    # ILC（反復学習制御）: profile×mode の補正テーブルを永続化し、走行残差から学習する。
-    ilc_repo = ILCRepository(pool)
-    ilc_service = ILCService(ilc_repo=ilc_repo, session_repo=SessionRepository(pool))
+    # エピソード型プラン学習: profile×mode の保存プランを永続化し、走行後に実効 effort＋残差
+    # から更新する（reward 改善時のみ採用）。ILC の後継。
+    plan_repo = PedalPlanRepository(pool)
+    plan_service = PedalPlanService(plan_repo=plan_repo, session_repo=SessionRepository(pool))
 
     # 周期は settings を単一ソースとし、PID の dt と DriveLoop の周期を一致させる
     loop_interval_s = settings.control.loop_interval_ms / 1000.0
@@ -201,7 +208,7 @@ async def build_real_controller(
         pre_check_runner=pre_check_runner,
         learning_manager=LearningDriveManager(),
         button_servo=button_servo,
-        ilc_service=ilc_service,
+        plan_service=plan_service,
         control_interval_s=loop_interval_s,
         log_every_n_cycles=log_every_n_cycles,
     )

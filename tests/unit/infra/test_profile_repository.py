@@ -453,6 +453,29 @@ class TestDeleteProfile:
         assert result is True
 
     @pytest.mark.asyncio
+    async def test_delete_removes_learning_cycles_after_sessions(self) -> None:
+        """回帰テスト: learning_cycles を消さずに vehicle_profiles を消すと
+        FK 違反（learning_cycles_profile_id_fkey）で 500 になるバグ。
+        drive_sessions.cycle_id が learning_cycles を参照するため順序も検証する。"""
+        pool, conn = make_mock_pool()
+        conn.execute.return_value = "DELETE 1"
+        repo = ProfileRepository(pool)
+
+        await repo.delete(PROFILE_ID)
+
+        tables = [call.args[0] for call in conn.execute.call_args_list]
+        cycles_idx = next(
+            i for i, sql in enumerate(tables) if "DELETE FROM learning_cycles" in sql
+        )
+        sessions_idx = next(
+            i for i, sql in enumerate(tables) if "DELETE FROM drive_sessions" in sql
+        )
+        profiles_idx = next(
+            i for i, sql in enumerate(tables) if "DELETE FROM vehicle_profiles" in sql
+        )
+        assert sessions_idx < cycles_idx < profiles_idx
+
+    @pytest.mark.asyncio
     async def test_delete_returns_false_when_not_found(self) -> None:
         pool, conn = make_mock_pool()
         conn.execute.return_value = "DELETE 0"

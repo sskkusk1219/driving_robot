@@ -1,12 +1,15 @@
 ---
 name: repository-structure
 description: リポジトリ構造定義書を作成するための詳細ガイドとテンプレート。リポジトリ構造定義時にのみ使用。
-allowed-tools: Read, Write
+allowed-tools: Read, Write, Edit
 ---
 
 # リポジトリ構造定義スキル
 
 このスキルは、明確で保守しやすいリポジトリ構造を定義するための詳細ガイドです。
+
+> **本プロジェクトの技術スタック**: Python 3.13 + FastAPI + PostgreSQL 15（Raspberry Pi 5）。
+> ガイド/テンプレート内のコード例やディレクトリ例（TypeScript/npm等）は汎用サンプルです。本プロジェクトでは `docs/repository-structure.md` の実構造を正としてください。
 
 ## 前提条件
 

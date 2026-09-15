@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from src.infra.actuator_driver import ActuatorDriver, _from_signed32, _to_signed32
+from src.infra.actuator_driver import (
+    ActuatorDriver,
+    _from_signed32,
+    _to_signed32,
+    acmd_for_move,
+    min_speed_for_lead,
+)
 
 # ---------------------------------------------------------------------------
 # ヘルパー
@@ -27,13 +33,14 @@ def _make_error_result() -> MagicMock:
     return result
 
 
-def _make_driver() -> tuple[ActuatorDriver, MagicMock]:
+def _make_driver(lead_mm: float = 0.0) -> tuple[ActuatorDriver, MagicMock]:
     """ActuatorDriver とモッククライアントのペアを返す。
 
     connect() 後の状態（_client がセット済み）を再現するため、
-    _client を直接差し替えてテストに使用する。
+    _client を直接差し替えてテストに使用する。lead_mm=0 は「settings.toml に
+    リード長が未記入」＝フォールバック下限（12.5mm/s）を使う既定の状態。
     """
-    driver = ActuatorDriver(port="/dev/ttyUSB0", slave_id=1)
+    driver = ActuatorDriver(port="/dev/ttyUSB0", slave_id=1, lead_mm=lead_mm)
     mock_client = MagicMock()
     mock_client.connect = AsyncMock(return_value=True)
     mock_client.close = MagicMock()
@@ -215,11 +222,17 @@ class TestMoveToPositionTimed:
 
     @pytest.mark.asyncio
     async def test_speed_clamped_to_floor(self) -> None:
+        """最低速度（RCP6-ROD 仕様: リード長÷0.8）を下回る要求は下限へ引き上げる。
+
+        仕様に「最低速度以下の速度は設定しないでください。設定した速度では動きません」と
+        明記されており、旧実装の下限 1mm/s はどのリードでもこれを下回る仕様違反だった
+        （学習運転の微小移動指令が黙って無視され、同定データが汚染されうる）。
+        """
         driver, mock_client = _make_driver()
-        # 0.1mm を 10s → 0.01mm/s → round→0 → 下限 1mm/s → VCMD 100 = 0x0064
+        # 0.1mm を 10s → 0.01mm/s → 下限 12.5mm/s → VCMD 1250 = 0x04E2
         await driver.move_to_position_timed(target_pos=10, current_pos=0, duration_s=10.0)
         regs = mock_client.write_registers.await_args.kwargs["values"]
-        assert regs[4] == 0x0000 and regs[5] == 0x0064
+        assert regs[4] == 0x0000 and regs[5] == 0x04E2
 
     @pytest.mark.asyncio
     async def test_speed_clamped_to_ceiling(self) -> None:
@@ -378,3 +391,132 @@ class TestTransactionInstrumentation:
             await driver.read_current()
 
         assert any("axis=accel" in r.message for r in caplog.records)
+
+
+class TestAcmdForMove:
+    """移動ごとの加減速度算出（acmd_for_move）。
+
+    実機 9eee549b の全サイクル実測では、1 サイクル移動量は accel 中央値 0.082mm /
+    p95 0.215mm / max 0.630mm、brake 中央値 0.040mm / max 2.244mm。100mm/s・0.3G の
+    三角プロファイル境界 3.4mm を一度も超えない＝所要時間は VCMD ではなく ACMD だけで
+    決まり、0.3G 固定では 0.082mm が 10.6ms で終わって**50ms サイクルの 79〜85% を
+    アクチュエータが停止して過ごす**（ペダルが 20Hz の階段状に動く）。
+    """
+
+    def test_tiny_move_uses_minimum_accel(self) -> None:
+        """中央値相当の微小移動は最小近傍まで落ちる（周期いっぱいかけて動く）。"""
+        assert acmd_for_move(0.082, 0.04) <= 3
+
+    def test_large_move_keeps_default_accel(self) -> None:
+        """実測最大級の移動は従来どおり 0.3G（上限）で速く動く。"""
+        assert acmd_for_move(2.244, 0.04) == 30
+
+    def test_acmd_scales_with_distance(self) -> None:
+        """a = 4d/t² なので距離に比例する。"""
+        # 0.2mm → 5.1→5、0.8mm → 20.4→20（小さい整数域の丸め差を避けて比較する）
+        assert acmd_for_move(0.8, 0.04) == pytest.approx(
+            acmd_for_move(0.2, 0.04) * 4, rel=0.1
+        )
+
+    def test_clamped_to_spec_range(self) -> None:
+        """MODBUS 5-132 の設定範囲 1〜300 内、かつ従来の 0.3G を超えない。"""
+        for d in (0.0, 1e-6, 0.5, 5.0, 1000.0):
+            assert 1 <= acmd_for_move(d, 0.04) <= 30
+
+    def test_zero_or_negative_duration_uses_default(self) -> None:
+        assert acmd_for_move(0.5, 0.0) == 30
+        assert acmd_for_move(0.0, 0.04) == 30
+
+
+class TestMoveSmoothing:
+    """move_to_position の smooth_over_s（前回指令位置からの距離で ACMD を決める）。"""
+
+    @pytest.mark.asyncio
+    async def test_first_move_uses_default_accel(self) -> None:
+        """前回指令位置が無い初回は既定 0.3G（距離が分からないため）。"""
+        driver, mock_client = _make_driver()
+        await driver.move_to_position(1000, smooth_over_s=0.04)
+        assert mock_client.write_registers.await_args.kwargs["values"][6] == 30
+
+    @pytest.mark.asyncio
+    async def test_small_step_lowers_accel(self) -> None:
+        """2 回目以降は前回指令位置からの距離で ACMD が下がる。"""
+        driver, mock_client = _make_driver()
+        await driver.move_to_position(1000, smooth_over_s=0.04)
+        await driver.move_to_position(1008, smooth_over_s=0.04)  # 0.08mm
+        assert mock_client.write_registers.await_args.kwargs["values"][6] <= 3
+
+    @pytest.mark.asyncio
+    async def test_explicit_accel_wins(self) -> None:
+        """accel を明示したら平滑化しない（既存呼び出しの後方互換）。"""
+        driver, mock_client = _make_driver()
+        await driver.move_to_position(1000, smooth_over_s=0.04)
+        await driver.move_to_position(1008, accel=7, smooth_over_s=0.04)
+        assert mock_client.write_registers.await_args.kwargs["values"][6] == 7
+
+    @pytest.mark.asyncio
+    async def test_without_smoothing_keeps_default(self) -> None:
+        """smooth_over_s 未指定なら従来どおり 0.3G 固定。"""
+        driver, mock_client = _make_driver()
+        await driver.move_to_position(1000)
+        await driver.move_to_position(1008)
+        assert mock_client.write_registers.await_args.kwargs["values"][6] == 30
+
+    @pytest.mark.asyncio
+    async def test_absolute_positioning_flags(self) -> None:
+        """CTLF=0（絶対位置移動・台形パターン）。INC ビットを立てない。
+
+        相対移動は Modbus の応答欠落が起きたときペダル位置が恒久的にずれる。
+        絶対なら次サイクルの指令で自己回復する。
+        """
+        driver, mock_client = _make_driver()
+        await driver.move_to_position(1000)
+        regs = mock_client.write_registers.await_args.kwargs["values"]
+        assert regs[8] == 0x0000
+
+
+class TestMinSpeedForLead:
+    """RCP6-ROD 1.2.1「最低速度 = リード長 ÷ 800 ÷ 0.001秒」の実装。
+
+    実機（docs/hardware.md）は accel が RA6R リード 6mm、brake が RA7R リード 8mm。
+    """
+
+    def test_accel_lead_6mm(self) -> None:
+        assert min_speed_for_lead(6.0) == pytest.approx(7.5)
+
+    def test_brake_lead_8mm(self) -> None:
+        assert min_speed_for_lead(8.0) == pytest.approx(10.0)
+
+    def test_unset_lead_falls_back(self) -> None:
+        """リード長未記入（0）なら従来のフォールバック 12.5mm/s。"""
+        assert min_speed_for_lead(0.0) == pytest.approx(12.5)
+        assert min_speed_for_lead(-1.0) == pytest.approx(12.5)
+
+
+class TestPerAxisSpeedFloor:
+    """時間指定移動の下限速度が軸ごとのリード長から決まること。"""
+
+    @pytest.mark.asyncio
+    async def test_accel_axis_floor_is_7_5(self) -> None:
+        driver, mock_client = _make_driver(lead_mm=6.0)
+        # 0.1mm を 10s → 0.01mm/s → 下限 7.5mm/s → VCMD 750 = 0x02EE
+        await driver.move_to_position_timed(target_pos=10, current_pos=0, duration_s=10.0)
+        regs = mock_client.write_registers.await_args.kwargs["values"]
+        assert regs[4] == 0x0000 and regs[5] == 0x02EE
+
+    @pytest.mark.asyncio
+    async def test_brake_axis_floor_is_10(self) -> None:
+        driver, mock_client = _make_driver(lead_mm=8.0)
+        # 下限 10.0mm/s → VCMD 1000 = 0x03E8
+        await driver.move_to_position_timed(target_pos=10, current_pos=0, duration_s=10.0)
+        regs = mock_client.write_registers.await_args.kwargs["values"]
+        assert regs[4] == 0x0000 and regs[5] == 0x03E8
+
+    @pytest.mark.asyncio
+    async def test_lead_does_not_affect_speeds_above_floor(self) -> None:
+        """下限より速い要求はリード長に関係なくそのまま通る。"""
+        driver, mock_client = _make_driver(lead_mm=6.0)
+        # 75.0mm を 1.5s → 50mm/s → VCMD 5000 = 0x1388
+        await driver.move_to_position_timed(target_pos=7500, current_pos=0, duration_s=1.5)
+        regs = mock_client.write_registers.await_args.kwargs["values"]
+        assert regs[4] == 0x0000 and regs[5] == 0x1388

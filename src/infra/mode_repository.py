@@ -10,6 +10,11 @@ import asyncpg
 from src.infra.db import DuplicateNameError
 from src.models.driving_mode import DrivingMode, SpeedPoint
 
+# 学習サイクルが内部生成する網羅検証パターン（システムモード）の予約名。この名前の行は
+# is_system=TRUE で永続化し、ユーザー向け一覧・編集から隔離する。名前が一意制約のため、
+# ON CONFLICT (name) でサイクル毎に同一 id を保ったまま軌跡だけ更新できる。
+RESERVED_SYSTEM_MODE_NAME = "__verify_pattern__"
+
 
 def _row_to_mode(row: asyncpg.Record) -> DrivingMode:
     ref_speed_raw = json.loads(row["reference_speed"])
@@ -22,6 +27,7 @@ def _row_to_mode(row: asyncpg.Record) -> DrivingMode:
         total_duration=row["total_duration"],
         max_speed=row["max_speed"],
         created_at=row["created_at"],
+        is_system=bool(row["is_system"]),
     )
 
 
@@ -32,13 +38,24 @@ class ModeRepository:
         self._pool = pool
 
     async def list_all(self) -> list[DrivingMode]:
-        """全走行モードを作成日時降順で返す。"""
+        """ユーザー登録の走行モードを作成日時降順で返す（システムモードは除外）。
+
+        システムモード（網羅検証パターン）を含めると、WebUI 一覧・自動運転のモード選択に
+        現れ、さらに検証パターン生成（build_verification_trajectory）の入力に自己参照が
+        混入してしまう。ユーザー向け列挙は常に is_system=FALSE に限定する。
+        """
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM driving_modes ORDER BY created_at DESC")
+            rows = await conn.fetch(
+                "SELECT * FROM driving_modes WHERE is_system = FALSE ORDER BY created_at DESC"
+            )
         return [_row_to_mode(row) for row in rows]
 
     async def get_by_id(self, mode_id: str) -> DrivingMode | None:
-        """ID で走行モードを取得する。存在しない場合は None。"""
+        """ID で走行モードを取得する（システムモードも取得可）。存在しない場合は None。
+
+        システムモードもプラン学習フェーズ・ログ画面のモード名解決で参照するため、
+        list_all と異なりフィルタしない。
+        """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM driving_modes WHERE id = $1",
@@ -46,6 +63,62 @@ class ModeRepository:
             )
         if row is None:
             return None
+        return _row_to_mode(row)
+
+    async def get_system_mode(self) -> DrivingMode | None:
+        """システムモード（網羅検証パターン）を予約名で取得する（無ければ None）。
+
+        upsert_system_mode の前に呼び、軌跡が前世代から変わるかを判定する
+        （変わる場合は旧軌跡で学習した保存プランをリセットする。learning_cycle 参照）。
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM driving_modes WHERE name = $1 AND is_system = TRUE",
+                RESERVED_SYSTEM_MODE_NAME,
+            )
+        if row is None:
+            return None
+        return _row_to_mode(row)
+
+    async def upsert_system_mode(self, mode: DrivingMode) -> DrivingMode:
+        """システムモード（網羅検証パターン）を予約名で INSERT または UPDATE する。
+
+        名前を予約名 `__verify_pattern__` に固定し、ON CONFLICT (name) で既存行の id を
+        保ったまま軌跡（reference_speed / total_duration / max_speed）だけ更新する。id が
+        安定するため pedal_plans の FK（profile×mode）が世代をまたいで有効に保たれる。
+        戻り値は永続化された（＝安定 id を持つ）DrivingMode。
+        """
+        ref_speed_json = json.dumps(
+            [{"time_s": p.time_s, "speed_kmh": p.speed_kmh} for p in mode.reference_speed]
+        )
+        # INSERT 用の候補 id は常に新規採番する。build_verification_trajectory が渡す mode.id は
+        # 合成値（"verify" など非 UUID）で DB の実 id ではないため、UUID パースしてはならない。
+        # 既存行があれば ON CONFLICT (name) が既存 id を保持し RETURNING で返る（id 安定）。
+        new_id = uuid.uuid4()
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO driving_modes
+                    (id, name, description, reference_speed,
+                     total_duration, max_speed, created_at, is_system)
+                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, TRUE)
+                ON CONFLICT (name) DO UPDATE SET
+                    description = EXCLUDED.description,
+                    reference_speed = EXCLUDED.reference_speed,
+                    total_duration = EXCLUDED.total_duration,
+                    max_speed = EXCLUDED.max_speed,
+                    is_system = TRUE
+                RETURNING *
+                """,
+                new_id,
+                RESERVED_SYSTEM_MODE_NAME,
+                mode.description,
+                ref_speed_json,
+                mode.total_duration,
+                mode.max_speed,
+                mode.created_at,
+            )
+        assert row is not None  # INSERT ... RETURNING は常に 1 行返す
         return _row_to_mode(row)
 
     async def create(self, mode: DrivingMode) -> DrivingMode:

@@ -28,7 +28,12 @@ from src.domain.control.kpi_monitor import (
 from src.domain.model_training import DEFAULT_DT_S, _group_by_session
 from src.models.drive_log import DriveLog
 from src.models.driving_mode import DrivingMode, SpeedPoint
-from src.models.profile import PIDGains, VehicleProfile
+from src.models.profile import (
+    SIMC_NOMINAL_SPEED_KMH,
+    PIDGains,
+    VehicleProfile,
+    robust_kp_at,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -42,7 +47,36 @@ TAU_MAX_S: float = 30.0  # 時定数のクランプ上限
 L_MAX_S: float = 3.0  # むだ時間のクランプ上限
 MIN_SEGMENTS_FOR_ID: int = 2  # FOPDT 同定に必要な最小区間数
 
+# ── θ（むだ時間）の相互相関同定 ────────────────────────────────────────
+# 旧実装の θ は「区間開始→実車速が ONSET_RISE_KMH 上昇するまで」で測っていたが、実機 5
+# サイクルで 0.30/0.70/0.50/0.80/1.05s と 3.5 倍ばらついた。原因は 3 つ:
+#   - 分解能が dt（0.1s）刻みでしか出ない
+#   - しきい値 0.3km/h が CAN 車速の 10Hz 隣接差 std 0.22-0.25km/h と同オーダー＝
+#     ノイズ 1 サンプルで θ が 0 にも 0.3s にもなる
+#   - 区間開始が「開度が 5% を跨いだ瞬間」なので、ペダル自体の移動時間が θ に混入する
+# θ は FB ロバスト上限 Kc・プラン参照の前倒し・ILC リード Δ の 3 か所を同時に決めるため、
+# ばらつきがそのまま「毎サイクル別の制御器で学習する」状態を作っていた。
+# 代わりにアクセル開度と加速度応答の相互相関ピークで測る。プラントは積分系
+# a(t) = k'(v)·(u(t−θ) − 不感帯) なので、u と a の相互相関ピーク lag が θ そのものになる。
+# 1 サンプルのノイズではなく区間全体の波形で決まるため、しきい値依存が消える。
+THETA_XCORR_PRE_S: float = 1.5  # 区間開始より前に遡る窓 [s]（ペダル踏み込みランプを含める）
+THETA_XCORR_POST_S: float = 4.0  # 区間開始より後に取る窓 [s]
+THETA_XCORR_SMOOTH_S: float = 0.5  # 加速度を出す前の車速平滑窓 [s]（センタリング＝位相不変）
+THETA_XCORR_MIN_CORR: float = 0.3  # ピーク相関がこれ未満の区間は棄却する
+# 走行間で θ が跳ねないようにする指数移動平均の係数（新しい同定値の重み）。
+# 実機 5 サイクルのオフライン比較（scripts/compare_theta_id）では、相互相関にしても
+# サイクル間の θ 中央値は 0.21/0.47/0.43/0.51/0.60s と残った。区間内のばらつき（IQR）は
+# オンセット方式の 0.52s → 0.23s へ半減したので推定は改善しているが、サイクル間の差は
+# 両方式が同じ順序で示すため「推定ノイズではなく実際に変わっている」可能性が高い。
+# θ は Kc・プラン前倒し・ILC リードの 3 か所を同時に決めるので、変化そのものより
+# 「1 サイクルで 2〜3.5 倍動くこと」が害になる。そこで前回値との EMA で追従を保ちつつ
+# 1 サイクルあたりの変化を抑える（α=0.4 なら上記の実測列で連続サイクル比 ≤1.2 に収まる）。
+THETA_EMA_ALPHA: float = 0.4
+
 # ── SIMC / ゲインクランプ ──────────────────────────────────────────────
+# 積分系 SIMC の閉ループ時定数 τc = tau_c_factor·θ。trim.SIMC_TAU_C_FACTOR と同値に保つこと
+# （公称ゲインとロバスト上限が同じ整定則から出ないと、上限が常に張り付くか常に緩むため）。
+SIMC_INTEGRATING_TAU_C_FACTOR: float = 1.5
 KP_MIN: float = 0.0
 KP_MAX: float = 50.0
 KI_MIN: float = 0.0
@@ -83,6 +117,31 @@ def initial_preview_from_fopdt(_fopdt: FOPDT) -> float:
     return 0.0
 
 
+def smooth_theta(previous: float | None, identified: float) -> float:
+    """前回の θ と今回の同定値を指数移動平均でならした θ [s] を返す。
+
+    θ は FB ロバスト上限 Kc（`robust_kp_at`: Kc ∝ 1/θ）・プラン参照の前倒し
+    （`drive_loop.PLAN_LEAD_THETA_FACTOR`）・ILC のリード Δ（`plan_update.lead_time_from_fopdt`）
+    の 3 か所を同時に決める。実機ではサイクルごとに 0.30〜1.05s（3.5 倍）動き、その結果
+    FB 権限が毎回 2〜3.5 倍変わって「毎回違う制御器で学習している」状態になっていた
+    （docs/Problem/引き継ぎ20260909.md 4-②）。
+
+    同定を相互相関へ替えても（`_segment_theta_xcorr`）サイクル間の差は残ったため、
+    追従性は保ったまま 1 サイクルあたりの変化幅だけを抑える。初回（previous=None）は
+    同定値をそのまま使う。
+
+    Args:
+        previous: 前回プロファイルに保存されていた θ [s]。未同定なら None。
+        identified: 今回の同定値 [s]。
+
+    Returns:
+        ならした θ [s]。
+    """
+    if previous is None or previous <= 0.0:
+        return identified
+    return previous + THETA_EMA_ALPHA * (identified - previous)
+
+
 def _segment_fopdt(
     speed: np.ndarray, opening: np.ndarray, dt: float
 ) -> tuple[float, float, float] | None:
@@ -114,11 +173,20 @@ def _segment_fopdt(
         return None
 
     # むだ時間: 区間開始から車速が ONSET_RISE_KMH を超えるまで
-    onset_idx = 0
+    onset_idx = -1
     for i in range(n):
         if speed[i] - v_start >= ONSET_RISE_KMH:
             onset_idx = i
             break
+    if onset_idx < 0:
+        # 上の rise < MIN_RISE_KMH ガードにより、ここへは到達しないはず
+        # （v_steady は区間末尾の平均なので、rise≥1.0km/h なら +0.3km/h を
+        #   超えるサンプルが必ず存在する）。
+        # 明示的に捨てるのは、旧実装が onset_idx=0 の初期値をそのまま使って θ=0.0 を返す形
+        # だったため。θ=0 は robust_kp_at が None を返し（profile.py）、
+        # fast_gain_scale_cap が +inf ＝ロバスト上限なしへ silent に倒れる。
+        # 前段のガードを緩めたときにその経路が復活しないよう、不変条件をここに固定しておく。
+        return None
     theta = min(onset_idx * dt, L_MAX_S)
 
     # 時定数: 残差 r = v_steady - v の対数線形フィット（r = r0·exp(-t/τ)）
@@ -136,6 +204,68 @@ def _segment_fopdt(
     tau = max(TAU_MIN_S, min(TAU_MAX_S, tau))
 
     return k, tau, theta
+
+
+def _segment_theta_xcorr(
+    speed: np.ndarray, accel: np.ndarray, dt: float, start: int, end: int
+) -> float | None:
+    """アクセル開度と加速度応答の相互相関ピークからむだ時間 θ [s] を推定する。
+
+    プラントは積分系＋むだ時間 `a(t) = k'(v)·(u(t−θ) − 不感帯)` なので、開度 u と加速度 a の
+    相互相関が最大になる lag が θ そのものになる。区間全体の波形で決まるため、
+    `_segment_fopdt` のオンセット方式のような「しきい値 1 サンプル」依存が無い。
+
+    窓は区間開始より THETA_XCORR_PRE_S だけ手前から取る。`_find_accel_segments` は開度が
+    SEG_MIN_OPENING_PCT を跨いだ点を区間開始にするため、そのままではペダルの踏み込みランプ
+    （＝ステップ入力そのもの）が窓の外に出てしまい、相関を取る立ち上がりが残らない。
+
+    Args:
+        speed: セッション全体の実車速 [km/h]。
+        accel: セッション全体のアクセル開度 [%]。
+        dt: サンプル周期 [s]。
+        start: 区間の開始インデックス。
+        end: 区間の終了インデックス（排他）。
+
+    Returns:
+        θ [s]（0 〜 L_MAX_S）。窓が短い・相関が弱い・信号が平坦なら None。
+    """
+    if dt <= 0.0:
+        return None
+    n = len(speed)
+    lo = max(0, start - int(round(THETA_XCORR_PRE_S / dt)))
+    hi = min(n, end, start + int(round(THETA_XCORR_POST_S / dt)))
+    if hi - lo < SEG_MIN_SAMPLES:
+        return None
+
+    u = accel[lo:hi].astype(float)
+    v = speed[lo:hi].astype(float)
+    # 加速度を出す前に車速を平滑する（CAN 生値の隣接差 std 0.22-0.25km/h が微分で
+    # 増幅されるため）。センタリング窓なので位相は動かない＝θ の推定を偏らせない。
+    # 端は edge パディングする（ゼロ padding だと窓端に巨大な偽の勾配が立つ）。
+    w = max(1, int(round(THETA_XCORR_SMOOTH_S / dt)))
+    if w > 1:
+        pad_lo = w // 2
+        v = np.convolve(
+            np.pad(v, (pad_lo, w - 1 - pad_lo), mode="edge"), np.ones(w) / w, mode="valid"
+        )
+    a = np.gradient(v, dt)
+
+    best_lag: int | None = None
+    best_corr = -2.0
+    for lag in range(0, int(round(L_MAX_S / dt)) + 1):
+        uu = u[: len(u) - lag] if lag else u
+        aa = a[lag:]
+        if len(uu) < SEG_MIN_SAMPLES:
+            break
+        if float(uu.std()) <= 0.0 or float(aa.std()) <= 0.0:
+            continue
+        corr = float(np.corrcoef(uu, aa)[0, 1])
+        if corr > best_corr:
+            best_corr, best_lag = corr, lag
+
+    if best_lag is None or best_corr < THETA_XCORR_MIN_CORR:
+        return None
+    return min(best_lag * dt, L_MAX_S)
 
 
 def _find_accel_segments(
@@ -169,6 +299,7 @@ def identify_fopdt(logs: list[DriveLog], profile: VehicleProfile) -> FOPDT | Non
     ks: list[float] = []
     taus: list[float] = []
     thetas: list[float] = []
+    thetas_xcorr: list[float] = []
 
     for session_logs in _group_by_session(logs):
         if len(session_logs) < SEG_MIN_SAMPLES:
@@ -194,43 +325,90 @@ def identify_fopdt(logs: list[DriveLog], profile: VehicleProfile) -> FOPDT | Non
             ks.append(k)
             taus.append(tau)
             thetas.append(theta)
+            theta_x = _segment_theta_xcorr(speed, accel, dt, s, e)
+            if theta_x is not None:
+                thetas_xcorr.append(theta_x)
 
     if len(ks) < MIN_SEGMENTS_FOR_ID:
         _logger.info("FOPDT 同定をスキップ: 有効区間 %d < %d", len(ks), MIN_SEGMENTS_FOR_ID)
         return None
 
+    # θ は相互相関を主、オンセット方式をフォールバックにする。相互相関はしきい値 1 サンプル
+    # ではなく区間全体の波形で決まるため走行間のばらつきが小さい（THETA_XCORR_* のコメント参照）。
+    theta_onset = float(np.median(thetas))
+    if len(thetas_xcorr) >= MIN_SEGMENTS_FOR_ID:
+        theta = float(np.median(thetas_xcorr))
+        _logger.info(
+            "θ 同定: 相互相関 %.2fs (n=%d) を採用（オンセット方式は %.2fs, n=%d）",
+            theta, len(thetas_xcorr), theta_onset, len(thetas),
+        )
+    else:
+        theta = theta_onset
+        _logger.info(
+            "θ 同定: 相互相関の有効区間が %d < %d のためオンセット方式 %.2fs を採用",
+            len(thetas_xcorr), MIN_SEGMENTS_FOR_ID, theta_onset,
+        )
+
     return FOPDT(
         k=float(np.median(ks)),
         tau=float(np.median(taus)),
-        theta=float(np.median(thetas)),
+        theta=theta,
     )
 
 
 def compute_pid_gains_simc(
     fopdt: FOPDT, profile: VehicleProfile, tau_c_factor: float = 0.5
 ) -> PIDGains:
-    """FOPDT から SIMC（Skogestad）則で PI ゲインを算出する（Kd は初期 0）。
+    """プラントモデルから SIMC（Skogestad）則で PI ゲインを算出する（Kd は初期 0）。
 
-    閉ループ時定数 τc は安定性ノブ。τc = max(L, tau_c_factor·τ) とし、大きいほど
-    ロバスト（ゲイン低下）。CAN 車速の量子化ノイズに対する微分の暴れを避けるため
-    Kd は 0 とし、必要なら閉ループ絞り込みで導入する。
+    **積分系＋むだ時間**（開度→加速度が静的、車速はその積分）として整定する:
+
+        Kc = 1 / (k'·(θ + τc)),  Ti = 4·(θ + τc),  τc = SIMC_INTEGRATING_TAU_C_FACTOR·θ
+
+    k' は同定済みペダルゲイン曲線 SIMC_NOMINAL_SPEED_KMH 上の値。速度依存は
+    ランタイムの gain_scale が担う（models.profile.robust_kp_at と同じ整定則）。
+
+    ペダルゲイン曲線が未同定のときだけ、旧来の自己制御系 FOPDT 式
+    Kc=(1/k)·τ/(τc+θ) へフォールバックする（後方互換。ただし k は学習運転がプラトーに
+    達しないと保持区間長を測るだけの値になる。詳細は robust_kp_at の docstring）。
+
+    CAN 車速の量子化ノイズに対する微分の暴れを避けるため Kd は 0 とし、必要なら
+    閉ループ絞り込みで導入する。
 
     Args:
-        fopdt: 同定済みプラントモデル
-        profile: 対象プロファイル（将来のクランプ調整用に受け取る）
-        tau_c_factor: 閉ループ時定数の τ に対する比率
+        fopdt: 同定済みプラントモデル（θ を使う。k/τ はフォールバック時のみ）
+        profile: 対象プロファイル（ペダルゲイン曲線とクランプに使う）
+        tau_c_factor: フォールバック時の閉ループ時定数の τ に対する比率
     """
-    k = fopdt.k
-    tau = fopdt.tau
     theta = fopdt.theta
-    if k <= 0.0:
-        # 非物理な同定結果。安全側に既存ゲインを返す。
-        return profile.pid_gains
+    kc = 0.0
+    tau_i = 0.0
 
-    tau_c = max(theta, tau_c_factor * tau)
-    denom = tau_c + theta
-    kc = (1.0 / k) * tau / denom if denom > 0.0 else 0.0
-    tau_i = min(tau, 4.0 * denom)
+    robust = (
+        robust_kp_at(
+            profile.feedforward_params,
+            SIMC_NOMINAL_SPEED_KMH,
+            theta,
+            is_accel=True,
+            tau_c_factor=SIMC_INTEGRATING_TAU_C_FACTOR,
+        )
+        if theta > 0.0
+        else None
+    )
+    if robust is not None:
+        kc = robust
+        tau_i = 4.0 * (theta + SIMC_INTEGRATING_TAU_C_FACTOR * theta)
+    else:
+        # フォールバック: 旧・自己制御系 FOPDT 式（ペダルゲイン未同定時のみ）
+        k = fopdt.k
+        tau = fopdt.tau
+        if k <= 0.0:
+            # 非物理な同定結果。安全側に既存ゲインを返す。
+            return profile.pid_gains
+        tau_c = max(theta, tau_c_factor * tau)
+        denom = tau_c + theta
+        kc = (1.0 / k) * tau / denom if denom > 0.0 else 0.0
+        tau_i = min(tau, 4.0 * denom)
 
     kp = kc
     ki = kc / tau_i if tau_i > 0.0 else 0.0
@@ -600,7 +778,13 @@ def build_verification_trajectory(
             scaled = hold * hold_scale
             if hold >= _VERIFY_MAX_CRUISE_HOLD_S:
                 scaled = max(scaled, 10.0)  # 最高速巡航は最低 10s
-            elif hold >= _VERIFY_STOP_HOLD_S:
+            elif hold == _VERIFY_STOP_HOLD_S:
+                # 停止保持セグメントのみ最低 4s（2026-09-08 修正: 旧 `hold >=
+                # _VERIFY_STOP_HOLD_S` は _VERIFY_CRUISE_HOLD_S(7.0) >= _VERIFY_STOP_HOLD_S
+                # (6.0) のため通常の巡航保持まで誤って 4s に床上げしており、budget_s を
+                # 下げても ramp_total 分以上は圧縮できなかった（実測: 180→130 で総尺が
+                # 191.5s のまま不変）。通常の巡航保持は床なしで budget に応じて自由に
+                # 圧縮する（0 まで許容、速度域の被覆点自体は削らない）。
                 scaled = max(scaled, 4.0)  # 停止保持は最低 4s
             t += scaled
             points.append((t, target))

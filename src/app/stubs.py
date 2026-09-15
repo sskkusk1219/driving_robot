@@ -8,11 +8,12 @@ from uuid import uuid4
 
 from src.app.robot_controller import RobotController
 from src.domain.control.feedforward import FeedforwardController
-from src.domain.control.ilc import ILCTable
+from src.domain.control.pedal_plan import PedalPlan
 from src.domain.control.pid import PIDController
 from src.domain.learning_drive import LearningDriveManager
 from src.infra.db import DuplicateNameError
-from src.infra.ilc_repository import ILCRecord
+from src.infra.mode_repository import RESERVED_SYSTEM_MODE_NAME
+from src.infra.pedal_plan_repository import PedalPlanRecord
 from src.infra.ups_monitor import UPSStatus
 from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession, LearningCycle
@@ -238,7 +239,12 @@ class InMemoryModeRepository:
         self._modes: dict[str, DrivingMode] = {}
 
     async def list_all(self) -> list[DrivingMode]:
-        return sorted(self._modes.values(), key=lambda m: m.created_at, reverse=True)
+        # システムモードはユーザー向け一覧から除外（DB リポジトリと挙動を揃える）
+        return sorted(
+            (m for m in self._modes.values() if not m.is_system),
+            key=lambda m: m.created_at,
+            reverse=True,
+        )
 
     async def get_by_id(self, mode_id: str) -> DrivingMode | None:
         return self._modes.get(mode_id)
@@ -256,6 +262,31 @@ class InMemoryModeRepository:
             total_duration=mode.total_duration,
             max_speed=mode.max_speed,
             created_at=mode.created_at,
+        )
+        self._modes[mode_id] = stored
+        return stored
+
+    async def get_system_mode(self) -> DrivingMode | None:
+        return next(
+            (m for m in self._modes.values() if m.name == RESERVED_SYSTEM_MODE_NAME), None
+        )
+
+    async def upsert_system_mode(self, mode: DrivingMode) -> DrivingMode:
+        # 予約名で既存システムモードを探し、あれば id を保って軌跡だけ差し替える。新規は
+        # 常に採番する（渡される mode.id は "verify" 等の合成値で実 id ではない。DB 版と同じ）。
+        existing = next(
+            (m for m in self._modes.values() if m.name == RESERVED_SYSTEM_MODE_NAME), None
+        )
+        mode_id = existing.id if existing is not None else str(uuid4())
+        stored = DrivingMode(
+            id=mode_id,
+            name=RESERVED_SYSTEM_MODE_NAME,
+            description=mode.description,
+            reference_speed=mode.reference_speed,
+            total_duration=mode.total_duration,
+            max_speed=mode.max_speed,
+            created_at=mode.created_at,
+            is_system=True,
         )
         self._modes[mode_id] = stored
         return stored
@@ -354,30 +385,39 @@ class InMemorySessionRepository:
         return []
 
 
-class InMemoryILCRepository:
-    """DB なし環境用の in-memory ILC リポジトリ（profile×mode をキーに保持）。"""
+class InMemoryPedalPlanRepository:
+    """DB なし環境用の in-memory プラン学習リポジトリ（profile×mode をキーに保持）。"""
 
     def __init__(self) -> None:
-        self._records: dict[tuple[str, str], ILCRecord] = {}
+        self._records: dict[tuple[str, str], PedalPlanRecord] = {}
 
-    async def get(self, profile_id: str, mode_id: str) -> ILCRecord | None:
+    async def get(self, profile_id: str, mode_id: str) -> PedalPlanRecord | None:
         return self._records.get((profile_id, mode_id))
 
     async def upsert(
         self,
         profile_id: str,
         mode_id: str,
-        table: ILCTable,
-        kpi_history: list[dict[str, object]],
+        plan: PedalPlan,
+        *,
+        iteration: int,
+        best_efforts: list[float],
+        best_reward: float | None,
+        reward_history: list[dict[str, object]],
+        model_path: str | None,
     ) -> None:
         prev = self._records.get((profile_id, mode_id))
         enabled = prev.enabled if prev is not None else True
-        self._records[(profile_id, mode_id)] = ILCRecord(
+        self._records[(profile_id, mode_id)] = PedalPlanRecord(
             profile_id=profile_id,
             mode_id=mode_id,
             enabled=enabled,
-            table=table,
-            kpi_history=list(kpi_history),
+            plan=plan,
+            iteration=iteration,
+            best_efforts=list(best_efforts),
+            best_reward=best_reward,
+            reward_history=list(reward_history),
+            model_path=model_path,
             updated_at=datetime.now(tz=UTC),
         )
 
@@ -391,20 +431,18 @@ class InMemoryILCRepository:
     async def set_enabled(self, profile_id: str, mode_id: str, enabled: bool) -> None:
         prev = self._records.get((profile_id, mode_id))
         if prev is not None:
-            self._records[(profile_id, mode_id)] = ILCRecord(
-                profile_id=profile_id,
-                mode_id=mode_id,
-                enabled=enabled,
-                table=prev.table,
-                kpi_history=prev.kpi_history,
-                updated_at=datetime.now(tz=UTC),
-            )
+            prev.enabled = enabled
+            prev.updated_at = datetime.now(tz=UTC)
         else:
-            self._records[(profile_id, mode_id)] = ILCRecord(
+            self._records[(profile_id, mode_id)] = PedalPlanRecord(
                 profile_id=profile_id,
                 mode_id=mode_id,
                 enabled=enabled,
-                table=ILCTable(),
-                kpi_history=[],
+                plan=PedalPlan(),
+                iteration=0,
+                best_efforts=[],
+                best_reward=None,
+                reward_history=[],
+                model_path=None,
                 updated_at=datetime.now(tz=UTC),
             )

@@ -44,3 +44,6 @@ Thumbs.db
 # Claude Code / Playwright ツールの実行時アーティファクト
 .claude/plans/
 .playwright-mcp/
+
+# tests/research の解析出力（png/csv/pkl、容量大・再生成可能）
+tests/research/results/

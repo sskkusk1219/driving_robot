@@ -202,4 +202,9 @@ def _row_to_log(row: asyncpg.Record) -> DriveLog:
         brake_pos=row["brake_pos"],
         accel_current=row["accel_current"],
         brake_current=row["brake_current"],
+        # 新列（プラン学習 effort 内訳）は後方互換に取り出す（旧クエリ結果に列が無くても None）。
+        plan_effort_pct=row.get("plan_effort_pct"),
+        trim_effort_pct=row.get("trim_effort_pct"),
+        applied_effort_pct=row.get("applied_effort_pct"),
+        phase=row.get("phase"),
     )

@@ -31,7 +31,9 @@ BRAKE_HOLD_OPENINGS_PCT: tuple[float, ...] = (1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30
 # BRAKE_HOLD で cap まで上げる加速開度（ガバナで 0.98×上限G に収束。確実に cap へ届く高開度）
 BRAKE_HOLD_ACCEL_PCT: float = 70.0
 
-COAST_DOWN_COUNT: int = 3  # 専用コーストダウン本数（速度全域の減速カーブ計測）
+# 専用コーストダウン本数（速度全域の減速カーブ計測）。cap→5km/h を完走する（coast_timeout_s=90）
+# ため 1 本 40〜85s かかる。惰行減速カーブ同定には 2 本で十分なため 3→2 に減らし時間を相殺。
+COAST_DOWN_COUNT: int = 2
 COAST_DOWN_ACCEL_PCT: float = 70.0  # コーストダウンの加速アクセル開度（cap まで上げる標準値）
 
 # 高速巡航トリム（CRUISE_TRIM）: cap まで加速後にアクセルを微小開度へ落として保持し、

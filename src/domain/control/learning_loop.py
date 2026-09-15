@@ -97,9 +97,12 @@ class LearningLoopConfig:
     # と同じ「中庸＝過G にならず素早く停車」の考え方）。
     overspeed_recovery_brake_pct: float = field(default=30.0)
     # コースト（惰行）: COAST_DOWN が coast_down_stop_speed_kmh まで惰行（速度全域の減速カーブ）。
-    # timeout でも前進する（予算上限）。
+    # timeout でも前進する（予算上限）。旧値 6s は cap(≈131km/h) から数 km/h しか惰行できず
+    # 低速域（<70km/h）の惰行減速データが皆無になり、惰行減速カーブ同定・フェーズ分類を
+    # 壊していた（sample_004 実機で p95=4.05 の主因）。131→5km/h の完走（減速 1.5〜3km/h/s で
+    # 40〜85s）を賄う値にする。
     coast_down_stop_speed_kmh: float = field(default=5.0)
-    coast_timeout_s: float = field(default=6.0)
+    coast_timeout_s: float = field(default=90.0)
     # クリープ安定待ち（accel=brake=0）: 車速が安定する＝|実測加速度| が tol 未満を
     # stable_duration 継続したら確定。最低 min_s は待ってから判定し、timeout で打ち切る。
     # クリープが出ず 0km/h のままでも「安定（|加速度|≈0）」として min_s 後に次へ進む。
