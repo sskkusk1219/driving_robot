@@ -95,6 +95,8 @@ class RunContext:
     limit_s: float | None = None
     # モード走行の準備（走行モードと FF モデル）。走行前チェックより前に読み込む
     mode_setup: ModeDriveSetup | None = None
+    # 設定検証を済ませたか。手順0 を含まない実行でも run_steps の冒頭で 1 回だけ行う
+    config_validated: bool = False
 
     @property
     def is_real_hw(self) -> bool:
@@ -126,6 +128,26 @@ class Step:
 # ─────────────────────────────────────────────────────────────────────
 
 
+def validate_config_once(ctx: RunContext) -> None:
+    """設定を検証する（1 回だけ）。問題があれば ConfigError を送出する。
+
+    手順0 を通らない実行（--only 2 / --only 3 など）でも設定検証が素通りしないよう、
+    run_steps の冒頭で必ず呼ぶ。手順0 からも呼ばれるため、二重表示を防ぐために
+    ctx.config_validated で 1 回だけに制限する。
+    """
+    if ctx.config_validated:
+        return
+    cfg = ctx.config
+    problems = validate_config(cfg)
+    if problems:
+        say(f"設定の検証で {len(problems)} 件の問題が見つかりました:")
+        for problem in problems:
+            say(f"  ✗ {problem}")
+        raise ConfigError("設定ファイルを修正してから再実行してください")
+    say("設定の検証: OK（値域・相互整合）")
+    ctx.config_validated = True
+
+
 async def step0_setup(ctx: RunContext) -> None:
     """テスト用車両プロファイルを読み込み、値域を検証して要約を表示する。
 
@@ -134,13 +156,7 @@ async def step0_setup(ctx: RunContext) -> None:
     cfg = ctx.config
     say(f"設定ファイル: {cfg.source_path}")
 
-    problems = validate_config(cfg)
-    if problems:
-        say(f"設定の検証で {len(problems)} 件の問題が見つかりました:")
-        for problem in problems:
-            say(f"  ✗ {problem}")
-        raise ConfigError("設定ファイルを修正してから再実行してください")
-    say("設定の検証: OK（値域・相互整合）")
+    validate_config_once(ctx)
 
     for label, directory in (
         ("結果", cfg.results_path),
@@ -182,6 +198,9 @@ def _print_summary(cfg: ResearchConfig) -> None:
         ("ペダル探索",
          f"{ps.step_mm:g}mm 刻み・待ち {ps.dwell_s:g}s・判定 ±{ps.onset_margin_kmh:g} km/h × "
          f"{ps.confirm_count}・停車保持 +{ps.stop_hold_margin_pct:g}%"),
+        ("クリープ安定判定",
+         f"{ps.creep_window_s:g}s 平均の傾き < {ps.creep_settle_kmhs:g} km/h/s・"
+         f"最短 {ps.creep_settle_min_s:g}s・最大 {ps.creep_timeout_s:g}s"),
         ("走行後の緩減速",
          f"目標 {cfg.decel_stop.target_decel_g:g}G（踏み増し < "
          f"{cfg.decel_stop.target_decel_g - cfg.decel_stop.press_margin_g:g}G・戻し > "
@@ -585,6 +604,14 @@ async def run_steps(ctx: RunContext, steps: list[Step]) -> int:
     """手順を順に実行する。終了時は成否にかかわらず必ず HW を片付ける。"""
     exit_code = 0
     try:
+        try:
+            # 手順0 を含まない実行（--only 2 / --only 3 など）でも、手順を 1 つも動かす前に
+            # 設定検証を通す。ループ内の except ConfigError では拾えない位置のため個別に囲む
+            validate_config_once(ctx)
+        except ConfigError as exc:
+            say(f"設定エラー: {exc}")
+            exit_code = 2
+            return exit_code
         for step in steps:
             try:
                 # 手順 1（初期化）→ [準備] → 走行前チェック → 走行する手順

@@ -29,7 +29,8 @@ FAST = {
     "pedal_search.step_mm": 1.0,
     "pedal_search.dwell_s": 0.3,
     "pedal_search.onset_margin_kmh": 0.05,  # スタブは車速ノイズが無い
-    "pedal_search.creep_stable_kmh": 0.05,
+    "pedal_search.creep_settle_kmhs": 0.017,
+    "pedal_search.creep_settle_min_s": 0.0,  # 実時間で待たない（FAST の趣旨）
     "pedal_search.creep_timeout_s": 10.0,
     "pedal_search.stop_hold_margin_pct": 3.0,
     "feedforward.creep_rate_kmhs": 3.0,

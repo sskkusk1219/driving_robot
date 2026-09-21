@@ -247,6 +247,7 @@ class PedalStats:
     accel_max_pct: float
     brake_max_moving_pct: float
     switches: int  # アクセル ⇔ ブレーキの切り替え回数
+    coast_s: float  # 惰行（どちらのペダルも使わなかった）時間
     governor_s: float
     brake_ineffective_s: float  # 不感帯以上のブレーキ指令なのに惰行カーブ相当しか効いていない時間
 
@@ -297,6 +298,7 @@ def pedal_stats(
         accel_max_pct=max((r.accel_pct for r in accel_rows), default=0.0),
         brake_max_moving_pct=max((r.brake_pct for r in brake_moving), default=0.0),
         switches=switches,
+        coast_s=sum(dt for r in rows if r.phase == "COAST"),
         governor_s=sum(dt for r in rows if r.phase == "BRAKE_GOV"),
         brake_ineffective_s=_brake_ineffective_s(rows, params, brake_db, dt),
     )
@@ -712,6 +714,7 @@ def write_mode_report(
                 ("アクセル開度の最大", f"{pedal.accel_max_pct:.1f}%"),
                 ("走行中のブレーキ開度の最大", f"{pedal.brake_max_moving_pct:.1f}%"),
                 ("アクセル ⇔ ブレーキの切り替え", f"{pedal.switches} 回"),
+                ("惰行（どちらのペダルも使わなかった時間）", f"{pedal.coast_s:.1f}s"),
                 ("減速G ガバナー作動", f"{pedal.governor_s:.1f}s"),
                 ("ブレーキ寄与ほぼ0（指令はあるが惰行カーブ相当しか効いていない）",
                  f"{pedal.brake_ineffective_s:.1f}s"),

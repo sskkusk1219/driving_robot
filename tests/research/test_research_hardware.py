@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.domain.pre_check import HOME_POSITION_TOLERANCE_PULSE, UPS_MIN_BATTERY_PCT
+from src.infra.actuator_driver import acmd_for_move
 from tests.research import config as cfgmod
 from tests.research import hardware as hwmod
 from tests.research import main as mainmod
@@ -372,3 +373,101 @@ async def test_research_driver_remembers_last_command() -> None:
     await driver.move_to_position_timed(900, 1500, 0.1)  # 本番は move_to_position に委ねる
     assert driver.last_command_pos == 900
     assert client.write_registers.await_count == 2
+
+
+# ── 段2a: 0A7「指令減速度異常」対策 ─────────────────────────────────────
+# 移動中に前回とほぼ同じ位置を再指令すると、ACMD が「前回指令との差」だけで決まる
+# 従来ロジックでは下限（1 = 0.01G）に落ちてアラームになる（ProblemReport_20260916）。
+# ResearchActuatorDriver は残距離（実位置→目標）との大きい方で ACMD を決め直す。
+
+
+async def _read_monitor_into(
+    driver: ResearchActuatorDriver, client: MagicMock, registers: list[int]
+) -> None:
+    """read_monitor() を 1 回呼んで driver._last_monitor を更新する。"""
+    result = MagicMock()
+    result.isError.return_value = False
+    result.registers = registers
+    client.read_holding_registers.return_value = result
+    await driver.read_monitor()
+
+
+def _last_written_accel(client: MagicMock) -> int:
+    return client.write_registers.await_args.kwargs["values"][6]
+
+
+def _pct_to_pulse(pct: float) -> int:
+    """開度[%] → pulse（100% = 9500 pulse、実ログの換算に合わせる）。"""
+    return round(pct / 100.0 * 9500)
+
+
+async def test_research_driver_acmd_unchanged_when_axis_at_rest() -> None:
+    """静止時（pos_done かつ非 moving）は従来どおり前回指令との差で ACMD が決まる。"""
+    driver, client = _research_driver()
+    driver.last_command_pos = 1000
+    await _read_monitor_into(
+        driver, client, _monitor_registers(pos=1000, current=0, dss1=DSS1_PEND)
+    )
+
+    await driver.move_to_position(1010, smooth_over_s=0.04)  # 微小移動 0.10mm
+
+    assert _last_written_accel(client) == acmd_for_move(0.10, 0.04)
+
+
+async def test_research_driver_acmd_uses_remaining_distance_when_moving() -> None:
+    """移動中に前回指令とほぼ同じ位置を再指令しても ACMD は下限 1 に落ちない（30 になる）。"""
+    driver, client = _research_driver()
+    driver.last_command_pos = 1000
+    # moving=1・pos_done=0、実位置は目標（1001 付近）の約 9mm 手前
+    await _read_monitor_into(
+        driver, client, _monitor_registers(pos=100, current=25, dsse=DSSE_MOVE)
+    )
+
+    await driver.move_to_position(1001, smooth_over_s=0.04)  # 前回指令との差はわずか 0.01mm
+
+    assert _last_written_accel(client) == 30
+
+
+async def test_research_driver_acmd_uses_last_command_when_monitor_unread() -> None:
+    """read_monitor() を一度も呼んでいなければ従来どおり前回指令との差で決まる。"""
+    driver, client = _research_driver()
+    driver.last_command_pos = 1000
+    assert driver._last_monitor is None
+
+    await driver.move_to_position(1010, smooth_over_s=0.04)
+
+    assert _last_written_accel(client) == acmd_for_move(0.10, 0.04)
+
+
+async def test_research_driver_acmd_explicit_value_passes_through() -> None:
+    """呼び出し側が accel= を明示したら残距離計算を経由せずそのまま送られる。"""
+    driver, client = _research_driver()
+    driver.last_command_pos = 1000
+    await _read_monitor_into(
+        driver, client, _monitor_registers(pos=100, current=25, dsse=DSSE_MOVE)
+    )
+
+    await driver.move_to_position(1001, accel=15, smooth_over_s=0.04)
+
+    assert _last_written_accel(client) == 15
+
+
+async def test_research_driver_acmd_reproduces_real_log_case() -> None:
+    """実ログ再現: 28.420%→17.099% の移動中に 17.101% を再指令しても ACMD は 1 にならない。
+
+    drive_log_real_20260918_041125.csv mode_time 136.60→136.65s。従来ロジックでは
+    前回指令(17.099%)との差が 0.002% しかないため ACMD が下限 1 に落ち、0A7 アラームに
+    至った場面。
+    """
+    driver, client = _research_driver()
+    driver.last_command_pos = _pct_to_pulse(17.099)
+    # このモニタは 136.65s 時点の実位置（26.589%）で、まだ目標まで動いている途中
+    await _read_monitor_into(
+        driver,
+        client,
+        _monitor_registers(pos=_pct_to_pulse(26.589), current=25, dsse=DSSE_MOVE),
+    )
+
+    await driver.move_to_position(_pct_to_pulse(17.101), smooth_over_s=0.04)
+
+    assert _last_written_accel(client) != 1

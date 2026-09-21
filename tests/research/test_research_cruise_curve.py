@@ -333,10 +333,10 @@ def test_main_returns_zero_and_prints_table(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # 既定 config の cruise_hold_settle_s=3.0・hold_s=8.0 に余裕を持たせ、
-    # 最初の 2 車速（30・40 km/h）が確実に保持完了するだけの行数を用意する
+    # 既定 config の先頭 2 段（10・20 km/h）が確実に保持完了するだけの行数を用意する
     rows: list[dict[str, str]] = []
     t = 0.0
-    for speed in (30.0, 40.0):
+    for speed in (10.0, 20.0):
         for _ in range(121):  # 0.1s 刻みで 12.1s 分（settle 3.0 + hold 8.0 = 11.0s に余裕）
             rows.append(_row(round(t, 1), speed, opening=speed / 2.0))
             t = round(t + 0.1, 1)

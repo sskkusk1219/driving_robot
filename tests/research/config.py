@@ -20,6 +20,8 @@ from typing import Any
 
 import yaml
 
+from src.domain.model_training import COAST_CURVE_BIN_KMH
+
 # 既定の設定ファイル（リポジトリに同梱。--config で別パスを指定すると
 # ここからコピーして作られる）
 DEFAULT_CONFIG_PATH = Path("tests/research/config_testVehicle.yaml")
@@ -60,6 +62,25 @@ class FeedforwardSection:
     engine_brake_decel_kmhs: float = 1.6
     coast_decel_speeds_kmh: list[float] = field(default_factory=list)
     coast_decel_kmhs: list[float] = field(default_factory=list)
+    # クリープ加速カーブ（0〜creep_speed_kmh の速度依存クリープ加速度。ProblemReport_20260916
+    # 課題#2）。ResearchFFParams 側で保持し、FeedforwardParams には持たせない（本番コード不変更）
+    creep_accel_speeds_kmh: list[float] = field(default_factory=list)
+    creep_accel_kmhs: list[float] = field(default_factory=list)
+    # 惰行とみなす要求加速度の帯（半幅）[km/h/s]。段2（惰行レジーム判定）で使う。段1は未参照
+    coast_band_kmhs: float = 0.0
+    # 段3 到達可能性判定（ProblemReport_20260916 課題#1・#3）に使う先読みホライズン [s]。
+    # 空リスト＝段3 無効（従来の regime_horizon 1 点だけの判定）。モデルの
+    # lookahead_horizons_s の部分集合であること（mode_drive.load_feedforward が検査する）
+    reach_horizons_s: list[float] = field(default_factory=list)
+    reach_step_s: float = 0.05  # v_free(t+h) の数値積分の刻み [s]
+    # 段4改訂 クリープ域ブレーキの下限（ProblemReport_20260916）: クリープ域でブレーキを保持して
+    # 実際に停車できた最小の「不感帯からの超過」[%]。手順2 で自動保存。0.0＝未同定
+    stop_brake_floor_offset_pct: float = 0.0
+    # この速度以下でブレーキの下限を効かせる [km/h]。0.0 で無効（人が決める値・自動保存の対象外）
+    brake_trim_max_kmh: float = 0.0
+    # 先読み車速（最短ホライズン=0.5s 先の基準）がこの値以下のときだけ下限を掛ける [km/h]
+    # （人が決める値・自動保存の対象外）
+    brake_trim_ref_kmh: float = 0.3
     pedal_gain_speeds_kmh: list[float] = field(default_factory=list)
     accel_gain_kmhs_per_pct: list[float] = field(default_factory=list)
     brake_gain_kmhs_per_pct: list[float] = field(default_factory=list)
@@ -159,8 +180,9 @@ class TuningSection:
 @dataclass
 class LearningSection:
     # A3・A4 で約 1020s の見積り。900s は記録だけ（本番へ移すときに削る）。2026-09-14 定速階段
-    # （段2）を足すとスタブで 1200s に収まらないことを実測したため 1400s に引き上げた
-    timeout_s: float = 1400.0
+    # （段2）を足すとスタブで 1200s に収まらないことを実測したため 1400s に引き上げた。
+    # 2026-09-19 低開度階段（段3-1）を足すと約 165s 追加になるため 1700s に引き上げた
+    timeout_s: float = 1700.0
     coast_timeout_s: float = 90.0
     # ペダルの固定開度 = 2-0 で測った不感帯 + offset [%]（本番の絶対開度は原点から測ると遊びの中）
     accel_deadband_probe_offsets_pct: list[float] = field(
@@ -206,20 +228,83 @@ class LearningSection:
     # ペダルゲイン推定に使うサンプル: 開度 ≥ 不感帯 + この値 [%]（本番は 5%）
     accel_gain_min_offset_pct: float = 0.5
     brake_gain_min_offset_pct: float = 0.5
+    # 2026-09-17 クリープ発進・低速ブレーキ保持（段1。ProblemReport_20260916 課題#2）:
+    # 定速階段の後、パターン列の末尾に足す（手順3のモード走行と同じ暖機状態でクリープを測るため）
+    creep_launch_count: int = 3  # クリープ発進パターンの本数（両ペダル解放で自走）
+    # 2026-09-17 段1b: 終了条件を「target_kmh 到達」から「平衡到達（加速が止まる）」に変更
+    # （ProblemReport_20260916 ユーザー決定）。target_kmh は安全上限として残し、既定を
+    # 4.5 → 15.0 に上げる（真のクリープ平衡 4.97 km/h 付近では終わらせず、途中で頭打ちに
+    # ならないようにするため）。timeout_s も平衡到達に十分な時間を見て 20.0 → 30.0 に上げる
+    creep_launch_target_kmh: float = 15.0  # 安全上限。これに達したら平衡を待たず打ち切る
+    # 2026-09-17（誤判定修正）: クリープ平衡への収束は漸近的で、pedal_search.creep_timeout_s が
+    # 90s を見ていることから 30s では足りない恐れがある（ユーザーが時間が伸びてよいと明言）。
+    # 30.0 → 60.0 に延長
+    creep_launch_timeout_s: float = 60.0  # 打ち切り [s]
+    creep_launch_settle_kmhs: float = 0.1  # 平衡到達とみなす車速の傾きのしきい値 [km/h/s]
+    creep_launch_settle_s: float = 2.0  # 傾きがしきい値を連続で下回り続けたら終了する時間 [s]
+    # 2026-09-17（誤判定修正）: 停車保持解放直後は車速0・傾き0で誤って平衡到達と判定していた
+    # （実機では解放から動き出しまで約0.3〜0.4s、その間の傾きは0.17km/h/s程度でしきい値0.1に
+    # 近く確実に誤判定する）。車速がこの値以上になるまで安定カウントを積まない
+    # （pedal_search.creep_min_speed_kmh と同じ考え方）
+    creep_launch_min_speed_kmh: float = 1.0  # クリープ発進の平衡判定を始める車速のしきい値 [km/h]
+    # elapsed がこの値以上になるまで平衡到達で終了しない（creep_settle_min_s と同じ流儀の
+    # 最短時間ガード）
+    creep_launch_settle_min_s: float = 5.0  # 平衡到達の最短経過時間 [s]
+    # クリープ車速からブレーキ「不感帯 + offset」で停車まで保持（低速ブレーキゲイン用）
+    creep_brake_hold_offsets_pct: list[float] = field(
+        default_factory=lambda: [0.5, 1.5, 3.0, 5.0]
+    )
+    # 2026-09-19 低開度階段（段3-1。ProblemReport_20260919 候補(c)）: 停車から不感帯 + offset を
+    # 1 段ずつ一定保持し、その開度固有の平衡車速へ収束させる。低速 × 低開度の学習行が
+    # 5.4 秒しか無かったことへの対策（空リストなら足さない）
+    low_open_stair_offsets_pct: list[float] = field(
+        default_factory=lambda: [0.5, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0]
+    )
+    low_open_stair_descend: bool = True   # 折り返して下りも測る（踏み方向の交絡を対にして測る）
+    low_open_stair_step_s: float = 8.0    # 1 段あたりの保持時間 [s]
+    low_open_stair_start_kmh: float = 4.5  # DRIVE_ACCEL をここで終える（クリープ平衡 4.77 の下）
+    low_open_stair_min_speed_kmh: float = 2.0  # これ以下に落ちたら停車復帰する
+    creep_curve_bin_kmh: float = 1.0  # クリープ加速カーブのビン幅 [km/h]
+    creep_curve_min_bin_samples: int = 5  # 採用する最小サンプル数/ビン
+    # 2026-09-18 段2.5（低速の惰行カーブを実測に合わせる。ProblemReport_20260916）: 惰行減速
+    # カーブの低速端（creep_speed_kmh〜coast_curve_low_max_kmh）を細ビンで同定し直す
+    # （本番の COAST_CURVE_BIN_KMH=10.0 幅だと 5〜10km/h が 1 ビンに潰れていた）
+    coast_curve_low_bin_kmh: float = 1.0  # 低速側のビン幅 [km/h]
+    coast_curve_low_max_kmh: float = 15.0  # ここまで細ビン。以上は本番と同じ 10 km/h 幅
+    coast_curve_low_min_bin_samples: int = 5  # 低速ビンの最少サンプル数
+    # 段4改訂 クリープ域ブレーキの下限（estimate_stop_brake_floor が使う）
+    stop_brake_floor_start_tol_kmh: float = 1.5  # 保持プラトー先頭車速の許容窓（±）[km/h]
+    stop_brake_floor_min_float_s: float = 5.0  # これ以上続けば「浮いた」とみなす最短時間 [s]
+    stop_brake_floor_opening_tol_pct: float = 0.3  # 候補開度への一致とみなす許容誤差 [%]
 
 
 @dataclass
 class PedalSearchSection:
-    step_mm: float = 0.5
-    dwell_s: float = 1.0
-    onset_margin_kmh: float = 0.3
+    step_mm: float = 0.5  # 停車保持への刻み送り専用（search_step_pulse）。不感帯探索には使わない
+    dwell_s: float = 1.0  # 反応判定に使う車速サンプルの待ち時間 [s]（傾きの算出窓もこの長さ）
+    onset_margin_kmh: float = 0.3  # ブレーキの「減速中は踏み増さない」判定・停止確認の余白 [km/h]
     confirm_count: int = 2
-    creep_stable_kmh: float = 0.2
+    # 2026-09-20: クリープ安定判定を「窓平均の変化量」から「窓平均の傾き＋最短時間」へ。
+    # 変化量は窓幅を変えると意味が変わるうえ、漸近的に近づく量に対しては収束前に必ず成立して
+    # しまう（実測で真の平衡 5.00 に対し 4.88 で確定していた）
+    creep_window_s: float = 3.0        # クリープ安定判定に使う平均車速の窓 [s]
+    creep_settle_kmhs: float = 0.033   # 窓平均の傾きのしきい値 [km/h/s]（旧 0.1km/h ÷ 3s と等価）
+    creep_settle_min_s: float = 10.0   # これだけ経つまで確定しない [s]
     creep_min_speed_kmh: float = 1.0
     creep_timeout_s: float = 90.0
     accel_max_pct: float = 20.0
-    brake_max_pct: float = 50.0
+    brake_max_pct: float = 50.0  # 停止確認まで踏み続ける上限（不感帯検出の上限は deadband_max_pct）
     stop_hold_margin_pct: float = 10.0
+    # 2026-09-17 段1b（ProblemReport_20260916）: 反応判定を「平均車速が基準を超えたか」から
+    # 「車速の傾き」に変える。基準車速との比較をやめるので、クリープのドリフト（実測で踏み込み中
+    # でも−0.4 km/h/sのドリフトが起きていた）を反応と誤検出しなくなる
+    onset_accel_kmhs: float = 0.2  # この傾き[km/h/s]以上（ブレーキは以下の符号反転）で「反応」
+    # 不感帯探索専用の1刻み。停車保持への刻み送り（step_mm）と分離し、探索だけ細かくできるように
+    # する（停車保持まで遅くしないため）。位置指令は0.01mm単位（PCON-CBのPCMD）なので
+    # 0.01mm = 1 pulse が機械的な下限
+    search_step_mm: float = 0.1
+    # 不感帯検出専用の探索上限。brake_max_pct（停止確認まで踏み続ける上限）とは兼用しない
+    deadband_max_pct: float = 20.0
 
 
 @dataclass
@@ -459,14 +544,56 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         ("stop_brake_opening_pct", ff.stop_brake_opening_pct),
     ):
         need(0.0 <= opening <= 100.0, f"feedforward.{label} が範囲外(0<=pct<=100): {opening}")
+    # 段2.5（ProblemReport_20260916）: coast_decel_kmhs の先頭・creep_accel_kmhs の末尾は
+    # クリープ平衡点（creep_speed_kmh。その速度でペダルを離すと加減速しない＝free_accel_at=0
+    # の定義値）を意図的に 0.0 で持つ（coast_curve.estimate_coast_decel_curve /
+    # creep_curve.estimate_creep_accel_curve が同じ値を置くことで free_accel_at を構造として
+    # 連続にする）。この端点だけ「正値で持つ規約」の例外として 0.0 を許す
     problems += _validate_curve(
-        "feedforward.coast_decel", ff.coast_decel_speeds_kmh, {"": ff.coast_decel_kmhs}
+        "feedforward.coast_decel", ff.coast_decel_speeds_kmh, {"": ff.coast_decel_kmhs},
+        allow_zero_at="first",
+    )
+    problems += _validate_curve(
+        "feedforward.creep_accel", ff.creep_accel_speeds_kmh, {"": ff.creep_accel_kmhs},
+        allow_zero_at="last",
+    )
+    need(
+        0.0 <= ff.coast_band_kmhs < 5.0,
+        f"feedforward.coast_band_kmhs が範囲外(0<=帯<5.0): {ff.coast_band_kmhs}",
+    )
+    # 段3（到達可能性判定）: ホライズンは正値・昇順（狭義単調増加）。空リストは段3 無効として合格
+    need(
+        all(h > 0.0 for h in ff.reach_horizons_s),
+        f"feedforward.reach_horizons_s に 0 以下の値があります: {ff.reach_horizons_s}",
+    )
+    need(
+        ff.reach_horizons_s == sorted(set(ff.reach_horizons_s)),
+        f"feedforward.reach_horizons_s は昇順（狭義単調増加）である必要があります: "
+        f"{ff.reach_horizons_s}",
+    )
+    need(
+        0.0 < ff.reach_step_s <= 0.5,
+        f"feedforward.reach_step_s が範囲外(0<刻み<=0.5): {ff.reach_step_s}",
     )
     problems += _validate_curve(
         "feedforward.pedal_gain",
         ff.pedal_gain_speeds_kmh,
         {"accel_gain_kmhs_per_pct": ff.accel_gain_kmhs_per_pct,
          "brake_gain_kmhs_per_pct": ff.brake_gain_kmhs_per_pct},
+    )
+    # 段4改訂 クリープ域ブレーキの下限（ProblemReport_20260916）
+    need(
+        0.0 <= ff.stop_brake_floor_offset_pct < 20.0,
+        f"feedforward.stop_brake_floor_offset_pct が範囲外(0<=pct<20.0): "
+        f"{ff.stop_brake_floor_offset_pct}",
+    )
+    need(
+        0.0 <= ff.brake_trim_max_kmh < 20.0,
+        f"feedforward.brake_trim_max_kmh が範囲外(0<=km/h<20.0): {ff.brake_trim_max_kmh}",
+    )
+    need(
+        0.0 < ff.brake_trim_ref_kmh <= 2.0,
+        f"feedforward.brake_trim_ref_kmh が範囲外(0<km/h<=2.0): {ff.brake_trim_ref_kmh}",
     )
 
     p = cfg.pid
@@ -544,6 +671,7 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     for label, offsets in (
         ("accel_sweep_add_offsets_pct", lr.accel_sweep_add_offsets_pct),
         ("brake_hold_low_offsets_pct", lr.brake_hold_low_offsets_pct),
+        ("low_open_stair_offsets_pct", lr.low_open_stair_offsets_pct),
     ):
         need(
             all(0.0 < p <= 100.0 for p in offsets)
@@ -614,12 +742,75 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     ):
         need(offset > 0.0, f"learning.{label} は正値: {offset}")
 
+    need(
+        lr.creep_launch_count >= 0,
+        f"learning.creep_launch_count は 0 以上: {lr.creep_launch_count}",
+    )
+    need(
+        0.0 < lr.creep_launch_target_kmh < cfg.vehicle.max_speed_kmh,
+        f"learning.creep_launch_target_kmh は 0 より大きく vehicle.max_speed_kmh 未満: "
+        f"{lr.creep_launch_target_kmh}",
+    )
+    need(lr.creep_launch_timeout_s > 0.0, "learning.creep_launch_timeout_s は正値")
+    need(lr.creep_launch_settle_kmhs > 0.0, "learning.creep_launch_settle_kmhs は正値")
+    need(lr.creep_launch_settle_s > 0.0, "learning.creep_launch_settle_s は正値")
+    need(
+        0.0 <= lr.creep_launch_min_speed_kmh < lr.creep_launch_target_kmh,
+        f"learning.creep_launch_min_speed_kmh は 0 以上 creep_launch_target_kmh 未満: "
+        f"{lr.creep_launch_min_speed_kmh}",
+    )
+    need(lr.creep_launch_settle_min_s >= 0.0, "learning.creep_launch_settle_min_s は 0 以上")
+    need(
+        all(0.0 < p <= 100.0 for p in lr.creep_brake_hold_offsets_pct)
+        and all(a < b for a, b in zip(
+            lr.creep_brake_hold_offsets_pct, lr.creep_brake_hold_offsets_pct[1:], strict=False
+        )),
+        f"learning.creep_brake_hold_offsets_pct は 0<pct<=100 の昇順リスト（空は可）: "
+        f"{lr.creep_brake_hold_offsets_pct}",
+    )
+    need(lr.low_open_stair_step_s > 0.0, "learning.low_open_stair_step_s は正値")
+    need(
+        0.0 < lr.low_open_stair_start_kmh < cfg.vehicle.max_speed_kmh,
+        f"learning.low_open_stair_start_kmh は 0 より大きく vehicle.max_speed_kmh 未満: "
+        f"{lr.low_open_stair_start_kmh}",
+    )
+    need(
+        0.0 <= lr.low_open_stair_min_speed_kmh < lr.low_open_stair_start_kmh,
+        f"learning.low_open_stair_min_speed_kmh は 0 以上 low_open_stair_start_kmh 未満: "
+        f"{lr.low_open_stair_min_speed_kmh}",
+    )
+    need(lr.creep_curve_bin_kmh > 0.0, "learning.creep_curve_bin_kmh は正値")
+    need(
+        lr.creep_curve_min_bin_samples >= 1,
+        f"learning.creep_curve_min_bin_samples は 1 以上: {lr.creep_curve_min_bin_samples}",
+    )
+    need(lr.coast_curve_low_bin_kmh > 0.0, "learning.coast_curve_low_bin_kmh は正値")
+    need(
+        lr.coast_curve_low_max_kmh >= COAST_CURVE_BIN_KMH,
+        f"learning.coast_curve_low_max_kmh は COAST_CURVE_BIN_KMH（{COAST_CURVE_BIN_KMH}）以上: "
+        f"{lr.coast_curve_low_max_kmh}",
+    )
+    need(
+        lr.coast_curve_low_min_bin_samples >= 1,
+        f"learning.coast_curve_low_min_bin_samples は 1 以上: {lr.coast_curve_low_min_bin_samples}",
+    )
+    need(
+        lr.stop_brake_floor_start_tol_kmh > 0.0, "learning.stop_brake_floor_start_tol_kmh は正値"
+    )
+    need(lr.stop_brake_floor_min_float_s > 0.0, "learning.stop_brake_floor_min_float_s は正値")
+    need(
+        lr.stop_brake_floor_opening_tol_pct > 0.0,
+        "learning.stop_brake_floor_opening_tol_pct は正値",
+    )
+
     ps = cfg.pedal_search
     need(0.0 < ps.step_mm <= 5.0, f"pedal_search.step_mm が範囲外(0<mm<=5): {ps.step_mm}")
     need(ps.dwell_s > 0.0, "pedal_search.dwell_s は正値")
     need(ps.onset_margin_kmh > 0.0, "pedal_search.onset_margin_kmh は正値")
     need(ps.confirm_count >= 1, "pedal_search.confirm_count は 1 以上")
-    need(ps.creep_stable_kmh > 0.0, "pedal_search.creep_stable_kmh は正値")
+    need(ps.creep_window_s > 0.0, "pedal_search.creep_window_s は正値")
+    need(ps.creep_settle_kmhs > 0.0, "pedal_search.creep_settle_kmhs は正値")
+    need(ps.creep_settle_min_s >= 0.0, "pedal_search.creep_settle_min_s は 0 以上")
     need(ps.creep_min_speed_kmh >= 0.0, "pedal_search.creep_min_speed_kmh は 0 以上")
     need(ps.creep_timeout_s > 0.0, "pedal_search.creep_timeout_s は正値")
     need(
@@ -631,6 +822,17 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         f"pedal_search.brake_max_pct({ps.brake_max_pct}) は 0 超・ブレーキ開度上限以下",
     )
     need(ps.stop_hold_margin_pct >= 0.0, "pedal_search.stop_hold_margin_pct は 0 以上")
+    need(ps.onset_accel_kmhs > 0.0, "pedal_search.onset_accel_kmhs は正値")
+    # 0.01mm = 1 pulse（PCON-CBの位置指令単位）が機械的な下限
+    need(
+        0.01 <= ps.search_step_mm <= 5.0,
+        f"pedal_search.search_step_mm が範囲外(0.01<=mm<=5): {ps.search_step_mm}",
+    )
+    need(
+        0.0 < ps.deadband_max_pct <= min(ps.accel_max_pct, ps.brake_max_pct),
+        f"pedal_search.deadband_max_pct({ps.deadband_max_pct}) は 0 超・"
+        f"accel_max_pct/brake_max_pct の小さい方以下",
+    )
 
     ds = cfg.decel_stop
     need(
@@ -683,9 +885,20 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
 
 
 def _validate_curve(
-    label: str, speeds: list[float], values: dict[str, list[float]]
+    label: str,
+    speeds: list[float],
+    values: dict[str, list[float]],
+    *,
+    allow_zero_at: str | None = None,
 ) -> list[str]:
-    """速度グリッドと値列の長さ・単調性を検証する。空（未同定）は合格。"""
+    """速度グリッドと値列の長さ・単調性を検証する。空（未同定）は合格。
+
+    値は正値で持つ規約だが、`allow_zero_at`（"first" または "last"）を指定すると、その
+    端点だけ厳密に 0.0 のときに限り例外として許す（負値はどの位置でも不正のまま）。
+    段2.5（ProblemReport_20260916）: coast_decel_kmhs の先頭・creep_accel_kmhs の末尾は
+    クリープ平衡点（free_accel_at=0 の定義値）として意図的に 0.0 を置くための例外
+    （呼び出し側のコメント参照）。それ以外の値列（pedal_gain 等）には渡さない。
+    """
     problems: list[str] = []
     if not speeds and not any(values.values()):
         return problems
@@ -697,8 +910,16 @@ def _validate_curve(
             problems.append(
                 f"{label}{suffix} の点数({len(vals)}) が速度グリッド({len(speeds)}) と不一致"
             )
-        if any(v <= 0.0 for v in vals):
-            problems.append(f"{label}{suffix} に 0 以下の値があります（正値で持つ規約）")
+        checked = list(vals)
+        if allow_zero_at == "first" and checked and checked[0] == 0.0:
+            checked = checked[1:]  # 先頭の平衡点（厳密に 0.0）だけ検査から除く
+        elif allow_zero_at == "last" and checked and checked[-1] == 0.0:
+            checked = checked[:-1]  # 末尾の平衡点（厳密に 0.0）だけ検査から除く
+        if any(v <= 0.0 for v in checked):
+            note = "（正値で持つ規約。端点の 0.0 は平衡点として例外）" if allow_zero_at else (
+                "（正値で持つ規約）"
+            )
+            problems.append(f"{label}{suffix} に 0 以下の値があります{note}")
     return problems
 
 

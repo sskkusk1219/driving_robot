@@ -18,6 +18,9 @@
 | `pedal_search.py` | ペダル探索（手順 2-0。不感帯と停車保持開度を車速応答で測る） |
 | `pattern_drive.py` | パターン走行 → 2次多項式 FF モデル作成（手順 2。本番から引用） |
 | `pedal_gain.py` | ペダルゲイン推定（手順 2-2。本番の計算で、使うサンプルのしきい値だけ「不感帯 + α%」に変える） |
+| `coast_curve.py` | 惰行減速カーブの低速端の再同定（段2.5。低速だけ細ビンにする） |
+| `creep_curve.py` | クリープ加速カーブの推定（段1） |
+| `relearn.py` | 既存の走行 CSV からモデル・カーブだけを作り直すオフライン入口（実機不要。`--dry-run` で差分確認のみ） |
 | `stop_decel.py` | 走行後の緩減速 → 停車保持（手順 2 のパターン走行の後。一方向に刻んで踏む） |
 | `mode_drive.py` | モード走行（手順 3。走行モード管理の WLTP を FF だけで 50ms 周期で走る） |
 | `mode_report.py` | モード走行のレポート（`reportYYYYMMDD_RunFF.md` ＋ 図）。CSV から作り直せる |
@@ -166,7 +169,7 @@
 
 | # | 段 | 判定 |
 |---|---|---|
-| 1 | クリープ安定待ち | 走行前チェックのブレーキを離し、両ペダル原点で、3s 平均の変化 < `creep_stable_kmh` かつ `creep_min_speed_kmh` 以上 → 基準車速 |
+| 1 | クリープ安定待ち | 走行前チェックのブレーキを離し、両ペダル原点で、`creep_window_s` 平均の傾き < `creep_settle_kmhs` かつ `creep_min_speed_kmh` 以上・`creep_settle_min_s` 経過後 → 基準車速 |
 | 2 | アクセル探索 | 基準 + `onset_margin_kmh` を `confirm_count` 刻み連続で超えた最初の位置 = アクセル不感帯 → 原点へ戻して 1 をやり直す |
 | 3 | ブレーキ探索 | 基準 − margin を連続で割った最初の位置 = ブレーキ不感帯。効き始めた後は車速が下がっている間は踏み増さず、0.02 km/h 未満になった位置 = 停止確認開度 |
 | 4 | 停車保持 | 停止確認開度 + `stop_hold_margin_pct`（10%）まで刻んで踏み、保持 = `stop_brake_opening_pct` |
@@ -265,6 +268,17 @@
 - 保存は停車保持の後（モデル作成の前）。異常終了でも、原点復帰の後にそこまでのログを保存する。
 - 2-2 のモデル作成は `section = PATTERN_DRIVE` の行だけを読む（`section` 列の無い旧 `pattern_drive_*.csv` は全行）。
 
+## 既存ログからの再学習（`relearn.py`）
+
+実機を走らせ直さずに、既存の走行 CSV（手順2 の `results/drive_log_real_*.csv`）からモデル・
+物理定数（惰行カーブ等）だけを作り直せる（段2.5。実機を走り直すと不感帯・クリープ速度も
+同時に変わってしまい 1 変数比較にならないため）。
+
+```bash
+.venv/bin/python -m tests.research.relearn tests/research/results/drive_log_real_XXXXXXXX.csv --dry-run  # 差分確認のみ
+.venv/bin/python -m tests.research.relearn tests/research/results/drive_log_real_XXXXXXXX.csv            # config_testVehicle.yaml へ保存
+```
+
 ## 設定の書き戻しについて
 
 手順 2/4/6/8 は同定・適合したパラメータを `config_testVehicle.yaml` へ書き戻すが、
@@ -276,3 +290,7 @@
 ```bash
 .venv/bin/python -m pytest tests/research -q
 ```
+
+`config_testVehicle.yaml` はユーザーが実機に合わせて書き換えるファイルなので、テストはその値を
+決め打ちしない。スタブ車両の物理に依存するテストは `dataclasses.replace` で固定値を明示する
+（`test_research_pedal_gain.py` の `_params()` 参照）。

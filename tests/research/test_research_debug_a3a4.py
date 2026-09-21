@@ -31,7 +31,9 @@ def test_a3a4_patterns_follow_config_order() -> None:
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     added = mod.a3a4_patterns(cfg)
     assert added.hard_holds == ("30:BRAKE_HOLD", "31:BRAKE_HOLD", "32:BRAKE_HOLD", "33:BRAKE_HOLD")
-    assert added.stairs == ("39:CRUISE_TRIM", "40:CRUISE_TRIM", "41:CRUISE_TRIM")
+    # 43 は低開度階段 LowOpenStairPattern。TrimStairPattern の派生なので a3a4_patterns の
+    # stairs に入るが、A3 のトリム階段（39〜41）とは別物（不感帯 +0.5〜+4.0% を停車から刻む）
+    assert added.stairs == ("39:CRUISE_TRIM", "40:CRUISE_TRIM", "41:CRUISE_TRIM", "43:CRUISE_TRIM")
     db = cfg.feedforward.accel_deadband_pct
     assert added.stair_steps_pct == pytest.approx((db + 8.0, db + 5.0, db + 2.0))
 

@@ -52,6 +52,7 @@ from tests.research.drive_log import (
     SessionLog,
 )
 from tests.research.ff_candidate import CandidateFeedforward, make_candidate
+from tests.research.ff_params import research_ff_params
 from tests.research.hardware import ActuatorProtocol, DriveError, ResearchHardware
 from tests.research.pattern_drive import _overcurrent_limit_ma, _release_pedals
 from tests.research.stop_decel import PHASE_APPROACH, PHASE_STOP_HOLD, decelerate_to_stop
@@ -132,10 +133,19 @@ def load_feedforward(cfg: ResearchConfig) -> CandidateFeedforward:
         )
     ff = make_candidate(ff_cfg.candidate)  # V1 案スイッチ（C1〜C6。既定 C1）
     ff.set_params(feedforward_params(cfg))
+    ff.set_research_params(research_ff_params(cfg))
     try:
         ff.load_model(ff_cfg.model_path)
     except (OSError, ValueError) as exc:
         raise ConfigError(f"FF モデルを読み込めません: {ff_cfg.model_path}（{exc}）") from exc
+    # 段3: reach_horizons_s はモデルの先読みホライズンの部分集合でなければならない
+    # （predict_effort が future_speeds の添字を引くため）。走行前に落とす
+    missing = [h for h in ff_cfg.reach_horizons_s if h not in ff.horizons]
+    if missing:
+        raise ConfigError(
+            f"feedforward.reach_horizons_s の {missing} はモデルの先読みホライズン "
+            f"{list(ff.horizons)} に含まれていません"
+        )
     return ff
 
 
@@ -402,14 +412,22 @@ class _ModeRun:
         C1〜C3 は今まで通り基準車速だけ。C4 は動作点だけ実車速にし、先読み・過去の変化量は
         基準車速のまま（偏差そのものは入れない）。C5 は過去を実測履歴、先読みを基準の絶対値にする
         （`dv = ref(t+h) − v_実測(t)` が自然に出る。KAIZEN 報告書 3 章 結論 8〜10）。
+        ただし基準が停車レジームのときは C4・C5 も基準車速だけを返す（下記参照）。
         """
         ff = self.ff
-        if not ff.uses_actual_speed:
-            future = [self.ref.at(t + h) for h in ff.horizons]
+        future = [self.ref.at(t + h) for h in ff.horizons]
+        # 停車判定は候補によらず基準車速で行う（C1 に倣う）。v0 を実測にする C4・C5 は
+        # 実車速が VEHICLE_STOP_SPEED_KMH を下回らない限り停車保持に入らないため
+        # （A8 報告 5 章 #2）。判定の形は predict_effort の停車レジーム（ff_candidate.py）と
+        # 同じく最短ホライズンのみ（3 秒先まで見ると発進の 3 秒前に保持ブレーキが解除され、
+        # クリープで動き出す。src/domain/control/feedforward.py:211-223 のレビュー指摘 #5）。
+        ref_is_stopped = (
+            ref <= VEHICLE_STOP_SPEED_KMH and future and future[0] <= VEHICLE_STOP_SPEED_KMH
+        )
+        if not ff.uses_actual_speed or ref_is_stopped:
             past = [self.ref.at(t - h) for h in ff.past_horizons]
             return ref, future, past
         if ff.candidate == "C5":
-            future = [self.ref.at(t + h) for h in ff.horizons]
             past = [self.actual_history.at(t - h) for h in ff.past_horizons]
         else:  # C4
             future = [speed + (self.ref.at(t + h) - ref) for h in ff.horizons]

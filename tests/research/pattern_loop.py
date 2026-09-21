@@ -77,6 +77,33 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
     - `_move_duration` は CRUISE_HOLD も DRIVE_ACCEL と同じ短い一手（pedal_step_time_s）にし、
       実開度が指令に追従できるようにする。G ガバナー（`_update_governor`）は CRUISE_HOLD に
       適用しない（緩い PI・レート制限そのものが穏やかなので、ガバナーによる頭打ちは不要と判断）。
+
+2026-09-17 クリープ発進・クリープ域ブレーキ保持（段1。ProblemReport_20260916 課題#2）で足したところ:
+    背景（docs/Problem/ProblemReport_20260916.md）: 本番のクリープ加速率 creep_rate_kmhs=0.19 が
+    実測クリープ加速（中央値 2.39 km/h/s）と 12 倍ずれていた。原因は「ペダルオフ・低速・加速中」の
+    全サンプルの中央値を取る既存推定（手順2がクリープ安定まで待つため母集団が定常側に偏る）。
+    - `CreepLaunchPattern`（kind は CREEP_SETTLE を流用）を追加: 専用フェーズ `_Phase.CREEP_LAUNCH`
+      で両ペダル 0%（完全解放）を指令し、`target_kmh` 到達または `timeout_s` の打ち切りまでクリープ
+      のみで自走させる（`_advance_creep_launch`）。到達後は `hold_after` で分岐:
+      False（クリープ発進）は通常の停車復帰（`_finish_pattern` → `_Phase.DRIVE_BRAKE`）、
+      True（クリープ域ブレーキ保持）は `brake_opening`（不感帯 + offset）を保持する
+      既存の `_Phase.BRAKE_HOLD` へ直接入る。
+    - `_move_duration` は変更しない（CREEP_LAUNCH は COAST と同じく既定の pedal_release_time_s）。
+      G ガバナー（`_update_governor`）も適用しない（両ペダル 0% で開度指令が無いため不要）。
+
+2026-09-19 低開度階段（段3-1。ProblemReport_20260919 候補(c)）で足したところ:
+    背景（docs/Problem/ProblemReport_20260919.md 6章）: 手順2 に「不感帯の直上を細かく刻んで
+    一定保持する」パターンが 1 本も無く、5〜24 km/h × 不感帯 +0〜2% の学習行が 5.4 秒しか
+    無かった（既存の ACCEL_DEADBAND_PROBE は無ランプ・昇順で停車に戻らずつながっており、
+    開度と車速が一体で動くため定常判定をほとんど通らない）。
+    - `LowOpenStairPattern`（`TrimStairPattern` を継承。kind は CRUISE_TRIM のまま）を追加:
+      停車から `accel_target_kmh`（= 1 段目と同じ開度で終える低い車速）まで加速し、
+      `trim_steps_pct` を `step_hold_s` ずつ一定保持して、その開度固有の平衡車速へ収束させる。
+      `TrimStairPattern` の機構（`_command_openings` の CRUISE_TRIM 分岐・
+      `_phase_after_accel`・`_finish_pattern` 等）をそのまま使うが、低速域が運転域の
+      真ん中に来るため、低速終了の判定だけ `min_speed_kmh`（既定 2.0）に差し替える
+      （`_advance_trim_stair`。トリム階段の `coast_down_stop_speed_kmh`=5.0 のままだと
+      1 段目で即終了してしまう）。
 """
 
 from __future__ import annotations
@@ -159,6 +186,40 @@ class CruiseStairPattern(LearningPattern):
     initial_offset_pct: float = 7.0
 
 
+@dataclass(frozen=True)
+class LowOpenStairPattern(TrimStairPattern):
+    """低開度階段（段3-1）: 不感帯の直上を細かく刻み、1 段ずつ一定保持して平衡車速へ収束させる。
+
+    kind は CRUISE_TRIM（TrimStairPattern と同じ。CSV の pattern/phase 列の形式を変えない）。
+    トリム階段との違いは運転域だけ: トリム階段が 50〜120 km/h から開度を下げていくのに対し、
+    こちらは停車から始めて 5〜23 km/h を上り下りする。そのため `_advance_trim_stair` の
+    低速終了判定（coast_down_stop_speed_kmh = 5.0 km/h）が運転域の真ん中に来てしまい、
+    1 段目で即終了する。この 1 点だけをパターン側の `min_speed_kmh` で差し替える。
+    """
+
+    min_speed_kmh: float = 2.0
+
+
+@dataclass(frozen=True)
+class CreepLaunchPattern(LearningPattern):
+    """クリープ発進・クリープ域ブレーキ保持（段1。ProblemReport_20260916 課題#2。研究側の追加）。
+
+    両ペダル 0%（完全解放）でクリープ自走し、専用フェーズ `_Phase.CREEP_LAUNCH` で `target_kmh`
+    到達または `timeout_s` の打ち切りを待つ。到達後の扱いは `hold_after`:
+      - False（クリープ発進）: 通常の停車復帰（`_Phase.DRIVE_BRAKE`、停車保持開度）。
+      - True（クリープ域ブレーキ保持）: `brake_opening`（不感帯 + offset。呼び出し側で
+        max_brake_opening にクランプ済み）を保持して停車させる（既存の `_Phase.BRAKE_HOLD`）。
+
+    kind は CREEP_SETTLE を流用する（両ペダル解放でクリープを測る、という意味は共通）。CSV の
+    pattern 列表示にのみ影響し、`_advance` の CREEP_SETTLE 専用分岐は `_Phase.MEASURE` でしか
+    見ない（本パターンの初期フェーズは CREEP_LAUNCH）ため衝突しない。
+    """
+
+    target_kmh: float = 0.0
+    timeout_s: float = 20.0
+    hold_after: bool = False
+
+
 def _accel_target_kmh(pattern: LearningPattern) -> float | None:
     """加速を終える目標車速。None なら cap − 先読み。"""
     if isinstance(pattern, SpeedTargetPattern | TrimStairPattern):
@@ -176,6 +237,7 @@ class _Phase(Enum):
     BRAKE_HOLD = auto()
     CRUISE_TRIM = auto()
     CRUISE_HOLD = auto()  # 定速階段（段2）。CRUISE_TRIM とは別フェーズにして CSV で見分ける
+    CREEP_LAUNCH = auto()  # クリープ発進・クリープ域ブレーキ保持（段1）。両ペダル 0% で自走
     DONE = auto()
 
 
@@ -210,6 +272,18 @@ class PatternLoopConfig:
     creep_settle_stable_tol_kmhs: float = field(default=0.3)
     creep_settle_stable_duration_s: float = field(default=2.0)
     creep_settle_timeout_s: float = field(default=25.0)
+    # クリープ発進（段1b。CreepLaunchPattern）の平衡到達判定。learning.creep_launch_settle_* から
+    # pattern_drive.py が渡す（既定値はここと config.py の LearningSection とで揃えている）
+    creep_launch_settle_kmhs: float = field(default=0.1)
+    creep_launch_settle_s: float = field(default=2.0)
+    # 2026-09-17（誤判定修正）: 停車保持解放直後は車速0・傾き0で
+    # abs(accel_kmhs) < creep_launch_settle_kmhs が最初から成立してしまい、車が動き出す前に
+    # 「平衡到達」と誤判定していた。車速がこの値以上になるまで安定カウントを積まない
+    # （本質的なガード）。learning.creep_launch_min_speed_kmh から渡す
+    creep_launch_min_speed_kmh: float = field(default=1.0)
+    # elapsed がこの値以上になるまで平衡到達で終了しない（_advance_creep_settle の
+    # creep_settle_min_s と同じ流儀の最短時間ガード）。learning.creep_launch_settle_min_s から渡す
+    creep_launch_settle_min_s: float = field(default=5.0)
 
 
 class ActuatorDriverProtocol(Protocol):
@@ -467,6 +541,8 @@ class PatternLoop:
     def _initial_phase(self, idx: int) -> _Phase:
         if idx >= len(self._patterns):
             return _Phase.DONE
+        if isinstance(self._patterns[idx], CreepLaunchPattern):
+            return _Phase.CREEP_LAUNCH
         if self._patterns[idx].kind in (
             PatternKind.ACCEL_SWEEP,
             PatternKind.BRAKE_HOLD,
@@ -489,6 +565,8 @@ class PatternLoop:
             return clamp_opening(ramped, self._profile.max_accel_opening), 0.0
         if self._phase is _Phase.COAST:
             return 0.0, 0.0
+        if self._phase is _Phase.CREEP_LAUNCH:
+            return 0.0, 0.0  # 両ペダル完全解放（クリープのみで自走）
         if self._phase is _Phase.CRUISE_TRIM:
             opening = pattern.trim_opening
             if isinstance(pattern, TrimStairPattern):
@@ -531,6 +609,9 @@ class PatternLoop:
             return
         if self._phase is _Phase.COAST:
             self._advance_coast(speed, elapsed, now)
+            return
+        if self._phase is _Phase.CREEP_LAUNCH:
+            self._advance_creep_launch(pattern, speed, accel_kmhs, elapsed, now)
             return
         if self._phase is _Phase.DRIVE_BRAKE:
             if speed <= STOP_SPEED_KMH:
@@ -604,6 +685,48 @@ class PatternLoop:
         if speed <= cfg.coast_down_stop_speed_kmh or elapsed >= cfg.coast_timeout_s:
             self._finish_pattern(speed, now)
 
+    def _advance_creep_launch(
+        self, pattern: LearningPattern, speed: float, accel_kmhs: float, elapsed: float, now: float
+    ) -> None:
+        """クリープ発進・クリープ域ブレーキ保持（段1b）の前進判定。
+
+        2026-09-17（ProblemReport_20260916 ユーザー決定）: 終了条件を「target_kmh 到達」から
+        「平衡到達（加速が止まった）」に変えた。車速の傾きが creep_launch_settle_kmhs 未満の
+        状態が creep_launch_settle_s 続いたら平衡到達とみなす（_advance_creep_settle と同じ
+        流儀）。target_kmh は安全上限として残す（クリープでこれ以上の車速にはならないはずなので、
+        達したら平衡を待たず打ち切る）。timeout_s は従来どおりの打ち切り。
+
+        2026-09-17（誤判定修正）: 停車保持を解放した直後は車速 0・傾き 0 で
+        abs(accel_kmhs) < creep_launch_settle_kmhs が最初から成立してしまい、車が動き出す前に
+        「平衡到達」と誤判定して即終了していた（実機では解放から動き出しまで約 0.3〜0.4s、その
+        間の傾きは 0.17 km/h/s 程度でしきい値 0.1 に近く、確実に誤判定する）。
+        _advance_creep_settle の settled 判定（creep_settle_min_s による最短時間ガード）に
+        揃えて、2 つのガードを足す:
+          - 車速ゲート: speed が creep_launch_min_speed_kmh 以上になるまで安定カウントを
+            積まない（動き出す前を「平衡」に含めない、本質的なガード）。
+          - 最短時間ガード: elapsed が creep_launch_settle_min_s 以上になるまで終了しない。
+        到達後は hold_after=True なら BRAKE_HOLD（brake_opening を保持して停車）、
+        False なら通常の停車復帰（_finish_pattern）へ進む。
+        """
+        assert isinstance(pattern, CreepLaunchPattern)
+        cfg = self._config
+        if speed > self._profile.max_speed:
+            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
+            return
+        moving = speed >= cfg.creep_launch_min_speed_kmh
+        if moving and abs(accel_kmhs) < cfg.creep_launch_settle_kmhs:
+            self._stable_count += 1
+        else:
+            self._stable_count = 0
+        stable_long = self._stable_count * self._interval_s >= cfg.creep_launch_settle_s
+        settled = elapsed >= cfg.creep_launch_settle_min_s and stable_long
+        if settled or speed >= pattern.target_kmh or elapsed >= pattern.timeout_s:
+            self._stable_count = 0
+            if pattern.hold_after:
+                self._enter_phase(_Phase.BRAKE_HOLD, now)
+            else:
+                self._finish_pattern(speed, now)
+
     def _advance_cruise_trim(self, speed: float, elapsed: float, now: float) -> None:
         cfg = self._config
         if speed > self._profile.max_speed:
@@ -620,8 +743,18 @@ class PatternLoop:
             self._finish_pattern(speed, now)
 
     def _advance_trim_stair(self, pattern: TrimStairPattern, speed: float, now: float) -> None:
-        """最高速超えの判定は呼び出し元（_advance_cruise_trim）が済ませている。"""
-        if speed <= self._config.coast_down_stop_speed_kmh:
+        """最高速超えの判定は呼び出し元（_advance_cruise_trim）が済ませている。
+
+        低速終了の判定値は `LowOpenStairPattern` だけ `min_speed_kmh` に差し替える
+        （運転域が低速に来るため、トリム階段の coast_down_stop_speed_kmh=5.0 のままだと
+        1 段目で即終了してしまう。クラスの docstring 参照）。
+        """
+        floor = (
+            pattern.min_speed_kmh
+            if isinstance(pattern, LowOpenStairPattern)
+            else self._config.coast_down_stop_speed_kmh
+        )
+        if speed <= floor:
             self._finish_pattern(speed, now)
             return
         last = self._trim_step >= len(pattern.trim_steps_pct) - 1
@@ -892,7 +1025,9 @@ __all__ = [
     "CANReaderProtocol",
     "OnSample",
     "PatternLoop",
+    "CreepLaunchPattern",
     "CruiseStairPattern",
+    "LowOpenStairPattern",
     "SpeedTargetPattern",
     "TrimStairPattern",
     "PatternLoopConfig",

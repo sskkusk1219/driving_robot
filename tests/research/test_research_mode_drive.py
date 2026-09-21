@@ -12,14 +12,17 @@ import random
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from src.domain.control.conversions import G_TO_KMHS
 from src.domain.control.kpi_monitor import KPIMonitor
 from src.models.drive_log import DriveLogData
 from src.models.driving_mode import DrivingMode, SpeedPoint
+from src.models.profile import FeedforwardParams
 from tests.research import config as cfgmod
 from tests.research import drive_log as dlmod
+from tests.research import ff_candidate
 from tests.research import hardware as hwmod
 from tests.research import kpi as kpimod
 from tests.research import main as mainmod
@@ -164,6 +167,58 @@ def test_load_feedforward_requires_trained_model(tmp_path: Path) -> None:
         mdmod.load_feedforward(cfg)
 
 
+def test_load_feedforward_passes_coast_band_to_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """段2: `load_feedforward` が config の `coast_band_kmhs` を候補へ渡すこと。"""
+    cfg = _tmp_cfg(tmp_path)
+    cfg.feedforward.coast_band_kmhs = 0.5
+    cfg.feedforward.model_path = str(tmp_path / "dummy.pkl")
+    (tmp_path / "dummy.pkl").write_bytes(b"")  # is_model_trained は存在チェックのみ
+
+    calls: dict[str, object] = {}
+
+    class _FakeFF(ff_candidate.CandidateFeedforward):
+        def set_research_params(self, research: object) -> None:
+            calls["research"] = research
+            super().set_research_params(research)  # type: ignore[arg-type]
+
+        def load_model(self, model_path: str) -> None:
+            calls["model_path"] = model_path  # 実ファイルは読まない（このテストの関心外）
+
+    monkeypatch.setattr(mdmod, "make_candidate", lambda name: _FakeFF())  # noqa: ARG005
+
+    ff = mdmod.load_feedforward(cfg)
+
+    assert calls["model_path"] == cfg.feedforward.model_path
+    assert calls["research"].coast_band_kmhs == pytest.approx(0.5)  # type: ignore[attr-defined]
+    assert ff._research.coast_band_kmhs == pytest.approx(0.5)  # noqa: SLF001
+
+
+def test_load_feedforward_rejects_reach_horizon_not_in_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """段3: `reach_horizons_s` にモデルの先読みホライズンに無い値があれば ConfigError。
+
+    `_FakeFF.load_model` は実ファイルを読まないため `ff.horizons` は既定の
+    `DEFAULT_FEATURE_SPEC.lookahead_horizons_s`（0.5, 1.0, 2.0, 3.0）のまま。5.0 はそこに
+    無いので弾かれる。
+    """
+    cfg = _tmp_cfg(tmp_path)
+    cfg.feedforward.reach_horizons_s = [0.5, 5.0]
+    cfg.feedforward.model_path = str(tmp_path / "dummy.pkl")
+    (tmp_path / "dummy.pkl").write_bytes(b"")
+
+    class _FakeFF(ff_candidate.CandidateFeedforward):
+        def load_model(self, model_path: str) -> None:
+            pass  # 実ファイルは読まない（このテストの関心外）
+
+    monkeypatch.setattr(mdmod, "make_candidate", lambda name: _FakeFF())  # noqa: ARG005
+
+    with pytest.raises(cfgmod.ConfigError, match="reach_horizons_s"):
+        mdmod.load_feedforward(cfg)
+
+
 # ── KPI ───────────────────────────────────────────────────────────────
 
 
@@ -224,7 +279,7 @@ async def test_run_mode_drive_records_rows_and_ends_in_stop_hold(tmp_path: Path)
     assert result.cycles >= 70  # 50ms 周期で 4s
     assert ff.calls == result.cycles
     rows = mrmod.rows_from_samples(result.samples)
-    assert 35 <= len(rows) <= 41  # 100ms ごと
+    assert 75 <= len(rows) <= 85  # 50ms ごと（段1b: csv_interval_s 0.1→0.05）
     assert rows[0].t_s == pytest.approx(0.0, abs=0.06)
     assert rows[0].brake_pct == HOLD_PCT and rows[0].accel_pct == 0.0  # 停車中は保持ブレーキ
     assert any(r.accel_pct == 30.0 for r in rows)  # 加速中はアクセル
@@ -716,6 +771,19 @@ class _FakeC5:
     past_horizons = (0.5,)
 
 
+class _ConstModel:
+    """与えた定数を返すだけの推定器（predict_effort の停車レジーム分岐だけを見るため）。
+
+    tests/research/test_research_ff_candidate.py の `_Const` と同じ役割。
+    """
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        return np.full(len(x), self.value, dtype=float)
+
+
 def _bare_mode_run(ff: object) -> mdmod._ModeRun:  # noqa: SLF001 - 単体テストで直接組み立てる
     mode = _mode([(0.0, 0.0), (10.0, 100.0)])
     run = object.__new__(mdmod._ModeRun)
@@ -755,3 +823,54 @@ def test_ff_inputs_c5_uses_absolute_reference_future_and_actual_past() -> None:
     assert future == [run.ref.at(t + h) for h in _FakeC5.horizons]  # 基準の絶対値
     assert past == [run.actual_history.at(t - h) for h in _FakeC5.past_horizons]  # 実測履歴
     assert past[0] == pytest.approx(33.0)
+
+
+def _bare_mode_run_for(ff: object, mode: DrivingMode) -> mdmod._ModeRun:  # noqa: SLF001
+    """`_bare_mode_run` の mode 差し替え版（停車区間を持つモードで確認したいテスト用）。"""
+    run = object.__new__(mdmod._ModeRun)
+    run.ff = ff  # type: ignore[attr-defined]
+    run.ref = mdmod.ReferenceSpeed(mode)
+    run.actual_history = mdmod.ActualSpeedHistory(max(ff.past_horizons, default=1.0) + 0.5)  # type: ignore[attr-defined]
+    return run
+
+
+def test_ff_inputs_stop_regime_forces_reference_speed_for_c4_and_c5() -> None:
+    """基準が停車レジームなら C4・C5 も基準車速ベースの入力になる（A8 報告 5 章 #2）。
+
+    停車指示中（t=0〜10s は基準 0 km/h）でも実車速がクリープ等で動いていることがある
+    （ここでは speed=3.0）。v0 を実車速にする C4・C5 は「実車速が 0.02 km/h を下回る」
+    条件が現実には成立せず停車保持に入れないため、基準車速が停車レジームのときは
+    uses_actual_speed に関係なく C1 と同じ入力（基準車速そのもの）を返す。
+    """
+    stopped_mode = _mode([(0.0, 0.0), (10.0, 0.0), (20.0, 100.0)])
+    t, speed = 5.0, 3.0
+    ref = mdmod.ReferenceSpeed(stopped_mode).at(t)
+    assert ref == 0.0  # 前提: t=5 は停車区間の途中
+
+    for ff_cls in (_FakeCandidate, _FakeC4, _FakeC5):
+        run = _bare_mode_run_for(ff_cls(), stopped_mode)
+        v0, future, past = run._ff_inputs(t, ref, speed)  # noqa: SLF001
+        assert v0 == 0.0, ff_cls.candidate
+        assert future == [run.ref.at(t + h) for h in ff_cls.horizons], ff_cls.candidate
+        assert future[0] == 0.0, ff_cls.candidate
+        assert past == [run.ref.at(t - h) for h in ff_cls.past_horizons], ff_cls.candidate
+
+
+def test_ff_inputs_stop_regime_feeds_into_stop_brake_hold() -> None:
+    """停車レジームの入力を実際に predict_effort へ渡すと停車保持ブレーキが出る（結合確認）。
+
+    _ff_inputs だけでなく CandidateFeedforward.predict_effort まで通して、A8 報告 5 章 #2 の
+    症状（停車指示中に実車速が動いていて停車保持に入らない）が解消したことを確認する。
+    """
+    stopped_mode = _mode([(0.0, 0.0), (10.0, 0.0), (20.0, 100.0)])
+    ff = ff_candidate.CandidateFeedforward()
+    ff.set_params(FeedforwardParams(stop_brake_opening_pct=HOLD_PCT))
+    ff._accel_model = _ConstModel(20.0)  # noqa: SLF001 - テスト用の差し込み
+    ff._brake_model = _ConstModel(20.0)  # noqa: SLF001
+
+    run = _bare_mode_run_for(ff, stopped_mode)
+    t, speed = 5.0, 3.0  # 停車指示中だが実車速はクリープ等で動いている
+    ref = run.ref.at(t)
+    v0, future, past = run._ff_inputs(t, ref, speed)  # noqa: SLF001
+
+    assert ff.predict_effort(v0, future, past) == pytest.approx(-HOLD_PCT)

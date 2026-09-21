@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import copy
 import pickle
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,7 +29,9 @@ from tests.research import main as mainmod
 from tests.research import pattern_drive as pdmod
 from tests.research.live_plot import PlotSample, save_drive_figure
 from tests.research.pattern_loop import (
+    CreepLaunchPattern,
     CruiseStairPattern,
+    LowOpenStairPattern,
     PatternLoopConfig,
     SpeedTargetPattern,
     TrimStairPattern,
@@ -99,7 +103,19 @@ def _synthetic_samples(cfg: cfgmod.ResearchConfig) -> list[dlmod.DriveSample]:
     """スタブ車両モデルを時間指定で回した、加速・制動・惰行を含む 0.1s 刻みのログ。"""
     accel = hwmod.StubActuator("accel", connected=True)
     brake = hwmod.StubActuator("brake", connected=True)
-    vehicle = hwmod.StubVehicle(accel=accel, brake=brake, params=feedforward_params(cfg))
+    # スタブ車両（hardware.StubVehicle: アクセル 0.25・ブレーキ 0.5 km/h/s/% 固定）と釣り合う
+    # 惰行にする。実機 config の 9.2〜10.8 km/h/s だとアクセル 25% でも 14 km/h で釣り合い、
+    # ブレーキ区間がクリープ以下に沈んでブレーキゲイン推定のサンプルが採れない
+    # （config_testVehicle.yaml はユーザーが実機に合わせて書き換える値なので決め打ちしない）
+    params = replace(
+        feedforward_params(cfg),
+        coast_decel_speeds_kmh=(),
+        coast_decel_kmhs=(),
+        engine_brake_decel_kmhs=1.6,
+        creep_speed_kmh=5.0,
+        creep_rate_kmhs=0.5,
+    )
+    vehicle = hwmod.StubVehicle(accel=accel, brake=brake, params=params)
     wall0 = datetime(2026, 9, 10, tzinfo=UTC)
     samples: list[dlmod.DriveSample] = []
     speed = vehicle.advance(0.0, now=0.0)
@@ -188,6 +204,9 @@ def _without_a3a4(cfg: cfgmod.ResearchConfig) -> cfgmod.ResearchConfig:
     plain = copy.deepcopy(cfg)
     plain.learning.trim_stair_start_kmh = []
     plain.learning.brake_hold_hard_offsets_pct = []
+    # 2026-09-19 低開度階段（段3-1）も TrimStairPattern の継承で本番の段と紛れるため、
+    # ここで一緒に無効化する（別途 test_build_patterns_adds_low_open_stair_* で確認する）
+    plain.learning.low_open_stair_offsets_pct = []
     return plain
 
 
@@ -232,11 +251,16 @@ def test_build_patterns_adds_low_sweeps_and_low_speed_brake_holds() -> None:
 def test_build_patterns_adds_hard_brake_holds_and_trim_stairs() -> None:
     """A3・A4: A5 の段の後に 20 km/h からの高ブレーキ 4 本、末尾にトリム階段 3 本（41 本）。
 
-    定速階段（段2）は本テストの対象外なので無効化する（別途 test_build_patterns_adds_cruise_stair
+    定速階段（段2）・クリープ発進/ブレーキ保持（段1）・低開度階段（段3-1）は本テストの対象外
+    なので無効化する（別途 test_build_patterns_adds_cruise_stair /
+    test_build_patterns_adds_creep_launches / test_build_patterns_adds_low_open_stair_*
     で確認する）。
     """
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     cfg.learning.cruise_hold_speeds_kmh = []
+    cfg.learning.creep_launch_count = 0
+    cfg.learning.creep_brake_hold_offsets_pct = []
+    cfg.learning.low_open_stair_offsets_pct = []
     profile = PEDAL.apply_to_profile(build_vehicle_profile(cfg))
     patterns = pdmod.build_patterns(cfg, profile)
     base = pdmod.build_patterns(_without_a3a4(cfg), profile)
@@ -281,8 +305,17 @@ def test_build_patterns_clamps_a3a4_openings_to_max() -> None:
 
 
 def test_build_patterns_adds_cruise_stair_at_end() -> None:
-    """2026-09-14 定速階段（段2）: トリム階段の後、パターン列の末尾に 1 本足す。"""
+    """2026-09-14 定速階段（段2）: トリム階段の後に 1 本足す。
+
+    クリープ発進・クリープ域ブレーキ保持（段1）・低開度階段（段3-1）は定速階段よりさらに後ろに
+    足すので、本テストの対象外として無効化する（別途
+    test_build_patterns_adds_creep_launches_and_holds_at_end /
+    test_build_patterns_adds_low_open_stair_* で確認）。
+    """
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.creep_launch_count = 0
+    cfg.learning.creep_brake_hold_offsets_pct = []
+    cfg.learning.low_open_stair_offsets_pct = []
     profile = PEDAL.apply_to_profile(build_vehicle_profile(cfg))
     patterns = pdmod.build_patterns(cfg, profile)
     without_cruise = copy.deepcopy(cfg)
@@ -313,6 +346,133 @@ def test_build_patterns_without_cruise_hold_speeds_has_no_cruise_stair() -> None
     cfg.learning.cruise_hold_speeds_kmh = []
     patterns = pdmod.build_patterns(cfg, PEDAL.apply_to_profile(build_vehicle_profile(cfg)))
     assert not any(isinstance(p, CruiseStairPattern) for p in patterns)
+
+
+# ── 低開度階段（段3-1。2026-09-19。ProblemReport_20260919 候補(c)） ────────────────────
+
+
+def test_build_patterns_adds_low_open_stair_before_creep_launches() -> None:
+    """定速階段の後・クリープ発進の前に 1 本足す。往復（descend）で offsets 10 個 → 19 段。"""
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    profile = PEDAL.apply_to_profile(build_vehicle_profile(cfg))
+    patterns = pdmod.build_patterns(cfg, profile)
+    without_low_open = copy.deepcopy(cfg)
+    without_low_open.learning.low_open_stair_offsets_pct = []
+    base = pdmod.build_patterns(without_low_open, profile)
+    assert len(patterns) == len(base) + 1
+
+    lr = cfg.learning
+    n_creep = lr.creep_launch_count + len(lr.creep_brake_hold_offsets_pct)
+    idx = len(base) - n_creep  # 定速階段の直後・クリープ発進の前の挿入位置
+    assert patterns[:idx] == base[:idx]
+    assert patterns[idx + 1:] == base[idx:]
+
+    stair = patterns[idx]
+    assert isinstance(stair, LowOpenStairPattern) and stair.kind is PatternKind.CRUISE_TRIM
+    ff = profile.feedforward_params
+    steps_up = tuple(round(ff.accel_deadband_pct + o, 2) for o in lr.low_open_stair_offsets_pct)
+    expected_steps = tuple(
+        min(v, profile.max_accel_opening) for v in (steps_up + steps_up[-2::-1])
+    )
+    assert len(lr.low_open_stair_offsets_pct) == 10 and len(expected_steps) == 19
+    assert stair.trim_steps_pct == pytest.approx(expected_steps)
+    assert stair.min_speed_kmh == pytest.approx(lr.low_open_stair_min_speed_kmh)
+    assert stair.step_hold_s == pytest.approx(lr.low_open_stair_step_s)
+    assert stair.accel_target_kmh == pytest.approx(lr.low_open_stair_start_kmh)
+    assert stair.hold_duration_s == pytest.approx(lr.low_open_stair_step_s * len(expected_steps))
+    label = " → ".join(f"{v:.2f}" for v in stair.trim_steps_pct)
+    assert f"低開度階段 {label}%" in pdmod._describe(stair)
+
+
+def test_build_patterns_low_open_stair_starts_at_first_step_opening() -> None:
+    """DRIVE_ACCEL の加速用開度は 1 段目と同じ開度にする（段差を作らない）。"""
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    profile = PEDAL.apply_to_profile(build_vehicle_profile(cfg))
+    patterns = pdmod.build_patterns(cfg, profile)
+    stair = next(p for p in patterns if isinstance(p, LowOpenStairPattern))
+    assert stair.accel_opening == pytest.approx(stair.trim_steps_pct[0])
+    assert stair.trim_opening == pytest.approx(stair.trim_steps_pct[0])
+
+
+def test_build_patterns_without_low_open_offsets_has_no_low_open_stair() -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.low_open_stair_offsets_pct = []
+    patterns = pdmod.build_patterns(cfg, PEDAL.apply_to_profile(build_vehicle_profile(cfg)))
+    assert not any(isinstance(p, LowOpenStairPattern) for p in patterns)
+
+
+def test_build_patterns_low_open_stair_descend_false_is_one_way() -> None:
+    """descend=False なら折り返さず、offsets と同じ本数のまま（昇順）。"""
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.low_open_stair_descend = False
+    profile = PEDAL.apply_to_profile(build_vehicle_profile(cfg))
+    patterns = pdmod.build_patterns(cfg, profile)
+    stair = next(p for p in patterns if isinstance(p, LowOpenStairPattern))
+    assert len(stair.trim_steps_pct) == len(cfg.learning.low_open_stair_offsets_pct)
+    assert list(stair.trim_steps_pct) == sorted(stair.trim_steps_pct)
+
+
+def test_build_patterns_clamps_low_open_stair_to_max() -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.low_open_stair_offsets_pct = [0.5, 90.0]  # 90 は max_accel_opening を超える
+    profile = PEDAL.apply_to_profile(build_vehicle_profile(cfg))
+    patterns = pdmod.build_patterns(cfg, profile)
+    stair = next(p for p in patterns if isinstance(p, LowOpenStairPattern))
+    assert max(stair.trim_steps_pct) == profile.max_accel_opening
+
+
+def test_build_patterns_adds_creep_launches_and_holds_at_end() -> None:
+    """2026-09-17 クリープ発進・クリープ域ブレーキ保持（段1。ProblemReport_20260916 課題#2）:
+
+    定速階段の後、パターン列の末尾に足す（手順3のモード走行と同じ暖機状態でクリープを測るため）。
+    """
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    profile = PEDAL.apply_to_profile(build_vehicle_profile(cfg))
+    patterns = pdmod.build_patterns(cfg, profile)
+    without_creep = copy.deepcopy(cfg)
+    without_creep.learning.creep_launch_count = 0
+    without_creep.learning.creep_brake_hold_offsets_pct = []
+    base = pdmod.build_patterns(without_creep, profile)
+
+    lr = cfg.learning
+    n_new = lr.creep_launch_count + len(lr.creep_brake_hold_offsets_pct)
+    assert len(patterns) == len(base) + n_new
+    assert patterns[:-n_new] == base
+
+    tail = patterns[-n_new:]
+    launches = tail[:lr.creep_launch_count]
+    holds = tail[lr.creep_launch_count:]
+
+    assert len(launches) == lr.creep_launch_count
+    for p in launches:
+        assert isinstance(p, CreepLaunchPattern) and p.kind is PatternKind.CREEP_SETTLE
+        assert not p.hold_after
+        assert (p.accel_opening, p.brake_opening) == (0.0, 0.0)
+        assert p.target_kmh == pytest.approx(lr.creep_launch_target_kmh)
+        assert p.timeout_s == pytest.approx(lr.creep_launch_timeout_s)
+        assert "クリープ発進" in pdmod._describe(p) and "停車復帰" in pdmod._describe(p)
+
+    assert len(holds) == len(lr.creep_brake_hold_offsets_pct)
+    ff = profile.feedforward_params
+    expected_openings = [
+        min(round(ff.brake_deadband_pct + offset, 2), profile.max_brake_opening)
+        for offset in lr.creep_brake_hold_offsets_pct
+    ]
+    for p, expected in zip(holds, expected_openings, strict=True):
+        assert isinstance(p, CreepLaunchPattern) and p.kind is PatternKind.CREEP_SETTLE
+        assert p.hold_after
+        assert p.accel_opening == 0.0
+        assert p.brake_opening == pytest.approx(expected)
+        assert p.target_kmh == pytest.approx(lr.creep_launch_target_kmh)
+        assert "ブレーキ保持" in pdmod._describe(p)
+
+
+def test_build_patterns_without_creep_settings_has_no_creep_launch() -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.creep_launch_count = 0
+    cfg.learning.creep_brake_hold_offsets_pct = []
+    patterns = pdmod.build_patterns(cfg, PEDAL.apply_to_profile(build_vehicle_profile(cfg)))
+    assert not any(isinstance(p, CreepLaunchPattern) for p in patterns)
 
 
 def test_build_patterns_without_additions_has_no_speed_target() -> None:
@@ -474,6 +634,135 @@ def test_build_ff_model_real_saves_model_but_not_measured_values(tmp_path: Path)
     assert not [p for p in cfgmod.validate_config(saved) if "pedal_gain" in p]
     # ユーザーが編集するファイルなのでコメントは消さない
     assert "# 2次多項式 Ridge 逆モデル" in cfg.source_path.read_text(encoding="utf-8")
+
+
+def test_build_ff_model_order_and_reference_basis_for_coast_creep_gain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """段2.5（ProblemReport_20260916）: 推定順は 惰行 → クリープ → ペダルゲイン。
+
+    クリープ加速カーブ・ペダルゲインの基準（reference）は、estimate_dynamics_params が返す
+    生の `after`（不感帯が表示専用の粗い推定値。実測 8.53/12.00% に対し推定 3.0/3.0% 相当）
+    ではなく、**before の実測不感帯・停車保持・creep_speed_kmh を保ったまま惰行カーブだけ
+    差し替えたもの**であること。これを取り違えると「不感帯以下＝ペダルオフ」判定とゲインの
+    分母（開度−不感帯）が壊れ、惰行サンプルが 995→361 点まで減る不具合が実機ログの relearn
+    dry-run で確認された回帰。
+    """
+    cfg = _tmp_cfg(tmp_path)
+    csv_path = tmp_path / "drive.csv"
+    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
+
+    calls: list[str] = []
+    captured: dict[str, Any] = {}
+    original_dynamics = pdmod.estimate_dynamics_params
+    original_coast = pdmod._estimate_research_coast_curve
+    original_creep = pdmod._estimate_research_creep_curve
+    original_gain = pdmod._estimate_research_pedal_gains
+
+    def spy_dynamics(logs, current):  # type: ignore[no-untyped-def]
+        captured["before"] = current
+        return original_dynamics(logs, current)
+
+    def spy_coast(cfg_, logs, reference, target):  # type: ignore[no-untyped-def]
+        calls.append("coast")
+        captured["coast_reference"] = reference
+        result = original_coast(cfg_, logs, reference, target)
+        captured["coast_result"] = result
+        return result
+
+    def spy_creep(cfg_, logs, params, before):  # type: ignore[no-untyped-def]
+        calls.append("creep")
+        captured["creep_params"] = params
+        return original_creep(cfg_, logs, params, before)
+
+    def spy_gain(cfg_, logs, before, after, research):  # type: ignore[no-untyped-def]
+        calls.append("gain")
+        captured["gain_before"] = before
+        captured["gain_after"] = after
+        return original_gain(cfg_, logs, before, after, research)
+
+    monkeypatch.setattr(pdmod, "estimate_dynamics_params", spy_dynamics)
+    monkeypatch.setattr(pdmod, "_estimate_research_coast_curve", spy_coast)
+    monkeypatch.setattr(pdmod, "_estimate_research_creep_curve", spy_creep)
+    monkeypatch.setattr(pdmod, "_estimate_research_pedal_gains", spy_gain)
+
+    pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL, pedal=PEDAL)
+
+    assert calls == ["coast", "creep", "gain"]
+
+    before = captured["before"]
+    coast_result = captured["coast_result"]
+
+    # 惰行カーブ同定そのもののサンプル抽出条件は before（2-0 実測）を渡す
+    assert captured["coast_reference"] is before
+
+    # クリープ・ゲインの基準は before の実測値そのもの（estimate_dynamics_params の粗い
+    # 推定値ではない）を保っている
+    for ref in (captured["creep_params"], captured["gain_before"]):
+        assert ref.accel_deadband_pct == pytest.approx(PEDAL.accel_deadband_pct)
+        assert ref.brake_deadband_pct == pytest.approx(PEDAL.brake_deadband_pct)
+        assert ref.accel_deadband_pct == pytest.approx(before.accel_deadband_pct)
+        assert ref.brake_deadband_pct == pytest.approx(before.brake_deadband_pct)
+        assert ref.creep_speed_kmh == pytest.approx(before.creep_speed_kmh)
+        assert ref.stop_brake_opening_pct == pytest.approx(before.stop_brake_opening_pct)
+        # 惰行カーブだけは今回同定した結果と一致する
+        assert ref.coast_decel_speeds_kmh == coast_result.coast_decel_speeds_kmh
+        assert ref.coast_decel_kmhs == coast_result.coast_decel_kmhs
+
+    assert captured["gain_after"] is coast_result
+
+
+def test_build_ff_model_stop_brake_floor_uses_reference_basis_and_saves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """段4改訂（ProblemReport_20260916 クリープ域ブレーキの下限）: 下限も段2.5 と同じ形で
+    reference（before 基準）で同定し、FF_PARAM_KEYS 経由で保存される。
+
+    `test_build_ff_model_order_and_reference_basis_for_coast_creep_gain` と同じ形で、基準に
+    渡された params の不感帯・停車保持開度が before（2-0 実測）の値であることをアサートする。
+    """
+    cfg = _tmp_cfg(tmp_path)
+    csv_path = tmp_path / "drive.csv"
+    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
+
+    captured: dict[str, Any] = {}
+    original_stop_brake = pdmod._estimate_research_stop_brake_floor
+
+    def spy_stop_brake(cfg_, logs, params, before):  # type: ignore[no-untyped-def]
+        captured["params"] = params
+        result = original_stop_brake(cfg_, logs, params, before)
+        captured["result"] = result
+        return result
+
+    monkeypatch.setattr(pdmod, "_estimate_research_stop_brake_floor", spy_stop_brake)
+
+    result = pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL, pedal=PEDAL)
+
+    # サンプル抽出条件の基準は before（2-0 実測）そのもの。estimate_dynamics_params の粗い
+    # 推定値ではない
+    params = captured["params"]
+    assert params.accel_deadband_pct == pytest.approx(PEDAL.accel_deadband_pct)
+    assert params.brake_deadband_pct == pytest.approx(PEDAL.brake_deadband_pct)
+    assert params.stop_brake_opening_pct == pytest.approx(PEDAL.stop_brake_opening_pct)
+
+    # 同定結果がそのまま research_params に乗り、FF_PARAM_KEYS 経由で YAML に保存される
+    floor_result = captured["result"]
+    assert (
+        result.research_params.stop_brake_floor_offset_pct
+        == floor_result.stop_brake_floor_offset_pct
+    )
+
+    saved = cfgmod.load_config(cfg.source_path)
+    assert saved.feedforward.stop_brake_floor_offset_pct == pytest.approx(
+        floor_result.stop_brake_floor_offset_pct
+    )
+    # brake_trim_max_kmh・brake_trim_ref_kmh は人が決める値なので自動保存の対象外
+    # （期待値は走行前の設定値。_tmp_cfg は config_testVehicle.yaml のコピーなので
+    # dataclass 既定値 0.0 とは限らない）
+    assert saved.feedforward.brake_trim_max_kmh == pytest.approx(
+        cfg.feedforward.brake_trim_max_kmh
+    )
+    assert saved.feedforward.brake_trim_ref_kmh == pytest.approx(cfg.feedforward.brake_trim_ref_kmh)
 
 
 def test_build_ff_model_stub_does_not_touch_yaml(tmp_path: Path) -> None:

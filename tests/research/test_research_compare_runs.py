@@ -95,6 +95,30 @@ def test_smaller_max_deviation_ranks_higher_when_both_completed(tmp_path: Path) 
     assert [r.label for r in ranked] == ["偏差小", "偏差大"]
 
 
+def test_completion_allows_one_cycle_short_of_duration(tmp_path: Path) -> None:
+    """1 周期弱だけ足りない実走は走破とみなす（実機 1799.898s の縮小再現）。
+
+    走行ループは duration_s 到達時点で抜けるため、最後の記録行は 1 周期手前になる。
+    dt=0.1s・到達 1.9s に対し duration_s=2.002 を渡すと、旧式のしきい値は
+    2.002 - 0.1 = 1.902 で 1.9 < 1.902 のため未走破と誤判定されていた。
+    2 周期の許容幅なら 2.002 - 0.2 = 1.802 で 1.9 >= 1.802 となり走破と判定される。
+    """
+    path = tmp_path / "near_complete.csv"
+    _write_run(path, n=20, dt=0.1, deviation_kmh=0.0, accel=15.0)  # 到達 1.9s
+    cfg = cfgmod.load_config(_cfg(tmp_path))
+    result = cr.evaluate_run(path, "近接完走", cfg, duration_s=2.002)
+    assert result.completed
+
+
+def test_completion_rejects_run_short_by_more_than_two_cycles(tmp_path: Path) -> None:
+    """2 周期より大きく足りない走行は未走破のまま（緩めすぎていないことの確認）。"""
+    path = tmp_path / "near_complete.csv"
+    _write_run(path, n=20, dt=0.1, deviation_kmh=0.0, accel=15.0)  # 到達 1.9s
+    cfg = cfgmod.load_config(_cfg(tmp_path))
+    result = cr.evaluate_run(path, "未走破", cfg, duration_s=2.3)
+    assert not result.completed
+
+
 def test_command_rate_p95_of_constant_signal_is_zero() -> None:
     rows = [
         cr.ModeRow(

@@ -514,11 +514,300 @@ async def test_cruise_stair_runs_to_completion() -> None:
     assert "CRUISE_HOLD" in phases  # CSV の phase 列で CRUISE_TRIM と見分けられる
 
 
+# ── 低開度階段（段3-1。2026-09-19。ProblemReport_20260919 候補(c)） ────────────────────
+
+
+def _low_stair(
+    min_speed_kmh: float = 2.0, target_kmh: float = 4.5,
+) -> plmod.LowOpenStairPattern:
+    return plmod.LowOpenStairPattern(
+        PatternKind.CRUISE_TRIM, accel_opening=6.8, brake_opening=0.0, hold_duration_s=24.0,
+        trim_opening=6.8, accel_target_kmh=target_kmh, trim_steps_pct=(6.8, 7.3, 7.8),
+        step_hold_s=8.0, min_speed_kmh=min_speed_kmh,
+    )
+
+
+def test_low_open_stair_uses_pattern_min_speed_not_coast_stop_speed() -> None:
+    """低速終了判定は min_speed_kmh を使う（トリム階段の coast_down_stop_speed_kmh=5.0 のままだと
+    低速の運転域の真ん中に来て 1 段目で即終了してしまう）。"""
+    pattern = _low_stair(min_speed_kmh=2.0)
+    loop, *_ = _loop([pattern])
+    assert loop._config.coast_down_stop_speed_kmh == 5.0  # 前提確認
+    loop._enter_phase(_Phase.CRUISE_TRIM, 0.0)
+    loop._advance(pattern, 4.0, 0.0, 1.0)  # coast_down_stop_speed_kmh(5.0) より低いが終了しない
+    assert loop._phase is _Phase.CRUISE_TRIM
+
+
+def test_low_open_stair_finishes_below_its_own_min_speed() -> None:
+    pattern = _low_stair(min_speed_kmh=2.0)
+    loop, *_ = _loop([pattern])
+    loop._enter_phase(_Phase.CRUISE_TRIM, 0.0)
+    loop._advance(pattern, 1.5, 0.0, 1.0)  # min_speed_kmh(2.0) を下回った
+    assert loop._phase is _Phase.DRIVE_BRAKE
+    assert _trim_command(loop, pattern, 1.0) == 0.0
+
+
+def test_low_open_stair_holds_each_step_constant_without_ramp() -> None:
+    """CRUISE_TRIM の指令は trim_steps_pct[i] そのもの（ランプもガバナーも掛からない）。"""
+    pattern = _low_stair()
+    loop, *_ = _loop([pattern])
+    loop._enter_phase(_Phase.CRUISE_TRIM, 0.0)
+    assert _trim_command(loop, pattern, 0.1) == pattern.trim_steps_pct[0]
+    loop._trim_step = 1
+    assert _trim_command(loop, pattern, 1.1) == pattern.trim_steps_pct[1]
+    loop._trim_step = 2
+    assert _trim_command(loop, pattern, 2.1) == pattern.trim_steps_pct[2]
+
+
+async def test_low_open_stair_runs_to_completion() -> None:
+    config = PatternLoopConfig(accel_ramp_time_s=0.0, brake_ramp_time_s=0.0)
+    pattern = plmod.LowOpenStairPattern(
+        PatternKind.CRUISE_TRIM, accel_opening=6.8, brake_opening=0.0, hold_duration_s=0.2,
+        trim_opening=6.8, accel_target_kmh=4.5, trim_steps_pct=(6.8, 7.3), step_hold_s=0.1,
+        min_speed_kmh=2.0,
+    )
+    loop, rec, can, *_ = _loop([pattern], speed_kmh=4.5, config=config)
+    task = asyncio.ensure_future(_run_until_done(loop, rec))
+    while loop._phase is not _Phase.DRIVE_BRAKE and not task.done():
+        await asyncio.sleep(0.01)
+    can.speed_kmh = 0.0
+    await task
+    assert rec.completed and not rec.emergency
+    trims = sorted({data.accel_opening for data, _, phase, *_ in rec.rows
+                    if phase == "CRUISE_TRIM"})
+    assert trims == [6.8, 7.3]
+
+
+# ── クリープ発進・クリープ域ブレーキ保持（段1。2026-09-17。ProblemReport_20260916 課題#2） ──
+
+
+def _creep_launch(
+    *, target_kmh: float = 5.0, timeout_s: float = 20.0,
+    hold_after: bool = False, brake_opening: float = 0.0,
+) -> plmod.CreepLaunchPattern:
+    return plmod.CreepLaunchPattern(
+        PatternKind.CREEP_SETTLE, accel_opening=0.0, brake_opening=brake_opening,
+        hold_duration_s=timeout_s, target_kmh=target_kmh, timeout_s=timeout_s,
+        hold_after=hold_after,
+    )
+
+
+def test_initial_phase_for_creep_launch_pattern_is_creep_launch() -> None:
+    loop, *_ = _loop([_creep_launch()])
+    assert loop._initial_phase(0) is _Phase.CREEP_LAUNCH
+
+
+def test_creep_launch_commands_both_pedals_released() -> None:
+    pattern = _creep_launch()
+    loop, *_ = _loop([pattern])
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+    assert loop._command_openings(pattern, 0.0) == (0.0, 0.0)
+    assert loop._command_openings(pattern, 5.0) == (0.0, 0.0)  # 時間が経っても常に両ペダル解放
+
+
+def test_creep_launch_reaches_target_goes_to_drive_brake_when_not_holding() -> None:
+    pattern = _creep_launch(target_kmh=5.0, hold_after=False)
+    loop, *_ = _loop([pattern])
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+    loop._advance(pattern, 4.9, 0.0, 1.0)
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 5.0, 0.0, 2.0)  # 目標到達
+    assert loop._phase is _Phase.DRIVE_BRAKE
+    assert not loop._overspeed_recovery
+
+
+def test_creep_launch_reaches_target_goes_to_brake_hold_when_holding() -> None:
+    pattern = _creep_launch(target_kmh=5.0, hold_after=True, brake_opening=15.0)
+    loop, *_ = _loop([pattern])
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+    loop._advance(pattern, 5.0, 0.0, 1.0)  # 目標到達
+    assert loop._phase is _Phase.BRAKE_HOLD
+    _, brake = loop._command_openings(pattern, 1.0 + loop._config.brake_ramp_time_s)
+    assert brake == pytest.approx(15.0)  # BRAKE_HOLD は pattern.brake_opening を保持する
+
+
+def test_creep_launch_timeout_advances_even_below_target() -> None:
+    pattern = _creep_launch(target_kmh=100.0, timeout_s=2.0, hold_after=False)
+    loop, *_ = _loop([pattern])
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+    loop._advance(pattern, 3.0, 0.0, 1.9)
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 3.0, 0.0, 2.0)  # timeout_s 経過 → 目標未到達でも打ち切り
+    assert loop._phase is _Phase.DRIVE_BRAKE
+
+
+def test_creep_launch_overspeed_enters_drive_brake_recovery() -> None:
+    pattern = _creep_launch()
+    loop, *_ = _loop([pattern])
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+    loop._advance(pattern, loop._profile.max_speed + 1.0, 0.0, 1.0)
+    assert loop._phase is _Phase.DRIVE_BRAKE and loop._overspeed_recovery
+
+
+async def test_creep_launch_runs_to_completion_via_timeout() -> None:
+    """速度が動かないスタブ CAN でも timeout_s で打ち切られ、停車済みなのでそのまま完了する。"""
+    config = PatternLoopConfig(brake_ramp_time_s=0.0, brake_stop_timeout_s=2.0)
+    pattern = _creep_launch(target_kmh=100.0, timeout_s=0.2, hold_after=False)
+    loop, rec, _, *_ = _loop([pattern], speed_kmh=0.0, config=config, interval_s=0.02)
+    await _run_until_done(loop, rec)
+    assert rec.completed and not rec.emergency
+    phases = {phase for _, _, phase, *_ in rec.rows}
+    assert phases == {"CREEP_LAUNCH"}
+
+
+async def test_creep_launch_hold_runs_to_completion_via_timeout() -> None:
+    config = PatternLoopConfig(brake_ramp_time_s=0.0, brake_hold_timeout_s=2.0)
+    pattern = _creep_launch(target_kmh=100.0, timeout_s=0.2, hold_after=True, brake_opening=15.0)
+    loop, rec, _, *_ = _loop([pattern], speed_kmh=0.0, config=config, interval_s=0.02)
+    await _run_until_done(loop, rec)
+    assert rec.completed and not rec.emergency
+    phases = {phase for _, _, phase, *_ in rec.rows}
+    assert "BRAKE_HOLD" in phases
+
+
 def test_defaults_are_a6_values() -> None:
     cfg = PatternLoopConfig()
     assert cfg.accel_full_range_timeout_s == 30.0
     assert cfg.brake_stop_timeout_s == 60.0
     assert (cfg.gov_release_frac, cfg.gov_raise_step_pct) == (0.7, 0.5)
+
+
+# ── クリープ発進の終了条件（段1b。2026-09-17。ProblemReport_20260916 ユーザー決定） ──
+
+
+def test_creep_launch_ends_when_slope_settles() -> None:
+    """target_kmh 到達を待たず、車速の傾きが settle_kmhs 未満で settle_s 続いたら終了する。
+
+    settle_min_s は 0 にして最短時間ガードを無効化し、傾き収束の判定だけを見る。
+    """
+    config = PatternLoopConfig(
+        creep_launch_settle_kmhs=0.1, creep_launch_settle_s=0.06, creep_launch_settle_min_s=0.0
+    )
+    pattern = _creep_launch(target_kmh=100.0, timeout_s=100.0, hold_after=False)
+    loop, *_ = _loop([pattern], config=config, interval_s=0.02)
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+
+    loop._advance(pattern, 4.90, 0.05, 0.02)  # 傾き 0.05 < 0.1 だが継続時間がまだ足りない
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 4.95, 0.05, 0.04)
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 4.97, 0.05, 0.06)  # 3周期 × 0.02s = 0.06s >= settle_s → 平衡到達
+    assert loop._phase is _Phase.DRIVE_BRAKE
+
+
+def test_creep_launch_slope_settle_resets_on_non_settled_sample() -> None:
+    """途中で傾きがしきい値を超えたら、継続時間のカウントが振り出しに戻る。"""
+    config = PatternLoopConfig(
+        creep_launch_settle_kmhs=0.1, creep_launch_settle_s=0.06, creep_launch_settle_min_s=0.0
+    )
+    pattern = _creep_launch(target_kmh=100.0, timeout_s=100.0, hold_after=False)
+    loop, *_ = _loop([pattern], config=config, interval_s=0.02)
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+
+    loop._advance(pattern, 4.90, 0.05, 0.02)  # 安定 1 周期目
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 5.00, 0.50, 0.04)  # 傾きがしきい値を超える → カウントリセット
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 5.02, 0.05, 0.06)  # 安定 1 周期目（リセット後）。まだ足りない
+    assert loop._phase is _Phase.CREEP_LAUNCH
+
+
+# ── クリープ発進の誤判定修正（2026-09-17。停止直後を「平衡」と誤判定していたバグ） ──
+
+
+def test_creep_launch_stationary_does_not_settle_even_past_settle_s() -> None:
+    """回帰テスト: 修正前は、停車状態（速度0・傾き0）が settle_s を超えて続いただけで
+
+    「平衡到達」と誤判定していた（停車保持を解放した直後は車速0・傾き0で
+    abs(accel_kmhs) < creep_launch_settle_kmhs が最初から成立してしまうため）。
+    車速が creep_launch_min_speed_kmh 未満の間は安定カウントを積まないよう直したので、
+    動き出す前は settle_s をいくら超えても終了しない。
+    """
+    config = PatternLoopConfig(
+        creep_launch_min_speed_kmh=1.0,
+        creep_launch_settle_kmhs=0.1,
+        creep_launch_settle_s=0.06,
+        creep_launch_settle_min_s=0.0,
+    )
+    pattern = _creep_launch(target_kmh=100.0, timeout_s=100.0, hold_after=False)
+    loop, *_ = _loop([pattern], config=config, interval_s=0.02)
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+
+    # 速度0・傾き0が settle_s（0.06s）をとうに超えて続いても、動き出していないので終了しない
+    for now in (0.02, 0.04, 0.06, 0.08, 0.10):
+        loop._advance(pattern, 0.0, 0.0, now)
+        assert loop._phase is _Phase.CREEP_LAUNCH
+
+
+def test_creep_launch_settles_after_moving_starts() -> None:
+    """動き出して（車速が creep_launch_min_speed_kmh 以上になって）から傾きが収束したら終了する。"""
+    config = PatternLoopConfig(
+        creep_launch_min_speed_kmh=1.0,
+        creep_launch_settle_kmhs=0.1,
+        creep_launch_settle_s=0.06,
+        creep_launch_settle_min_s=0.0,
+    )
+    pattern = _creep_launch(target_kmh=100.0, timeout_s=100.0, hold_after=False)
+    loop, *_ = _loop([pattern], config=config, interval_s=0.02)
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+
+    # 停車保持解放直後: 動いていないので、傾きが小さくても安定カウントは積まれない
+    loop._advance(pattern, 0.0, 0.0, 0.02)
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 0.5, 0.05, 0.04)  # まだ min_speed_kmh 未満
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    # 動き出した（車速が min_speed_kmh 以上）後、傾きが収束し settle_s 続いたら終了
+    loop._advance(pattern, 1.10, 0.05, 0.06)
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 1.15, 0.05, 0.08)
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 1.20, 0.05, 0.10)  # 3周期 × 0.02s = 0.06s >= settle_s → 平衡到達
+    assert loop._phase is _Phase.DRIVE_BRAKE
+
+
+def test_creep_launch_settle_min_s_blocks_early_finish() -> None:
+    """動き出して傾きが収束していても、elapsed が settle_min_s 未満なら終了しない。"""
+    config = PatternLoopConfig(
+        creep_launch_min_speed_kmh=1.0,
+        creep_launch_settle_kmhs=0.1,
+        creep_launch_settle_s=0.02,
+        creep_launch_settle_min_s=5.0,
+    )
+    pattern = _creep_launch(target_kmh=100.0, timeout_s=100.0, hold_after=False)
+    loop, *_ = _loop([pattern], config=config, interval_s=0.02)
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+
+    # 動いていて傾きも収束済み（settle_s は満たす）だが、elapsed(0.02s) < settle_min_s(5.0s)
+    loop._advance(pattern, 1.10, 0.05, 0.02)
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 1.12, 0.05, 0.04)
+    assert loop._phase is _Phase.CREEP_LAUNCH
+
+
+def test_creep_launch_target_kmh_is_a_safety_cap() -> None:
+    """平衡に達していなくても target_kmh に達したら安全上限として打ち切る。"""
+    config = PatternLoopConfig(creep_launch_settle_kmhs=0.1, creep_launch_settle_s=100.0)
+    pattern = _creep_launch(target_kmh=5.0, timeout_s=100.0, hold_after=False)
+    loop, *_ = _loop([pattern], config=config, interval_s=0.02)
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+
+    loop._advance(pattern, 4.9, 1.0, 0.02)  # 傾き 1.0（settle 条件は満たさない）
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 5.0, 1.0, 0.04)  # target_kmh 到達 → 安全上限で打ち切り
+    assert loop._phase is _Phase.DRIVE_BRAKE
+
+
+def test_creep_launch_settle_timeout_still_cuts_off() -> None:
+    """平衡にもtarget_kmhにも達さなくても timeout_s で打ち切られる（従来どおり）。"""
+    config = PatternLoopConfig(creep_launch_settle_kmhs=0.1, creep_launch_settle_s=100.0)
+    pattern = _creep_launch(target_kmh=100.0, timeout_s=2.0, hold_after=False)
+    loop, *_ = _loop([pattern], config=config, interval_s=0.02)
+    loop._enter_phase(_Phase.CREEP_LAUNCH, 0.0)
+
+    loop._advance(pattern, 3.0, 1.0, 1.9)
+    assert loop._phase is _Phase.CREEP_LAUNCH
+    loop._advance(pattern, 3.0, 1.0, 2.0)  # timeout_s 経過
+    assert loop._phase is _Phase.DRIVE_BRAKE
 
 
 async def test_stop_return_timeout_aborts_with_reason() -> None:

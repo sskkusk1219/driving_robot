@@ -18,7 +18,8 @@
         ... tests/research/results/drive_log_real_<C4_3>.csv
 
 順位（5.8.1、上から順に見る。同点なら次の基準）:
-    1. 走破したか（中断した案は中断時刻の早い順に下）
+    1. 走破したか（中断した案は中断時刻の早い順に下。走行ループは duration_s 到達時点で
+       抜けるため最後の記録行は 1 周期手前になるので、走破の許容幅は 2 周期分見る）
     2. 最大逸脱（小さいほど良い）
     3. |偏差| p95（小さいほど良い）
     4. 符号反転（少ないほど良い）
@@ -87,6 +88,16 @@ def command_rate_p95(rows: list[ModeRow]) -> float:
     return float(np.percentile(rate, 95)) if len(rate) else 0.0
 
 
+#: 走破とみなす許容幅は 2 周期。走行ループは duration_s 到達時点で抜けるため最後の行は
+#: 1 周期手前になり、そこに周期遅れ 1 回（実測 0.198〜0.228s）が乗ることがある
+COMPLETION_TOLERANCE_CYCLES = 2.0
+
+
+def completion_threshold_s(duration_s: float, t: Sequence[float]) -> float:
+    """走破とみなす到達時刻のしきい値 [s]。"""
+    return duration_s - COMPLETION_TOLERANCE_CYCLES * sample_interval_s(t)
+
+
 def evaluate_run(
     csv_path: Path, label: str, cfg: ResearchConfig, duration_s: float
 ) -> RunResult:
@@ -97,7 +108,7 @@ def evaluate_run(
     deviation = [r.deviation_kmh for r in rows]
     kpi = compute_kpi(t, deviation, cfg.kpi)
     reached = max(t)
-    completed = reached >= duration_s - sample_interval_s(t)
+    completed = reached >= completion_threshold_s(duration_s, t)
     pedal = pedal_stats(
         rows, cfg.feedforward.accel_deadband_pct, cfg.feedforward.brake_deadband_pct,
         feedforward_params(cfg),
