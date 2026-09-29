@@ -13,9 +13,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from src.domain.model_training import FeatureSpec
-from src.models.profile import FeedforwardParams
 from tests.research import ff_explain as ffx
+from tests.research.ff_model import FeatureSpec
+from tests.research.research_types import FeedforwardParams
 
 ACCEL_PRED = 12.0
 BRAKE_PRED = 20.0
@@ -118,3 +118,52 @@ def test_pedal_class_uses_deadbands() -> None:
     p = _params()
     effort = np.array([15.0, 5.0, 0.0, -10.0, -20.0])
     assert list(ffx.pedal_class(*ffx.effort_to_pedals(effort), p)) == ["A", "-", "-", "-", "B"]
+
+
+# ── 手順6: ペダル別ホライズンの pkl は未対応として拒否する ────────────────
+
+
+def test_load_ff_model_rejects_pedal_separated_pkl(tmp_path) -> None:
+    import pickle
+    from dataclasses import asdict
+
+    accel_spec = FeatureSpec(lookahead_horizons_s=(0.5, 1.0, 2.0, 3.0))
+    brake_spec = FeatureSpec(lookahead_horizons_s=(0.1, 1.0))
+    control_spec = FeatureSpec(lookahead_horizons_s=(0.1, 0.5, 1.0, 2.0, 3.0))
+    path = tmp_path / "separated.pkl"
+    with path.open("wb") as f:
+        pickle.dump(
+            {
+                "accel_model": _ConstModel(1.0),
+                "brake_model": _ConstModel(1.0),
+                "feature_spec": asdict(control_spec),
+                "accel_feature_spec": asdict(accel_spec),
+                "brake_feature_spec": asdict(brake_spec),
+                "speed_clip_max": None,
+            },
+            f,
+        )
+
+    with pytest.raises(ValueError, match="ペダル別ホライズン"):
+        ffx.load_ff_model(str(path))
+
+
+def test_load_ff_model_accepts_legacy_pkl(tmp_path) -> None:
+    import pickle
+    from dataclasses import asdict
+
+    path = tmp_path / "legacy.pkl"
+    with path.open("wb") as f:
+        pickle.dump(
+            {
+                "accel_model": _ConstModel(1.0),
+                "brake_model": _ConstModel(1.0),
+                "feature_spec": asdict(FeatureSpec()),
+                "speed_clip_max": None,
+            },
+            f,
+        )
+
+    model = ffx.load_ff_model(str(path))
+
+    assert model.spec == FeatureSpec()

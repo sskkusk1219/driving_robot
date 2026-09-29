@@ -39,9 +39,6 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from src.domain.control.conversions import G_TO_KMHS, VEHICLE_STOP_SPEED_KMH
-from src.models.drive_log import DriveLogData
-from src.models.driving_mode import DrivingMode, SpeedPoint
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.axis_safety import AxisSafetyNet
 from tests.research.config import ConfigError, ResearchConfig
@@ -55,6 +52,13 @@ from tests.research.ff_candidate import CandidateFeedforward, make_candidate
 from tests.research.ff_params import research_ff_params
 from tests.research.hardware import ActuatorProtocol, DriveError, ResearchHardware
 from tests.research.pattern_drive import _overcurrent_limit_ma, _release_pedals
+from tests.research.research_types import (
+    G_TO_KMHS,
+    VEHICLE_STOP_SPEED_KMH,
+    DriveLogData,
+    DrivingMode,
+    SpeedPoint,
+)
 from tests.research.stop_decel import PHASE_APPROACH, PHASE_STOP_HOLD, decelerate_to_stop
 from tests.research.term import drive_status_line, say
 from tests.research.vehicle import build_vehicle_profile, feedforward_params, opening_to_pulse
@@ -180,8 +184,40 @@ async def prepare_mode_drive(cfg: ResearchConfig, mode_name: str) -> ModeDriveSe
         )
     ff = load_feedforward(cfg)
     ff_cfg = cfg.feedforward
-    say(f"FF 候補: {ff.candidate}　モデル: {ff_cfg.model_path}"
-        f"（先読み {list(ff.horizons)}s・過去 {list(ff.past_horizons)}s）")
+    ft = cfg.features
+    if ff.is_pedal_separated:
+        # 手順6: アクセル・ブレーキが別々のホライズンを選んだ pkl（horizon_search）
+        say(f"FF 候補: {ff.candidate}　モデル: {ff_cfg.model_path}")
+        say(f"  先読み アクセル {list(ff.accel_spec.lookahead_horizons_s)}s / "
+            f"ブレーキ {list(ff.brake_spec.lookahead_horizons_s)}s・"
+            f"停車保持/ブレーキ下限 {ff.stop_horizon_s:g}s 先")
+        say(f"  過去 アクセル {list(ff.accel_spec.past_horizons_s)}s / "
+            f"ブレーキ {list(ff.brake_spec.past_horizons_s)}s")
+        # horizon_search が選ぶのは先読み・過去だけなので、それ以外（レジーム・停車保持の
+        # ホライズン・past_as_delta・v0_sq・交互作用項）だけ設定と食い違いが無いか見る
+        mismatches = []
+        if ff.spec.regime_horizon_s != ft.h1_s:
+            mismatches.append(
+                f"h1_s（レジーム）: pkl {ff.spec.regime_horizon_s:g} / 設定 {ft.h1_s:g}"
+            )
+        if ff.stop_horizon_s != ft.h0_s:
+            mismatches.append(f"h0_s（停車保持）: pkl {ff.stop_horizon_s:g} / 設定 {ft.h0_s:g}")
+        if ff.spec.past_as_delta != ft.past_as_delta:
+            mismatches.append("past_as_delta")
+        if ff.spec.include_v0_sq != ft.use_v0_sq:
+            mismatches.append("use_v0_sq")
+        if ff.spec.include_dv_regime_x_v0 != ft.use_dv1_x_v0:
+            mismatches.append("use_dv1_x_v0")
+        if mismatches:
+            say(f"  ⚠ 設定 features と pkl が食い違っています（{'、'.join(mismatches)}）。"
+                "設定を変えたなら手順2（学習）をやり直してください（走行は pkl のまま続けます）")
+    else:
+        say(f"FF 候補: {ff.candidate}　モデル: {ff_cfg.model_path}"
+            f"（先読み {list(ff.horizons)}s・過去 {list(ff.past_horizons)}s）")
+        say(f"  特徴量（pkl）: {ff.spec.feature_names()}")
+        if ff.spec != ft.to_feature_spec():
+            say("  ⚠ 設定 features の特徴量と pkl の特徴量が違います。設定を変えたなら"
+                "手順2（学習）をやり直してください（走行は pkl の特徴量で続けます）")
     say(f"  不感帯 アクセル {ff_cfg.accel_deadband_pct:.2f}% / "
         f"ブレーキ {ff_cfg.brake_deadband_pct:.2f}%・停車保持 {ff_cfg.stop_brake_opening_pct:.2f}%")
     return ModeDriveSetup(mode=mode, ff=ff)

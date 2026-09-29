@@ -11,12 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from src.domain.control.conversions import VEHICLE_STOP_SPEED_KMH
 from tests.research import config as cfgmod
 from tests.research import hardware as hwmod
 from tests.research import main as mainmod
 from tests.research import pedal_search as psmod
 from tests.research import pre_drive_check as pcmod
+from tests.research.research_types import VEHICLE_STOP_SPEED_KMH
 from tests.research.vehicle import opening_to_pulse, pulse_to_opening
 
 FAST = {

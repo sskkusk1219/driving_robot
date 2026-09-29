@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from src.domain.control.conversions import VEHICLE_STOP_SPEED_KMH
 from tests.research import config as cfgmod
 from tests.research import hardware as hwmod
 from tests.research import pedal_search as psmod
+from tests.research.research_types import VEHICLE_STOP_SPEED_KMH
 from tests.research.vehicle import build_vehicle_profile, opening_to_pulse, pulse_to_opening
 
 WINDOW_S = 0.6
@@ -369,9 +369,3 @@ def test_apply_to_profile_overrides_measured_values() -> None:
         ffp.stop_brake_opening_pct,
         ffp.creep_speed_kmh,
     ) == (6.0, 8.0, 24.0, 5.0)
-
-
-def test_probe_list_must_be_ascending() -> None:
-    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
-    cfg.learning.accel_deadband_probe_offsets_pct = [5.0, 1.0]
-    assert any("accel_deadband_probe_offsets_pct" in p for p in cfgmod.validate_config(cfg))

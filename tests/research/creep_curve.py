@@ -24,10 +24,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from src.domain.model_training import STOP_SPEED_KMH, _group_by_session
-from src.models.drive_log import DriveLog
-from src.models.profile import FeedforwardParams
+from tests.research.ff_model import STOP_SPEED_KMH, group_by_session
 from tests.research.pedal_gain import _sample_interval_s
+from tests.research.research_types import DriveLog, FeedforwardParams
 
 
 @dataclass(frozen=True)
@@ -57,7 +56,7 @@ def estimate_creep_accel_curve(
     """
     speeds: list[float] = []
     accels: list[float] = []
-    for session_logs in _group_by_session(logs):
+    for session_logs in group_by_session(logs):
         if len(session_logs) < 2:
             continue
         speed = np.clip(

@@ -26,12 +26,11 @@ from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from src.domain.control.conversions import G_TO_KMHS, VEHICLE_STOP_SPEED_KMH
-from src.models.profile import VehicleProfile
 from tests.research.config import ResearchConfig
 from tests.research.drive_log import SECTION_DECEL_TO_STOP, SessionLog, mark
 from tests.research.hardware import DriveError, ResearchHardware
 from tests.research.pedal_search import HOLD_STEP_DWELL_S, SPEED_SAMPLE_INTERVAL_S, step_to_position
+from tests.research.research_types import G_TO_KMHS, VEHICLE_STOP_SPEED_KMH, VehicleProfile
 from tests.research.term import say
 from tests.research.vehicle import opening_to_pulse, pulse_to_opening
 

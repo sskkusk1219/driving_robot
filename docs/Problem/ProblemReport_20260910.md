@@ -158,9 +158,30 @@ FF + PID
     **reportYYYYMMDD_debag_process2,3.md**としてレポートを作成すること\
     - どこをどのように変更したのか？
     - 実機確認結果
+        **reportYYYYMMDD_debag_process2,3_A8.md**に記載
 
+    ### **reportYYYYMMDD_debag_process2,3_A8.md**に従って進める
+        - ここまでで見つかった問題
+            - テスト 4 件／C5・C4 の停車保持／走破判定／`docs/Problem/ProblemReport_20260916.md`／安全網
+        - `docs/Problem/ProblemReport_20260919.md`の着手
+            - |偏差|>1.0km/hの解決方法検討
+                - 手順2で低開度の測定方法を追加 ⇛ モデルに反映。結果として低速で改善したが中速で悪化。モデルが低速側に寄ったため
+                - ゲイン式の検討 ⇛ 効果見込めず\
+                上記、2件を不採用とした
+        - `docs/Problem/ProblemReport_20260920.md`の着手
+            - `docs/Problem/ProblemReport_20260919.md`の結果を受けて、**逆モデルを速度で分ける**方法を検討する
+            `tests/research/results/report20260921_RunFF_2.md`の結果から追従性が向上したので、制御が複雑になるので**速度別モデルは未着手**
+        - `docs/Problem/ProblemReport_20260921.md`の着手
+            - アクセルの操作がバタバタする問題
+            
+        - `docs/Problem/ProblemReport_20260919_2.md`で人間の運転が再現できているか確認する
+        - C5で再走行して問題がないことを確認
+        - 手順4へ
 
 4. Kpのみの適合
+    `tests/research/results/report20260912_KAIZEN_process2,3.md`に沿って進める
+    
+
     本番環境のPID適合用モードパターンを流用してKpのみ適合(10回まで走行可。その中で一番車速追従精度の良い値を採用する)\
     適合中は手順2までで保存したパラメータを使って良い。手順2までで保存したパラメータの設定変更は不可
     アクセル用のKpとブレーキ用のKpを設定すること
@@ -169,6 +190,9 @@ FF + PID
     **実行手順**
         - 手順1 → 走行前チェック → 手順4
 5. FF + Kpでモード走行
+    `tests/research/results/report20260912_KAIZEN_process2,3.md`に沿って進める
+    **ここでC1とC5どちらを採用するか決める**
+
     走行モード管理に保存されているWLTP(Low,Mid,Hi,ExHi)1800sのモードを走行
     結果を`results/`に0.1s刻みのcsvとして保存。収集するデータは本番環境のログを流用
     - **reportYYYYMMDD_RunFF&Kp.md**として文、表、図を用いてわかりやすくレポートを作成すること\

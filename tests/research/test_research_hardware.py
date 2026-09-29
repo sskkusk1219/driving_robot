@@ -10,11 +10,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.domain.pre_check import HOME_POSITION_TOLERANCE_PULSE, UPS_MIN_BATTERY_PCT
-from src.infra.actuator_driver import acmd_for_move
 from tests.research import config as cfgmod
 from tests.research import hardware as hwmod
 from tests.research import main as mainmod
+from tests.research.actuator_driver import acmd_for_move
 from tests.research.axis_monitor import (
     DSS1_PEND,
     DSS1_SV,
@@ -22,6 +21,7 @@ from tests.research.axis_monitor import (
     MONITOR_REGISTER_COUNT,
     AxisMonitor,
 )
+from tests.research.pre_check import HOME_POSITION_TOLERANCE_PULSE, UPS_MIN_BATTERY_PCT
 from tests.research.research_actuator import ResearchActuatorDriver
 
 

@@ -28,8 +28,6 @@ from typing import Any
 
 import numpy as np
 
-from src.domain.control.conversions import VEHICLE_STOP_SPEED_KMH
-from src.models.profile import FeedforwardParams, coast_decel_at
 from tests.research.config import ResearchConfig, load_config
 from tests.research.drive_log import (
     SECTION_MODE_DRIVE,
@@ -39,7 +37,18 @@ from tests.research.drive_log import (
     pid_effort,
     total_effort,
 )
-from tests.research.kpi import KpiResult, compute_kpi, sample_interval_s
+from tests.research.kpi import (
+    CHATTER_BAND_HZ,
+    CHATTER_HOLD_TOL_PCT,
+    CHATTER_WINDOW_S,
+    SMOOTH_CUTOFF_HZ,
+    KpiResult,
+    chatter_metrics,
+    compute_kpi,
+    sample_interval_s,
+    speed_band_label,
+    speed_band_order,
+)
 from tests.research.live_plot import (
     COLOR_ACCEL,
     COLOR_ACTUAL,
@@ -50,6 +59,7 @@ from tests.research.live_plot import (
     save_drive_figure,
 )
 from tests.research.mode_drive import standby_label
+from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, FeedforwardParams, coast_decel_at
 from tests.research.term import say
 from tests.research.vehicle import feedforward_params
 
@@ -61,7 +71,6 @@ STATE_ACCEL = "加速"
 STATE_CRUISE = "定速"
 STATE_DECEL = "減速"
 STATES = (STATE_STOP, STATE_ACCEL, STATE_CRUISE, STATE_DECEL)
-SPEED_BANDS_KMH = (0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 1000.0)
 ZOOM_HALF_WINDOW_S = 20.0
 TOP_EPISODES = 10
 COLOR_DEV = "#5a6fd6"
@@ -219,17 +228,6 @@ def group_stats(
             over_limit_s=float(np.count_nonzero(np.abs(dev) > limit_kmh)) * dt,
         ))
     return out
-
-
-def speed_band_label(ref_kmh: float) -> str:
-    for lo, hi in zip(SPEED_BANDS_KMH, SPEED_BANDS_KMH[1:], strict=False):
-        if ref_kmh < hi:
-            return f"{lo:.0f}〜{hi:.0f}" if hi < 1000 else f"{lo:.0f}〜"
-    return ""
-
-
-def speed_band_order() -> list[str]:
-    return [speed_band_label(lo) for lo in SPEED_BANDS_KMH[:-1]]
 
 
 # ブレーキ寄与の判定（2026-09-13 手順3 でブレーキ軸の電流が脱落し、指令は出続けたが制動が
@@ -550,6 +548,10 @@ def write_mode_report(
     pedal = pedal_stats(
         rows, ff.accel_deadband_pct, ff.brake_deadband_pct, feedforward_params(cfg)
     )
+    chatter = chatter_metrics(
+        t, [r.ref_kmh for r in rows], [r.actual_kmh for r in rows],
+        [r.accel_pct for r in rows], [r.brake_pct for r in rows], [r.phase for r in rows], k,
+    )
     state_at = dict(zip(t, state_keys, strict=True))
 
     say(f"レポートの図を作成します: {fig_dir}/ …")
@@ -574,6 +576,10 @@ def write_mode_report(
         status = "完走"
     reversal_at = (
         f"（t={kpi.reversal_max_t_s:.1f}s）" if kpi.reversal_max_t_s is not None else ""
+    )
+    pedal_ok = (
+        chatter.pedal_reversal_per_s <= k.pedal_reversal_limit_per_s
+        and chatter.pedal_reversal_window_max_per_s <= k.pedal_reversal_window_limit_per_s
     )
 
     md: list[str] = [
@@ -600,9 +606,19 @@ def write_mode_report(
                 (f"符号反転（±{k.reversal_band_kmh:g} km/h を両側で超えた往復）",
                  f"≤ {k.reversal_limit_per_window:g} 回/{k.reversal_window_s:g}s",
                  f"{kpi.reversal_max_per_window} 回{reversal_at}", _ok(kpi.reversal_ok)),
+                (f"ペダル操作の滑らかさ（アクセル指令が {k.pedal_reversal_hyst_pct:g}% 以上"
+                 "戻った往復）",
+                 f"全体 ≤ {k.pedal_reversal_limit_per_s:g} 回/s かつ "
+                 f"{k.pedal_reversal_window_s:g}s ごとの最大 "
+                 f"≤ {k.pedal_reversal_window_limit_per_s:g} 回/s",
+                 f"全体 {chatter.pedal_reversal_per_s:.2f} 回/s・"
+                 f"{k.pedal_reversal_window_s:g}s ごとの最大 "
+                 f"{chatter.pedal_reversal_window_max_per_s:.2f} 回/s", _ok(pedal_ok)),
             ],
         ),
         "",
+        "- ペダル操作の滑らかさは上の 3 項目の総合判定・満たした項目数には含めず、別枠で判定する"
+        "（ProblemReport_20260921 手順3）。",
         f"- 判定は MODE_DRIVE の 0.1s 刻みの行（{kpi.n_samples} 行、CSV と同じ）で計算"
         "（`tests/research/kpi.py`、定義は本番 `kpi_monitor.py` と同じ）。",
         "",
@@ -718,6 +734,26 @@ def write_mode_report(
                 ("減速G ガバナー作動", f"{pedal.governor_s:.1f}s"),
                 ("ブレーキ寄与ほぼ0（指令はあるが惰行カーブ相当しか効いていない）",
                  f"{pedal.brake_ineffective_s:.1f}s"),
+                (f"ばたつき（実車速 {CHATTER_BAND_HZ[0]:g}〜{CHATTER_BAND_HZ[1]:g}Hz の帯 RMS・"
+                 f"{CHATTER_WINDOW_S:g}s 窓の中央値）",
+                 f"{chatter.speed_band_rms_kmh:.3f} km/h"),
+                ("　同じ帯の基準車速（比較用）", f"{chatter.ref_band_rms_kmh:.3f} km/h"),
+                ("　アクセル指令の帯 RMS", f"{chatter.accel_band_rms_pct:.3f} %"),
+                ("　卓越周波数", f"{chatter.dominant_hz:.2f} Hz"),
+                (f"アクセル指令の往復（{k.pedal_reversal_hyst_pct:g}% 以上戻ったら 1 回）",
+                 f"全体 {chatter.pedal_reversal_per_s:.2f} 回/s・"
+                 f"{k.pedal_reversal_window_s:g}s ごとの最大 "
+                 f"{chatter.pedal_reversal_window_max_per_s:.2f} 回/s"),
+                ("アクセル指令の方向反転（しきい値なし・参考）",
+                 f"{chatter.accel_reversals_per_s:.2f} 回/s"
+                 f"（総移動 {chatter.accel_travel_pct:.0f}%）"),
+                ("ブレーキ指令の方向反転",
+                 f"{chatter.brake_reversals_per_s:.2f} 回/s"
+                 f"（総移動 {chatter.brake_travel_pct:.0f}%）"),
+                (f"アクセル開度を ±{CHATTER_HOLD_TOL_PCT:g}% で保てた時間",
+                 f"中央値 {chatter.hold_median_s:.2f}s / p90 {chatter.hold_p90_s:.2f}s"),
+                (f"偏差から {SMOOTH_CUTOFF_HZ:g}Hz 超を除いたときの符号反転",
+                 f"{chatter.reversal_smoothed} 回（生 {chatter.reversal_raw} 回）"),
             ],
         ),
         "",

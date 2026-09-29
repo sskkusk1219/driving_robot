@@ -39,18 +39,104 @@ def test_p95_above_hard_limit_is_rejected() -> None:
     assert any("max_abs_deviation_kmh" in p for p in problems)
 
 
+def test_pedal_reversal_kpi_settings_are_validated() -> None:
+    cfg = _load_default()
+    assert not any("pedal_reversal" in p for p in cfgmod.validate_config(cfg))
+    cfg.kpi.pedal_reversal_window_limit_per_s = cfg.kpi.pedal_reversal_limit_per_s - 0.1
+    assert any("pedal_reversal_window_limit_per_s" in p for p in cfgmod.validate_config(cfg))
+    cfg = _load_default()
+    cfg.kpi.pedal_reversal_min_window_s = cfg.kpi.pedal_reversal_window_s + 1.0
+    assert any("pedal_reversal_min_window_s" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_features_section_is_case_a_and_validated() -> None:
+    """手順5-1 案A: dv_0.5 を外し、過去は素の past_speeds。設定の不整合は検証で落ちる。"""
+    cfg = _load_default()
+    spec = cfg.features.to_feature_spec()
+    assert "dv_0.5" not in spec.feature_names()
+    assert spec.feature_names()[-2:] == ["past_0.5", "past_1.0"]
+    assert cfgmod.validate_config(cfg) == []
+
+    cfg.features.use_h1 = False  # レジーム判定に使うので外せない
+    assert any("use_h1" in p for p in cfgmod.validate_config(cfg))
+    cfg.features.use_h1 = True
+    cfg.features.p1_s = 2.0  # 過去が昇順でない
+    assert any("p1_s" in p for p in cfgmod.validate_config(cfg))
+    cfg.features.p1_s = 0.5
+    cfg.features.h2_s = 0.8  # 先読みが昇順でない
+    assert any("features" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_search_grid_matches_min_max_step() -> None:
+    """手順6: ホライズン自動選択の探索格子。0.1刻みの浮動小数丸め誤差が出ないこと。"""
+    ft = cfgmod.FeaturesSection(search_min_s=0.1, search_max_s=1.0, search_step_s=0.1)
+    grid = ft.search_grid()
+    assert grid == pytest.approx(tuple(round(0.1 * i, 1) for i in range(1, 11)))
+
+
+def test_search_grid_excludes_below_min_horizon() -> None:
+    ft = cfgmod.FeaturesSection(
+        search_min_s=0.1, search_max_s=1.0, search_step_s=0.1, search_min_horizon_s=0.5
+    )
+    grid = ft.search_grid()
+    assert min(grid) == pytest.approx(0.5)
+    assert 0.3 not in [round(g, 1) for g in grid]
+
+
+def test_search_grid_rejects_nonpositive_step() -> None:
+    ft = cfgmod.FeaturesSection(search_step_s=0.0)
+    with pytest.raises(ValueError, match="search_step_s"):
+        ft.search_grid()
+
+
+def test_default_config_has_horizon_search_settings_validated() -> None:
+    """同梱の config_testVehicle.yaml の探索パラメータ（手順6）はそのまま検証を通る。"""
+    cfg = _load_default()
+    assert cfgmod.validate_config(cfg) == []
+    assert cfg.features.search_max_s > cfg.features.search_min_s
+    assert len(cfg.features.search_grid()) > 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("search_min_s", 0.0, "search_min_s"),
+        ("search_step_s", -0.1, "search_step_s"),
+        ("search_max_horizons", 0, "search_max_horizons"),
+        ("search_min_improvement", 1.0, "search_min_improvement"),
+        ("search_min_improvement", -0.1, "search_min_improvement"),
+        ("search_min_horizon_s", -1.0, "search_min_horizon_s"),
+        ("search_cv_splits", 1, "search_cv_splits"),
+    ],
+)
+def test_horizon_search_settings_out_of_range_are_rejected(
+    field: str, value: float, match: str
+) -> None:
+    cfg = _load_default()
+    setattr(cfg.features, field, value)
+    problems = cfgmod.validate_config(cfg)
+    assert any(match in p for p in problems), problems
+
+
+def test_search_max_s_must_exceed_search_min_s() -> None:
+    cfg = _load_default()
+    cfg.features.search_max_s = cfg.features.search_min_s
+    problems = cfgmod.validate_config(cfg)
+    assert any("search_max_s" in p for p in problems)
+
+
 def test_unknown_candidate_is_rejected() -> None:
     cfg = _load_default()
     # candidate の既定値は config_testVehicle.yaml（ユーザーが書き換えるファイル）依存なので
-    # 決め打ちせず、C9 を弾き C5・C6 を通すことだけを主題にする
+    # 決め打ちせず、C9・C6 を弾き C5 を通すことだけを主題にする
     assert cfg.feedforward.candidate in cfgmod.CANDIDATE_NAMES
     cfg.feedforward.candidate = "C9"
     problems = cfgmod.validate_config(cfg)
     assert any("candidate" in p for p in problems)
     cfg.feedforward.candidate = "C5"
     assert not any("candidate" in p for p in cfgmod.validate_config(cfg))
-    cfg.feedforward.candidate = "C6"  # 2026-09-15 追加（骨格を実測テーブルにする案）
-    assert not any("candidate" in p for p in cfgmod.validate_config(cfg))
+    cfg.feedforward.candidate = "C6"  # 2026-09-25 段4 で削除（骨格を定速階段にする案）
+    assert any("candidate" in p for p in cfgmod.validate_config(cfg))
 
 
 def test_curve_length_mismatch_is_rejected() -> None:
@@ -242,140 +328,33 @@ def test_pedal_search_creep_keys_validate() -> None:
     assert cfgmod.validate_config(cfg) == []
 
 
-def test_learning_offsets_are_validated() -> None:
+def test_gain_min_offsets_are_validated() -> None:
     cfg = _load_default()
-    cfg.learning.brake_hold_offsets_pct = [1.0, 0.5]  # 昇順でない
-    assert any("brake_hold_offsets_pct" in p for p in cfgmod.validate_config(cfg))
-    cfg.learning.brake_hold_offsets_pct = [0.5, 1.0]
-    cfg.learning.cruise_trim_offsets_pct = []  # 空
-    assert any("cruise_trim_offsets_pct" in p for p in cfgmod.validate_config(cfg))
-    cfg.learning.cruise_trim_offsets_pct = [1.0]
     cfg.learning.brake_gain_min_offset_pct = 0.0  # 正値でない
     assert any("brake_gain_min_offset_pct" in p for p in cfgmod.validate_config(cfg))
 
 
-def test_added_pattern_settings_are_validated() -> None:
-    """A2・A5 の追加段: 空リストは可（足さない）、昇順でないと不可、開始車速は 0〜最高速。"""
-    cfg = _load_default()
-    assert cfg.learning.accel_sweep_add_offsets_pct == [2.0, 5.0, 8.0]
-    assert cfg.learning.brake_hold_low_offsets_pct == [0.5, 2.0, 4.0]
-    assert cfg.learning.brake_hold_low_start_kmh == 60.0
-    # timeout_s は本テストの主題（A2・A5 の追加段）と無関係かつ運用で変わる値なので assert しない
-    cfg.learning.accel_sweep_add_offsets_pct = []
-    cfg.learning.brake_hold_low_offsets_pct = []
-    assert cfgmod.validate_config(cfg) == []
-    cfg.learning.accel_sweep_add_offsets_pct = [5.0, 2.0]
-    assert any("accel_sweep_add_offsets_pct" in p for p in cfgmod.validate_config(cfg))
-    cfg.learning.accel_sweep_add_offsets_pct = [2.0]
-    cfg.learning.brake_hold_low_start_kmh = cfg.vehicle.max_speed_kmh
-    assert any("brake_hold_low_start_kmh" in p for p in cfgmod.validate_config(cfg))
-
-
-def test_cruise_hold_settings_are_validated() -> None:
-    """2026-09-14 定速階段（段2）: 空リストは可、車速は 0〜最高速の昇順、ゲイン・時定数は正値。"""
+def test_sample_weight_settings_are_validated() -> None:
+    """段2（ProblemReport_20260925。学習サンプルの WLTP 重み付け）: 既定は無効（後方互換）、
+    範囲は 0 < min <= 1 <= max。"""
     cfg = _load_default()
     lr = cfg.learning
-    # 2026-09-21 の `10,0` タイプミス修正（10.0 の欠落を戻す）と 140.0 km/h 追加で
-    # 10 段（10〜140、10 km/h 刻み）に更新
-    assert lr.cruise_hold_speeds_kmh == [
-        10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0,
-        100.0, 110.0, 120.0, 130.0, 140.0,
-    ]
+    assert lr.sample_weight_enabled is False
+    assert (lr.sample_weight_min, lr.sample_weight_max) == (0.2, 5.0)
     assert cfgmod.validate_config(cfg) == []
 
-    def problems_about(key: str) -> bool:
-        return any(key in p for p in cfgmod.validate_config(cfg))
+    lr.sample_weight_min = 0.0  # 0 < min でなければならない
+    assert any("sample_weight" in p for p in cfgmod.validate_config(cfg))
 
-    lr.cruise_hold_speeds_kmh = []
-    assert cfgmod.validate_config(cfg) == []  # 空は可（足さない）
-    lr.cruise_hold_speeds_kmh = [40.0, 30.0]  # 昇順でない
-    assert problems_about("cruise_hold_speeds_kmh")
-    lr.cruise_hold_speeds_kmh = [30.0, cfg.vehicle.max_speed_kmh]  # 最高速以上
-    assert problems_about("cruise_hold_speeds_kmh")
-    lr.cruise_hold_speeds_kmh = [30.0, 40.0]
+    lr.sample_weight_min = 1.5  # min <= 1 でなければならない
+    assert any("sample_weight" in p for p in cfgmod.validate_config(cfg))
 
-    lr.cruise_hold_settle_tol_kmh = 0.0
-    assert problems_about("cruise_hold_settle_tol_kmh")
-    lr.cruise_hold_settle_tol_kmh = 1.0
-    lr.cruise_hold_settle_s = 0.0
-    assert problems_about("cruise_hold_settle_s")
-    lr.cruise_hold_settle_s = 3.0
-    lr.cruise_hold_hold_s = 0.0
-    assert problems_about("cruise_hold_hold_s")
-    lr.cruise_hold_hold_s = 8.0
-    lr.cruise_hold_step_timeout_s = 0.0
-    assert problems_about("cruise_hold_step_timeout_s")
-    lr.cruise_hold_step_timeout_s = 30.0
-    lr.cruise_hold_kp = 0.0
-    assert problems_about("cruise_hold_kp")
-    lr.cruise_hold_kp = 0.3
-    lr.cruise_hold_ki = -0.1
-    assert problems_about("cruise_hold_ki")
-    lr.cruise_hold_ki = 0.05
-    lr.cruise_hold_max_rate_pct_per_s = 0.0
-    assert problems_about("cruise_hold_max_rate_pct_per_s")
-    lr.cruise_hold_max_rate_pct_per_s = 1.0
-    lr.cruise_hold_initial_offset_pct = -1.0
-    assert problems_about("cruise_hold_initial_offset_pct")
-    lr.cruise_hold_initial_offset_pct = 7.0
-    assert cfgmod.validate_config(cfg) == []
+    lr.sample_weight_min = 0.2
+    lr.sample_weight_max = 0.5  # 1 <= max でなければならない
+    assert any("sample_weight" in p for p in cfgmod.validate_config(cfg))
 
-
-def test_cruise_hold_speeds_typo_with_zero_is_rejected() -> None:
-    """2026-09-21 の回帰: `10,0`（カンマ）が `10.0` の誤入力で
-
-    cruise_hold_speeds_kmh が [10.0, 0.0, 20.0, ...] になり、定速階段が
-    2 段目（0.0 km/h）で終わって 30〜130 km/h の定速保持の学習行が pkl から
-    丸ごと抜けた。0 を含む・昇順でないリストを検証で必ず弾く。
-    """
-    cfg = _load_default()
-    lr = cfg.learning
-    lr.cruise_hold_speeds_kmh = [10.0, 0.0, 20.0]
-    problems = cfgmod.validate_config(cfg)
-    assert any("cruise_hold_speeds_kmh" in p for p in problems)
-
-    lr.cruise_hold_speeds_kmh = [10.0, 20.0, 140.0]
-    cfg.vehicle.max_speed_kmh = 150.0
-    problems = cfgmod.validate_config(cfg)
-    assert not any("cruise_hold_speeds_kmh" in p for p in problems)
-
-
-def test_a3a4_settings_are_validated() -> None:
-    """A3・A4: 空リストは可、階段は降順・高ブレーキは昇順、開始車速は 0〜最高速。"""
-    cfg = _load_default()
-    lr = cfg.learning
-    assert (lr.trim_stair_start_kmh, lr.trim_stair_offsets_pct, lr.trim_stair_step_s) == (
-        [120.0, 90.0, 50.0], [8.0, 5.0, 2.0], 8.0
-    )
-    assert lr.brake_hold_hard_offsets_pct == [7.0, 17.0, 27.0, 37.0]
-    assert (lr.brake_hold_hard_start_kmh, lr.brake_hold_hard_accel_offset_pct) == (20.0, 8.0)
-
-    def problems_about(key: str) -> bool:
-        return any(key in p for p in cfgmod.validate_config(cfg))
-
-    lr.trim_stair_start_kmh, lr.trim_stair_offsets_pct = [], []
-    lr.brake_hold_hard_offsets_pct = []
-    assert cfgmod.validate_config(cfg) == []
-    lr.trim_stair_start_kmh = [120.0]
-    assert problems_about("trim_stair_offsets_pct も要る")
-    lr.trim_stair_offsets_pct = [2.0, 8.0]
-    assert problems_about("trim_stair_offsets_pct は")
-    lr.trim_stair_offsets_pct = [8.0, 2.0]
-    lr.trim_stair_start_kmh = [cfg.vehicle.max_speed_kmh]
-    assert problems_about("trim_stair_start_kmh")
-    lr.trim_stair_start_kmh = [120.0]
-    lr.trim_stair_step_s = 0.0
-    assert problems_about("trim_stair_step_s")
-    lr.trim_stair_step_s = 8.0
-    lr.brake_hold_hard_offsets_pct = [17.0, 7.0]
-    assert problems_about("brake_hold_hard_offsets_pct")
-    lr.brake_hold_hard_offsets_pct = [7.0]
-    lr.brake_hold_hard_start_kmh = 0.0
-    assert problems_about("brake_hold_hard_start_kmh")
-    lr.brake_hold_hard_start_kmh = 20.0
-    lr.brake_hold_hard_accel_offset_pct = 0.0
-    assert problems_about("brake_hold_hard_accel_offset_pct")
-    lr.brake_hold_hard_accel_offset_pct = 8.0
+    lr.sample_weight_min = 1.0
+    lr.sample_weight_max = 1.0  # 境界（min=1=max）は合格
     assert cfgmod.validate_config(cfg) == []
 
 
@@ -392,16 +371,17 @@ def test_creep_launch_settings_are_validated() -> None:
     """
     cfg = _load_default()
     lr = cfg.learning
-    assert lr.creep_launch_count == 3
+    # 2026-09-27 段7a（ProblemReport_20260925 段7）: 手順2 の計測効率化のため 3→0
+    assert lr.creep_launch_count == 0
     assert lr.creep_launch_target_kmh == 15.0
     assert lr.creep_launch_timeout_s == 60.0
     assert lr.creep_launch_settle_kmhs == 0.1
     assert lr.creep_launch_settle_s == 2.0
     assert lr.creep_launch_min_speed_kmh == 1.0
     assert lr.creep_launch_settle_min_s == 5.0
-    # 2026-09-18 段4改訂: 17%（浮く）と23.4%（止まる）の間が未測定だったので、
-    # 不感帯+6〜+12%（=18〜24%）を足して停止境界をはさむ形に更新
-    assert lr.creep_brake_hold_offsets_pct == [0.5, 1.5, 3.0, 5.0, 6.0, 8.0, 10.0, 11.0, 12.0]
+    # 2026-09-25 段4: 「不感帯 + frac × (停車保持開度 − 不感帯)」の frac 列（1.0 = 停車保持開度）。
+    # 修理後の実測（不感帯 7.26・停車保持 18.63）で +0.6〜+11.4% になり、停止境界をはさむ
+    assert lr.creep_brake_hold_fracs == [0.05, 0.15, 0.25, 0.45, 0.55, 0.7, 0.9, 1.0]
     assert lr.creep_curve_bin_kmh == 1.0
     assert lr.creep_curve_min_bin_samples == 5
     assert cfgmod.validate_config(cfg) == []
@@ -412,7 +392,7 @@ def test_creep_launch_settings_are_validated() -> None:
     lr.creep_launch_count = -1
     assert problems_about("creep_launch_count")
     lr.creep_launch_count = 0
-    lr.creep_brake_hold_offsets_pct = []
+    lr.creep_brake_hold_fracs = []
     assert cfgmod.validate_config(cfg) == []  # 両方 0/空でも可（足さない）
 
     lr.creep_launch_target_kmh = 0.0
@@ -443,9 +423,13 @@ def test_creep_launch_settings_are_validated() -> None:
     assert problems_about("creep_launch_settle_min_s")
     lr.creep_launch_settle_min_s = 5.0
 
-    lr.creep_brake_hold_offsets_pct = [1.5, 0.5]  # 昇順でない
-    assert problems_about("creep_brake_hold_offsets_pct")
-    lr.creep_brake_hold_offsets_pct = [0.5, 1.5]
+    lr.creep_brake_hold_fracs = [0.5, 0.2]  # 昇順でない
+    assert problems_about("creep_brake_hold_fracs")
+    lr.creep_brake_hold_fracs = [0.0, 0.5]  # 0 は不可（0<frac<=1.2）
+    assert problems_about("creep_brake_hold_fracs")
+    lr.creep_brake_hold_fracs = [0.5, 1.3]  # 停車保持開度の 1.2 倍を超える
+    assert problems_about("creep_brake_hold_fracs")
+    lr.creep_brake_hold_fracs = [0.2, 0.5]
 
     lr.creep_curve_bin_kmh = 0.0
     assert problems_about("creep_curve_bin_kmh")
@@ -454,48 +438,6 @@ def test_creep_launch_settings_are_validated() -> None:
     lr.creep_curve_min_bin_samples = 0
     assert problems_about("creep_curve_min_bin_samples")
     lr.creep_curve_min_bin_samples = 5
-    assert cfgmod.validate_config(cfg) == []
-
-
-def test_low_open_stair_settings_are_validated() -> None:
-    """2026-09-19 低開度階段（段3-1。ProblemReport_20260919 候補(c)）の新設定。
-
-    offsets は空でも可（足さない）・0<pct<=100 の昇順リスト。step_s は正値。
-    start_kmh は 0〜最高速。min_speed_kmh は 0 以上 start_kmh 未満。
-    """
-    cfg = _load_default()
-    lr = cfg.learning
-    assert lr.low_open_stair_offsets_pct == [0.5, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0]
-    assert lr.low_open_stair_descend is True
-    assert lr.low_open_stair_step_s == 8.0
-    assert lr.low_open_stair_start_kmh == 4.5
-    assert lr.low_open_stair_min_speed_kmh == 2.0
-    assert cfgmod.validate_config(cfg) == []
-
-    def problems_about(key: str) -> bool:
-        return any(key in p for p in cfgmod.validate_config(cfg))
-
-    lr.low_open_stair_offsets_pct = []
-    assert cfgmod.validate_config(cfg) == []  # 空は可（足さない）
-    lr.low_open_stair_offsets_pct = [1.0, 0.5]  # 昇順でない
-    assert problems_about("low_open_stair_offsets_pct")
-    lr.low_open_stair_offsets_pct = [0.5, 1.0]
-
-    lr.low_open_stair_step_s = 0.0
-    assert problems_about("low_open_stair_step_s")
-    lr.low_open_stair_step_s = 8.0
-
-    lr.low_open_stair_start_kmh = 0.0
-    assert problems_about("low_open_stair_start_kmh")
-    lr.low_open_stair_start_kmh = cfg.vehicle.max_speed_kmh
-    assert problems_about("low_open_stair_start_kmh")
-    lr.low_open_stair_start_kmh = 4.5
-
-    lr.low_open_stair_min_speed_kmh = -1.0
-    assert problems_about("low_open_stair_min_speed_kmh")
-    lr.low_open_stair_min_speed_kmh = lr.low_open_stair_start_kmh  # start_kmh 未満でなければ不可
-    assert problems_about("low_open_stair_min_speed_kmh")
-    lr.low_open_stair_min_speed_kmh = 2.0
     assert cfgmod.validate_config(cfg) == []
 
 
@@ -805,3 +747,29 @@ def test_invalid_config_returns_exit_code_2(
     cfg.save({"vehicle.max_decel_g": 2.5})
     assert mainmod.main(["--only", "0", "--config", str(path)]) == 2
     assert "max_decel_g" in capsys.readouterr().out
+
+
+def test_coverage_mode_names_are_validated() -> None:
+    cfg = _load_default()
+    assert cfg.modes.coverage_mode_names  # 既定は空でない
+    assert not any("coverage_mode_names" in p for p in cfgmod.validate_config(cfg))
+    for bad in ([], ["01_WLTP_Low,Mid,Hi,ExHi", "01_WLTP_Low,Mid,Hi,ExHi"], [" "]):
+        cfg.modes.coverage_mode_names = bad
+        assert any("coverage_mode_names" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_default_coverage_modes_and_grid_edges_include_us06_range() -> None:
+    from tests.research.config import LearningSection, ModesSection
+
+    assert ModesSection().coverage_mode_names == ["01_WLTP_Low,Mid,Hi,ExHi"]
+    edges = LearningSection().grid_accel_edges_kmhs
+    assert edges[0] == -14.0 and edges[-1] == 14.0  # max_decel_g 0.4G ≒ 14.1 km/h/s
+
+
+def test_grid_hole_wltp_min_s_key_is_gone(tmp_path: Path) -> None:
+    """しきい値は 1 ステップで測れる長さ（窓 − 頭の除外）から自動で決まる。旧キーは未知キー。"""
+    path = tmp_path / "cfg.yaml"
+    path.write_text("learning:\n  grid_hole_wltp_min_s: 5.0\n", encoding="utf-8")
+    with pytest.raises(cfgmod.ConfigError, match="grid_hole_wltp_min_s"):
+        cfgmod.load_config(path)
+    assert cfgmod.LearningSection().grid_target_min_s == pytest.approx(2.5)

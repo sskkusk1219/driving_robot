@@ -12,12 +12,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from src.models.drive_log import DriveLog
-from src.models.profile import FeedforwardParams
 from tests.research import config as cfgmod
 from tests.research import hardware as hwmod
 from tests.research import pedal_gain as pgmod
 from tests.research.ff_params import ResearchFFParams
+from tests.research.research_types import DriveLog, FeedforwardParams
 from tests.research.vehicle import feedforward_params, opening_to_pulse
 
 # 既定の config_testVehicle.yaml と同じクリープ域ビン化パラメータ

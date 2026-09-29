@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from src.models.drive_log import DriveLogData
 from tests.research import debug_a7 as a7
 from tests.research import drive_log as dlmod
 from tests.research.axis_monitor import AxisMonitor
+from tests.research.research_types import DriveLogData
 from tests.research.vehicle import opening_to_pulse
 
 

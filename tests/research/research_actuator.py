@@ -23,7 +23,7 @@ pymodbus を要するので、`hardware.build_hardware` の実機側でだけ遅
 
 from __future__ import annotations
 
-from src.infra.actuator_driver import ActuatorDriver, acmd_for_move
+from tests.research.actuator_driver import ActuatorDriver, acmd_for_move
 from tests.research.axis_monitor import (
     MONITOR_REGISTER_COUNT,
     MONITOR_START_REGISTER,

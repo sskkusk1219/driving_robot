@@ -5,6 +5,19 @@
 ここでは **FF → PID → ペダル調停 → ペダル** だけの単純な系を組み、手順を 1 つずつ足しながら
 プライマリー KPI（最大逸脱 ≤1.0 km/h・p95 ≤0.4 km/h・符号反転 ≤1回/5s）の達成度を測る。
 
+**`tests/research` は `src/` に依存しない**（`src/` を丸ごと削除しても動く。2026-09-24 ProblemReport_20260924）。
+本番から持ち込んだ部品は次のファイルに写してあり、本番との対応は各ファイル先頭の「移植元」に書いてある。
+`test_research_no_src_import.py` が `src` の import が 1 つも無いことを毎回確かめる。
+
+| 持ち込んだもの | ファイル（移植元） |
+|---|---|
+| 型・定数・小さな純関数 | `research_types.py`（`src/models/*`、`conversions`、`pedal_safety`、`utils/time`） |
+| 学習パターン生成 | `learning_patterns.py`（`src/domain/learning_drive.py`） |
+| 物理定数推定 | `dynamics_estimation.py`（`src/domain/model_training.py` の `estimate_dynamics_params` 系） |
+| FF 推論・特徴量 | `ff_model.py`（`model_training` の特徴量・`FeedforwardController.predict_effort`） |
+| 走行前チェック | `pre_check.py`（`src/domain/pre_check.py`） |
+| アクチュエータ・CAN・UPS・設定 | `actuator_driver.py`・`can_reader.py`・`ups_monitor.py`・`app_settings.py`（`src/infra/*`。そのままコピー） |
+
 ## ファイル
 
 | ファイル | 役割 |
@@ -16,7 +29,11 @@
 | `pre_drive_check.py` | 走行前チェック（手順 1 と手順 2 の間。本番 `PreCheckRunner` ＋ブレーキを小刻みに踏んで停止確認） |
 | `vehicle.py` | 開度の定義（原点 = 0%、9500 pulse = 100%）と YAML → 本番 `VehicleProfile` への変換 |
 | `pedal_search.py` | ペダル探索（手順 2-0。不感帯と停車保持開度を車速応答で測る） |
-| `pattern_drive.py` | パターン走行 → 2次多項式 FF モデル作成（手順 2。本番から引用） |
+| `pattern_drive.py` | パターン走行 → 2次多項式 FF モデル作成（手順 2。`build_patterns` が新しいパターン列を組む） |
+| `grid_planner.py` / `grid_patterns.py` | 格子ステップ走行（狙いの列・開度・感度の更新・打ち切り・強いステップの助走／モード集計 → パターン列） |
+| `grid_settle.py` | 落ち着き待ち・ステップの傾きの当てはめの集計（2-1 の終わりに表示。許容幅・待ち時間を実機データで決め直す材料） |
+| `grid_stub_run.py` | 格子ステップ走行・手順 2 全体をスタブで走らせる動作確認 CLI（`--full`） |
+| `wltp_grid.py` | モード（`modes.coverage_mode_names` の合成）の車速 × 加速度の網羅マップ（手順 2 の CSV がどれだけ覆うか） |
 | `pedal_gain.py` | ペダルゲイン推定（手順 2-2。本番の計算で、使うサンプルのしきい値だけ「不感帯 + α%」に変える） |
 | `coast_curve.py` | 惰行減速カーブの低速端の再同定（段2.5。低速だけ細ビンにする） |
 | `creep_curve.py` | クリープ加速カーブの推定（段1） |
@@ -81,7 +98,7 @@
 ## 初期化シーケンス（手順 1）
 
 本番 `src/app/robot_controller.py` の `start()` + `initialize()`、判定しきい値は
-`src/domain/pre_check.py` から引用している。1 項目でも NG なら走行に進まない。
+`pre_check.py`（本番 `src/domain/pre_check.py` の移植）から引用している。1 項目でも NG なら走行に進まない。
 
 | # | 項目 | 内容 / 判定 | `checks.*` |
 |---|---|---|---|
@@ -105,8 +122,8 @@
 
 実行順は **手順 1（初期化）→ 走行前チェック → 手順 2 以降（走行）**。走行する手順の最初の 1 つの前に
 自動で 1 回だけ行う（`--dry-run` / `--list` にも表示される）。本番 `RobotController` の arm と同じ 3 段で、
-判定は本番 `src/domain/pre_check.py` の `PreCheckRunner` をそのまま使う。
-場所は`src/domain/control/conversions.py` 変数名`VEHICLE_STOP_SPEED_KMH: float = XXX`
+判定は `pre_check.py` の `PreCheckRunner`（本番 `src/domain/pre_check.py` の移植）をそのまま使う。
+場所は`research_types.py` 変数名`VEHICLE_STOP_SPEED_KMH: float = XXX`
 
 | # | 段 | 内容 / 判定 | `checks.*` |
 |---|---|---|---|
@@ -126,15 +143,16 @@
 
 ## パターン走行 → FF モデル作成（手順 2）
 
-最初にペダル探索（2-0）で不感帯と停車保持開度を測り、そのあと本番の学習運転パターンを走る。
-パターン生成・モデル学習は本番の関数をそのまま呼ぶが、走行ループ自体は `pattern_loop.py` に
-アルゴリズムを移植した自前実装（`PatternLoop`）で、本番 `LearningLoop` クラスは実行しない
-（`/src` の本番コードを実行しないという遵守事項に対応）。
+最初にペダル探索（2-0）で不感帯と停車保持開度を測り、そのあと「車両に依らない測定パターン」
+（コーストダウン → 格子ステップ走行 → クリープ。2026-09-25 段4）を走る。
+物理定数推定は本番の関数を移植したもの（`dynamics_estimation.py`）を呼び、
+走行ループ自体は `pattern_loop.py` にアルゴリズムを移植した自前実装（`PatternLoop`）。
+`/src` の本番コードは import も実行もしない。
 
 | 段 | 内容 | 引用元 |
 |---|---|---|
 | 2-0 探索 | クリープ中に 0.5mm ずつ踏み、アクセル/ブレーキの不感帯と停止確認開度を測る → 停止確認 +10% で停車保持 | 研究用（下記） |
-| 2-1 走行 | パターン列（クリープ・不感帯プローブ・加速スイープ・定常ブレーキ・コーストダウン・高速巡航トリム）を 100ms 周期で実行。不感帯プローブ・定常ブレーキ・巡航トリムの開度は 2-0 の不感帯 + offset | `LearningDriveManager.generate_patterns` / `pattern_loop.PatternLoop`（`LearningLoop` のアルゴリズムを移植） |
+| 2-1 走行 | パターン列を 100ms 周期で実行: ①コーストダウン ×2 → ②格子ステップ走行（WLTP の車速 × 加速度の格子を狙う。開度は較正から車両ごとに自動で決め、測定区間は開度固定。`grid_planner.py`・`grid_patterns.py`）→ ③クリープ発進 ×3 → ④クリープ域ブレーキ保持（開度 = 不感帯 + frac × (停車保持開度 − 不感帯)） | `pattern_drive.build_patterns` / `pattern_loop.PatternLoop`（`LearningLoop` のアルゴリズムを移植） |
 | 走行後 | アクセル 0% → 不感帯の手前まで一発 → 0.5mm 刻みで 0.2G 付近の緩減速 → 停車保持 | 研究用（下記。本番 `_decelerate_to_stop` の置き換え） |
 | 2-2 モデル | 2次多項式＋標準化＋Ridge の逆モデル（アクセル/ブレーキ）→ クリープ・惰行減速カーブ・ペダルゲインを推定（不感帯・停車保持は 2-0 の実測を採用。ペダルゲインは `pedal_gain.py` で不感帯 + 0.5% 以上のサンプルから推定し直す） | `train_inverse_model` / `estimate_dynamics_params` |
 
@@ -144,14 +162,16 @@
   `config_testVehicle.yaml` へ書き戻す（スタブ走行の模擬値で実機の値を上書きしないため）。
 - 開度の定義: **0% = 原点復帰位置（0 pulse）、100% = ストローク限界 9500 pulse**（本番 `_ACTUATOR_PULSE_MAX`）。
   本番のキャリブレーションは使わない。原点からペダルに触れるまでの隙間とペダルの遊びは不感帯に含まれる。
-- ペダルの固定開度は「2-0 で測った不感帯 + `learning` の offset」。本番の開度はキャリブレーション前提の絶対値で、
-  原点から測ると遊びの中に入る（実機でブレーキ 1〜10%・巡航トリム 1.5/3.0% は惰行と同じだった）。
-
-  | パターン | 開度 | YAML キー（既定） | 本番 |
-  |---|---|---|---|
-  | アクセル不感帯プローブ | アクセル不感帯 + offset | `accel_deadband_probe_offsets_pct`（0.5/1/2/3/5） | 0.5〜5% |
-  | 高速巡航トリム | アクセル不感帯 + offset | `cruise_trim_offsets_pct`（1/2/3） | 1.5/3.0% |
-  | 定常ブレーキ（BRAKE_HOLD） | ブレーキ不感帯 + offset | `brake_hold_offsets_pct`（0.5〜4 を 0.5 刻み） | 1〜40% |
+- 開度は固定値ではなく、車両ごとに自動で決まる（段4）: 格子ステップ走行の開度は走行中に較正した感度から、
+  クリープ域ブレーキ保持は 2-0 の実測（不感帯・停車保持開度）と `learning.creep_brake_hold_fracs` から。
+  旧パターン（不感帯 + `*_offsets_pct` の ACCEL_SWEEP・BRAKE_HOLD・トリム階段・定速階段・低開度階段）と
+  その YAML キーは削除した。**旧キーを含む YAML（`config_testVehicle_old.yaml`・`results/config_testVehicle_before_*.yaml`
+  など）は `ConfigError` で読めない**（記録として残してある）。
+- 格子ステップ走行が狙うモード（DB の `modes.coverage_mode_names`。既定は WLTP + US06。重なるマスは 1 回だけ測る）は
+  走る前に全部読む（DB が読めない・モードが無いと 2-0 の前に止まる）。加速度の列は ±14 km/h/s まで。
+  「狙うマスの最小秒数」は 1 ステップで測れる長さ（`grid_step_window_s − grid_step_lag_s`）から自動。強いステップ
+  （|狙い| > 6.7 km/h/s）は帯の手前の端で落ち着いてから踏む（助走）。
+  スタブで全体を通すには `python -m tests.research.grid_stub_run --full`（`docs/memo_codeRun.md`）。
 
 - ペダルゲインの推定に使うのは、開度 ≥ 不感帯 + `accel_gain_min_offset_pct` / `brake_gain_min_offset_pct`（既定 0.5%）の
   サンプル（本番は +5%）。この車両のブレーキは 16% ≈ 0.2G・20% ≈ 0.41G と効きが急で、+5% ≈ 0.38G は減速G ガバナーの
@@ -191,7 +211,7 @@
 |---|---|---|
 | 1 | `APPROACH` | アクセルを原点へ。ブレーキを `brake_deadband_pct − approach_margin_pct`（13.68 − 1%）まで最高速度で動かす（遊びの中なので減速は出ない） |
 | 2 | `STEP` | `step_mm`（0.5mm）踏む → `dwell_s`（1s）待つ → 直近 `slope_window_s`（1s）の車速の傾き（最小二乗）で減速度を出す。`target_decel_g − press_margin_g`（0.18G）未満なら 1 刻み踏み増し、`release_above_g`（0.3G）を超えたときだけ 1 刻み戻す。それ以外は保持 |
-| 3 | `STOP_HOLD` | 車速が `VEHICLE_STOP_SPEED_KMH`（`src/domain/control/conversions.py`）未満で停止確認 → 停車保持開度まで刻んで踏む（通常は到達済み） |
+| 3 | `STOP_HOLD` | 車速が `VEHICLE_STOP_SPEED_KMH`（`research_types.py`）未満で停止確認 → 停車保持開度まで刻んで踏む（通常は到達済み） |
 
 - 踏み増しの上限は `feedforward.stop_brake_opening_pct`。届いても減速が足りなければ「上限で待機」して停車を待つ。
 - 刻むたびに 車速 / 減速度 G / ブレーキ位置 / 判定（踏み増し・保持・戻し・上限で待機）を print し、

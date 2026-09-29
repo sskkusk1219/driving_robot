@@ -30,11 +30,15 @@ from typing import Any
 
 import numpy as np
 
-from src.domain.control.feedforward import FeedforwardController
-from src.domain.model_training import STOP_SPEED_KMH, FeatureSpec, build_feature_row
-from src.models.profile import FeedforwardParams, coast_decel_at, pedal_gain_at
 from tests.research.config import DEFAULT_CONFIG_PATH, ResearchConfig, load_config
 from tests.research.drive_log import SECTION_MODE_DRIVE, cmd_opening, ff_effort
+from tests.research.ff_model import (
+    STOP_SPEED_KMH,
+    FeatureSpec,
+    FeedforwardModel,
+    build_feature_row,
+    require_single_spec_pkl,
+)
 from tests.research.live_plot import (
     COLOR_ACCEL,
     COLOR_ACTUAL,
@@ -43,6 +47,7 @@ from tests.research.live_plot import (
     FONT_FAMILY,
 )
 from tests.research.mode_drive import ReferenceSpeed, load_mode
+from tests.research.research_types import FeedforwardParams, coast_decel_at, pedal_gain_at
 from tests.research.vehicle import feedforward_params
 
 Floats = Sequence[float] | np.ndarray
@@ -86,8 +91,15 @@ class FFModel:
 
 
 def load_ff_model(path: str) -> FFModel:
+    """手順2 の pkl を読む。
+
+    手順6（ProblemReport_20260921）: ペダル別ホライズンの pkl（`accel_feature_spec` と
+    `brake_feature_spec` が異なる）は、ここから先の解析（`ModelOutputs` が単一 spec の
+    特徴量行を両方のモデルに渡す）が壊れるため、分かりやすいエラーで拒否する。
+    """
     with open(path, "rb") as f:
         data = pickle.load(f)  # noqa: S301 - 手順 2 で作った信頼済みファイル
+    require_single_spec_pkl(data, "ff_explain", path=path)
     clip = data.get("speed_clip_max")
     return FFModel(
         path=path,
@@ -215,8 +227,8 @@ def decide_all(p: FeedforwardParams, out: ModelOutputs) -> Trace:
 def verify_against_production(
     p: FeedforwardParams, model: FFModel, ref: ReferenceSpeed, trace: Trace
 ) -> float:
-    """写した分岐が本番 predict_effort と一致するか。最大の差 [%] を返す。"""
-    ff = FeedforwardController()
+    """写した分岐が本番 predict_effort（移植: `FeedforwardModel`）と一致するか。最大の差 [%]。"""
+    ff = FeedforwardModel()
     ff.set_params(p)
     ff.load_model(model.path)
     worst = 0.0

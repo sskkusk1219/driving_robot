@@ -10,7 +10,6 @@ from dataclasses import replace
 
 import pytest
 
-from src.models.profile import FeedforwardParams
 from tests.research import config as cfgmod
 from tests.research.ff_params import (
     ResearchFFParams,
@@ -18,6 +17,7 @@ from tests.research.ff_params import (
     free_accel_at,
     research_ff_params,
 )
+from tests.research.research_types import FeedforwardParams
 
 
 def _params(**kw: float) -> FeedforwardParams:

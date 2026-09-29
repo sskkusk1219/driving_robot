@@ -31,11 +31,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from src.domain.pre_check import HOME_POSITION_TOLERANCE_PULSE, UPS_MIN_BATTERY_PCT
-from src.infra.settings import AppSettings, load_settings
-from src.models.profile import FeedforwardParams, coast_decel_at
+from tests.research.app_settings import AppSettings, load_settings
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.config import ChecksSection, ResearchConfig
+from tests.research.pre_check import HOME_POSITION_TOLERANCE_PULSE, UPS_MIN_BATTERY_PCT
+from tests.research.research_types import FeedforwardParams, coast_decel_at
 from tests.research.term import display_width, say
 from tests.research.vehicle import feedforward_params, pulse_to_opening
 
@@ -308,7 +308,7 @@ class _BenignActuatorNoiseFilter(logging.Filter):
 
 
 def _configure_actuator_logging() -> None:
-    logging.getLogger("src.infra.actuator_driver").addFilter(_BenignActuatorNoiseFilter())
+    logging.getLogger("tests.research.actuator_driver").addFilter(_BenignActuatorNoiseFilter())
 
 
 @dataclass
@@ -354,9 +354,9 @@ def build_hardware(cfg: ResearchConfig, hw_mode: str) -> ResearchHardware:
         raise InitializationError(f"未知のハードウェアモード: {hw_mode!r}")
 
     # 実機構築は import を遅延させる。スタブ実行に pymodbus / python-can を要求しないため。
-    from src.infra.can_reader import CANReader  # noqa: PLC0415
-    from src.infra.ups_monitor import NutUPSMonitor  # noqa: PLC0415
+    from tests.research.can_reader import CANReader  # noqa: PLC0415
     from tests.research.research_actuator import ResearchActuatorDriver  # noqa: PLC0415
+    from tests.research.ups_monitor import NutUPSMonitor  # noqa: PLC0415
 
     _configure_actuator_logging()
 

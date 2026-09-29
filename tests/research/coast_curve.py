@@ -34,15 +34,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from src.domain.model_training import (
+from tests.research.creep_curve import _bin_median
+from tests.research.dynamics_estimation import (
     COAST_CURVE_BIN_KMH,
     COAST_CURVE_MIN_BIN_SAMPLES,
-    _group_by_session,
 )
-from src.models.drive_log import DriveLog
-from src.models.profile import FeedforwardParams
-from tests.research.creep_curve import _bin_median
+from tests.research.ff_model import group_by_session
 from tests.research.pedal_gain import _sample_interval_s
+from tests.research.research_types import DriveLog, FeedforwardParams
 
 
 @dataclass(frozen=True)
@@ -77,7 +76,7 @@ def estimate_coast_decel_curve(
     """
     speeds: list[float] = []
     decels: list[float] = []
-    for session_logs in _group_by_session(logs):
+    for session_logs in group_by_session(logs):
         if len(session_logs) < 2:
             continue
         speed = np.clip(

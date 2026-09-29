@@ -12,10 +12,10 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pytest
 
-from src.domain.model_training import DEFAULT_FEATURE_SPEC, _make_estimator, _metrics
-from src.models.drive_log import DriveLog
 from tests.research import model_analysis as ma
+from tests.research.ff_model import DEFAULT_FEATURE_SPEC, make_estimator, metrics
 from tests.research.mode_drive import split_effort
+from tests.research.research_types import DriveLog
 
 ACCEL_PCT = 15.0
 BRAKE_DB = 13.68
@@ -78,9 +78,9 @@ def test_score_matches_production_metrics() -> None:
     rng = np.random.default_rng(0)
     x = rng.normal(size=(80, 9))
     y = x[:, 0] * 3.0 + rng.normal(size=80)
-    model = _make_estimator().fit(x, y)
-    assert ma.metrics_match(_metrics(model, x, y), ma.score(y, model.predict(x)))
-    assert not ma.metrics_match(_metrics(model, x, y), ma.score(y, model.predict(x) + 1.0))
+    model = make_estimator().fit(x, y)
+    assert ma.metrics_match(metrics(model, x, y), ma.score(y, model.predict(x)))
+    assert not ma.metrics_match(metrics(model, x, y), ma.score(y, model.predict(x) + 1.0))
 
 
 def test_out_of_pattern_prediction_covers_all_rows() -> None:
@@ -146,3 +146,37 @@ def test_series_csv_columns(tmp_path) -> None:
     lines = path.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "time_s,ref_speed_kmh,accel_opening,brake_opening"
     assert lines[2] == "0.1,1.500,12.000,0.000"
+
+
+# ── 手順6: ペダル別ホライズンの pkl は未対応として拒否する ────────────────
+
+
+def test_run_metrics_rejects_pedal_separated_pkl(tmp_path) -> None:
+    import pickle
+    from dataclasses import asdict
+
+    from tests.research.ff_model import FeatureSpec
+
+    accel_spec = FeatureSpec(lookahead_horizons_s=(0.5, 1.0, 2.0, 3.0))
+    brake_spec = FeatureSpec(lookahead_horizons_s=(0.1, 1.0))
+    control_spec = FeatureSpec(lookahead_horizons_s=(0.1, 0.5, 1.0, 2.0, 3.0))
+    model_path = tmp_path / "separated.pkl"
+    with model_path.open("wb") as f:
+        pickle.dump(
+            {
+                "accel_model": make_estimator(),
+                "brake_model": make_estimator(),
+                "feature_spec": asdict(control_spec),
+                "accel_feature_spec": asdict(accel_spec),
+                "brake_feature_spec": asdict(brake_spec),
+                "metrics": {},
+            },
+            f,
+        )
+
+    # ガードは CSV を読む前に発火するため、存在しないパスでも到達しない
+    with pytest.raises(ValueError, match="ペダル別ホライズン"):
+        ma.run_metrics(
+            model_path, tmp_path / "does_not_exist.csv", tmp_path,
+            accel_db=5.0, brake_db=8.0,
+        )

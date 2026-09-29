@@ -38,16 +38,6 @@ import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GroupKFold
 
-from src.domain.model_training import (
-    DEFAULT_FEATURE_SPEC,
-    FeatureSpec,
-    _build_feature_matrix,
-    _estimate_offsets,
-    _make_estimator,
-    _metrics,
-)
-from src.models.drive_log import DriveLog
-from src.models.profile import FeedforwardParams
 from tests.research.config import DEFAULT_CONFIG_PATH, ResearchConfig, load_config
 from tests.research.drive_log import SECTION_PATTERN_DRIVE, actual_opening, read_drive_logs
 from tests.research.ff_explain import (
@@ -64,9 +54,19 @@ from tests.research.ff_explain import (
     pedal_class,
     verify_against_production,
 )
+from tests.research.ff_model import (
+    DEFAULT_FEATURE_SPEC,
+    FeatureSpec,
+    build_feature_matrix,
+    estimate_offsets,
+    make_estimator,
+    metrics,
+    require_single_spec_pkl,
+)
 from tests.research.live_plot import COLOR_ACCEL, COLOR_BRAKE, COLOR_REF, FIGSIZE
 from tests.research.mode_drive import ReferenceSpeed, load_mode
 from tests.research.mode_report import STATES, ModeRow, driving_states
+from tests.research.research_types import DriveLog, FeedforwardParams
 from tests.research.vehicle import feedforward_params
 
 # 手順 2 で test_vehicle_20260911_072504.pkl を作った走行（pkl には学習 CSV のパスが残らない。
@@ -148,10 +148,10 @@ def build_training_set(
     brake_raw = np.array([lg.brake_opening for lg in logs], dtype=float)
     brake = np.where(brake_raw >= brake_deadband_pct, brake_raw, 0.0)
     timestamps = [lg.timestamp for lg in logs]
-    x, idx = _build_feature_matrix(
+    x, idx = build_feature_matrix(
         speed,
-        _estimate_offsets(timestamps, spec.lookahead_horizons_s),
-        _estimate_offsets(timestamps, spec.past_horizons_s),
+        estimate_offsets(timestamps, spec.lookahead_horizons_s),
+        estimate_offsets(timestamps, spec.past_horizons_s),
         spec,
     )
     accel_mask = x[:, spec.regime_col()] >= 0.0
@@ -174,7 +174,7 @@ def build_training_set(
 
 
 def score(y: np.ndarray, pred: np.ndarray) -> dict[str, float]:
-    """_metrics と同じ指標（R² は分散があるときだけ）を予測値から出す。"""
+    """metrics と同じ指標（R² は分散があるときだけ）を予測値から出す。"""
     out = {
         "mae": float(mean_absolute_error(y, pred)),
         "rmse": float(mean_squared_error(y, pred) ** 0.5),
@@ -202,7 +202,7 @@ def predict_out_of_pattern(data: RegimeData, n_splits: int = CV_SPLITS) -> np.nd
     if splits < 2:
         return oof  # パターンが 1 本だけでは「使っていないパターン」が作れない
     for train, test in GroupKFold(n_splits=splits).split(data.x, data.y, groups=groups):
-        model = _make_estimator().fit(data.x[train], data.y[train])
+        model = make_estimator().fit(data.x[train], data.y[train])
         oof[test] = model.predict(data.x[test])
     return oof
 
@@ -381,6 +381,9 @@ def run_metrics(model_path: Path, train_csv: Path, out_dir: Path, *, accel_db: f
                 brake_db: float) -> int:
     with model_path.open("rb") as f:
         model: dict[str, Any] = pickle.load(f)  # noqa: S301 - 手順 2 で作った信頼済みファイル
+    # 手順6（ProblemReport_20260921）: ペダル別ホライズンの pkl は未対応（下の regimes が
+    # アクセル・ブレーキ共通の 1 つの spec で特徴量行列を作るため）
+    require_single_spec_pkl(model, "model_analysis --part metrics", path=str(model_path))
     spec = FeatureSpec(**model["feature_spec"])
     logs, patterns, phases = load_training_rows(train_csv)
     regimes = build_training_set(
@@ -392,7 +395,7 @@ def run_metrics(model_path: Path, train_csv: Path, out_dir: Path, *, accel_db: f
           f"不感帯 アクセル {accel_db:g}% / ブレーキ {brake_db:g}%")
 
     saved = model["metrics"]
-    recomputed = {d.name: _metrics(estimators[d.name], d.x, d.y) for d in regimes}
+    recomputed = {d.name: metrics(estimators[d.name], d.x, d.y) for d in regimes}
     for d in regimes:
         if not metrics_match(saved[d.name], recomputed[d.name]):
             print(f"\n**保存値を再現できません（{d.label}）**: 保存 {saved[d.name]} / "

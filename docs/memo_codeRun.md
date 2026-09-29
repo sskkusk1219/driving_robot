@@ -2,12 +2,18 @@
 - ユーザーが実行するコードのメモです。
 - 議論内容や設計内容はここに記載しないでください。
 
+## 基本
 sudo shutdown -h now
 vcgencmd measure_temp
 
 cd driving_robot
 source .venv/bin/activate
 ssh raspi5_16gb@raspi5-16gb.local
+
+## githubへの保存
+  git add src/ tests/ CLAUDE.md memo.txt
+  git commit -m "..."
+  git push origin <name>
 
 ## 非常停止スイッチの原点復帰確認
 .venv/bin/python tests/hardware/test_emergency_stop_home_return.py
@@ -635,3 +641,128 @@ KAIZEN 表5-5 順6。両軸を毎周期 0x9000 から 14 レジスタまとめ�
   `.venv/bin/python -m tests.research.compare_runs <C1の3本CSV> <C5の3本CSV> <C4の3本CSV>`
 
   # 注意: C2 は今回走らない（ブレーキ上限を下げる安全策を入れてから走る。値は未定）。C3 も対象外（前提の 0.5s 遅れが手順3 に無い）
+
+## ばたつき（ペダルの小刻みな上下）を測る（2026-09-22。ProblemReport_20260921 手順1。車両には触らない）
+
+  # 走行ログからレポートを作り直すと「5. ペダル指令の特徴」に帯 RMS・方向反転・保持時間が出る
+  `.venv/bin/python -m tests.research.mode_report tests/research/results/drive_log_real_20260921_085635.csv --label FF`
+
+  # 2 本以上を並べて、ばたつきの前後比較（実車速 帯RMS / アクセル反転 / 平滑後の符号反転の列が付く）
+  `.venv/bin/python -m tests.research.compare_runs <前のCSV> <後のCSV>`
+
+  # 指標の定義と計算: tests/research/kpi.py の chatter_metrics()
+  #   ばたつき帯 0.9〜1.7Hz・15s 窓（基準車速 5km/h 未満を含む窓は捨てる）・零位相バンドパスの標準偏差の中央値
+  #   平滑後の符号反転 = 偏差を 0.9Hz ローパス（零位相）してから既存の reversal_max() で数えたもの
+
+  # 変更箇所だけのテスト
+  `.venv/bin/python -m pytest tests/research/test_research_kpi.py tests/research/test_research_compare_runs.py -q`
+
+## C5 の実質 Kp を測る（2026-09-22。ProblemReport_20260921 手順2 段A。車両には触らない）
+
+  # 学習済み pkl から ∂アクセル開度/∂実車速 [%/(km/h)] を速度別に出す（複数 pkl を並べられる）
+  `.venv/bin/python -m tests.research.model_gain <pkl> [<pkl> ...] --speeds 30,40,60,96,120`
+
+  # --freq を付けると、その周波数での経路別内訳（合計 / dv 経路 / dv_past 経路）も出る
+  `.venv/bin/python -m tests.research.model_gain <pkl> --speeds 40,96 --freq 1.4`
+
+  # 変更箇所だけのテスト
+  `.venv/bin/python -m pytest tests/research/test_research_model_gain.py -q`
+
+## 加振走行（ペダル→車速の周波数応答 P(f) を測る・手順 11）
+
+段B。FF・PID を使わない開ループで `base + A·sin(2πft)` を出し、ペダル→車速の応答を直接測る。
+
+```bash
+# 変更箇所だけのテスト
+.venv/bin/python -m pytest tests/research/test_research_excite.py -q
+.venv/bin/python -m ruff check tests/research/excite.py tests/research/test_research_excite.py
+
+# 実機（周囲の安全を確認してから。速度 2 点 × 周波数 7 点で約 4〜5 分）
+.venv/bin/python -m tests.research.main --steps 1,11 --hw real; echo "exit=$?"
+
+# 走行後（走行中にも自動で表は出るが、あとから出し直せる）
+.venv/bin/python -m tests.research.excite --analyze tests/research/results/drive_log_real_<日時>.csv
+#   --pkl を付けると実質 Kp を掛けたループゲイン |P・Kp| の表になる
+#   --report を付けると results/reportYYYYMMDD_FreqResp.md を書き出す
+```
+
+設定は `config_testVehicle.yaml` の `excite:`（速度・周波数・振幅・到達フェーズの PI・中止条件）。
+
+### スタブで動かすときの注意
+
+スタブ車両は実車と応答が違う（アクセルゲイン 0.25 vs 約 1.2 km/h/s per %、遊び 6% vs 不感帯 3.68%、
+60km/h の保持に開度 42.8% vs 約 11%）。**実車向けの既定値のままでは到達フェーズが整定しない**ので、
+設定を上書きしたコピーを `--config` で渡す。既定値（実車用）は変更しないこと。
+
+```bash
+cp tests/research/config_testVehicle.yaml /tmp/config_stub.yaml
+# /tmp/config_stub.yaml の excite: を編集
+#   speeds_kmh: [60.0] / frequencies_hz: [0.7, 1.4]
+#   approach_timeout_s: 180.0 / approach_kp_pct_per_kmh: 0.6 / approach_max_rate_pct_s: 2.0
+.venv/bin/python -m tests.research.main --steps 1,11 --hw stub --config /tmp/config_stub.yaml; echo "exit=$?"
+```
+
+スタブは**理論値が分かる純積分器**（`|P| = 0.25/(2πf)`・位相 −90°）なので、解析の検算に使える。
+0.7Hz でゲイン 0.057・1.4Hz で 0.029 が出れば解析は正しい。
+
+## WLTP 網羅マップ（ProblemReport_20260925 段1。走行なし・実機不要）
+
+手順2 の CSV が WLTP の「車速 × 加速度」格子をどれだけ埋めているかを表にする。
+セルは「モードが要る秒（複数モードは最大） / 学習データの秒」、`*` は穴（モードが 2.5s 以上要るのに 学習 < 2s。
+2.5s は 1 ステップで測れる長さ = `grid_step_window_s − grid_step_lag_s` から自動。学習データの下限は `learning.grid_hole_data_max_s`）。
+上に、モードごとの「格子外 N 秒」（加速度の列の外で数えられていない走り）も出る。
+不感帯は config の値で判定する（CSV を取ったときの値と違うとアクセル／ブレーキの振り分けがずれる）。
+
+```bash
+# DB の modes.coverage_mode_names（WLTP + US06 など。全モードを合成）を使う
+.venv/bin/python -m tests.research.wltp_grid tests/research/results/drive_log_real_<手順2>.csv
+# DB を使わず、手順3 のモード走行 CSV の基準車速 1 本だけを使う
+.venv/bin/python -m tests.research.wltp_grid tests/research/results/drive_log_real_<手順2>.csv \
+    --ref-csv tests/research/results/drive_log_real_<手順3>.csv
+```
+
+## 手順2 の新パターン列（ProblemReport_20260925 段4。スタブで通し確認・走行は実機不要）
+
+手順2 のパターン列は「コーストダウン ×2 → 格子ステップ走行 → クリープ発進 ×3 → クリープ域ブレーキ保持」に置き換えた
+（旧パターン・旧ツール `debug_a2a5`・`debug_a3a4`・`stair_gain`・`cruise_curve`・`kaizen --part coverage`・
+`accel_onset` の表3b・`train_candidate_model --cruise-curve-from`・FF 候補 C6 は削除）。
+`learning.*_offsets_pct` 系・`trim_stair_*`・`cruise_hold_*`・`low_open_stair_*` の YAML キーも無い。
+**旧キーを含む YAML（`config_testVehicle_old.yaml`・`results/config_testVehicle_before_*.yaml`）は `ConfigError` で読めない。**
+クリープ域ブレーキ保持の開度は新キー `learning.creep_brake_hold_fracs`（不感帯 + frac × (停車保持開度 − 不感帯)）。
+
+```bash
+R=tests/research/results/drive_log_real_20260925_075149.csv   # 基準車速を持つ CSV（DB 不要）
+# 手順2 の全体構成（コースト → 格子 → クリープ）をスタブで走り、モデル作成（YAML は更新しない）まで通す。
+# --stations は格子ステップの車速を絞る（全部だとスタブでは非常に長い）。スタブは応答が遅く所要時間は見積もれない
+.venv/bin/python -m tests.research.grid_stub_run --ref-csv $R --full --stations 15 --gain-scale 5
+```
+
+見るもの: パターン一覧（COAST_DOWN ×2 → GRID_STEP → GRID_LAUNCH → クリープ発進 ×3 → ブレーキ保持 ×8）、
+完走、網羅マップ、最後の 2-2 で惰行カーブ・クリープカーブ・停止下限・ペダルゲインの推定行が出ること
+（スタブなので数値の良し悪しは判断しない）。
+
+### 狙うモードを選ぶ（ProblemReport_20260925 段4b）
+
+格子ステップ走行が狙う車速 × 加速度は、`modes.coverage_mode_names`（DB の `driving_modes.name` のリスト）の全モードから作る。
+重なるマスは 1 回だけ測る（秒数はモードごとの最大、平均加速度は秒数で重み付け）。発進・停車セル（0〜20 km/h）の狙いも選んだモードから自動で決まる
+（US06 を入れると発進 +9.4・停車 −8.0 km/h/s が増える）。手順3 で走るモードと 2-2 の MAE_WLTP は従来どおり `modes.wltp_mode_name`。
+加速度の列は ±14 km/h/s まで（`vehicle.max_decel_g` 0.4G ≒ 14.1）。
+
+```bash
+# 手順2 の全体構成を WLTP + US06 の合成でスタブ走行（--ref-csv を付けない = DB の全モードを読む）
+.venv/bin/python -m tests.research.grid_stub_run --full --stations 15 --gain-scale 5
+```
+
+強いステップ（|狙い| > 6.7 km/h/s）は、帯の手前の端まで移って落ち着いてから踏む（助走。行の終わりに「助走 N km/h」）。
+2-1 の終わりに「落ち着き判定の集計」（待ち時間・許容幅内の割合・開度のばらつき・ステップの当てはめ点数）が出る。
+これで `grid_settle_tol_kmh`・`grid_settle_s`・`grid_step_window_s` の仮の値を段5 の実機データから決め直す。
+
+単体テスト（変更箇所のみ）:
+```bash
+.venv/bin/python -m pytest tests/research/test_research_pattern_drive.py tests/research/test_research_pattern_loop.py \
+  tests/research/test_research_pattern_loop_grid.py tests/research/test_research_grid_patterns.py \
+  tests/research/test_research_config.py tests/research/test_research_ff_candidate.py \
+  tests/research/test_research_train_candidate_model.py tests/research/test_research_accel_onset.py \
+  tests/research/test_research_kaizen.py tests/research/test_research_stop_brake_floor.py -q
+```
+（既知: `test_stop_brake_floor_settings_are_validated` は作業ツリーの yaml `stop_brake_floor_offset_pct` が 0.5 のため失敗する。段4 と無関係）

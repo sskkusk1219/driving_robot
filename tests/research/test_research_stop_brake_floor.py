@@ -10,9 +10,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from src.models.drive_log import DriveLog
-from src.models.profile import FeedforwardParams
-from tests.research.stop_brake_floor import estimate_stop_brake_floor
+from tests.research.research_types import DriveLog, FeedforwardParams
+from tests.research.stop_brake_floor import creep_brake_hold_openings, estimate_stop_brake_floor
 
 PARAMS = FeedforwardParams(
     accel_deadband_pct=5.0, brake_deadband_pct=10.0, stop_brake_opening_pct=28.42,
@@ -162,3 +161,21 @@ def test_unidentified_when_no_stopped_points() -> None:
     assert not floor.identified
     assert floor.stopped_pct == ()
     assert floor.floated_pct == (12.0,)
+
+
+# ── creep_brake_hold_openings（段4。手順2 の指令開度と候補開度を同じ式にする） ──
+
+
+def test_creep_brake_hold_openings_are_deadband_plus_frac_of_span() -> None:
+    got = creep_brake_hold_openings(10.0, 28.42, [0.0, 0.25, 0.5, 1.0])
+    assert got == pytest.approx((10.0, 14.6, 19.21, 28.42), abs=0.01)
+
+
+def test_creep_brake_hold_openings_follow_another_vehicle() -> None:
+    """不感帯・停車保持開度が違う車でも、同じ frac で実測に追従する。"""
+    assert creep_brake_hold_openings(4.0, 10.0, [0.5, 1.0]) == pytest.approx((7.0, 10.0))
+
+
+def test_creep_brake_hold_openings_with_broken_measurement_collapse_to_deadband() -> None:
+    """停車保持開度が不感帯以下（実測が壊れている）なら、全て不感帯（負の幅を作らない）。"""
+    assert creep_brake_hold_openings(10.0, 8.0, [0.5, 1.0]) == (10.0, 10.0)

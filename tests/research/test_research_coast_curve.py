@@ -11,9 +11,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from src.models.drive_log import DriveLog
-from src.models.profile import FeedforwardParams
 from tests.research.coast_curve import estimate_coast_decel_curve
+from tests.research.research_types import DriveLog, FeedforwardParams
 
 PARAMS = FeedforwardParams(
     creep_speed_kmh=5.0, accel_deadband_pct=10.0, brake_deadband_pct=12.0,

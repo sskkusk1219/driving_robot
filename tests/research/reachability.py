@@ -25,8 +25,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from src.models.profile import FeedforwardParams
 from tests.research.ff_params import ResearchFFParams, free_accel_at
+from tests.research.research_types import FeedforwardParams
 
 __all__ = ["decide_regime", "free_speeds_at", "reach_needs"]
 

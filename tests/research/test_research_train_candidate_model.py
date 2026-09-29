@@ -13,12 +13,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.domain.model_training import DEFAULT_FEATURE_SPEC
-from src.models.drive_log import DriveLogData
 from tests.research import config as cfgmod
 from tests.research import drive_log as dlmod
 from tests.research import train_candidate_model as tcm
 from tests.research.axis_monitor import AxisMonitor
+from tests.research.ff_model import DEFAULT_FEATURE_SPEC
+from tests.research.research_types import DriveLogData
 from tests.research.test_research_model_analysis import _logs
 from tests.research.vehicle import opening_to_pulse
 
@@ -133,140 +133,3 @@ def test_main_trains_and_saves_pkl(tmp_path: Path, label: str) -> None:
     ])
     assert rc == 0
     assert list(out_dir.glob("*.pkl"))
-
-
-# ── C6: --cruise-curve-from ────────────────────────────────────────
-
-
-def _cruise_hold_sample(
-    elapsed_s: float, speed: float, opening: float, pattern: str
-) -> dlmod.DriveSample:
-    """定速階段（CRUISE_HOLD）の合成 1 行（アクセル開度一定・ブレーキ 0）。"""
-    data = DriveLogData(
-        ref_speed_kmh=None, actual_speed_kmh=speed,
-        accel_opening=opening, brake_opening=0.0,
-        accel_pos=opening_to_pulse(opening), brake_pos=opening_to_pulse(0.0),
-        accel_current=0.0, brake_current=0.0,
-    )
-    return dlmod.DriveSample(
-        elapsed_s=elapsed_s, timestamp=datetime.now(tz=UTC), data=data,
-        section=dlmod.SECTION_PATTERN_DRIVE, phase="CRUISE_HOLD", pattern=pattern,
-        monitor_accel=AxisMonitor(
-            position_pulse=opening_to_pulse(opening), current_ma=0.0,
-            alarm_code=0, servo_on=True, moving=False, pos_done=True,
-        ),
-        monitor_brake=AxisMonitor(
-            position_pulse=opening_to_pulse(0.0), current_ma=0.0,
-            alarm_code=0, servo_on=True, moving=False, pos_done=True,
-        ),
-    )
-
-
-def _cruise_hold_samples(
-    pattern: str, steps: list[tuple[float, float]], count_per_step: int
-) -> list[dlmod.DriveSample]:
-    """1 パターン内で複数車速を順に保持する合成行（`extract_hold_steps` は 1 パターン内で
-    `learning.cruise_hold_speeds_kmh` を順に消化するため、車速ごとに別パターンにはしない）。
-
-    settle_s=0.3・hold_s=0.5（テスト用の小さな custom config）に余裕を持たせた行数
-    （test_research_cruise_curve.py の合成行と同じ考え方）。
-    """
-    samples: list[dlmod.DriveSample] = []
-    t = 0.0
-    for speed, opening in steps:
-        for _ in range(count_per_step):
-            samples.append(_cruise_hold_sample(round(t, 1), speed, opening, pattern))
-            t = round(t + 0.1, 1)
-    return samples
-
-
-def _write_training_csv_with_cruise_hold(path: Path) -> None:
-    """`_write_training_csv` に定速階段（2 車速）を足した CSV（C6 用の実測テーブルが作れる）。"""
-    samples = []
-    for i in range(100):
-        samples.append(_sample(
-            10.0 + 0.2 * i, accel_cmd=15.0, brake_cmd=0.0, pattern="1:ACCEL_SWEEP",
-            accel_actual=15.0, brake_actual=0.0,
-        ))
-    for i in range(50):
-        samples.append(_sample(
-            30.0 - 0.2 * i, accel_cmd=0.0, brake_cmd=20.0, pattern="2:BRAKE_A",
-            accel_actual=0.0, brake_actual=20.0,
-        ))
-    for i in range(50):
-        samples.append(_sample(
-            20.0 - 0.2 * i, accel_cmd=0.0, brake_cmd=20.0, pattern="3:BRAKE_B",
-            accel_actual=0.0, brake_actual=20.0,
-        ))
-    samples += _cruise_hold_samples("4:CRUISE_TRIM", [(15.0, 12.0), (25.0, 16.0)], 12)
-    dlmod.write_csv(samples, path)
-
-
-def _write_small_cruise_hold_config(cfg_path: Path) -> None:
-    """テストが速く終わるよう settle/hold を小さくした最小 YAML（他セクションは既定値）。"""
-    cfg_path.write_text(
-        "learning:\n"
-        "  cruise_hold_speeds_kmh: [15.0, 25.0]\n"
-        "  cruise_hold_settle_tol_kmh: 1.0\n"
-        "  cruise_hold_settle_s: 0.3\n"
-        "  cruise_hold_hold_s: 0.5\n"
-        "  cruise_hold_step_timeout_s: 5.0\n",
-        encoding="utf-8",
-    )
-
-
-def test_main_with_cruise_curve_from_writes_c6_pkl_and_speed_bands(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    csv_path = tmp_path / "log.csv"
-    _write_training_csv_with_cruise_hold(csv_path)
-    cfg_path = tmp_path / "cfg.yaml"
-    _write_small_cruise_hold_config(cfg_path)
-    out_dir = tmp_path / "models"
-
-    rc = tcm.main([
-        str(csv_path), "--label", "cmd", "--config", str(cfg_path), "--out-dir", str(out_dir),
-        "--cruise-curve-from", str(csv_path),
-    ])
-    assert rc == 0
-
-    pkls = list(out_dir.glob("*.pkl"))
-    assert pkls
-    import pickle  # noqa: PLC0415 - このテストだけで使う
-
-    with pkls[0].open("rb") as f:
-        payload = pickle.load(f)  # noqa: S301 - テストで作った自前のファイル
-    assert "cruise_curve" in payload
-
-    out = capsys.readouterr().out
-    assert "feedforward.candidate: C6" in out
-    assert "実測テーブル" in out
-    assert "km/h: MAE=" in out  # 速度帯別 CV の表示
-    assert "参考値" in out
-
-
-def test_main_without_cruise_curve_from_has_no_c6_markers(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """C1（既定）は cruise_curve キー無し・C6 の注記も出ない。"""
-    csv_path = tmp_path / "log.csv"
-    _write_training_csv(csv_path)
-    cfg_path = tmp_path / "cfg.yaml"
-    cfgmod.load_config(cfg_path)
-    out_dir = tmp_path / "models"
-
-    rc = tcm.main([
-        str(csv_path), "--label", "cmd", "--config", str(cfg_path), "--out-dir", str(out_dir),
-    ])
-    assert rc == 0
-
-    pkls = list(out_dir.glob("*.pkl"))
-    import pickle  # noqa: PLC0415
-
-    with pkls[0].open("rb") as f:
-        payload = pickle.load(f)  # noqa: S301
-    assert "cruise_curve" not in payload
-
-    out = capsys.readouterr().out
-    assert "feedforward.candidate: C6" not in out
-    assert "参考値" not in out

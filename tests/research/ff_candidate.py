@@ -19,11 +19,13 @@
     B3 不感帯切り上げ 選んだペダルの開度を max(不感帯, 予測) にする（足すのは FF の 1 か所だけ。
                       `arbiter.enable_deadband_compensation` は false のまま）。
 
-C6（2026-09-15 追加。docs/memo.md「段4-2 関門確認 → 骨格を実測テーブルに変更」）:
-    アクセル側だけ、骨格（定速階段の実測テーブル `cruise_curve.CruiseCurve` + 要求加速度 ÷
-    ペダルゲイン）と残差 ML モデルの和にする。C1 との差はアクセルモデルの目的変数だけ（ラベル
-    − 骨格）で、特徴量・推定器・B1〜B3・停車保持・クリープ・学習域クリップは C1 と同じ
-    （1 変数比較を保つ、というユーザー決定）。ブレーキ側は C1 と同一。
+C6（骨格を定速階段の実測テーブルにする案）は 2026-09-25 段4 で、定速階段とともに削除した。
+
+段2（2026-09-25 学習サンプルの WLTP 重み付け。ProblemReport_20260925）:
+    `train_inverse_model_effective` に `weighting: WltpWeighting | None` を追加した。
+    `weighting.enabled` のときだけ fit に `sample_weight` を渡す（既定 None は今までと完全に
+    同じ経路）。`weighting` を渡した場合は enabled に関係なく metrics に `mae_wltp`
+    （重み付き MAE。重みなし／ありのモデルを同じ物差しで比べるため）を追加する。
 
 段4（2026-09-19 改訂: クリープ域ブレーキの下限。ProblemReport_20260916）:
     レジーム判定（1〜3）・B1〜B3・停車保持は変えない。B3 の後、ブレーキ側の開度だけ
@@ -32,6 +34,13 @@ C6（2026-09-15 追加。docs/memo.md「段4-2 関門確認 → 骨格を実測�
     カーブだった旧仕様（`ref_far` で停止／発進を場合分けし上限・下限の 2 式を使う）は
     実測で「境界に速度依存がほとんど無く、停止側・発進側が同じ規則で書ける」ことが
     分かったため定数 1 個の下限 1 本に単純化した。詳細は `_apply_brake_trim` の docstring。
+
+手順6（2026-09-28 ホライズン自動選択。ProblemReport_20260921）:
+    `train_inverse_model_effective` の `feature_spec` 引数を `accel_spec`/`brake_spec` に
+    分割した（省略時は両方とも既定の `DEFAULT_FEATURE_SPEC`＝今までと完全に同じ）。
+    `predict_effort`（`CandidateFeedforward` とその派生）はアクセル・ブレーキそれぞれの
+    spec で特徴量行を組み、それぞれの `accel_model`/`brake_model` に渡す
+    （`FeedforwardModel`（ff_model.py）の同じ仕組みを継承）。
 """
 
 from __future__ import annotations
@@ -41,84 +50,44 @@ from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import numpy as np
+from sklearn.metrics import mean_absolute_error
 
-from src.domain.control.feedforward import FeedforwardController
-from src.domain.control.pedal_plan import pedal_gain_at
-from src.domain.learning_drive import LearningDataError
-from src.domain.model_training import (
+from tests.research.ff_model import (
     DEFAULT_FEATURE_SPEC,
     MIN_REGIME_SAMPLES,
     MIN_SAMPLES_FOR_TRAINING,
     MODEL_TYPE,
     STOP_SPEED_KMH,
     FeatureSpec,
-    _build_feature_matrix,  # noqa: PLC2701 - 学習の特徴量は本番と同一にする
-    _estimate_offsets,  # noqa: PLC2701
-    _group_by_session,  # noqa: PLC2701
-    _make_estimator,  # noqa: PLC2701
-    _metrics,  # noqa: PLC2701
+    FeedforwardModel,
+    build_feature_matrix,
     build_feature_row,
+    estimate_offsets,
+    group_by_session,
+    make_estimator,
+    metrics,
 )
-from src.models.drive_log import DriveLog
-from src.models.profile import FeedforwardParams, VehicleProfile
-from tests.research.cruise_curve import CruiseCurve
 from tests.research.ff_params import ResearchFFParams, free_accel_at
+from tests.research.learning_patterns import LearningDataError
 from tests.research.reachability import decide_regime, free_speeds_at, reach_needs
+from tests.research.research_types import DriveLog, VehicleProfile, pedal_gain_at
+from tests.research.sample_weight import WltpWeighting, compute_weights, summarize
 
 __all__ = [
     "CandidateC2",
     "CandidateC3",
     "CandidateC4",
     "CandidateC5",
-    "CandidateC6",
     "CandidateFeedforward",
     "CANDIDATE_CLASSES",
-    "cruise_skeleton",
     "make_candidate",
     "train_inverse_model_effective",
 ]
 
 # pkl に残す学習セットの作り方（後から取り違えないため。load_model は無視する追加キー）
 TRAINING_ROWS_EFFECTIVE: str = "effective_only"
-
-
-# ─────────────────────────────────────────────────────────────────────
-# C6: 骨格（定速階段の実測テーブル + 要求加速度 ÷ ペダルゲイン）
-# ─────────────────────────────────────────────────────────────────────
-
-
-def cruise_skeleton(
-    curve: CruiseCurve, params: FeedforwardParams, v0: float, a_req: float
-) -> float:
-    """C6 のアクセル骨格開度 [%]（学習・推論の両方から呼び、定義の食い違いを防ぐ）。
-
-    骨格 = curve.opening_at(v0, floor=アクセル不感帯) + a_req ÷ k(v0)。
-    k はアクセル側ペダルゲイン（`pedal_gain_at`、[km/h/s per %]）。未同定（None）・0 以下なら
-    a_req 項は 0（惰行の骨格だけを返す）。
-    """
-    base = float(curve.opening_at(v0, params.accel_deadband_pct))
-    k = pedal_gain_at(params, v0, is_accel=True)
-    term = 0.0 if k is None or k <= 0.0 else a_req / k
-    return base + term
-
-
-class _PrecomputedPredictor:
-    """既に計算済みの予測配列をそのまま返す（`_metrics`/`_below_ratio` を再利用するための器）。
-
-    C6 の学習時、_metrics は「骨格＋残差予測（reconstructed）」と元のラベルを比べたい。
-    `_metrics`/`_below_ratio` は model.predict(x) を呼ぶだけなので、reconstructed を
-    そのまま返す predict() を持たせれば実装を重複させずに済む。
-    """
-
-    def __init__(self, predictions: np.ndarray) -> None:
-        self._predictions = predictions
-
-    def predict(self, x: np.ndarray) -> np.ndarray:
-        del x  # 予測は呼び出し側で計算済み
-        return self._predictions
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -130,13 +99,15 @@ def train_inverse_model_effective(
     logs: list[DriveLog],
     profile: VehicleProfile,
     output_dir: str = "data/models",
-    feature_spec: FeatureSpec = DEFAULT_FEATURE_SPEC,
-    cruise_curve: CruiseCurve | None = None,
+    accel_spec: FeatureSpec = DEFAULT_FEATURE_SPEC,
+    brake_spec: FeatureSpec = DEFAULT_FEATURE_SPEC,
+    stop_horizon_s: float | None = None,
+    weighting: WltpWeighting | None = None,
 ) -> tuple[str, dict[str, dict[str, float]]]:
     """A1: 効いている行だけで 2 次多項式 Ridge 逆モデルを学習し pkl 保存する。
 
     本番 `train_inverse_model` との違いは**学習行の選び方だけ**で、特徴量・推定器・pkl 形式は
-    同じ（`FeedforwardController.load_model` がそのまま読める）。
+    同じ（`FeedforwardModel.load_model` がそのまま読める）。
 
     - アクセルモデル: `accel_opening >= accel_deadband_pct` の行だけ
     - ブレーキモデル: `brake_opening >= brake_deadband_pct` の行だけ
@@ -146,23 +117,42 @@ def train_inverse_model_effective(
     「0% の行」と「14〜18% の行」が同じような入力で混ざり、回帰がその平均（＝不感帯の中）を
     返していた（レポート 表 3-2 の 66%）。
 
+    手順6（ProblemReport_20260921。2026-09-28）: `accel_spec`/`brake_spec` を別々に渡すと、
+    アクセル・ブレーキが別のホライズンで学習される（`horizon_search.py` が交差検証で選ぶ）。
+    省略時（両方とも既定の `DEFAULT_FEATURE_SPEC`）は今までと完全に同じ挙動。
+
     Args:
-        cruise_curve: 指定すると C6（骨格 + 残差 ML）としてアクセルモデルを学習する。骨格は
-            行ごとに `cruise_skeleton(cruise_curve, params, v0, a_req)`（v0・a_req は特徴量
-            から取り出す）で求め、アクセルモデルの目的変数を「ラベル − 骨格」にする。ブレーキ
-            モデルは変えない。None（既定）なら今まで通り（C1）。
+        accel_spec: アクセルモデルの特徴量構成。
+        brake_spec: ブレーキモデルの特徴量構成。`accel_spec` と `regime_horizon_s` が違うと
+            レジーム判定が二重になるため ValueError。
+        stop_horizon_s: 停車保持の判定・ブレーキ下限の `ref_next` が見るホライズン。省略時は
+            `accel_spec.lookahead_horizons_s[0]`（旧来の「先読みの先頭」と同じ）。
+        weighting: 指定すると WLTP の車速×加速度分布に基づく学習サンプル重み（段2。
+            `sample_weight.compute_weights`）をアクセル・ブレーキそれぞれに求める。
+            `weighting.enabled` が True のときだけ実際に `fit` へ渡す（False は今まで通り
+            重みなしで学習する）。None（既定）なら計算自体行わず、今までと完全に同じ挙動。
 
     Returns:
         (保存パス, {"accel": metrics, "brake": metrics})。metrics には本番の mae/rmse/r2/n に
-        加えて `below_deadband`（学習行での予測が不感帯未満だった割合）が入る。`cruise_curve`
-        指定時、accel の指標は骨格 + 残差予測（reconstructed）と元のラベルの比較で、C1 の
-        指標とそのまま比べられる。
+        加えて `below_deadband`（学習行での予測が不感帯未満だった割合）が入る。
+        `weighting` 指定時（enabled に関係なく）は `mae_wltp`（重み付き MAE）と
+        `weight_min`/`weight_max`/`weight_mean`/`weight_at_min_ratio`/
+        `weight_at_max_ratio`（学習行の重み分布の要約）が入る。
 
     Raises:
+        ValueError: `accel_spec`/`brake_spec` の `regime_horizon_s` が食い違う場合、または
+            `stop_horizon_s` がどちらの spec の `lookahead_horizons_s` にも含まれない場合
         LearningDataError: サンプルが不足しモデル構築できない場合
     """
-    spec = feature_spec
-    n_features = len(spec.feature_names())
+    if accel_spec.regime_horizon_s != brake_spec.regime_horizon_s:
+        raise ValueError(
+            f"accel_spec.regime_horizon_s({accel_spec.regime_horizon_s}) と "
+            f"brake_spec.regime_horizon_s({brake_spec.regime_horizon_s}) が違います"
+            "（レジーム判定は両ペダル共通のホライズンを使います）"
+        )
+    if stop_horizon_s is None:
+        stop_horizon_s = accel_spec.lookahead_horizons_s[0]
+
     params = profile.feedforward_params
     accel_db = params.accel_deadband_pct
     brake_db = params.brake_deadband_pct
@@ -172,8 +162,10 @@ def train_inverse_model_effective(
     x_brake_parts: list[np.ndarray] = []
     y_brake_parts: list[np.ndarray] = []
     speed_clip_max = 0.0  # 全ログの観測最高車速（推論時の入力クリップ＝外挿の飽和に使う）
+    n_accel_features = len(accel_spec.feature_names())
+    n_brake_features = len(brake_spec.feature_names())
 
-    for session_logs in _group_by_session(logs):
+    for session_logs in group_by_session(logs):
         if len(session_logs) < 2:
             continue
         speed = np.clip(
@@ -182,29 +174,37 @@ def train_inverse_model_effective(
         speed_clip_max = max(speed_clip_max, float(speed.max()))
         accel_open = np.array([log.accel_opening for log in session_logs], dtype=float)
         brake_open = np.array([log.brake_opening for log in session_logs], dtype=float)
-
         timestamps = [log.timestamp for log in session_logs]
-        x, idx = _build_feature_matrix(
+
+        # A1: そのペダルが効いている行だけを、そのモデルに入れる（惰行の行はどちらにも入れない）。
+        # アクセル・ブレーキで spec（ホライズン）が違うと有効行の範囲も違うため、別々に作る。
+        xa, idx_a = build_feature_matrix(
             speed,
-            _estimate_offsets(timestamps, spec.lookahead_horizons_s),
-            _estimate_offsets(timestamps, spec.past_horizons_s),
-            spec,
+            estimate_offsets(timestamps, accel_spec.lookahead_horizons_s),
+            estimate_offsets(timestamps, accel_spec.past_horizons_s),
+            accel_spec,
         )
-        if len(idx) == 0:
-            continue
+        if len(idx_a) > 0:
+            a_label = accel_open[idx_a]
+            a_mask = a_label >= accel_db
+            x_accel_parts.append(xa[a_mask])
+            y_accel_parts.append(a_label[a_mask])
 
-        # A1: そのペダルが効いている行だけを、そのモデルに入れる（惰行の行はどちらにも入れない）
-        a_label, b_label = accel_open[idx], brake_open[idx]
-        a_mask = a_label >= accel_db
-        b_mask = b_label >= brake_db
-        x_accel_parts.append(x[a_mask])
-        y_accel_parts.append(a_label[a_mask])
-        x_brake_parts.append(x[b_mask])
-        y_brake_parts.append(b_label[b_mask])
+        xb, idx_b = build_feature_matrix(
+            speed,
+            estimate_offsets(timestamps, brake_spec.lookahead_horizons_s),
+            estimate_offsets(timestamps, brake_spec.past_horizons_s),
+            brake_spec,
+        )
+        if len(idx_b) > 0:
+            b_label = brake_open[idx_b]
+            b_mask = b_label >= brake_db
+            x_brake_parts.append(xb[b_mask])
+            y_brake_parts.append(b_label[b_mask])
 
-    x_accel = np.vstack(x_accel_parts) if x_accel_parts else np.empty((0, n_features))
+    x_accel = np.vstack(x_accel_parts) if x_accel_parts else np.empty((0, n_accel_features))
     y_accel = np.concatenate(y_accel_parts) if y_accel_parts else np.empty(0)
-    x_brake = np.vstack(x_brake_parts) if x_brake_parts else np.empty((0, n_features))
+    x_brake = np.vstack(x_brake_parts) if x_brake_parts else np.empty((0, n_brake_features))
     y_brake = np.concatenate(y_brake_parts) if y_brake_parts else np.empty(0)
 
     total = len(y_accel) + len(y_brake)
@@ -224,44 +224,69 @@ def train_inverse_model_effective(
             f"開度 ≥ 不感帯 {brake_db:.2f}%)。最低 {MIN_REGIME_SAMPLES} 点必要です。"
         )
 
-    # C6: アクセルの目的変数を「ラベル − 骨格」にする（骨格は v0・a_req から一意に決まるので、
-    # x_accel の列だけから再現できる。skeleton_accel を別途持ち回らなくてよい）
-    skeleton_accel: np.ndarray | None = None
-    if cruise_curve is not None:
-        regime_col = spec.regime_col()
-        v0_accel = x_accel[:, 0]
-        a_req_accel = x_accel[:, regime_col] / spec.regime_horizon_s
-        skeleton_accel = np.array(
-            [
-                cruise_skeleton(cruise_curve, params, float(v), float(a))
-                for v, a in zip(v0_accel, a_req_accel, strict=True)
-            ]
-        )
-        y_accel_fit = y_accel - skeleton_accel
+    # v0・要求加速度（regime ホライズン先）は段2 の WLTP 重み付けが使う取り出し方
+    # （wltp_grid._v0_and_a_req と同じ定義）。regime_horizon_s は両 spec で共通なので、
+    # 値は spec が違っても同じ意味になる（列位置だけがそれぞれの spec 内で違う）
+    v0_accel = x_accel[:, 0]
+    a_req_accel = x_accel[:, accel_spec.regime_col()] / accel_spec.regime_horizon_s
+    v0_brake = x_brake[:, 0]
+    a_req_brake = x_brake[:, brake_spec.regime_col()] / brake_spec.regime_horizon_s
+
+    # 段2: WLTP 重み付け。weighting が None なら計算自体行わず、今までと完全に同じ経路
+    # （fit に sample_weight を渡さない）。weighting.enabled が False でも重みは計算する
+    # （mae_wltp で重みなし/ありを同じ物差しで比較できるようにするため）
+    w_accel: np.ndarray | None = None
+    w_brake: np.ndarray | None = None
+    if weighting is not None:
+        w_accel = compute_weights(v0_accel, a_req_accel, weighting)
+        w_brake = compute_weights(v0_brake, a_req_brake, weighting)
+
+    accel_model = make_estimator()
+    brake_model = make_estimator()
+    if weighting is not None and weighting.enabled:
+        accel_model.fit(x_accel, y_accel, ridge__sample_weight=w_accel)
+        brake_model.fit(x_brake, y_brake, ridge__sample_weight=w_brake)
     else:
-        y_accel_fit = y_accel
+        accel_model.fit(x_accel, y_accel)
+        brake_model.fit(x_brake, y_brake)
 
-    accel_model = _make_estimator()
-    accel_model.fit(x_accel, y_accel_fit)
-    brake_model = _make_estimator()
-    brake_model.fit(x_brake, y_brake)
-
-    # C6 は「骨格 + 残差予測（reconstructed）」を元のラベルと比べる。_metrics/_below_ratio は
-    # model.predict(x) を呼ぶだけなので、reconstructed を返す _PrecomputedPredictor を挟めば
-    # C1 の指標計算をそのまま再利用できる（C1 との比較可能性を保つ）
-    if skeleton_accel is not None:
-        reconstructed_accel = skeleton_accel + accel_model.predict(x_accel)
-        accel_metrics_model: Any = _PrecomputedPredictor(reconstructed_accel)
-    else:
-        accel_metrics_model = accel_model
-
-    metrics = {
-        "accel": _metrics(accel_metrics_model, x_accel, y_accel),
-        "brake": _metrics(brake_model, x_brake, y_brake),
+    fit_metrics = {
+        "accel": metrics(accel_model, x_accel, y_accel),
+        "brake": metrics(brake_model, x_brake, y_brake),
     }
     # B3 の切り上げ前に、予測がどれだけ不感帯の中へ落ちているか（レポート 表 3-2 の指標）
-    metrics["accel"]["below_deadband"] = _below_ratio(accel_metrics_model, x_accel, accel_db)
-    metrics["brake"]["below_deadband"] = _below_ratio(brake_model, x_brake, brake_db)
+    fit_metrics["accel"]["below_deadband"] = _below_ratio(accel_model, x_accel, accel_db)
+    fit_metrics["brake"]["below_deadband"] = _below_ratio(brake_model, x_brake, brake_db)
+    # 段2: weighting 指定時は enabled に関係なく mae_wltp と重み分布の要約を残す（重みなし／
+    # ありのモデルを同じ物差しで比べるため）
+    if weighting is not None:
+        assert w_accel is not None  # weighting is not None のとき必ず計算済み
+        assert w_brake is not None
+        fit_metrics["accel"]["mae_wltp"] = float(
+            mean_absolute_error(y_accel, accel_model.predict(x_accel), sample_weight=w_accel)
+        )
+        fit_metrics["brake"]["mae_wltp"] = float(
+            mean_absolute_error(y_brake, brake_model.predict(x_brake), sample_weight=w_brake)
+        )
+        for side, w in (("accel", w_accel), ("brake", w_brake)):
+            for key, value in summarize(w).items():
+                if key != "n":
+                    fit_metrics[side][f"weight_{key}"] = value
+
+    # 制御用 spec（pkl の feature_spec）: アクセル・ブレーキのホライズンの和集合＋stop_horizon_s。
+    # mode_drive はこの並びで future/past を組む（ff.horizons / ff.past_horizons）
+    control_lookahead = tuple(
+        sorted({*accel_spec.lookahead_horizons_s, *brake_spec.lookahead_horizons_s, stop_horizon_s})
+    )
+    control_past = tuple(sorted({*accel_spec.past_horizons_s, *brake_spec.past_horizons_s}))
+    control_spec = FeatureSpec(
+        lookahead_horizons_s=control_lookahead,
+        past_horizons_s=control_past,
+        regime_horizon_s=accel_spec.regime_horizon_s,
+        include_v0_sq=accel_spec.include_v0_sq,
+        include_dv_regime_x_v0=accel_spec.include_dv_regime_x_v0,
+        past_as_delta=accel_spec.past_as_delta,
+    )
 
     # ファイル名はローカル時刻（走行ログ CSV = drive_log.py:142 の datetime.now() と揃える）で
     # 付ける。同じ走行の CSV と pkl をファイル名で対応づけるため。
@@ -274,26 +299,32 @@ def train_inverse_model_effective(
         "model_type": MODEL_TYPE,
         "accel_model": accel_model,
         "brake_model": brake_model,
-        "feature_names": spec.feature_names(),
-        "horizons": list(spec.lookahead_horizons_s),
-        "past_horizons": list(spec.past_horizons_s),
-        "regime_horizon": spec.regime_horizon_s,
-        "feature_spec": asdict(spec),
+        "feature_names": accel_spec.feature_names(),
+        "horizons": list(control_spec.lookahead_horizons_s),
+        "past_horizons": list(control_spec.past_horizons_s),
+        "regime_horizon": control_spec.regime_horizon_s,
+        "feature_spec": asdict(control_spec),
+        "accel_feature_spec": asdict(accel_spec),
+        "brake_feature_spec": asdict(brake_spec),
+        "stop_horizon_s": stop_horizon_s,
         "speed_clip_max": speed_clip_max,
         "profile_id": profile.id,
         "trained_at": datetime.now(tz=UTC).isoformat(),
-        "metrics": metrics,
+        "metrics": fit_metrics,
         # 研究用の追加キー（load_model は読み飛ばす）。学習セットの作り方を pkl に残す
         "training_rows": TRAINING_ROWS_EFFECTIVE,
         "deadbands_pct": {"accel": accel_db, "brake": brake_db},
+        # 段2: どの重み設定で学習したか（研究設定は走行ログに残らないため、pkl で追えるように）
+        "sample_weight": (
+            {"enabled": weighting.enabled, "w_min": weighting.w_min, "w_max": weighting.w_max}
+            if weighting is not None
+            else {"enabled": False}
+        ),
     }
-    if cruise_curve is not None:
-        # C6 専用キー。CandidateC6.load_model はこれが無い pkl（= C1）を拒否する
-        payload["cruise_curve"] = cruise_curve.to_dict()
     with pkl_path.open("wb") as f:
         pickle.dump(payload, f)
 
-    return str(pkl_path), metrics
+    return str(pkl_path), fit_metrics
 
 
 def _below_ratio(model: object, x: np.ndarray, deadband_pct: float) -> float:
@@ -309,10 +340,10 @@ def _below_ratio(model: object, x: np.ndarray, deadband_pct: float) -> float:
 # ─────────────────────────────────────────────────────────────────────
 
 
-class CandidateFeedforward(FeedforwardController):
+class CandidateFeedforward(FeedforwardModel):
     """C1 の FF。停車保持・学習域クリップは現行のまま、合成だけ差し替える。
 
-    `FeedforwardController` を継承しているので、モデルのロード（`load_model`）・物理定数の設定
+    `FeedforwardModel`（ff_model.py）を継承しているので、モデルのロード（`load_model`）・物理定数の設定
     （`set_params`）・ホライズンの参照は本番と同じ実装を使う。差し替えるのは `predict_effort` の
     「手順 3 レジーム合成」だけ。
 
@@ -358,15 +389,14 @@ class CandidateFeedforward(FeedforwardController):
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         p = self._params
-        spec = self._spec
+        spec = self._spec  # 制御用（アクセル・ブレーキの和集合）
 
-        # 1. 停車レジーム（現行と同じ。判定は最短ホライズンのみ）
-        if v0 <= STOP_SPEED_KMH and future_speeds and future_speeds[0] <= STOP_SPEED_KMH:
+        # 1. 停車レジーム（現行と同じ。判定は stop_horizon_s のみ。手順6: アクセル・ブレーキが
+        #    別のホライズンを選んでも、この判定は固定のホライズンを見続ける）
+        future_map_raw = dict(zip(spec.lookahead_horizons_s, future_speeds, strict=True))
+        stop_future = future_map_raw.get(self._stop_horizon_s)
+        if v0 <= STOP_SPEED_KMH and stop_future is not None and stop_future <= STOP_SPEED_KMH:
             return -max(0.0, min(100.0, p.stop_brake_opening_pct))
-
-        # C6: 骨格（実測テーブル）はクリップ前の v0 を参照する（外挿は opening_at の直線延長が
-        # 担う）。残差モデルの入力は今まで通りクリップ後の特徴量。
-        v0_raw = v0
 
         # 学習域クリップ（現行と同じ。v0 > cm のときは軌跡全体を平行移動して dv を保つ）
         cm = self._speed_clip_max
@@ -379,8 +409,11 @@ class CandidateFeedforward(FeedforwardController):
             future_speeds = [min(f, cm) for f in future_speeds]
             past_speeds = [min(s, cm) for s in past_speeds]
 
-        features = build_feature_row(v0, future_speeds, past_speeds, spec)
-        dv_regime = float(features[0, spec.regime_col()])
+        # 手順6: future_speeds/past_speeds は spec（和集合）の並びで渡される。ホライズン値で
+        # 引ける辞書にしてから、ペダルごとの spec に必要な列だけを取り出す。
+        future_map = dict(zip(spec.lookahead_horizons_s, future_speeds, strict=True))
+        past_map = dict(zip(spec.past_horizons_s, past_speeds, strict=True))
+        dv_regime = future_map[spec.regime_horizon_s] - v0
         desired_accel = dv_regime / spec.regime_horizon_s  # km/h/s（正: 加速, 負: 減速）
 
         # 2. B1: 両ペダルを離したときの加速度。クリープ域は +creep_accel_at(v0)、それ以上は
@@ -392,9 +425,8 @@ class CandidateFeedforward(FeedforwardController):
             # （coast を 1 秒一定とみなす近似をやめ、ホライズンも 1 点から複数へ）。
             # future_speeds・v0 はここまでで学習域クリップ済みの値（特徴量と基準をそろえる）
             hs = self._research.reach_horizons_s
-            idx = [spec.lookahead_horizons_s.index(h) for h in hs]
             v_free = free_speeds_at(p, self._research, v0, hs, step_s=self._research.reach_step_s)
-            needs = reach_needs([future_speeds[i] for i in idx], v_free, hs)
+            needs = reach_needs([future_map[h] for h in hs], v_free, hs)
             decisive = decide_regime(needs, self._research.coast_band_kmhs)
             if decisive is None:
                 return 0.0
@@ -405,16 +437,28 @@ class CandidateFeedforward(FeedforwardController):
                 return 0.0
             want_accel = desired_accel >= coast
 
-        accel_pred = self._accel_opening(v0_raw, desired_accel, features)
-        brake_pred = max(0.0, float(self._brake_model.predict(features)[0]))
+        accel_row = build_feature_row(
+            v0,
+            [future_map[h] for h in self._accel_spec.lookahead_horizons_s],
+            [past_map[h] for h in self._accel_spec.past_horizons_s],
+            self._accel_spec,
+        )
+        brake_row = build_feature_row(
+            v0,
+            [future_map[h] for h in self._brake_spec.lookahead_horizons_s],
+            [past_map[h] for h in self._brake_spec.past_horizons_s],
+            self._brake_spec,
+        )
+        accel_pred = max(0.0, float(self._accel_model.predict(accel_row)[0]))
+        brake_pred = max(0.0, float(self._brake_model.predict(brake_row)[0]))
         # 4. B3: 選んだペダルは不感帯以上（効かない指令を出さない）。B2: 惰行テーパは無い。
-        # 段4: ブレーキ側だけ、学習域クリップ後の future_speeds[0]（= ref_next。最短ホライズン
-        # 先の基準）を渡してクリープ域ブレーキの下限を効かせる（_apply_brake_trim 参照）
+        # 段4: ブレーキ側だけ、学習域クリップ後の stop_horizon_s 先（= ref_next）を渡して
+        # クリープ域ブレーキの下限を効かせる（_apply_brake_trim 参照）
         effort = (
             max(p.accel_deadband_pct, accel_pred)
             if want_accel
             else self._brake_effort(
-                v0, desired_accel, coast, brake_pred, ref_next=future_speeds[0]
+                v0, desired_accel, coast, brake_pred, ref_next=future_map[self._stop_horizon_s]
             )
         )
         return max(-100.0, min(100.0, effort))
@@ -481,17 +525,6 @@ class CandidateFeedforward(FeedforwardController):
         floor = self._params.brake_deadband_pct + research.stop_brake_floor_offset_pct
         return max(opening_pct, floor)  # 上側は既存のクランプに任せる
 
-    def _accel_opening(self, v0_raw: float, desired_accel: float, features: np.ndarray) -> float:
-        """アクセル開度の予測（0 クランプ済み）。C6 だけ骨格 + 残差に差し替える。
-
-        Args:
-            v0_raw: 学習域クリップ前の v0（C6 の骨格参照用。C1〜C5 では未使用）。
-            desired_accel: 要求加速度 [km/h/s]（C6 の骨格計算用）。
-            features: クリップ後の特徴行（残差/本体モデルへの入力）。
-        """
-        model: Any = self._accel_model  # predict_effort で None でないことを確認済み
-        return max(0.0, float(model.predict(features)[0]))
-
 
 # ─────────────────────────────────────────────────────────────────────
 # C2〜C5（KAIZEN 報告書 3 章 表 3-1 の定義。report20260912_KAIZEN_process2,3.md:249-253）
@@ -526,7 +559,7 @@ class CandidateC2(CandidateFeedforward):
 class CandidateC3(CandidateFeedforward):
     """C3: C1 と同じロジック。先読み窓を 0.5s ずらして学習したモデルを読ませるだけ。
 
-    `FeedforwardController.load_model` が pkl の horizons を読み込み、呼び出し側
+    `FeedforwardModel.load_model` が pkl の horizons を読み込み、呼び出し側
     （mode_drive.py）はその horizons で future/past を組み立てるため、コードは C1 と同一でよい。
     候補名だけ別にして走行ログで取り違えないようにする。
     """
@@ -556,43 +589,6 @@ class CandidateC5(CandidateFeedforward):
     uses_actual_speed = True
 
 
-class CandidateC6(CandidateFeedforward):
-    """C6: アクセル側の骨格を定速階段の実測テーブルにし、残差だけ ML で学習する。
-
-    骨格 = `cruise_skeleton(cruise_curve, params, v0, a_req)`（実測テーブル + 要求加速度 ÷
-    ペダルゲイン）。`_accel_model` は学習時に骨格を引いた残差を学習しているので、推論では
-    骨格 + 残差予測を返す。ブレーキ側・停車保持・クリープ・B1・B3・学習域クリップは C1 と同じ。
-    骨格の v0 だけクリップ前の実測値を使う（学習域を超えても `opening_at` の直線延長で外挿
-    する。残差モデルの入力は今まで通りクリップ後の特徴量）。
-    """
-
-    candidate = "C6"
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._cruise_curve: CruiseCurve | None = None
-
-    def load_model(self, model_path: str) -> None:
-        """本体の load_model に加えて、pkl の `cruise_curve` キーを読む（無ければ ValueError）。"""
-        super().load_model(model_path)
-        with Path(model_path).open("rb") as f:
-            payload: dict[str, Any] = pickle.load(f)  # noqa: S301 - 開発者が生成した信頼済み pkl
-        if "cruise_curve" not in payload:
-            raise ValueError(
-                f"C6 用の pkl ではありません（cruise_curve キーがありません）: {model_path}。"
-                "train_candidate_model.py --cruise-curve-from で作った pkl を指定してください。"
-            )
-        self._cruise_curve = CruiseCurve.from_dict(payload["cruise_curve"])
-
-    def _accel_opening(self, v0_raw: float, desired_accel: float, features: np.ndarray) -> float:
-        if self._cruise_curve is None:
-            raise RuntimeError("C6 は cruise_curve が未ロードです。load_model() を呼んでください。")
-        model: Any = self._accel_model  # predict_effort で None でないことを確認済み
-        residual = float(model.predict(features)[0])
-        skeleton = cruise_skeleton(self._cruise_curve, self._params, v0_raw, desired_accel)
-        return max(0.0, skeleton + residual)
-
-
 #: V1 案スイッチ: config の feedforward.candidate 名 → クラス
 CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward]] = {
     "C1": CandidateFeedforward,
@@ -600,12 +596,11 @@ CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward]] = {
     "C3": CandidateC3,
     "C4": CandidateC4,
     "C5": CandidateC5,
-    "C6": CandidateC6,
 }
 
 
 def make_candidate(name: str) -> CandidateFeedforward:
-    """候補名（C1〜C6）から FF インスタンスを作る。未知の名前は ValueError。"""
+    """候補名（C1〜C5）から FF インスタンスを作る。未知の名前は ValueError。"""
     try:
         cls = CANDIDATE_CLASSES[name]
     except KeyError:

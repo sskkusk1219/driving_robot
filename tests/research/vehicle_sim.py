@@ -30,9 +30,9 @@ from pathlib import Path
 
 import numpy as np
 
-from src.models.profile import FeedforwardParams
 from tests.research.drive_log import cmd_opening
 from tests.research.hardware import STUB_CREEP_STIFFNESS_PER_S
+from tests.research.research_types import FeedforwardParams
 
 LOG_DT_S = 0.1  # 走行ログの刻み
 SIM_DT_S = 0.05  # 閉ループ模擬の刻み（手順 3 の制御周期と同じ）

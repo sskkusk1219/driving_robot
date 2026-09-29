@@ -6,15 +6,14 @@ DB・実走行ログを使わない部分（再生の総当たり・最小の組
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from src.models.profile import FeedforwardParams
 from tests.research import kaizen
 from tests.research import vehicle_sim as vs
+from tests.research.research_types import FeedforwardParams
 
 PARAMS = FeedforwardParams(
     creep_speed_kmh=4.944,
@@ -162,7 +161,7 @@ def test_decide_openings_clamps_to_max_opening() -> None:
 def test_ref_frames_shift_moves_the_lookahead_window() -> None:
     from datetime import UTC, datetime
 
-    from src.models.driving_mode import DrivingMode, SpeedPoint
+    from tests.research.research_types import DrivingMode, SpeedPoint
 
     mode = DrivingMode(
         id="x", name="ramp", description="", total_duration=20.0, max_speed=20.0,
@@ -229,7 +228,7 @@ def _ramp_frames(n: int = 40) -> kaizen.RefFrames:
     """40 km/h から 1 km/h/s で上がる基準（停車・クリープの分岐に入らない領域）。"""
     from datetime import UTC, datetime
 
-    from src.models.driving_mode import DrivingMode, SpeedPoint
+    from tests.research.research_types import DrivingMode, SpeedPoint
 
     mode = DrivingMode(
         id="x", name="ramp", description="", total_duration=60.0, max_speed=100.0,
@@ -283,33 +282,8 @@ def test_replan_command_opens_more_than_c4_when_behind() -> None:
     assert accel5 > accel4
 
 
-# ─── --part coverage（段階 3: 網羅性と所要時間） ───
-
-GAIN_PARAMS = FeedforwardParams(
-    creep_speed_kmh=4.944,
-    creep_rate_kmhs=0.155,
-    coast_decel_speeds_kmh=(5.0, 135.0),
-    coast_decel_kmhs=(2.0, 2.0),
-    pedal_gain_speeds_kmh=(5.0, 135.0),
-    accel_gain_kmhs_per_pct=(1.0, 1.0),
-    brake_gain_kmhs_per_pct=(2.0, 2.0),
-    accel_deadband_pct=10.0,
-    brake_deadband_pct=13.68,
-)
-
-
-def _flat_frames(v0: Sequence[float], a_req: Sequence[float]) -> kaizen.RefFrames:
-    """wltp_demand が見る列（v0_raw・near・a_req）だけを持つ最小の RefFrames。"""
-    n = len(v0)
-    return kaizen.RefFrames(
-        t=np.arange(n, dtype=float),
-        v0_raw=np.array(v0, dtype=float),
-        near=np.array(v0, dtype=float),
-        v0_model=np.array(v0, dtype=float),
-        dv_future=np.zeros((n, 1)),
-        dv_past=np.zeros((n, 1)),
-        a_req=np.array(a_req, dtype=float),
-    )
+# ─── 学習データ（パターン走行 CSV）を使う分析 ───
+# （--part coverage は 2026-09-25 段4 で削除した。網羅マップは test_research_wltp_grid.py）
 
 
 def _write_train_csv(path: Path) -> Path:
@@ -340,90 +314,9 @@ def _write_train_csv(path: Path) -> Path:
     return path
 
 
-def test_open_index_puts_values_in_the_bin_that_starts_at_the_edge() -> None:
-    edges = (10.0, 15.0, 20.0)
-    got = kaizen._open_index(np.array([9.9, 10.0, 14.9, 15.0, 25.0, np.nan]), edges)
-    assert list(got) == [-1, 0, 0, 1, 2, -1]  # 下端未満と NaN は -1、最後の辺以上は最後のビン
-
-
-def test_band_index_keeps_the_top_speed_in_the_last_band() -> None:
-    edges = (0.0, 20.0, 40.0)
-    got = kaizen._band_index(np.array([0.0, 19.9, 20.0, 40.0, 200.0]), edges)
-    assert list(got) == [0, 0, 1, 1, 1]
-
-
-def test_wltp_demand_splits_pedals_at_the_coast_curve() -> None:
-    """惰行（−2.0 km/h/s）より緩い減速はアクセル、下ならブレーキ。開度は物理式で逆算。"""
-    demand = kaizen.wltp_demand(GAIN_PARAMS, _flat_frames([60.0, 60.0], [-1.0, -4.0]))
-    assert list(demand.pedal) == [kaizen.PEDAL_ACCEL, kaizen.PEDAL_BRAKE]
-    assert float(demand.opening[0]) == pytest.approx(1.0 / 1.0 + 10.0)
-    assert float(demand.opening[1]) == pytest.approx(2.0 / 2.0 + 13.68)
-
-
-def test_wltp_demand_ignores_stop_and_creep() -> None:
-    """停車保持とクリープ任せの周期は「要る開度」に数えない。"""
-    demand = kaizen.wltp_demand(GAIN_PARAMS, _flat_frames([0.0, 3.0], [0.0, 0.1]))
-    assert list(demand.pedal) == [kaizen.PEDAL_COAST, kaizen.PEDAL_COAST]
-    assert not np.any(np.isfinite(demand.opening))
-
-
-def test_coverage_grid_counts_required_time_and_training_rows() -> None:
-    frames = _flat_frames([30.0] * 20, [-1.0] * 20)  # 30 km/h で 11.0% を 20 周期ぶん要求
-    demand = kaizen.wltp_demand(GAIN_PARAMS, frames)
-    rows = kaizen.EffectiveRows(
-        speed=np.array([30.0, 30.0, 90.0]),
-        opening=np.array([11.0, 12.0, 11.0]),
-        kind=np.array(["ACCEL_SWEEP"] * 3),
-    )
-    grid = kaizen.coverage_grid(demand, frames, rows, kaizen.PEDAL_ACCEL)
-    assert grid[1][0] == (pytest.approx(20 * kaizen.SIM_DT_S), 2)  # 20〜40 km/h × 10〜15%
-    assert grid[4][0] == (pytest.approx(0.0), 1)  # 80〜100 km/h は要らないが行はある
-
-
-def test_is_hole_flags_empty_and_thin_cells() -> None:
-    assert kaizen._is_hole(1.0, 0)  # 要るのに 1 行も無い
-    assert kaizen._is_hole(kaizen.HOLE_NEED_S, kaizen.HOLE_ROWS - 1)  # 長く要るのに薄い
-    assert not kaizen._is_hole(kaizen.HOLE_NEED_S, kaizen.HOLE_ROWS)
-    assert not kaizen._is_hole(0.5, 0)  # ほとんど要らないセルは空白と呼ばない
-
-
-def test_effective_rows_keeps_only_openings_at_or_above_the_deadband(tmp_path: Path) -> None:
-    csv_path = _write_train_csv(tmp_path / "train.csv")
-    accel, brake = kaizen.effective_rows(csv_path, PARAMS)
-    assert len(accel.opening) == 200  # ACCEL_SWEEP 24% と CRUISE_TRIM 13%（どちらも 10% 以上）
-    assert len(brake.opening) == 201  # BRAKE_HOLD 20%（13.68% 以上）
-    assert set(accel.kind) == {"ACCEL_SWEEP", "CRUISE_TRIM"}
-
-
-def test_pattern_stats_splits_by_pattern_and_reports_the_whole_span(tmp_path: Path) -> None:
-    stats, span = kaizen.pattern_stats(_write_train_csv(tmp_path / "train.csv"), PARAMS)
-    assert [s.name for s in stats] == ["1:ACCEL_SWEEP", "2:BRAKE_HOLD", "3:CRUISE_TRIM"]
-    assert [s.rows for s in stats] == [100, 201, 100]
-    assert stats[0].duration_s == pytest.approx(9.9)
-    assert stats[1].max_brake == pytest.approx(20.0)
-    assert stats[2].eff_accel == 100
-    assert span == pytest.approx(40.0)  # 401 行 × 0.1s − 1 周期
-
-
-def test_phase_stats_marks_blocks_that_sit_on_the_timeout(tmp_path: Path) -> None:
-    stats = kaizen.phase_stats(_write_train_csv(tmp_path / "train.csv"))
-    hold = next(s for s in stats if s.phase == "BRAKE_HOLD")
-    assert hold.limit_s == pytest.approx(20.0)
-    assert hold.at_limit == 1  # 20.0s で打ち切りに張り付いた
-    accel = next(s for s in stats if s.phase == "DRIVE_ACCEL")
-    assert accel.at_limit == 0  # 9.9s なので打ち切り 20s には届いていない
-
-
 def test_train_models_exclude_kinds_drops_only_that_family(tmp_path: Path) -> None:
     csv_path = _write_train_csv(tmp_path / "train.csv")
     base = kaizen.train_models(csv_path, PARAMS)
     without = kaizen.train_models(csv_path, PARAMS, exclude_kinds=("CRUISE_TRIM",))
     assert 0 < without.rows[0] < base.rows[0]  # アクセルは減るが無くならない
     assert without.rows[1] == base.rows[1]  # ブレーキ側は CRUISE_TRIM を使っていない
-
-
-def test_proposal_total_is_the_sum_of_the_steps() -> None:
-    table = kaizen.proposal_table(560.9, 900.0)
-    total = 560.9 + sum(s.delta_s for s in kaizen.PROPOSAL)
-    assert f"提案 {total:.1f}s" in table
-    assert f"余裕 {900.0 - total:.1f}s" in table

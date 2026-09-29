@@ -15,8 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.models.profile import FeedforwardParams, _interp_curve, coast_decel_at
 from tests.research.config import ResearchConfig
+from tests.research.research_types import FeedforwardParams, _interp_curve, coast_decel_at
 
 
 @dataclass(frozen=True)

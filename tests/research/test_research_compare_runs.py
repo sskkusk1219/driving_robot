@@ -12,10 +12,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.models.drive_log import DriveLogData
 from tests.research import compare_runs as cr
 from tests.research import config as cfgmod
 from tests.research import drive_log as dlmod
+from tests.research.research_types import DriveLogData
 
 
 def _mode_sample(

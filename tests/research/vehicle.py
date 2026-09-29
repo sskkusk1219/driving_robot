@@ -15,13 +15,18 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from src.app.robot_controller import _ACTUATOR_PULSE_MAX
-from src.domain.control.conversions import opening_to_position
-from src.models.calibration import CalibrationData
-from src.models.profile import FeedforwardParams, PIDGains, StopConfig, VehicleProfile
 from tests.research.config import ResearchConfig
+from tests.research.research_types import (
+    ACTUATOR_PULSE_MAX,
+    CalibrationData,
+    FeedforwardParams,
+    PIDGains,
+    StopConfig,
+    VehicleProfile,
+    opening_to_position,
+)
 
-STROKE_LIMIT_PULSE: int = _ACTUATOR_PULSE_MAX  # 開度 100% の位置 [pulse]（両軸共通）
+STROKE_LIMIT_PULSE: int = ACTUATOR_PULSE_MAX  # 開度 100% の位置 [pulse]（両軸共通）
 
 
 def opening_to_pulse(opening_pct: float) -> int:

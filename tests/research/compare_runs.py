@@ -43,7 +43,13 @@ import numpy as np
 
 from tests.research.config import DEFAULT_CONFIG_PATH, ResearchConfig, load_config
 from tests.research.drive_log import SECTION_MODE_DRIVE
-from tests.research.kpi import KpiResult, compute_kpi, sample_interval_s
+from tests.research.kpi import (
+    ChatterMetrics,
+    KpiResult,
+    chatter_metrics,
+    compute_kpi,
+    sample_interval_s,
+)
 from tests.research.mode_report import ModeRow, PedalStats, pedal_stats, rows_from_csv
 from tests.research.vehicle import feedforward_params
 
@@ -58,6 +64,7 @@ class RunResult:
     kpi: KpiResult
     pedal: PedalStats
     command_rate_p95: float  # |Δ(アクセル% − ブレーキ%)| / dt の p95 [%/s]
+    chatter: ChatterMetrics  # 1.4Hz 付近のばたつき指標（tests/research/kpi.py）
     rows: list[ModeRow] = field(default_factory=list, repr=False)
 
     @property
@@ -113,10 +120,15 @@ def evaluate_run(
         rows, cfg.feedforward.accel_deadband_pct, cfg.feedforward.brake_deadband_pct,
         feedforward_params(cfg),
     )
+    chatter = chatter_metrics(
+        t, [r.ref_kmh for r in rows], [r.actual_kmh for r in rows],
+        [r.accel_pct for r in rows], [r.brake_pct for r in rows], [r.phase for r in rows],
+        cfg.kpi,
+    )
     return RunResult(
         label=label, csv_path=csv_path, n_rows=len(rows), reached_s=reached,
         completed=completed, kpi=kpi, pedal=pedal, command_rate_p95=command_rate_p95(rows),
-        rows=rows,
+        chatter=chatter, rows=rows,
     )
 
 
@@ -125,17 +137,25 @@ def rank(results: list[RunResult]) -> list[RunResult]:
 
 
 def summary_table(results: list[RunResult]) -> str:
+    # 末尾 3 列（ばたつき指標、tests/research/kpi.py）は順位には使わない参考値。
+    # rank() の基準は変えない（過去の判断と比較できなくなるため）。
     header = (
         "| 順位 | ラベル | 走破 | 到達[s] | 最大逸脱[km/h] | \\|偏差\\|p95[km/h] | "
-        "符号反転(窓内最大) | ペダル切替[回] | 指令p95[%/s] |"
+        "符号反転(窓内最大) | ペダル切替[回] | 指令p95[%/s] | "
+        "実車速 帯RMS [km/h] | アクセル反転 [回/s] | 符号反転(平滑後) | "
+        "指令往復 全体 [回/s] | 指令往復 60s窓最大 [回/s] |"
     )
-    sep = "|---|---|---|---|---|---|---|---|---|"
+    sep = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     lines = [header, sep]
     for i, r in enumerate(rank(results), start=1):
         lines.append(
             f"| {i} | {r.label} | {'○' if r.completed else '×'} | {r.reached_s:.1f} | "
             f"{r.kpi.max_abs_kmh:.2f} | {r.kpi.p95_kmh:.2f} | {r.kpi.reversal_max_per_window} | "
-            f"{r.pedal.switches} | {r.command_rate_p95:.2f} |"
+            f"{r.pedal.switches} | {r.command_rate_p95:.2f} | "
+            f"{r.chatter.speed_band_rms_kmh:.3f} | {r.chatter.accel_reversals_per_s:.2f} | "
+            f"{r.chatter.reversal_smoothed} | "
+            f"{r.chatter.pedal_reversal_per_s:.2f} | "
+            f"{r.chatter.pedal_reversal_window_max_per_s:.2f} |"
         )
     return "\n".join(lines)
 

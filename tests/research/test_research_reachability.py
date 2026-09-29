@@ -11,9 +11,9 @@ from dataclasses import replace
 
 import pytest
 
-from src.models.profile import FeedforwardParams
 from tests.research.ff_params import ResearchFFParams
 from tests.research.reachability import decide_regime, free_speeds_at, reach_needs
+from tests.research.research_types import FeedforwardParams
 
 # クリープ域（0〜5.0 km/h）は速度依存カーブ、惰行域（5.0 km/h 以上）は速度依存カーブ。
 # どちらも creep_speed_kmh=5.0 でちょうど 0 になる（段2.5 の接続点の作り方と同じ）。

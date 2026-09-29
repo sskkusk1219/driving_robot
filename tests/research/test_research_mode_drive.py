@@ -15,11 +15,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.domain.control.conversions import G_TO_KMHS
-from src.domain.control.kpi_monitor import KPIMonitor
-from src.models.drive_log import DriveLogData
-from src.models.driving_mode import DrivingMode, SpeedPoint
-from src.models.profile import FeedforwardParams
 from tests.research import config as cfgmod
 from tests.research import drive_log as dlmod
 from tests.research import ff_candidate
@@ -29,6 +24,13 @@ from tests.research import main as mainmod
 from tests.research import mode_drive as mdmod
 from tests.research import mode_report as mrmod
 from tests.research.axis_safety import ALARM_CHECK_INTERVAL_S
+from tests.research.research_types import (
+    G_TO_KMHS,
+    DriveLogData,
+    DrivingMode,
+    FeedforwardParams,
+    SpeedPoint,
+)
 from tests.research.vehicle import feedforward_params, opening_to_pulse, pulse_to_opening
 
 HOLD_PCT = 22.0
@@ -219,11 +221,97 @@ def test_load_feedforward_rejects_reach_horizon_not_in_model(
         mdmod.load_feedforward(cfg)
 
 
+# ── 手順6: ペダル別ホライズン（ProblemReport_20260921） ─────────────
+
+
+def _write_pedal_separated_pkl(path: Path) -> None:
+    import pickle
+    from dataclasses import asdict
+
+    from tests.research.ff_model import MODEL_TYPE, FeatureSpec, make_estimator
+
+    accel_spec = FeatureSpec(lookahead_horizons_s=(0.5, 1.0, 3.0))
+    brake_spec = FeatureSpec(lookahead_horizons_s=(0.1, 1.0))
+    control_spec = FeatureSpec(lookahead_horizons_s=(0.1, 0.5, 1.0, 3.0))
+    accel_model, brake_model = make_estimator(), make_estimator()
+    rng = np.random.default_rng(5)
+    xa = rng.normal(size=(30, len(accel_spec.feature_names())))
+    xb = rng.normal(size=(30, len(brake_spec.feature_names())))
+    accel_model.fit(xa, xa[:, 0])
+    brake_model.fit(xb, xb[:, 0])
+    payload = {
+        "model_type": MODEL_TYPE,
+        "accel_model": accel_model,
+        "brake_model": brake_model,
+        "feature_spec": asdict(control_spec),
+        "accel_feature_spec": asdict(accel_spec),
+        "brake_feature_spec": asdict(brake_spec),
+        "stop_horizon_s": 0.5,
+        "speed_clip_max": 140.0,
+    }
+    with path.open("wb") as f:
+        pickle.dump(payload, f)
+
+
+async def test_prepare_mode_drive_shows_pedal_specific_horizons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ペダル別ホライズンの pkl を読んだとき、アクセル/ブレーキ別に先読みを表示すること。"""
+    cfg = _tmp_cfg(tmp_path)
+    cfg.feedforward.model_path = str(tmp_path / "separated.pkl")
+    _write_pedal_separated_pkl(Path(cfg.feedforward.model_path))
+    mode = _mode([(0.0, 0.0), (10.0, 20.0)])
+
+    async def fake_load_mode(_cfg: cfgmod.ResearchConfig, _name: str) -> object:
+        return mode
+
+    monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+
+    setup = await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+
+    assert setup.ff.is_pedal_separated
+    assert setup.ff.accel_spec.lookahead_horizons_s == (0.5, 1.0, 3.0)
+    assert setup.ff.brake_spec.lookahead_horizons_s == (0.1, 1.0)
+    out = capsys.readouterr().out
+    assert "先読み アクセル" in out
+    assert "先読み" in out and "ブレーキ" in out
+
+
+async def test_prepare_mode_drive_warns_on_h0_h1_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """pkl の h0/h1 が現在の設定と食い違うと警告を出す（走行は pkl のまま続ける）。"""
+    cfg = _tmp_cfg(tmp_path)
+    cfg.feedforward.model_path = str(tmp_path / "separated.pkl")
+    _write_pedal_separated_pkl(Path(cfg.feedforward.model_path))
+    cfg.features.h1_s = 2.0  # pkl の regime_horizon_s（1.0）と食い違わせる
+    mode = _mode([(0.0, 0.0), (10.0, 20.0)])
+
+    async def fake_load_mode(_cfg: cfgmod.ResearchConfig, _name: str) -> object:
+        return mode
+
+    monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+
+    await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+
+    out = capsys.readouterr().out
+    assert "食い違っています" in out
+    assert "h1_s" in out
+
+
 # ── KPI ───────────────────────────────────────────────────────────────
 
 
+# 本番 KPIMonitor（src/domain/control/kpi_monitor.py）に下の系列を通した結果。2026-09-25 に
+# src を実行して採取した固定値（`tests/` だけで完結させるため src は呼ばない。
+# ProblemReport_20260924）。
+PROD_KPI_MAX_ABS_KMH = 3.1069116493567535
+PROD_KPI_REVERSAL_MAX_PER_5S = 9
+PROD_KPI_P95_KMH = 1.61  # 本番はビン幅 0.01 に丸めた値
+
+
 def test_kpi_matches_production_monitor() -> None:
-    """最大逸脱・符号反転は本番 KPIMonitor と一致、p95 はビン幅 0.01 以内。"""
+    """最大逸脱・符号反転は本番 KPIMonitor の値と一致、p95 はビン幅 0.01 以内。"""
     rng = random.Random(3)
     t, dev = [], []
     value = 0.0
@@ -231,16 +319,12 @@ def test_kpi_matches_production_monitor() -> None:
         value = 0.9 * value + rng.gauss(0.0, 0.35)
         t.append(i * 0.1)
         dev.append(value)
-    monitor = KPIMonitor()
-    for ti, d in zip(t, dev, strict=True):
-        monitor.update(ref_kmh=50.0, actual_kmh=50.0 + d, now_s=ti)
-    prod = monitor.summary()
 
     result = kpimod.compute_kpi(t, dev, cfgmod.KpiSection())
-    assert result.max_abs_kmh == pytest.approx(prod["max_abs_deviation_kmh"], abs=1e-9)
-    assert result.reversal_max_per_window == prod["reversal_max_per_5s"]
+    assert result.max_abs_kmh == pytest.approx(PROD_KPI_MAX_ABS_KMH, abs=1e-9)
+    assert result.reversal_max_per_window == PROD_KPI_REVERSAL_MAX_PER_5S
     assert result.reversal_max_per_window > 1  # 反転が数えられるデータになっていること
-    assert 0.0 <= prod["p95_kmh"] - result.p95_kmh <= 0.0101
+    assert 0.0 <= PROD_KPI_P95_KMH - result.p95_kmh <= 0.0101
 
 
 def test_kpi_episodes_and_verdict() -> None:

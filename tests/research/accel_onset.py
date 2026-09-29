@@ -28,12 +28,11 @@ CSV と yaml を読むだけで、既定ではファイルも書かない。
                   実車速 >= `--min-speed-kmh`（既定 5.0。`free_accel_at` は creep_speed_kmh=4.77
                   で符号が反転するため 3 ではなく 5 で切る）
 
-出す表 6 つ＋表3b（詳細は各 `build_table*` の docstring 参照）:
+出す表 6 つ（詳細は各 `build_table*` の docstring 参照。表3b＝低開度階段の上り／下りは
+2026-09-25 段4 で低開度階段とともに削除した）:
     1. サンプル母数（CSV ごとの行数・dt・条件を満たす行数・惰行残差の検算）
     2. 速度帯 × 開度帯（a_eff 中央値・n・割線・接線の 3 つの十字表）
     3. 踏み方向の層別（下り/一定/上り の a_eff 中央値と、上り−下り の差）
-    3b. 低開度階段の上り／下り層別（`LowOpenStairPattern` の往復を段の山型から検出し、
-       表3 の瞬時踏み方向では区別できない「一定保持中の上り／下り」を対で比較する）
     4. 当てはめ（判定）… 速度帯ごとに折れ線 `a = k·max(0, x−x0)` をビン中央値へ等重みで当てはめ、
        x0 の 95% 区間をブートストラップで出す
     5. 応答遅れ（指令→実開度、実開度→a_eff のピーク lag・相関）
@@ -43,7 +42,7 @@ CSV と yaml を読むだけで、既定ではファイルも書かない。
 
 2026-09-19（段3-1。ProblemReport_20260919 低開度階段の検証用）: `--section` を足した
 （既定 MODE_DRIVE。**既定の挙動は変えない**）。PATTERN_DRIVE を指定すると手順2 のパターン走行
-区間を同じロジックで解析できる（低開度階段が狙いどおり測れたかの確認に使う）。時刻列は
+区間を同じロジックで解析できる。時刻列は
 `mode_time_s` があればそれ、無ければ `elapsed_s` にフォールバックする。
 
 CLI:
@@ -63,7 +62,6 @@ from pathlib import Path
 
 import numpy as np
 
-from src.models.profile import FeedforwardParams, pedal_gain_at
 from tests.research.config import DEFAULT_CONFIG_PATH, load_config
 from tests.research.debug_process23 import md_table
 from tests.research.drive_log import (
@@ -74,6 +72,7 @@ from tests.research.drive_log import (
 )
 from tests.research.ff_params import ResearchFFParams, free_accel_at, research_ff_params
 from tests.research.kpi import find_episodes, sample_interval_s
+from tests.research.research_types import FeedforwardParams, pedal_gain_at
 from tests.research.vehicle import feedforward_params
 
 Row = Mapping[str, str]
@@ -115,8 +114,6 @@ class CsvSeries:
     brake_pct: np.ndarray  # 実開度ブレーキ（NaN=欠測）
     accel_cmd_pct: np.ndarray  # 指令開度アクセル（表5 の「指令→実開度」用）
     deviation_kmh: np.ndarray  # 偏差＝実車速−基準車速（NaN=基準なし）
-    pattern: np.ndarray  # pattern 列（表3b の階段判定用。dtype=str。欠測は空文字）
-    phase: np.ndarray  # phase 列（表3b の階段判定用。dtype=str。欠測は空文字）
 
 
 def _opt_opening(row: Row, axis: str) -> float:
@@ -160,12 +157,10 @@ def series_from_rows(
     brake = np.array([_opt_opening(r, "brake") for r in sec_rows], dtype=float)
     accel_cmd = np.array([cmd_opening(r, "accel") for r in sec_rows], dtype=float)
     deviation = np.array([_opt_float(r.get("deviation_kmh")) for r in sec_rows], dtype=float)
-    pattern = np.array([r.get("pattern", "") or "" for r in sec_rows], dtype=str)
-    phase = np.array([r.get("phase", "") or "" for r in sec_rows], dtype=str)
 
     dt = sample_interval_s(t.tolist())
     return CsvSeries(
-        source, dt, len(sec_rows), t, v, accel, brake, accel_cmd, deviation, pattern, phase,
+        source, dt, len(sec_rows), t, v, accel, brake, accel_cmd, deviation,
     )
 
 
@@ -242,76 +237,6 @@ def _direction_labels(
     return labels
 
 
-# 低開度階段（`pattern_loop.LowOpenStairPattern`）の一定保持がこの phase に入る。
-# 加速掃引（ACCEL_SWEEP）やブレーキ保持（BRAKE_HOLD）も「踏む→離す」で指令開度が山型に
-# なるため、段数・山型だけでは階段と区別できない。phase で絞り込むことで、この2つを弾く
-# （2026-09-20 追加。当初 phase 絞り込み無しで実装したところ、階段以外まで誤って
-# 階段扱いしていたための訂正）。
-STAIR_PHASE = "CRUISE_TRIM"
-
-
-def _stair_leg_labels(pattern: np.ndarray, phase: np.ndarray, accel_cmd: np.ndarray) -> np.ndarray:
-    """低開度階段（往復）の上り／下りレッグを判定する（表3b 用）。
-
-    `phase == STAIR_PHASE` の行だけを対象にする（それ以外は問答無用で ""）。そのうえで
-    `pattern` が同じ連続行を 1 つの「パターン区間」とみなし、その中で `accel_cmd` の値が
-    変わるたびに段番号を振る。段が 5 段以上あり、かつ段の代表値が「単調増→単調減」の
-    山型（折り返しが実在＝先頭・末尾以外に頂点がある）になっている区間だけを階段とみなし、
-    頂点までの段を「上り」、頂点より後の段を「下り」にする。それ以外の行は ""。
-
-    パターン名の文字列には依存しない（phase と指令開度の形だけで判定する）。
-    """
-    n = len(accel_cmd)
-    labels = np.full(n, "", dtype="<U4")
-    if n == 0:
-        return labels
-
-    stair_rows = phase == STAIR_PHASE
-    seg_start = 0
-    for i in range(1, n + 1):
-        if i == n or pattern[i] != pattern[seg_start]:
-            _label_stair_segment(labels, accel_cmd, stair_rows, seg_start, i)
-            seg_start = i
-    return labels
-
-
-def _label_stair_segment(
-    labels: np.ndarray, accel_cmd: np.ndarray, stair_rows: np.ndarray, start: int, end: int,
-) -> None:
-    """`[start, end)` の 1 パターン区間を山型階段として判定し、`labels` を書き換える（副作用）。"""
-    idx = [i for i in range(start, end) if stair_rows[i] and not np.isnan(accel_cmd[i])]
-    if not idx:
-        return
-
-    steps: list[list[int]] = [[idx[0]]]
-    values: list[float] = [float(accel_cmd[idx[0]])]
-    for i in idx[1:]:
-        v = float(accel_cmd[i])
-        if v != values[-1]:
-            steps.append([i])
-            values.append(v)
-        else:
-            steps[-1].append(i)
-
-    m = len(steps)
-    if m < 5:
-        return
-
-    s = np.array(values)
-    peak = int(np.argmax(s))
-    if peak < 1 or peak > m - 2:
-        return
-    if not np.all(np.diff(s[: peak + 1]) >= 0):
-        return
-    if not np.all(np.diff(s[peak:]) <= 0):
-        return
-
-    for step_i, rows in enumerate(steps):
-        label = "上り" if step_i <= peak else "下り"
-        for i in rows:
-            labels[i] = label
-
-
 def _free_accel_array(
     v: np.ndarray, params: FeedforwardParams, research: ResearchFFParams
 ) -> np.ndarray:
@@ -332,7 +257,6 @@ class CsvAnalysis:
     sample_mask: np.ndarray  # 表2/3/4 の母集団（定常窓あり）
     episode_mask: np.ndarray  # 表6 の母集団（定常窓なし）
     coast_mask: np.ndarray  # 表1 の惰行残差検算用（アクセル・ブレーキとも不感帯以下）
-    stair_leg: np.ndarray  # 表3b 用（低開度階段の上り／下りレッグ。"上り"/"下り"/""）
 
 
 def analyze_rows(
@@ -362,7 +286,6 @@ def analyze_rows(
     direction = _direction_labels(
         series.accel_pct, series.dt_s, direction_lookback_s, direction_tol_pct
     )
-    stair_leg = _stair_leg_labels(series.pattern, series.phase, series.accel_cmd_pct)
 
     valid = ~np.isnan(series.accel_pct) & ~np.isnan(series.brake_pct) & ~np.isnan(a_eff)
     brake_ok = series.brake_pct <= params.brake_deadband_pct
@@ -376,7 +299,7 @@ def analyze_rows(
 
     return CsvAnalysis(
         series, a_obs, free_accel, a_eff, x, steady, direction,
-        sample_mask, episode_mask, coast_mask, stair_leg,
+        sample_mask, episode_mask, coast_mask,
     )
 
 
@@ -398,7 +321,6 @@ def _pool_samples(
 
     既存の呼び出し元（本体の `run()` と `test_research_accel_onset.py` の回帰テストが直接
     この関数を呼んでいる）が 4 要素タプルの分解に依存しているため、戻り値の個数は変えない。
-    表3b 用の階段レッグは `_pool_stair_legs`（直後）を別途呼ぶ。
     """
     v_all, x_all, a_all, dir_all = [], [], [], []
     for an in analyses:
@@ -413,15 +335,6 @@ def _pool_samples(
         np.concatenate(a_all) if a_all else np.array([]),
         np.concatenate(dir_all) if dir_all else np.array([], dtype="<U4"),
     )
-
-
-def _pool_stair_legs(analyses: Sequence[CsvAnalysis]) -> np.ndarray:
-    """`sample_mask` 行の階段レッグ（表3b 用）を全 CSV 分プールする（`_pool_samples` と対で使う）。
-
-    表3b だけが使うため、`_pool_samples` の戻り値の個数は変えずに別関数として切り出した。
-    """
-    leg_all = [an.stair_leg[an.sample_mask] for an in analyses]
-    return np.concatenate(leg_all) if leg_all else np.array([], dtype="<U4")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -568,52 +481,6 @@ def build_table3(
             up, down = medians["上り"], medians["下り"]
             cells.append("—" if up is None or down is None else f"{up - down:+.2f}")
             rows.append(cells)
-    return header, rows
-
-
-# ─────────────────────────────────────────────────────────────────────
-# 表3b: 低開度階段の上り／下り
-# ─────────────────────────────────────────────────────────────────────
-
-
-def build_table3b(
-    v: np.ndarray, x: np.ndarray, a: np.ndarray, leg: np.ndarray,
-    speed_bins: Sequence[float], offset_bins: Sequence[float],
-) -> tuple[list[str], list[list[str]]]:
-    """`LowOpenStairPattern`（低開度階段）の往復を上り／下りで層別する（表3 の一定保持版）。
-
-    一定保持中は表3 の瞬時踏み方向では「一定」に潰れて区別できないため、`_stair_leg_labels`
-    が判定した往復レッグ（段の山型から折り返しを検出）で層別する。上り・下りの両方に
-    1 サンプル以上あるセルだけを出す（片方しか無いセルは差が計算できず読みにくいため省く）。
-    """
-    header = [
-        "速度帯 [km/h]", "開度帯 [%]", "上り n", "上り a_eff", "下り n", "下り a_eff",
-        "差(上り-下り)",
-    ]
-    rows = []
-    for si in range(len(speed_bins) - 1):
-        smask = (v >= speed_bins[si]) & (v < speed_bins[si + 1])
-        for oi in range(len(offset_bins) - 1):
-            omask = smask & (x >= offset_bins[oi]) & (x < offset_bins[oi + 1])
-            if not np.any(omask):
-                continue
-            medians: dict[str, float | None] = {}
-            counts: dict[str, int] = {}
-            for label in ("上り", "下り"):
-                dmask = omask & (leg == label)
-                n = int(np.count_nonzero(dmask))
-                counts[label] = n
-                medians[label] = float(np.median(a[dmask])) if n else None
-            up, down = medians["上り"], medians["下り"]
-            if up is None or down is None:
-                continue
-            rows.append([
-                f"{speed_bins[si]:g}〜{speed_bins[si + 1]:g}",
-                f"{offset_bins[oi]:g}〜{offset_bins[oi + 1]:g}",
-                str(counts["上り"]), f"{up:+.2f}",
-                str(counts["下り"]), f"{down:+.2f}",
-                f"{up - down:+.2f}",
-            ])
     return header, rows
 
 
@@ -1051,7 +918,6 @@ def run(
     print(md_table(*build_table1(analyses)))
 
     v, x, a, direction = _pool_samples(analyses)
-    leg = _pool_stair_legs(analyses)
     stats = _bin_stats(v, x, a, speed_bins, offset_bins)
 
     print("\n## 表2: 速度帯 × 開度帯\n")
@@ -1064,17 +930,6 @@ def run(
 
     print("\n## 表3: 踏み方向の層別\n")
     print(md_table(*build_table3(v, x, a, direction, speed_bins, offset_bins)))
-
-    print("\n## 表3b: 低開度階段の上り／下り\n")
-    print(
-        "※ 各段は「一定保持に入った直後の過渡」と「落ち着いた後」の両方を含む。"
-        "上りと下りが同じ速度帯を通るのは主に過渡なので、この差は過渡の差として読むこと。"
-    )
-    if not np.any(leg != ""):
-        print("低開度階段（指令開度が山型の一定保持パターン）が見つからないため表3b は省略します")
-    else:
-        header3b, rows3b = build_table3b(v, x, a, leg, speed_bins, offset_bins)
-        print(md_table(header3b, rows3b) if rows3b else "（該当セル無し）")
 
     print("\n## 表4: 当てはめ（判定）\n")
     table_steady, table_all = build_table4(

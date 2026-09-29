@@ -23,17 +23,8 @@
         判定は WLTP 1800s の閉ループ模擬（KPI・走行状態別の偏差・効くペダルの割合・
         不感帯内の指令・開度の跳び）と、ペダル応答 ±20% での頑健性。
 
-    --part coverage   段階 3: 手順 2 のパターン走行が WLTP に要る領域を覆えているか
-        V-1 速度帯 × 開度で「WLTP が要る時間」と「学習の効く行数」を並べる
-        V-2 開度ごとの分布（速度をまとめたもの）
-        V-3 パターンごとの実績（所要時間・開度・開始車速・効く行数）
-        V-4 フェーズごとの所要時間（打ち切りに張り付いていないか）
-        V-5 現行パターンの欠陥（V-3・V-4 の実測を根拠にする）
-        V-6 パターン案と所要時間（実測の単位時間から積算。車両モデルでは模擬しない）
-        V-7 系統を 1 つ抜いて学習し直したときの WLTP 指令開度の変化
-        V-8 実開度 PNOW（0x9000）を毎周期の読み取りに相乗りさせる案のフレーム長
-        要る開度は基準車速から物理式（惰行カーブ＋ペダルゲイン）で逆算する。学習した
-        モデルの予測は使わない（学習データの中身に結論を依存させないため）。
+    （--part coverage＝手順 2 パターン走行の網羅性は、2026-09-25 段4 で旧パターンとともに削除した。
+    WLTP の網羅マップは `python -m tests.research.wltp_grid`。）
 """
 
 from __future__ import annotations
@@ -47,22 +38,6 @@ from pathlib import Path
 
 import numpy as np
 
-from src.domain.control.pedal_plan import analytic_efforts
-from src.domain.learning_drive import (
-    ACCEL_DEADBAND_PROBE_HOLD_S,
-    ACCEL_SWEEP_FRACS,
-    CRUISE_TRIM_HOLD_S,
-    HOLD_DURATION_S,
-)
-from src.domain.model_training import (
-    DEFAULT_FEATURE_SPEC,
-    STOP_SPEED_KMH,
-    FeatureSpec,
-    _build_feature_matrix,
-    _estimate_offsets,
-    _make_estimator,
-)
-from src.models.profile import FeedforwardParams
 from tests.research.config import DEFAULT_CONFIG_PATH, ResearchConfig, load_config
 from tests.research.drive_log import SECTION_MODE_DRIVE, SECTION_PATTERN_DRIVE
 from tests.research.ff_explain import (
@@ -75,6 +50,14 @@ from tests.research.ff_explain import (
     outputs_from_points,
     pedal_class,
 )
+from tests.research.ff_model import (
+    DEFAULT_FEATURE_SPEC,
+    STOP_SPEED_KMH,
+    FeatureSpec,
+    build_feature_matrix,
+    estimate_offsets,
+    make_estimator,
+)
 from tests.research.kpi import compute_kpi
 from tests.research.live_plot import COLOR_ACTUAL, COLOR_REF
 from tests.research.mode_drive import ReferenceSpeed, load_mode
@@ -86,7 +69,12 @@ from tests.research.model_analysis import (
     load_training_rows,
     switch_count,
 )
-from tests.research.pattern_loop import PatternLoopConfig
+from tests.research.research_types import (
+    VEHICLE_STOP_SPEED_KMH,
+    FeedforwardParams,
+    coast_decel_at,
+    pedal_gain_at,
+)
 from tests.research.vehicle import feedforward_params
 from tests.research.vehicle_sim import (
     OVER_EDGES_PCT,
@@ -399,6 +387,57 @@ ROBUST_SCALES = (0.8, 1.0, 1.2)  # ペダル応答の倍率（車両モデルが
 COMPARE_ZOOMS_S = ((20.0, 120.0), (860.0, 930.0), (1550.0, 1650.0))
 
 
+# 移植元: src/domain/control/pedal_plan.py の coast_accel / analytic_efforts
+# （`tests/` だけで完結させるため持ち込んだ。ロジックは同じ。ProblemReport_20260924）
+
+def coast_accel(v: float, params: FeedforwardParams) -> float:
+    """速度 v [km/h] での惰行加速度 a_coast [km/h/s]（ペダル未操作時）。
+
+    クリープ速度未満はクリープが車を押す（+creep_rate）、以上は惰行減速カーブ
+    （coast_decel_at: 同定済みなら速度依存の補間、未同定は engine_brake_decel 定数）で
+    減速する。フェーズ分類の基準線。速度依存を無視すると、実惰行が基準より強い速度域で
+    緩減速を BRAKE と誤分類し、プランが必要な正 effort を出せなくなる（sample_004 実機）。
+    """
+    if v < params.creep_speed_kmh:
+        return params.creep_rate_kmhs
+    return -coast_decel_at(params, v)
+
+
+def analytic_efforts(
+    speeds: np.ndarray, accels: np.ndarray, params: FeedforwardParams
+) -> np.ndarray:
+    """惰行カーブとペダルゲインから必要 effort [%] を解析的に求める（同定なしは NaN）。
+
+    effort = (a_req − a_coast(v)) / ペダルゲイン(v) + 不感帯。Δa=0（＝惰行そのまま）で
+    effort=0 が構造的に保証されるため、学習データが無い低開度域が「モデルの外挿」ではなく
+    「原点との内挿」になる。不感帯を足すのは PedalArbiter が開度を max(deadband, |effort|)
+    に丸めるため（ゲインは不感帯超の開度で同定している。model_training.
+    _estimate_pedal_gain_curve 参照）。
+
+    ペダルゲイン未同定の向き・停車域は np.nan を返し、呼び出し元がモデル出力へ
+    フォールバックできるようにする。
+    """
+    out = np.full(len(speeds), np.nan, dtype=float)
+    accel_db = max(0.0, params.accel_deadband_pct)
+    brake_db = max(0.0, params.brake_deadband_pct)
+    for i, (v, a) in enumerate(zip(speeds, accels)):
+        v_f = float(v)
+        if v_f < VEHICLE_STOP_SPEED_KMH:
+            continue  # 停車保持は clamp_effort_by_phase の保持 effort が支配する
+        delta_a = float(a) - coast_accel(v_f, params)
+        if delta_a > 0.0:
+            gain = pedal_gain_at(params, v_f, is_accel=True)
+            if gain is not None:
+                out[i] = delta_a / gain + accel_db
+        elif delta_a < 0.0:
+            gain = pedal_gain_at(params, v_f, is_accel=False)
+            if gain is not None:
+                out[i] = -(-delta_a / gain + brake_db)
+        else:
+            out[i] = 0.0
+    return out
+
+
 def coast_accel_array(p: FeedforwardParams, speed_kmh: np.ndarray) -> np.ndarray:
     """両ペダルを離したときの加速度（本番 pedal_plan.coast_accel の配列版）。"""
     return np.where(speed_kmh < p.creep_speed_kmh, p.creep_rate_kmhs, -coast_decel(p, speed_kmh))
@@ -437,10 +476,10 @@ def _feature_matrix(
     accel_open = np.array([lg.accel_opening for lg in logs], dtype=float)
     brake_open = np.array([lg.brake_opening for lg in logs], dtype=float)
     timestamps = [lg.timestamp for lg in logs]
-    x, idx = _build_feature_matrix(
+    x, idx = build_feature_matrix(
         speed,
-        _estimate_offsets(timestamps, spec.lookahead_horizons_s),
-        _estimate_offsets(timestamps, spec.past_horizons_s),
+        estimate_offsets(timestamps, spec.lookahead_horizons_s),
+        estimate_offsets(timestamps, spec.past_horizons_s),
         spec,
     )
     kinds = np.array([s.split(":", 1)[-1] for s in patterns])
@@ -474,8 +513,8 @@ def train_models(
     a_lab, b_lab = accel_open[label_idx], brake_open[label_idx]
     a_mask = a_lab >= p.accel_deadband_pct
     b_mask = b_lab >= p.brake_deadband_pct
-    accel_model = _make_estimator().fit(x[a_mask], a_lab[a_mask])
-    brake_model = _make_estimator().fit(x[b_mask], b_lab[b_mask])
+    accel_model = make_estimator().fit(x[a_mask], a_lab[a_mask])
+    brake_model = make_estimator().fit(x[b_mask], b_lab[b_mask])
     a_pred = np.maximum(0.0, accel_model.predict(x[a_mask]))
     b_pred = np.maximum(0.0, brake_model.predict(x[b_mask]))
     return TrainedModels(
@@ -1111,638 +1150,6 @@ def run_compare(cfg: ResearchConfig, run_csv: Path, train_csv: Path, out_dir: Pa
 
 
 # ─────────────────────────────────────────────────────────────────────
-# --part coverage（段階 3: 手順 2 パターン走行の網羅性と所要時間）
-# ─────────────────────────────────────────────────────────────────────
-
-COVER_SPEED_EDGES_KMH = (0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0)
-COVER_OPEN_EDGES_PCT = (10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0)
-SPEED_BAND_LABELS = [
-    f"{COVER_SPEED_EDGES_KMH[i]:g}〜{COVER_SPEED_EDGES_KMH[i + 1]:g}"
-    for i in range(len(COVER_SPEED_EDGES_KMH) - 1)
-]
-OPEN_BIN_LABELS = [
-    *(f"{COVER_OPEN_EDGES_PCT[i]:g}〜{COVER_OPEN_EDGES_PCT[i + 1]:g}"
-      for i in range(len(COVER_OPEN_EDGES_PCT) - 1)),
-    f"{COVER_OPEN_EDGES_PCT[-1]:g}〜",
-]
-# 学習の系統（CSV の pattern 列 "12:ACCEL_SWEEP" の ":" より後ろ）
-PATTERN_KINDS = (
-    "ACCEL_SWEEP", "BRAKE_HOLD", "COAST_DOWN", "CRUISE_TRIM", "ACCEL_DEADBAND_PROBE",
-    "CREEP", "CREEP_SETTLE",
-)
-# フェーズごとの上限（打ち切り時間、または設計上の保持時間）。
-# 打ち切りは tests/research/pattern_loop.PatternLoopConfig、
-# 設計上の保持は src/domain/learning_drive の既定値。
-PHASE_LIMIT_S = {
-    ("", "DRIVE_ACCEL"): PatternLoopConfig().accel_full_range_timeout_s,
-    ("", "DRIVE_BRAKE"): PatternLoopConfig().brake_stop_timeout_s,
-    ("", "BRAKE_HOLD"): PatternLoopConfig().brake_hold_timeout_s,
-    ("", "COAST"): PatternLoopConfig().coast_timeout_s,
-    ("", "CRUISE_TRIM"): CRUISE_TRIM_HOLD_S,
-    ("CREEP", "MEASURE"): HOLD_DURATION_S,
-    ("CREEP_SETTLE", "MEASURE"): PatternLoopConfig().creep_settle_timeout_s,
-    ("ACCEL_DEADBAND_PROBE", "MEASURE"): ACCEL_DEADBAND_PROBE_HOLD_S,
-}
-AT_LIMIT_TOL_S = 0.3  # これだけ下回っていなければ「上限に張り付いた」と数える
-HOLE_NEED_S = 10.0  # 「空白」と呼ぶ下限: WLTP がこれ以上の時間を要求している
-HOLE_ROWS = 50  # かつ学習の効く行がこれ未満（0.1s 刻みなので 50 行 = 5s ぶん）
-MODBUS_BYTE_S = 10.0 / 38400.0  # 8N1・38400bps で 1 バイトあたりの時間 [s]
-CONTROL_PERIOD_S = 0.05  # 制御周期（src/domain/control/drive_loop.CONTROL_LOOP_INTERVAL_S）
-
-
-def _band_index(values: np.ndarray, edges: Sequence[float]) -> np.ndarray:
-    """速度帯の番号（最後の辺以上は最後の帯に入れる）。"""
-    e = np.asarray(edges, dtype=float)
-    return np.clip(np.searchsorted(e, values, side="right") - 1, 0, len(e) - 2)
-
-
-def _open_index(values: np.ndarray, edges: Sequence[float]) -> np.ndarray:
-    """開度ビンの番号（edges[0] 未満と NaN は -1、最後の辺以上は最後のビン）。"""
-    e = np.asarray(edges, dtype=float)
-    idx = np.searchsorted(e, values, side="right") - 1
-    return np.where(np.isfinite(values) & (values >= e[0]), idx, -1)
-
-
-@dataclass(frozen=True)
-class Demand:
-    """WLTP が要る「ペダル」と「開度」。"""
-
-    pedal: np.ndarray
-    opening: np.ndarray  # 要る開度 [%]（惰行・停車・クリープの周期は NaN）
-
-
-def wltp_demand(p: FeedforwardParams, frames: RefFrames) -> Demand:
-    """基準車速だけから「どのペダルが何 % 要るか」を物理式で逆算する。
-
-    Ridge の予測は使わない（学習データの中身に依存させないため）。`analytic_efforts` は
-    要求加速度が惰行より上ならアクセル・下ならブレーキと分けるので、`decide_openings`
-    （C1〜C5 のペダル選択）と同じ基準になる。停車保持とクリープ任せの周期は数えない。
-    """
-    eff = analytic_efforts(frames.v0_raw, frames.a_req, p)
-    stop = (frames.v0_raw <= STOP_SPEED_KMH) & (frames.near <= STOP_SPEED_KMH)
-    creep = (
-        (~stop) & (frames.a_req >= 0.0) & (frames.v0_raw < p.creep_speed_kmh)
-        & (frames.a_req <= p.creep_rate_kmhs)
-    )
-    idle = stop | creep | ~np.isfinite(eff) | (eff == 0.0)
-    pedal = np.where(idle, PEDAL_COAST, np.where(eff > 0.0, PEDAL_ACCEL, PEDAL_BRAKE))
-    return Demand(pedal=pedal, opening=np.where(idle, np.nan, np.abs(eff)))
-
-
-@dataclass(frozen=True)
-class EffectiveRows:
-    """C1〜C5 が学習に使う行（そのペダルの開度が不感帯以上）。"""
-
-    speed: np.ndarray
-    opening: np.ndarray
-    kind: np.ndarray
-
-
-def effective_rows(train_csv: Path, p: FeedforwardParams) -> tuple[EffectiveRows, EffectiveRows]:
-    """手順 2 のログから、アクセル / ブレーキが効いている行を取り出す。"""
-    logs, patterns, _ = load_training_rows(train_csv)
-    kinds = np.array([s.split(":", 1)[-1] for s in patterns])
-    speed = np.clip(np.array([lg.actual_speed_kmh for lg in logs], dtype=float), 0.0, None)
-    accel = np.array([lg.accel_opening for lg in logs], dtype=float)
-    brake = np.array([lg.brake_opening for lg in logs], dtype=float)
-    ma, mb = accel >= p.accel_deadband_pct, brake >= p.brake_deadband_pct
-    return (
-        EffectiveRows(speed[ma], accel[ma], kinds[ma]),
-        EffectiveRows(speed[mb], brake[mb], kinds[mb]),
-    )
-
-
-def coverage_table(demand: Demand, frames: RefFrames, rows: EffectiveRows, pedal: str) -> str:
-    """速度帯 × 開度ビンで「WLTP が要る時間[s]」と「学習の効く行数」を並べる。
-
-    太字は空白のセル: 要る時間が 1s 以上あって学習の行が 0、または要る時間が
-    HOLE_NEED_S 以上あって学習の行が HOLE_ROWS 未満。
-    """
-    grid = coverage_grid(demand, frames, rows, pedal)
-    body = []
-    for i in range(len(SPEED_BAND_LABELS)):
-        cells = []
-        for j in range(len(OPEN_BIN_LABELS)):
-            sec, cnt = grid[i][j]
-            if sec < 1.0:
-                cells.append("—" if cnt == 0 else f"要らない / {cnt}")
-            elif _is_hole(sec, cnt):
-                cells.append(f"**{sec:.0f}s / {cnt}**")
-            else:
-                cells.append(f"{sec:.0f}s / {cnt}")
-        body.append([SPEED_BAND_LABELS[i], *cells])
-    return md_table(["速度帯[km/h] \\ 開度[%]", *OPEN_BIN_LABELS], body)
-
-
-def _is_hole(sec: float, rows: int) -> bool:
-    """そのセルが「要るのに学習データが無い（少ない）」か。"""
-    return (sec >= 1.0 and rows == 0) or (sec >= HOLE_NEED_S and rows < HOLE_ROWS)
-
-
-def coverage_grid(
-    demand: Demand, frames: RefFrames, rows: EffectiveRows, pedal: str
-) -> list[list[tuple[float, int]]]:
-    """速度帯 × 開度ビンの (WLTP が要る時間[s], 学習の効く行数)。"""
-    m = demand.pedal == pedal
-    sb = _band_index(frames.v0_raw[m], COVER_SPEED_EDGES_KMH)
-    ob = _open_index(demand.opening[m], COVER_OPEN_EDGES_PCT)
-    rb = _band_index(rows.speed, COVER_SPEED_EDGES_KMH)
-    ro = _open_index(rows.opening, COVER_OPEN_EDGES_PCT)
-    return [
-        [(SIM_DT_S * int(np.sum((sb == i) & (ob == j))), int(np.sum((rb == i) & (ro == j))))
-         for j in range(len(OPEN_BIN_LABELS))]
-        for i in range(len(SPEED_BAND_LABELS))
-    ]
-
-
-def worst_holes(
-    demand: Demand, frames: RefFrames, rows: EffectiveRows, pedal: str, top: int = 3
-) -> str:
-    """要る時間が長いのに学習データが少ないセルを、要る時間の多い順に並べた文字列。"""
-    grid = coverage_grid(demand, frames, rows, pedal)
-    found = [
-        (sec, cnt, i, j)
-        for i, row in enumerate(grid) for j, (sec, cnt) in enumerate(row) if _is_hole(sec, cnt)
-    ]
-    found.sort(reverse=True)
-    text = " / ".join(
-        f"{SPEED_BAND_LABELS[i]} km/h × {OPEN_BIN_LABELS[j]}% は {sec:.0f}s 要るのに {cnt} 行"
-        for sec, cnt, i, j in found[:top]
-    )
-    return f"{text}（空白のセルは全部で {len(found)} 個）" if found else "なし"
-
-
-def opening_hist_table(demand: Demand, rows_a: EffectiveRows, rows_b: EffectiveRows) -> str:
-    """開度ビンごとの「WLTP が要る時間」と「学習の効く行数」（速度をまとめた分布）。"""
-    pairs = ((PEDAL_ACCEL, rows_a), (PEDAL_BRAKE, rows_b))
-    body = []
-    for j, label in enumerate(OPEN_BIN_LABELS):
-        cells: list[str] = [label]
-        for pedal, rows in pairs:
-            m = demand.pedal == pedal
-            sec = SIM_DT_S * int(
-                np.sum(_open_index(demand.opening[m], COVER_OPEN_EDGES_PCT) == j)
-            )
-            cnt = int(np.sum(_open_index(rows.opening, COVER_OPEN_EDGES_PCT) == j))
-            cells += [f"{sec:.0f}" if sec >= 0.5 else "—", str(cnt) if cnt > 0 else "—"]
-        body.append(cells)
-    totals: list[str] = ["**合計**"]
-    for pedal, rows in pairs:
-        m = demand.pedal == pedal
-        totals += [f"**{SIM_DT_S * int(np.sum(m)):.0f}**", f"**{len(rows.opening)}**"]
-    body.append(totals)
-    return md_table(
-        ["開度[%]", "アクセル 要る時間[s]", "アクセル 学習行",
-         "ブレーキ 要る時間[s]", "ブレーキ 学習行"],
-        body,
-    )
-
-
-@dataclass(frozen=True)
-class PatternStat:
-    """手順 2 のログで、1 パターンが実際にどう走ったか。"""
-
-    name: str
-    kind: str
-    rows: int
-    duration_s: float
-    max_accel: float
-    max_brake: float
-    v_start: float
-    v_max: float
-    eff_accel: int
-    eff_brake: int
-    phases: str
-
-
-def pattern_stats(train_csv: Path, p: FeedforwardParams) -> tuple[list[PatternStat], float]:
-    """CSV の pattern 列ごとに、所要時間・開度・車速・効く行数をまとめる。
-
-    2 番目の返り値はパターン走行の全体時間（最初の行から最後の行まで）。パターンごとの
-    所要時間の合計より数秒長い（パターンの切れ目に指令の送り直しが入るため）。
-    """
-    logs, patterns, phases = load_training_rows(train_csv)
-    out: list[PatternStat] = []
-    start = 0
-    for i in range(1, len(patterns) + 1):
-        if i < len(patterns) and patterns[i] == patterns[start]:
-            continue
-        block = logs[start:i]
-        ph = phases[start:i]
-        speed = np.clip(np.array([lg.actual_speed_kmh for lg in block], dtype=float), 0.0, None)
-        accel = np.array([lg.accel_opening for lg in block], dtype=float)
-        brake = np.array([lg.brake_opening for lg in block], dtype=float)
-        seen: list[str] = []
-        for name in ph:
-            if not seen or seen[-1] != name:
-                seen.append(str(name))
-        out.append(PatternStat(
-            name=str(patterns[start]),
-            kind=str(patterns[start]).split(":", 1)[-1],
-            rows=len(block),
-            duration_s=(block[-1].timestamp - block[0].timestamp).total_seconds(),
-            max_accel=float(accel.max()),
-            max_brake=float(brake.max()),
-            v_start=float(speed[0]),
-            v_max=float(speed.max()),
-            eff_accel=int(np.sum(accel >= p.accel_deadband_pct)),
-            eff_brake=int(np.sum(brake >= p.brake_deadband_pct)),
-            phases="→".join(seen),
-        ))
-        start = i
-    span = (logs[-1].timestamp - logs[0].timestamp).total_seconds()
-    return out, span
-
-
-def pattern_table(stats: Sequence[PatternStat], span_s: float) -> str:
-    body = [[
-        s.name, str(s.rows), f"{s.duration_s:.1f}", f"{s.max_accel:.2f}", f"{s.max_brake:.2f}",
-        f"{s.v_start:.1f}", f"{s.v_max:.1f}", str(s.eff_accel), str(s.eff_brake), s.phases,
-    ] for s in stats]
-    body.append(["**合計**", f"**{sum(s.rows for s in stats)}**",
-                 f"**{span_s:.1f}**（パターンごとの和は {sum(s.duration_s for s in stats):.1f}）",
-                 "—", "—", "—", "—", f"**{sum(s.eff_accel for s in stats)}**",
-                 f"**{sum(s.eff_brake for s in stats)}**", "—"])
-    return md_table(
-        ["パターン", "行数", "所要[s]", "最大アクセル[%]", "最大ブレーキ[%]", "開始車速[km/h]",
-         "到達最高速[km/h]", "効くアクセル行", "効くブレーキ行", "フェーズ"],
-        body,
-    )
-
-
-@dataclass(frozen=True)
-class PhaseStat:
-    """系統 × フェーズの連続ブロックの所要時間（打ち切りに張り付いていないか）。"""
-
-    kind: str
-    phase: str
-    count: int
-    median_s: float
-    min_s: float
-    max_s: float
-    limit_s: float
-    at_limit: int
-
-
-def phase_stats(train_csv: Path) -> list[PhaseStat]:
-    logs, patterns, phases = load_training_rows(train_csv)
-    blocks: dict[tuple[str, str], list[float]] = {}
-    start = 0
-    for i in range(1, len(patterns) + 1):
-        same = i < len(patterns) and patterns[i] == patterns[start] and phases[i] == phases[start]
-        if same:
-            continue
-        key = (str(patterns[start]).split(":", 1)[-1], str(phases[start]))
-        dur = (logs[i - 1].timestamp - logs[start].timestamp).total_seconds()
-        blocks.setdefault(key, []).append(dur)
-        start = i
-    out: list[PhaseStat] = []
-    for (kind, phase), durs in sorted(blocks.items()):
-        limit = PHASE_LIMIT_S.get((kind, phase), PHASE_LIMIT_S.get(("", phase), float("nan")))
-        at_limit = int(sum(1 for d in durs if np.isfinite(limit) and d >= limit - AT_LIMIT_TOL_S))
-        out.append(PhaseStat(
-            kind=kind, phase=phase, count=len(durs), median_s=float(np.median(durs)),
-            min_s=min(durs), max_s=max(durs), limit_s=limit, at_limit=at_limit,
-        ))
-    return out
-
-
-def phase_table(stats: Sequence[PhaseStat]) -> str:
-    body = [[
-        s.kind, s.phase, str(s.count), f"{s.median_s:.1f}", f"{s.min_s:.1f}", f"{s.max_s:.1f}",
-        f"{s.limit_s:.0f}" if np.isfinite(s.limit_s) else "—",
-        f"**{s.at_limit} / {s.count}**" if s.at_limit == s.count else f"{s.at_limit} / {s.count}",
-    ] for s in stats]
-    return md_table(
-        ["系統", "フェーズ", "本数", "所要 中央値[s]", "最短[s]", "最長[s]",
-         "上限[s]（打ち切り / 設計の保持）", "上限に張り付いた本数"],
-        body,
-    )
-
-
-def defect_table(
-    stats: Sequence[PatternStat], phases: Sequence[PhaseStat], demand: Demand, frames: RefFrames,
-    rows_a: EffectiveRows, rows_b: EffectiveRows, cfg: ResearchConfig,
-) -> str:
-    """現行パターンの欠陥（症状・根拠の数値・直し方）。数値はすべて上の表から取る。"""
-    sweep = [s for s in stats if s.kind == "ACCEL_SWEEP"]
-    hold = [s for s in stats if s.kind == "BRAKE_HOLD"]
-    coast = [s for s in stats if s.kind == "COAST_DOWN"]
-    trim = [s for s in stats if s.kind == "CRUISE_TRIM"]
-    probe = [s for s in stats if s.kind == "ACCEL_DEADBAND_PROBE"]
-    cap = cfg.vehicle.max_speed_kmh * PatternLoopConfig().accel_speed_cap_frac
-    accel_need_max = float(np.nanmax(demand.opening[demand.pedal == PEDAL_ACCEL]))
-    over = int(np.sum(rows_a.opening > accel_need_max))
-    starts = " / ".join(f"{s.v_start:.0f}" for s in sweep)
-    hold_starts = " / ".join(f"{s.v_start:.0f}" for s in hold)
-    ret = next((s for s in phases if s.phase == "DRIVE_BRAKE"), None)
-    acc = next((s for s in phases if s.kind == "BRAKE_HOLD" and s.phase == "DRIVE_ACCEL"), None)
-    acc_coast = next(
-        (s for s in phases if s.kind == "COAST_DOWN" and s.phase == "DRIVE_ACCEL"), None
-    )
-    bh = next((s for s in phases if s.phase == "BRAKE_HOLD"), None)
-    probe_rows = sum(s.eff_accel for s in probe)
-    body = [
-        ["1. 開始速度が前パターン次第",
-         f"ACCEL_SWEEP 4 本の開始車速が {starts} km/h、BRAKE_HOLD 8 本が {hold_starts} km/h",
-         f"停車へ戻す DRIVE_BRAKE が {ret.count if ret else 0} 本すべて打ち切り "
-         f"{ret.limit_s if ret else 0:.0f}s に張り付き、停車しないまま次へ進む"
-         if ret else "—",
-         "各段の前に「停車まで戻す」か「指定速度まで整える」を置き、打ち切りを停車できる長さにする"],
-        ["2. WLTP で使わない開度を掃いている",
-         f"ACCEL_SWEEP の保持開度は {ACCEL_SWEEP_FRACS} × 上限 "
-         f"{cfg.vehicle.max_accel_opening_pct:.0f}% = "
-         + " / ".join(f"{f * cfg.vehicle.max_accel_opening_pct:.0f}" for f in ACCEL_SWEEP_FRACS)
-         + "%",
-         f"WLTP のアクセル需要は最大 {accel_need_max:.1f}%。効くアクセル行 {len(rows_a.opening)} の"
-         f"うち {over} 行（{100 * over / len(rows_a.opening):.0f}%）がそれを超える開度",
-         "高開度の段を落とし、不感帯 +2〜+12%（＝12〜22%）の保持に付け替える"],
-        ["3. 逆に、WLTP がいちばん長く要求する域を掃いていない",
-         f"アクセル: {worst_holes(demand, frames, rows_a, PEDAL_ACCEL)}",
-         f"ブレーキ: {worst_holes(demand, frames, rows_b, PEDAL_BRAKE)}",
-         "固定開度で cap まで上げる代わりに、目標速度まで上げてから"
-         "「不感帯すぐ上の開度」を保持して速度帯ごとに採る"],
-        ["4. 加速が cap に届かない",
-         f"BRAKE_HOLD・COAST_DOWN の到達最高速は {min(s.v_max for s in hold + coast):.1f}〜"
-         f"{max(s.v_max for s in hold + coast):.1f} km/h（cap {cap:.1f} km/h 未達）。"
-         f"COAST_DOWN の加速は {acc_coast.at_limit if acc_coast else 0} / "
-         f"{acc_coast.count if acc_coast else 0} 本が打ち切り "
-         f"{acc_coast.limit_s if acc_coast else 0:.0f}s に張り付く",
-         "保持や惰行を始める速度が毎回変わるので、高速側のブレーキ・惰行データが揃わない",
-         f"加速フェーズの打ち切りを延ばす（{acc.limit_s if acc else 0:.0f} → 30s）"],
-        ["5. ブレーキ保持が停車まで届かない",
-         f"BRAKE_HOLD の保持は {bh.at_limit if bh else 0} / {bh.count if bh else 0} 本が"
-         f"打ち切り {bh.limit_s if bh else 0:.0f}s に張り付く",
-         "低開度（不感帯 +0.5〜+4%）ばかりで低速域まで減速できず、"
-         "低速 × 高ブレーキ開度が空白のまま（V-1）",
-         "低開度の段を減らし、20 km/h から 20〜50% を停車まで踏む段を足す"],
-        ["6. 惰行がどちらも cap から始まっていない",
-         " / ".join(f"COAST_DOWN {s.name.split(':')[0]} は {s.v_max:.1f} km/h から" for s in coast),
-         f"2 本とも cap {cap:.1f} km/h 未達。とくに 1 本は 86 km/h 止まりで、"
-         "高速側の惰行カーブを裏取りできるのが 1 本だけになる",
-         "加速の打ち切りを延ばして 2 本とも cap から惰行させる"],
-        ["7. 保持が設計より短い / 空振り",
-         " / ".join(f"CRUISE_TRIM {s.name.split(':')[0]} は {s.duration_s:.1f}s" for s in trim),
-         f"設計の保持は {CRUISE_TRIM_HOLD_S:.0f}s。最短の 1 本は実質データ無し",
-         "本数を減らして 1 本ずつ設計どおり保持する"],
-        ["8. 不感帯プローブは学習セルを埋めない",
-         f"ACCEL_DEADBAND_PROBE {len(probe)} 本・"
-         f"{sum(s.duration_s for s in probe):.1f}s で効くアクセル行 {probe_rows} 行",
-         "すべて低速 × 不感帯すぐ上に入るので V-1 の空白は埋めない",
-         "不感帯・クリープの同定用として残す（学習データとしては数えない）"],
-    ]
-    return md_table(["欠陥", "実測", "何が起きるか", "直し方"], body)
-
-
-@dataclass(frozen=True)
-class ProposalStep:
-    """パターン案の 1 項目（所要時間の増減は実測の単位時間から積算する）。"""
-
-    action: str
-    name: str
-    delta_s: float
-    basis: str
-    effect: str
-
-
-PROPOSAL: tuple[ProposalStep, ...] = (
-    ProposalStep(
-        "削除", "ACCEL_SWEEP の 40 / 56 / 80%（3 段）", -45.9,
-        "実測 19.5 + 13.4 + 13.0s",
-        "WLTP のアクセル需要は最大 25.2%。この 3 段は外挿にしか効かない（V-1・V-2）",
-    ),
-    ProposalStep(
-        "変更", "BRAKE_HOLD 8 段 → 5 段。うち 2 段は cap から（+1.0 / +3.0%）、"
-        "3 段は 60 km/h から（+0.5 / +2.0 / +4.0%）＝20s の打ち切り内で停車まで届く", -98.3,
-        "2 本 ×（加速 20.0s ＋ 保持 20.0s）＋ 3 本 ×（60 km/h まで 10.0s ＋ 保持 20.0s）"
-        "= 170.0s（現行は実測 268.3s）",
-        "15〜20% の 1172 行（V-2）を減らし、代わりに 20〜60 km/h × 13.7〜15% "
-        "（27 + 22s 要るのに 0〜16 行）を埋める",
-    ),
-    ProposalStep(
-        "置換", "CRUISE_TRIM（高速 3 本）→ アクセルトリム階段（目標速度まで上げてから"
-        "不感帯 +8 / +5 / +2% を各 8s 保持して踏みながら減速 → 停車）を cap / 90 / 50 km/h 始まりで"
-        " 3 本", +169.1,
-        "削除 −34.9s（実測 28.0 + 6.8 + 0.1s）、追加 +204.0s"
-        "（3 本 ×（加速 20.0s ＋ 保持 3 × 8.0s ＋ 停車まで 24.0s = 68.0s））",
-        "20〜60 km/h × 10〜20%（WLTP が 625s 要求するのに 37 行しかない最大の空白）と"
-        "「踏みながら減速」が埋まる",
-    ),
-    ProposalStep(
-        "追加", "低速 × 高ブレーキ保持（20 km/h から 20 / 30 / 40 / 50% を停車まで）", +36.0,
-        "4 本 ×（20 km/h まで 5.0s ＋ 停車まで 4.0s）",
-        "0〜20 km/h × 25% 以上のうち、学習行が 0 のセル（25〜30 / 40〜50 / 50% 以上で"
-        "合わせて 21s 要る）が埋まる（V-1）",
-    ),
-    ProposalStep(
-        "変更", "加速フェーズの打ち切りを 20 → 30s（cap まで上げる BRAKE_HOLD 2 本・"
-        "COAST_DOWN 2 本・トリム階段の cap 始まり 1 本）", +40.0,
-        "4 本 × +10.0s（トリム階段の 1 本は上の行に入っている）",
-        "cap（137.2 km/h）まで届かせて、高速側のブレーキ・惰行データを揃える",
-    ),
-    ProposalStep(
-        "残す", "CREEP 5 本・CREEP_SETTLE・ACCEL_DEADBAND_PROBE 5 本・COAST_DOWN 2 本", 0.0,
-        "実測 14.7 + 12.9 + 14.8 + 136.2s",
-        "不感帯・停車保持開度・クリープ・惰行カーブの同定に要る（学習セルは埋めない）",
-    ),
-)
-
-
-def proposal_table(current_s: float, timeout_s: float) -> str:
-    body = [[s.action, s.name, f"{s.delta_s:+.1f}", s.basis, s.effect] for s in PROPOSAL]
-    total = current_s + sum(s.delta_s for s in PROPOSAL)
-    body.append([
-        "—", "**合計**", f"**{total - current_s:+.1f}**",
-        f"**現状 {current_s:.1f}s → 提案 {total:.1f}s**",
-        f"**打ち切り {timeout_s:.0f}s に対し余裕 {timeout_s - total:.1f}s**",
-    ])
-    return md_table(["", "内容", "所要時間[s]", "時間の根拠（手順 2 の実測）", "埋まる / 空くもの"],
-                    body)
-
-
-def _delta_cell(full: np.ndarray, other: np.ndarray) -> str:
-    """そのペダルを踏んでいる周期での指令開度の差（平均 / p95 / 最大 [%]）。"""
-    m = (full > 0.0) | (other > 0.0)
-    if not np.any(m):
-        return "—"
-    d = np.abs(full[m] - other[m])
-    return f"{d.mean():.2f} / {np.percentile(d, 95):.2f} / {d.max():.2f}"
-
-
-def leave_out_table(
-    train_csv: Path, p: FeedforwardParams, cfg: ResearchConfig, frames: RefFrames,
-    base: TrainedModels, rows_a: EffectiveRows, rows_b: EffectiveRows,
-) -> str:
-    """系統を 1 つ抜いて学習し直し、WLTP の指令開度がどれだけ動くかを測る。
-
-    実測データだけで完結する（合成した走行で採点しない）。動き幅が不感帯より大きければ
-    「パターン構成が指令を決めている」＝パターン見直しの効き先が分かる。
-    「学習行の減り」が「効く行」より小さいのは、パターンの切れ目の行は先読み・過去の窓が
-    揃わず、抜く前から学習に入っていないため。
-    """
-    full_a, full_b = candidate_openings(C1, base, p, cfg, frames)
-    body = []
-    for kind in PATTERN_KINDS:
-        share_a = int(np.sum(rows_a.kind == kind))
-        share_b = int(np.sum(rows_b.kind == kind))
-        if share_a == 0 and share_b == 0:
-            body.append([kind, "0", "0", "—", "—", "変わらない", "変わらない"])
-            continue
-        model = train_models(train_csv, p, exclude_kinds=(kind,))
-        accel, brake = candidate_openings(C1, model, p, cfg, frames)
-        body.append([
-            kind,
-            f"{share_a} ({100 * share_a / len(rows_a.kind):.0f}%)",
-            f"{share_b} ({100 * share_b / len(rows_b.kind):.0f}%)",
-            f"{model.rows[0] - base.rows[0]:+d}", f"{model.rows[1] - base.rows[1]:+d}",
-            _delta_cell(full_a, accel), _delta_cell(full_b, brake),
-        ])
-    return md_table(
-        ["抜いた系統", "効くアクセル行（全体比）", "効くブレーキ行（全体比）",
-         "学習行の減り アクセル", "同 ブレーキ",
-         "WLTP アクセル指令の変化 平均/p95/最大[%]", "同 ブレーキ[%]"],
-        body,
-    )
-
-
-def pnow_table() -> str:
-    """PNOW（実位置）を毎周期の読み取りに相乗りさせたときのフレーム長と計算上の増分。"""
-    def frame(count: int) -> int:
-        return 8 + (5 + 2 * count)  # クエリ 8 バイト＋レスポンス（3 + データ + CRC2）
-
-    cases = (
-        ("現行: CNOW だけ（0x900C count=2）を両軸", frame(2) * 2, "電流"),
-        ("PNOW を別クエリで足す（0x9000 count=2 を追加）を両軸",
-         (frame(2) + frame(2)) * 2, "電流＋実位置"),
-        ("まとめ読み 0x9000 count=14 を両軸", frame(14) * 2, "実位置〜電流"),
-        ("まとめ読み 0x9000 count=14 を動いている軸だけ（他軸は現行）",
-         frame(14) + frame(2), "実位置〜電流"),
-        ("まとめ読み 0x9000 count=16 を動いている軸だけ（偏差モニターまで）",
-         frame(16) + frame(2), "実位置〜電流＋偏差"),
-    )
-    base = cases[0][1]
-    body = []
-    for name, total_b, gets in cases:
-        ms = 1000.0 * MODBUS_BYTE_S * total_b
-        body.append([
-            name, str(total_b), f"{ms:.1f}",
-            f"{1000.0 * MODBUS_BYTE_S * (total_b - base):+.1f}",
-            f"{100.0 * MODBUS_BYTE_S * (total_b - base) / CONTROL_PERIOD_S:+.1f}%", gets,
-        ])
-    return md_table(
-        ["読み方", "1 周期のバイト数", "伝送時間[ms]", "現行との差[ms]",
-         f"周期 {1000 * CONTROL_PERIOD_S:.0f}ms に対する増分", "取れるもの"],
-        body,
-    )
-
-
-def fig_coverage_map(
-    demand: Demand, frames: RefFrames, rows_a: EffectiveRows, rows_b: EffectiveRows, path: Path
-) -> None:
-    plt = _plt()
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    panels = (
-        (axes[0], PEDAL_ACCEL, rows_a, "アクセル", 40.0),
-        (axes[1], PEDAL_BRAKE, rows_b, "ブレーキ", 100.0),
-    )
-    for ax, pedal, rows, name, top in panels:
-        m = demand.pedal == pedal
-        ax.scatter(frames.v0_raw[m], demand.opening[m], s=4, color=COLOR_REF, alpha=0.25,
-                   label="WLTP が要る開度（物理式で逆算）")
-        ax.scatter(rows.speed, rows.opening, s=4, color=COLOR_ACTUAL, alpha=0.35,
-                   label="手順 2 の効いている行")
-        ax.set_title(f"{name}（{top:.0f}% より上は表示を切っている）")
-        ax.set_xlabel("車速 [km/h]")
-        ax.set_ylabel("開度 [%]")
-        ax.set_xlim(0.0, 145.0)
-        ax.set_ylim(0.0, top)
-        ax.grid(alpha=0.3)
-        ax.legend(loc="upper right", fontsize=8)
-    fig.suptitle("WLTP が要る開度と、手順 2 の学習データにある開度")
-    fig.tight_layout()
-    fig.savefig(path, dpi=100)
-    plt.close(fig)
-
-
-def fig_coverage_openings(
-    demand: Demand, rows_a: EffectiveRows, rows_b: EffectiveRows, path: Path
-) -> None:
-    plt = _plt()
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
-    x = np.arange(len(OPEN_BIN_LABELS))
-    for ax, pedal, rows, name in (
-        (axes[0], PEDAL_ACCEL, rows_a, "アクセル"),
-        (axes[1], PEDAL_BRAKE, rows_b, "ブレーキ"),
-    ):
-        m = demand.pedal == pedal
-        ob = _open_index(demand.opening[m], COVER_OPEN_EDGES_PCT)
-        ro = _open_index(rows.opening, COVER_OPEN_EDGES_PCT)
-        sec = np.array([SIM_DT_S * int(np.sum(ob == j)) for j in x])
-        cnt = np.array([int(np.sum(ro == j)) for j in x])
-        ax.bar(x - 0.2, sec, width=0.4, color=COLOR_REF, label="WLTP が要る時間 [s]")
-        ax.set_ylabel("WLTP が要る時間 [s]")
-        ax2 = ax.twinx()
-        ax2.bar(x + 0.2, cnt, width=0.4, color=COLOR_ACTUAL, label="手順 2 の効く行数")
-        ax2.set_ylabel("学習の効く行数")
-        ax.set_xticks(x)
-        ax.set_xticklabels(OPEN_BIN_LABELS)
-        ax.set_xlabel("開度 [%]")
-        ax.set_title(name)
-        ax.grid(alpha=0.3)
-        handles = ax.get_legend_handles_labels()[0] + ax2.get_legend_handles_labels()[0]
-        labels = ax.get_legend_handles_labels()[1] + ax2.get_legend_handles_labels()[1]
-        ax.legend(handles, labels, loc="upper right", fontsize=8)
-    fig.suptitle("開度ごとの「WLTP が要る時間」と「学習データの行数」")
-    fig.tight_layout()
-    fig.savefig(path, dpi=100)
-    plt.close(fig)
-
-
-def run_coverage(cfg: ResearchConfig, train_csv: Path, out_dir: Path) -> int:
-    p = feedforward_params(cfg)
-    mode = asyncio.run(load_mode(cfg, cfg.modes.wltp_mode_name))
-    ref = ReferenceSpeed(mode)
-    t = np.round(np.arange(0.0, mode.total_duration + SIM_DT_S / 2, SIM_DT_S), 4)
-    frames = ref_frames(ref, t, DEFAULT_FEATURE_SPEC)
-    demand = wltp_demand(p, frames)
-    rows_a, rows_b = effective_rows(train_csv, p)
-    stats, span_s = pattern_stats(train_csv, p)
-    phases = phase_stats(train_csv)
-    print(f"# 段階 3 手順 2 パターン走行の網羅性と所要時間"
-          f"（要る開度は {mode.name} {mode.total_duration:.0f}s から物理式で逆算、"
-          f"学習データは {train_csv.name}）")
-    print(f"\n- 不感帯: アクセル {p.accel_deadband_pct:g}% / ブレーキ {p.brake_deadband_pct:g}%"
-          f"（開度ビンの下端はアクセル不感帯に合わせている）")
-
-    print("\n### V-1 網羅性（速度帯 × 開度。セルは「WLTP が要る時間 / 学習の効く行数」）")
-    print("\n#### アクセル")
-    print(coverage_table(demand, frames, rows_a, PEDAL_ACCEL))
-    print("\n#### ブレーキ")
-    print(coverage_table(demand, frames, rows_b, PEDAL_BRAKE))
-    print("\n### V-2 開度ごとの分布（速度をまとめたもの）")
-    print(opening_hist_table(demand, rows_a, rows_b))
-    print("\n### V-3 パターンごとの実績（手順 2 のログ）")
-    print(pattern_table(stats, span_s))
-    print("\n### V-4 フェーズごとの所要時間（打ち切りに張り付いていないか）")
-    print(phase_table(phases))
-    print("\n### V-5 現行パターンの欠陥")
-    print(defect_table(stats, phases, demand, frames, rows_a, rows_b, cfg))
-    print("\n### V-6 パターン案と所要時間（車両モデルでは模擬しない）")
-    print(proposal_table(span_s, cfg.learning.timeout_s))
-    print("\n### V-7 系統を 1 つ抜いて学習し直したときの指令の変化")
-    print(leave_out_table(train_csv, p, cfg, frames,
-                          train_models(train_csv, p, label="全体"), rows_a, rows_b))
-    print("\n### V-8 実開度（PNOW 0x9000）を毎周期の読み取りに相乗りさせる案")
-    print(pnow_table())
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig_coverage_map(demand, frames, rows_a, rows_b, out_dir / "coverage_map.png")
-    fig_coverage_openings(demand, rows_a, rows_b, out_dir / "coverage_openings.png")
-    print(f"\n- 図: {out_dir}")
-    return 0
-
-
-# ─────────────────────────────────────────────────────────────────────
 # --part sim-check
 # ─────────────────────────────────────────────────────────────────────
 
@@ -1843,7 +1250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--part", choices=("sim-check", "compare", "coverage"), required=True)
+    ap.add_argument("--part", choices=("sim-check", "compare"), required=True)
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     ap.add_argument("--run-csv", type=Path, default=DEFAULT_RUN_CSV,
                     help="手順 3 の実走行 CSV")
@@ -1857,8 +1264,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_dir = args.out or cfg.results_path / f"report{datetime.now():%Y%m%d}_KAIZEN_process2,3"
     if args.part == "compare":
         return run_compare(cfg, args.run_csv, args.train_csv, out_dir)
-    if args.part == "coverage":
-        return run_coverage(cfg, args.train_csv, out_dir)
     return run_sim_check(cfg, args.run_csv, args.train_csv, out_dir)
 
 

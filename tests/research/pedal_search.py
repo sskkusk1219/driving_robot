@@ -54,11 +54,10 @@ import asyncio
 from dataclasses import dataclass, replace
 from typing import Any
 
-from src.domain.control.conversions import VEHICLE_STOP_SPEED_KMH
-from src.models.profile import VehicleProfile
 from tests.research.config import ResearchConfig
 from tests.research.drive_log import SECTION_PEDAL_SEARCH, SessionLog, mark
 from tests.research.hardware import ActuatorProtocol, DriveError, ResearchHardware
+from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, VehicleProfile
 from tests.research.term import say
 from tests.research.vehicle import STROKE_LIMIT_PULSE, opening_to_pulse, pulse_to_opening
 

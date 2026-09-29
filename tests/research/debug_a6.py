@@ -9,8 +9,7 @@
 出すもの（KAIZEN 表5-5 順3 の関門と、A6 で変えたところ）:
     gate      関門 3 つ: 各パターンの開始車速・加速を終えた車速（cap との差）・
               所要時間（900s との差）
-    phase     系統 × フェーズの所要時間と打ち切りに張り付いた本数（kaizen.phase_stats。
-              上限は A6 の既定値なので新しい CSV だけに出す）
+    （phase＝フェーズの所要時間の表は、kaizen --part coverage とともに 2026-09-25 段4 で削除）
     governor  系統 × フェーズごとに、開度を最大値から下げていた時間・下げたまま終わった本数・
               governor_active の秒数（前の手順 2 は列が無いので「下げた」だけで数える）
     rows      学習に効く行（開度 ≥ 不感帯）を 5% 刻みで。うちガバナーで下げていた行
@@ -31,7 +30,6 @@ import matplotlib
 from tests.research.config import load_config
 from tests.research.debug_process23 import md_table
 from tests.research.drive_log import SECTION_PATTERN_DRIVE, cmd_opening
-from tests.research.kaizen import phase_stats, phase_table
 from tests.research.live_plot import COLOR_ACCEL, COLOR_ACTUAL, COLOR_BRAKE, FONT_FAMILY
 from tests.research.pattern_loop import STOP_SPEED_KMH, PatternLoopConfig
 
@@ -361,8 +359,6 @@ def run(new_csv: Path, old_csv: Path, cfg_path: Path, out: Path) -> int:
         print(gate_summary(rows, gates, cfg.learning.timeout_s))
         print()
         print(gate_table(gates, cap))
-    print("\n### フェーズの所要時間（新。上限は A6 の既定値）\n")
-    print(phase_table(phase_stats(new_csv)))
 
     print("\n### ガバナー（前後）\n")
     print(governor_table(governor_stats(old), governor_stats(new)))

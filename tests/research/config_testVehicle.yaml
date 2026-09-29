@@ -35,20 +35,27 @@ feedforward:
   candidate: C5
   # 2次多項式 Ridge 逆モデル（本番 src/domain/model_training.py と同型）の保存先
   # ファイル名の日時はローカル時刻（JST）。2026-09-20 以前の pkl は UTC 命名（JST−9h）
-  model_path: tests/research/results/models/test_vehicle_20260921_085550.pkl
+  model_path: tests/research/results/models/test_vehicle_20260929_051025.pkl
+  # ── 参照用（走行時は pkl を読み、以下は読まない。手順2 / relearn が model_path と一緒に自動で書く） ──
+  # 選ばれたホライズン（何秒先の基準車速を特徴量にしたか）・特徴量・係数の場所。手で書き換えても走行には効かない
+  model_accel_horizons_s: [0.5, 1.0, 2.6]  # アクセルモデルの先読みホライズン [s]
+  model_brake_horizons_s: [0.1, 0.2, 0.7, 1.0, 2.3]  # ブレーキモデルの先読みホライズン [s]
+  model_accel_features: [v0, dv_0.5, dv_1.0, dv_2.6, v0_sq, dv1_x_v0, past_0.5, past_1.0]  # アクセルモデルの入力（多項式展開の前）
+  model_brake_features: [v0, dv_0.1, dv_0.2, dv_0.7, dv_1.0, dv_2.3, v0_sq, dv1_x_v0, past_0.5, past_1.0]  # ブレーキモデルの入力（多項式展開の前）
+  model_coef_path: tests/research/results/models/test_vehicle_20260929_051025.yaml  # 係数（特徴量の元の単位に戻した値）の yaml。pkl の隣の同名 .yaml
   # 停車〜クリープ域（滑らかなモデルで表現できないため定数で補う）
-  creep_speed_kmh: 4.99  # クリープで到達する車速 [km/h]
-  creep_rate_kmhs: 0.22  # クリープ加速率 [km/h/s]
-  stop_brake_opening_pct: 18.16  # 停車保持ブレーキ開度 [%]（手順 2-0 で「停止確認開度＋マージン」を自動保存）
+  creep_speed_kmh: 5.0  # クリープで到達する車速 [km/h]
+  creep_rate_kmhs: 0.3  # クリープ加速率 [km/h/s]
+  stop_brake_opening_pct: 18.63  # 停車保持ブレーキ開度 [%]（手順 2-0 で「停止確認開度＋マージン」を自動保存）
   # 惰行（ペダル未操作）減速量。カーブが空なら下の定数を使う
-  engine_brake_decel_kmhs: 9.115  # 惰行減速量の代表値（正値）[km/h/s]
-  coast_decel_speeds_kmh: [4.99, 5.49, 6.49, 7.49, 8.49, 9.49, 10.49, 11.49, 12.49, 13.49, 14.49, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 105.0, 115.0, 125.0, 135.0]  # 惰行カーブ 速度グリッド [km/h]（昇順）
-  coast_decel_kmhs: [0.0, 1.79, 2.135, 2.275, 2.755, 2.945, 3.33, 3.62, 3.435, 3.85, 4.54, 4.18, 6.435, 7.84, 8.99, 9.2, 9.2, 9.2, 9.2, 9.2, 9.49, 10.16, 11.07, 11.135]  # 各速度での惰行減速量（正値）[km/h/s]
+  engine_brake_decel_kmhs: 2.2  # 惰行減速量の代表値（正値）[km/h/s]
+  coast_decel_speeds_kmh: [5.0, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5, 14.5, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 105.0, 115.0, 125.0, 135.0, 145.0]  # 惰行カーブ 速度グリッド [km/h]（昇順）
+  coast_decel_kmhs: [0.0, 2.0, 2.0, 2.0, 2.155, 2.09, 2.0, 2.0, 0.92, 1.0, 1.91, 1.97, 1.93, 2.09, 2.28, 2.3, 2.3, 2.3, 2.3, 2.31, 2.46, 2.64, 2.825, 3.02, 3.14]  # 各速度での惰行減速量（正値）[km/h/s]
   # クリープ加速カーブ（0〜creep_speed_kmh の速度依存クリープ加速度。手順2で自動保存）。
   # ProblemReport_20260916 課題#2: 定数 creep_rate_kmhs 1個ではクリープ発進を表現できない
   # （実測では 1 km/h 地点で 1.5 km/h/s、平衡付近で 0 に落ちる）
-  creep_accel_speeds_kmh: [0.5, 1.5, 2.5, 3.5, 4.5, 4.99]  # クリープ加速カーブ 速度グリッド [km/h]（昇順）
-  creep_accel_kmhs: [1.69, 1.29, 0.92, 0.5, 0.1, 0.0]  # 各速度でのクリープ加速度（正値）[km/h/s]
+  creep_accel_speeds_kmh: [0.5, 1.5, 2.5, 3.5, 4.5, 5.0]  # クリープ加速カーブ 速度グリッド [km/h]（昇順）
+  creep_accel_kmhs: [2.195, 1.71, 1.25, 0.665, 0.1, 0.0]  # 各速度でのクリープ加速度（正値）[km/h/s]
   # 惰行とみなす要求加速度の帯（半幅）[km/h/s]。人が決める値で自動保存の対象外。0 で無効。
   # 2026-09-17 段2: 実測ログ上の試算でアクセル⇔ブレーキ反転 106→21回・帯にいる間の最大ドリフト
   # 0.31km/h（KPI 1.0 の 1/3）となる 0.5 を採用
@@ -70,8 +77,8 @@ feedforward:
   # 2026-09-19 段4 改訂 クリープ域ブレーキの下限（手順2 で自動保存）: 不感帯からの超過 [%]。
   # 「クリープ平衡からブレーキを保持して実際に停車できた最小オフセット」。2026-09-19 の手順2 で
   # +6.0%（17.79%）は 0.33 km/h に浮き、+8.0%（19.79%）は 1.78s で停止した。真の境界は
-  # +6.0〜+8.0% の間なので、次の手順2 で creep_brake_hold_offsets_pct に 7.0 を足せば詰められる
-  stop_brake_floor_offset_pct: 6.0
+  # +6.0〜+8.0% の間なので、次の手順2 で creep_brake_hold_fracs に frac を足せば詰められる
+  stop_brake_floor_offset_pct: 1.63
   # この車速以下で下限を効かせる [km/h]。0.0 で無効（人が決める値・自動保存の対象外）。
   # 手順2 の直後に 0.0 で 1 本走らせて新しい基準を取り、その次に有効化して 1 変数比較する
   brake_trim_max_kmh: 5.0
@@ -80,11 +87,56 @@ feedforward:
   brake_trim_ref_kmh: 2.0
   # ペダルゲイン（開度1%あたり惰行から何 km/h/s 変わるか。どちらも正値）
   pedal_gain_speeds_kmh: [0.5, 1.5, 2.5, 3.5, 4.5, 5.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 105.0, 115.0, 125.0, 135.0, 145.0]  # 速度グリッド [km/h]（昇順）
-  accel_gain_kmhs_per_pct: [2.27564, 2.27564, 2.27564, 2.27564, 2.27564, 2.27564, 2.36779, 1.83789, 1.69126, 1.57381, 1.28395, 1.23592, 1.22503, 1.17903, 1.20601, 1.19391, 1.16904, 1.19405, 1.13231, 1.07109]  # アクセル側ゲイン [km/h/s per %]
-  brake_gain_kmhs_per_pct: [0.31096, 0.493522, 0.389222, 0.4448, 0.49199, 0.171564, 0.549145, 1.28065, 2.17639, 2.64277, 3.08, 3.17, 3.165, 2.26804, 3.16, 3.98792, 3.98792, 3.98792, 3.98792, 3.98792]  # ブレーキ側ゲイン [km/h/s per %]
+  accel_gain_kmhs_per_pct: [1.35512, 1.35512, 1.35512, 1.35512, 1.35512, 1.35512, 0.728747, 0.345577, 0.270556, 0.246278, 0.212796, 0.201576, 0.200256, 0.18064, 0.160655, 0.145243, 0.134674, 0.125094, 0.113688, 0.0946881]  # アクセル側ゲイン [km/h/s per %]
+  brake_gain_kmhs_per_pct: [2.46218, 3.3912, 4.91148, 4.05335, 1.0021, 0.6691, 0.690569, 0.679702, 0.889277, 1.32968, 1.98464, 2.15941, 2.15941, 2.15731, 2.14383, 2.42446, 2.42332, 2.39435, 2.39435, 2.39435]  # ブレーキ側ゲイン [km/h/s per %]
   # 不感帯（遊び。原点からペダルに触れるまでの隙間を含む）。手順 2-0 で実測して自動保存
-  accel_deadband_pct: 3.68  # アクセル不感帯 [%]
-  brake_deadband_pct: 7.05  # ブレーキ不感帯 [%]
+  accel_deadband_pct: 4.74  # アクセル不感帯 [%]
+  brake_deadband_pct: 7.79  # ブレーキ不感帯 [%]
+
+# ── C5 の逆モデルが使う特徴量（手順2 の学習時に効く。ProblemReport_20260921 手順5-1） ─────
+#   先読み h0〜h3 の dv（= 基準(t+h) − v0）と過去 p1・p2 を true/false で選ぶ。
+#   use_h0=false は dv_0.5 を特徴量から外す（実質Kp の 8〜9 割の出どころ。手順4 4-2）。外した先読みも
+#   ホライズンとしては残るので、停車保持の判定（最短ホライズン先の基準）とブレーキ下限は変わらない。
+#   past_as_delta=false は過去を v0 − past ではなく past そのものにする（手順4 4-3）。
+#   変更したら手順2（学習）をやり直すこと（走行時は pkl の特徴量が使われ、食い違うと警告が出る）。
+features:
+  h0_s: 0.5
+  h1_s: 1.0        # レジーム判定（要求加速度 = dv_h1 / h1_s）に使うので use_h1 は false 不可
+  h2_s: 2.0
+  h3_s: 3.0
+  use_h0: false
+  use_h1: true
+  use_h2: true
+  use_h3: true
+  p1_s: 0.5
+  p2_s: 1.0
+  use_p1: true
+  use_p2: true
+  past_as_delta: false
+  use_v0_sq: true
+  use_dv1_x_v0: true
+  # 2026-09-28 手順6（ProblemReport_20260921）: ホライズン自動選択。true の間は上の
+  # h0_s〜h3_s・use_h0〜use_h3 は使わない（h1_s だけ探索の開始点・レジーム判定として使う）。
+  # アクセル・ブレーキ別に交差検証 MAE が最も下がるホライズンの組を貪欲法で選ぶ
+  # （tests/research/horizon_search.py）。選んだ組は pkl が持つ（config には書き戻さない）
+  #
+  # 2026-09-28 段2 の実機破綻: 実車速が基準より遅れるとアクセル FF が下がる（逆向き）pkl が
+  # 採用され、遅れが自分で広がって最大逸脱 126km/h に至った（ProblemReport_20260921 手順6
+  # 6-7）。段B で実装した下の実質Kp 合否条件（search_gain_check_speeds_kmh /
+  # search_min_deviation_gain）で再発を防ぐ（案a。ユーザー決定）
+  horizon_search: true
+  search_min_s: 0.1        # 探索格子の下限 [s]
+  search_max_s: 3.0        # 探索格子の上限 [s]
+  search_step_s: 0.1       # 探索格子の刻み [s]
+  search_max_horizons: 10  # 1 ペダルの先読み本数の上限（h1_s を含む）
+  search_min_improvement: 0.01  # 仮値: CV-MAE の相対改善がこれ未満なら打ち切る
+  search_min_horizon_s: 0.0     # 最短ホライズンの下限 [s]（0.0 = 無効。ユーザー決定で既定無効）
+  search_cv_splits: 5      # パターン単位の交差検証の分割数
+  # 実質Kp（deviation_gain）の合否条件（案a。ProblemReport_20260921 手順6 段2 の再発防止）。
+  # CV-MAE では決まらない「偏差への反応が正しい向きか」を、この速度ごとに確かめ、逆向きの組は
+  # 探索候補から除外する。最終 pkl でも確かめ、下限を割ったら手順2 をエラーで止める
+  search_gain_check_speeds_kmh: [20.0, 40.0, 60.0, 80.0, 100.0, 120.0]
+  search_min_deviation_gain: 0.0  # 仮値: 向きが正しい（0 以上）ことだけを見る。上限は置かない
 
 # ── PID（手順 4/6/8 で適合して自動保存される） ───────────────────────
 pid:
@@ -120,6 +172,9 @@ control:
 modes:
   wltp_mode_name: "01_WLTP_Low,Mid,Hi,ExHi"  # "01_WLTP_Low,Mid,Hi,ExHi", "02_WLTP_Low,Mid,Hi", "03_WLTP_Low", "04_WLTP_Mid", "05_WLTP_Hi", "06_WLTP_ExHi"
   tuning_mode_name: "__verify_pattern__"     # 手順 4/6/8 のPID適合用パターン
+  # 2026-09-26 段4b: 手順2 の格子ステップ走行が狙うモード（重なるマスは 1 回だけ測る）。
+  # wltp_mode_name は手順3 で走るモードと手順2 の MAE_WLTP 用で、ここには影響しない
+  coverage_mode_names: ["01_WLTP_Low,Mid,Hi,ExHi", "09_US06"]
   # モード走行レポートの区間別集計（WLTP の区間名と境界 [s]。境界は区間名より 1 つ少ない）
   segment_names: [Low, Mid, High, ExHi]
   segment_bounds_s: [589.0, 1022.0, 1477.0]
@@ -137,6 +192,35 @@ mode_drive:
   pedal_standby: true
   standby_margin_pct: 2.0         # 探索値は 1 刻み深く出る・日によって 0.5% 動くため 2%
 
+# ── 加振走行（ペダル→車速の周波数応答を開ループで測る。FF・PID は使わない） ────
+#   ProblemReport_20260921 手順3 の 1.4Hz ばたつき対策: 一定速度に小さな正弦波を重ね、
+#   フィードバックを使わずに P(f)（ペダル1%が車速を何km/h動かすか）を直接測る。
+#   到達フェーズ（定速保持の PI で目標速度へ。learning.cruise_hold_* と同じ構造・同じ既定値）→
+#   加振フェーズ（周波数ごとに正弦波。平均速度は遅いトリムだけで保つ）を
+#   speeds_kmh × frequencies_hz ぶん繰り返し、最後に緩減速で停車する。
+excite:
+  speeds_kmh: [60.0, 100.0]                          # 加振する基準車速 [km/h]
+  frequencies_hz: [0.2, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0]  # 加振周波数 [Hz]（1.4Hz が段Aの疑い）
+  amplitude_pct: 0.3              # 基準開度に重ねる正弦波の振幅 [%]（ハード上限 1.0）
+  hold_s: 12.0                    # 1 周波数あたりの加振時間 [s]（実際は整数周期に切り上げ）
+  analysis_skip_s: 2.0            # 各ブロック先頭の過渡応答を解析から捨てる時間 [s]
+  approach_timeout_s: 90.0        # 目標速度に入れなかったら中止 [s]
+  # 実機の到達フェーズ PI は約 0.34Hz でハンチングし（速度標準偏差 0.34km/h）、狭い帯・短い整定
+  # 時間だと settle が成立せず approach_timeout で中止していた（ProblemReport_20260921）。
+  # 1.0 は定速保持で実績のある learning.cruise_hold_settle_tol_kmh と同じ値、6.0s はこの
+  # ハンチング（周期約 2.9s）の約 2 周期分をカバーする長さ
+  approach_band_kmh: 1.0          # この幅に入ったら整定とみなす [km/h]
+  approach_settle_s: 6.0          # 上の幅に入り続ける必要がある時間 [s]
+  # 到達フェーズの PI（learning.cruise_hold_* と同じ既定値。同じ車で 9.6〜141km/h の定速保持の
+  # 実績がある構造をそのまま使う。到達フェーズはオーバーシュートしないことが最優先のため）
+  approach_kp_pct_per_kmh: 0.3       # 比例ゲイン [%/(km/h)]
+  approach_ki_pct_per_kmh_s: 0.05    # 積分ゲイン [%/(km/h・s)]
+  approach_max_rate_pct_s: 1.0       # 1 周期あたりの開度変化量の上限 [%/s]
+  approach_initial_offset_pct: 7.0   # 初期開度 = アクセル不感帯 + この値 [%]
+  trim_gain_pct_per_kmh_s: 0.05      # 加振中の「遅いトリム」の積分ゲイン（弱いので 1.4Hz は通さない）
+  speed_lpf_tau_s: 1.0            # トリムに使う車速の1次ローパス時定数 [s]（1.4Hz を通さない）
+  abort_band_kmh: 8.0             # 目標速度からこれだけ外れたら中止 [km/h]（過速は両フェーズで見る）
+
 # ── PID 適合（手順 4/6/8） ───────────────────────────────────────────
 tuning:
   max_runs: 10                    # 1ゲインあたりの最大走行本数
@@ -147,45 +231,16 @@ tuning:
 
 # ── 学習運転（手順 2 の閉ループパターン走行） ────────────────────────
 learning:
-  timeout_s: 3600.0               # 走行完了待ちのタイムアウト [s]（A3・A4 で約 1020s の見積り。900s は記録だけ。本番へ移すときに削る。2026-09-14 定速階段（段2）でスタブが1200sに収まらず1400sへ。2026-09-15 実機で1400s超え→1800sにしたが、原因は max_speed_kmh 180 の残りによる DRIVE_ACCEL 延長（160 km/h 張り付き）。140 では1088s。余裕として1800のまま）
+  timeout_s: 7200.0               # 走行完了待ちのタイムアウト [s]（2026-09-25 段4: 格子ステップ走行は実車で約 30 分の見込み。余裕として 3600）
   coast_timeout_s: 90.0           # コーストダウン 1 本の上限 [s]
-  # ペダルの固定開度は「手順 2-0 で測った不感帯 + offset」[%]（昇順）。本番の開度はキャリブレーション
-  # 前提の絶対値で、原点から測ると遊びの中に入る（ブレーキ 1〜10%・巡航トリム 1.5/3.0% は惰行と同じだった）
-  accel_deadband_probe_offsets_pct: [0.5, 1.0, 2.0, 3.0, 5.0]  # アクセル不感帯プローブ（クリープ中に各 3s 保持。本番 0.5〜5%）
-  cruise_trim_offsets_pct: [1.0, 2.0, 3.0]  # 高速巡航トリム（cap まで加速後に保持。本番 1.5/3.0%）
-  brake_hold_offsets_pct: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]  # 定常ブレーキ（cap から保持。本番 1〜40%）
-  # 研究側で本番のパターン列に足す段（A2・A5。空リストなら足さない）
-  accel_sweep_add_offsets_pct: [2.0, 5.0, 8.0]  # ACCEL_SWEEP を追加（本番の上限×0.3/0.5/0.7/1.0 に加えて、不感帯+offset で cap まで）
-  brake_hold_low_offsets_pct: [0.5, 2.0, 4.0]   # BRAKE_HOLD を追加（brake_hold_low_start_kmh まで上げてから保持）
-  brake_hold_low_start_kmh: 60.0                # その BRAKE_HOLD の保持を始める車速 [km/h]
-  # A3 トリム階段（空リストなら足さない）: 各車速まで 70% で上げ、不感帯 + offset をこの順（降順）に各 step_s 保持。
-  # cap に達したら次の段へ下げ、最後の段は保持を続ける。cap 始まりは行き過ぎ（実測 +12 km/h）を見込んで 120
-  trim_stair_start_kmh: [120.0, 90.0, 50.0]     # 階段を始める車速 [km/h]
-  trim_stair_offsets_pct: [8.0, 5.0, 2.0]       # 各段のアクセル = 不感帯 + offset [%]
-  trim_stair_step_s: 8.0                        # 1 段の保持 [s]
-  # A4 低速 × 高ブレーキ（空リストなら足さない）: 不感帯 + accel_offset で start_kmh まで上げ、ブレーキを停車まで保持
-  brake_hold_hard_offsets_pct: [7.0, 17.0, 27.0, 37.0]  # ブレーキ = 不感帯 + offset [%]（≈20/30/40/50%）
-  brake_hold_hard_start_kmh: 20.0               # 保持を始める車速 [km/h]
-  brake_hold_hard_accel_offset_pct: 8.0         # 加速のアクセル = 不感帯 + offset [%]（70% だと 20 km/h を大きく行き過ぎる）
-  # 2026-09-14 定速階段（段2。空リストなら足さない）: トリム階段の後、各車速を弱い PI で保持する。
-  # 50 km/h 以上に定速保持の状態が無く FF モデルの定速予測がずれていた対策（docs/memo.md 参照）
-  cruise_hold_speeds_kmh: [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 140.0]  # 保持する車速 [km/h]（昇順）
-  cruise_hold_settle_tol_kmh: 1.0               # 「保持できた」とみなす速度偏差の許容幅 [km/h]
-  cruise_hold_settle_s: 3.0                     # 許容幅に連続でこの秒数いたら保持タイマー開始 [s]
-  cruise_hold_hold_s: 8.0                       # 保持タイマー開始後、この秒数記録したら次の車速へ [s]
-  cruise_hold_step_timeout_s: 30.0              # 1 車速あたりの打ち切り（保持できなくても次へ）[s]
-  # PI ゲイン: 実測の感度（手順3 の 110〜140 km/h で約 1.3〜2 km/h/s per %）で時定数が数秒になる値。
-  # レートを絞って実開度が指令に追従できる速さ（手順3 の実測遅れ ≈0.1s）に保つ
-  cruise_hold_kp: 0.3                           # 比例ゲイン [%/(km/h)]
-  cruise_hold_ki: 0.05                          # 積分ゲイン [%/(km/h・s)]
-  cruise_hold_max_rate_pct_per_s: 1.0           # 1 周期あたりの開度変化量の上限 [%/s]
-  cruise_hold_initial_offset_pct: 7.0           # 初期開度 = アクセル不感帯 + この値 [%]
   # ペダルゲイン推定に使うサンプル: 開度 ≥ 不感帯 + この値 [%]（本番は 5%。ブレーキは +5% ≈ 0.38G で採れない）
   accel_gain_min_offset_pct: 0.5
   brake_gain_min_offset_pct: 0.5
-  # 2026-09-17 クリープ発進・低速ブレーキ保持（ProblemReport_20260916 課題#2）: 定速階段の後、
-  # パターン列の末尾に足す（手順3のモード走行と同じ暖機状態でクリープを測るため）
-  creep_launch_count: 3            # クリープ発進パターンの本数（両ペダル解放で自走 → 通常の停車復帰）
+  # 2026-09-17 クリープ発進・低速ブレーキ保持（ProblemReport_20260916 課題#2）: 格子ステップ走行の後、
+  # パターン列の末尾に置く（手順3のモード走行と同じ暖機状態でクリープを測るため）
+  # 2026-09-27 段7a（ProblemReport_20260925 段7）: 手順2 の計測効率化のため 3→0（実測 065502 で、
+  # 単独クリープ発進を抜いても網羅表の穴が増えないことを確認済み）
+  creep_launch_count: 0            # クリープ発進パターンの本数（両ペダル解放で自走 → 通常の停車復帰）
   # 2026-09-17 段1b: 終了条件を「creep_launch_target_kmh 到達」から「平衡到達（車速の傾きが
   # 止まる）」に変更（ユーザー決定）。target_kmh は安全上限として残し、真のクリープ平衡
   # （4.97 km/h 付近）より十分高い 15.0 に上げる。timeout_s も平衡到達を待てるよう 30.0 に上げる
@@ -201,19 +256,10 @@ learning:
   # （pedal_search.creep_min_speed_kmh と同じ考え方）
   creep_launch_min_speed_kmh: 1.0  # クリープ発進の平衡判定を始める車速のしきい値 [km/h]
   creep_launch_settle_min_s: 5.0   # 平衡到達の最短経過時間（elapsedがこれ未満なら終了しない）[s]
-  # 2026-09-18 段4: 17%（浮く）と 23.4%（止まる）の間が未測定だったので、不感帯 +6〜+12%
-  # （= 18〜24%）を足して停止境界をはさむ。0.5〜5.0 は段1 からの既存点（浮く側の実測）。
-  # pattern_loop の BRAKE_HOLD は「speed <= STOP_SPEED_KMH で次へ / brake_hold_timeout_s で
-  # 打ち切り」なので、止まる開度なら「止まった」、浮く開度なら「平衡速度」が同じ窓から取れる
-  creep_brake_hold_offsets_pct: [0.5, 1.5, 3.0, 5.0, 6.0, 8.0, 10.0, 11.0, 12.0]  # クリープ車速からブレーキ「不感帯+offset」で停車まで保持
-  # 2026-09-19 低開度階段（段3-1。ProblemReport_20260919 候補(c)）: 停車から不感帯 + offset を
-  # 1 段ずつ一定保持し、その開度固有の平衡車速へ収束させる。低速 × 低開度の学習行が
-  # 5.4 秒しか無かったことへの対策（空リストなら足さない）
-  low_open_stair_offsets_pct: [0.5, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0]  # 各段のアクセル = 不感帯 + offset [%]
-  low_open_stair_descend: true          # 折り返して下りも測る（踏み方向の交絡を対にして測る）
-  low_open_stair_step_s: 8.0            # 1 段あたりの保持時間 [s]
-  low_open_stair_start_kmh: 4.5         # DRIVE_ACCEL をここで終える（クリープ平衡 4.77 の下）
-  low_open_stair_min_speed_kmh: 2.0     # これ以下に落ちたら停車復帰する
+  # 2026-09-25 段4: クリープ車速からブレーキ「不感帯 + frac × (停車保持開度 − 不感帯)」で停車まで保持する。
+  # 停車保持開度は 2-0 の実測なので車両に合わせて自動で決まる（frac=1.0 が停車保持そのもの）。
+  # 修理後の実測（不感帯 7.26・停車保持 18.63）だと +0.6〜+11.4% で、停止境界をはさむ
+  creep_brake_hold_fracs: [0.05, 0.15, 0.25, 0.45, 0.55, 0.7, 0.9, 1.0]
   creep_curve_bin_kmh: 1.0         # クリープ加速カーブのビン幅 [km/h]
   creep_curve_min_bin_samples: 5   # 採用する最小サンプル数/ビン
   # stop_brake_curve_bin_kmh: 0.5         # 停止ブレーキ境界カーブの速度ビン幅 [km/h]
@@ -224,6 +270,55 @@ learning:
   coast_curve_low_bin_kmh: 1.0          # 低速側のビン幅 [km/h]
   coast_curve_low_max_kmh: 15.0         # ここまで細ビン。以上は本番と同じ 10 km/h 幅
   coast_curve_low_min_bin_samples: 5    # 低速ビンの最少サンプル数
+  # 2026-09-25 WLTP 網羅マップ（ProblemReport_20260925 段1。python -m tests.research.wltp_grid）:
+  # 車速 × 加速度の格子。加速度は FF の regime ホライズン（1.0s）先との差。境界は昇順
+  grid_speed_edges_kmh: [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140]  # [km/h]
+  # [km/h/s]（±0.5 が定速の 1 列。定速保持の実測は ±1 km/h/s 揺れる）。外側の端 ±14 は max_decel_g 0.4G ≒ 14.1
+  grid_accel_edges_kmhs: [-14.0, -7.0, -3.0, -1.5, -0.5, 0.5, 1.5, 3.0, 7.0, 14.0]
+  # 狙う・穴と判定するマスの最小秒数は grid_step_window_s − grid_step_lag_s（1 ステップで測れる長さ）から自動
+  grid_hole_data_max_s: 2.0             # 学習データがこれ未満なら穴 [s]
+  # 2026-09-25 格子ステップ走行（ProblemReport_20260925 段3）。感度 g = 開度 1% あたりの加速度
+  # [km/h/s per %]。初期値は大きめ（1 回目は弱く外れる側）。PI の kp/ki は g で割って車両に依らない
+  grid_station_min_kmh: 10.0            # これ未満の車速帯はステーションを置かない（発進・停車が担当）
+  grid_settle_tol_kmh: 1.0              # 「落ち着いた」とみなす車速の許容幅 [km/h]
+  grid_settle_s: 3.0                    # 許容幅の中にこの秒数いたら落ち着いた [s]
+  grid_settle_timeout_s: 40.0           # 落ち着かないとき、そのステーションの残りをとばす [s]
+  grid_step_window_s: 3.0               # 開度固定の 1 ステップの長さ [s]
+  grid_step_lag_s: 0.5                  # ステップの頭のこの秒数は傾きの計算から除く [s]
+  grid_step_band_max_kmh: 10.0          # ステーションからこれ以上離れたらステップを終える [km/h]
+  grid_step_min_fit_s: 1.0              # 中心から踏んで傾きを測れる時間がこれ未満なら、帯の手前の端から踏む（助走）[s]
+  grid_overshoot_frac: 1.2              # WLTP の最大（最小）加速度のこの倍を超えたら打ち切り
+  grid_max_tries: 2                     # 1 つの狙いに使う最大回数（やり直しは 1 回）
+  grid_gain_init_kmhs_per_pct: 2.0      # アクセルの感度の初期値
+  grid_brake_gain_init_kmhs_per_pct: 2.0  # ブレーキの感度の初期値
+  grid_gain_min_kmhs_per_pct: 0.05      # 更新した感度のクランプ
+  grid_gain_max_kmhs_per_pct: 20.0
+  grid_hold_kp_norm: 0.36               # PI 保持: kp = この値 / g_accel（実車 g≈1.2 で kp 0.3 相当）
+  grid_hold_ki_norm: 0.06               # ki = この値 / g_accel
+  grid_hold_max_rate_pct_per_s: 1.0     # PI の開度変化の上限 [%/s]（実開度が追従できる速さ。g では割らない）
+  grid_launch_end_kmh: 20.0             # 発進・停車セルが担当する車速の上端 [km/h]
+  # 2026-09-27 段7b（ProblemReport_20260925 段7）: ステップの後・助走の目標を決めたときの
+  # 「ステーションの目標へ戻る」区間（_Phase.GRID_RETURN）。目標から離れていれば固定開度で速く
+  # 戻り、近づいたら PI（CRUISE_HOLD）へ切り替える（実測 065502: 戻りが待ち時間の最大要因）。
+  # grid_return_accel_kmhs は半分データ由来: 薄い +1.5〜+3 km/h/s の列（戻りの行がこの列を埋める）
+  # の中で、約 0.06G と上限 G に遠い。実機の戻り時間・網羅表で決め直す
+  grid_return_accel_kmhs: 2.0           # GRID_RETURN の狙い加速度（目標より遅いとき）[km/h/s]
+  # grid_return_switch_kmh は仮の値: 2 km/h/s × 遅れ 0.6s（gov_lead_s の実測）≒ 1.2 km/h に余裕。
+  # 実機で切り替え後の行き過ぎ（±1 km/h に入るまでの時間）を見て決め直す
+  grid_return_switch_kmh: 1.5           # これ以下まで近づいたら CRUISE_HOLD の PI に切り替える
+  # 2026-09-27 段6a（門①）: 開度の上限に使う G [G]（仮の値）。G 校正と走行中の実測から「この G に届く開度」を
+  # 車速帯ごとに予測して、格子ステップ・発進停車の開度をそれ以下にする。ブレーキは踏むほど効く（実測 比 1.6）ので
+  # 0.3G と予測した開度は実際 約 0.36G。vehicle.max_decel_g（0.4G）との余裕。手順2 の実測点で決め直す
+  g_cap_g: 0.3
+  # 2026-09-27 段6c: 通し掃引 1 本の最大回数（仮の値。0 で掃引なし）。1 回で 1 セル約 1 s しか取れず、
+  # 穴の基準 2 s に 2〜3 回 × 余裕 2 倍。手順2 の実機で「何回で埋まったか」を見て決め直す
+  grid_sweep_max_passes: 6
+  # 2026-09-25 学習サンプルの WLTP 重み付け（ProblemReport_20260925 段2）: 重み =
+  # clip(WLTP 占有率 / 学習データ占有率, w_min, w_max) をペダルごとに平均 1 へ正規化して学習に
+  # 渡す。既定 false は今までと完全に同じ結果になる（後方互換）
+  sample_weight_enabled: false          # true で学習に重みを渡す
+  sample_weight_min: 0.2                # 重みの下限
+  sample_weight_max: 5.0                # 重みの上限
 
 # ── ペダル探索（手順 2-0。不感帯と停車保持開度を車速応答で測る） ────────
 #   クリープ中に 1 刻みずつ踏み、待ち時間の車速の傾きが onset_accel_kmhs 以上（ブレーキは以下の
@@ -231,19 +326,20 @@ learning:
 #   固定基準との比較をやめるので、クリープのドリフトを反応と誤検出しなくなる）。
 #   ブレーキはそのまま停車まで刻み、停止確認開度 + stop_hold_margin_pct で停車保持する。
 pedal_search:
-  step_mm: 0.5                    # 停車保持位置への刻み送りの1刻み [mm]（走行前チェックも共通。不感帯探索には使わない）
+  step_mm: 1.0                    # 停車保持位置への刻み送りの1刻み [mm]（走行前チェックも共通。不感帯探索には使わない）
   dwell_s: 1.0                    # 1 刻みごとの待ち（この間の車速サンプルで判定。走行前チェックも共通）[s]
   onset_margin_kmh: 0.3           # ブレーキの「減速中は踏み増さない」判定・停止確認の余白 [km/h]
   confirm_count: 2                # 反応が何刻み連続したら確定するか
-  creep_window_s: 5.0             # クリープ安定: 平均車速の窓 [s]
+  creep_window_s: 10.0            # クリープ安定: 平均車速の窓 [s]
   creep_settle_kmhs: 0.020        # クリープ安定: 窓平均の傾きがこれ未満 [km/h/s]（旧 0.1km/h÷3s と等価）
   creep_settle_min_s: 10.0        # クリープ安定: これだけ経つまで確定しない [s]（漸近の途中で止まらないため）
   creep_min_speed_kmh: 1.0        # クリープ安定: 平均車速がこれ以上 [km/h]
   creep_timeout_s: 90.0           # クリープ安定待ちの上限 [s]
   accel_max_pct: 20.0             # アクセル探索の上限 [%]（ここまで反応が無ければエラー）
   brake_max_pct: 50.0             # 停止確認まで踏み続ける上限 [%]（不感帯検出の上限は deadband_max_pct）
-  stop_hold_margin_pct: 5.0       # 停車保持 = 停止確認開度 + この値 [%]
-  onset_accel_kmhs: 0.2           # この傾き [km/h/s] 以上（ブレーキは以下の符号反転）で「反応」
+  stop_hold_margin_pct: 10.0      # 停車保持 = 停止確認開度 + この値 [%]
+  stop_confirm_max_wait_s: 10.0   # 走行前チェック（手順3以降）で停止確認開度まで踏んだ後、停車を待つ上限 [s]
+  onset_accel_kmhs: 0.09           # この傾き [km/h/s] 以上（ブレーキは以下の符号反転）で「反応」
   # 2026-09-17 段1b: 不感帯探索専用の1刻み。停車保持への刻み送り（step_mm）とは分離し、探索だけ
   # 細かくできるようにする（停車保持まで遅くしないため）。位置指令は0.01mm単位（PCON-CBのPCMD）
   # なので 0.01mm = 1 pulse が機械的な下限。0→20%を0.1mm刻みで探ると片ペダル約3.5分の見積り
@@ -272,6 +368,12 @@ kpi:
   reversal_band_kmh: 0.3          # 符号反転を数える偏差の振幅しきい値 [km/h]
   reversal_window_s: 5.0          # 反転回数を数える窓 [s]
   reversal_limit_per_window: 1.0  # 窓あたりの反転回数上限
+  # ペダル操作の滑らかさ: アクセル指令の往復回数（ProblemReport_20260921 手順3）
+  pedal_reversal_hyst_pct: 0.1          # 山（谷）からこれ以上戻ったら 1 回と数える [%]
+  pedal_reversal_limit_per_s: 0.4       # 全体の上限 [回/s]
+  pedal_reversal_window_s: 60.0         # 局所を見る窓 [s]
+  pedal_reversal_window_limit_per_s: 1.0  # 窓ごとの最大の上限 [回/s]
+  pedal_reversal_min_window_s: 15.0     # 対象（ACCEL・基準5km/h以上）が これ未満の窓は除く [s]
 
 # ── 手順 1（初期化）と走行前チェックの実施項目（false でスキップ） ─────────
 #   false にした項目は実行も判定もせず [SKIP] と表示する。安全装置を外すことになるので注意。

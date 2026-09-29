@@ -21,8 +21,11 @@
 
 from __future__ import annotations
 
-from src.domain.control.conversions import VEHICLE_STOP_SPEED_KMH
-from src.domain.pre_check import (
+from tests.research.config import ChecksSection, ResearchConfig
+from tests.research.drive_log import SECTION_PRE_DRIVE_CHECK, SessionLog, mark
+from tests.research.hardware import DriveError, PreDriveCheckError, ResearchHardware
+from tests.research.pedal_search import mean_speed, search_step_pulse
+from tests.research.pre_check import (
     ITEM_ACTUATOR_POSITION,
     ITEM_CALIBRATION,
     ITEM_COMMUNICATION,
@@ -32,11 +35,7 @@ from src.domain.pre_check import (
     ITEM_VEHICLE_STOPPED,
     PreCheckRunner,
 )
-from src.models.pre_check import PreCheckResult
-from tests.research.config import ChecksSection, ResearchConfig
-from tests.research.drive_log import SECTION_PRE_DRIVE_CHECK, SessionLog, mark
-from tests.research.hardware import DriveError, PreDriveCheckError, ResearchHardware
-from tests.research.pedal_search import mean_speed, search_step_pulse
+from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, PreCheckResult
 from tests.research.term import display_width, say
 from tests.research.vehicle import build_vehicle_profile, opening_to_pulse, pulse_to_opening
 
@@ -48,8 +47,6 @@ PHASE_POST_CHECK = "POST_CHECK"
 # 停車ブレーキ位置（stop_brake_opening_pct）判明済み（次が手順 2 以外）のときの踏み込み速度。
 # 段階的に探る必要が無いため、一気に踏んでよい。
 DIRECT_PRESS_SPEED_MM_S = 20.0
-# 踏み込み後、停止確認のために平均車速を測り直して待つ上限 [s]
-DIRECT_PRESS_MAX_WAIT_S = 5.0
 
 # 1 pulse = 0.01mm（PCON-CB の PCMD 単位。search_step_pulse と同じ換算）
 _PULSE_PER_MM = 100.0
@@ -188,7 +185,7 @@ async def brake_to_target(hw: ResearchHardware, cfg: ResearchConfig) -> int:
 
     手順 2（ペダル探索）で判明済みの位置のため、小刻みに探る必要はない。
     `DIRECT_PRESS_SPEED_MM_S` で一気に踏んだ後、踏み込み直後はまだ車速が落ちきっていない分だけ
-    平均車速を測り直して待つ（`DIRECT_PRESS_MAX_WAIT_S` まで。位置は動かさない）。
+    平均車速を測り直して待つ（`pedal_search.stop_confirm_max_wait_s` まで。位置は動かさない）。
     """
     s = cfg.pedal_search
     target = opening_to_pulse(cfg.feedforward.stop_brake_opening_pct)
@@ -200,12 +197,13 @@ async def brake_to_target(hw: ResearchHardware, cfg: ResearchConfig) -> int:
     await hw.brake.move_to_position_timed(target, current, duration_s)
     speed = await mean_speed(hw, s.dwell_s)
     say(_line(target, speed, "現在"))
+    max_wait_s = s.stop_confirm_max_wait_s
     waited_s = s.dwell_s
     while speed >= VEHICLE_STOP_SPEED_KMH:
-        if waited_s >= DIRECT_PRESS_MAX_WAIT_S:
+        if waited_s >= max_wait_s:
             raise PreDriveCheckError(
                 f"stop_brake_opening_pct（{cfg.feedforward.stop_brake_opening_pct:.2f}%）まで"
-                f"踏んでも停車しません（{DIRECT_PRESS_MAX_WAIT_S:g}s 待機・"
+                f"踏んでも停車しません（{max_wait_s:g}s 待機・"
                 f"車速 {speed:.2f} km/h）。手順 2（ペダル探索）からやり直してください"
             )
         speed = await mean_speed(hw, s.dwell_s)

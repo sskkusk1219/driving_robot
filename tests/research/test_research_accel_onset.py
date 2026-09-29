@@ -19,10 +19,10 @@ from collections.abc import Sequence
 import numpy as np
 import pytest
 
-from src.models.profile import FeedforwardParams
 from tests.research import accel_onset as ao
 from tests.research.drive_log import SECTION_MODE_DRIVE, SECTION_PATTERN_DRIVE
 from tests.research.ff_params import ResearchFFParams
+from tests.research.research_types import FeedforwardParams
 
 # 表2/表4 の既定と同じ開度オフセット帯（テストでもそのまま使う）
 OFFSET_BINS: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 30.0)
@@ -314,98 +314,3 @@ def test_series_from_rows_reads_pattern_drive_section_with_elapsed_s() -> None:
 
     default_series = ao.series_from_rows(rows, source="synthetic")  # 既定は MODE_DRIVE のまま
     assert default_series.n_mode_rows == len(mode_rows)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# 表3b: 低開度階段の上り／下り（段3-2。ProblemReport_20260919 6章の往復の層別）
-# ─────────────────────────────────────────────────────────────────────
-
-
-def test_stair_leg_labels_splits_up_and_down() -> None:
-    """山型（1,1,2,2,3,3,2,2,1,1。5段）の CRUISE_TRIM 指令開度: 頂点までが「上り」、
-    頂点より後が「下り」になる。"""
-    pattern = np.array(["P"] * 10)
-    phase = np.array([ao.STAIR_PHASE] * 10)
-    accel_cmd = np.array([1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0])
-
-    labels = ao._stair_leg_labels(pattern, phase, accel_cmd)
-
-    assert list(labels[:6]) == ["上り"] * 6
-    assert list(labels[6:]) == ["下り"] * 4
-
-
-def test_stair_leg_labels_ignores_monotonic_pattern() -> None:
-    """折り返しの無い単調増の区間（山の頂点が最後の段）はすべて "" になる。"""
-    pattern = np.array(["P"] * 6)
-    phase = np.array([ao.STAIR_PHASE] * 6)
-    accel_cmd = np.array([1.0, 1.0, 2.0, 2.0, 3.0, 3.0])
-
-    labels = ao._stair_leg_labels(pattern, phase, accel_cmd)
-
-    assert list(labels) == [""] * 6
-
-
-def test_stair_leg_labels_separates_patterns() -> None:
-    """`pattern` が変われば別区間: 一方が単調（無効）でも他方の山型判定に影響しない。"""
-    pattern = np.array(["A"] * 4 + ["B"] * 10)
-    phase = np.array([ao.STAIR_PHASE] * 14)
-    accel_cmd = np.array(
-        [1.0, 2.0, 3.0, 4.0]  # A: 単調増、折り返し無し → 無効
-        + [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0]  # B: 5段の山型 → 有効
-    )
-
-    labels = ao._stair_leg_labels(pattern, phase, accel_cmd)
-
-    assert list(labels[:4]) == [""] * 4
-    assert list(labels[4:10]) == ["上り"] * 6
-    assert list(labels[10:14]) == ["下り"] * 4
-
-
-def test_stair_leg_labels_ignores_non_cruise_trim_phase() -> None:
-    """階段判定は `phase == STAIR_PHASE`（CRUISE_TRIM）の行だけが対象。
-
-    加速掃引（DRIVE_ACCEL）やブレーキ保持（DRIVE_BRAKE）も「踏む→離す」で指令開度が
-    山型になるが、phase が違うため誤って階段扱いされない（実ログでの誤判定の回帰テスト）。
-    """
-    stair_shape = [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0]  # 5段の山型（形は有効）
-    pattern = np.array(["P1"] * 10 + ["P2"] * 10)
-    phase = np.array(["DRIVE_ACCEL"] * 10 + ["DRIVE_BRAKE"] * 10)
-    accel_cmd = np.array(stair_shape + stair_shape)
-
-    labels = ao._stair_leg_labels(pattern, phase, accel_cmd)
-
-    assert list(labels) == [""] * 20
-
-
-def test_stair_leg_labels_requires_five_steps() -> None:
-    """phase が CRUISE_TRIM でも段が 4 段以下の山型は "" になる（m>=5 が必要）。"""
-    pattern = np.array(["P"] * 4)
-    phase = np.array([ao.STAIR_PHASE] * 4)
-    accel_cmd = np.array([1.0, 2.0, 3.0, 2.0])  # 4段の山型（折り返しはあるが段数不足）
-
-    labels = ao._stair_leg_labels(pattern, phase, accel_cmd)
-
-    assert list(labels) == [""] * 4
-
-
-def test_build_table3b_reports_up_minus_down() -> None:
-    """上り・下り両方があるセルだけ「差(上り-下り)」が出て、片方しか無いセルは行が出ない。"""
-    speed_bins = (0.0, 100.0)
-    offset_bins = (0.0, 1.0, 2.0)
-
-    v = np.array([10.0, 10.0, 10.0, 10.0, 10.0])
-    x = np.array([0.5, 0.5, 0.5, 0.5, 1.5])
-    a = np.array([1.0, 1.2, 0.6, 0.8, 2.0])
-    leg = np.array(["上り", "上り", "下り", "下り", "上り"])
-
-    header, rows = ao.build_table3b(v, x, a, leg, speed_bins, offset_bins)
-
-    assert header == [
-        "速度帯 [km/h]", "開度帯 [%]", "上り n", "上り a_eff", "下り n", "下り a_eff",
-        "差(上り-下り)",
-    ]
-    # 開度帯 0〜1 は上り(n=2, median=1.1)・下り(n=2, median=0.7) の両方あり → 出る
-    # 開度帯 1〜2 は上りしか無い（n=1）→ 行ごと省かれる
-    assert rows == [
-        ["0〜100", "0〜1", "2", "+1.10", "2", "+0.70", "+0.40"],
-    ]

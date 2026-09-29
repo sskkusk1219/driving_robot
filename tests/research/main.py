@@ -44,14 +44,21 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from src.domain.learning_drive import LearningDataError
 from tests.research.config import (
     ConfigError,
     ResearchConfig,
     load_config,
     validate_config,
 )
-from tests.research.drive_log import SECTION_MODE_DRIVE, SECTION_PRE_DRIVE_CHECK, SessionLog
+from tests.research.drive_log import (
+    SECTION_EXCITE,
+    SECTION_MODE_DRIVE,
+    SECTION_PRE_DRIVE_CHECK,
+    SessionLog,
+)
+from tests.research.excite import _format_table as excite_format_table
+from tests.research.excite import analyze as excite_analyze
+from tests.research.excite import run_excite
 from tests.research.hardware import (
     HW_REAL,
     HW_STUB,
@@ -62,13 +69,15 @@ from tests.research.hardware import (
     run_initialize,
     shutdown,
 )
-from tests.research.mode_drive import ModeDriveSetup, prepare_mode_drive, run_mode_drive
+from tests.research.learning_patterns import LearningDataError
+from tests.research.mode_drive import ModeDriveSetup, load_mode, prepare_mode_drive, run_mode_drive
 from tests.research.mode_report import RunInfo, rows_from_samples, write_mode_report
 from tests.research.pattern_drive import DriveError, build_ff_model, run_pattern_drive
 from tests.research.pedal_search import run_pedal_search
 from tests.research.pre_drive_check import PHASE_PRE_CHECK, run_pre_drive_check
 from tests.research.term import banner, display_width, say
 from tests.research.vehicle import STROKE_LIMIT_PULSE
+from tests.research.wltp_grid import coverage_stats_from_modes, edges_from_config, outside_text
 
 DEFAULT_CONFIG = Path("tests/research/config_testVehicle.yaml")
 
@@ -309,17 +318,34 @@ async def step2_pattern_drive(ctx: RunContext) -> None:
     """ペダル探索 → 本番の学習運転パターンで走行 → その CSV から 2次多項式 FF モデルを作る。"""
     hw = ctx.require_hardware()
     log = ctx.session_log
+    # 段4/段4b（ProblemReport_20260925）: パターン列は選んだモード（modes.coverage_mode_names）の
+    # 車速 × 加速度の格子から作るので、走る前（2-0 の前）に全モードの基準車速を読む
+    # （DB が読めないならここで止まる）。wltp_mode は MAE_WLTP（2-2）用
+    cfg = ctx.config
+    wltp_mode = await load_mode(cfg, cfg.modes.wltp_mode_name)
+    cover_modes = [
+        wltp_mode if name == cfg.modes.wltp_mode_name else await load_mode(cfg, name)
+        for name in cfg.modes.coverage_mode_names
+    ]
+    lr = cfg.learning
+    wltp_stats, outside = coverage_stats_from_modes(
+        cover_modes, edges_from_config(lr.grid_speed_edges_kmh, lr.grid_accel_edges_kmhs)
+    )
+    say("狙うモード（格子の外＝狙えない走りの秒数）:")
+    say(outside_text(outside))
     say("2-0. ペダル探索（不感帯と停車保持開度を車速応答で測り、停車保持する）")
     pedal = await run_pedal_search(hw, ctx.config, log=log)
     say()
-    say("2-1. パターン走行（本番の学習運転と同じパターン列・PatternLoop）→ 緩減速で停車保持")
-    drive = await run_pattern_drive(hw, ctx.config, pedal=pedal, log=log)
+    say("2-1. パターン走行（コースト → 格子ステップ → クリープ。PatternLoop）→ 緩減速で停車保持")
+    drive = await run_pattern_drive(hw, ctx.config, pedal=pedal, log=log, wltp_stats=wltp_stats)
     if log is not None:
         await log.close()  # 停車保持まで記録したら保存し、その CSV（パターン走行の行）で学習する
     say()
     say("2-2. 走行結果から 2次多項式 FF モデルを作成")
+    # 重み付けは sample_weight_enabled のときだけ有効（無効でも wltp_mode を渡すと MAE_WLTP が出る）
     await asyncio.to_thread(
-        build_ff_model, ctx.config, drive.csv_path, hw_mode=hw.hw_mode, pedal=pedal
+        build_ff_model,
+        ctx.config, drive.csv_path, hw_mode=hw.hw_mode, pedal=pedal, wltp_mode=wltp_mode,
     )
     if hw.is_real:
         ctx.config = load_config(ctx.config.source_path)  # 以降の手順は書き戻した値で走る
@@ -337,12 +363,19 @@ async def prepare_step3(ctx: RunContext) -> None:
     ctx.mode_setup = await prepare_mode_drive(ctx.config, ctx.config.modes.wltp_mode_name)
 
 
-def _session_log_for_drive(ctx: RunContext, hw: ResearchHardware) -> SessionLog:
-    """走行前チェックから続くログがあればそれを、手順 2 で閉じていれば新しく作って使う。"""
+def _session_log_for_drive(
+    ctx: RunContext, hw: ResearchHardware, *, section: str = SECTION_MODE_DRIVE,
+    has_ref: bool = True,
+) -> SessionLog:
+    """走行前チェックから続くログがあればそれを、前の手順で閉じていれば新しく作って使う。
+
+    `has_ref`/`section` は手順 11（加振走行）向け: 基準車速が無い走行（`has_ref=False`）は
+    グラフに基準線を描かない。
+    """
     log = ctx.session_log
     if log is None or log.closed:
-        log = SessionLog(ctx.config, hw, has_ref=True)
-        log.start(SECTION_MODE_DRIVE, "")
+        log = SessionLog(ctx.config, hw, has_ref=has_ref)
+        log.start(section, "")
         ctx.session_log = log
     return log
 
@@ -402,6 +435,39 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 手順 11: 加振走行（ペダル→車速の周波数応答。ProblemReport_20260921 の 1.4Hz ばたつき対策）
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def step11_excite(ctx: RunContext) -> None:
+    """停車保持の状態から加振走行を行い、CSV と周波数応答の表を残す。
+
+    FF・PID は使わない開ループ走行なので、手順 2/3 のような FF モデル・走行モード（DB）の
+    読み込みは不要（`prepare` なし）。基準車速を持たないので `has_ref=False`。
+    """
+    hw = ctx.require_hardware()
+    log = _session_log_for_drive(ctx, hw, section=SECTION_EXCITE, has_ref=False)
+    result = await run_excite(hw, ctx.config, log=log, limit_s=ctx.limit_s)
+    await log.close()  # 停車保持まで記録したら保存し、その CSV で周波数応答を求める
+
+    if result.samples:
+        blocks = excite_analyze(log.csv_path, skip_s=ctx.config.excite.analysis_skip_s)
+        say()
+        if blocks:
+            say(excite_format_table(blocks, None))
+        else:
+            say("加振ブロックの行が skip_s で全て捨てられたため、周波数応答は出しません"
+                f"（.venv/bin/python -m tests.research.excite --analyze {log.csv_path} で"
+                "後から確認できます）")
+    else:
+        say("加振走行の行が無いため、周波数応答は出しません")
+    if not result.completed:
+        raise DriveError(result.abort_reason)
+    say()
+    say("手順 11 完了。")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 手順 4 以降（1 手順ずつ実装する方針のため、未実装は明示的に停止する）
 # ─────────────────────────────────────────────────────────────────────
 
@@ -441,6 +507,12 @@ STEPS: tuple[Step, ...] = (
     Step(8, "Kp + Ki + Kd 適合", _pending(8)),
     Step(9, "FF + Kp + Ki + Kd で WLTP モード走行", _pending(9)),
     Step(10, "制約の追加（不感帯 / レートリミット / 先読み / ILC）", _pending(10)),
+    Step(
+        11,
+        "加振走行（ペダル→車速の周波数応答）",
+        step11_excite,
+        drives=True,
+    ),
 )
 _STEP_BY_NUMBER = {step.number: step for step in STEPS}
 MAX_STEP = max(_STEP_BY_NUMBER)
@@ -590,8 +662,13 @@ def retrain_only(args: argparse.Namespace) -> int:
         say(f"設定の読み込みに失敗しました: {exc}")
         return 2
     say(f"ハードウェアモード: {args.hw}（走行はしません）")
+    # 段2（ProblemReport_20260925）: sample_weight_enabled のときだけ WLTP の基準車速を読む。
+    # retrain_only は asyncio ループの外（同期関数）から呼ばれるので asyncio.run でよい
+    wltp_mode = None
+    if config.learning.sample_weight_enabled:
+        wltp_mode = asyncio.run(load_mode(config, config.modes.wltp_mode_name))
     try:
-        build_ff_model(config, csv_path, hw_mode=args.hw, pedal=None)
+        build_ff_model(config, csv_path, hw_mode=args.hw, pedal=None, wltp_mode=wltp_mode)
     except LearningDataError as exc:
         say(f"モデル作成エラー: {exc}")
         return 6

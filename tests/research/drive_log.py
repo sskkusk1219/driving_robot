@@ -18,6 +18,8 @@
     PATTERN_DRIVE   … 2-1 パターン走行（FF モデルの学習に使うのはこの区間だけ）
     MODE_DRIVE      … 手順 3/5/7/9 のモード走行（KPI・レポートはこの区間だけ。
                       mode_time_s 列 = モード経過秒）
+    EXCITE          … 加振走行（一定速度に正弦波を重ねてペダル→車速の周波数応答を測る。
+                      FF・PID は使わない開ループ走行。excite.py。mode_time_s 列 = 走行経過秒）
     DECEL_TO_STOP   … 走行後の緩減速 → 停車保持
 
 記録の仕方:
@@ -41,12 +43,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from src.models.drive_log import DriveLog, DriveLogData
-from src.utils.time import to_jst_naive
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.config import ResearchConfig
 from tests.research.hardware import ResearchHardware
 from tests.research.live_plot import LivePlot, PlotSample, save_drive_figure
+from tests.research.research_types import DriveLog, DriveLogData, to_jst_naive
 from tests.research.term import say
 from tests.research.vehicle import pulse_to_opening
 
@@ -54,6 +55,7 @@ SECTION_PRE_DRIVE_CHECK = "PRE_DRIVE_CHECK"
 SECTION_PEDAL_SEARCH = "PEDAL_SEARCH"
 SECTION_PATTERN_DRIVE = "PATTERN_DRIVE"
 SECTION_MODE_DRIVE = "MODE_DRIVE"
+SECTION_EXCITE = "EXCITE"  # 加振走行（ペダル→車速の周波数応答を開ループで測る。excite.py）
 SECTION_DECEL_TO_STOP = "DECEL_TO_STOP"
 
 LIVE_PNG_NAME = "live_drive.png"

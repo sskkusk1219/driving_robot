@@ -37,17 +37,14 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from src.domain.model_training import (
-    DEFAULT_DT_S,
-    STOP_SPEED_KMH,
+from tests.research.dynamics_estimation import (
     _estimate_pedal_gain_curve,
-    _group_by_session,
     _merge_pedal_gain_curves,
     _steady_opening_mask,
 )
-from src.models.drive_log import DriveLog
-from src.models.profile import FeedforwardParams
+from tests.research.ff_model import DEFAULT_DT_S, STOP_SPEED_KMH, group_by_session
 from tests.research.ff_params import ResearchFFParams, free_accel_at
+from tests.research.research_types import DriveLog, FeedforwardParams
 
 
 @dataclass(frozen=True)
@@ -79,7 +76,7 @@ def estimate_gain_curve(
     """
     speeds: list[float] = []
     gains: list[float] = []
-    for session_logs in _group_by_session(logs):
+    for session_logs in group_by_session(logs):
         if len(session_logs) < 2:
             continue
         speed = np.clip(

@@ -8,24 +8,13 @@ A1（学習行の選別）はそのペダルが効いている行だけを使う
 from __future__ import annotations
 
 import pickle
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from src.domain.control.feedforward import FeedforwardController
-from src.domain.learning_drive import LearningDataError
-from src.domain.model_training import DEFAULT_FEATURE_SPEC, STOP_SPEED_KMH
-from src.models.drive_log import DriveLog
-from src.models.profile import (
-    FeedforwardParams,
-    PIDGains,
-    StopConfig,
-    VehicleProfile,
-    coast_decel_at,
-)
-from tests.research.cruise_curve import CruiseCurve
 from tests.research.ff_candidate import (
     CANDIDATE_CLASSES,
     TRAINING_ROWS_EFFECTIVE,
@@ -33,14 +22,22 @@ from tests.research.ff_candidate import (
     CandidateC3,
     CandidateC4,
     CandidateC5,
-    CandidateC6,
     CandidateFeedforward,
-    cruise_skeleton,
     make_candidate,
     train_inverse_model_effective,
 )
+from tests.research.ff_model import DEFAULT_FEATURE_SPEC, STOP_SPEED_KMH, FeatureSpec
 from tests.research.ff_params import ResearchFFParams, creep_accel_at
+from tests.research.learning_patterns import LearningDataError
 from tests.research.reachability import free_speeds_at
+from tests.research.research_types import (
+    DriveLog,
+    FeedforwardParams,
+    PIDGains,
+    StopConfig,
+    VehicleProfile,
+    coast_decel_at,
+)
 
 SPEEDS = (5.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 105.0, 115.0, 125.0, 135.0)
 COAST = (1.6, 1.73, 2.58, 3.195, 3.575, 3.57, 3.11, 2.54, 1.83, 1.6, 1.6, 1.6, 1.6, 1.6)
@@ -137,12 +134,6 @@ def test_b2_no_coast_taper() -> None:
     coast = -coast_decel_at(PARAMS, v0)
     future, past = _points(v0, coast * 0.9)  # 現行なら accel_pred × 0.1 まで絞られる領域
     assert _ff(accel_pred, 20.0).predict_effort(v0, future, past) == pytest.approx(accel_pred)
-    # 現行（FeedforwardController）はここでテーパがかかることを対照として確かめる
-    current = FeedforwardController()
-    current.set_params(PARAMS)
-    current._accel_model = _Const(accel_pred)  # noqa: SLF001
-    current._brake_model = _Const(20.0)  # noqa: SLF001
-    assert current.predict_effort(v0, future, past) == pytest.approx(accel_pred * 0.1, abs=0.2)
 
 
 @pytest.mark.parametrize(
@@ -560,7 +551,7 @@ def test_a1_uses_only_effective_rows(tmp_path: Path) -> None:
 
 
 def test_a1_model_loads_into_feedforward(tmp_path: Path) -> None:
-    """pkl の形式は本番と同じ（FeedforwardController.load_model がそのまま読める）。"""
+    """pkl の形式は本番と同じ（FeedforwardModel.load_model がそのまま読める）。"""
     path, _ = train_inverse_model_effective(_logs(_mixed_rows()), _profile(), str(tmp_path))
     ff = CandidateFeedforward()
     ff.set_params(PARAMS)
@@ -590,6 +581,77 @@ def test_pkl_filename_stamp_is_local_time(tmp_path: Path) -> None:
     assert abs(trained_at - datetime.now()) < timedelta(minutes=5)
 
 
+# ── 手順6: ペダル別ホライズン（ProblemReport_20260921） ─────────────
+
+
+def test_train_with_distinct_accel_brake_specs_saves_both(tmp_path: Path) -> None:
+    """accel_spec/brake_spec を別々に渡すと、pkl にペダル別 feature_spec が保存される。"""
+    accel_spec = FeatureSpec(lookahead_horizons_s=(0.5, 1.0, 2.0, 3.0))
+    brake_spec = FeatureSpec(lookahead_horizons_s=(0.1, 1.0))
+    path, metrics = train_inverse_model_effective(
+        _logs(_mixed_rows()), _profile(), output_dir=str(tmp_path),
+        accel_spec=accel_spec, brake_spec=brake_spec, stop_horizon_s=0.5,
+    )
+    with Path(path).open("rb") as f:
+        payload = pickle.load(f)  # noqa: S301 - テストで作った自前のファイル
+
+    assert payload["accel_feature_spec"] == asdict(accel_spec)
+    assert payload["brake_feature_spec"] == asdict(brake_spec)
+    assert payload["stop_horizon_s"] == 0.5
+    # 制御用 feature_spec は両ペダルの和集合 ＋ stop_horizon_s
+    control = FeatureSpec(**payload["feature_spec"])
+    assert set(control.lookahead_horizons_s) == {0.1, 0.5, 1.0, 2.0, 3.0}
+    assert metrics["accel"]["n"] > 0
+    assert metrics["brake"]["n"] > 0
+
+
+def test_train_with_default_specs_is_unchanged_from_legacy(tmp_path: Path) -> None:
+    """accel_spec/brake_spec を省略すると、両方とも DEFAULT_FEATURE_SPEC（今までと同じ）。"""
+    path, _ = train_inverse_model_effective(
+        _logs(_mixed_rows()), _profile(), output_dir=str(tmp_path)
+    )
+    with Path(path).open("rb") as f:
+        payload = pickle.load(f)  # noqa: S301
+
+    assert payload["accel_feature_spec"] == payload["brake_feature_spec"] == payload["feature_spec"]
+    assert FeatureSpec(**payload["feature_spec"]) == DEFAULT_FEATURE_SPEC
+    assert payload["stop_horizon_s"] == DEFAULT_FEATURE_SPEC.lookahead_horizons_s[0]
+
+
+def test_train_rejects_mismatched_regime_horizon(tmp_path: Path) -> None:
+    accel_spec = FeatureSpec(lookahead_horizons_s=(1.0, 2.0), regime_horizon_s=1.0)
+    brake_spec = FeatureSpec(lookahead_horizons_s=(1.5,), regime_horizon_s=1.5)
+    with pytest.raises(ValueError, match="regime_horizon_s"):
+        train_inverse_model_effective(
+            _logs(_mixed_rows()), _profile(), output_dir=str(tmp_path),
+            accel_spec=accel_spec, brake_spec=brake_spec,
+        )
+
+
+def test_pedal_separated_model_predicts_with_correct_spec_per_pedal(tmp_path: Path) -> None:
+    """学習した pkl をロードした CandidateFeedforward の predict_effort が、
+    アクセル・ブレーキそれぞれ自分の spec の行を使って予測すること（形状エラーが出ない）。
+    """
+    accel_spec = FeatureSpec(lookahead_horizons_s=(0.5, 1.0, 2.0, 3.0))
+    brake_spec = FeatureSpec(lookahead_horizons_s=(0.1, 1.0))
+    path, _ = train_inverse_model_effective(
+        _logs(_mixed_rows()), _profile(), output_dir=str(tmp_path),
+        accel_spec=accel_spec, brake_spec=brake_spec, stop_horizon_s=0.5,
+    )
+    ff = CandidateFeedforward()
+    ff.set_params(PARAMS)
+    ff.load_model(path)
+
+    assert ff.is_pedal_separated
+    future = {h: 40.0 for h in ff.horizons}
+    future[1.0] = 45.0  # 加速レジーム
+    past = {h: 39.0 for h in ff.past_horizons}
+    effort = ff.predict_effort(
+        40.0, [future[h] for h in ff.horizons], [past[h] for h in ff.past_horizons]
+    )
+    assert -100.0 <= effort <= 100.0
+
+
 # ── V1: C2〜C5（KAIZEN 報告書 3 章 表 3-1） ─────────────────────────
 
 
@@ -613,7 +675,7 @@ PARAMS_WITH_GAIN = FeedforwardParams(
 def test_candidate_classes_registered_with_matching_names() -> None:
     for name, cls in CANDIDATE_CLASSES.items():
         assert cls().candidate == name
-    assert set(CANDIDATE_CLASSES) == {"C1", "C2", "C3", "C4", "C5", "C6"}
+    assert set(CANDIDATE_CLASSES) == {"C1", "C2", "C3", "C4", "C5"}
 
 
 def test_make_candidate_unknown_name_raises() -> None:
@@ -682,125 +744,3 @@ def test_c2_falls_back_to_model_when_gain_not_identified() -> None:
     assert c2.predict_effort(v0, future, past) == pytest.approx(
         c1.predict_effort(v0, future, past)
     )
-
-
-# ── C6: 骨格（定速階段の実測テーブル）+ 残差 ML ─────────────────────
-
-
-def _c6_curve() -> CruiseCurve:
-    return CruiseCurve(
-        speeds_kmh=(30.0, 60.0, 90.0), openings_pct=(12.65, 16.96, 16.82), n_rows=(6, 6, 6)
-    )
-
-
-def test_cruise_skeleton_adds_gain_term_when_identified() -> None:
-    """骨格 = opening_at(v0) + a_req ÷ k(v0)（ゲイン同定済み）。"""
-    curve = _c6_curve()
-    skeleton = cruise_skeleton(curve, PARAMS_WITH_GAIN, 60.0, 1.0)
-    assert skeleton == pytest.approx(16.96 + 1.0 / 0.5)  # ACCEL_GAIN の一定値 0.5
-
-
-def test_cruise_skeleton_a_req_term_is_zero_when_gain_not_identified() -> None:
-    """ゲイン未同定（None）・0 以下なら a_req 項は 0（実測テーブルの値だけを返す）。"""
-    curve = _c6_curve()
-    assert cruise_skeleton(curve, PARAMS, 60.0, 1.0) == pytest.approx(16.96)
-    assert cruise_skeleton(curve, PARAMS, 60.0, -3.0) == pytest.approx(16.96)
-
-
-def _sample_curve_for_training() -> CruiseCurve:
-    """学習ログの車速レンジ（_mixed_rows は概ね 1〜60 km/h）を覆う小さな実測テーブル。"""
-    return CruiseCurve(speeds_kmh=(10.0, 50.0), openings_pct=(12.0, 16.0), n_rows=(5, 5))
-
-
-def test_train_inverse_model_effective_with_curve_writes_cruise_curve_key(tmp_path: Path) -> None:
-    curve = _sample_curve_for_training()
-    path, metrics = train_inverse_model_effective(
-        _logs(_mixed_rows()), _profile(), output_dir=str(tmp_path), cruise_curve=curve
-    )
-    with Path(path).open("rb") as f:
-        payload = pickle.load(f)  # noqa: S301 - テストで作った自前のファイル
-    assert payload["cruise_curve"] == curve.to_dict()
-    assert "below_deadband" in metrics["accel"]
-    assert metrics["accel"]["n"] > 0
-
-
-def test_train_inverse_model_effective_without_curve_has_no_cruise_curve_key(
-    tmp_path: Path,
-) -> None:
-    """C1（cruise_curve 省略）の pkl には研究用キーが増えないこと。"""
-    path, _ = train_inverse_model_effective(
-        _logs(_mixed_rows()), _profile(), output_dir=str(tmp_path)
-    )
-    with Path(path).open("rb") as f:
-        payload = pickle.load(f)  # noqa: S301
-    assert "cruise_curve" not in payload
-
-
-def test_candidate_c6_load_model_rejects_c1_pkl(tmp_path: Path) -> None:
-    """C1 の pkl（cruise_curve キーなし）を C6 に読ませたら ValueError（黙って動かさない）。"""
-    path, _ = train_inverse_model_effective(
-        _logs(_mixed_rows()), _profile(), output_dir=str(tmp_path)
-    )
-    ff = CandidateC6()
-    ff.set_params(PARAMS)
-    with pytest.raises(ValueError, match="cruise_curve"):
-        ff.load_model(path)
-
-
-def test_candidate_c6_load_model_reads_cruise_curve(tmp_path: Path) -> None:
-    curve = _sample_curve_for_training()
-    path, _ = train_inverse_model_effective(
-        _logs(_mixed_rows()), _profile(), output_dir=str(tmp_path), cruise_curve=curve
-    )
-    ff = CandidateC6()
-    ff.set_params(PARAMS)
-    ff.load_model(path)
-    assert ff.has_model
-    assert ff._cruise_curve == curve  # noqa: SLF001 - テスト用の確認
-
-
-def _c6(
-    residual: float, brake_pred: float, curve: CruiseCurve, clip: float | None = None
-) -> CandidateC6:
-    ff = CandidateC6()
-    ff.set_params(PARAMS)
-    ff._accel_model = _Const(residual)  # noqa: SLF001
-    ff._brake_model = _Const(brake_pred)  # noqa: SLF001
-    ff._speed_clip_max = clip  # noqa: SLF001
-    ff._cruise_curve = curve  # noqa: SLF001
-    return ff
-
-
-def test_c6_accel_prediction_is_skeleton_plus_residual() -> None:
-    """C6 のアクセル予測 = max(0, 骨格 + 残差)。B3 の不感帯切り上げは C1 と同じ。"""
-    curve = _c6_curve()
-    residual = 2.0
-    ff = _c6(residual, brake_pred=0.0, curve=curve)
-    v0 = 60.0  # 表の点そのもの（16.96%）
-    future, past = _points(v0, 1.0)  # 加速要求 → アクセル側（B1）
-
-    effort = ff.predict_effort(v0, future, past)
-
-    expected_skeleton = 16.96  # ゲイン未同定の PARAMS なので a_req 項は 0
-    assert effort == pytest.approx(max(PARAMS.accel_deadband_pct, expected_skeleton + residual))
-
-
-def test_c6_accel_opening_uses_raw_v0_for_skeleton_above_speed_clip() -> None:
-    """骨格の v0 は学習域クリップ前の実測値（表の外は opening_at の直線延長で外挿する）。"""
-    curve = _c6_curve()
-    ff = _c6(residual=0.0, brake_pred=0.0, curve=curve, clip=50.0)
-    v0 = 100.0  # 表の最高速 90 を超え、かつ学習域クリップ (50) も超える
-    future, past = _points(v0, 1.0)
-
-    effort = ff.predict_effort(v0, future, past)
-
-    high_slope = (16.82 - 16.96) / (90.0 - 60.0)
-    expected_skeleton = 16.82 + high_slope * (v0 - 90.0)  # v0=100（クリップ後の 50 ではない）
-    assert effort == pytest.approx(max(PARAMS.accel_deadband_pct, expected_skeleton))
-
-
-def test_make_candidate_c6() -> None:
-    ff = make_candidate("C6")
-    assert isinstance(ff, CandidateC6)
-    assert ff.candidate == "C6"
-    assert not ff.uses_actual_speed

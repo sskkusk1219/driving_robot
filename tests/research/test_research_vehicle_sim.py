@@ -9,8 +9,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.models.profile import FeedforwardParams, coast_decel_at
 from tests.research import vehicle_sim as vs
+from tests.research.research_types import FeedforwardParams, coast_decel_at
 
 SPEEDS = (5.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 105.0, 115.0, 125.0, 135.0)
 COAST = (1.6, 1.73, 2.58, 3.195, 3.575, 3.57, 3.11, 2.54, 1.83, 1.6, 1.6, 1.6, 1.6, 1.6)

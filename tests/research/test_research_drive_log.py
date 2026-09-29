@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from src.models.drive_log import DriveLogData
 from tests.research import config as cfgmod
 from tests.research import drive_log as dlmod
 from tests.research import hardware as hwmod
@@ -23,6 +22,7 @@ from tests.research import pattern_drive as pdmod
 from tests.research import pedal_search as psmod
 from tests.research import pre_drive_check as pcmod
 from tests.research.axis_monitor import AxisMonitor
+from tests.research.research_types import DriveLogData
 from tests.research.test_research_pattern_drive import FAST_LOOP, SHORT_PATTERNS
 
 FAST = {

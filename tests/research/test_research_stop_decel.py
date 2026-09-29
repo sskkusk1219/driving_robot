@@ -13,11 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from src.domain.control.conversions import VEHICLE_STOP_SPEED_KMH
 from tests.research import config as cfgmod
 from tests.research import hardware as hwmod
 from tests.research import stop_decel as sdmod
 from tests.research.pedal_search import PedalSearchResult
+from tests.research.research_types import VEHICLE_STOP_SPEED_KMH
 from tests.research.vehicle import build_vehicle_profile, opening_to_pulse
 
 FAST = {

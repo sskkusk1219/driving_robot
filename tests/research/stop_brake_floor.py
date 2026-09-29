@@ -32,7 +32,8 @@ ProblemReport_20260916 段4）: クリープ平衡 4.77 km/h からブレーキ�
     `phase` 列は `tests.research.drive_log.read_drive_logs` が `DriveLog` に読み戻さない
     （CSV には残るが読み込み時に捨てられ常に None）ため、走行時の意図（保持中か刻み送り中か）
     をログから復元できない。そこで代わりに、**手順2 が指令した候補開度**
-    （`learning.creep_brake_hold_offsets_pct` から作った開度列）を呼び出し側から渡す設計にし、
+    （`learning.creep_brake_hold_fracs` から `creep_brake_hold_openings` で作った開度列）を
+    呼び出し側から渡す設計にし、
     候補開度ごとに実際に保持できていた区間（プラトー）だけを抽出する。
 
     各候補開度の保持プラトーの**先頭車速**がクリープ平衡（`start_speed_kmh`）付近であることを
@@ -67,12 +68,11 @@ from pathlib import Path
 
 import numpy as np
 
-from src.domain.model_training import STOP_SPEED_KMH, _group_by_session
-from src.models.drive_log import DriveLog
-from src.models.profile import FeedforwardParams
 from tests.research.config import DEFAULT_CONFIG_PATH, load_config
 from tests.research.debug_process23 import md_table
 from tests.research.drive_log import read_drive_logs
+from tests.research.ff_model import STOP_SPEED_KMH, group_by_session
+from tests.research.research_types import DriveLog, FeedforwardParams
 from tests.research.vehicle import build_vehicle_profile
 
 
@@ -116,7 +116,7 @@ def estimate_stop_brake_floor(
     """走行ログからクリープ域ブレーキの下限（不感帯からの超過 [%]）を推定する。
 
     サンプル条件・アルゴリズムはモジュール docstring 参照。手順:
-        1. セッション分割（`_group_by_session`）
+        1. セッション分割（`group_by_session`）
         2. 各セッションで `accel_opening <= accel_deadband_pct and
            brake_opening > brake_deadband_pct` の連続区間（run）を作る
         3. 各 run の中で、各候補開度について `abs(brake_opening - o) <= opening_tol_pct` の
@@ -135,7 +135,7 @@ def estimate_stop_brake_floor(
     stopped: set[float] = set()
     floated: set[float] = set()
 
-    for session_logs in _group_by_session(logs):
+    for session_logs in group_by_session(logs):
         if len(session_logs) < 1:
             continue
         speed = np.clip(
@@ -187,7 +187,21 @@ def estimate_stop_brake_floor(
     return StopBrakeFloor(offset_pct=offset_pct, stopped_pct=stopped_pct, floated_pct=floated_pct)
 
 
-__all__ = ["StopBrakeFloor", "estimate_stop_brake_floor"]
+def creep_brake_hold_openings(
+    brake_deadband_pct: float, stop_brake_opening_pct: float, fracs: Sequence[float]
+) -> tuple[float, ...]:
+    """クリープ域ブレーキ保持の開度列 = 不感帯 + frac × (停車保持開度 − 不感帯)。
+
+    手順2 のパターン生成（`pattern_drive.build_patterns`）とこの推定の候補開度が**同じ式**で
+    ないと「指令した開度」と「候補開度」が食い違うので、両方ここを呼ぶ（2026-09-25 段4）。
+    不感帯・停車保持開度は 2-0 の実測なので、車両が変わっても自動で追従する。
+    停車保持開度が不感帯以下（実測が壊れている）なら差を 0 とみなし、全て不感帯になる。
+    """
+    span = max(stop_brake_opening_pct - brake_deadband_pct, 0.0)
+    return tuple(round(brake_deadband_pct + frac * span, 2) for frac in fracs)
+
+
+__all__ = ["StopBrakeFloor", "creep_brake_hold_openings", "estimate_stop_brake_floor"]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -202,9 +216,9 @@ def run(csv_path: Path, config_path: Path) -> int:
     lr = cfg.learning
     ff = cfg.feedforward
 
-    candidate_openings_pct = [
-        round(ff.brake_deadband_pct + offset, 2) for offset in lr.creep_brake_hold_offsets_pct
-    ]
+    candidate_openings_pct = list(creep_brake_hold_openings(
+        ff.brake_deadband_pct, ff.stop_brake_opening_pct, lr.creep_brake_hold_fracs
+    ))
 
     floor = estimate_stop_brake_floor(
         logs, params,
