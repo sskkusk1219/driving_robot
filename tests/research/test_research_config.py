@@ -25,6 +25,18 @@ def test_default_config_loads_and_validates() -> None:
     assert cfgmod.validate_config(cfg) == []
 
 
+def test_arbiter_new_flags_load_and_default_false() -> None:
+    """段3: 調停の個別スイッチ（微小変化の保持・再踏込ディレイ・解放レート）が読める。"""
+    # YAML の値は段3で 1 つずつ切り替えるので、型だけ確かめる（既定値はクラス側で確かめる）
+    a = _load_default().arbiter
+    for flag in (a.enable_min_step, a.enable_reengage_dwell, a.enable_release_rate):
+        assert isinstance(flag, bool)
+    d = cfgmod.ArbiterSection()
+    assert (d.enable_min_step, d.enable_reengage_dwell, d.enable_release_rate) == (
+        False, False, False
+    )
+
+
 def test_log_interval_must_be_multiple_of_loop_interval() -> None:
     cfg = _load_default()
     cfg.control.log_interval_ms = 130
@@ -773,3 +785,29 @@ def test_grid_hole_wltp_min_s_key_is_gone(tmp_path: Path) -> None:
     with pytest.raises(cfgmod.ConfigError, match="grid_hole_wltp_min_s"):
         cfgmod.load_config(path)
     assert cfgmod.LearningSection().grid_target_min_s == pytest.approx(2.5)
+
+
+def test_arbiter_band_and_direction_keys_load_and_are_validated() -> None:
+    """段3c/3d: 加速度帯・向きのヒステリシスのキーが読め、0 以下は検証で落ちる。"""
+    a = _load_default().arbiter
+    assert isinstance(a.enable_accel_band, bool)
+    assert isinstance(a.enable_direction_hysteresis, bool)
+    d = cfgmod.ArbiterSection()
+    assert (d.enable_accel_band, d.enable_direction_hysteresis) == (False, False)
+    assert (d.accel_band_horizon_s, d.accel_band_kmhs, d.accel_band_dev_escape_kmh) == (
+        3.0, 0.25, 0.3
+    )
+    assert d.accel_band_open_escape_pct == 2.0
+    assert isinstance(a.accel_band_open_escape_pct, float)
+    assert d.accel_direction_hysteresis_pct == 0.5
+    for key in (
+        "accel_band_horizon_s",
+        "accel_band_kmhs",
+        "accel_band_dev_escape_kmh",
+        "accel_band_open_escape_pct",
+        "accel_direction_hysteresis_pct",
+    ):
+        cfg = _load_default()
+        assert not any(key in p for p in cfgmod.validate_config(cfg))
+        setattr(cfg.arbiter, key, 0.0)
+        assert any(key in p for p in cfgmod.validate_config(cfg))

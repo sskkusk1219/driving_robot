@@ -135,6 +135,13 @@ from tests.research.pattern_loop import (
     PatternLoopConfig,
 )
 from tests.research.pedal_gain import apply_pedal_gains, estimate_gain_curve
+from tests.research.pedal_lag import (
+    KINDS as PEDAL_LAG_KINDS,
+)
+from tests.research.pedal_lag import (
+    estimate_pedal_lag,
+    read_step_rows,
+)
 from tests.research.pedal_search import PedalSearchResult
 from tests.research.research_types import (
     DriveLog,
@@ -730,6 +737,7 @@ def build_ff_model(
     research_after = _estimate_research_stop_brake_floor(cfg, logs, reference, research_after)
     after = _estimate_research_pedal_gains(cfg, logs, reference, after, research_after)
     _print_param_changes(before, after, research_before, research_after)
+    pedal_lag_s = _estimate_research_pedal_lag(cfg, csv_path)
 
     if not write_config:
         if hw_mode == HW_REAL:
@@ -756,6 +764,9 @@ def build_ff_model(
             continue
         value = getattr(research_after, key) if key in RESEARCH_PARAM_KEYS else getattr(after, key)
         updates[f"feedforward.{key}"] = list(value) if isinstance(value, tuple) else float(value)
+    # L（ペダル選択窓の中心）。FF_PARAM_KEYS とは別扱いで、測れたときだけ書く
+    if pedal_lag_s is not None:
+        updates["feedforward.pedal_select_center_s"] = pedal_lag_s
     changed = cfg.save(updates)
     say(f"{cfg.source_path} に保存しました（{len(changed)} 行を更新）:")
     for line in changed:
@@ -933,6 +944,32 @@ def _estimate_research_pedal_gains(
             say(f"  {label}: 同定できず（条件を満たす {curve.samples} 点。本番推定の値のまま）")
         curves[is_accel] = curve
     return apply_pedal_gains(after, accel=curves[True], brake=curves[False])
+
+
+def _estimate_research_pedal_lag(cfg: ResearchConfig, csv_path: Path) -> float | None:
+    """ペダル指令→加速度の遅れ L を HOLD_STEP から測って表示する（ProblemReport_20260929 段2）。
+
+    測り方は `pedal_lag` のモジュール docstring 参照。戻り値は 0.01s に丸めた L
+    （build_ff_model が write_config のときだけ `feedforward.pedal_select_center_s` に書く）。
+    測れなかった（HOLD_STEP 無し・件数不足・範囲外）ときは None で、config の値は据え置き。
+    """
+    before = cfg.feedforward.pedal_select_center_s
+    say("ペダル遅れ L: 格子ステップの HOLD_STEP から測定（指令 50% 点 → 加速度 50% 点の中央値） …")
+    result = estimate_pedal_lag(read_step_rows(csv_path))
+    if result.lag_s is None:
+        say(f"  警告: L を測れませんでした（{result.reason}）。pedal_select_center_s は "
+            f"{before:g}s のまま据え置きます")
+        return None
+    lag = round(result.lag_s, 2)
+    iqr = f"（四分位 {result.iqr_s[0]:.2f}〜{result.iqr_s[1]:.2f}s）" if result.iqr_s else ""
+    say(f"  pedal_select_center_s: {before:g}s → {lag:g}s  採用 {result.n_used}/"
+        f"{result.n_steps_total} ステップ{iqr}")
+    kinds = "  ".join(
+        f"{k} {result.by_kind[k][0]}件 {result.by_kind[k][1]:.2f}s"
+        for k in PEDAL_LAG_KINDS if k in result.by_kind
+    )
+    say(f"  種類別（参考。L は全部の中央値）: {kinds}")
+    return lag
 
 
 def _print_metrics(metrics: dict[str, dict[str, float]]) -> None:

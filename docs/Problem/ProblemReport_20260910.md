@@ -173,7 +173,10 @@ FF + PID
             `tests/research/results/report20260921_RunFF_2.md`の結果から追従性が向上したので、制御が複雑になるので**速度別モデルは未着手**
         - `docs/Problem/ProblemReport_20260921.md`の着手
             - アクセルの操作がバタバタする問題
-            
+            - "C5"ではこれ以上改善しないことを確認して、次へ 実装はそのまま残してある
+        - `docs/Problem/ProblemReport_20260929.md`
+            - h1の決め方問題
+            - アクセル/ブレーキの決定方法はGとした
         - `docs/Problem/ProblemReport_20260919_2.md`で人間の運転が再現できているか確認する
         - C5で再走行して問題がないことを確認
         - 手順4へ

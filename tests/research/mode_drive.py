@@ -1,7 +1,7 @@
 """手順 3: 走行モード管理の WLTP を FF だけで走り、車速追従を記録する（手順 5/7/9 で PID を足す）。
 
     基準車速 → FF（手順 2 のモデル）──┐
-                                      ＋ → effort → 調停（符号で振り分け）→ アクセル/ブレーキ → 車両
+                                      ＋ → effort → 調停（PedalArbiter）→ アクセル/ブレーキ → 車両
       PID（手順 5 以降。手順 3 は 0）──┘                                                      │
        ↑                                                                                      │
        └──────────────────────────── 車速（CAN） ───────────────────────────────────────────────┘
@@ -21,9 +21,11 @@
 本番の自動走行との違い（第1段階として極端に単純にしたところ）:
     - プラン・トリム・フェーズ権限・ゲインスケジューリング・最小実効ブレーキ・FB 用ローパスは
       持たない。
-    - 調停は effort の符号でアクセル/ブレーキに振り分け、開度上限でクランプするだけ。不感帯補償・
-      レートリミット・ヒステリシス・再踏込ディレイ・解放レートは持たない（arbiter.enable_* が
-      true なら手順 3 は開始しない）。
+    - 調停は pedal_arbiter.PedalArbiter（本番の移植）。機能は arbiter.enable_* で 1 つずつ有効化する
+      （ヒステリシス・不感帯補償・レートリミット・微小変化の保持・再踏込ディレイ・解放レート、
+      研究専用の加速度帯の保持・向きのヒステリシス）。
+      すべて false なら effort の符号でアクセル/ブレーキに振り分け、開度上限でクランプするだけ
+      （split_effort と同一）。
     - 一時停止・WebSocket・DB ログは持たない。ログは SessionLog（CSV/PNG）に 0.1s 刻みで残す。
     - 周期は固定の asyncio ループ。1 周期以上遅れたら次の周期から数え直し、回数をレポートに出す。
     - 減速G ガバナー（安全網）を持つ。本番の自動走行には無いので、作動した時間をレポートに出す。
@@ -52,6 +54,12 @@ from tests.research.ff_candidate import CandidateFeedforward, make_candidate
 from tests.research.ff_params import research_ff_params
 from tests.research.hardware import ActuatorProtocol, DriveError, ResearchHardware
 from tests.research.pattern_drive import _overcurrent_limit_ma, _release_pedals
+from tests.research.pedal_arbiter import (
+    PedalArbiter,
+    enabled_arbiter_features,
+    plan_accel_kmhs,
+)
+from tests.research.pedal_select import window_slope_kmhs
 from tests.research.research_types import (
     G_TO_KMHS,
     VEHICLE_STOP_SPEED_KMH,
@@ -153,26 +161,7 @@ def load_feedforward(cfg: ResearchConfig) -> CandidateFeedforward:
     return ff
 
 
-def require_simple_arbiter(cfg: ResearchConfig) -> None:
-    """第1段階（調停オプションすべて無効）でしか走らせない。"""
-    enabled = [
-        name
-        for name, on in (
-            ("enable_deadband_compensation", cfg.arbiter.enable_deadband_compensation),
-            ("enable_rate_limit", cfg.arbiter.enable_rate_limit),
-            ("enable_hysteresis", cfg.arbiter.enable_hysteresis),
-        )
-        if on
-    ]
-    if enabled:
-        raise ConfigError(
-            "モード走行の調停は第1段階（符号で振り分けるだけ）のみ実装しています。"
-            f"arbiter.{' / arbiter.'.join(enabled)} を false にしてください"
-        )
-
-
 async def prepare_mode_drive(cfg: ResearchConfig, mode_name: str) -> ModeDriveSetup:
-    require_simple_arbiter(cfg)
     say(f"走行モードを読み込みます: {mode_name!r}（{cfg.hardware.database_url}）")
     mode = await load_mode(cfg, mode_name)
     say(f"  {len(mode.reference_speed)} 点・{mode.total_duration:.0f}s・"
@@ -406,6 +395,16 @@ class _ModeRun:
             enabled=cfg.mode_drive.decel_governor,
         )
         self.accel_standby, self.brake_standby = standby_openings(cfg)
+        self.arbiter = PedalArbiter(
+            cfg.arbiter,
+            accel_deadband_pct=cfg.feedforward.accel_deadband_pct,
+            brake_deadband_pct=cfg.feedforward.brake_deadband_pct,
+            max_accel_opening=cfg.vehicle.max_accel_opening_pct,
+            max_brake_opening=cfg.vehicle.max_brake_opening_pct,
+            nominal_dt_s=cfg.control.loop_interval_s,
+        )
+        self.arbiter.reset()
+        self._prev_now: float | None = None  # 調停の dt 用（前サイクルの時刻）
         # V2: C5 だけが使う実測車速の履歴（過去ホライズンの最大値ぶんだけ保持すればよい）
         self.actual_history = ActualSpeedHistory(max(self.ff.past_horizons, default=1.0) + 0.5)
         self.cycles = 0
@@ -470,6 +469,29 @@ class _ModeRun:
             past = [speed + (self.ref.at(t - h) - ref) for h in ff.past_horizons]
         return speed, future, past
 
+    def _select_kwargs(self, t: float, v0: float) -> dict[str, float]:
+        """ペダル選択の差し替え引数（ProblemReport_20260929 段3）。
+
+        `pedal_select_mode` が window のときは、窓の傾き G と ref(t+L) を渡す。
+        point のときは、`reach_horizons_s` が空なら `pedal_select_point_s`（hp）先の傾き
+        (ref(t+hp) − v0) / hp だけを渡す（惰行加速度は従来どおり v0 で評価するので速度は渡さない。
+        モデルの h1 とは独立に先読みを変えられる）。C4 は v0 が実車速で、FF の入力上の偏差が
+        ref(t+h) − ref(t) なので、その場合だけ基準を ref(t) にする。到達判定
+        （`reach_horizons_s` が空でない）がペダル選択を担うときは何も渡さない。
+        """
+        ff_cfg = self.cfg.feedforward
+        if ff_cfg.pedal_select_mode != "window":
+            if ff_cfg.reach_horizons_s:
+                return {}
+            hp = ff_cfg.pedal_select_point_s
+            base = self.ref.at(t) if getattr(self.ff, "candidate", "") == "C4" else v0
+            return {"select_accel_kmhs": (self.ref.at(t + hp) - base) / hp}
+        center, width = ff_cfg.pedal_select_center_s, ff_cfg.pedal_select_width_s
+        return {
+            "select_accel_kmhs": window_slope_kmhs(self.ref.at, t, center, width),
+            "select_speed_kmh": self.ref.at(t + center),
+        }
+
     async def _cycle(self, t: float, now: float) -> None:
         cfg, hw = self.cfg, self.hw
         cycle_started = time.perf_counter()
@@ -481,16 +503,29 @@ class _ModeRun:
 
         ref = self.ref.at(t)
         v0, future, past = self._ff_inputs(t, ref, speed)
-        ff_effort = self.ff.predict_effort(v0, future, past)
+        ff_effort = self.ff.predict_effort(v0, future, past, **self._select_kwargs(t, v0))
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
         effort = ff_effort + pid_effort
         # ログの「指示開度 FF」列（FF の出力をペダル別に分けた値。ガバナー・待機位置の前）
         accel_ff, brake_ff = split_effort(
             ff_effort, cfg.vehicle.max_accel_opening_pct, cfg.vehicle.max_brake_opening_pct
         )
-        accel, brake = split_effort(
-            effort, cfg.vehicle.max_accel_opening_pct, cfg.vehicle.max_brake_opening_pct
-        )
+        # 調停の dt は前サイクルからの経過。初回は公称周期（arbitrate が dt<=0 で置き換える）
+        arb_dt = 0.0 if self._prev_now is None else now - self._prev_now
+        self._prev_now = now
+        if cfg.arbiter.enable_accel_band:
+            # 加速度帯の保持（段3c）: 計画加速度（基準 0〜H 秒先の傾き）と偏差を渡す
+            arb = self.arbiter.arbitrate(
+                effort,
+                arb_dt,
+                plan_accel_kmhs=plan_accel_kmhs(
+                    self.ref.at, t, cfg.arbiter.accel_band_horizon_s
+                ),
+                deviation_kmh=speed - ref,
+            )
+        else:
+            arb = self.arbiter.arbitrate(effort, arb_dt)
+        accel, brake = arb.accel_opening, arb.brake_opening
         brake, governed = self.governor.apply(now, speed, brake)
         if governed:
             self.governor_cycles += 1
@@ -656,8 +691,9 @@ async def run_mode_drive(
     limited = duration < mode.total_duration
     say(f"モード走行: {mode.name}（{duration:.0f}s"
         f"{f' ／ 動作確認のため先頭 {duration:.0f}s で打ち切り' if limited else ''}）")
-    say("制御構成: FF のみ（Kp=Ki=Kd=0）→ 調停は effort の符号で振り分け（不感帯補償・"
-        "レートリミット・ヒステリシスなし）")
+    arb_features = enabled_arbiter_features(cfg.arbiter)
+    say("制御構成: FF のみ（Kp=Ki=Kd=0）→ 調停は "
+        + (" + ".join(arb_features) if arb_features else "符号で振り分けのみ"))
     gov = cfg.mode_drive
     say(f"減速G ガバナー（安全網）: {'有効' if gov.decel_governor else '無効'}"
         f"（{cfg.vehicle.max_decel_g:g}G × {GOVERNOR_LIMIT_FRAC:g} 以上で頭打ち）")

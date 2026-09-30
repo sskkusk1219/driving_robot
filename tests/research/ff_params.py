@@ -45,6 +45,11 @@ class ResearchFFParams:
     # 先読み車速（最短ホライズン=0.5s 先の基準）がこの値以下のときだけ下限を掛ける [km/h]
     # （人が決める値・自動保存の対象外）
     brake_trim_ref_kmh: float = 0.3
+    # ペダル選択を窓の傾き G で行うときの窓（段1。L=中心・H=幅）と方式（段3。point | window）
+    pedal_select_center_s: float = 0.5
+    pedal_select_width_s: float = 3.0
+    pedal_select_mode: str = "point"
+    pedal_select_point_s: float = 1.0
 
 
 def creep_accel_at(research: ResearchFFParams, v_kmh: float) -> float | None:
@@ -80,6 +85,10 @@ def research_ff_params(cfg: ResearchConfig) -> ResearchFFParams:
         stop_brake_floor_offset_pct=ff.stop_brake_floor_offset_pct,
         brake_trim_max_kmh=ff.brake_trim_max_kmh,
         brake_trim_ref_kmh=ff.brake_trim_ref_kmh,
+        pedal_select_center_s=ff.pedal_select_center_s,
+        pedal_select_width_s=ff.pedal_select_width_s,
+        pedal_select_mode=ff.pedal_select_mode,
+        pedal_select_point_s=ff.pedal_select_point_s,
     )
 
 

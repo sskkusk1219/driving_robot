@@ -744,3 +744,67 @@ def test_c2_falls_back_to_model_when_gain_not_identified() -> None:
     assert c2.predict_effort(v0, future, past) == pytest.approx(
         c1.predict_effort(v0, future, past)
     )
+
+
+# ── ペダル選択の差し替え（ProblemReport_20260929 段3） ────────────────
+
+
+def test_select_kwargs_none_is_identical_to_default() -> None:
+    """select_* を渡さない（None）なら従来と完全に同じ。"""
+    research = ResearchFFParams(coast_band_kmhs=0.5)
+    ff = _ff_with_research(16.0, 20.0, research)
+    v0 = 60.0
+    coast = -coast_decel_at(PARAMS, v0)
+    for a in (coast + 2.0, coast, coast - 2.0):
+        future, past = _points(v0, a)
+        assert ff.predict_effort(v0, future, past) == ff.predict_effort(
+            v0, future, past, select_accel_kmhs=None, select_speed_kmh=None
+        )
+
+
+def test_select_accel_changes_only_the_pedal_choice() -> None:
+    """選択だけが変わり、開度は同じ経路（モデル予測）で決まる。"""
+    ff = _ff_with_research(16.0, 20.0, ResearchFFParams(coast_band_kmhs=0.5))
+    v0 = 60.0
+    coast = -coast_decel_at(PARAMS, v0)
+    future, past = _points(v0, coast - 2.0)  # 従来ならブレーキ
+    assert ff.predict_effort(v0, future, past) == pytest.approx(-20.0)
+    # 窓の傾きがアクセル側 → アクセル。開度は accel モデルの値（=同じ経路）
+    assert ff.predict_effort(
+        v0, future, past, select_accel_kmhs=coast + 2.0, select_speed_kmh=v0
+    ) == pytest.approx(16.0)
+    # 窓の傾きが帯の中 → 惰行
+    assert ff.predict_effort(
+        v0, future, past, select_accel_kmhs=coast, select_speed_kmh=v0
+    ) == 0.0
+    # 窓の傾きもブレーキ側 → 従来と同じブレーキ開度（desired_accel を変えない）
+    assert ff.predict_effort(
+        v0, future, past, select_accel_kmhs=coast - 3.0, select_speed_kmh=v0
+    ) == pytest.approx(-20.0)
+
+
+def test_select_speed_changes_the_coast_used_for_selection() -> None:
+    """惰行加速度の評価速度だけが差し替わる（開度側の coast は v0 のまま）。"""
+    ff = _ff_with_research(16.0, 20.0, ResearchFFParams(coast_band_kmhs=0.5))
+    v0, sel_v = 60.0, 100.0
+    coast_v0 = -coast_decel_at(PARAMS, v0)
+    coast_sel = -coast_decel_at(PARAMS, sel_v)
+    assert abs(coast_v0 - coast_sel) > 1.0
+    future, past = _points(v0, coast_v0)  # 従来なら惰行
+    assert ff.predict_effort(v0, future, past) == 0.0
+    # 選択の要求加速度が「sel_v での惰行」ちょうど → 帯の中で惰行
+    assert ff.predict_effort(
+        v0, future, past, select_accel_kmhs=coast_sel, select_speed_kmh=sel_v
+    ) == 0.0
+    # 要求が v0 での惰行値のままだと、sel_v の惰行より 1 以上ずれるので帯の外
+    assert ff.predict_effort(
+        v0, future, past, select_accel_kmhs=coast_v0, select_speed_kmh=sel_v
+    ) != 0.0
+
+
+def test_select_kwargs_rejected_with_reach_horizons() -> None:
+    research = ResearchFFParams(coast_band_kmhs=0.5, reach_horizons_s=(0.5, 1.0))
+    ff = _ff_with_research(16.0, 20.0, research)
+    future, past = _points(60.0, 0.0)
+    with pytest.raises(ValueError, match="reach_horizons_s"):
+        ff.predict_effort(60.0, future, past, select_accel_kmhs=0.0, select_speed_kmh=60.0)

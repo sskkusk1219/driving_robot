@@ -32,7 +32,7 @@ vehicle:
 feedforward:
   # C1~C6のモデル候補(C1:ベース,C4:V0実測値,C5:過去&V0実測,C6:C1+テーブル,)
   # candidate と model_path は必ず組で書き換えてください。C6にC1のモデルを組み合わせると、走り出す前にエラーで止まります
-  candidate: C5
+  candidate: C1
   # 2次多項式 Ridge 逆モデル（本番 src/domain/model_training.py と同型）の保存先
   # ファイル名の日時はローカル時刻（JST）。2026-09-20 以前の pkl は UTC 命名（JST−9h）
   model_path: tests/research/results/models/test_vehicle_20260929_051025.pkl
@@ -74,6 +74,12 @@ feedforward:
   # 詳細は docs/Problem/ProblemReport_20260916.md「段3: 実装したが無効のまま保留」
   reach_horizons_s: []
   reach_step_s: 0.05              # v_free の数値積分の刻み [s]（制御周期と同じ）
+  # ペダル選択を「区間の傾き G」で行うための窓（ProblemReport_20260929）。G は基準車速の
+  # 「今から L 秒先」を中心にした幅 H 秒の区間の最小二乗の傾き。
+  pedal_select_center_s: 0.5      # L [s]。手順2／relearn で自動保存（格子ステップの指令50%→加速度50% の遅れの中央値）
+  pedal_select_width_s: 3.0       # H [s]。手で決める値（自動保存の対象外）
+  pedal_select_mode: point        # point=今までどおり 1 点の傾き / window=窓の傾き G
+  pedal_select_point_s: 1.0       # point の先読み [s]。ペダル選択だけに使う（モデルの h1＝features.h1_s とは別。1.0 で従来と同じ）
   # 2026-09-19 段4 改訂 クリープ域ブレーキの下限（手順2 で自動保存）: 不感帯からの超過 [%]。
   # 「クリープ平衡からブレーキを保持して実際に停車できた最小オフセット」。2026-09-19 の手順2 で
   # +6.0%（17.79%）は 0.33 km/h に浮き、+8.0%（19.79%）は 1.78s で停止した。真の境界は
@@ -147,7 +153,7 @@ pid:
   integral_limit_pct: 20.0        # 積分項の上限 [%]（第2段階 anti-windup）
   derivative_filter_hz: 5.0       # 微分項のローパス [Hz]（0で無効）
 
-# ── ペダル調停（第1段階は全て無効。手順5「deadzone/rate limit」で有効化） ──
+# ── ペダル調停（段3: 機能ごとのスイッチ。1 つずつ有効化して実機で試す。全て false なら符号で振り分けるだけ） ──
 arbiter:
   enable_deadband_compensation: false  # 不感帯ぶんを上乗せするか
   enable_rate_limit: false             # 開度変化率を制限するか
@@ -157,7 +163,23 @@ arbiter:
   brake_rate_limit_pct_s: 300.0        # ブレーキ開度レートリミット [%/s]
   accel_reengage_dwell_s: 0.3          # ブレーキ解放後のアクセル再踏込ディレイ [s]
   accel_release_rate_pct_s: 10.0       # 惰行遷移でアクセルを戻すレート [%/s]
-  accel_min_step_pct: 0.2              # アクセル開度の量子化しきい値 [%]
+  # 2026-09-29 段3b（ProblemReport_20260921 6-14）: 0.2 → 0.5。仮の値（半分データ由来）。
+  # 053152 のアクセル往復は振幅 94% が 0.5% 未満。開ループ後掛け試算で 全体 2.41→0.58・60s最大 3.80→1.23 回/s。
+  # 閉ループでは保持で偏差が溜まり効き方が変わるので、採否と値は実機比較で決める
+  accel_min_step_pct: 1.0              # アクセル開度の量子化しきい値 [%]
+  # 2026-09-30 段3c で無効化（微小変化の保持は加速度帯の保持に置き換え。ProblemReport_20260921 6-15）
+  enable_min_step: false               # 微小変化の保持（変化が accel_min_step_pct 未満なら前回開度を保つ）
+  enable_reengage_dwell: false         # ブレーキ後の再踏込ディレイ（accel_reengage_dwell_s の間アクセルを抑止）
+  enable_release_rate: false           # 惰行でアクセルを accel_release_rate_pct_s で漸減（false は即 0）
+  # 2026-09-30 段3c/3d（ProblemReport_20260921 6-15）。研究専用（src の調停にはない）。
+  # 1 本目は段3c のみ有効。段3d は enable_direction_hysteresis を true に（単独比較は enable_accel_band: false）
+  enable_accel_band: false             # 加速度帯の保持（計画加速度が帯の中かつ偏差変化が小さければアクセル開度を保つ）
+  accel_band_horizon_s: 3.0            # 半分データ由来: 計画加速度＝基準 0〜3 秒先の直線近似の傾き（2s 未満は WLTP の 1s 段差が残る。ユーザー決定。次の候補 2s）
+  accel_band_kmhs: 0.25                # データ由来（半分仮）: 往復の 95% は要求加速度の振れ幅 0.5 km/h/s 未満 → 半幅 0.25
+  accel_band_dev_escape_kmh: 0.3       # 仮の値: 前回動かした時から偏差がこれ以上変わったら追従（保持で偏差が溜まるのを防ぐ）
+  accel_band_open_escape_pct: 100.0    # 2026-09-30 実機: 100＝実質オフ（2% だと 19↔21% の矩形発振。6-16）。元は 2.0。2026-09-30 追加（ProblemReport_20260921 6-15）。仮の値。142539 への後掛け試算で、3s先の傾きが変わり目に約1.5s早く基準点を決めた後、FF 要求が 23→9% に下がっても保持し続けた（最大差 14%）。2% で抜けると往復 0.28→0.29 回/s・最大差 2% に収まる。値は実機比較で決める
+  enable_direction_hysteresis: false   # 向きのヒステリシス（同じ向きはすぐ追従、逆向きは w% 戻る時だけ）
+  accel_direction_hysteresis_pct: 0.5  # 仮の値: 段3b の実機で 0.5% 保持が効いた実績から。実機比較で決める
 
 # ── 制御周期 ─────────────────────────────────────────────────────────
 control:

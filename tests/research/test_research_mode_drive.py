@@ -76,7 +76,9 @@ class FakeFF:
     def __init__(self) -> None:
         self.calls = 0
 
-    def predict_effort(self, v0: float, future: list[float], past: list[float]) -> float:
+    def predict_effort(
+        self, v0: float, future: list[float], past: list[float], **_select: float
+    ) -> float:
         self.calls += 1
         if v0 <= 0.02 and future[0] <= 0.02:
             return -HOLD_PCT
@@ -140,13 +142,6 @@ def test_governor_disabled_passes_through() -> None:
         assert (brake, active) == (40.0, False)
     assert gov.decel_kmhs == pytest.approx(3.0 / 0.05)
     assert gov.limit_kmhs == pytest.approx(0.4 * G_TO_KMHS * 0.98)
-
-
-def test_arbiter_options_are_rejected(tmp_path: Path) -> None:
-    cfg = _tmp_cfg(tmp_path)
-    cfg.arbiter.enable_rate_limit = True
-    with pytest.raises(cfgmod.ConfigError, match="enable_rate_limit"):
-        mdmod.require_simple_arbiter(cfg)
 
 
 def test_segment_at_uses_bounds() -> None:
@@ -958,3 +953,65 @@ def test_ff_inputs_stop_regime_feeds_into_stop_brake_hold() -> None:
     v0, future, past = run._ff_inputs(t, ref, speed)  # noqa: SLF001
 
     assert ff.predict_effort(v0, future, past) == pytest.approx(-HOLD_PCT)
+
+
+def test_select_kwargs_point_is_empty_and_window_uses_L_and_H() -> None:
+    """ペダル選択の方式（20260929 段3）: point は何も渡さず、window は G と ref(t+L)を渡す。"""
+    from tests.research.pedal_select import window_slope_kmhs  # noqa: PLC0415
+
+    run = _bare_mode_run(_FakeCandidate())
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    run.cfg = cfg  # type: ignore[attr-defined]
+    cfg.feedforward.pedal_select_mode = "point"
+    cfg.feedforward.reach_horizons_s = [0.5]  # 到達判定が選択を担う間は point でも何も渡さない
+    assert run._select_kwargs(4.0, 40.0) == {}  # noqa: SLF001
+    cfg.feedforward.reach_horizons_s = []
+
+    cfg.feedforward.pedal_select_mode = "window"
+    cfg.feedforward.pedal_select_center_s = 0.5
+    cfg.feedforward.pedal_select_width_s = 3.0
+    kwargs = run._select_kwargs(4.0, 40.0)  # noqa: SLF001
+    expected_g = window_slope_kmhs(run.ref.at, 4.0, 0.5, 3.0)
+    assert kwargs["select_accel_kmhs"] == pytest.approx(expected_g)
+    assert kwargs["select_speed_kmh"] == pytest.approx(run.ref.at(4.5))
+
+
+def test_select_kwargs_point_uses_pedal_select_point_s_independent_of_h1() -> None:
+    """point の先読み（pedal_select_point_s）だけでペダル選択の傾きが決まる（20260930）。
+
+    hp=1.0 は FF の入力の h1 点（future の 1.0s 先）から作る従来の desired_accel と完全一致。
+    """
+    run = _bare_mode_run(_FakeCandidate())
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    run.cfg = cfg  # type: ignore[attr-defined]
+    cfg.feedforward.pedal_select_mode = "point"
+    cfg.feedforward.reach_horizons_s = []
+    t, speed = 4.0, 55.0
+    ref = run.ref.at(t)
+    v0, future, _ = run._ff_inputs(t, ref, speed)  # noqa: SLF001
+    h1_point = future[list(_FakeCandidate.horizons).index(1.0)]
+    assert h1_point == run.ref.at(t + 1.0)
+
+    cfg.feedforward.pedal_select_point_s = 1.0
+    kwargs = run._select_kwargs(t, v0)  # noqa: SLF001
+    assert set(kwargs) == {"select_accel_kmhs"}  # 惰行加速度は v0 のまま（速度は渡さない）
+    assert kwargs["select_accel_kmhs"] == (h1_point - v0) / 1.0  # 浮動小数まで一致
+
+    cfg.feedforward.pedal_select_point_s = 2.0
+    kwargs = run._select_kwargs(t, v0)  # noqa: SLF001
+    assert kwargs["select_accel_kmhs"] == pytest.approx((run.ref.at(t + 2.0) - v0) / 2.0)
+
+
+def test_select_kwargs_point_c4_uses_reference_delta() -> None:
+    """C4 は v0 が実車速。FF の dv は ref(t+h) − ref(t) なので選択も同じ基準にする。"""
+    run = _bare_mode_run(_FakeC4())
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    run.cfg = cfg  # type: ignore[attr-defined]
+    cfg.feedforward.pedal_select_mode = "point"
+    cfg.feedforward.reach_horizons_s = []
+    cfg.feedforward.pedal_select_point_s = 2.0
+    t, speed = 4.0, 55.0
+    kwargs = run._select_kwargs(t, speed)  # noqa: SLF001
+    assert kwargs["select_accel_kmhs"] == pytest.approx(
+        (run.ref.at(t + 2.0) - run.ref.at(t)) / 2.0
+    )

@@ -368,7 +368,13 @@ class CandidateFeedforward(FeedforwardModel):
         self._research = research
 
     def predict_effort(
-        self, v0: float, future_speeds: Sequence[float], past_speeds: Sequence[float]
+        self,
+        v0: float,
+        future_speeds: Sequence[float],
+        past_speeds: Sequence[float],
+        *,
+        select_accel_kmhs: float | None = None,
+        select_speed_kmh: float | None = None,
     ) -> float:
         """C1 の符号付き努力量 [%]（正: 名目アクセル開度、負: 名目ブレーキ開度）。
 
@@ -384,6 +390,12 @@ class CandidateFeedforward(FeedforwardModel):
         3. 開度の計算式は段3 の有無で変えない（`desired_accel` を使う 1.0s 1 点の値のまま
            `_accel_opening`/`_brake_effort` へ渡す）
         4. B3 選んだペダルの開度を不感帯以上に切り上げる
+
+        ペダル選択の差し替え（ProblemReport_20260929 段3）: `select_accel_kmhs`（窓の傾き G）と
+        `select_speed_kmh`（惰行加速度を評価する速度 = ref(t+L)）が渡されたときだけ、2. の
+        「惰行／アクセル／ブレーキ」の判定に使う要求加速度と惰行加速度を差し替える。開度の計算
+        （モデル予測・`_brake_effort` の desired_accel/coast）は一切変えない。None（既定）なら
+        従来と完全に同じ。`reach_horizons_s`（段3 到達可能性）と併用すると ValueError。
         """
         if self._accel_model is None or self._brake_model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
@@ -420,6 +432,11 @@ class CandidateFeedforward(FeedforwardModel):
         #    -coast_decel_at(v0)（段1で作った単一ソース）。旧「クリープ任せ」分岐はこの帯に
         #    吸収した（`coast_band_kmhs` 既定 0.0 なら帯は無効）
         coast = free_accel_at(p, self._research, v0)
+        use_select = select_accel_kmhs is not None or select_speed_kmh is not None
+        if use_select and self._research.reach_horizons_s:
+            raise ValueError(
+                "select_accel_kmhs/select_speed_kmh は reach_horizons_s と併用できません"
+            )
         if self._research.reach_horizons_s:
             # 段3: 惰行のまま進んだ先の速度 v_free(t+h) と基準を各ホライズンで比べる
             # （coast を 1 秒一定とみなす近似をやめ、ホライズンも 1 点から複数へ）。
@@ -433,9 +450,16 @@ class CandidateFeedforward(FeedforwardModel):
             want_accel = needs[decisive] >= 0.0
         else:
             # 3. 惰行レジーム: 要求が惰行の ±帯 内なら、どちらのペダルも使わない（待機位置）
-            if abs(desired_accel - coast) < self._research.coast_band_kmhs:
+            # ペダル選択だけを差し替える（窓の傾き G と ref(t+L) での惰行加速度）。開度側の
+            # desired_accel・coast は変えない。速度は v0 と同じ学習域クリップを掛ける
+            sel_accel = desired_accel if select_accel_kmhs is None else select_accel_kmhs
+            sel_coast = coast
+            if select_speed_kmh is not None:
+                sel_v = select_speed_kmh if cm is None else min(select_speed_kmh, cm)
+                sel_coast = free_accel_at(p, self._research, sel_v)
+            if abs(sel_accel - sel_coast) < self._research.coast_band_kmhs:
                 return 0.0
-            want_accel = desired_accel >= coast
+            want_accel = sel_accel >= sel_coast
 
         accel_row = build_feature_row(
             v0,

@@ -88,6 +88,17 @@ class FeedforwardSection:
     # 先読み車速（最短ホライズン=0.5s 先の基準）がこの値以下のときだけ下限を掛ける [km/h]
     # （人が決める値・自動保存の対象外）
     brake_trim_ref_kmh: float = 0.3
+    # ペダル選択を「区間の傾き G」で行うための窓（ProblemReport_20260929 段1）。G は基準車速の
+    # 「今から L 秒先」を中心にした幅 H 秒の区間の最小二乗の傾き。
+    # L: 窓の中心（今から何秒先か）[s]。段2 以降は手順2 で自動保存
+    pedal_select_center_s: float = 0.5
+    # H: 窓の幅 [s]。手で決める値（自動保存の対象外）
+    pedal_select_width_s: float = 3.0
+    # ペダル選択の方式（段3）: point＝今までどおり 1 点の傾き / window＝窓の傾き G
+    pedal_select_mode: str = "point"
+    # point の先読み [s]。ペダル選択だけに使う（モデルの h1＝features.h1_s とは別。
+    # 1.0 で従来と同じ）
+    pedal_select_point_s: float = 1.0
     pedal_gain_speeds_kmh: list[float] = field(default_factory=list)
     accel_gain_kmhs_per_pct: list[float] = field(default_factory=list)
     brake_gain_kmhs_per_pct: list[float] = field(default_factory=list)
@@ -131,6 +142,18 @@ class ArbiterSection:
     accel_reengage_dwell_s: float = 0.3
     accel_release_rate_pct_s: float = 10.0
     accel_min_step_pct: float = 0.2
+    # 段3: 本番の調停にある残りの機能。1 つずつ有効化して実機で試す（pedal_arbiter.py）
+    enable_min_step: bool = False  # 微小変化の保持（accel_min_step_pct）
+    enable_reengage_dwell: bool = False  # ブレーキ後の再踏込ディレイ（accel_reengage_dwell_s）
+    enable_release_rate: bool = False  # 惰行でのアクセル解放レート（accel_release_rate_pct_s）
+    # 段3c/3d（ProblemReport_20260921 6-15）: 研究専用（src の調停にはない）
+    enable_accel_band: bool = False  # 加速度帯の保持（計画加速度が帯の中ならアクセル開度を保つ）
+    accel_band_horizon_s: float = 3.0  # 計画加速度＝基準 0〜H 秒先の直線近似の傾きの H [s]
+    accel_band_kmhs: float = 0.25  # 前回動かした時の計画加速度からの半幅 [km/h/s]
+    accel_band_dev_escape_kmh: float = 0.3  # 前回動かした時からの偏差変化がこれ超で追従 [km/h]
+    accel_band_open_escape_pct: float = 2.0  # 保持中の開度と要求開度の差がこれ以上で追従 [%]
+    enable_direction_hysteresis: bool = False  # 向きのヒステリシス（逆向きは w% 戻る時だけ追従）
+    accel_direction_hysteresis_pct: float = 0.5  # 逆向きに変える時に要る動き w [%]
 
 
 @dataclass
@@ -742,6 +765,26 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         0.0 <= ff.coast_band_kmhs < 5.0,
         f"feedforward.coast_band_kmhs が範囲外(0<=帯<5.0): {ff.coast_band_kmhs}",
     )
+    need(
+        0.0 < ff.pedal_select_center_s <= 2.0,
+        f"feedforward.pedal_select_center_s が範囲外(0<L<=2.0): {ff.pedal_select_center_s}",
+    )
+    need(
+        2.0 <= ff.pedal_select_width_s <= 6.0,
+        f"feedforward.pedal_select_width_s が範囲外(2<=H<=6): {ff.pedal_select_width_s}",
+    )
+    need(
+        ff.pedal_select_mode in ("point", "window"),
+        f"feedforward.pedal_select_mode は point か window: {ff.pedal_select_mode!r}",
+    )
+    need(
+        0.0 < ff.pedal_select_point_s <= 3.0,
+        f"feedforward.pedal_select_point_s が範囲外(0<x<=3.0): {ff.pedal_select_point_s}",
+    )
+    need(
+        not (ff.pedal_select_mode == "window" and ff.reach_horizons_s),
+        "feedforward.pedal_select_mode: window は reach_horizons_s と併用できません",
+    )
     # 段3（到達可能性判定）: ホライズンは正値・昇順（狭義単調増加）。空リストは段3 無効として合格
     need(
         all(h > 0.0 for h in ff.reach_horizons_s),
@@ -792,6 +835,14 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(a.accel_reengage_dwell_s >= 0.0, "arbiter.accel_reengage_dwell_s は 0 以上")
     need(a.accel_release_rate_pct_s > 0.0, "arbiter.accel_release_rate_pct_s は正値")
     need(a.accel_min_step_pct >= 0.0, "arbiter.accel_min_step_pct は 0 以上")
+    need(a.accel_band_horizon_s > 0.0, "arbiter.accel_band_horizon_s は正値")
+    need(a.accel_band_kmhs > 0.0, "arbiter.accel_band_kmhs は正値")
+    need(a.accel_band_dev_escape_kmh > 0.0, "arbiter.accel_band_dev_escape_kmh は正値")
+    need(a.accel_band_open_escape_pct > 0.0, "arbiter.accel_band_open_escape_pct は正値")
+    need(
+        a.accel_direction_hysteresis_pct > 0.0,
+        "arbiter.accel_direction_hysteresis_pct は正値",
+    )
 
     c = cfg.control
     need(c.loop_interval_ms > 0, "control.loop_interval_ms は正値")

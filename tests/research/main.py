@@ -73,6 +73,7 @@ from tests.research.learning_patterns import LearningDataError
 from tests.research.mode_drive import ModeDriveSetup, load_mode, prepare_mode_drive, run_mode_drive
 from tests.research.mode_report import RunInfo, rows_from_samples, write_mode_report
 from tests.research.pattern_drive import DriveError, build_ff_model, run_pattern_drive
+from tests.research.pedal_arbiter import enabled_arbiter_features
 from tests.research.pedal_search import run_pedal_search
 from tests.research.pre_drive_check import PHASE_PRE_CHECK, run_pre_drive_check
 from tests.research.term import banner, display_width, say
@@ -249,16 +250,8 @@ def _print_summary(cfg: ResearchConfig) -> None:
 
 
 def _arbiter_summary(cfg: ResearchConfig) -> str:
-    enabled = [
-        name
-        for name, on in (
-            ("不感帯補償", cfg.arbiter.enable_deadband_compensation),
-            ("レートリミット", cfg.arbiter.enable_rate_limit),
-            ("ヒステリシス", cfg.arbiter.enable_hysteresis),
-        )
-        if on
-    ]
-    return " + ".join(enabled) if enabled else "すべて無効（第1段階）"
+    enabled = enabled_arbiter_features(cfg.arbiter)
+    return " + ".join(enabled) if enabled else "すべて無効（符号で振り分けのみ）"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -402,7 +395,7 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
     info = RunInfo(
         label="FF",
         title="手順 3: FF のみでモード走行",
-        controller="FF のみ（Kp=Ki=Kd=0）→ effort の符号でアクセル/ブレーキに振り分け",
+        controller=f"FF のみ（Kp=Ki=Kd=0）→ 調停: {_arbiter_summary(ctx.config)}",
         csv_path=log.csv_path,
         hw_mode=hw.hw_mode,
         mode_name=result.mode_name,
