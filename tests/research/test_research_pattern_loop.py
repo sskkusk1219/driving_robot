@@ -9,7 +9,7 @@
 
 2026-09-25 段4: ACCEL_SWEEP・BRAKE_HOLD・CRUISE_TRIM・各階段パターンは削除した。ここでは残った
 COAST_DOWN・クリープ発進（ブレーキ保持は BRAKE_HOLD フェーズ）で同じ機構（ガバナー・停車復帰・
-ランプ・安全網）を確かめる。格子ステップ走行は test_research_pattern_loop_grid.py。
+ランプ・安全網）を確かめる。G ランプ走行は test_research_pattern_loop_ramp.py。
 """
 
 from __future__ import annotations
@@ -334,7 +334,8 @@ def test_coast_accel_defaults_match_decel_stop_section() -> None:
 
 
 def test_brake_ramp_starts_from_opening_at_phase_entry() -> None:
-    loop, *_ = _loop([_pattern(PatternKind.COAST_DOWN, accel=70.0, brake=15.0)])
+    # コーストダウン以外（徐々に踏むのはコーストダウンだけ。2026-10-08 段2l-6b）
+    loop, *_ = _loop([_pattern(PatternKind.CREEP, brake=15.0)])
     loop._current_brake_opening = 15.0  # BRAKE_HOLD（クリープ域ブレーキ保持）で保持していた開度
     loop._enter_phase(_Phase.DRIVE_BRAKE, 10.0)
     pattern = loop._patterns[0]
@@ -357,8 +358,14 @@ def test_driving_patterns_end_with_stop_return(phase: _Phase) -> None:
     # 保持・惰行が終わっても車速が残っていれば、次へ進まず停車復帰に入る
     loop._advance(patterns[0], 40.0, 0.0, 2.0)
     assert (loop._pattern_idx, loop._phase) == (0, _Phase.DRIVE_BRAKE)
-    # 停車したら次のパターンへ
+    # 停車しても、停車保持開度に届くまで（徐々に踏む。段2l-6b）は次へ進まない
+    loop._command_openings(patterns[0], 3.0)
     loop._advance(patterns[0], 0.0, 0.0, 3.0)
+    assert (loop._pattern_idx, loop._phase) == (0, _Phase.DRIVE_BRAKE)
+    # 届いたら次のパターンへ
+    t_reach = 3.0 + loop._stop_return_brake_pct / loop._stop_return_press_rate_pctps() + 1.0
+    loop._command_openings(patterns[0], t_reach)
+    loop._advance(patterns[0], 0.0, 0.0, t_reach)
     assert (loop._pattern_idx, loop._phase) == (1, _Phase.DRIVE_ACCEL)
 
 
@@ -619,8 +626,9 @@ async def test_stop_return_timeout_aborts_with_reason() -> None:
 
 
 async def test_loop_completes_after_stop_return() -> None:
+    # calib_dwell_s を小さくして、停車保持開度まで徐々に踏む時間を短くする（段2l-6b）
     config = PatternLoopConfig(accel_full_range_timeout_s=0.1, coast_timeout_s=0.1,
-                               accel_ramp_time_s=0.0)
+                               accel_ramp_time_s=0.0, calib_dwell_s=0.01)
     loop, rec, can, *_ = _loop(
         [_pattern(PatternKind.COAST_DOWN, accel=30.0)], speed_kmh=50.0, config=config
     )
@@ -730,26 +738,35 @@ def test_pattern_loop_protocol_includes_alarm() -> None:
     assert hasattr(hwmod.StubActuator, "is_alarm_active")
 
 
-# ── G 校正（段6a・門①）: G 比例加速 → 0.2G 狙いのブレーキ減速 ──────────────
+# ── 高い車速からの停車復帰の G 比例ブレーキ（段6a・6b。DRIVE_BRAKE の `_db_gprop`） ──
 
 
 def _calib_loop(
     config: PatternLoopConfig | None = None,
 ) -> tuple[PatternLoop, LearningPattern]:
-    loop, *_ = _loop([_pattern(PatternKind.G_CALIB, accel=70.0)], config=config)
+    loop, *_ = _loop([_pattern(PatternKind.COAST_DOWN, accel=70.0)], config=config)
     return loop, loop._patterns[0]
+
+
+def _enter_gprop_brake(loop: PatternLoop, speed_kmh: float) -> None:
+    """高い車速から停車復帰（DRIVE_BRAKE）に入る。G 比例ブレーキ（`_db_gprop`）になる。"""
+    loop._last_speed = speed_kmh
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 0.0)
+    assert loop._db_gprop
 
 
 def _brake_plant(loop: PatternLoop, pattern: LearningPattern, *, v0: float, t_end: float,
                  gain_g_per_pct: float = 0.0085, coast_g: float = 0.05) -> tuple[float, float]:
-    """CALIB_BRAKE を 0.1s 周期で流す。減速 = 惰行 + 感度 ×（不感帯からの踏み込み）。
+    """G 比例ブレーキの停車復帰（DRIVE_BRAKE・`_db_gprop`）を 0.1s 周期で流す。
+
+    減速 = 惰行 + 感度 ×（不感帯からの踏み込み）。
 
     戻り値は (最大減速 [G], 終了時刻)。車速が下がるほどブレーキが効かなくなる素朴なプラント
     （効き = gain × v/25。実機の 25 km/h で 0.3・65 km/h で約 1.1 km/h/s/% に近い）。
     """
     db = loop._profile.feedforward_params.brake_deadband_pct
     v, t, peak = v0, 0.0, 0.0
-    while t < t_end and loop._phase is _Phase.CALIB_BRAKE:
+    while t < t_end and loop._db_gprop:
         brake = loop._command_openings(pattern, t)[1]
         loop._current_brake_opening = brake
         g = coast_g + gain_g_per_pct * (v / 25.0) * max(0.0, brake - db)
@@ -760,19 +777,11 @@ def _brake_plant(loop: PatternLoop, pattern: LearningPattern, *, v0: float, t_en
     return peak, t
 
 
-def test_calib_drive_accel_ends_in_calib_brake_not_coast() -> None:
-    loop, pattern = _calib_loop()
-    loop._enter_phase(_Phase.DRIVE_ACCEL, 0.0)
-    _feed(loop, pattern, 0.0, 5.0)
-    _feed(loop, pattern, 0.1, loop._accel_speed_cap + 0.1)
-    assert loop._phase is _Phase.CALIB_BRAKE
-
-
-def test_calib_brake_ramps_to_just_below_deadband_then_steps_toward_target_g() -> None:
+def test_gprop_brake_ramps_to_just_below_deadband_then_steps_toward_target_g() -> None:
     loop, pattern = _calib_loop()
     cfg = loop._config
     ff = loop._profile.feedforward_params
-    loop._enter_phase(_Phase.CALIB_BRAKE, 0.0)
+    _enter_gprop_brake(loop, 100.0)
     approach = min(
         loop._stop_return_brake_pct,
         max(0.0, ff.brake_deadband_pct - cfg.coast_accel_approach_margin_pct),
@@ -783,9 +792,9 @@ def test_calib_brake_ramps_to_just_below_deadband_then_steps_toward_target_g() -
     assert loop._command_openings(pattern, cfg.brake_ramp_time_s)[1] == pytest.approx(approach)
 
 
-def test_calib_brake_holds_near_target_g_and_never_exceeds_it_much() -> None:
+def test_gprop_brake_holds_near_target_g_and_never_exceeds_it_much() -> None:
     loop, pattern = _calib_loop()
-    loop._enter_phase(_Phase.CALIB_BRAKE, 0.0)
+    _enter_gprop_brake(loop, 120.0)
     peak, _ = _brake_plant(loop, pattern, v0=120.0, t_end=40.0)
     cfg = loop._config
     # 目標 0.2G。刻みが小さいので release_above_g（0.3G）どころか 0.25G も超えない
@@ -793,43 +802,21 @@ def test_calib_brake_holds_near_target_g_and_never_exceeds_it_much() -> None:
     assert peak > cfg.coast_accel_target_g - 0.05
 
 
-def test_calib_brake_records_opening_and_decel_points_into_the_map() -> None:
+def test_gprop_brake_records_opening_and_decel_points_into_the_map() -> None:
     loop, pattern = _calib_loop()
-    loop._enter_phase(_Phase.CALIB_BRAKE, 0.0)
+    _enter_gprop_brake(loop, 120.0)
     for v in range(5, 130, 10):  # 手順2 ではこの前に走るコーストダウンが惰行の減速を測っている
         loop.glimit.add_coast(float(v), 0.05 * G_TO_KMHS)
     _brake_plant(loop, pattern, v0=120.0, t_end=40.0)
     assert loop.glimit.has_data("brake")
     ff = loop._profile.feedforward_params
     cap = loop.glimit.cap_pct(
-        "brake", 60.0, loop._config.g_cap_g * G_TO_KMHS, ff.brake_deadband_pct
+        "brake", 60.0, 0.3 * G_TO_KMHS, ff.brake_deadband_pct
     )
     assert cap is not None and cap > ff.brake_deadband_pct
     # プラントは開度に線形（感度 0.0085G/% × v/25）なので割線の外挿が当たる。
     # 60〜70 km/h の帯（平均 約 65 km/h）で惰行 0.05G → 0.3G に届く開度 = 不感帯 + 0.25 / 0.0221
     assert cap == pytest.approx(ff.brake_deadband_pct + 0.25 / (0.0085 * 65.0 / 25.0), rel=0.3)
-
-
-def test_calib_brake_finishes_pattern_at_low_speed_and_reports_table() -> None:
-    lines: list[str] = []
-    loop, pattern = _calib_loop()
-    loop._on_calib_done = lines.extend
-    loop._enter_phase(_Phase.CALIB_BRAKE, 0.0)
-    _brake_plant(loop, pattern, v0=60.0, t_end=60.0)
-    assert loop._phase is not _Phase.CALIB_BRAKE  # 5 km/h 以下で終わり、停車復帰へ
-    assert loop._pattern_idx == 0 or lines  # パターンが進んだときだけ表が出る
-    loop._advance_pattern(100.0)
-    assert lines and lines[0].startswith("車速帯")
-
-
-def test_calib_brake_uses_brake_governor_and_step_move_time() -> None:
-    loop, pattern = _calib_loop()
-    loop._enter_phase(_Phase.CALIB_BRAKE, 0.0)
-    assert loop._move_duration() == loop._config.pedal_step_time_s
-    loop._current_brake_opening = 12.0
-    loop._brake_request = 12.0
-    loop._update_governor(-(loop._g_limit_kmhs + 1.0))  # 上限を超える減速
-    assert loop._brake_gov_cap == pytest.approx(12.0)
 
 
 def test_coast_phase_feeds_coast_decel_after_the_measure_delay() -> None:
@@ -960,13 +947,22 @@ def test_stop_return_from_speed_is_g_proportional_not_a_jump_to_the_hold_opening
     assert brake < loop._stop_return_brake_pct
 
 
-def test_stop_return_from_creep_speed_keeps_the_old_ramp() -> None:
-    loop, pattern = _calib_loop()
+def test_stop_return_from_creep_speed_keeps_the_old_ramp_for_non_coast_patterns() -> None:
+    """G ランプなどコーストダウン以外は従来どおり brake_ramp_time_s のランプ・停車で即前進。"""
+    p = plmod.GRampPattern(PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0,
+                           hold_duration_s=0.0, target_g=0.1, top_kmh=60.0)
+    loop, *_ = _loop([p, _pattern(PatternKind.COAST_DOWN, accel=30.0)])
+    pattern = loop._patterns[0]
     loop._last_speed = 4.0
     loop._enter_phase(_Phase.DRIVE_BRAKE, 0.0)
-    assert not loop._db_gprop
+    assert not loop._db_gprop and not loop._db_creep_press
     brake = loop._command_openings(pattern, loop._config.brake_ramp_time_s)[1]
     assert brake == pytest.approx(loop._stop_return_brake_pct)
+    # 停車したら、停車保持開度に届く前でも次へ進む
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 10.0)
+    loop._command_openings(pattern, 10.0)
+    loop._advance(pattern, 0.0, 0.0, 10.0)
+    assert loop._pattern_idx == 1
 
 
 def test_stop_return_gprop_starts_from_the_calibrated_opening_and_hands_over_at_low_speed() -> None:
@@ -986,10 +982,239 @@ def test_stop_return_gprop_starts_from_the_calibrated_opening_and_hands_over_at_
     assert not loop._db_gprop
     assert loop._brake_ramp_from == pytest.approx(12.0)
     assert loop._command_openings(pattern, t + 5.0)[1] == pytest.approx(12.0)
-    end = loop._command_openings(pattern, t + 5.0 + loop._config.brake_ramp_time_s)[1]
+    assert loop._db_creep_press  # コーストダウンなので徐々に踏む（段2l-6b）
+    rate = loop._stop_return_press_rate_pctps()
+    one_s = loop._command_openings(pattern, t + 6.0)[1]
+    assert one_s == pytest.approx(12.0 + rate)
+    end = loop._command_openings(pattern, t + 5.0 + 100.0)[1]
     assert end == pytest.approx(loop._stop_return_brake_pct)
 
 
 def test_step_ramp_and_predictive_lead_defaults_are_documented_values() -> None:
     c = PatternLoopConfig()
     assert (c.gov_lead_s, c.gov_soft_frac) == (0.6, 0.85)
+
+
+# ── 使わない側のペダルを待機位置（min）に置く（2026-10-07 段2l-4、段2l-6 で min そのものに）──
+
+
+async def _one_cycle_openings(
+    phase: _Phase, *, standby: bool, speed_kmh: float = 50.0,
+    pattern: LearningPattern | None = None, launch_done: bool = False,
+) -> tuple[float, float]:
+    """phase に入れて 1 周期だけ走らせ、記録された (アクセル, ブレーキ) 指令開度を返す。
+
+    launch_done=True は G ランプの発進の段階を終えた状態（ブレーキが min に着いた後）にする。"""
+    pat = pattern or _pattern(PatternKind.COAST_DOWN, accel=30.0)
+    config = PatternLoopConfig(pedal_standby=standby, accel_ramp_time_s=0.0,
+                               brake_ramp_time_s=0.0)
+    loop, rec, *_ = _loop([pat], speed_kmh=speed_kmh, config=config)
+    loop._running = True
+    loop._enter_phase(phase, asyncio.get_running_loop().time())
+    if launch_done:
+        loop._rp_launch = False
+    await loop._execute_one_cycle()
+    data = rec.rows[-1][0]
+    return data.accel_opening, data.brake_opening
+
+
+def _standby() -> tuple[float, float]:
+    """待機位置 ＝ ペダルに触れた位置 min（プロファイルの名前は不感帯のまま）。"""
+    ff = build_vehicle_profile(cfgmod.load_config(CFG_PATH)).feedforward_params
+    return ff.accel_deadband_pct, ff.brake_deadband_pct
+
+
+async def test_coast_command_is_standby_on_both_pedals() -> None:
+    a, b = await _one_cycle_openings(_Phase.COAST, standby=True)
+    sa, sb = _standby()
+    assert (a, b) == (pytest.approx(sa), pytest.approx(sb))
+    assert sa > 0.0 and sb > 0.0
+
+
+async def test_brake_command_during_accel_is_standby() -> None:
+    a, b = await _one_cycle_openings(_Phase.DRIVE_ACCEL, standby=True)
+    assert b == pytest.approx(_standby()[1])
+    assert a >= _standby()[0]
+
+
+async def test_ramp_up_brake_command_is_standby_after_the_launch_stage() -> None:
+    p = plmod.GRampPattern(PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0,
+                           hold_duration_s=0.0, target_g=0.1, top_kmh=60.0)
+    a, b = await _one_cycle_openings(
+        _Phase.RAMP_UP, standby=True, speed_kmh=20.0, pattern=p, launch_done=True
+    )
+    assert b == pytest.approx(_standby()[1])
+    assert a >= _standby()[0]
+
+
+async def test_ramp_up_launch_stage_holds_the_brake_and_keeps_accel_at_standby() -> None:
+    """発進の段階: ブレーキは止まった開度（stop_confirm_pct）から始め、アクセルは min。"""
+    p = plmod.GRampPattern(PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0,
+                           hold_duration_s=0.0, target_g=0.1, top_kmh=60.0)
+    config = PatternLoopConfig(pedal_standby=True, stop_confirm_pct=12.0, brake_ramp_time_s=0.0)
+    loop, rec, *_ = _loop([p], speed_kmh=0.0, config=config)
+    loop._running = True
+    loop._enter_phase(_Phase.RAMP_UP, asyncio.get_running_loop().time())
+    await loop._execute_one_cycle()
+    data = rec.rows[-1][0]
+    assert data.brake_opening == pytest.approx(12.0)
+    assert data.accel_opening == pytest.approx(_standby()[0])
+
+
+async def test_accel_command_during_stop_hold_is_standby() -> None:
+    pat = _pattern(PatternKind.COAST_DOWN, accel=30.0, brake=15.0)
+    a, b = await _one_cycle_openings(_Phase.BRAKE_HOLD, standby=True, speed_kmh=0.0, pattern=pat)
+    assert a == pytest.approx(_standby()[0])
+    assert b >= _standby()[1]
+
+
+async def test_creep_launch_command_is_standby_on_both_pedals() -> None:
+    a, b = await _one_cycle_openings(
+        _Phase.CREEP_LAUNCH, standby=True, speed_kmh=0.0, pattern=_creep_launch()
+    )
+    assert (a, b) == (pytest.approx(_standby()[0]), pytest.approx(_standby()[1]))
+
+
+async def test_no_standby_keeps_the_unused_pedals_at_zero() -> None:
+    assert await _one_cycle_openings(_Phase.COAST, standby=False) == (0.0, 0.0)
+    a, b = await _one_cycle_openings(_Phase.DRIVE_ACCEL, standby=False)
+    assert b == 0.0
+
+
+async def test_standby_is_output_only_internal_opening_stays_unfloored() -> None:
+    config = PatternLoopConfig(pedal_standby=True)
+    loop, rec, *_ = _loop([_pattern(PatternKind.COAST_DOWN, accel=30.0)], speed_kmh=50.0,
+                          config=config)
+    loop._running = True
+    loop._enter_phase(_Phase.COAST, asyncio.get_running_loop().time())
+    await loop._execute_one_cycle()
+    assert loop._current_accel_opening == 0.0 and loop._current_brake_opening == 0.0
+    assert rec.rows[-1][0].accel_opening > 0.0
+
+
+def test_standby_margin_pct_is_gone_from_the_loop_config() -> None:
+    assert not hasattr(PatternLoopConfig(), "standby_margin_pct")
+    assert PatternLoopConfig().pedal_standby is False
+    assert PatternLoopConfig().stop_confirm_pct is None
+
+
+# ── コーストダウンの上端（2026-10-07 段2l-4）────────────────────────────────
+
+
+def test_top_speed_cap_lowers_the_coast_accel_speed_cap() -> None:
+    loop, *_ = _loop([_pattern(PatternKind.COAST_DOWN, accel=30.0)],
+                     config=PatternLoopConfig(top_speed_cap_kmh=100.0))
+    assert loop._accel_speed_cap == pytest.approx(100.0)
+
+
+def test_top_speed_cap_above_the_vehicle_limit_is_ignored_and_none_is_unchanged() -> None:
+    plain, *_ = _loop([_pattern(PatternKind.COAST_DOWN, accel=30.0)])
+    high, *_ = _loop([_pattern(PatternKind.COAST_DOWN, accel=30.0)],
+                     config=PatternLoopConfig(top_speed_cap_kmh=9999.0))
+    assert plain._accel_speed_cap == pytest.approx(high._accel_speed_cap)
+
+
+def test_coast_accel_ends_near_the_top_speed_cap() -> None:
+    loop, *_ = _loop([_pattern(PatternKind.COAST_DOWN, accel=30.0)],
+                     config=PatternLoopConfig(top_speed_cap_kmh=100.0))
+    pattern = loop._patterns[0]
+    loop._enter_phase(_Phase.DRIVE_ACCEL, 0.0)
+    _feed(loop, pattern, 0.0, 99.0)
+    assert loop._phase is _Phase.DRIVE_ACCEL
+    _feed(loop, pattern, 0.1, 100.1)
+    assert loop._phase is _Phase.COAST
+
+
+# ── コーストダウンの停車復帰: クリープ域は停車保持開度まで徐々に踏む（2026-10-08 段2l-6b） ──
+
+
+def _creep_press_loop(creep_kmh: float = 5.0) -> tuple[PatternLoop, LearningPattern]:
+    loop, pattern = _calib_loop()
+    loop._profile.feedforward_params.creep_speed_kmh = creep_kmh
+    return loop, pattern
+
+
+def test_creep_domain_stop_return_presses_monotonically_at_the_calib_step_rate() -> None:
+    loop, pattern = _creep_press_loop()
+    loop._last_speed = 3.0
+    loop._current_brake_opening = 4.0
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 0.0)
+    assert loop._db_creep_press and not loop._db_gprop
+    cfg = loop._config
+    rate = cfg.calib_step_mm * 100.0 * 100.0 / plmod.ACTUATOR_PULSE_MAX / cfg.calib_dwell_s
+    assert loop._stop_return_press_rate_pctps() == pytest.approx(rate)
+    prev, t = None, 0.0
+    while t < 60.0:
+        b = loop._command_openings(pattern, t)[1]
+        if prev is not None:
+            assert b >= prev - 1e-12  # 途中で下げない
+            assert b - prev <= rate * 0.1 + 1e-9  # 1 周期あたりの増分は速さ以下
+        prev, t = b, round(t + 0.1, 6)
+    assert prev == pytest.approx(loop._stop_return_brake_pct)
+    assert loop._command_openings(pattern, 0.0)[1] == pytest.approx(4.0)
+
+
+def test_creep_press_does_not_advance_until_the_hold_opening_is_reached() -> None:
+    loop, pattern = _creep_press_loop()
+    loop._last_speed = 0.0
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 0.0)
+    assert loop._db_creep_press
+    loop._command_openings(pattern, 5.0)
+    loop._advance(pattern, 0.0, 0.0, 5.0)  # 停車しているが、まだ踏み途中
+    assert (loop._pattern_idx, loop._phase) == (0, _Phase.DRIVE_BRAKE)
+    t_reach = loop._stop_return_brake_pct / loop._stop_return_press_rate_pctps()
+    loop._command_openings(pattern, t_reach + 0.1)
+    loop._advance(pattern, 0.0, 0.0, t_reach + 0.1)
+    assert loop._pattern_idx == 1 and loop._pending_abort is None
+
+
+def test_creep_press_timeout_counts_from_reaching_the_hold_opening() -> None:
+    loop, pattern = _creep_press_loop()
+    loop._config = PatternLoopConfig(brake_stop_timeout_s=10.0)
+    cfg = loop._config
+    loop._last_speed = 2.0
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 0.0)
+    t_reach = loop._stop_return_brake_pct / loop._stop_return_press_rate_pctps()
+    assert t_reach > cfg.brake_stop_timeout_s  # 踏み上げだけで時間切れ秒を超える
+    loop._command_openings(pattern, t_reach - 1.0)
+    loop._advance(pattern, 2.0, 0.0, t_reach - 1.0)  # 動いたまま。届く前は中断しない
+    assert loop._pending_abort is None
+    loop._command_openings(pattern, t_reach + 0.1)
+    loop._advance(pattern, 2.0, 0.0, t_reach + 0.1)  # 届いた時刻
+    assert loop._pending_abort is None
+    loop._command_openings(pattern, t_reach + 0.2 + cfg.brake_stop_timeout_s)
+    loop._advance(pattern, 2.0, 0.0, t_reach + 0.2 + cfg.brake_stop_timeout_s)
+    assert loop._pending_abort is not None and "停車しません" in loop._pending_abort
+
+
+def test_stop_return_boundary_follows_the_creep_speed_of_the_vehicle() -> None:
+    """クリープ車速 8.0 km/h の車では境目が 8.0 + 1.0 = 9.0 km/h。5 km/h 固定ではない。"""
+    loop, pattern = _creep_press_loop(creep_kmh=8.0)
+    assert loop._stop_return_low_speed_kmh() == pytest.approx(9.0)
+    loop._enter_phase(_Phase.COAST, 0.0)
+    loop._advance(pattern, 8.5, -1.0, 5.0)  # 8.5 は天井 9.0 以下
+    loop._last_speed = 8.5
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 5.0)
+    assert loop._db_creep_press and not loop._db_gprop  # G 比例ではなく徐々に踏む
+    loop._last_speed = 9.5
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 5.0)
+    assert loop._db_gprop and not loop._db_creep_press
+
+
+def test_overspeed_recovery_in_coast_down_keeps_the_old_behavior() -> None:
+    loop, pattern = _creep_press_loop()
+    loop._last_speed = 3.0
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 0.0, overspeed_recovery=True)
+    assert not loop._db_creep_press and not loop._db_gprop
+    assert loop._stop_return_low_speed_kmh() == loop._config.coast_down_stop_speed_kmh
+    brake = loop._command_openings(pattern, loop._config.brake_ramp_time_s)[1]
+    assert brake >= loop._config.overspeed_recovery_brake_pct - 1e-9
+
+
+def test_creep_press_falls_back_to_the_ramp_when_calib_dwell_is_not_positive() -> None:
+    loop, pattern = _calib_loop(PatternLoopConfig(calib_dwell_s=0.0))
+    loop._last_speed = 3.0
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 0.0)
+    assert not loop._db_creep_press
+    brake = loop._command_openings(pattern, loop._config.brake_ramp_time_s)[1]
+    assert brake == pytest.approx(loop._stop_return_brake_pct)

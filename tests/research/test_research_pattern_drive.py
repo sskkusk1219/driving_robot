@@ -8,13 +8,11 @@
 
 from __future__ import annotations
 
-import pickle
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pytest
 
 from tests.research import config as cfgmod
@@ -22,13 +20,11 @@ from tests.research import drive_log as dlmod
 from tests.research import hardware as hwmod
 from tests.research import main as mainmod
 from tests.research import pattern_drive as pdmod
-from tests.research.ff_model import MODEL_TYPE
 from tests.research.learning_patterns import COAST_DOWN_COUNT, LearningDataError
 from tests.research.live_plot import PlotSample, save_drive_figure
 from tests.research.pattern_loop import (
     CreepLaunchPattern,
-    GridLaunchPattern,
-    GridStationPattern,
+    GRampPattern,
     PatternLoopConfig,
 )
 from tests.research.pedal_search import PedalSearchResult
@@ -47,11 +43,13 @@ from tests.research.vehicle import (
     opening_to_pulse,
 )
 
-# 2-0 のペダル探索が終わった想定の結果（スタブの真の遊び 6%/8% に近い値）
+# ペダルに触れた位置 min（yaml の vehicle.min_*_opening_pct。スタブの真の遊び 6%/8% に近い値）。
+# 2026-10-08 段2l-6: 不感帯の測定をやめたので 2-0 の結果ではなく設定の値（_tmp_cfg で書く）
+MIN_ACCEL_PCT = 6.3
+MIN_BRAKE_PCT = 8.4
+# 2-0 のペダル探索が終わった想定の結果
 PEDAL = PedalSearchResult(
     creep_speed_kmh=5.0,
-    accel_deadband_pct=6.3,
-    brake_deadband_pct=8.4,
     stop_confirm_pct=12.0,
     stop_brake_opening_pct=22.0,
 )
@@ -79,16 +77,8 @@ SHORT_PATTERNS = [
 ]
 
 
-class _Stats:
-    """`wltp_grid.wltp_cell_stats` の結果と同じ形（速度 14 行 × 加速度 7 列）。"""
-
-    def __init__(self) -> None:
-        n_speed, n_accel = 14, 7
-        self.seconds = np.full((n_speed, n_accel), 9.0)
-        self.seconds[13] = 0.0  # 130〜140 は WLTP が無い
-        self.mean_accel = np.tile(np.array([-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0]), (n_speed, 1))
-        self.max_accel_by_speed = np.full(n_speed, 5.0)
-        self.min_accel_by_speed = np.full(n_speed, -5.0)
+# 段の (狙いの G, 上端の車速)。2 周目（0.08 の 2 本目）を含む実行順
+RAMP_ORDER = [(0.02, 100.0), (0.08, 90.0), (0.25, 60.0), (0.08, 90.0)]
 
 
 def _tmp_cfg(tmp_path: Path) -> cfgmod.ResearchConfig:
@@ -99,6 +89,11 @@ def _tmp_cfg(tmp_path: Path) -> cfgmod.ResearchConfig:
             "output.results_dir": str(tmp_path / "results"),
             "feedforward.model_path": str(tmp_path / "results" / "models" / "ff.pkl"),
             "output.plot": False,
+            # 段2l-6 から手順2 の対象は C7・C8 だけ（C1〜C5 は ConfigError）。C7 に固定
+            # （既定 yaml は C7/C8 のこともある）
+            "feedforward.candidate": "C7",
+            "vehicle.min_accel_opening_pct": MIN_ACCEL_PCT,
+            "vehicle.min_brake_opening_pct": MIN_BRAKE_PCT,
             # 走行後の緩減速を短くする（判定ロジックは既定と同じ）
             "decel_stop.step_mm": 1.0,
             "decel_stop.dwell_s": 0.2,
@@ -191,112 +186,98 @@ def test_build_vehicle_profile_maps_yaml() -> None:
     assert profile.max_speed == cfg.vehicle.max_speed_kmh
     assert profile.max_decel_g == cfg.vehicle.max_decel_g
     ffp = profile.feedforward_params
-    assert ffp.stop_brake_opening_pct == cfg.feedforward.stop_brake_opening_pct
-    assert ffp.brake_deadband_pct == cfg.feedforward.brake_deadband_pct
+    assert ffp.stop_brake_opening_pct == cfg.stop_brake_opening_pct
+    # 2026-10-08 段2l-6: 名前は不感帯のまま、値は u の原点 min
+    assert ffp.brake_deadband_pct == cfg.vehicle.min_brake_opening_pct
+    assert ffp.accel_deadband_pct == cfg.vehicle.min_accel_opening_pct
 
 
 def _profile(cfg: cfgmod.ResearchConfig) -> Any:
     return PEDAL.apply_to_profile(build_vehicle_profile(cfg))
 
 
-def test_build_patterns_layout_is_coast_grid_creep_launch_creep_hold() -> None:
-    """段4・段6a: コーストダウン → G 校正 → 格子ステップ走行（ステーション → 発進・停車）
-    → クリープ発進 → クリープ域ブレーキ保持。旧パターン（ACCEL_SWEEP など）は無い。"""
+def test_build_patterns_layout_is_coast_then_ramps_only() -> None:
+    """段2l-6: コーストダウン → G ランプ（実行順どおり）だけ。クリープ域ブレーキ保持・
+    クリープ発進・格子ステップ・発進停車・G 校正・通し掃引は入らない。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
-    patterns = pdmod.build_patterns(cfg, _profile(cfg), _Stats())
-    lr = cfg.learning
+    patterns = pdmod.build_patterns(cfg, _profile(cfg), RAMP_ORDER)
 
-    coast = [p for p in patterns if p.kind is PatternKind.COAST_DOWN]
-    stations = [p for p in patterns if isinstance(p, GridStationPattern)]
-    launches = [p for p in patterns if isinstance(p, GridLaunchPattern)]
-    creeps = [p for p in patterns if isinstance(p, CreepLaunchPattern)]
-    assert len(coast) == COAST_DOWN_COUNT
-    assert len(stations) == 12 and len(launches) == 1
-    assert len(creeps) == lr.creep_launch_count + len(lr.creep_brake_hold_fracs)
-    calib = [p for p in patterns if p.kind is PatternKind.G_CALIB]
-    sweeps = [p for p in patterns if p.kind is PatternKind.GRID_SWEEP]
-    assert len(calib) == 1 and len(sweeps) == 1
-    assert len(patterns) == len(coast) + 1 + len(stations) + len(launches) + 1 + len(creeps)
+    head = patterns[:COAST_DOWN_COUNT]
+    ramps = patterns[COAST_DOWN_COUNT:]
+    assert len(patterns) == COAST_DOWN_COUNT + len(RAMP_ORDER)
+    assert [p.kind for p in head] == [PatternKind.COAST_DOWN] * COAST_DOWN_COUNT
+    assert all(isinstance(p, GRampPattern) and p.kind is PatternKind.G_RAMP for p in ramps)
+    # 段の G と上端の車速は渡した順のまま
+    assert [(p.target_g, p.top_kmh) for p in ramps if isinstance(p, GRampPattern)] == RAMP_ORDER
+    assert pdmod.ramp_order_of(patterns) == RAMP_ORDER
+    assert not any(isinstance(p, CreepLaunchPattern) for p in patterns)
+    assert not any(p.kind.name in {"ACCEL_SWEEP", "BRAKE_HOLD", "CRUISE_TRIM", "CREEP_SETTLE"}
+                   for p in patterns)
 
-    kinds = [p.kind for p in patterns]
-    assert kinds[:COAST_DOWN_COUNT] == [PatternKind.COAST_DOWN] * COAST_DOWN_COUNT
-    assert kinds[COAST_DOWN_COUNT] is PatternKind.G_CALIB  # コーストダウンの直後・格子の前
-    grid_end = COAST_DOWN_COUNT + 1 + len(stations) + len(launches)
-    assert isinstance(patterns[grid_end - 1], GridLaunchPattern)  # 発進・停車は格子の最後
-    assert patterns[grid_end].kind is PatternKind.GRID_SWEEP  # 通し掃引はその後・クリープの前
-    grid_end += 1
-    assert all(isinstance(p, CreepLaunchPattern) for p in patterns[grid_end:])
-    assert not any(p.kind.name in {"ACCEL_SWEEP", "BRAKE_HOLD", "CRUISE_TRIM"} for p in patterns)
+
+def test_build_patterns_matches_ramp_plan_execution_order() -> None:
+    """RampPlan.execution_order() をそのまま渡すと、段の G・上端の車速が RampPlan と一致する。"""
+    from tests.research.ramp_planner import RampLevel, RampPlan
+
+    levels = (
+        RampLevel(g=0.02, top_kmh=100.0, mode_accel_s=10.0, mode_decel_s=10.0, est_s=300.0,
+                  passes=2),
+        RampLevel(g=0.25, top_kmh=60.0, mode_accel_s=5.0, mode_decel_s=5.0, est_s=50.0, passes=1),
+    )
+    plan = RampPlan(levels=levels, skipped=(0.35,), total_est_s=650.0, budget_s=1200.0,
+                    over_budget=False, cruise_s=0.0)
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    patterns = pdmod.build_patterns(cfg, _profile(cfg), plan.execution_order())
+    ramps = [p for p in patterns if isinstance(p, GRampPattern)]
+    assert [(p.target_g, p.top_kmh) for p in ramps] == [(0.02, 100.0), (0.25, 60.0), (0.02, 100.0)]
+    # 1 周目は G 昇順、2 周目は後ろに回る
+    assert [p.kind for p in patterns[COAST_DOWN_COUNT:COAST_DOWN_COUNT + 3]] == [
+        PatternKind.G_RAMP
+    ] * 3
+
+
+def test_result_table_lists_each_ramp_and_marks_unrun() -> None:
+    from tests.research.pattern_loop import RampResult
+
+    results = [RampResult(0, 0.08, 90.0, 40.0, 35.0, 0.081, 0.079, 90.5)]
+    text = pdmod.result_table([(0.08, 90.0), (0.25, 60.0)], results, 120.0)
+    assert "0.081" in text and "90.5" in text
+    assert "走っていない" in text  # 2 本目は結果が無い
+    assert "120 s" in text
 
 
 def test_build_patterns_coast_down_is_vehicle_independent_and_clamped() -> None:
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     profile = _profile(cfg)
-    patterns = pdmod.build_patterns(cfg, profile, _Stats())
+    patterns = pdmod.build_patterns(cfg, profile, RAMP_ORDER)
     for p in patterns[:COAST_DOWN_COUNT]:
         assert p.accel_opening == min(70.0, profile.max_accel_opening)
         assert p.brake_opening == 0.0
 
 
-def test_build_patterns_creep_launches_then_brake_holds_at_end() -> None:
-    """クリープ発進（停車復帰）→ ブレーキ保持（開度 = 不感帯 + frac×(停車保持−不感帯)）。"""
+def test_build_patterns_ignores_creep_settings() -> None:
+    """creep_launch_count・creep_brake_hold_fracs が残っていても列に入らない（段2l-6）。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
-    profile = _profile(cfg)
-    patterns = pdmod.build_patterns(cfg, profile, _Stats())
-    lr = cfg.learning
-    n_new = lr.creep_launch_count + len(lr.creep_brake_hold_fracs)
-    tail = patterns[-n_new:]
-    launches, holds = tail[:lr.creep_launch_count], tail[lr.creep_launch_count:]
-
-    for p in launches:
-        assert isinstance(p, CreepLaunchPattern) and p.kind is PatternKind.CREEP_SETTLE
-        assert not p.hold_after
-        assert (p.accel_opening, p.brake_opening) == (0.0, 0.0)
-        assert p.target_kmh == pytest.approx(lr.creep_launch_target_kmh)
-        assert p.timeout_s == pytest.approx(lr.creep_launch_timeout_s)
-        assert "クリープ発進" in pdmod._describe(p) and "停車復帰" in pdmod._describe(p)
-
-    ff = profile.feedforward_params
-    span = ff.stop_brake_opening_pct - ff.brake_deadband_pct
-    expected = [
-        min(round(ff.brake_deadband_pct + frac * span, 2), profile.max_brake_opening)
-        for frac in lr.creep_brake_hold_fracs
-    ]
-    assert len(holds) == len(expected)
-    for p, opening in zip(holds, expected, strict=True):
-        assert isinstance(p, CreepLaunchPattern) and p.hold_after
-        assert p.accel_opening == 0.0
-        assert p.brake_opening == pytest.approx(opening)
-        assert "ブレーキ保持" in pdmod._describe(p)
-
-
-def test_build_patterns_brake_hold_follows_measured_pedal_values() -> None:
-    """別の車（2-0 の実測が違う）でも、ブレーキ保持は同じ frac のまま実測に追従する。"""
-    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
-    profile = build_vehicle_profile(cfg)
-    other = replace(
-        PEDAL, brake_deadband_pct=4.0, stop_brake_opening_pct=10.0
-    ).apply_to_profile(profile)
-    holds = [
-        p for p in pdmod.build_patterns(cfg, other, _Stats())
-        if isinstance(p, CreepLaunchPattern) and p.hold_after
-    ]
-    fracs = cfg.learning.creep_brake_hold_fracs
-    assert [p.brake_opening for p in holds] == pytest.approx([4.0 + f * 6.0 for f in fracs])
-
-
-def test_build_patterns_without_creep_settings_has_no_creep_launch() -> None:
-    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
-    cfg.learning.creep_launch_count = 0
-    cfg.learning.creep_brake_hold_fracs = []
-    patterns = pdmod.build_patterns(cfg, _profile(cfg), _Stats())
+    cfg.learning.creep_launch_count = 3
+    cfg.learning.creep_brake_hold_fracs = [0.1, 0.5]
+    patterns = pdmod.build_patterns(cfg, _profile(cfg), RAMP_ORDER)
     assert not any(isinstance(p, CreepLaunchPattern) for p in patterns)
+    assert len(patterns) == COAST_DOWN_COUNT + len(RAMP_ORDER)
 
 
-async def test_run_pattern_drive_requires_patterns_or_wltp_stats(tmp_path: Path) -> None:
+def test_loop_config_carries_standby_and_stop_confirm() -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    loop_cfg = pdmod.loop_config_from_config(cfg, stop_confirm_pct=12.3)
+    assert loop_cfg.pedal_standby is cfg.mode_drive.pedal_standby
+    assert loop_cfg.stop_confirm_pct == 12.3
+    cfg.mode_drive.pedal_standby = False
+    assert pdmod.loop_config_from_config(cfg).pedal_standby is False
+
+
+async def test_run_pattern_drive_requires_patterns_or_ramp_order(tmp_path: Path) -> None:
     cfg = _tmp_cfg(tmp_path)
     hw = await _held_stub(cfg)
-    with pytest.raises(cfgmod.ConfigError, match="wltp_stats"):
+    with pytest.raises(cfgmod.ConfigError, match="ramp_order"):
         await pdmod.run_pattern_drive(hw, cfg, pedal=PEDAL)
     await hwmod.shutdown(hw)
 
@@ -422,8 +403,23 @@ def test_save_drive_figure_writes_png(tmp_path: Path) -> None:
 # ── 2-2. モデル作成 ──────────────────────────────────────────────────
 
 
-def test_build_ff_model_real_saves_model_but_not_measured_values(tmp_path: Path) -> None:
+def _fake_table_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """C7 の表づくり（fwd_tool）を差し替える。ここで見るのは物理定数の推定と保存の流れ。"""
+
+    def fake(profile, csv_path, models_dir, hw_mode, *, announce=True):  # type: ignore[no-untyped-def]
+        path = tmp_path / "results" / "models" / f"fwd_table_fake_{hw_mode}.pkl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        return pdmod._BuiltModel(model_path=str(path), metrics={})
+
+    monkeypatch.setattr(pdmod, "_build_table_model", fake)
+
+
+def test_build_ff_model_real_saves_model_but_not_measured_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
 
@@ -432,17 +428,21 @@ def test_build_ff_model_real_saves_model_but_not_measured_values(tmp_path: Path)
     saved = cfgmod.load_config(cfg.source_path)
     assert saved.feedforward.model_path == result.model_path
     assert saved.feedforward.is_model_trained
-    with Path(result.model_path).open("rb") as f:
-        assert pickle.load(f)["model_type"] == MODEL_TYPE
-    assert set(result.metrics) == {"accel", "brake"}
     assert saved.feedforward.engine_brake_decel_kmhs == pytest.approx(
         result.params.engine_brake_decel_kmhs, rel=1e-5
     )
-    # 不感帯・停車保持開度は 2-0 の実測が正。推定値では上書きしない
+    # 停車保持開度・クリープ平衡車速は 2-0 の実測が正。推定値では上書きしない
+    assert pdmod.MEASURED_KEYS == {"stop_brake_opening_pct", "creep_speed_kmh"}
     for key in pdmod.MEASURED_KEYS:
-        assert getattr(saved.feedforward, key) == getattr(cfg.feedforward, key)
-        assert not any(line.startswith(f"feedforward.{key}:") for line in result.changed)
-    # ペダルゲインは研究側の推定（不感帯 + 0.5% 以上）で両側とも同定し、グリッドと同じ点数で書き戻す
+        # 2026-10-08 段2l-7: yaml のキーは stop_brake_offset_pct（min からの量）
+        yaml_key = "stop_brake_offset_pct" if key == "stop_brake_opening_pct" else key
+        assert getattr(saved.feedforward, yaml_key) == getattr(cfg.feedforward, yaml_key)
+        assert not any(line.startswith(f"feedforward.{yaml_key}:") for line in result.changed)
+    # 不感帯の推定値は yaml に書かない（キー自体が無い。u の原点は vehicle.min_*_opening_pct）
+    assert "accel_deadband_pct" not in pdmod.FF_PARAM_KEYS
+    assert "brake_deadband_pct" not in pdmod.FF_PARAM_KEYS
+    assert not any("deadband" in line for line in result.changed)
+    # ペダルゲインは研究側の推定（min + 0.5% 以上）で両側とも同定し、グリッドと同じ点数で書き戻す
     ff = saved.feedforward
     assert len(ff.pedal_gain_speeds_kmh) >= 2
     assert len(ff.accel_gain_kmhs_per_pct) == len(ff.pedal_gain_speeds_kmh)
@@ -450,18 +450,6 @@ def test_build_ff_model_real_saves_model_but_not_measured_values(tmp_path: Path)
     assert not [p for p in cfgmod.validate_config(saved) if "pedal_gain" in p]
     # ユーザーが編集するファイルなのでコメントは消さない
     assert "# 2次多項式 Ridge 逆モデル" in cfg.source_path.read_text(encoding="utf-8")
-    # 参照用: 選ばれたホライズン・特徴量・係数 yaml の場所が config に残る（走行時は読まない）
-    with Path(result.model_path).open("rb") as f:
-        payload = pickle.load(f)
-    assert ff.model_accel_horizons_s == pytest.approx(
-        list(payload["accel_feature_spec"]["lookahead_horizons_s"])
-    )
-    assert ff.model_brake_horizons_s == pytest.approx(
-        list(payload["brake_feature_spec"]["lookahead_horizons_s"])
-    )
-    assert ff.model_accel_features and ff.model_brake_features
-    assert ff.model_coef_path == str(Path(result.model_path).with_suffix(".yaml"))
-    assert Path(ff.model_coef_path).exists()
 
 
 def test_build_ff_model_order_and_reference_basis_for_coast_creep_gain(
@@ -470,13 +458,12 @@ def test_build_ff_model_order_and_reference_basis_for_coast_creep_gain(
     """段2.5（ProblemReport_20260916）: 推定順は 惰行 → クリープ → ペダルゲイン。
 
     クリープ加速カーブ・ペダルゲインの基準（reference）は、estimate_dynamics_params が返す
-    生の `after`（不感帯が表示専用の粗い推定値。実測 8.53/12.00% に対し推定 3.0/3.0% 相当）
-    ではなく、**before の実測不感帯・停車保持・creep_speed_kmh を保ったまま惰行カーブだけ
-    差し替えたもの**であること。これを取り違えると「不感帯以下＝ペダルオフ」判定とゲインの
-    分母（開度−不感帯）が壊れ、惰行サンプルが 995→361 点まで減る不具合が実機ログの relearn
-    dry-run で確認された回帰。
+    生の `after`（u の原点の推定値が表示専用の粗い値）ではなく、**before の u の原点（min）・
+    停車保持・creep_speed_kmh を保ったまま惰行カーブだけ差し替えたもの**であること。
+    2026-10-08 段2l-6: before の u の原点は yaml の vehicle.min_*_opening_pct。
     """
     cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
 
@@ -521,14 +508,14 @@ def test_build_ff_model_order_and_reference_basis_for_coast_creep_gain(
     before = captured["before"]
     coast_result = captured["coast_result"]
 
-    # 惰行カーブ同定そのもののサンプル抽出条件は before（2-0 実測）を渡す
+    # 惰行カーブ同定そのもののサンプル抽出条件は before を渡す
     assert captured["coast_reference"] is before
 
-    # クリープ・ゲインの基準は before の実測値そのもの（estimate_dynamics_params の粗い
-    # 推定値ではない）を保っている
+    # クリープ・ゲインの基準は before の値そのもの（estimate_dynamics_params の粗い推定値
+    # ではない）を保っている。u の原点は yaml の min
     for ref in (captured["creep_params"], captured["gain_before"]):
-        assert ref.accel_deadband_pct == pytest.approx(PEDAL.accel_deadband_pct)
-        assert ref.brake_deadband_pct == pytest.approx(PEDAL.brake_deadband_pct)
+        assert ref.accel_deadband_pct == pytest.approx(MIN_ACCEL_PCT)
+        assert ref.brake_deadband_pct == pytest.approx(MIN_BRAKE_PCT)
         assert ref.accel_deadband_pct == pytest.approx(before.accel_deadband_pct)
         assert ref.brake_deadband_pct == pytest.approx(before.brake_deadband_pct)
         assert ref.creep_speed_kmh == pytest.approx(before.creep_speed_kmh)
@@ -540,61 +527,41 @@ def test_build_ff_model_order_and_reference_basis_for_coast_creep_gain(
     assert captured["gain_after"] is coast_result
 
 
-def test_build_ff_model_stop_brake_floor_uses_reference_basis_and_saves(
+def test_build_ff_model_does_not_estimate_stop_brake_floor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """段4改訂（ProblemReport_20260916 クリープ域ブレーキの下限）: 下限も段2.5 と同じ形で
-    reference（before 基準）で同定し、FF_PARAM_KEYS 経由で保存される。
-
-    `test_build_ff_model_order_and_reference_basis_for_coast_creep_gain` と同じ形で、基準に
-    渡された params の不感帯・停車保持開度が before（2-0 実測）の値であることをアサートする。
-    """
+    """段2l-6: クリープ域ブレーキ保持を列から外したので、stop_brake_floor は推定せず、
+    yaml の stop_brake_floor_offset_pct を据え置く。"""
     cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
 
-    captured: dict[str, Any] = {}
-    original_stop_brake = pdmod._estimate_research_stop_brake_floor
+    def must_not_call(*args: object, **kwargs: object) -> None:
+        raise AssertionError("stop_brake_floor の推定は呼ばない")
 
-    def spy_stop_brake(cfg_, logs, params, before):  # type: ignore[no-untyped-def]
-        captured["params"] = params
-        result = original_stop_brake(cfg_, logs, params, before)
-        captured["result"] = result
-        return result
-
-    monkeypatch.setattr(pdmod, "_estimate_research_stop_brake_floor", spy_stop_brake)
-
+    monkeypatch.setattr(pdmod, "_estimate_research_stop_brake_floor", must_not_call)
     result = pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL, pedal=PEDAL)
-
-    # サンプル抽出条件の基準は before（2-0 実測）そのもの。estimate_dynamics_params の粗い
-    # 推定値ではない
-    params = captured["params"]
-    assert params.accel_deadband_pct == pytest.approx(PEDAL.accel_deadband_pct)
-    assert params.brake_deadband_pct == pytest.approx(PEDAL.brake_deadband_pct)
-    assert params.stop_brake_opening_pct == pytest.approx(PEDAL.stop_brake_opening_pct)
-
-    # 同定結果がそのまま research_params に乗り、FF_PARAM_KEYS 経由で YAML に保存される
-    floor_result = captured["result"]
-    assert (
-        result.research_params.stop_brake_floor_offset_pct
-        == floor_result.stop_brake_floor_offset_pct
-    )
 
     saved = cfgmod.load_config(cfg.source_path)
     assert saved.feedforward.stop_brake_floor_offset_pct == pytest.approx(
-        floor_result.stop_brake_floor_offset_pct
+        cfg.feedforward.stop_brake_floor_offset_pct
+    )
+    assert result.research_params.stop_brake_floor_offset_pct == pytest.approx(
+        cfg.feedforward.stop_brake_floor_offset_pct
     )
     # brake_trim_max_kmh・brake_trim_ref_kmh は人が決める値なので自動保存の対象外
-    # （期待値は走行前の設定値。_tmp_cfg は config_testVehicle.yaml のコピーなので
-    # dataclass 既定値 0.0 とは限らない）
     assert saved.feedforward.brake_trim_max_kmh == pytest.approx(
         cfg.feedforward.brake_trim_max_kmh
     )
     assert saved.feedforward.brake_trim_ref_kmh == pytest.approx(cfg.feedforward.brake_trim_ref_kmh)
 
 
-def test_build_ff_model_stub_does_not_touch_yaml(tmp_path: Path) -> None:
+def test_build_ff_model_stub_does_not_touch_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
     before = cfg.source_path.read_text(encoding="utf-8")
@@ -602,19 +569,18 @@ def test_build_ff_model_stub_does_not_touch_yaml(tmp_path: Path) -> None:
     result = pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_STUB)
 
     assert cfg.source_path.read_text(encoding="utf-8") == before
-    assert "_stub_" in Path(result.model_path).name
+    assert "_stub" in Path(result.model_path).name
     assert result.changed == []
 
 
-def test_build_ff_model_raises_on_too_few_samples(tmp_path: Path) -> None:
+@pytest.mark.parametrize("candidate", ["C1", "C2", "C3", "C4", "C5"])
+def test_build_ff_model_rejects_polynomial_candidates(tmp_path: Path, candidate: str) -> None:
+    """段2l-6: C1〜C5 は手順2 の対象外。CSV を読む前に ConfigError。"""
     cfg = _tmp_cfg(tmp_path)
-    csv_path = tmp_path / "drive.csv"
-    dlmod.write_csv(_synthetic_samples(cfg)[:10], csv_path)
-    with pytest.raises(LearningDataError):
-        pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL)
-
-
-# ── 段2（ProblemReport_20260925）: 学習サンプルの WLTP 重み付け ──────────────
+    cfg.save({"feedforward.candidate": candidate})
+    cfg = cfgmod.load_config(cfg.source_path)
+    with pytest.raises(cfgmod.ConfigError, match="手順 2 の対象外"):
+        pdmod.build_ff_model(cfg, tmp_path / "missing.csv", hw_mode=hwmod.HW_STUB)
 
 
 def _tiny_wltp_mode() -> DrivingMode:
@@ -625,50 +591,6 @@ def _tiny_wltp_mode() -> DrivingMode:
             SpeedPoint(time_s=0.0, speed_kmh=0.0), SpeedPoint(time_s=20.0, speed_kmh=40.0),
         ],
     )
-
-
-def test_build_ff_model_raises_config_error_when_enabled_without_wltp_mode(tmp_path: Path) -> None:
-    """sample_weight_enabled=true なのに wltp_mode が無いと ConfigError（重みには WLTP が要る）。"""
-    cfg = _tmp_cfg(tmp_path)
-    cfg.learning.sample_weight_enabled = True
-    csv_path = tmp_path / "drive.csv"
-    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
-    with pytest.raises(cfgmod.ConfigError):
-        pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_STUB)
-
-
-def test_build_ff_model_with_wltp_mode_adds_mae_wltp_and_does_not_require_enabled(
-    tmp_path: Path,
-) -> None:
-    """wltp_mode を渡せば enabled=False でも mae_wltp が付く（重みなし/ありを比較できるように）。"""
-    cfg = _tmp_cfg(tmp_path)
-    csv_path = tmp_path / "drive.csv"
-    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
-
-    result = pdmod.build_ff_model(
-        cfg, csv_path, hw_mode=hwmod.HW_STUB, wltp_mode=_tiny_wltp_mode(),
-    )
-    assert "mae_wltp" in result.metrics["accel"]
-    assert "mae_wltp" in result.metrics["brake"]
-
-
-def test_build_ff_model_sample_weight_enabled_override_ignores_config(tmp_path: Path) -> None:
-    """`sample_weight_enabled` 引数は config の値を一時的に上書きできる（config は変更しない）。"""
-    cfg = _tmp_cfg(tmp_path)
-    assert cfg.learning.sample_weight_enabled is False
-    csv_path = tmp_path / "drive.csv"
-    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
-
-    # enabled=False のまま（config どおり）だと wltp_mode が無くてもエラーにならない
-    result_off = pdmod.build_ff_model(
-        cfg, csv_path, hw_mode=hwmod.HW_STUB, sample_weight_enabled=False
-    )
-    assert "mae_wltp" not in result_off.metrics["accel"]
-
-    # 明示的に True を渡すと、config が False のままでも wltp_mode が要る
-    with pytest.raises(cfgmod.ConfigError):
-        pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_STUB, sample_weight_enabled=True)
-    assert cfg.learning.sample_weight_enabled is False  # config 自体は変わらない
 
 
 # ── CLI 経由 ─────────────────────────────────────────────────────────
@@ -691,6 +613,24 @@ async def _fake_load_mode(cfg: object, name: str) -> DrivingMode:
 def test_step2_requires_step1(capsys: pytest.CaptureFixture[str]) -> None:
     assert mainmod.main(["--only", "2"]) == 4
     assert "手順 1 を先に実行" in capsys.readouterr().out
+
+
+def test_step2_with_polynomial_candidate_stops_before_driving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """段2l-6: C1〜C5 は走る前（走行前チェックの前）に「手順2 の対象外」で止まる。"""
+
+    async def never(hw: object, cfg: object, **kwargs: object) -> None:
+        raise AssertionError("ハードを動かしてはいけない")
+
+    cfg = _tmp_cfg(tmp_path)
+    cfg.save({"feedforward.candidate": "C1"})
+    monkeypatch.setattr(mainmod, "run_pre_drive_check", never)
+    monkeypatch.setattr(mainmod, "load_mode", never)
+    monkeypatch.setattr(mainmod, "run_pedal_search", never)
+    assert mainmod.main(["--steps", "1,2", "--config", str(cfg.source_path)]) == 2
+    out = capsys.readouterr().out
+    assert "手順 2 の対象外" in out and "C1" in out
 
 
 def test_drive_error_exit_code_is_5(
@@ -734,7 +674,7 @@ def test_step2_loads_every_coverage_mode_before_the_pedal_search(
     assert loaded == [wltp, "09_US06"]  # WLTP は 1 回だけ（MAE 用と共用）
     assert events == ["pedal_search"]
     out = capsys.readouterr().out
-    assert "格子外" in out  # モードごとの格子の外の秒数を出す
+    assert "上端の車速" in out  # 走る前に G ランプの段の表を出す
 
 
 def test_step2_stops_before_driving_when_a_coverage_mode_is_missing(

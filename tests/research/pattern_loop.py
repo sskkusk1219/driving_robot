@@ -105,29 +105,6 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
       （`_advance_trim_stair`。トリム階段の `coast_down_stop_speed_kmh`=5.0 のままだと
       1 段目で即終了してしまう）。
 
-2026-09-25 格子ステップ走行（ProblemReport_20260925 段3）で足したところ:
-    背景: 手順2 の開度は「不感帯 + 固定の%」で車両に合わせて手で決めた値だった。車両が変わっても
-    WLTP の「車速 × 加速度」の格子を測れるように、開度を車両ごとに自動で決める新パターンを足す
-    （既存パターンは変えない。手順2 への組み込み・旧パターンの削除は段4）。決め方・打ち切りは
-    `grid_planner.py`、ここは走行の状態機械だけ持つ。
-    - `GridStationPattern`（車速ステーション 1 つ。kind は GRID_STEP）: 専用の PI（`pi_hold_step`。
-      P・I ゲインは感度 g_accel で正規化、レート上限は実開度が追従できる速さの固定値）で
-      車速を保ち、落ち着いたら定常開度 u0（落ち着いた窓の指令の平均）を決めて、プランナーが返す
-      ステップを `_Phase.HOLD_STEP`（開度固定・ランプなし）で 1 つずつ測る。ステップが終わる
-      たびに開度を u0 に戻して PI へ戻り、全部終わったら**止まらず**次のステーションへ
-      （PI の状態を引き継ぐ）。最後のステーションの後は停車復帰。
-    - `GridLaunchPattern`（kind は GRID_LAUNCH）: 停車から固定アクセルで launch_end_kmh まで
-      （LAUNCH）→ そのまま固定ブレーキで停車まで（STOP）を、プランナーの狙いぶん繰り返す。
-      停車の後は停車復帰（DRIVE_BRAKE）を挟んで次の発進へ。
-    - HOLD_STEP 中も G ガバナー（安全網）は効く。作動したステップは「強すぎ」として打ち切り扱い。
-    - 強いステップの助走（段4b）: 中心から踏むと帯を出るまでに傾きを測る時間が足りない狙い
-      （`GridPlanner.is_strong`）は、帯の手前の端（`peek_approach_kmh`）へ PI で下がって（上がって）
-      落ち着いてから踏む。落ち着いた窓の開度を基準 u0' として開度を決め、ステップは帯の反対側へ
-      出たら終える。助走で落ち着かなければそのステップだけとばす。終わったらステーションの
-      中心へ戻る。
-    - PI 状態（`_grid_opening`・`_grid_integral`）は `_enter_phase` の `keep_grid=True` で引き継ぐ。
-      ブレーキ復帰・最高速超えの回復などを通ったら作り直す。
-
 2026-09-25 段4（ProblemReport_20260925）で削除したところ:
     手順2 のパターン列を格子ステップ走行に置き換えたため、上記の履歴のうち次の機構はコードから
     消した（履歴は経緯として残す）: 目標車速つき `SpeedTargetPattern`・トリム階段・定速階段・
@@ -136,24 +113,6 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
     `PatternKind` も無い。残るのは COAST_DOWN・クリープ発進（CreepLaunchPattern。ブレーキ保持は
     `_Phase.BRAKE_HOLD`）・格子ステップ走行。`_Phase.CRUISE_HOLD` は格子ステーションの PI 保持が
     使う（CSV の phase 名を段3 と揃えるため名前は据え置き）。
-
-2026-09-27 段7b（ProblemReport_20260925 段7。手順2 の計測効率化）で足したところ:
-    背景: 実測（065502、約3035s）で、ステップの後にステーションの目標（中心・助走の車速）へ
-    PI（CRUISE_HOLD）だけで戻す区間が待ち時間の最大要因だった（低ゲイン・レート制限で意図的に
-    穏やかにしているため遅い）。
-    - 新フェーズ `_Phase.GRID_RETURN`: 固定開度で目標へ速く戻る。目標より遅ければ
-      `grid_return_accel_kmhs` 狙いのアクセル（`u0 + (狙い − a_hold) / g_accel`。範囲
-      [u0, 最大開度]、上限 G の予測（`_glimit_cap`）で頭打ち）、速ければ不感帯（惰行）。
-      先読みガバナー・G ガバナーは HOLD_STEP・SWEEP と同じく適用する（安全網）。
-    - 入る場所（`_grid_begin_return`）: ステップの後（`_advance_grid_step`）と、助走の目標を
-      セットしたとき（`_advance_grid_hold`）。条件は「ステーション開始済み（u0 あり）かつ
-      |PI の目標 − 車速| > `grid_return_switch_kmh`」。満たさなければ従来どおり直接 CRUISE_HOLD
-      （`_grid_switch_to_cruise_hold`。開度・積分 = u0）。
-    - 抜ける（`_advance_grid_return`）: |目標 − 車速| ≤ `grid_return_switch_kmh` で
-      `_grid_switch_to_cruise_hold` へ（CRUISE_HOLD の落ち着き判定に戻す）。落ち着き待ちの
-      打ち切りタイマー（`_grid_settle_started`）は `_grid_begin_return` で戻り試行の頭でしか
-      リセットしないため、GRID_RETURN の間も進み続ける（打ち切り 40s の扱い自体は変えない）。
-      最高車速超えは従来どおり `_Phase.DRIVE_BRAKE`（残りのステップは捨てる）。
 
 2026-09-28 段7c（ProblemReport_20260925 段7。実機 20260928_035806 で見つかった不具合の修正）で
 変えたところ:
@@ -206,6 +165,38 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
     - 上限開度表（`GLimitMap.table`）: 予測開度が 100% を超える帯は数値の代わりに
       「100%(届かない)」と表示する（実際に機構の上限 G まで踏めないという意味。上限としての
       動きは変えない）。
+
+2026-10 段2k 段E（ProblemReport_20261001）で削除したところ:
+    手順2 のパターン列は G ランプ走行（`GRampPattern`）に置き換わったため、格子ステップ走行・
+    通し掃引・G 校正の機構（`GridStationPattern`・`GridLaunchPattern`・`GridSweepPattern`、
+    フェーズ CRUISE_HOLD・HOLD_STEP・GRID_RETURN・CALIB_BRAKE・SWEEP_UP・SWEEP、`PatternKind` の
+    GRID_STEP・GRID_LAUNCH・G_CALIB・GRID_SWEEP、grid_planner.py ほか）をコードから消した。
+    上の段7c・7d の履歴のうち、これらに触れる箇所は経緯として残してある。残るのは
+    COAST_DOWN・クリープ発進・クリープ域ブレーキ保持・G ランプ走行・停車復帰（高い車速からは
+    `_step_gprop_brake` の G 比例ブレーキ）。
+
+2026-10-08 段2l-6（ProblemReport_20261001）で変えたところ:
+    不感帯の測定をやめ、手で測った「ペダルに触れた位置」min（vehicle.min_*_opening_pct。
+    プロファイルの feedforward_params.accel_deadband_pct・brake_deadband_pct に入る。名前は
+    不感帯のまま、意味は u の原点）を待機位置かつ u の原点にした。
+    - 待機位置: 「不感帯 − standby_margin_pct」をやめ min そのもの（`pedal_standby`）。ラッチ後の
+      ブレーキは u ≤ 0 でブレーキ ＝ min ＋ |u|（下限 min・u の上限 0）。
+    - 「踏んでいない」の判定に幅 PEDAL_OFF_TOL_PCT（待機位置がしきい値ちょうどになり、実位置の
+      ずれで行が割れるため）。G ランプの実測点を貯める条件に使う。
+    - G ランプの最初の開度の見積もりは外挿しない（`_glimit_open_for(extrapolate=False)`）。
+    - RAMP_UP の発進（`_rp_launch`）: 停車保持開度から止まった開度（2-0 の stop_confirm_pct）まで
+      戻し、そこから毎周期「実測 G ＜ 狙い（保持マージンの外）」のときだけブレーキを下げる。
+      単調に下がり、踏み直さない。min に着いたらアクセルの u 制御（u ≥ 0）に渡す。
+    - RAMP_DOWN は 5 km/h（coast_down_stop_speed_kmh）ではなく停車（STOP_SPEED_KMH）まで続ける。
+
+2026-10-08 段2l-6b（ProblemReport_20261001。ユーザー決定）で変えたところ:
+    コーストダウンの停車復帰（DRIVE_BRAKE）の境目を車ごとの値にした。クリープ車速は車によって
+    違うので、固定の `coast_down_stop_speed_kmh`（5.0）ではなく「クリープ車速 + 落ち着きの許容幅」
+    （`_creep_ceiling_kmh(grid_settle_tol_kmh)`）より上は G 比例ブレーキ、以下（クリープ域）は
+    今のブレーキ開度から停車保持開度まで一定の速さで踏み上げる（`_db_creep_press`。速さは
+    `_step_gprop_brake` の 1 刻み/待ちと同じ。単調に上げ、途中で下げない）。次のパターンへ進むのは
+    停車かつ停車保持開度に届いてから、`brake_stop_timeout_s` も届いてから数える。G ランプなど
+    他のパターンの停車復帰・速度超過の回復（overspeed_recovery）は従来どおり。
 """
 
 from __future__ import annotations
@@ -214,7 +205,7 @@ import asyncio
 import statistics
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Protocol
@@ -223,23 +214,11 @@ import numpy as np
 
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.axis_safety import AxisSafetyNet
-from tests.research.coverage_live import LiveCoverage
 from tests.research.g_limit import PEDAL_ACCEL, PEDAL_BRAKE, GLimitMap
-from tests.research.grid_planner import (
-    GridPlanner,
-    GridSettings,
-    LaunchPlan,
-    StationPlan,
-    Step,
-    StepKind,
-    StepResult,
-    fit_slope,
-    pi_hold_step,
-)
-from tests.research.grid_settle import SettleRecord
 from tests.research.research_types import (
     ACTUATOR_PULSE_MAX,
     G_TO_KMHS,
+    PEDAL_OFF_TOL_PCT,
     VEHICLE_STOP_SPEED_KMH,
     DriveLogData,
     LearningPattern,
@@ -250,10 +229,23 @@ from tests.research.research_types import (
     opening_to_position,
     position_to_opening,
 )
-from tests.research.sweep_planner import SweepPlan, plan_sweeps
+
+
+def fit_slope(times_s: Sequence[float], speeds_kmh: Sequence[float]) -> float:
+    """車速 [km/h] の時間 [s] に対する最小二乗の傾き [km/h/s]。2 点未満・時間幅 0 なら 0。"""
+    if len(times_s) < 2 or times_s[-1] - times_s[0] <= 0.0:
+        return 0.0
+    slope, _ = np.polyfit(np.asarray(times_s, dtype=float), np.asarray(speeds_kmh, dtype=float), 1)
+    return float(slope)
+
 
 PATTERN_LOOP_INTERVAL_S: float = 0.1  # 100ms 周期（drive_logs の記録間隔に一致。本番と同じ）
 STOP_SPEED_KMH: float = VEHICLE_STOP_SPEED_KMH
+# G ランプ 1 区間（加速または減速）の打ち切り = 見込み秒数（上端 ÷ 狙いの加速度）× 係数 + 余裕。
+# 仮値（データの根拠なし）。狙いの G に届かず上端に着けない・クリープ域まで下りられない場合の
+# 安全網で、通常の走行には効かない。2l の実機で実際の所要秒数を見て決め直す
+RAMP_LEG_TIMEOUT_FACTOR: float = 3.0
+RAMP_LEG_TIMEOUT_MARGIN_S: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -277,42 +269,30 @@ class CreepLaunchPattern(LearningPattern):
 
 
 @dataclass(frozen=True)
-class GridStationPattern(LearningPattern):
-    """格子ステップ走行の車速ステーション 1 つ（段3。kind は GRID_STEP）。
+class GRampPattern(LearningPattern):
+    """G ランプ走行 1 本（段2k 段B。kind は G_RAMP）。
 
-    `plan` が狙う加速度の列、`settings` が調整値。開度は走行中にプランナーが決める
-    （`accel_opening` 等の固定開度は使わない）。
+    停車から `+target_g` を狙って `top_kmh` まで加速（RAMP_UP）→ `-target_g` を狙って減速
+    （RAMP_DOWN）→ クリープ域まで下りたら通常の停車復帰。開度は固定値を持たず、走行中に
+    実測の G を見て「効く開度 u」を動かして作る（`accel_opening` 等は使わない）。
     """
 
-    plan: StationPlan | None = None
-    settings: GridSettings = GridSettings()
+    target_g: float = 0.0  # 狙いの G（正。加速は +、減速は − に使う）
+    top_kmh: float = 0.0  # 上端の車速 [km/h]
 
 
 @dataclass(frozen=True)
-class GridLaunchPattern(LearningPattern):
-    """格子ステップ走行の発進・停車セル（段3。kind は GRID_LAUNCH）。"""
+class RampResult:
+    """G ランプ 1 本の結果（段ごとの表示用。`PatternLoop.ramp_results`）。"""
 
-    plan: LaunchPlan | None = None
-    settings: GridSettings = GridSettings()
-
-
-@dataclass(frozen=True)
-class GridSweepPattern(LearningPattern):
-    """通し掃引（段6c。kind は GRID_SWEEP）。走行中に網羅の穴を見て、掃引を作って走る。
-
-    `wltp_seconds`/`wltp_mean` はモード（複数なら合成）の車速 × 加速度の集計、`speed_edges`/
-    `accel_edges` は格子の境界、`min_s` は「狙う最小秒数」、`data_max_s` は「穴」の判定
-    （データ秒がこれ未満）、`max_passes` は 1 本の掃引の最大回数（0 なら何もしない）。
-    """
-
-    wltp_seconds: np.ndarray | None = field(default=None, compare=False)
-    wltp_mean: np.ndarray | None = field(default=None, compare=False)
-    speed_edges: tuple[float, ...] = ()
-    accel_edges: tuple[float, ...] = ()
-    min_s: float = 2.5
-    data_max_s: float = 2.0
-    max_passes: int = 6
-    settings: GridSettings = GridSettings()
+    pattern_idx: int
+    target_g: float
+    top_kmh: float
+    up_s: float  # RAMP_UP の所要秒数
+    down_s: float  # RAMP_DOWN の所要秒数
+    accel_g_median: float | None  # 加速側の実測 G の中央値（取れなければ None）
+    decel_g_median: float | None  # 減速側の実測 G の中央値（正。取れなければ None）
+    max_speed_kmh: float  # 到達した最高車速
 
 
 class _Phase(Enum):
@@ -321,13 +301,9 @@ class _Phase(Enum):
     COAST = auto()
     DRIVE_BRAKE = auto()
     BRAKE_HOLD = auto()
-    CRUISE_HOLD = auto()  # 格子ステップ走行の PI 保持（段3）。旧定速階段のフェーズ名を引き継ぐ
     CREEP_LAUNCH = auto()  # クリープ発進・クリープ域ブレーキ保持（段1）。両ペダル 0% で自走
-    HOLD_STEP = auto()  # 格子ステップ走行（段3）。開度固定・ランプなしで加速度を測る
-    GRID_RETURN = auto()  # 格子ステップ走行（段7b）: ステップの後、固定開度で目標へ速く戻る
-    CALIB_BRAKE = auto()  # G 校正（段6a）: 0.2G 狙いの G 比例ブレーキ減速。各車速の開度と減速を記録
-    SWEEP_UP = auto()  # 通し掃引（段6c）の助走: G 比例の加速で掃引の開始車速まで上げる
-    SWEEP = auto()  # 通し掃引（段6c）: 車速のセルごとに開度を切り替えながら通り抜ける
+    RAMP_UP = auto()  # G ランプ走行（段2k 段B）: 狙いの G で上端の車速まで加速
+    RAMP_DOWN = auto()  # G ランプ走行（段2k 段B）: 同じ G で減速してクリープ域まで下りる
     DONE = auto()
 
 
@@ -359,7 +335,7 @@ class PatternLoopConfig:
     coast_down_stop_speed_kmh: float = field(default=5.0)
     coast_timeout_s: float = field(default=90.0)
     # 段7c: コーストダウンの終了判定に使う「落ち着いた」許容幅（learning.grid_settle_tol_kmh から
-    # pattern_drive.py が渡す。既定値は GridSettings.settle_tol_kmh と揃えている）
+    # pattern_drive.py が渡す。既定値は config.LearningSection と揃えている）
     grid_settle_tol_kmh: float = field(default=1.0)
     creep_settle_min_s: float = field(default=13.0)
     creep_settle_stable_tol_kmhs: float = field(default=0.3)
@@ -385,32 +361,56 @@ class PatternLoopConfig:
     coast_accel_target_g: float = field(default=0.2)
     coast_accel_press_margin_g: float = field(default=0.02)  # 目標 ± これ の間は開度を保持
     coast_accel_slope_window_s: float = field(default=1.0)  # 加速度（最小二乗の傾き）の窓 [s]
-    coast_accel_approach_margin_pct: float = field(default=1.0)  # 不感帯 − これ まで先に上げる
+    coast_accel_approach_margin_pct: float = field(default=1.0)  # min − これ まで先に上げる
     # 踏む速さ [%/s] = これ ×（目標 G − 今の G）。半分データ由来・半分仮の値:
     # 感度 0.004〜0.005 G/%・遅れ約 1s（実機 110427）から、応答の時定数（1/(これ×感度) ≒ 2〜2.5s）
     # が遅れの 2 倍以上になる値。大きいほど早く届くが 0.2G を超えやすい。実機で決め直す
     coast_accel_rate_gain: float = field(default=100.0)
-    # G 校正のブレーキ減速（CALIB_BRAKE）。stop_decel.decelerate_to_stop（手順2 終了時の緩減速）と
-    # 同じ刻み方: dwell_s ごとに直近 slope_window_s の減速 G を見て、目標 − press_margin 未満なら
+    # 高い車速からの停車復帰の G 比例ブレーキ（DRIVE_BRAKE。`_step_gprop_brake`）。
+    # stop_decel.decelerate_to_stop（手順2 終了時の緩減速）と同じ刻み方:
+    # dwell_s ごとに直近 slope_window_s の減速 G を見て、目標 − press_margin 未満なら
     # step_mm 踏み増し、release_above_g 超なら step_mm 戻す。目標・余裕・窓・接近位置は
     # coast_accel_* を共用（decel_stop と同じ値）。pattern_drive.py が decel_stop から渡す
     calib_release_above_g: float = field(default=0.3)
     calib_step_mm: float = field(default=0.5)
     calib_dwell_s: float = field(default=1.0)
-    # 上限 G の予測の目標 [G]（learning.g_cap_g から渡す）。ここまでなら踏んでよいと予測した開度で
-    # 格子ステップの開度を頭打ちにする。既定は config.LearningSection.g_cap_g と揃えている
-    g_cap_g: float = field(default=0.3)
     # 惰行に入ってからこの時間は減速を数えない（ペダルを離してから車が応える遅れ。実機で
     # 指令→G の山まで約 0.6s、離す動作 0.4s）。惰行の減速 → 上限 G の予測の基準点に使う
     coast_measure_delay_s: float = field(default=1.5)
     # 段6b・門②: 上限 G を先読みして緩める。G の見込み = 今の G + G の増える速さ × gov_lead_s。
     # gov_lead_s 0.6 s は実機（20260926 の 890.7→891.3 s）で「ブレーキ指令から G の山まで」の遅れ。
     # 見込みが上限 × gov_soft_frac に届いたら踏み増しを止め、上限（× g_limit_frac）に届いたら
-    # 従来どおり 1 周期ごとに下げる。gov_soft_frac 0.85 は**仮の値**（0.85 × 0.4G × 0.98 ≒ 0.33G。
-    # g_cap_g 0.3G と上限 0.4G の間）。実機の G の最大で決め直す
+    # 従来どおり 1 周期ごとに下げる。gov_soft_frac 0.85 は**仮の値**（0.85 × 0.4G × 0.98 ≒ 0.33G）。
+    # 実機の G の最大で決め直す
     gov_lead_s: float = field(default=0.6)
     gov_soft_frac: float = field(default=0.85)
+    # 待機位置を使うか。待機位置 ＝ ペダルに触れた位置 min（プロファイルの
+    # feedforward_params.*_deadband_pct。名前は不感帯のまま値は u の原点）。(1) G ランプの減速で
+    # ブレーキの領域に入ったあと、ブレーキの下限を min にする（0% へ戻さない。2026-10-07 段2l-3）。
+    # (2) 周期の出力で両ペダルの指令に min を下限として掛ける（使わない側を 0% にせず待機位置に
+    # 置く。手順3 の mode_drive と同じ形。2026-10-07 段2l-4）。False なら (2) は掛けない
+    # （今までどおり 0%）。2026-10-08 段2l-6: 旧 standby_margin_pct（不感帯 − 余裕）を置き換えた
+    pedal_standby: bool = field(default=False)
+    # G ランプの発進の最初のブレーキ開度 = 2-0 で測った止まった開度（stop_confirm_pct）。
+    # None なら停車保持開度から始める。2026-10-08 段2l-6
+    stop_confirm_pct: float | None = field(default=None)
+    # コーストダウン加速の車速の上端 [km/h]（None なら車両の最高速 × accel_speed_cap_frac のまま）。
+    # 選んだモードの最高車速 + 余裕（learning.ramp_top_margin_kmh）。2026-10-07 段2l-4
+    top_speed_cap_kmh: float | None = field(default=None)
     gov_rate_window_s: float = field(default=0.5)  # G の増える速さを見る窓 [s]
+    # G ランプ走行（段2k 段B。GRampPattern）。learning.ramp_* から pattern_drive.py が渡す。
+    # 効く開度 u の動かす速さ [%/s] = ゲイン ×（狙いの G − 実測の G）のゲインの上限（感度が測れて
+    # いないときはこの値）。半分データ由来: コーストダウン加速（coast_accel_rate_gain）と同じ値。
+    # 前の車で感度 0.004〜0.005 G/%・遅れ約 1 s から決めた。2026-10-07 段2l-2 で意味を「上限」に変更
+    ramp_rate_gain: float = field(default=100.0)
+    # G のずれを何秒かけて埋めるか。ゲイン ＝ min(ramp_rate_gain, 1 ÷（感度[G/%] × これ））。
+    # 2026-10-07 段2l-2
+    ramp_settle_time_s: float = field(default=2.0)
+    # 狙いとの差がこの幅以内なら u を動かさない。幅 = max(狙いの G × frac, min_g)。仮値
+    # （今の固定 0.02G は 0.02G の段では使えないため、狙いに比例させ下限を置いた）。
+    # 開度の細かい往復に効く。2l の実機走行後に決め直す
+    ramp_hold_margin_frac: float = field(default=0.10)
+    ramp_hold_margin_min_g: float = field(default=0.005)
 
 
 class ActuatorDriverProtocol(Protocol):
@@ -456,10 +456,6 @@ class PatternLoop:
         on_sample: OnSample,
         config: PatternLoopConfig | None = None,
         interval_s: float = PATTERN_LOOP_INTERVAL_S,
-        on_grid_result: Callable[[StepResult], None] | None = None,
-        on_grid_settle: Callable[[SettleRecord], None] | None = None,
-        on_calib_done: Callable[[list[str]], None] | None = None,
-        on_sweep_log: Callable[[str], None] | None = None,
     ) -> None:
         self._accel_driver = accel_driver
         self._brake_driver = brake_driver
@@ -472,16 +468,12 @@ class PatternLoop:
         self._on_sample = on_sample
         self._config = config if config is not None else PatternLoopConfig()
         self._interval_s = interval_s
-        self._on_grid_result = on_grid_result
-        self._on_grid_settle = on_grid_settle
-        # G 校正が終わったとき、上限開度の表（行のリスト）を渡す
-        self._on_calib_done = on_calib_done
-        self._on_sweep_log = on_sweep_log  # 通し掃引の 1 行ログ
-        self.grid_settles: list[SettleRecord] = []  # 落ち着き待ちの記録（grid_settle の集計用）
 
         self._max_decel_kmhs = max(profile.max_decel_g * G_TO_KMHS, 0.0)
         self._g_limit_kmhs = self._max_decel_kmhs * self._config.g_limit_frac
         self._accel_speed_cap = profile.max_speed * self._config.accel_speed_cap_frac
+        if self._config.top_speed_cap_kmh is not None:  # 2026-10-07 段2l-4
+            self._accel_speed_cap = min(self._accel_speed_cap, self._config.top_speed_cap_kmh)
 
         self._running = False
         self._cycle_task: asyncio.Task[None] | None = None
@@ -514,58 +506,47 @@ class PatternLoop:
         # 段7d: 毎周期の実開度（monitor から。_execute_one_cycle で更新）。モニタが無い経路
         # （_advance 直叩きのテスト等）では None のまま（_step_coast_accel が _ca_opening で代用）
         self._accel_actual_pct: float | None = None
-        # 段7b・7c: GRID_RETURN の刻み足し（_step_grid_return）の状態。_grid_begin_return で作り直す
-        self._gr_opening = 0.0  # 指令開度（ガバナー適用前）
-        self._gr_last_t: float | None = None  # 直近に開度を更新した時刻
-        self._gr_hist: deque[tuple[float, float]] = deque()  # 加速度の窓 (時刻, 車速)
-        # G 校正のブレーキ減速（CALIB_BRAKE）の状態。_enter_phase で作り直す
+        # 高い車速からの停車復帰の G 比例ブレーキ（DRIVE_BRAKE）の状態。_enter_phase で作り直す
         self._cb_t0: float | None = None  # 接近ランプの開始時刻
         self._cb_approach_pct = 0.0
         self._cb_opening = 0.0  # 接近後の指令開度（ガバナー適用前）
         self._cb_next_t: float | None = None  # 次に開度を決める時刻。None ならまだ接近中
         self._cb_hist: deque[tuple[float, float]] = deque()  # 減速度の窓 (時刻, 車速)
-        # 上限 G に届く開度の予測マップ（段6a）。G 校正・惰行・格子ステップの実測で育てる
+        # 上限 G に届く開度の予測マップ（段6a）。コーストダウン・G ランプの実測で育てる
+    # （G ランプの最初の開度の見積もりに使う）
         self.glimit = GLimitMap()
         # 停車復帰（DRIVE_BRAKE）を G 比例で行うか（高い車速から入ったとき。_enter_phase で決める）
         self._db_gprop = False
+        # コーストダウンの停車復帰のクリープ域で、停車保持開度まで徐々に踏むか（段2l-6b）
+        self._db_creep_press = False
+        self._db_press_reached_at: float | None = None  # 停車保持開度に届いた時刻
         self._cb_start_pct = 0.0  # G 比例ブレーキの最初の開度（接近ランプの目標）
-        # 通し掃引（段6c）。網羅カウンタは掃引のパターンがあるときだけ作る（全周期の車速を数える）
-        self.coverage: LiveCoverage | None = None
-        sweeps = [p for p in patterns if isinstance(p, GridSweepPattern)]
-        if sweeps and sweeps[0].speed_edges:
-            self.coverage = LiveCoverage(list(sweeps[0].speed_edges), list(sweeps[0].accel_edges))
-        self._sw_seen_idx = -1
-        self._sw_plans: list[SweepPlan] = []  # まだ走っていない掃引（先頭が今の掃引）
-        self._sw_passes = 0  # 今の掃引を走った回数
-        # 今の掃引のセルごとの (アクセル, ブレーキ)
-        self._sw_openings: list[tuple[float, float]] = []
-        self._sw_from = (0.0, 0.0)  # セルが変わったときのランプの始点
-        self._sw_cell = -1  # 今のセル（plan.cells の添字）
-        self._sw_ramp_t = 0.0
-        self._sw_cmd = (0.0, 0.0)  # 今の指令開度 (アクセル, ブレーキ)
-        self._sw_before = 0.0  # 掃引の前の、対象セルのデータ秒の合計（ログ用）
+        # G ランプ走行（段2k 段B）。RAMP_UP に入るたびに _enter_phase が作り直す
+        self._rp_u: float | None = None  # 効く開度 u [%]（None なら RAMP_UP の最初の見積もり前）
+        # この減速の区間で一度でもブレーキ側（u ＜ 0）に入ったか（2026-10-07 段2l-2）。立つと
+        # アクセルへ戻らない（惰行の減速は車速が下がるほど弱くなるので、戻る必要がない）
+        self._rp_brake_latched = False
+        # 発進の段階（2026-10-08 段2l-6）: RAMP_UP の頭でブレーキを止まった開度から min まで
+        # 単調に離す。その間 u は None のまま。min に着いたら False にして u を見積もる
+        self._rp_launch = False
+        self._rp_launch_brake_pct = 0.0  # 発進の段階のブレーキ指令（ガバナー適用前）
+        self._rp_last_t: float | None = None  # 直近に u を更新した時刻
+        self._rp_hist: deque[tuple[float, float]] = deque()  # 加速度の窓 (時刻, 車速)
+        # 実開度の履歴 (時刻, アクセル, ブレーキ)。遅れを見込んだ窓の代表開度を作る
+        self._rp_open_hist: deque[tuple[float, float, float]] = deque()
+        self._rp_record_t = -1e9  # 上限 G マップに最後に足した時刻（1 s に 1 点）
+        self._rp_up_started = 0.0
+        self._rp_down_started = 0.0
+        self._rp_max_speed = 0.0
+        self._rp_up_g: list[float] = []  # 加速側の実測 G（符号つき。窓が溜まってから）
+        self._rp_down_g: list[float] = []  # 減速側の実測 G（符号つき）
+        self.ramp_results: list[RampResult] = []  # G ランプ 1 本ごとの結果
+        self._brake_actual_pct: float | None = None  # 毎周期のブレーキ実開度（モニターから）
         self._accel_hist: deque[tuple[float, float]] = deque()  # (時刻, 平滑化した加速度)
         self._accel_rate = 0.0  # 加速度の変化の速さ [km/h/s²]（先読みガバナー用）
-        self._step_from = (0.0, 0.0)  # 開度固定ステップを始めたときの (アクセル, ブレーキ) 開度
         self._ca_record_t = -1e9  # 加速側の点を最後に足した時刻（1 s に 1 点）
         self._speed_hist: deque[tuple[float, float]] = deque()
         self._last_speed = 0.0  # 定速階段の PI が使う直近の車速（_execute_one_cycle で更新）
-        # 格子ステップ走行（段3）。グリッドのパターンがあるときだけプランナーを持つ
-        self._grid: GridPlanner | None = None
-        self._grid_opening: float | None = None  # 専用 PI の開度（None なら未初期化）
-        self._grid_integral = 0.0
-        self._grid_seen_idx = -1  # 入場処理を済ませたパターン番号
-        self._grid_station_begun = False  # begin_station を呼んだか（u0 を決めたか）
-        self._grid_settle_started = 0.0  # 落ち着くのを待ち始めた時刻（打ち切り用）
-        self._grid_settle_since: float | None = None
-        self._grid_window_speeds: list[tuple[float, float]] = []  # 落ち着いた窓の (時刻, 車速)
-        self._grid_approach_kmh: float | None = None  # 助走中の PI の目標車速（None なら中心）
-        self._grid_window: list[float] = []  # 連続して許容幅内だった間に送ったアクセル開度
-        self._grid_wait_cycles = 0  # 落ち着き待ちの周期数と、そのうち許容幅内だった周期数
-        self._grid_inside_cycles = 0
-        self._grid_step: Step | None = None
-        self._grid_samples: list[tuple[float, float]] = []  # (時刻, 車速)
-        self._grid_governed = False
         self._accel_pos_cmd = 0
         self._brake_pos_cmd = 0
         self._current_accel_opening = 0.0
@@ -579,40 +560,14 @@ class PatternLoop:
             self._profile.max_brake_opening,
         )
 
-        grid_patterns = [
-            p for p in patterns if isinstance(p, GridStationPattern | GridLaunchPattern)
-        ]
-        if grid_patterns:
-            ff = profile.feedforward_params
-            self._grid = GridPlanner(
-                grid_patterns[0].settings,
-                accel_deadband_pct=ff.accel_deadband_pct,
-                brake_deadband_pct=ff.brake_deadband_pct,
-                max_accel_pct=profile.max_accel_opening,
-                max_brake_pct=profile.max_brake_opening,
-                # 減速の助走の上限。落ち着き待ちの許容幅が最高車速を超えないよう手前にする
-                max_speed_kmh=profile.max_speed - 2.0 * grid_patterns[0].settings.settle_tol_kmh,
-                stop_brake_pct=ff.stop_brake_opening_pct,
-                cap_fn=self._glimit_cap,
-                # 惰行はコーストダウンの実測から引く（段7a）。測れない車速帯は None
-                # （GridPlanner が従来どおり惰行ステップにフォールバックする）
-                coast_fn=lambda v: (d := self.glimit.coast_decel_kmhs(v)) and -d,
-                # そのステーションでまだ測っていないペダルの最初の感度を、glimit の実測点から
-                # 引く（段7c。仮定値 2.0 が実測と 8 倍ずれ、GRID_RETURN の開度が浅すぎた対策）
-                gain_fn=self.glimit.strongest_point,
-            )
-
         calib = self._profile.calibration
         if calib is not None:
             self._accel_pos_cmd = calib.accel_zero_pos
             self._brake_pos_cmd = opening_to_position(
                 self._stop_return_brake_pct, calib.brake_zero_pos, calib.brake_full_pos
             )
-
-    @property
-    def grid_planner(self) -> GridPlanner | None:
-        """格子ステップ走行のプランナー（測定結果 `results`・感度 g を持つ）。無ければ None。"""
-        return self._grid
+        if self._phase is _Phase.RAMP_UP:  # 最初が G ランプのとき（_enter_phase を通らない）
+            self._ramp_launch_begin()
 
     # ── ライフサイクル ─────────────────────────────────────────────
     def start(self) -> None:
@@ -669,10 +624,6 @@ class PatternLoop:
             self._phase_started_at = now
         if self._started_at is None:
             self._started_at = now
-        if self._grid_enter_pattern(pattern, now):
-            return  # 狙いが無いグリッドのパターンをとばした。次の周期でやり直す
-        if self._sweep_enter_pattern(pattern, now):
-            return  # 穴が無く掃引をとばした。次の周期でやり直す
 
         try:
             speed = await self._can_reader.read_speed()
@@ -681,8 +632,6 @@ class PatternLoop:
             return
 
         self._last_speed = speed
-        if self.coverage is not None:
-            self.coverage.push(now, speed)
         self._speed_hist.append((now, speed))
         accel_kmhs = self._smoothed_accel(now)
         self._update_accel_rate(now, accel_kmhs)
@@ -692,6 +641,14 @@ class PatternLoop:
         accel_opening, brake_opening = enforce_pedal_exclusion(accel_opening, brake_opening)
         self._current_accel_opening = accel_opening
         self._current_brake_opening = brake_opening
+        # 2026-10-07 段2l-4: 出力だけ待機位置を下限にする（手順3 mode_drive と同じ形）。内部状態
+        # （_current_*・ガバナー・停車復帰）は掛ける前の値のまま。
+        # pedal_standby が False なら掛けない。
+        # 2026-10-08 段2l-6: 待機位置は min（ペダルに触れた位置）そのもの
+        if self._config.pedal_standby:
+            ff = self._profile.feedforward_params
+            accel_opening = max(accel_opening, ff.accel_deadband_pct)
+            brake_opening = max(brake_opening, ff.brake_deadband_pct)
 
         calib = self._profile.calibration
         if calib is None:
@@ -714,9 +671,12 @@ class PatternLoop:
 
         cycle_ms = 1000.0 * (time.perf_counter() - cycle_started)
         accel_current, brake_current = monitor_accel.current_ma, monitor_brake.current_ma
-        # 段7d: G 校正の上限開度表用に、指令ではなく実際の開度を積む（低速の踏み込みは遅れる）
+        # 段7d: 上限 G の予測マップ用に、指令ではなく実際の開度を積む（低速の踏み込みは遅れる）
         self._accel_actual_pct = position_to_opening(
             monitor_accel.position_pulse, calib.accel_zero_pos, calib.accel_full_pos
+        )
+        self._brake_actual_pct = position_to_opening(
+            monitor_brake.position_pulse, calib.brake_zero_pos, calib.brake_full_pos
         )
         t = now - self._started_at
         for label, current in (("アクセル", accel_current), ("ブレーキ", brake_current)):
@@ -774,22 +734,18 @@ class PatternLoop:
             return _Phase.DONE
         if isinstance(self._patterns[idx], CreepLaunchPattern):
             return _Phase.CREEP_LAUNCH
-        if isinstance(self._patterns[idx], GridStationPattern):
-            return _Phase.CRUISE_HOLD  # 停車からも専用の PI で上げる（固定開度の加速は使わない）
-        if isinstance(self._patterns[idx], GridLaunchPattern):
-            return _Phase.HOLD_STEP
-        if isinstance(self._patterns[idx], GridSweepPattern):
-            return _Phase.SWEEP_UP  # 入場処理（_sweep_enter_pattern）が掃引を作って始める
-        if self._patterns[idx].kind in (PatternKind.COAST_DOWN, PatternKind.G_CALIB):
+        if isinstance(self._patterns[idx], GRampPattern):
+            return _Phase.RAMP_UP  # 停車保持から。発進の段階でブレーキを離し、min で u の制御へ
+        if self._patterns[idx].kind is PatternKind.COAST_DOWN:
             return _Phase.DRIVE_ACCEL
         return _Phase.MEASURE
 
     def _command_openings(self, pattern: LearningPattern, now: float) -> tuple[float, float]:
         assert self._phase_started_at is not None
         elapsed = max(0.0, now - self._phase_started_at)
-        if self._phase is _Phase.SWEEP:
-            return self._sweep_command(now)
-        if self._phase in (_Phase.DRIVE_ACCEL, _Phase.SWEEP_UP):
+        if self._phase in (_Phase.RAMP_UP, _Phase.RAMP_DOWN):
+            return self._ramp_command()
+        if self._phase is _Phase.DRIVE_ACCEL:
             ramped = self._coast_accel_opening(pattern, now)
             self._accel_request = ramped
             if self._accel_gov_cap is not None:
@@ -799,27 +755,23 @@ class PatternLoop:
             return 0.0, 0.0
         if self._phase is _Phase.CREEP_LAUNCH:
             return 0.0, 0.0  # 両ペダル完全解放（クリープのみで自走）
-        if self._phase is _Phase.CRUISE_HOLD:
-            assert isinstance(pattern, GridStationPattern)
-            return self._grid_hold_opening(pattern), 0.0
-        if self._phase is _Phase.GRID_RETURN:
-            assert isinstance(pattern, GridStationPattern)
-            opening = self._grid_return_opening(pattern)
-            self._accel_request = opening
-            if self._accel_gov_cap is not None:
-                opening = min(opening, self._accel_gov_cap)
-            return clamp_opening(opening, self._profile.max_accel_opening), 0.0
-        if self._phase is _Phase.HOLD_STEP:
-            assert isinstance(pattern, GridStationPattern | GridLaunchPattern)
-            return self._grid_step_openings(now, pattern.settings.step_lag_s)
-        if self._phase is _Phase.CALIB_BRAKE or (
-            self._phase is _Phase.DRIVE_BRAKE and self._db_gprop
-        ):
+        if self._phase is _Phase.DRIVE_BRAKE and self._db_gprop:
             opening = self._calib_brake_opening(now)
             self._brake_request = opening
             if self._brake_gov_cap is not None:
                 opening = min(opening, self._brake_gov_cap)
             return 0.0, clamp_opening(opening, self._profile.max_brake_opening)
+        if self._phase is _Phase.DRIVE_BRAKE and self._db_creep_press:
+            # 段2l-6b: 今の開度から停車保持開度まで一定の速さで踏み上げる（下げない）
+            rate = self._stop_return_press_rate_pctps()
+            assert rate is not None
+            target_brake = self._stop_return_brake_pct
+            ramped = min(target_brake, self._brake_ramp_from + rate * elapsed)
+            ramped = max(ramped, min(self._brake_ramp_from, target_brake))
+            self._brake_request = ramped
+            if self._brake_gov_cap is not None:
+                ramped = min(ramped, self._brake_gov_cap)
+            return 0.0, clamp_opening(ramped, self._profile.max_brake_opening)
         if self._phase in (_Phase.DRIVE_BRAKE, _Phase.BRAKE_HOLD):
             target_brake = pattern.brake_opening
             if self._phase is _Phase.DRIVE_BRAKE:
@@ -853,39 +805,40 @@ class PatternLoop:
         if self._phase is _Phase.COAST:
             self._advance_coast(speed, accel_kmhs, elapsed, now)
             return
-        if self._phase is _Phase.CALIB_BRAKE:
-            self._advance_calib_brake(speed, elapsed, now)
-            return
-        if self._phase is _Phase.SWEEP_UP:
-            assert isinstance(pattern, GridSweepPattern)
-            self._advance_sweep_up(pattern, speed, elapsed, now)
-            return
-        if self._phase is _Phase.SWEEP:
-            assert isinstance(pattern, GridSweepPattern)
-            self._advance_sweep(pattern, speed, elapsed, now)
-            return
         if self._phase is _Phase.CREEP_LAUNCH:
             self._advance_creep_launch(pattern, speed, accel_kmhs, elapsed, now)
             return
-        if self._phase is _Phase.HOLD_STEP:
-            self._advance_grid_step(pattern, speed, now)
+        if self._phase in (_Phase.RAMP_UP, _Phase.RAMP_DOWN):
+            assert isinstance(pattern, GRampPattern)
+            self._advance_ramp(pattern, speed, elapsed, now)
             return
         if self._phase is _Phase.DRIVE_BRAKE:
             if self._db_gprop:
                 self._step_gprop_brake(speed, now)
-                if speed <= self._config.coast_down_stop_speed_kmh:
-                    # 低速まで下りた。あとは従来どおり停車保持開度へランプ（今の開度から）
+                if speed <= self._stop_return_low_speed_kmh():
+                    # 低速まで下りた。あとは停車保持開度へ（今の開度から。コーストダウンは
+                    # 徐々に踏む、それ以外は従来どおり brake_ramp_time_s のランプ）
                     self._db_gprop = False
+                    self._db_creep_press = self._creep_press_applies()
                     self._brake_ramp_from = self._current_brake_opening
                     self._phase_started_at = now
                     elapsed = 0.0
-            if speed <= STOP_SPEED_KMH:
-                if isinstance(pattern, GridLaunchPattern):
-                    self._grid_launch_continue(now)  # 停車復帰が済んだ。次の発進へ
-                elif isinstance(pattern, GridSweepPattern):
-                    self._sweep_pass_done(pattern, now)  # 掃引 1 回が済んだ。次の回・次の掃引へ
-                else:
+            if self._db_creep_press:
+                # 段2l-6b: 停車かつ停車保持開度に届いてから次へ。時間切れも届いてから数える
+                # （踏み上げに 30 秒以上かかるため、届く前には中断しない）
+                if (
+                    self._db_press_reached_at is None
+                    and self._brake_request >= self._stop_return_brake_pct - 1e-9
+                ):
+                    self._db_press_reached_at = now
+                if self._db_press_reached_at is None:
+                    return
+                if speed <= STOP_SPEED_KMH:
                     self._advance_pattern(now)
+                    return
+                elapsed = now - self._db_press_reached_at
+            if speed <= STOP_SPEED_KMH:
+                self._advance_pattern(now)
             elif elapsed >= self._config.brake_stop_timeout_s:
                 self._pending_abort = (
                     f"停車復帰（DRIVE_BRAKE）で brake_stop_timeout_s="
@@ -901,14 +854,6 @@ class PatternLoop:
             elif elapsed >= self._config.brake_hold_timeout_s:
                 self._finish_pattern(speed, now)
             return
-        if self._phase is _Phase.CRUISE_HOLD:
-            assert isinstance(pattern, GridStationPattern)
-            self._advance_grid_hold(pattern, speed, now)
-            return
-        if self._phase is _Phase.GRID_RETURN:
-            assert isinstance(pattern, GridStationPattern)
-            self._advance_grid_return(pattern, speed, now)
-            return
         if self._phase is _Phase.MEASURE and pattern.kind is PatternKind.CREEP_SETTLE:
             self._advance_creep_settle(elapsed, accel_kmhs, now)
             return
@@ -920,7 +865,7 @@ class PatternLoop:
     def _coast_accel_opening(self, pattern: LearningPattern, now: float) -> float:
         """コーストダウン加速の指令開度（ガバナー適用前）。
 
-        最初は 0 から「不感帯 − approach_margin」まで accel_ramp_time_s で上げる（遊びの中では
+        最初は 0 から「min − approach_margin」まで accel_ramp_time_s で上げる（遊びの中では
         加速が出ない）。以降の開度は `_step_coast_accel` が G との差に応じて動かす。
         """
         cfg = self._config
@@ -1012,16 +957,347 @@ class PatternLoop:
         # （目標 G が出ないほどペダルが利かない場合に、加速だけで走り続けないための打ち切り）
         exit_speed = self._accel_speed_cap - max(0.0, accel_kmhs) * cfg.overspeed_lead_s
         if speed >= exit_speed or elapsed >= cfg.accel_full_range_timeout_s:
-            if pattern.kind is PatternKind.G_CALIB:
-                self._enter_phase(_Phase.CALIB_BRAKE, now)  # 惰行せず、cap からそのまま校正の減速へ
+            self._enter_phase(_Phase.COAST, now)
+
+    # ── G ランプ走行（段2k 段B）─────────────────────────────────────
+    def _ramp_u_limits(self) -> tuple[float, float]:
+        """効く開度 u の範囲 (下限＝ブレーキ側, 上限＝アクセル側)。
+
+        2026-10-07 段2l-2: RAMP_UP は下限 0（ブレーキ側へ行かない。クリープ域で狙いより強く加速
+        しても両ペダル 0 のままクリープに任せる）。RAMP_DOWN で一度ブレーキ側に入ったあと
+        （`_rp_brake_latched`）は上限 0（アクセルへ戻らない。惰行の減速は車速が下がるほど弱く
+        なるので、一度ブレーキが要る領域に入ったらその先でアクセルが要ることはない。ユーザー決定）。
+
+        2026-10-07 段2l-3: ラッチ後の上限を待機位置に取り、u が 0 をまたぐたびにブレーキが
+        0% ↔ 不感帯を飛ばないようにした（飛ぶとペダルの移動（約 0.7 秒）の間に G が変わらず u が
+        積み上がって踏みすぎ、往復した。実機 151515）。
+        2026-10-08 段2l-6: 待機位置が min そのものになったので、ラッチ後の上限は素直に 0
+        （ブレーキ ＝ min ＋ |u|。下限 min）。
+        """
+        ff = self._profile.feedforward_params
+        lo = -max(0.0, self._profile.max_brake_opening - ff.brake_deadband_pct)
+        hi = max(0.0, self._profile.max_accel_opening - ff.accel_deadband_pct)
+        if self._phase is _Phase.RAMP_UP:
+            lo = 0.0
+        elif self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched:
+            hi = 0.0
+        return lo, hi
+
+    def _ramp_on_brake(self) -> bool:
+        """G ランプの u がブレーキ側を指すか（RAMP_DOWN のラッチ後、または u ＜ 0）。"""
+        if self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched:
+            return True
+        return self._rp_u is not None and self._rp_u < 0.0
+
+    def _ramp_estimate_u(self, speed: float, target_g: float) -> float | None:
+        """`speed` で `target_g`（符号つき。加速 +・減速 −）を出すと予測される u。無ければ None。
+
+        実測の（車速・開度・加速度）を持つ `self.glimit` から引く。減速で狙いが惰行より緩い
+        （その車速帯の惰行の減速の中央値より小さい）ときはアクセルを少し踏んだ側（u ＞ 0）、
+        それ以外の減速はブレーキ側（u ＜ 0）の予測を使う。
+
+        2026-10-08 段2l-6: 狙いが貯めた点のどれより強いときは割線の外挿をせず、いちばん効いた
+        点の開度を返す（`extrapolate=False`）。補間は変わらない。
+        """
+        ff = self._profile.feedforward_params
+        target_kmhs = target_g * G_TO_KMHS
+        if target_kmhs >= 0.0:
+            opening = self._glimit_open_for(PEDAL_ACCEL, speed, target_kmhs, extrapolate=False)
+            return None if opening is None else opening - ff.accel_deadband_pct
+        coast = self.glimit.coast_decel_kmhs(speed)
+        if coast is not None and -target_kmhs < coast:
+            # 惰行より緩い減速: アクセル側の負の加速度として引く（惰行の点も使う）
+            opening = self._glimit_open_for(PEDAL_ACCEL, speed, target_kmhs, extrapolate=False)
+            return None if opening is None else opening - ff.accel_deadband_pct
+        opening = self._glimit_open_for(PEDAL_BRAKE, speed, -target_kmhs, extrapolate=False)
+        return None if opening is None else -(opening - ff.brake_deadband_pct)
+
+    def _ramp_command(self) -> tuple[float, float]:
+        """G ランプの指令開度 (アクセル, ブレーキ)。u ＞ 0 はアクセル ＝ min ＋ u、
+        u ＜ 0 はブレーキ ＝ min ＋ |u|、u ＝ 0 は両方 0（待機位置の下限は出力側で掛ける。
+        `fwd_data.effective_opening` の逆）。
+
+        2026-10-07 段2l-3: RAMP_DOWN のラッチ後（ブレーキの領域）は u の符号に関係なく
+        アクセル ＝ 0、ブレーキ ＝ min − u（u は 0 以下なのでブレーキ ≧ min。0% へ戻さない）。
+        0% ↔ 不感帯の飛びでペダルの移動 約 0.7 秒の間に踏みすぎて往復した（実機 151515）。
+
+        2026-10-08 段2l-6: RAMP_UP の発進の段階（`_rp_launch`）は u を使わず、ブレーキ指令
+        `_rp_launch_brake_pct`（止まった開度から min へ単調に下がる）だけを出す。アクセルは 0
+        （待機位置の下限で min）。
+        """
+        ff = self._profile.feedforward_params
+        if self._rp_launch:
+            accel = 0.0
+            brake = self._rp_launch_brake_pct
+        else:
+            if self._rp_u is None:  # RAMP_UP の発進の後: 実測から見積もる。無ければ u ＝ 0 から
+                self._rp_u = self._ramp_initial_u(self._last_speed)
+            u = self._rp_u
+            if self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched:
+                accel = 0.0
+                brake = ff.brake_deadband_pct - u
             else:
-                self._enter_phase(_Phase.COAST, now)
+                accel = ff.accel_deadband_pct + u if u > 0.0 else 0.0
+                brake = ff.brake_deadband_pct - u if u < 0.0 else 0.0
+        self._accel_request = accel
+        self._brake_request = brake
+        if accel <= 0.0:
+            self._accel_gov_cap = None  # 使っていないペダルの古い頭打ちは持ち越さない
+        if brake <= 0.0:
+            self._brake_gov_cap = None
+        if self._accel_gov_cap is not None:
+            accel = min(accel, self._accel_gov_cap)
+        if self._brake_gov_cap is not None:
+            brake = min(brake, self._brake_gov_cap)
+        return (
+            clamp_opening(accel, self._profile.max_accel_opening),
+            clamp_opening(brake, self._profile.max_brake_opening),
+        )
+
+    def _ramp_initial_u(self, speed: float) -> float:
+        """今のフェーズの最初の u。実測から見積もり、範囲に収める（見積もれなければ 0）。"""
+        est = self._ramp_estimate_u(speed, self._ramp_target_g())
+        lo, hi = self._ramp_u_limits()
+        return 0.0 if est is None else min(hi, max(lo, est))
+
+    def _ramp_launch_begin(self) -> None:
+        """RAMP_UP の発進の段階を始める。ブレーキを止まった開度（無ければ停車保持開度）に置く。
+
+        今のブレーキ位置がそれより低いとき（前の G ランプの減速で、止まった開度に届く前に停車した
+        など）は、踏み直さずに今の位置から始める。
+        """
+        self._rp_launch = True
+        start = self._config.stop_confirm_pct
+        if start is None:
+            start = self._stop_return_brake_pct
+        calib = self._profile.calibration
+        if calib is not None:
+            start = min(
+                start,
+                position_to_opening(
+                    self._brake_pos_cmd, calib.brake_zero_pos, calib.brake_full_pos
+                ),
+            )
+        floor = self._profile.feedforward_params.brake_deadband_pct
+        self._rp_launch_brake_pct = max(floor, min(start, self._profile.max_brake_opening))
+
+    def _ramp_target_g(self) -> float:
+        """今のフェーズの狙いの G（符号つき）。"""
+        pattern = self._patterns[self._pattern_idx]
+        assert isinstance(pattern, GRampPattern)
+        return pattern.target_g if self._phase is _Phase.RAMP_UP else -pattern.target_g
+
+    def _ramp_lagged_openings(self, now: float) -> tuple[float, float] | None:
+        """遅れ gov_lead_s を見込んだ窓の実開度の平均 (アクセル, ブレーキ)。2 点未満なら None。"""
+        cfg = self._config
+        lo = now - cfg.gov_lead_s - cfg.coast_accel_slope_window_s
+        hi = now - cfg.gov_lead_s
+        rows = [(a, b) for t, a, b in self._rp_open_hist if lo <= t <= hi]
+        if len(rows) < 2:
+            return None
+        return sum(a for a, _ in rows) / len(rows), sum(b for _, b in rows) / len(rows)
+
+    def _ramp_gain(
+        self, speed: float, actual_a: float, actual_b: float, *, on_brake: bool | None = None
+    ) -> float:
+        """u を動かす速さのゲイン [%/s per G]。
+
+        ゲイン ＝ min(ramp_rate_gain, 1 ÷（感度[G/%] × ramp_settle_time_s））。感度は上限 G の
+        予測マップの実測（今使っているペダルの今の開度付近。`sensitivity_kmhs_per_pct`）。
+        測れていない（None）か 0 以下ならゲインは ramp_rate_gain。ブレーキはアクセルより開度
+        あたりの効きが数倍大きいので、同じゲインでは往復する（2026-10-07 段2l-2）。
+        `on_brake` を渡すとブレーキ側・アクセル側をそれで決める（発進の段階は u が無いので True）。
+        """
+        cfg = self._config
+        ff = self._profile.feedforward_params
+        if self._ramp_on_brake() if on_brake is None else on_brake:
+            sens = self.glimit.sensitivity_kmhs_per_pct(
+                PEDAL_BRAKE, speed, actual_b, ff.brake_deadband_pct
+            )
+        else:
+            sens = self.glimit.sensitivity_kmhs_per_pct(
+                PEDAL_ACCEL, speed, actual_a, ff.accel_deadband_pct
+            )
+        gain = cfg.ramp_rate_gain
+        if sens is not None and sens > 0.0:
+            gain = min(gain, 1.0 / ((sens / G_TO_KMHS) * cfg.ramp_settle_time_s))
+        return gain
+
+    def _step_ramp(self, pattern: GRampPattern, speed: float, now: float) -> float | None:
+        """毎周期、直近 slope_window_s の加速度 G から u を動かす。戻り値は実測 G（窓前は None）。
+
+        u の動かす速さ [%/s] = ゲイン ×（狙いの G − 実測の G）。ゲインは `_ramp_gain`
+        （実測の感度から決め、ramp_rate_gain を上限とする）。差が保持幅
+        max(狙い × ramp_hold_margin_frac, ramp_hold_margin_min_g) 以内なら動かさない。実測は
+        上限 G の予測マップにも足す（アクセル側・ブレーキ側それぞれ。`_step_coast_accel` と同じ）。
+        """
+        cfg = self._config
+        hist = self._rp_hist
+        hist.append((now, speed))
+        while hist and now - hist[0][0] > cfg.coast_accel_slope_window_s:
+            hist.popleft()
+        actual_a = self._accel_actual_pct if self._accel_actual_pct is not None else (
+            self._current_accel_opening
+        )
+        actual_b = self._brake_actual_pct if self._brake_actual_pct is not None else (
+            self._current_brake_opening
+        )
+        self._rp_open_hist.append((now, actual_a, actual_b))
+        max_age = cfg.coast_accel_slope_window_s + cfg.gov_lead_s + 0.5
+        while self._rp_open_hist and now - self._rp_open_hist[0][0] > max_age:
+            self._rp_open_hist.popleft()
+        last_t = self._rp_last_t
+        self._rp_last_t = now
+        # 発進の段階は u が無い（min に着いて渡すとき見積もる）。それ以外は u が出来てから
+        if last_t is None or (self._rp_u is None and not self._rp_launch) or len(hist) < 3:
+            return None
+        dt = now - last_t
+        accel_kmhs = fit_slope([t for t, _ in hist], [v for _, v in hist])
+        measured_g = accel_kmhs / G_TO_KMHS
+        lagged = self._ramp_lagged_openings(now)
+        if lagged is not None and now - self._rp_record_t >= 1.0:
+            lag_a, lag_b = lagged
+            mean_v = sum(v for _, v in hist) / len(hist)
+            # 2026-10-07 段2l-4: 両ペダルが待機位置にいるので「0 超・0.05 以下」では判定できない。
+            # 2026-10-08 段2l-6: 待機位置が min なので、自分が min ＋ 幅 より上・反対側が
+            # min ＋ 幅 以下
+            # （PEDAL_OFF_TOL_PCT。実位置のずれで行が割れないよう幅を持たせる）
+            ffp = self._profile.feedforward_params
+            a_floor = ffp.accel_deadband_pct + PEDAL_OFF_TOL_PCT
+            b_floor = ffp.brake_deadband_pct + PEDAL_OFF_TOL_PCT
+            if lag_a > a_floor and lag_b <= b_floor:
+                self._rp_record_t = now
+                self.glimit.add(PEDAL_ACCEL, mean_v, lag_a, accel_kmhs)
+            elif lag_b > b_floor and lag_a <= a_floor:
+                # 発進の段階は加速中でブレーキの減速は負になる。減速が出た点だけ貯める
+                if not self._rp_launch or -accel_kmhs > 0.0:
+                    self._rp_record_t = now
+                    self.glimit.add(PEDAL_BRAKE, mean_v, lag_b, -accel_kmhs)
+        target = self._ramp_target_g()
+        err = target - measured_g
+        margin = max(pattern.target_g * cfg.ramp_hold_margin_frac, cfg.ramp_hold_margin_min_g)
+        if self._rp_launch:
+            self._step_ramp_launch(speed, err, margin, dt, actual_a, actual_b)
+            return measured_g
+        assert self._rp_u is not None
+        if abs(err) > margin:
+            new_u = self._rp_u + self._ramp_gain(speed, actual_a, actual_b) * err * dt
+            # ガバナーで削られている間は、削られているペダルをさらに踏み増す向きへ積まない
+            # （ラッチ後は u が減る向きが踏み増し。それ以外は |u| が増える向き）
+            if self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched:
+                pressing_more = new_u < self._rp_u
+            else:
+                pressing_more = abs(new_u) > abs(self._rp_u)
+            if self._governor_limiting() and pressing_more:
+                new_u = self._rp_u
+            lo, hi = self._ramp_u_limits()
+            self._rp_u = min(hi, max(lo, new_u))
+            if (
+                self._phase is _Phase.RAMP_DOWN
+                and not self._rp_brake_latched
+                and self._rp_u < 0.0
+            ):
+                self._rp_brake_latched = True
+                # ラッチした瞬間は待機位置（min）から踏み始める（0% から min まで空走させない）
+                self._rp_u = self._ramp_u_limits()[1]
+        return measured_g
+
+    def _step_ramp_launch(
+        self, speed: float, err: float, margin: float, dt: float, actual_a: float, actual_b: float
+    ) -> None:
+        """RAMP_UP の発進の段階の毎周期の処理（2026-10-08 段2l-6）。
+
+        実測 G が狙いより margin を超えて低いときだけ、ブレーキを `ramp_gain × 不足 × dt` 下げる。
+        狙い以上ならその位置で止めて待つ。上げる方向へは動かさない（単調に下がり、踏み直さない）。
+        ブレーキが min に着いたら発進の段階を終える（u の見積もりは次の指令で `_ramp_command` が
+        行い、アクセルの u 制御（u ≥ 0）に渡す。以後その RAMP_UP ではブレーキに戻らない）。
+        """
+        floor = self._profile.feedforward_params.brake_deadband_pct
+        if err > margin:
+            gain = self._ramp_gain(speed, actual_a, actual_b, on_brake=True)
+            self._rp_launch_brake_pct = max(floor, self._rp_launch_brake_pct - gain * err * dt)
+        if self._rp_launch_brake_pct <= floor:
+            self._rp_launch = False
+
+    def _advance_ramp(
+        self, pattern: GRampPattern, speed: float, elapsed: float, now: float
+    ) -> None:
+        """G ランプの前進判定。
+
+        RAMP_UP: 車速が上端（`top_kmh`。最高速側の安全のため accel_speed_cap − 加速度 ×
+        overspeed_lead_s でも頭打ち）に着いたら RAMP_DOWN へ。RAMP_DOWN: 車速が停車
+        （`STOP_SPEED_KMH` 以下）になったら `_finish_pattern` へ渡す（2026-10-08 段2l-6:
+        旧 coast_down_stop_speed_kmh（5 km/h）から変更。0 km/h まで測る）。
+        どちらの区間も、見込み秒数 × RAMP_LEG_TIMEOUT_FACTOR ＋ RAMP_LEG_TIMEOUT_MARGIN_S で打ち切り
+        （狙いの G に届かないときの安全網。RAMP_UP は RAMP_DOWN へ、RAMP_DOWN は停車復帰へ進む）。
+        """
+        cfg = self._config
+        measured_g = self._step_ramp(pattern, speed, now)
+        self._rp_max_speed = max(self._rp_max_speed, speed)
+        if measured_g is not None and elapsed >= cfg.coast_accel_slope_window_s:
+            (self._rp_up_g if self._phase is _Phase.RAMP_UP else self._rp_down_g).append(measured_g)
+        if speed > self._profile.max_speed:
+            self._skip_count += 1
+        else:
+            self._skip_count = 0
+        if self._skip_count >= cfg.skip_consecutive_required:
+            self._ramp_record_result(pattern, now)
+            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
+            return
+        leg_s = max(pattern.top_kmh, 0.0) / (max(pattern.target_g, 1e-6) * G_TO_KMHS)  # 0 km/h まで
+        timeout_s = leg_s * RAMP_LEG_TIMEOUT_FACTOR + RAMP_LEG_TIMEOUT_MARGIN_S
+        if self._phase is _Phase.RAMP_UP:
+            hist = self._rp_hist
+            accel_kmhs = (
+                fit_slope([t for t, _ in hist], [v for _, v in hist]) if len(hist) >= 3 else 0.0
+            )
+            exit_speed = min(
+                pattern.top_kmh, self._accel_speed_cap - max(0.0, accel_kmhs) * cfg.overspeed_lead_s
+            )
+            if speed >= exit_speed or elapsed >= timeout_s:
+                self._ramp_switch_down(speed, now)
+            return
+        if speed <= STOP_SPEED_KMH or elapsed >= timeout_s:
+            self._ramp_record_result(pattern, now)
+            self._finish_pattern(speed, now)
+
+    def _ramp_switch_down(self, speed: float, now: float) -> None:
+        """RAMP_UP → RAMP_DOWN。最初の u は実測から見積もる（無ければ今の u から続ける）。"""
+        self._rp_down_started = now
+        self._enter_phase(_Phase.RAMP_DOWN, now)  # u は引き継ぐ（RAMP_UP のときだけ作り直す）
+        self._rp_brake_latched = False  # 見積もりの前に下ろす（上限 0 で見積もりを潰さない）
+        est = self._ramp_estimate_u(speed, self._ramp_target_g())
+        if est is not None:
+            lo, hi = self._ramp_u_limits()
+            self._rp_u = min(hi, max(lo, est))
+            if est < 0.0:
+                self._rp_brake_latched = True
+
+    def _ramp_record_result(self, pattern: GRampPattern, now: float) -> None:
+        """この G ランプの結果（所要秒数・実測 G の中央値・最高車速）を記録する。"""
+        if self._phase is _Phase.RAMP_UP:
+            up_s, down_s = now - self._rp_up_started, 0.0
+        else:
+            up_s = self._rp_down_started - self._rp_up_started
+            down_s = now - self._rp_down_started
+        self.ramp_results.append(
+            RampResult(
+                pattern_idx=self._pattern_idx,
+                target_g=pattern.target_g,
+                top_kmh=pattern.top_kmh,
+                up_s=up_s,
+                down_s=down_s,
+                accel_g_median=statistics.median(self._rp_up_g) if self._rp_up_g else None,
+                decel_g_median=-statistics.median(self._rp_down_g) if self._rp_down_g else None,
+                max_speed_kmh=self._rp_max_speed,
+            )
+        )
 
     def _calib_brake_opening(self, now: float) -> float:
-        """G 校正のブレーキ開度（ガバナー適用前）。
+        """高い車速からの停車復帰の G 比例ブレーキ開度（ガバナー適用前）。
 
-        最初は 0 から「不感帯 − approach_margin」まで brake_ramp_time_s で上げる（遊びの中では
-        減速が出ない）。以降の開度は `_advance_calib_brake` が減速 G との差に応じて刻む。
+        最初は 0 から「min − approach_margin」まで brake_ramp_time_s で上げる（遊びの中では
+        減速が出ない）。以降の開度は `_step_gprop_brake` が減速 G との差に応じて刻む。
         上限は停車保持開度（停車復帰で毎回踏んでいる実績のある開度）。
         """
         cfg = self._config
@@ -1031,8 +1307,8 @@ class PatternLoop:
                 self._stop_return_brake_pct,
                 max(0.0, ff.brake_deadband_pct - cfg.coast_accel_approach_margin_pct),
             )
-            # G 校正が済んでいれば、その車速で目標 G が出る開度から始める（校正の結果の使いどころ。
-            # 無ければ不感帯の手前から刻んで上げる）
+            # コーストダウン・G ランプの実測があれば、その車速で目標 G が出る開度から始める
+            # （無ければ min の手前から刻んで上げる）
             self._cb_start_pct = self._cb_approach_pct
             predicted = self._glimit_open_for(
                 PEDAL_BRAKE, self._last_speed, cfg.coast_accel_target_g * G_TO_KMHS
@@ -1050,18 +1326,8 @@ class PatternLoop:
             self._cb_next_t = now + cfg.calib_dwell_s
         return self._cb_opening
 
-    def _advance_calib_brake(self, speed: float, elapsed: float, now: float) -> None:
-        """G 校正の減速。低速まで下りたら終わる。刻みは `_step_gprop_brake`。"""
-        cfg = self._config
-        self._step_gprop_brake(speed, now)
-        if speed > self._profile.max_speed:
-            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
-            return
-        if speed <= cfg.coast_down_stop_speed_kmh or elapsed >= cfg.brake_stop_timeout_s:
-            self._finish_pattern(speed, now)
-
     def _step_gprop_brake(self, speed: float, now: float) -> None:
-        """G 比例ブレーキ減速の毎周期の処理（G 校正・高い車速からの停車復帰で共用）。
+        """G 比例ブレーキ減速の毎周期の処理（高い車速からの停車復帰）。
 
         dwell_s ごとに直近 slope_window_s の減速 G から開度を 1 刻み動かし、そのときの
         (開度, 減速) を上限 G の予測マップに足す。
@@ -1088,33 +1354,17 @@ class PatternLoop:
         elif decel_kmhs < press_below:
             self._cb_opening = min(self._stop_return_brake_pct, self._cb_opening + step_pct)
 
-    def _glimit_open_for(self, pedal: str, speed_kmh: float, target_kmhs: float) -> float | None:
-        """そのペダルが `target_kmhs`（正）を出すと予測される開度（測れていなければ None）。"""
+    def _glimit_open_for(
+        self, pedal: str, speed_kmh: float, target_kmhs: float, *, extrapolate: bool = True
+    ) -> float | None:
+        """そのペダルが `target_kmhs`（正）を出すと予測される開度（測れていなければ None）。
+
+        `extrapolate=False` は G ランプの最初の開度の見積もり用（狙いが貯めた点のどれより強い
+        ときは、いちばん効いた点の開度を返す。2026-10-08 段2l-6）。
+        """
         ff = self._profile.feedforward_params
         db = ff.brake_deadband_pct if pedal == PEDAL_BRAKE else ff.accel_deadband_pct
-        return self.glimit.cap_pct(pedal, speed_kmh, target_kmhs, db)
-
-    def _glimit_cap(self, pedal: str, speed_kmh: float) -> float | None:
-        """格子ステップの開度の上限（上限 G に届くと予測される開度）。測れていなければ None。"""
-        ff = self._profile.feedforward_params
-        db = ff.brake_deadband_pct if pedal == PEDAL_BRAKE else ff.accel_deadband_pct
-        return self.glimit.cap_pct(pedal, speed_kmh, self._config.g_cap_g * G_TO_KMHS, db)
-
-    def _grid_feed_glimit(self, step: Step, a_meas: float, now: float, s: GridSettings) -> None:
-        """測れたステップの (開度, 加速度) を上限 G の予測マップに足す。"""
-        assert self._phase_started_at is not None
-        t0 = self._phase_started_at + s.step_lag_s
-        vs = [v for t, v in self._grid_samples if t >= t0] or [v for _, v in self._grid_samples]
-        if not vs:
-            return
-        mean_v = sum(vs) / len(vs)
-        if step.kind is StepKind.COAST:
-            if a_meas < 0.0:
-                self.glimit.add_coast(mean_v, -a_meas)
-        elif step.brake_pct > 0.0:
-            self.glimit.add(PEDAL_BRAKE, mean_v, step.brake_pct, -a_meas)
-        elif step.accel_pct > 0.0 and step.kind is not StepKind.HOLD:
-            self.glimit.add(PEDAL_ACCEL, mean_v, step.accel_pct, a_meas)
+        return self.glimit.cap_pct(pedal, speed_kmh, target_kmhs, db, extrapolate=extrapolate)
 
     def _advance_coast(self, speed: float, accel_kmhs: float, elapsed: float, now: float) -> None:
         """コーストダウンの惰行の前進判定（段7c: 終了をクリープ平衡車速から決める）。
@@ -1123,16 +1373,17 @@ class PatternLoop:
         高い車両では惰行だけで届かず `coast_timeout_s`（90s）まで待ち、低い車両では惰行カーブの
         低速端のデータを取りこぼしていた。惰行は平衡へ漸近するだけでちょうど届く保証がないため、
         平衡以下に達するか、クリープの影響が残る車速（平衡 + `grid_settle_tol_kmh`）以下で
-        車速の傾きが落ち着いたら終える（`_coast_creep_settled`。停車ステップの
-        `_grid_creep_settled` と同じ判定・調整値）。`coast_down_stop_speed_kmh` は他の使い道
-        （G 校正のブレーキ減速の終了・停車復帰の切替・格子ステップの底・発進セル）のまま残す。
+        車速の傾きが落ち着いたら終える（`_coast_creep_settled`）。`coast_down_stop_speed_kmh` は
+        他の使い道（G ランプの減速の終了・G ランプなどの停車復帰の切替・超過回復）のまま残す。
+        コーストダウンの停車復帰の境目は車ごと（`_stop_return_low_speed_kmh`。2026-10-08
+        段2l-6b）で、クリープ域は停車保持開度まで徐々に踏む。
         """
         cfg = self._config
         if speed > self._profile.max_speed:
             self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
             return
         if elapsed >= cfg.coast_measure_delay_s and accel_kmhs < 0.0:
-            self.glimit.add_coast(speed, -accel_kmhs)  # 上限 G の予測の基準（開度=不感帯の点）
+            self.glimit.add_coast(speed, -accel_kmhs)  # 上限 G の予測の基準（開度=min の点）
         if elapsed >= cfg.coast_timeout_s:
             self._finish_pattern(speed, now)
             return
@@ -1140,16 +1391,15 @@ class PatternLoop:
         if speed <= creep:
             self._finish_pattern(speed, now)
             return
-        ceiling = self._grid_creep_ceiling_kmh(cfg.grid_settle_tol_kmh)
+        ceiling = self._creep_ceiling_kmh(cfg.grid_settle_tol_kmh)
         if speed <= ceiling and self._coast_creep_settled(now):
             self._finish_pattern(speed, now)
 
     def _coast_creep_settled(self, now: float) -> bool:
         """コーストダウンの惰行が、クリープ平衡近くで車速の傾きが落ち着いたか（段7c）。
 
-        停車ステップの `_grid_creep_settled` と同じ判定・同じ調整値（`creep_launch_settle_*`）を、
-        格子ステップの記録（`_grid_samples`）ではなく毎周期の `_speed_hist`（コーストダウンは
-        格子パターンの外でも走るため）から行う。
+        クリープ発進の平衡到達と同じ調整値（`creep_launch_settle_*`）で、毎周期の `_speed_hist`
+        の傾きを見る。
         """
         cfg = self._config
         window_s = cfg.creep_launch_settle_s
@@ -1213,458 +1463,45 @@ class PatternLoop:
             self._stable_count = 0
             self._advance_pattern(now)
 
-    # ── 格子ステップ走行（段3）───────────────────────────────────────
-    def _grid_enter_pattern(self, pattern: LearningPattern, now: float) -> bool:
-        """グリッドのパターンに入った最初の周期の準備。パターンをとばしたら True。"""
-        if self._grid is None or self._grid_seen_idx == self._pattern_idx:
-            return False
-        if not isinstance(pattern, GridStationPattern | GridLaunchPattern):
-            return False
-        self._grid_seen_idx = self._pattern_idx
-        if isinstance(pattern, GridStationPattern):
-            self._grid_reset_settle(now)
-            self._grid_station_begun = False
-            self._grid_approach_kmh = None
-            return False
-        assert pattern.plan is not None
-        self._grid.begin_launch(pattern.plan)
-        step = self._grid.next_step()
-        if step is None:
-            self._advance_pattern(now)
-            return True
-        self._grid_start_step(step, now)
-        return False
-
-    def _grid_reset_settle(self, now: float) -> None:
-        self._grid_settle_started = now
-        self._grid_settle_since = None
-        self._grid_window = []
-        self._grid_window_speeds = []
-        self._grid_wait_cycles = 0
-        self._grid_inside_cycles = 0
-
-    def _grid_record_settle(
-        self, pattern: GridStationPattern, now: float, *, timed_out: bool
-    ) -> None:
-        """落ち着き待ちの 1 回ぶんを記録する（許容幅・待ち時間を決める材料。grid_settle）。"""
-        assert pattern.plan is not None
-        window = self._grid_window
-        window_speeds = self._grid_window_speeds
-        record = SettleRecord(
-            station_kmh=pattern.plan.speed_kmh,
-            target_kmh=self._grid_target_kmh(pattern),
-            approach=self._grid_approach_kmh is not None,
-            wait_s=now - self._grid_settle_started,
-            inside_frac=self._grid_inside_cycles / max(self._grid_wait_cycles, 1),
-            u_mean_pct=(
-                float("nan") if timed_out or not window else statistics.fmean(window)
-            ),
-            u_std_pct=(
-                float("nan") if timed_out or len(window) < 2 else statistics.pstdev(window)
-            ),
-            timed_out=timed_out,
-            slope_kmhs=(
-                float("nan") if timed_out or len(window_speeds) < 2
-                else fit_slope([t for t, _ in window_speeds], [v for _, v in window_speeds])
-            ),
-        )
-        self.grid_settles.append(record)
-        if self._on_grid_settle is not None:
-            self._on_grid_settle(record)
-
-    def _grid_start_step(self, step: Step, now: float) -> None:
-        """開度固定のステップを始める（`_enter_phase` は通さない。PI 状態を消さないため）。"""
-        self._grid_step = step
-        self._grid_samples = []
-        self._grid_governed = False
-        self._accel_gov_cap = None
-        self._brake_gov_cap = None
-        self._step_from = (self._current_accel_opening, self._current_brake_opening)
-        self._phase = _Phase.HOLD_STEP
-        self._phase_started_at = now
-
-    def _grid_target_kmh(self, pattern: GridStationPattern) -> float:
-        """PI の目標車速: 助走中は助走の車速、それ以外はステーションの中心。"""
-        assert pattern.plan is not None
-        if self._grid_approach_kmh is not None:
-            return self._grid_approach_kmh
-        return pattern.plan.speed_kmh
-
-    def _grid_hold_opening(self, pattern: GridStationPattern) -> float:
-        """ステーションの車速へ保つ専用 PI の開度。ゲインは感度 g_accel で正規化する。"""
-        assert self._grid is not None and pattern.plan is not None
-        s = pattern.settings
-        ff = self._profile.feedforward_params
-        min_pct, max_pct = ff.accel_deadband_pct, self._profile.max_accel_opening
-        if self._grid_opening is None:
-            self._grid_opening = min_pct  # 停車・回復の後は不感帯から。レート制限で上げていく
-            self._grid_integral = min_pct
-        g = self._grid.g_accel
-        self._grid_opening, self._grid_integral = pi_hold_step(
-            self._grid_opening, self._grid_integral,
-            self._grid_target_kmh(pattern), self._last_speed,
-            kp=s.hold_kp_norm / g, ki=s.hold_ki_norm / g, min_pct=min_pct, max_pct=max_pct,
-            max_rate_pct_s=s.hold_max_rate_pct_s, dt=self._interval_s,
-        )
-        return self._grid_opening
-
-    def _grid_return_opening(self, pattern: GridStationPattern) -> float:
-        """GRID_RETURN（段7b・7c）の指令開度。PI（CRUISE_HOLD）より速く目標へ寄せる。
-
-        目標より遅ければ `_step_grid_return` が毎周期刻み足した開度（`_gr_opening`）をそのまま
-        返す。目標より速ければ不感帯（惰行）でよい（下がり過ぎない限りブレーキは踏まない）。
-        """
-        assert self._grid is not None and pattern.plan is not None
-        ff = self._profile.feedforward_params
-        if self._last_speed >= self._grid_target_kmh(pattern):
-            return ff.accel_deadband_pct
-        return self._gr_opening
-
-    def _step_grid_return(self, pattern: GridStationPattern, speed: float, now: float) -> None:
-        """GRID_RETURN 毎周期の開度の刻み足し（段7c）。
-
-        直近 `coast_accel_slope_window_s` の実測加速度と `grid_return_accel_kmhs`（狙い）の差
-        [G] に応じて `coast_accel_rate_gain` で踏み足す（G 校正の加速 `_step_coast_accel` と
-        同じ式）。踏み始めの開度は `_grid_begin_return` が `u0 + (狙い − a_hold) / g_accel`
-        （感度は段7c で glimit から種をまいた値）で決めており、ここではその後を実測で補正する。
-
-        20260928 実機: 15→25 km/h の戻りが、感度の当て推量（仮定値 2.0 で実測の 1/8）だけの
-        開度 8.11%（釣り合い車速 21.2 km/h）で 190 s 止まった。実測の加速度で補正すれば、
-        狙いに届かない開度のまま止まり続けることはない。
-        """
-        assert self._grid is not None
-        cfg = self._config
-        hist = self._gr_hist
-        hist.append((now, speed))
-        while hist and now - hist[0][0] > cfg.coast_accel_slope_window_s:
-            hist.popleft()
-        if self._gr_last_t is None:
-            self._gr_last_t = now
-            return
-        dt = now - self._gr_last_t
-        self._gr_last_t = now
-        if len(hist) < 3:
-            return
-        accel_kmhs = fit_slope([t for t, _ in hist], [v for _, v in hist])
-        margin_g = (pattern.settings.grid_return_accel_kmhs - accel_kmhs) / G_TO_KMHS
-        if abs(margin_g) <= cfg.coast_accel_press_margin_g:
-            return
-        opening = self._gr_opening + cfg.coast_accel_rate_gain * margin_g * dt
-        opening = min(self._profile.max_accel_opening, max(self._grid.u0, opening))
-        cap = self._glimit_cap(PEDAL_ACCEL, speed)
-        if cap is not None:
-            opening = min(opening, cap)
-        self._gr_opening = opening
-
-    def _grid_step_openings(self, now: float, lag_s: float) -> tuple[float, float]:
-        """HOLD_STEP の指令: ステップの開度（固定）。踏むペダルは step_lag_s かけて上げる（段6b）。
-
-        一気に出すと、指令から G の山まで約 0.6 s の遅れの間に上限 G を超える（20260926 の 0.47G）。
-        step_lag_s は傾きの当てはめから除く区間（頭の 0.5 s）と同じなので、測定には影響しない。
-        もう一方のペダル（0 のペダル）は即座に離す。ランプの始点はステップを始めたときの開度。
-        """
-        step = self._grid_step
-        assert step is not None and self._phase_started_at is not None
-        frac = self._ramp_fraction(now - self._phase_started_at, lag_s)
-        accel, brake = step.accel_pct, step.brake_pct
-        self._accel_request, self._brake_request = accel, brake
-        from_accel, from_brake = self._step_from
-        if accel > 0.0:
-            accel = from_accel + (accel - from_accel) * frac
-        if brake > 0.0:
-            brake = from_brake + (brake - from_brake) * frac
-        if self._accel_gov_cap is not None:
-            accel = min(accel, self._accel_gov_cap)
-        if self._brake_gov_cap is not None:
-            brake = min(brake, self._brake_gov_cap)
+    def _creep_press_applies(self) -> bool:
+        """停車復帰を「徐々に踏む」にするか（段2l-6b）。コーストダウンで、超過回復でなく、
+        踏む速さが決まる（calib_dwell_s > 0）とき。"""
         return (
-            clamp_opening(accel, self._profile.max_accel_opening),
-            clamp_opening(brake, self._profile.max_brake_opening),
+            self._pattern_idx < len(self._patterns)
+            and self._patterns[self._pattern_idx].kind is PatternKind.COAST_DOWN
+            and not self._overspeed_recovery
+            and self._stop_return_press_rate_pctps() is not None
         )
 
-    def _grid_handle_settle_timeout(
-        self, pattern: GridStationPattern, speed: float, now: float
-    ) -> None:
-        """落ち着き待ちの打ち切り（CRUISE_HOLD・GRID_RETURN 共通。段7c）。
+    def _stop_return_low_speed_kmh(self) -> float:
+        """停車復帰で G 比例ブレーキからクリープ域の踏み方へ切り替える車速（段2l-6b）。
 
-        助走中なら、そのステップだけとばして中心へ戻る。中心（助走なし）ならステーションの
-        残りをすべて捨てて次へ進む。以前は CRUISE_HOLD（`_advance_grid_hold`）側にしか無く、
-        GRID_RETURN は釣り合い車速が目標に届かないと永久に待ち続けた（20260928 実機で 190 s）。
+        コーストダウンはクリープ車速 + 落ち着きの許容幅（車ごと）。それ以外・超過回復は固定の
+        `coast_down_stop_speed_kmh`。
         """
-        assert self._grid is not None
-        self._grid_record_settle(pattern, now, timed_out=True)
-        if self._grid_approach_kmh is not None:
-            self._grid.drop_next()
-            self._grid_approach_kmh = None
-            self._grid_reset_settle(now)
-            return
-        self._grid.abort_remaining()
-        self._grid_station_done(speed, now)
+        cfg = self._config
+        if (
+            self._pattern_idx < len(self._patterns)
+            and self._patterns[self._pattern_idx].kind is PatternKind.COAST_DOWN
+            and not self._overspeed_recovery
+        ):
+            return self._creep_ceiling_kmh(cfg.grid_settle_tol_kmh)
+        return cfg.coast_down_stop_speed_kmh
 
-    def _advance_grid_hold(self, pattern: GridStationPattern, speed: float, now: float) -> None:
-        """ステーションで PI が落ち着くのを待ち、落ち着いたら次のステップを始める。"""
-        assert self._grid is not None and pattern.plan is not None
-        s = pattern.settings
-        if speed > self._profile.max_speed:
-            self._grid.abort_remaining()
-            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
-            return
-        self._grid_wait_cycles += 1
-        if abs(speed - self._grid_target_kmh(pattern)) <= s.settle_tol_kmh:
-            self._grid_inside_cycles += 1
-            if self._grid_settle_since is None:
-                self._grid_settle_since = now
-            self._grid_window.append(self._current_accel_opening)
-            self._grid_window_speeds.append((now, speed))
-        else:
-            self._grid_settle_since = None
-            self._grid_window = []
-            self._grid_window_speeds = []
-        settled = (
-            self._grid_settle_since is not None and now - self._grid_settle_since >= s.settle_s
-        )
-        if not settled:
-            if now - self._grid_settle_started >= s.settle_timeout_s:
-                self._grid_handle_settle_timeout(pattern, speed, now)
-            return
-        window_mean = sum(self._grid_window) / len(self._grid_window)
-        self._grid_record_settle(pattern, now, timed_out=False)
-        if not self._grid_station_begun:
-            self._grid.begin_station(pattern.plan, window_mean)
-            self._grid_station_begun = True
-        u0_approach: float | None = None
-        if self._grid_approach_kmh is None:
-            approach = self._grid.peek_approach_kmh()
-            if approach is not None:  # 強いステップ: 帯の手前の端へ移ってから踏む
-                self._grid_begin_return(pattern, now, approach, speed, is_approach=True)
-                return
-        else:
-            u0_approach = window_mean  # 助走の車速で落ち着いた開度 = そこでの加速度 0 の開度 u0'
-        step = self._grid.next_step(u0_approach)
-        self._grid_approach_kmh = None
-        if step is None:
-            self._grid_station_done(speed, now)
-            return
-        self._grid_start_step(step, now)
+    def _stop_return_press_rate_pctps(self) -> float | None:
+        """クリープ域で停車保持開度へ踏み上げる速さ [%/s]。`_step_gprop_brake` の 1 刻み/待ちと
+        同じ。calib_dwell_s が 0 以下なら None（従来のランプに落とす）。"""
+        cfg = self._config
+        if cfg.calib_dwell_s <= 0.0:
+            return None
+        return cfg.calib_step_mm * 100.0 * 100.0 / ACTUATOR_PULSE_MAX / cfg.calib_dwell_s
 
-    def _advance_grid_step(self, pattern: LearningPattern, speed: float, now: float) -> None:
-        """開度固定のステップの終了判定。終わったら加速度を測って記録し、次へ進む。"""
-        assert self._grid is not None and self._grid_step is not None
-        assert isinstance(pattern, GridStationPattern | GridLaunchPattern)
-        assert pattern.plan is not None
-        s = pattern.settings
-        step = self._grid_step
-        assert self._phase_started_at is not None
-        elapsed = now - self._phase_started_at
-        self._grid_samples.append((now, speed))
-        self._grid_governed = self._grid_governed or self._governor_limiting()
-        launching = isinstance(pattern, GridLaunchPattern)
-        if speed > self._profile.max_speed:
-            self._grid.abort_remaining()
-            self._grid_step = None
-            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
-            return
-        if step.kind is StepKind.LAUNCH:
-            plan = pattern.plan
-            assert isinstance(plan, LaunchPlan)
-            done = speed >= plan.end_kmh or elapsed >= s.settle_timeout_s
-        elif step.kind is StepKind.STOP:
-            done = (
-                speed <= STOP_SPEED_KMH or elapsed >= s.settle_timeout_s
-                or self._grid_creep_settled(now, speed, s)
-            )
-        else:
-            plan = pattern.plan
-            assert isinstance(plan, StationPlan)
-            floor = self._config.coast_down_stop_speed_kmh
-            if step.approach_kmh is not None:
-                assert step.target is not None
-                # 助走の端から踏んだので、帯の反対側へ出たら終える（今いる側は出ていてよい）
-                edge = s.step_band_max_kmh
-                beyond = (
-                    speed > plan.speed_kmh + edge if step.target.a_kmhs > 0.0
-                    else speed < plan.speed_kmh - edge
-                )
-            else:
-                beyond = abs(speed - plan.speed_kmh) > s.step_band_max_kmh
-            done = elapsed >= s.step_window_s or beyond or speed <= floor
-        if not done:
-            return
-        a_meas, fit_points, fit_resid = self._grid_measured_accel(step, now, s)
-        self._grid_feed_glimit(step, a_meas, now, s)
-        result = self._grid.record(
-            step, a_meas, governed=self._grid_governed,
-            fit_points=fit_points, fit_resid_kmh=fit_resid,
-        )
-        if self._on_grid_result is not None:
-            self._on_grid_result(result)
-        self._grid_step = None
-        if launching:
-            self._grid_launch_after_step(pattern, speed, now)
-        else:
-            # 低速まで落ちても残りは捨てない（段4b）。低いステーションでは強い減速のあとに車速が
-            # 底まで落ちるが、続く強い加速こそ US06 などで要る狙い。GRID_RETURN・PI（段7b）で
-            # ステーションの車速へ戻る（戻れなければ落ち着き待ちの打ち切りが残りをとばす）
-            assert isinstance(pattern, GridStationPattern)
-            self._grid_begin_return(pattern, now, plan.speed_kmh, speed, is_approach=False)
-
-    def _grid_creep_ceiling_kmh(self, settle_tol_kmh: float) -> float:
+    def _creep_ceiling_kmh(self, settle_tol_kmh: float) -> float:
         """クリープの影響が残る車速の上端 = クリープ平衡速度 + 落ち着きの許容幅。
 
-        段7c: コーストダウンの終了判定（`_advance_coast`）からも使うため、`GridSettings` 全体
-        ではなく `settle_tol_kmh` だけを受け取る（格子のパターンが無い走行でも使えるように）。
+        コーストダウンの終了判定（`_advance_coast`）が使う。
         """
         return self._profile.feedforward_params.creep_speed_kmh + settle_tol_kmh
-
-    def _grid_creep_settled(self, now: float, speed: float, s: GridSettings) -> bool:
-        """停車ステップがクリープ平衡に達したか（ブレーキが弱く、停まらずにクリープ速度で釣り合った）。
-
-        車速がクリープ域で、直近 creep_launch_settle_s の傾きが creep_launch_settle_kmhs 未満。
-        判定値は既存のクリープ発進の平衡到達と同じ（新しい数値は持たない）。
-        """
-        if speed > self._grid_creep_ceiling_kmh(s.settle_tol_kmh):
-            return False
-        window_s = self._config.creep_launch_settle_s
-        recent = [(t, v) for t, v in self._grid_samples if t >= now - window_s]
-        if len(recent) < 3 or self._grid_samples[0][0] > now - window_s:
-            return False
-        slope = fit_slope([t for t, _ in recent], [v for _, v in recent])
-        return abs(slope) < self._config.creep_launch_settle_kmhs
-
-    def _grid_measured_accel(
-        self, step: Step, now: float, s: GridSettings
-    ) -> tuple[float, int, float]:
-        """ステップの加速度 [km/h/s] = 車速の最小二乗の傾き。頭の step_lag_s は除く。
-
-        戻り値は `(傾き, 当てはめに使った点数, 車速の残差の標準偏差)`（後ろ 2 つは集計用）。
-        """
-        assert self._phase_started_at is not None
-        t0 = self._phase_started_at + s.step_lag_s
-        samples = [(t, v) for t, v in self._grid_samples if t >= t0]
-        if step.kind in (StepKind.LAUNCH, StepKind.STOP):
-            # クリープの影響がある低速域（停車付近・クリープ平衡）を除く
-            floor = self._grid_creep_ceiling_kmh(s.settle_tol_kmh)
-            samples = [(t, v) for t, v in samples if v >= floor]
-        if len(samples) < 3:
-            samples = self._grid_samples
-        times, speeds = [t for t, _ in samples], [v for _, v in samples]
-        slope = fit_slope(times, speeds)
-        resid = float("nan")
-        if len(samples) >= 3 and times[-1] - times[0] > 0.0:
-            coef = np.polyfit(np.asarray(times, dtype=float), np.asarray(speeds, dtype=float), 1)
-            fitted = np.polyval(coef, np.asarray(times, dtype=float))
-            resid = float(np.std(np.asarray(speeds, dtype=float) - fitted))
-        return slope, len(samples), resid
-
-    def _grid_begin_return(
-        self, pattern: GridStationPattern, now: float, target_kmh: float, speed: float,
-        *, is_approach: bool,
-    ) -> None:
-        """新しい戻り試行を始める（段7b）: ステップの後、または助走の目標を決めたとき。
-
-        ステーション開始済み（u0 あり）で、目標（`target_kmh`）から `grid_return_switch_kmh` より
-        離れていれば `_Phase.GRID_RETURN`（固定開度で速く戻る）へ。そうでなければ従来どおり
-        直接 `_grid_switch_to_cruise_hold`（PI に任せる）。落ち着き待ちの打ち切りタイマーは
-        ここで一度だけリセットする（GRID_RETURN に入ってもリセットしない＝戻りの間も進む）。
-        """
-        assert self._grid is not None
-        self._grid_reset_settle(now)
-        self._grid_approach_kmh = target_kmh if is_approach else None
-        # 直前のステップのガバナー頭打ちを引き継がない（`_grid_start_step` と同じ流儀）
-        self._accel_gov_cap = None
-        self._brake_gov_cap = None
-        switch = pattern.settings.grid_return_switch_kmh
-        if self._grid_station_begun and abs(target_kmh - speed) > switch:
-            self._phase = _Phase.GRID_RETURN
-            self._phase_started_at = now
-            self._gr_hist.clear()
-            self._gr_last_t = None
-            # 段7c: 開度の始点は従来どおりの当て推量（u0 + (狙い − a_hold) / g_accel。g_accel は
-            # ステーション開始時に glimit から種をまいた値）。以降は _step_grid_return が実測で補正
-            grid = self._grid
-            u = grid.u0 + max(0.0, pattern.settings.grid_return_accel_kmhs - grid.a_hold) / (
-                grid.g_accel
-            )
-            u = min(max(u, grid.u0), self._profile.max_accel_opening)
-            cap = self._glimit_cap(PEDAL_ACCEL, speed)
-            self._gr_opening = u if cap is None else min(u, cap)
-            return
-        self._grid_switch_to_cruise_hold()
-
-    def _grid_switch_to_cruise_hold(self) -> None:
-        """開度を定常開度 u0 に戻して PI（CRUISE_HOLD）へ（積分も u0。段差は PI のレート制限が
-        ならす）。GRID_RETURN の出口・戻り不要のときの両方から呼ぶ（落ち着き待ちの打ち切り
-        タイマーはここでは触らない。段7b）。
-        """
-        assert self._grid is not None
-        self._grid_opening = self._grid.u0
-        self._grid_integral = self._grid.u0
-        self._phase = _Phase.CRUISE_HOLD
-
-    def _advance_grid_return(self, pattern: GridStationPattern, speed: float, now: float) -> None:
-        """GRID_RETURN（段7b・7c）: 開度を刻み足しながらステーションの目標へ戻る。近づいたら PI へ。
-
-        落ち着き待ちの打ち切り（段7c）を CRUISE_HOLD と共通の `_grid_handle_settle_timeout` で
-        判定する。以前は無く、釣り合い車速が目標に届かないと GRID_RETURN から永久に抜けなかった
-        （20260928 実機で 190 s）。
-        """
-        assert self._grid is not None
-        s = pattern.settings
-        if speed > self._profile.max_speed:
-            self._grid.abort_remaining()
-            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
-            return
-        target = self._grid_target_kmh(pattern)
-        if abs(target - speed) <= s.grid_return_switch_kmh:
-            self._grid_switch_to_cruise_hold()
-            return
-        if now - self._grid_settle_started >= s.settle_timeout_s:
-            self._grid_handle_settle_timeout(pattern, speed, now)
-            return
-        if speed < target:
-            self._step_grid_return(pattern, speed, now)
-        else:
-            self._gr_hist.clear()
-            self._gr_last_t = None
-
-    def _grid_station_done(self, speed: float, now: float) -> None:
-        """ステーションが終わった。次もステーションなら止まらずに移り、最後なら停車復帰。"""
-        nxt = self._pattern_idx + 1
-        if nxt < len(self._patterns) and isinstance(self._patterns[nxt], GridStationPattern):
-            self._pattern_idx = nxt
-            self._enter_phase(_Phase.CRUISE_HOLD, now, keep_grid=True)
-            return
-        self._finish_pattern(speed, now)
-
-    def _grid_launch_after_step(self, pattern: LearningPattern, speed: float, now: float) -> None:
-        """発進・停車セルのステップの後。発進の後は止まらずに停車ステップへ、停車の後は停車復帰。"""
-        assert self._grid is not None
-        assert isinstance(pattern, GridLaunchPattern) and pattern.plan is not None
-        while (kind := self._grid.peek_kind()) is not None:
-            if kind is StepKind.STOP:
-                if speed >= pattern.plan.end_kmh - 3.0:  # 発進の直後（走行中）だけ測れる
-                    step = self._grid.next_step()
-                    assert step is not None
-                    self._grid_start_step(step, now)
-                    return
-                self._grid.drop_next()  # 発進が打ち切られて走っていない: 停車は測れない
-                continue
-            break
-        if kind is None:
-            self._finish_pattern(speed, now)
-        elif speed > STOP_SPEED_KMH:
-            self._enter_phase(_Phase.DRIVE_BRAKE, now)  # 停車復帰 → 次の発進（終わりは _advance）
-        else:
-            self._grid_launch_continue(now)
-
-    def _grid_launch_continue(self, now: float) -> None:
-        """停車した状態から次の発進ステップを始める（無ければパターンを終える）。"""
-        assert self._grid is not None
-        step = self._grid.next_step()
-        if step is None:
-            self._advance_pattern(now)
-            return
-        self._grid_start_step(step, now)
 
     def _finish_pattern(self, speed: float, now: float) -> None:
         """運転パターンの計測が終わった。停車していなければ停車復帰（DRIVE_BRAKE）に入る（A6）。"""
@@ -1673,247 +1510,12 @@ class PatternLoop:
         else:
             self._advance_pattern(now)
 
-    # ── 通し掃引（段6c） ─────────────────────────────────────────────
-    def _sweep_log(self, text: str) -> None:
-        if self._on_sweep_log is not None:
-            self._on_sweep_log(text)
-
-    def _sweep_enter_pattern(self, pattern: LearningPattern, now: float) -> bool:
-        """通し掃引のパターンに入った最初の周期: 網羅の穴から掃引を作る。とばしたら True。"""
-        if not isinstance(pattern, GridSweepPattern) or self._sw_seen_idx == self._pattern_idx:
-            return False
-        self._sw_seen_idx = self._pattern_idx
-        cov = self.coverage
-        if (
-            cov is None or pattern.wltp_seconds is None or pattern.wltp_mean is None
-            or pattern.max_passes <= 0
-        ):
-            self._sweep_log("通し掃引: 無効（何もしません）")
-            self._advance_pattern(now)
-            return True
-        holes = cov.holes(pattern.wltp_seconds, pattern.min_s, pattern.data_max_s)
-        self._sw_plans = plan_sweeps(
-            holes, pattern.wltp_mean, pattern.speed_edges, pattern.accel_edges,
-            self._config.g_cap_g * G_TO_KMHS, pattern.wltp_seconds,
-        )
-        demand = sum(float(pattern.wltp_seconds[c]) for c in holes)
-        self._sweep_log(
-            f"通し掃引: 穴 {len(holes)} セル（WLTP {demand:.0f}s）"
-            f" → 掃引 {len(self._sw_plans)} 本（各 最大 {pattern.max_passes} 回）"
-        )
-        self._sw_passes = 0
-        if not self._sweep_begin(pattern, now):
-            self._advance_pattern(now)
-            return True
-        return False
-
-    def _sweep_open_for(self, plan: SweepPlan) -> list[tuple[float, float]] | None:
-        """掃引のセルごとの (アクセル, ブレーキ) 開度。狙いの加速度が出る開度を上限 G で頭打ち。
-
-        どこか 1 つでも予測できない（G 校正・格子の実測が無い）セルが両端にあれば、そのセルを
-        外す。途中のセルは隣の開度で埋める。全部予測できなければ None。
-        """
-        ff = self._profile.feedforward_params
-        found: list[tuple[float, float] | None] = []
-        for cell in plan.cells:
-            v = 0.5 * (cell.speed_lo_kmh + cell.speed_hi_kmh)
-            if plan.decel:
-                u = self._glimit_open_for(PEDAL_BRAKE, v, -cell.a_kmhs)
-                cap = self._glimit_cap(PEDAL_BRAKE, cell.speed_hi_kmh)  # 帯の中で一番効く端
-                if u is not None and cap is not None:
-                    u = min(u, cap)
-                found.append(
-                    None if u is None
-                    else (0.0, min(max(u, ff.brake_deadband_pct), self._profile.max_brake_opening))
-                )
-            else:
-                u = self._glimit_open_for(PEDAL_ACCEL, v, cell.a_kmhs)
-                cap = self._glimit_cap(PEDAL_ACCEL, cell.speed_lo_kmh)
-                if u is not None and cap is not None:
-                    u = min(u, cap)
-                found.append(
-                    None if u is None
-                    else (min(max(u, ff.accel_deadband_pct), self._profile.max_accel_opening), 0.0)
-                )
-        if all(f is None for f in found):
-            return None
-        last = None
-        for k, f in enumerate(found):  # 途中の欠けは前のセルの開度で埋める（先頭の欠けは後ろから）
-            if f is None:
-                found[k] = last
-            else:
-                last = f
-        nxt = None
-        for k in range(len(found) - 1, -1, -1):
-            if found[k] is None:
-                found[k] = nxt
-            else:
-                nxt = found[k]
-        return [f for f in found if f is not None]
-
-    def _sweep_begin(self, pattern: GridSweepPattern, now: float) -> bool:
-        """先頭の掃引の 1 回目を始める。始められる掃引が無ければ False。"""
-        while self._sw_plans:
-            plan = self._sw_plans[0]
-            openings = self._sweep_open_for(plan)
-            if openings is None:
-                self._sweep_log(
-                    f"  掃引 {self._sweep_name(plan)}: 開度を予測できないのでとばします"
-                )
-                self._sw_plans.pop(0)
-                continue
-            self._sw_openings = openings
-            self._sw_passes = 0
-            self._sweep_start_pass(pattern, now)
-            return True
-        return False
-
-    @staticmethod
-    def _sweep_name(plan: SweepPlan) -> str:
-        a = [c.a_kmhs for c in plan.cells]
-        return (
-            f"{'減速' if plan.decel else '加速'} {min(a):+.1f}〜{max(a):+.1f} km/h/s、車速 "
-            f"{plan.cells[0].speed_lo_kmh:g}〜{plan.cells[-1].speed_hi_kmh:g} km/h"
-            if not plan.decel
-            else f"減速 {min(a):+.1f}〜{max(a):+.1f} km/h/s、車速 "
-            f"{plan.cells[-1].speed_lo_kmh:g}〜{plan.cells[0].speed_hi_kmh:g} km/h"
-        )
-
-    def _sweep_cell_seconds(self, plan: SweepPlan) -> float:
-        cov = self.coverage
-        assert cov is not None
-        return float(sum(cov.seconds[c.i, c.j] for c in plan.cells))
-
-    def _sweep_start_pass(self, pattern: GridSweepPattern, now: float) -> None:
-        """掃引 1 回を始める: 開始車速まで G 比例で加速（停車からの加速掃引は直接）。"""
-        plan = self._sw_plans[0]
-        self._sw_before = self._sweep_cell_seconds(plan)
-        if plan.start_kmh - 2.0 <= self._config.coast_down_stop_speed_kmh and not plan.decel:
-            self._sweep_go(now)
-        else:
-            self._enter_phase(_Phase.SWEEP_UP, now)
-
-    def _sweep_up_target_kmh(self, plan: SweepPlan) -> float:
-        """助走の目標車速。減速は最初のセルの上端、加速は最初のセルの下端の少し手前。
-
-        最高車速（加速の cap）を超えないようにする。
-        """
-        target = plan.start_kmh + 1.0 if plan.decel else plan.start_kmh - 2.0
-        return min(target, self._accel_speed_cap - 2.0)
-
-    def _advance_sweep_up(
-        self, pattern: GridSweepPattern, speed: float, elapsed: float, now: float
-    ) -> None:
-        self._step_coast_accel(pattern, speed, now)  # G 比例の加速（上限 G の予測の点も足す）
-        if speed > self._profile.max_speed:
-            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
-            return
-        target = self._sweep_up_target_kmh(self._sw_plans[0])
-        if speed >= target:
-            self._sweep_go(now)
-        elif elapsed >= self._config.accel_full_range_timeout_s:
-            self._sweep_log("  掃引: 開始車速まで上がらない（打ち切り）")
-            self._enter_phase(_Phase.DRIVE_BRAKE, now)
-
-    def _sweep_go(self, now: float) -> None:
-        self._enter_phase(_Phase.SWEEP, now)
-        self._sw_cell = -1
-        self._sw_from = (self._current_accel_opening, self._current_brake_opening)
-        self._sw_ramp_t = now
-        self._sw_cmd = self._sw_from
-
-    def _sweep_command(self, now: float) -> tuple[float, float]:
-        """掃引中の指令。今の車速のセルの開度へ、セルが変わったら step_lag_s かけて移る。
-
-        踏むペダルだけランプさせ、もう一方は即座に離す（HOLD_STEP と同じ）。
-        """
-        plan = self._sw_plans[0]
-        cell = plan.cell_at(self._last_speed)
-        k = plan.cells.index(cell)
-        pattern = self._patterns[self._pattern_idx]
-        assert isinstance(pattern, GridSweepPattern)
-        if k != self._sw_cell:
-            self._sw_cell = k
-            self._sw_from = self._sw_cmd
-            self._sw_ramp_t = now
-        # 開度の表は掃引のセルと同じ順（_sweep_open_for が欠けを埋めて同じ長さにする）
-        target_a, target_b = self._sw_openings[min(k, len(self._sw_openings) - 1)]
-        frac = self._ramp_fraction(now - self._sw_ramp_t, pattern.settings.step_lag_s)
-        accel, brake = target_a, target_b
-        self._accel_request, self._brake_request = accel, brake
-        if accel > 0.0:
-            accel = self._sw_from[0] + (accel - self._sw_from[0]) * frac
-        if brake > 0.0:
-            brake = self._sw_from[1] + (brake - self._sw_from[1]) * frac
-        if self._accel_gov_cap is not None:
-            accel = min(accel, self._accel_gov_cap)
-        if self._brake_gov_cap is not None:
-            brake = min(brake, self._brake_gov_cap)
-        accel = clamp_opening(accel, self._profile.max_accel_opening)
-        brake = clamp_opening(brake, self._profile.max_brake_opening)
-        self._sw_cmd = (accel, brake)
-        return accel, brake
-
-    def _advance_sweep(
-        self, pattern: GridSweepPattern, speed: float, elapsed: float, now: float
-    ) -> None:
-        plan = self._sw_plans[0]
-        cfg = self._config
-        if speed > self._profile.max_speed:
-            self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
-            return
-        floor = max(plan.end_kmh, STOP_SPEED_KMH)
-        done = speed <= floor if plan.decel else speed >= plan.end_kmh
-        if done or elapsed >= cfg.coast_timeout_s:
-            # 掃引が済んだ。停車してから次の回・次の掃引へ
-            self._enter_phase(_Phase.DRIVE_BRAKE, now)
-
-    def _sweep_pass_done(self, pattern: GridSweepPattern, now: float) -> None:
-        """掃引 1 回が済んで停車した。対象セルに穴が残れば同じ掃引をもう 1 回、無ければ次へ。"""
-        assert self.coverage is not None and pattern.wltp_seconds is not None
-        plan = self._sw_plans[0]
-        self._sw_passes += 1
-        after = self._sweep_cell_seconds(plan)
-        left = [
-            c for c in plan.cells
-            if pattern.wltp_seconds[c.i, c.j] >= pattern.min_s
-            and self.coverage.seconds[c.i, c.j] < pattern.data_max_s
-        ]
-        self._sweep_log(
-            f"  掃引 {self._sweep_name(plan)}: {self._sw_passes} 回目 "
-            f"対象セルのデータ {self._sw_before:.1f}s → {after:.1f}s、残りの穴 {len(left)} セル"
-        )
-        if left and self._sw_passes < pattern.max_passes:
-            openings = self._sweep_open_for(plan)  # 実測が増えたので開度を引き直す
-            if openings is not None:
-                self._sw_openings = openings
-            self._sweep_start_pass(pattern, now)
-            return
-        self._sw_plans.pop(0)
-        if not self._sweep_begin(pattern, now):
-            self._advance_pattern(now)
-
-    def glimit_table(self) -> list[str]:
-        """車速帯ごとの上限開度の表（今の予測。ターミナル表示用）。"""
-        ff = self._profile.feedforward_params
-        return self.glimit.table(
-            self._config.g_cap_g * G_TO_KMHS, ff.brake_deadband_pct, ff.accel_deadband_pct,
-            self._profile.max_speed,
-        )
-
     def _advance_pattern(self, now: float) -> None:
-        if (
-            self._on_calib_done is not None
-            and self._pattern_idx < len(self._patterns)
-            and self._patterns[self._pattern_idx].kind is PatternKind.G_CALIB
-        ):
-            self._on_calib_done(self.glimit_table())
         self._pattern_idx += 1
         self._enter_phase(self._initial_phase(self._pattern_idx), now)
 
     def _enter_phase(
-        self, phase: _Phase, now: float, *, overspeed_recovery: bool = False,
-        keep_grid: bool = False,
+        self, phase: _Phase, now: float, *, overspeed_recovery: bool = False
     ) -> None:
         self._phase = phase
         self._phase_started_at = now
@@ -1924,47 +1526,58 @@ class PatternLoop:
         self._ca_t0 = None
         self._ca_last_t = None
         self._ca_hist.clear()
-        self._ca_opening_hist.clear()  # 段7d: 前のパターンの開度を次の G 校正に持ち込まない
+        self._ca_opening_hist.clear()  # 段7d: 前のパターンの開度を次のパターンに持ち込まない
         self._cb_t0 = None
         self._cb_next_t = None
         self._cb_hist.clear()
         # 停車復帰は、低速（クリープ域）からでなければ G 比例で減速する（段6b）。一気に停車保持
         # 開度へ踏むと、高い車速ではブレーキがよく効いて上限 G を超える（20260926: 134 km/h で
         # 0.30〜0.35G）
+        self._overspeed_recovery = overspeed_recovery  # 下の停車復帰の判定が見る
         self._db_gprop = (
-            phase is _Phase.DRIVE_BRAKE
-            and self._last_speed > self._config.coast_down_stop_speed_kmh
+            phase is _Phase.DRIVE_BRAKE and self._last_speed > self._stop_return_low_speed_kmh()
         )
-        self._overspeed_recovery = overspeed_recovery
+        # コーストダウンのクリープ域からの停車復帰は徐々に踏む（段2l-6b）
+        self._db_creep_press = (
+            phase is _Phase.DRIVE_BRAKE and not self._db_gprop and self._creep_press_applies()
+        )
+        self._db_press_reached_at = None
+        self._rp_hist.clear()
+        self._rp_open_hist.clear()
+        self._rp_last_t = None
+        self._rp_record_t = -1e9
+        self._rp_launch = False  # 発進の段階は RAMP_UP の頭だけ（下で始める）
+        if phase is _Phase.RAMP_UP:  # G ランプ 1 本の始まり: 状態を作り直す
+            self._rp_u = None
+            self._rp_brake_latched = False
+            self._ramp_launch_begin()  # 2026-10-08 段2l-6: 発進の段階から始める
+            self._rp_up_started = now
+            self._rp_down_started = now
+            self._rp_max_speed = 0.0
+            self._rp_up_g = []
+            self._rp_down_g = []
         self._brake_ramp_from = self._current_brake_opening
-        if not keep_grid:  # ステーション間の移動以外は、格子の PI 状態を作り直す
-            self._grid_opening = None
-            self._grid_integral = 0.0
-            self._grid_step = None
-            self._grid_approach_kmh = None
 
     def _update_governor(self, accel_kmhs: float) -> None:
-        """G ガバナー（段6b で先読みつきに）。CRUISE_HOLD（格子の PI 保持）には適用しない: PI 自体が
-        低ゲイン・レート制限で穏やかなので、頭打ちの必要が無いと判断した。HOLD_STEP・GRID_RETURN
-        （段7b。固定開度で速く戻る）には適用する。
+        """G ガバナー（段6b で先読みつきに）。加速（DRIVE_ACCEL）・ブレーキ（DRIVE_BRAKE・
+        BRAKE_HOLD）・G ランプ（RAMP_UP・RAMP_DOWN）に適用する。
         """
         if self._g_limit_kmhs <= 0.0:
             return
         rate = self._accel_rate
-        if self._phase in (_Phase.DRIVE_ACCEL, _Phase.SWEEP_UP):
+        if self._phase in (_Phase.DRIVE_ACCEL,):
             self._accel_gov_cap = self._next_gov_cap(
                 self._accel_gov_cap, accel_kmhs, rate, self._current_accel_opening,
                 self._accel_request,
             )
-        elif self._phase in (
-            _Phase.DRIVE_BRAKE, _Phase.BRAKE_HOLD, _Phase.CALIB_BRAKE
-        ):
+        elif self._phase in (_Phase.DRIVE_BRAKE, _Phase.BRAKE_HOLD):
             self._brake_gov_cap = self._next_gov_cap(
                 self._brake_gov_cap, -accel_kmhs, -rate, self._current_brake_opening,
                 self._brake_request,
             )
-        elif self._phase in (_Phase.HOLD_STEP, _Phase.SWEEP, _Phase.GRID_RETURN):
-            accel_on, brake_on = self._governed_step_pedals()
+        elif self._phase in (_Phase.RAMP_UP, _Phase.RAMP_DOWN):
+            # G ランプは今使っているペダルだけ頭打ちする
+            accel_on, brake_on = self._accel_request > 0.0, self._brake_request > 0.0
             if accel_on:
                 self._accel_gov_cap = self._next_gov_cap(
                     self._accel_gov_cap, accel_kmhs, rate, self._current_accel_opening,
@@ -1975,19 +1588,6 @@ class PatternLoop:
                     self._brake_gov_cap, -accel_kmhs, -rate, self._current_brake_opening,
                     self._brake_request,
                 )
-
-    def _governed_step_pedals(self) -> tuple[bool, bool]:
-        """開度固定の区間（HOLD_STEP・SWEEP・GRID_RETURN）で今使っているペダル
-        (アクセル, ブレーキ)。
-        """
-        if self._phase is _Phase.HOLD_STEP:
-            step = self._grid_step
-            if step is None:
-                return False, False
-            return step.accel_pct > 0.0, step.brake_pct > 0.0
-        if self._phase is _Phase.GRID_RETURN:  # ブレーキは使わない（惰行が頭打ち）
-            return self._accel_request > 0.0, False
-        return self._accel_request > 0.0, self._brake_request > 0.0
 
     def _next_gov_cap(
         self, cap: float | None, pedal_accel_kmhs: float, pedal_rate: float, current: float,
@@ -2023,9 +1623,9 @@ class PatternLoop:
 
     def _governor_limiting(self) -> bool:
         """この周期の指令がガバナーで削られたか（CSV の governor_active 列）。"""
-        if self._phase in (_Phase.DRIVE_ACCEL, _Phase.SWEEP_UP) and self._accel_gov_cap is not None:
+        if self._phase is _Phase.DRIVE_ACCEL and self._accel_gov_cap is not None:
             return self._accel_gov_cap < self._accel_request
-        if self._phase in (_Phase.HOLD_STEP, _Phase.SWEEP, _Phase.GRID_RETURN):
+        if self._phase in (_Phase.RAMP_UP, _Phase.RAMP_DOWN):
             accel_limited = (
                 self._accel_gov_cap is not None and self._accel_gov_cap < self._accel_request
             )
@@ -2033,7 +1633,7 @@ class PatternLoop:
                 self._brake_gov_cap is not None and self._brake_gov_cap < self._brake_request
             )
             return accel_limited or brake_limited
-        braking = self._phase in (_Phase.DRIVE_BRAKE, _Phase.BRAKE_HOLD, _Phase.CALIB_BRAKE)
+        braking = self._phase in (_Phase.DRIVE_BRAKE, _Phase.BRAKE_HOLD)
         if braking and self._brake_gov_cap is not None:
             return self._brake_gov_cap < self._brake_request
         return False
@@ -2072,9 +1672,8 @@ class PatternLoop:
     # ── 補助 ───────────────────────────────────────────────────────
     def _move_duration(self) -> float:
         if self._phase in (
-            _Phase.DRIVE_ACCEL, _Phase.DRIVE_BRAKE, _Phase.BRAKE_HOLD, _Phase.CRUISE_HOLD,
-            _Phase.HOLD_STEP, _Phase.CALIB_BRAKE, _Phase.SWEEP_UP, _Phase.SWEEP,
-            _Phase.GRID_RETURN,
+            _Phase.DRIVE_ACCEL, _Phase.DRIVE_BRAKE, _Phase.BRAKE_HOLD,
+            _Phase.RAMP_UP, _Phase.RAMP_DOWN,
         ):
             return self._config.pedal_step_time_s
         return self._config.pedal_release_time_s
@@ -2133,7 +1732,7 @@ __all__ = [
     "OnSample",
     "PatternLoop",
     "CreepLaunchPattern",
-    "GridLaunchPattern",
-    "GridStationPattern",
+    "GRampPattern",
+    "RampResult",
     "PatternLoopConfig",
 ]

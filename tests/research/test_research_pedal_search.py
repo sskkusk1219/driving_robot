@@ -1,7 +1,9 @@
-"""研究開発用ハーネス 手順 2-0（ペダル探索）のユニットテスト。
+"""研究開発用ハーネス 手順 2-0（ペダル探索: クリープ車速 → 停車保持開度）のユニットテスト。
 
-スタブ車両は設定の不感帯とは独立した「真の遊び」（アクセル 6%・ブレーキ 8%）を持つ。
-探索がそれを当て、停止確認開度 + マージンで停車保持することを確かめる。
+2026-10-08 段2l-6: 不感帯の探索（アクセル・ブレーキの反応判定）はやめた。両ペダルを min
+（vehicle.min_*_opening_pct）に置き、クリープ車速が落ち着くのを待ち、ブレーキを min から刻んで
+踏んで停止確認開度を測り、+ マージンで停車保持することを確かめる。
+スタブ車両は「真の遊び」（アクセル 6%・ブレーキ 8%）を持つ（min はその手前の 2.9% を既定にする）。
 時間を縮めるため、刻みを 1mm・待ちを 0.3s にしている（判定ロジックは既定と同じ）。
 """
 
@@ -21,13 +23,9 @@ from tests.research.vehicle import build_vehicle_profile, opening_to_pulse, puls
 WINDOW_S = 0.6
 FAST = {
     "pedal_search.step_mm": 1.0,
-    "pedal_search.search_step_mm": 1.0,  # 既定 0.1mm だとテストが遅くなるため、旧来どおり粗く
+    "pedal_search.brake_step_mm": 1.0,  # 既定 0.1mm だとテストが遅くなるため、粗く
     "pedal_search.dwell_s": 0.3,
     "pedal_search.onset_margin_kmh": 0.05,  # スタブは車速ノイズが無い
-    # スタブは不感帯未満で傾きが厳密に0（ノイズ無し）なので浅くできるが、実時間の sleep に
-    # 依存するテストのため、遊びを越えた直後の小さな傾き（実測で約0.05〜0.1）との差を
-    # 十分に取れる値にする（0.05 ちょうどだとタイミング次第で誤判定した）
-    "pedal_search.onset_accel_kmhs": 0.02,
     "pedal_search.creep_settle_kmhs": 0.017,
     "pedal_search.creep_settle_min_s": 0.0,  # 実時間で待たない（FAST の趣旨）
     "pedal_search.creep_timeout_s": 10.0,
@@ -57,27 +55,42 @@ async def _ready_stub(cfg: cfgmod.ResearchConfig) -> hwmod.ResearchHardware:
     return hw
 
 
-async def test_search_finds_stub_play_and_holds_stop(tmp_path: Path) -> None:
+async def test_search_starts_from_min_finds_stop_and_holds(tmp_path: Path) -> None:
     cfg = _tmp_cfg(tmp_path)
     hw = await _ready_stub(cfg)
     # 停車までを短くする（既定ゲインだとクリープの押しとほぼ釣り合い、止まるまで十数秒かかる）
     hw.can.vehicle.brake_gain_kmhs_per_pct = 1.5  # type: ignore[attr-defined]
     yaml_before = cfg.source_path.read_text(encoding="utf-8")
+    visited_accel: list[int] = []
+    visited_brake: list[int] = []
+    for axis, visited in ((hw.accel, visited_accel), (hw.brake, visited_brake)):
+        original = axis.move_to_position
+
+        async def record(pos, *, smooth_over_s=None, _o=original, _v=visited):  # type: ignore[no-untyped-def]
+            _v.append(pos)
+            await _o(pos, smooth_over_s=smooth_over_s)
+
+        axis.move_to_position = record  # type: ignore[method-assign]
 
     result = await psmod.run_pedal_search(hw, cfg, window_s=WINDOW_S)
 
+    # 両ペダルはまず min（待機位置）へ。アクセルはその後動かさない
+    assert visited_accel == [opening_to_pulse(cfg.vehicle.min_accel_opening_pct)]
+    assert visited_brake[0] == opening_to_pulse(cfg.vehicle.min_brake_opening_pct)
+    assert all(p >= visited_brake[0] for p in visited_brake)  # ブレーキは min から上へ
+    # 停止確認は遊び（8%）を越えた位置。刻みは粗い（1mm ≒ 1.05%）ので数刻み遅れうる
     step_pct = pulse_to_opening(psmod.search_step_pulse(cfg))
-    # 検出は応答を見てからなので真値より浅くは出ない。深い側は立ち上がり遅れぶん（数刻み）まで許す
-    assert hwmod.STUB_ACCEL_PLAY_PCT <= result.accel_deadband_pct
-    assert result.accel_deadband_pct <= hwmod.STUB_ACCEL_PLAY_PCT + 3 * step_pct
-    assert hwmod.STUB_BRAKE_PLAY_PCT <= result.brake_deadband_pct
-    assert result.brake_deadband_pct <= hwmod.STUB_BRAKE_PLAY_PCT + 3 * step_pct
-    assert result.stop_confirm_pct >= result.brake_deadband_pct
+    assert hwmod.STUB_BRAKE_PLAY_PCT < result.stop_confirm_pct
+    assert result.stop_confirm_pct <= hwmod.STUB_BRAKE_PLAY_PCT + 12 * step_pct
     # 停車保持 = 停止確認 + マージン。その位置まで踏んで停車している
     assert result.stop_brake_opening_pct == pytest.approx(result.stop_confirm_pct + 3.0, abs=0.01)
     assert hw.brake.position == opening_to_pulse(result.stop_brake_opening_pct)
-    assert hw.accel.position == 0
+    assert hw.accel.position == opening_to_pulse(cfg.vehicle.min_accel_opening_pct)
     assert await hw.can.read_speed() < VEHICLE_STOP_SPEED_KMH
+    # 結果は不感帯を持たない（クリープ車速・停止確認・停車保持開度＋書き戻し用のブレーキ min）
+    assert set(result.__dataclass_fields__) == {
+        "creep_speed_kmh", "stop_confirm_pct", "stop_brake_opening_pct", "brake_min_pct"
+    }
     # スタブは YAML を書き換えない
     assert cfg.source_path.read_text(encoding="utf-8") == yaml_before
     await hwmod.shutdown(hw)
@@ -93,53 +106,16 @@ async def test_search_fails_without_creep(tmp_path: Path) -> None:
     await hwmod.shutdown(hw)
 
 
-async def test_search_fails_when_accel_has_no_effect(tmp_path: Path) -> None:
-    cfg = _tmp_cfg(tmp_path, **{"pedal_search.accel_max_pct": 3.0})
+async def test_search_fails_when_brake_does_not_stop_within_limit(tmp_path: Path) -> None:
+    """vehicle.max_brake_opening_pct まで踏んでも停車しなければ DriveError（スタブの遊びは 8%）。"""
+    cfg = _tmp_cfg(tmp_path, **{"vehicle.max_brake_opening_pct": 6.0})
     hw = await _ready_stub(cfg)
-    with pytest.raises(hwmod.DriveError, match="アクセルを 3% まで踏んでも"):
+    with pytest.raises(
+        hwmod.DriveError,
+        match="ブレーキを開度上限 6%（vehicle.max_brake_opening_pct）まで踏んでも停車しません",
+    ):
         await psmod.run_pedal_search(hw, cfg, window_s=WINDOW_S)
     await hwmod.shutdown(hw)
-
-
-async def test_search_fails_when_brake_deadband_not_found_within_limit(tmp_path: Path) -> None:
-    """段1b: 不感帯検出専用の上限 deadband_max_pct を超えても反応が無ければ DriveError。
-
-    停止確認の上限 brake_max_pct とは別物であることを確かめる（スタブの遊びは 8%）。
-    """
-    cfg = _tmp_cfg(tmp_path, **{"pedal_search.deadband_max_pct": 3.0})
-    hw = await _ready_stub(cfg)
-    with pytest.raises(hwmod.DriveError, match="ブレーキを 3% まで踏んでも車速が下がりません"):
-        await psmod.run_pedal_search(hw, cfg, window_s=WINDOW_S)
-    await hwmod.shutdown(hw)
-
-
-# ── 傾き算出（段1b。ProblemReport_20260916） ────────────────────────────
-
-
-def test_speed_slope_is_zero_for_constant_speed() -> None:
-    samples = [(t, 5.0) for t in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)]
-    assert psmod.speed_slope(samples) == pytest.approx(0.0)
-
-
-def test_speed_slope_recovers_ramp_rate() -> None:
-    rate = 1.7
-    samples = [(t, 5.0 + rate * t) for t in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)]
-    assert psmod.speed_slope(samples) == pytest.approx(rate)
-
-
-def test_speed_slope_uses_only_tail_half() -> None:
-    """前半（下降）と後半（上昇）が混じっていても、後半だけの傾きが返ること。
-
-    踏んでから車速が動くまでの遅れ（むだ時間）が前半に乗るのを避けるため（SLOPE_TAIL_FRACTION）。
-    全体の最小二乗なら傾きはほぼ 0 だが、後半だけなら明確に正になる。
-    """
-    samples = [(0.0, 10.0), (0.1, 9.0), (0.2, 8.0), (0.3, 8.2), (0.4, 8.4), (0.5, 8.6)]
-    assert psmod.speed_slope(samples) == pytest.approx(2.0)  # 後半3点: (8.6-8.2)/(0.5-0.3)
-
-
-def test_speed_slope_returns_zero_for_fewer_than_two_samples() -> None:
-    assert psmod.speed_slope([]) == 0.0
-    assert psmod.speed_slope([(0.0, 5.0)]) == 0.0
 
 
 class _ScriptedCAN:
@@ -273,58 +249,74 @@ async def test_wait_creep_stable_raises_on_timeout() -> None:
         await psmod.wait_creep_stable(hw, cfg)
 
 
-async def test_search_accel_detects_true_onset_via_slope() -> None:
-    """実機ログ（drive_log_real_20260915_052432.csv）相当の合成応答を模した回帰テスト。
-
-    8.42%相当で -0.4、8.95%相当で +0.21、9.47%相当で +1.0 km/h/s という実測どおりの傾きを与えると、
-    傾き判定は最初に反応した 8.95%相当の刻みを返す（confirm_count=2 は 9.47%相当で満たす）。
-    旧来の「待ち時間の平均車速が基準+0.3km/hを超えたか」判定では、この3刻みのどの平均も
-    基準を超えないため、実際には 10.00%相当までさらに検出が遅れていた。
-    """
+async def test_search_brake_stops_at_first_step_below_stop_speed() -> None:
+    """min から 1 刻みずつ踏み、平均車速が停止しきい値未満になった刻みの位置を返す。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
-    cfg.pedal_search.dwell_s = 0.2  # 0.1s間隔で3サンプル/刻み（後半2点で正確に傾きが再現できる）
+    cfg.pedal_search.dwell_s = 0.2  # 0.1s 間隔で 3 サンプル/刻み
     speeds = [
-        5.00, 4.96, 4.92,       # 8.42%相当: -0.4 km/h/s（反応なし）
-        4.92, 4.941, 4.962,     # 8.95%相当: +0.21 km/h/s ← 真の効き始め
-        4.962, 5.062, 5.162,    # 9.47%相当: +1.0 km/h/s（2刻み連続で確定）
+        5.0, 5.0, 5.0,     # 1 刻み目: 変化なし
+        4.9, 4.9, 4.9,     # 2 刻み目: 少し下がる（onset_margin 未満なので続けて踏む）
+        0.01, 0.01, 0.01,  # 3 刻み目: 停止
     ]
     hw = _scripted_hw(speeds)
-    step = 50  # pulse。値自体は判定に無関係（位置の表示にのみ使う）
+    start, step = 100, 50
 
-    onset = await psmod._search_accel(hw, cfg, base=4.98, step=step)
+    stop_pos = await psmod._search_brake(hw, cfg, base=5.0, start_pos=start, step=step)
 
-    assert onset == 2 * step  # 8.95%相当（最初に反応した刻み）
+    assert stop_pos == start + 3 * step
 
 
-async def test_search_brake_detects_true_onset_via_slope_then_holds_and_stops() -> None:
-    """`_search_brake` も傾きで反応を検出し、最初に反応した刻みを不感帯として返す。
-
-    確定後は従来どおり平均車速で「減速中は踏み増さない（holding）」・停止確認を行う
-    （this パスは変更していないので、ここで一緒に確かめる）。
-    """
+async def test_search_brake_does_not_press_further_while_slowing() -> None:
+    """車速が onset_margin_kmh 以上下がった直後の刻みは踏み増さない（踏み過ぎ防止）。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     cfg.pedal_search.dwell_s = 0.2
+    cfg.pedal_search.onset_margin_kmh = 0.3
     speeds = [
-        5.0, 5.0, 5.0,     # 1刻み目: 傾き 0（反応なし）
-        5.0, 4.9, 4.8,     # 2刻み目: 傾き -1.0（反応。first）
-        4.9, 4.7, 4.5,     # 3刻み目: 傾き -2.0（2刻み連続 → 不感帯確定）
-        4.7, 0.01, 0.01,   # 4刻み目: 平均車速が大きく下がる（last_drop が margin 超え）
-        0.01, 0.01, 0.01,  # 5刻み目: holding で踏み増さず、平均車速が停止確認を満たす
+        5.0, 5.0, 5.0,     # 1 刻み目
+        4.5, 4.5, 4.5,     # 2 刻み目: -0.5（margin 超え）
+        4.5, 4.5, 4.5,     # 3 刻み目: 減速中なので保持（踏み増さない）。ここでは下がらない
+        0.01, 0.01, 0.01,  # 4 刻み目: 停止
     ]
     hw = _scripted_hw(speeds)
-    step = 50
+    moved: list[int] = []
+    original = hw.brake.move_to_position
 
-    onset, stop_pos = await psmod._search_brake(hw, cfg, base=5.0, step=step)
+    async def record(pos: int, *, smooth_over_s: float | None = None) -> None:
+        moved.append(pos)
+        await original(pos, smooth_over_s=smooth_over_s)
 
-    assert onset == 2 * step  # 2刻み目（最初に反応した刻み）
-    assert stop_pos == 4 * step  # 5刻み目は holding で踏み増していない
+    hw.brake.move_to_position = record  # type: ignore[method-assign]
+
+    stop_pos = await psmod._search_brake(hw, cfg, base=5.0, start_pos=0, step=50)
+
+    assert moved == [50, 100, 150]  # 3 刻み目は動かさない（保持）
+    assert stop_pos == 150
 
 
-def test_search_step_mm_is_independent_of_step_mm(tmp_path: Path) -> None:
-    """段1b: 不感帯探索の刻み（search_step_mm）と停車保持への刻み送り（step_mm）を分離。"""
-    cfg = _tmp_cfg(tmp_path, **{"pedal_search.step_mm": 0.5, "pedal_search.search_step_mm": 0.1})
-    assert psmod.search_step_pulse(cfg) == 50           # step_mm 基準（停車保持の刻み送り）
-    assert psmod.deadband_search_step_pulse(cfg) == 10  # search_step_mm 基準（不感帯探索の刻み）
+async def test_search_brake_raises_when_over_limit() -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.pedal_search.dwell_s = 0.1
+    cfg.vehicle.max_brake_opening_pct = 1.0  # 約 95 pulse（検証を通さず直接書き換える）
+    hw = _scripted_hw([5.0] * 10)
+    with pytest.raises(
+        hwmod.DriveError,
+        match="ブレーキを開度上限 1%（vehicle.max_brake_opening_pct）まで踏んでも停車しません",
+    ):
+        await psmod._search_brake(hw, cfg, base=5.0, start_pos=0, step=50)
+
+
+def test_brake_step_mm_is_independent_of_step_mm(tmp_path: Path) -> None:
+    """2-0 のブレーキ踏み込みの刻み（brake_step_mm）と停車保持への刻み送り（step_mm）を分離。"""
+    cfg = _tmp_cfg(tmp_path, **{"pedal_search.step_mm": 0.5, "pedal_search.brake_step_mm": 0.1})
+    assert psmod.search_step_pulse(cfg) == 50  # step_mm 基準（停車保持の刻み送り）
+    assert psmod.brake_step_pulse(cfg) == 10  # brake_step_mm 基準（ブレーキ踏み込みの刻み）
+
+
+def test_removed_deadband_search_api() -> None:
+    """不感帯探索の部品は無い（段2l-6）。"""
+    for name in ("OnsetDetector", "OnsetUpdate", "_search_accel", "end_speed",
+                 "deadband_search_step_pulse", "PHASE_ACCEL_SEARCH"):
+        assert not hasattr(psmod, name), name
 
 
 async def test_step_to_position_moves_in_steps_both_ways() -> None:
@@ -346,26 +338,31 @@ def test_save_to_config_writes_measured_values(tmp_path: Path) -> None:
     cfg = _tmp_cfg(tmp_path)
     result = psmod.PedalSearchResult(
         creep_speed_kmh=4.9,
-        accel_deadband_pct=6.32,
-        brake_deadband_pct=8.42,
         stop_confirm_pct=14.74,
         stop_brake_opening_pct=24.74,
+        brake_min_pct=2.9,
     )
     psmod.save_to_config(cfg, result)
     saved = cfgmod.load_config(cfg.source_path).feedforward
-    assert saved.accel_deadband_pct == pytest.approx(6.32)
-    assert saved.brake_deadband_pct == pytest.approx(8.42)
-    assert saved.stop_brake_opening_pct == pytest.approx(24.74)
+    # 2026-10-08 段2l-7: yaml へは「停車保持 − ブレーキの min」で書く
+    assert saved.stop_brake_offset_pct == pytest.approx(24.74 - 2.9)
     assert saved.creep_speed_kmh == pytest.approx(4.9)
+
+
+def test_config_updates_has_only_stop_hold_and_creep() -> None:
+    result = psmod.PedalSearchResult(5.0, 14.0, 24.0, brake_min_pct=3.0)
+    assert result.config_updates() == {
+        "feedforward.stop_brake_offset_pct": 21.0,
+        "feedforward.creep_speed_kmh": 5.0,
+    }
 
 
 def test_apply_to_profile_overrides_measured_values() -> None:
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
-    result = psmod.PedalSearchResult(5.0, 6.0, 8.0, 14.0, 24.0)
-    ffp = result.apply_to_profile(build_vehicle_profile(cfg)).feedforward_params
-    assert (
-        ffp.accel_deadband_pct,
-        ffp.brake_deadband_pct,
-        ffp.stop_brake_opening_pct,
-        ffp.creep_speed_kmh,
-    ) == (6.0, 8.0, 24.0, 5.0)
+    result = psmod.PedalSearchResult(5.0, 14.0, 24.0)
+    base = build_vehicle_profile(cfg)
+    ffp = result.apply_to_profile(base).feedforward_params
+    assert (ffp.stop_brake_opening_pct, ffp.creep_speed_kmh) == (24.0, 5.0)
+    # u の原点（名前は不感帯のまま）は 2-0 で上書きしない。yaml の min のまま
+    assert ffp.accel_deadband_pct == cfg.vehicle.min_accel_opening_pct
+    assert ffp.brake_deadband_pct == cfg.vehicle.min_brake_opening_pct

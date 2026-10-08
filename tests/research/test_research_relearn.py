@@ -17,13 +17,18 @@ import pytest
 from tests.research import drive_log as dlmod
 from tests.research import relearn as relearnmod
 from tests.research.research_types import DrivingMode, SpeedPoint
-from tests.research.test_research_pattern_drive import _synthetic_samples, _tmp_cfg
+from tests.research.test_research_pattern_drive import (
+    _fake_table_model,
+    _synthetic_samples,
+    _tmp_cfg,
+)
 
 
 def test_relearn_dry_run_does_not_touch_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)  # C7 の表づくりは差し替え（物理定数の流れを見る）
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
     before = cfg.source_path.read_text(encoding="utf-8")
@@ -39,6 +44,7 @@ def test_relearn_without_dry_run_saves_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)  # C7 の表づくりは差し替え（物理定数の流れを見る）
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
     before = cfg.source_path.read_text(encoding="utf-8")
@@ -53,32 +59,39 @@ def test_relearn_without_dry_run_saves_config(
 def test_relearn_does_not_overwrite_measured_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """relearn は pedal=None で呼ぶため、不感帯・停車保持開度（2-0 の実測）は書き換わらない。"""
+    """relearn は pedal=None で呼ぶため、停車保持開度・クリープ車速（2-0 の実測）と
+    u の原点（vehicle.min_*_opening_pct）は書き換わらない。"""
     cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
     monkeypatch.setattr(relearnmod, "DEFAULT_CONFIG_PATH", cfg.source_path)
 
     before_ff = cfg.feedforward
+    before_v = cfg.vehicle
     relearnmod.main([str(csv_path)])
 
     from tests.research import config as cfgmod
 
     after_cfg = cfgmod.load_config(cfg.source_path)
-    assert after_cfg.feedforward.accel_deadband_pct == before_ff.accel_deadband_pct
-    assert after_cfg.feedforward.brake_deadband_pct == before_ff.brake_deadband_pct
-    assert after_cfg.feedforward.stop_brake_opening_pct == before_ff.stop_brake_opening_pct
+    assert after_cfg.vehicle.min_accel_opening_pct == before_v.min_accel_opening_pct
+    assert after_cfg.vehicle.min_brake_opening_pct == before_v.min_brake_opening_pct
+    assert after_cfg.feedforward.stop_brake_offset_pct == before_ff.stop_brake_offset_pct
+    assert after_cfg.feedforward.creep_speed_kmh == before_ff.creep_speed_kmh
 
 
-def test_relearn_raises_exit_code_6_on_too_few_samples(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_relearn_rejects_polynomial_candidates_with_exit_code_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """段2l-6: C1〜C5 は対象外。設定エラー（終了コード 2）で止まる。"""
     cfg = _tmp_cfg(tmp_path)
+    cfg.save({"feedforward.candidate": "C1"})
     csv_path = tmp_path / "drive.csv"
-    dlmod.write_csv(_synthetic_samples(cfg)[:10], csv_path)
+    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
     monkeypatch.setattr(relearnmod, "DEFAULT_CONFIG_PATH", cfg.source_path)
 
-    assert relearnmod.main([str(csv_path), "--dry-run"]) == 6
+    assert relearnmod.main([str(csv_path), "--dry-run"]) == 2
+    assert "手順 2 の対象外" in capsys.readouterr().out
 
 
 # ─────────────────────────────────────────────────────────────────────

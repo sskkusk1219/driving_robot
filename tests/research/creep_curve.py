@@ -26,7 +26,7 @@ import numpy as np
 
 from tests.research.ff_model import STOP_SPEED_KMH, group_by_session
 from tests.research.pedal_gain import _sample_interval_s
-from tests.research.research_types import DriveLog, FeedforwardParams
+from tests.research.research_types import PEDAL_OFF_TOL_PCT, DriveLog, FeedforwardParams
 
 
 @dataclass(frozen=True)
@@ -49,7 +49,8 @@ def estimate_creep_accel_curve(
 ) -> CreepAccelCurve:
     """走行ログからクリープ加速カーブ（0〜creep_speed_kmh の a_creep(v)、正値）を推定する。
 
-    サンプル条件: 両ペダルが不感帯以下（accel<=accel_deadband_pct・brake<=brake_deadband_pct）
+    サンプル条件: 両ペダルが min ＋ 幅 以下（accel<=accel_deadband_pct+PEDAL_OFF_TOL_PCT・
+    brake<=brake_deadband_pct+PEDAL_OFF_TOL_PCT。名前は不感帯のままだが値は u の原点 min）
     かつ STOP_SPEED_KMH < v < params.creep_speed_kmh かつ dv > 0。段階解放中の行（本番
     `src/domain/learning_drive.py` の CREEP_RELEASE_STEPS）は両ペダル不感帯以下という条件を
     満たさないため自然に除外される。単調性の強制はしない（実測をそのまま出す）。
@@ -67,8 +68,10 @@ def estimate_creep_accel_curve(
         dt = _sample_interval_s(session_logs)
         dv = np.diff(speed) / dt  # i→i+1 の加速度 [km/h/s]
         sp = speed[:-1]
-        pedal_off = (accel[:-1] <= params.accel_deadband_pct) & (
-            brake[:-1] <= params.brake_deadband_pct
+        # 2026-10-08 段2l-6: 待機位置が min（=accel/brake_deadband_pct）ちょうどなので、
+        # 実位置のずれで行が割れないよう PEDAL_OFF_TOL_PCT の幅を持たせる
+        pedal_off = (accel[:-1] <= params.accel_deadband_pct + PEDAL_OFF_TOL_PCT) & (
+            brake[:-1] <= params.brake_deadband_pct + PEDAL_OFF_TOL_PCT
         )
         mask = pedal_off & (sp > STOP_SPEED_KMH) & (sp < params.creep_speed_kmh) & (dv > 0.0)
         if not np.any(mask):

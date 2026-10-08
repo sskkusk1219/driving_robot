@@ -12,7 +12,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from tests.research.creep_curve import estimate_creep_accel_curve
-from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, DriveLog, FeedforwardParams
+from tests.research.research_types import (
+    PEDAL_OFF_TOL_PCT,
+    VEHICLE_STOP_SPEED_KMH,
+    DriveLog,
+    FeedforwardParams,
+)
 
 PARAMS = FeedforwardParams(
     creep_speed_kmh=5.0, accel_deadband_pct=10.0, brake_deadband_pct=12.0,
@@ -140,14 +145,32 @@ def test_estimate_creep_accel_curve_no_samples_is_unidentified() -> None:
 
 
 def test_estimate_creep_accel_curve_respects_current_deadbands() -> None:
-    """不感帯は params（呼び出し時点の値）を使う。不感帯を上げると同じログでも除外されうる。"""
+    """u の原点 min（params。名前は不感帯のまま）は呼び出し時点の値を使う。
+
+    ペダルオフは「min ＋ PEDAL_OFF_TOL_PCT 以下」（2026-10-08 段2l-6）。"""
     dt = 0.02
     speeds = _ramp(0.0, 4.9, 3.4, dt)
-    logs = _logs(speeds, dt=dt, accel_pct=0.3)
+    logs = _logs(speeds, dt=dt, accel_pct=0.5)
     lenient = estimate_creep_accel_curve(logs, PARAMS, bin_kmh=1.0, min_bin_samples=5)
-    assert lenient.identified  # 0.3% は不感帯 10.0% 以下
+    assert lenient.identified  # 0.5% は min 10.0% 以下
 
     strict = replace(PARAMS, accel_deadband_pct=0.1)
     curve = estimate_creep_accel_curve(logs, strict, bin_kmh=1.0, min_bin_samples=5)
-    assert not curve.identified  # 0.3% > 不感帯 0.1% なので全サンプル除外
+    assert not curve.identified  # 0.5% > min 0.1% + 幅 0.3% なので全サンプル除外
+
+
+def test_estimate_creep_accel_curve_tolerates_standby_jitter() -> None:
+    """待機位置が min ちょうどで、実位置が min より幅以内にずれていてもペダルオフ。"""
+    dt = 0.02
+    speeds = _ramp(0.0, 4.9, 3.4, dt)
+    params = replace(PARAMS, accel_deadband_pct=6.5, brake_deadband_pct=2.9)
+
+    def logs_at(accel_pct: float, brake_pct: float):  # type: ignore[no-untyped-def]
+        out = _logs(speeds, dt=dt, accel_pct=accel_pct)
+        return [replace(lg, brake_opening=brake_pct) for lg in out]
+
+    within = logs_at(6.5 + PEDAL_OFF_TOL_PCT - 0.01, 2.9 + PEDAL_OFF_TOL_PCT - 0.01)
+    assert estimate_creep_accel_curve(within, params, bin_kmh=1.0, min_bin_samples=5).identified
+    over = logs_at(6.5 + PEDAL_OFF_TOL_PCT + 0.05, 2.9)
+    assert not estimate_creep_accel_curve(over, params, bin_kmh=1.0, min_bin_samples=5).identified
     assert VEHICLE_STOP_SPEED_KMH < PARAMS.creep_speed_kmh  # 前提の確認

@@ -46,10 +46,11 @@ C6（骨格を定速階段の実測テーブルにする案）は 2026-09-25 段
 from __future__ import annotations
 
 import pickle
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from sklearn.metrics import mean_absolute_error
@@ -75,12 +76,20 @@ from tests.research.reachability import decide_regime, free_speeds_at, reach_nee
 from tests.research.research_types import DriveLog, VehicleProfile, pedal_gain_at
 from tests.research.sample_weight import WltpWeighting, compute_weights, summarize
 
+if TYPE_CHECKING:
+    # 実行時は使うメソッドの中で import する（fwd_map・fwd_plan は ff_bias 経由でこのモジュールを
+    # import するため、先頭で import すると循環する）
+    from tests.research.fwd_map import ForwardTable
+    from tests.research.fwd_plan import ForwardPlan
+
 __all__ = [
     "CandidateC2",
     "CandidateC3",
     "CandidateC4",
     "CandidateC5",
     "CandidateFeedforward",
+    "ForwardMapFeedforward",
+    "ForwardModelFeedforward",
     "CANDIDATE_CLASSES",
     "make_candidate",
     "train_inverse_model_effective",
@@ -375,6 +384,9 @@ class CandidateFeedforward(FeedforwardModel):
         *,
         select_accel_kmhs: float | None = None,
         select_speed_kmh: float | None = None,
+        select_brake_accel_kmhs: float | None = None,
+        select_brake_speed_kmh: float | None = None,
+        brake_inputs: tuple[float, Sequence[float], Sequence[float]] | None = None,
     ) -> float:
         """C1 の符号付き努力量 [%]（正: 名目アクセル開度、負: 名目ブレーキ開度）。
 
@@ -396,6 +408,20 @@ class CandidateFeedforward(FeedforwardModel):
         「惰行／アクセル／ブレーキ」の判定に使う要求加速度と惰行加速度を差し替える。開度の計算
         （モデル予測・`_brake_effort` の desired_accel/coast）は一切変えない。None（既定）なら
         従来と完全に同じ。`reach_horizons_s`（段3 到達可能性）と併用すると ValueError。
+
+        ブレーキの判定だけ別の窓（ProblemReport_20260930 段2-2）: `select_brake_accel_kmhs`
+        （L_b の窓の傾き）と `select_brake_speed_kmh`（ref(t+L_b)）が渡されたときだけ、
+        「アクセルでないとき」のブレーキ⇔惰行の判定にこの組を使う。規則は
+        diff ≥ 帯 → アクセル（上の select_* の組。L の窓）／それ以外で diff_b ≤ −帯 → ブレーキ／
+        それ以外 → 惰行。diff = 傾き − 惰行（free_accel_at）。両方 None なら diff_b = diff
+        （従来と同値）。片方だけ渡したときは、渡さない側を select_*（なければ従来の値）で補う。
+        開度の計算（desired_accel・coast）は変えない。
+
+        ブレーキモデル入力の差し替え（ProblemReport_20260929 段2）: `brake_inputs` =
+        (v0, future_speeds, past_speeds)（主入力と同じ spec＝和集合の並び）が渡されたときだけ、
+        **ブレーキモデルの特徴量（`brake_row`）だけ**をこの値から作る（学習域クリップは主入力と
+        同じ処理を掛ける）。停車保持・レジーム/ペダル選択・`desired_accel`・`coast`・`ref_next`
+        （ブレーキ下限）・アクセル側は元の入力のまま。None（既定）なら従来と完全に同じ。
         """
         if self._accel_model is None or self._brake_model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
@@ -412,14 +438,7 @@ class CandidateFeedforward(FeedforwardModel):
 
         # 学習域クリップ（現行と同じ。v0 > cm のときは軌跡全体を平行移動して dv を保つ）
         cm = self._speed_clip_max
-        if cm is not None:
-            if v0 > cm:
-                shift = v0 - cm
-                v0 = cm
-                future_speeds = [f - shift for f in future_speeds]
-                past_speeds = [s - shift for s in past_speeds]
-            future_speeds = [min(f, cm) for f in future_speeds]
-            past_speeds = [min(s, cm) for s in past_speeds]
+        v0, future_speeds, past_speeds = self._clip_inputs(v0, future_speeds, past_speeds)
 
         # 手順6: future_speeds/past_speeds は spec（和集合）の並びで渡される。ホライズン値で
         # 引ける辞書にしてから、ペダルごとの spec に必要な列だけを取り出す。
@@ -432,10 +451,16 @@ class CandidateFeedforward(FeedforwardModel):
         #    -coast_decel_at(v0)（段1で作った単一ソース）。旧「クリープ任せ」分岐はこの帯に
         #    吸収した（`coast_band_kmhs` 既定 0.0 なら帯は無効）
         coast = free_accel_at(p, self._research, v0)
-        use_select = select_accel_kmhs is not None or select_speed_kmh is not None
+        use_select = (
+            select_accel_kmhs is not None
+            or select_speed_kmh is not None
+            or select_brake_accel_kmhs is not None
+            or select_brake_speed_kmh is not None
+        )
         if use_select and self._research.reach_horizons_s:
             raise ValueError(
-                "select_accel_kmhs/select_speed_kmh は reach_horizons_s と併用できません"
+                "select_accel_kmhs/select_speed_kmh/select_brake_* は "
+                "reach_horizons_s と併用できません"
             )
         if self._research.reach_horizons_s:
             # 段3: 惰行のまま進んだ先の速度 v_free(t+h) と基準を各ホライズンで比べる
@@ -457,9 +482,26 @@ class CandidateFeedforward(FeedforwardModel):
             if select_speed_kmh is not None:
                 sel_v = select_speed_kmh if cm is None else min(select_speed_kmh, cm)
                 sel_coast = free_accel_at(p, self._research, sel_v)
-            if abs(sel_accel - sel_coast) < self._research.coast_band_kmhs:
+            band = self._research.coast_band_kmhs
+            diff = sel_accel - sel_coast
+            # ブレーキ用の判定量（L_b の窓）。渡さない側は L の窓の値のまま
+            diff_b = diff
+            if select_brake_accel_kmhs is not None or select_brake_speed_kmh is not None:
+                b_accel = sel_accel if select_brake_accel_kmhs is None else select_brake_accel_kmhs
+                b_coast = sel_coast
+                if select_brake_speed_kmh is not None:
+                    b_v = select_brake_speed_kmh if cm is None else min(select_brake_speed_kmh, cm)
+                    b_coast = free_accel_at(p, self._research, b_v)
+                diff_b = b_accel - b_coast
+            # アクセルは L の窓で先に判定、次にブレーキを L_b の窓で判定、残りは惰行
+            # （diff_b = diff なら従来の「|diff|<帯 → 惰行、diff>=0 → アクセル、他 → ブレーキ」
+            # と同値）
+            if diff >= band:
+                want_accel = True
+            elif diff_b <= -band:
+                want_accel = False
+            else:
                 return 0.0
-            want_accel = sel_accel >= sel_coast
 
         accel_row = build_feature_row(
             v0,
@@ -467,10 +509,16 @@ class CandidateFeedforward(FeedforwardModel):
             [past_map[h] for h in self._accel_spec.past_horizons_s],
             self._accel_spec,
         )
+        if brake_inputs is None:
+            b_v0, b_future_map, b_past_map = v0, future_map, past_map
+        else:
+            b_v0, b_f, b_p = self._clip_inputs(*brake_inputs)
+            b_future_map = dict(zip(spec.lookahead_horizons_s, b_f, strict=True))
+            b_past_map = dict(zip(spec.past_horizons_s, b_p, strict=True))
         brake_row = build_feature_row(
-            v0,
-            [future_map[h] for h in self._brake_spec.lookahead_horizons_s],
-            [past_map[h] for h in self._brake_spec.past_horizons_s],
+            b_v0,
+            [b_future_map[h] for h in self._brake_spec.lookahead_horizons_s],
+            [b_past_map[h] for h in self._brake_spec.past_horizons_s],
             self._brake_spec,
         )
         accel_pred = max(0.0, float(self._accel_model.predict(accel_row)[0]))
@@ -486,6 +534,20 @@ class CandidateFeedforward(FeedforwardModel):
             )
         )
         return max(-100.0, min(100.0, effort))
+
+    def _clip_inputs(
+        self, v0: float, future_speeds: Sequence[float], past_speeds: Sequence[float]
+    ) -> tuple[float, list[float], list[float]]:
+        """学習域クリップ（v0 > cm は軌跡全体を平行移動して dv を保ち、各値を cm で頭打ち）。"""
+        cm = self._speed_clip_max
+        if cm is None:
+            return v0, list(future_speeds), list(past_speeds)
+        if v0 > cm:
+            shift = v0 - cm
+            v0 = cm
+            future_speeds = [f - shift for f in future_speeds]
+            past_speeds = [s - shift for s in past_speeds]
+        return v0, [min(f, cm) for f in future_speeds], [min(s, cm) for s in past_speeds]
 
     def _brake_effort(
         self, v0: float, desired_accel: float, coast: float, brake_pred: float,
@@ -613,18 +675,153 @@ class CandidateC5(CandidateFeedforward):
     uses_actual_speed = True
 
 
+class ForwardMapFeedforward:
+    """C7（表）・C8（モデル）: 順モデルを逆に引いて、走る前に作った開度の列を FF として出す。
+
+    C7 は実測の表（kind=table）、C8 は同じ格子に評価したモデル（kind=model。サブクラス
+    `ForwardModelFeedforward`）。読む pkl の kind が違うだけで、開度の列の作り方は同じ。
+
+    多項式モデルの `FeedforwardModel` とは中身がまったく別（表・時刻で引く開度の列・
+    特徴量なし）なので、継承せず別クラスにした。継承すると `spec`・`accel_model` など
+    多項式前提の属性が未初期化のまま残り、誤って触ったときに黙って別の値を返しうる。
+    走行ループ（mode_drive）が見る属性だけを、同じ名前で持つ。
+
+    使い方: `load_model(pkl)` → `build_plan(ref_at, duration_s, …)` → 周期ごとに `effort_at(t)`。
+    `predict_effort`（速度から引く形）は使わない。
+    """
+
+    candidate = "C7"
+    expected_kind = "table"  # 読める pkl の kind（fwd_map.KIND_TABLE。C8 は KIND_MODEL）
+    uses_actual_speed = False  # 実測車速は見ない（開度の列は走る前に作り終えている）
+    horizons: tuple[float, ...] = ()  # 先読み・過去の特徴量は持たない
+    past_horizons: tuple[float, ...] = ()
+    is_pedal_separated = False
+
+    def __init__(self) -> None:
+        self._table: ForwardTable | None = None
+        self._plan: ForwardPlan | None = None
+        self._params: object | None = None
+
+    @property
+    def table(self) -> ForwardTable:
+        if self._table is None:
+            raise RuntimeError(
+                f"{self.candidate}: 表を読み込んでいません（load_model を先に呼んでください）"
+            )
+        return self._table
+
+    @property
+    def plan(self) -> ForwardPlan:
+        if self._plan is None:
+            raise RuntimeError(
+                f"{self.candidate}: 開度の列がありません（build_plan を先に呼んでください）"
+            )
+        return self._plan
+
+    @property
+    def has_model(self) -> bool:
+        return self._table is not None
+
+    def set_params(self, params: object) -> None:
+        """他の候補と同じ呼び出しに合わせて受け取る（この計算では使わない）。"""
+        self._params = params
+
+    def load_model(self, model_path: str) -> None:
+        """順モデルの pkl を読む。多項式モデルの pkl・kind が expected_kind でない pkl は
+        ValueError。"""
+        from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
+
+        path = Path(model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        try:
+            table = load_forward_map(path)
+        except ValueError as exc:
+            raise ValueError(
+                f"{self.candidate} には順モデルの"
+                f"{'表' if self.expected_kind == 'table' else 'モデル'}の pkl"
+                f"（model_type=forward_map_v1。kind={self.expected_kind!r}）が必要です。"
+                f"多項式モデルなど別の pkl が指定されています: {exc}"
+            ) from exc
+        if table.kind != self.expected_kind:
+            raise ValueError(
+                f"{self.candidate} は kind={self.expected_kind!r} の pkl だけ扱えます"
+                f"（{model_path} は kind={table.kind!r}）"
+            )
+        self._table = table
+        self._plan = None
+
+    def build_plan(
+        self,
+        ref_at: Callable[[float], float],
+        duration_s: float,
+        *,
+        accel_deadband_pct: float,
+        brake_deadband_pct: float,
+        stop_brake_opening_pct: float,
+        stop_horizon_s: float,
+        period_s: float,
+        accel_lag_s: float | None = None,
+        brake_lag_s: float | None = None,
+        need_window_s: float,
+        coast_band_kmhs: float,
+    ) -> ForwardPlan:
+        """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。"""
+        from tests.research.fwd_plan import build_plan  # noqa: PLC0415
+
+        self._plan = build_plan(
+            ref_at,
+            duration_s,
+            self.table,
+            accel_deadband_pct=accel_deadband_pct,
+            brake_deadband_pct=brake_deadband_pct,
+            stop_brake_opening_pct=stop_brake_opening_pct,
+            stop_horizon_s=stop_horizon_s,
+            period_s=period_s,
+            accel_lag_s=accel_lag_s,
+            brake_lag_s=brake_lag_s,
+            need_window_s=need_window_s,
+            coast_band_kmhs=coast_band_kmhs,
+        )
+        return self._plan
+
+    def effort_at(self, t_s: float) -> float:
+        """時刻 t の FF の開度 [%]（正＝アクセル、負＝ブレーキ）。列の端より先は端で止まる。"""
+        return self.plan.at(t_s)
+
+    def predict_effort(self, *args: object, **kwargs: object) -> float:
+        raise NotImplementedError(
+            f"{self.candidate} は速度から引かず、時刻で引きます"
+            "（build_plan → effort_at(t) を使ってください）"
+        )
+
+
+class ForwardModelFeedforward(ForwardMapFeedforward):
+    """C8: 順モデルのモデル版（線形回帰・Ridge・ニューラルネットを C7 と同じ格子に評価した pkl。
+    fwd_model_*.pkl。kind=model）。開度の列の作り方・使い方は C7 と同じ。"""
+
+    candidate = "C8"
+    expected_kind = "model"  # fwd_map.KIND_MODEL
+
+
 #: V1 案スイッチ: config の feedforward.candidate 名 → クラス
-CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward]] = {
+CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedforward]] = {
     "C1": CandidateFeedforward,
     "C2": CandidateC2,
     "C3": CandidateC3,
     "C4": CandidateC4,
     "C5": CandidateC5,
+    "C7": ForwardMapFeedforward,
+    "C8": ForwardModelFeedforward,
 }
 
 
-def make_candidate(name: str) -> CandidateFeedforward:
-    """候補名（C1〜C5）から FF インスタンスを作る。未知の名前は ValueError。"""
+def make_candidate(name: str) -> CandidateFeedforward | ForwardMapFeedforward:
+    """候補名（C1〜C5・C7・C8）から FF インスタンスを作る。未知の名前は ValueError。
+
+    C7・C8 は多項式モデルではなく `ForwardMapFeedforward`（C8 はそのサブクラス。順モデルを読み、
+    時刻で開度を引く）。
+    """
     try:
         cls = CANDIDATE_CLASSES[name]
     except KeyError:

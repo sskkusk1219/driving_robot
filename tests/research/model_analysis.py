@@ -731,7 +731,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_simulate(cfg, out_dir, parse_zooms(args.zoom))
     return run_metrics(
         Path(ff.model_path), args.train_csv, out_dir,
-        accel_db=ff.accel_deadband_pct, brake_db=ff.brake_deadband_pct,
+        accel_db=cfg.vehicle.min_accel_opening_pct, brake_db=cfg.vehicle.min_brake_opening_pct,
     )
 
 

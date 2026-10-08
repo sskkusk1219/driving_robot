@@ -22,12 +22,20 @@ ssh raspi5_16gb@raspi5-16gb.local
 ## キャリブレーションの確認
 .venv/bin/python tests/hardware/test_calibration.py
   操作方法:
-  - e: +0.5mm（前進）
-  - w: -0.5mm（後退）
-  - d: +0.1mm（前進）
-  - s: -0.1mm（後退）
-  - Enter: 確定
+  - e: +1.0mm（前進）
+  - w: -1.0mm（後退）
+  - d: +0.5mm（前進）
+  - s: -0.5mm（後退）
+  - Enter: 確定（1 軸につき 2 回。1 回目＝ペダルに触れた位置（min・目視）、そのままジョグを続けて 2 回目＝上限（max））
   - q: 中止
+  - アクセル → ブレーキの順に測る（アクセルだけなら `--accel-only`）
+  - 表示された `min_accel_opening_pct`・`max_accel_opening_pct`・`min_brake_opening_pct`・`max_brake_opening_pct` を
+    `tests/research/config_testVehicle.yaml` の `vehicle` 節に書き写す（min は待機位置と効く開度 u の原点。段2l-6）
+  - min を測り直しても pkl は使い続けられる（表は u＝開度−min で持ち、走行時に yaml の min ＋ u へ戻す。停車保持は yaml の `stop_brake_offset_pct`＝min からの量。段2l-7）。動きの比率が変わる付け直しをしたときだけ手順2 をやり直す
+  - 取り付け直した後の手順（手順2 を飛ばす。比率が変わらない前提）:
+      1. `.venv/bin/python tests/hardware/test_calibration.py` で 4 値を測る
+      2. 4 値を `tests/research/config_testVehicle.yaml` の `vehicle` 節へ書き写す
+      3. `.venv/bin/python -m tests.research.main --steps 1,3 --hw real; echo "exit=$?"`
 
 ## CANの受信確認
 sudo .venv/bin/python scripts/check_can.py
@@ -721,48 +729,51 @@ cp tests/research/config_testVehicle.yaml /tmp/config_stub.yaml
     --ref-csv tests/research/results/drive_log_real_<手順3>.csv
 ```
 
-## 手順2 の新パターン列（ProblemReport_20260925 段4。スタブで通し確認・走行は実機不要）
+## 手順2 のパターン列＝G ランプ走行（ProblemReport_20261001 段2k。2026-10-06）
 
-手順2 のパターン列は「コーストダウン ×2 → 格子ステップ走行 → クリープ発進 ×3 → クリープ域ブレーキ保持」に置き換えた
-（旧パターン・旧ツール `debug_a2a5`・`debug_a3a4`・`stair_gain`・`cruise_curve`・`kaizen --part coverage`・
-`accel_onset` の表3b・`train_candidate_model --cruise-curve-from`・FF 候補 C6 は削除）。
-`learning.*_offsets_pct` 系・`trim_stair_*`・`cruise_hold_*`・`low_open_stair_*` の YAML キーも無い。
-**旧キーを含む YAML（`config_testVehicle_old.yaml`・`results/config_testVehicle_before_*.yaml`）は `ConfigError` で読めない。**
-クリープ域ブレーキ保持の開度は新キー `learning.creep_brake_hold_fracs`（不感帯 + frac × (停車保持開度 − 不感帯)）。
+手順2 のパターン列は「コーストダウン ×1 → G ランプ（段ごとに 狙いの G で加速 → 上端の車速 → 同じ G で減速 → 停車）→ クリープ域ブレーキ保持 ×8」。
+2026-09-25 段4 の格子ステップ走行（`grid_planner`・`grid_patterns`・`grid_settle`・`sweep_planner`・`coverage_live`・`grid_stub_run`、
+`learning.grid_station_*`・`grid_hold_*`・`grid_release_*`・`g_cap_g` などのキー）は削除した。
+**旧キーを含む YAML は `ConfigError` で読めない。**
 
-```bash
-R=tests/research/results/drive_log_real_20260925_075149.csv   # 基準車速を持つ CSV（DB 不要）
-# 手順2 の全体構成（コースト → 格子 → クリープ）をスタブで走り、モデル作成（YAML は更新しない）まで通す。
-# --stations は格子ステップの車速を絞る（全部だとスタブでは非常に長い）。スタブは応答が遅く所要時間は見積もれない
-.venv/bin/python -m tests.research.grid_stub_run --ref-csv $R --full --stations 15 --gain-scale 5
-```
-
-見るもの: パターン一覧（COAST_DOWN ×2 → GRID_STEP → GRID_LAUNCH → クリープ発進 ×3 → ブレーキ保持 ×8）、
-完走、網羅マップ、最後の 2-2 で惰行カーブ・クリープカーブ・停止下限・ペダルゲインの推定行が出ること
-（スタブなので数値の良し悪しは判断しない）。
-
-### 狙うモードを選ぶ（ProblemReport_20260925 段4b）
-
-格子ステップ走行が狙う車速 × 加速度は、`modes.coverage_mode_names`（DB の `driving_modes.name` のリスト）の全モードから作る。
-重なるマスは 1 回だけ測る（秒数はモードごとの最大、平均加速度は秒数で重み付け）。発進・停車セル（0〜20 km/h）の狙いも選んだモードから自動で決まる
-（US06 を入れると発進 +9.4・停車 −8.0 km/h/s が増える）。手順3 で走るモードと 2-2 の MAE_WLTP は従来どおり `modes.wltp_mode_name`。
-加速度の列は ±14 km/h/s まで（`vehicle.max_decel_g` 0.4G ≒ 14.1）。
+手順2 の最後に作るモデルは `feedforward.candidate` で決まる（C1〜C5＝多項式／C7＝表 `fwd_table_*.pkl`／C8＝表と `fwd_model_*.pkl`）。
+実機では作った pkl を `feedforward.model_path` に書く（`candidate` は書き換えない）。**走る前に yaml の `candidate` を確認すること。**
 
 ```bash
-# 手順2 の全体構成を WLTP + US06 の合成でスタブ走行（--ref-csv を付けない = DB の全モードを読む）
-.venv/bin/python -m tests.research.grid_stub_run --full --stations 15 --gain-scale 5
+# 段の計画を見る（走らない。DB の modes.coverage_mode_names を読む）。
+# 上: 車速帯 × G の段ごとのモードの秒数、下: 段ごとの上端の車速・見込み秒数・周回数
+.venv/bin/python -m tests.research.ramp_planner
+
+# 手順2 と同じパターン列をスタブで走る（2-0 のペダル探索は飛ばす。スタブの手順2 は 2-0 で止まるため）
+# --levels で G の段を絞る（2 段で約 7〜9 分）。--full は全段（約 23 分）。--csv で毎周期の生データ
+.venv/bin/python -m tests.research.ramp_stub_run --levels 0.08,0.25 --gain-scale 5
+.venv/bin/python -m tests.research.ramp_stub_run --full --gain-scale 5 --csv /tmp/ramp.csv
+
+# 実機（シャシダイナモ上。ユーザー作業）
+.venv/bin/python -m tests.research.main --steps 1,2 --hw real; echo "exit=$?"
+
+# 走行後: CSV からモデルと物理定数だけ作り直す（実機不要。candidate のモデルを作る）
+# --dry-run は yaml を書き換えないが、pkl は results/models に残る（C8 は 1600 秒ぶんのログで約 2 分）
+.venv/bin/python -m tests.research.relearn tests/research/results/drive_log_real_<手順2>.csv --dry-run
+
+# 走行後: C8 の別の版を作る（--map は手順2 が作った C7 の表）
+.venv/bin/python -m tests.research.fwd_final --train tests/research/results/drive_log_real_<手順2>.csv \
+    --map tests/research/results/models/fwd_table_<時刻>.pkl \
+    --hidden 50 50 --activation relu --drop-stop-approach --out tests/research/results/models/fwd_model_<名前>.pkl
+
+# 走行後の網羅の確認（車速 × 加速度／車速 × 開度）
+.venv/bin/python -m tests.research.wltp_grid tests/research/results/drive_log_real_<手順2>.csv
+.venv/bin/python -m tests.research.fwd_tool cells --train tests/research/results/drive_log_real_<手順2>.csv
 ```
 
-強いステップ（|狙い| > 6.7 km/h/s）は、帯の手前の端まで移って落ち着いてから踏む（助走。行の終わりに「助走 N km/h」）。
-2-1 の終わりに「落ち着き判定の集計」（待ち時間・許容幅内の割合・開度のばらつき・ステップの当てはめ点数）が出る。
-これで `grid_settle_tol_kmh`・`grid_settle_s`・`grid_step_window_s` の仮の値を段5 の実機データから決め直す。
+見るもの: 走る前の段の表（上端の車速・見込み秒数・合計と枠 `learning.ramp_time_budget_s`）、走行後の段ごとの結果
+（加速・減速の秒数、実測 G の中央値、最高車速）。スタブの秒数・G は実車の値ではない（数値の良し悪しは判断しない）。
 
 単体テスト（変更箇所のみ）:
 ```bash
-.venv/bin/python -m pytest tests/research/test_research_pattern_drive.py tests/research/test_research_pattern_loop.py \
-  tests/research/test_research_pattern_loop_grid.py tests/research/test_research_grid_patterns.py \
-  tests/research/test_research_config.py tests/research/test_research_ff_candidate.py \
-  tests/research/test_research_train_candidate_model.py tests/research/test_research_accel_onset.py \
-  tests/research/test_research_kaizen.py tests/research/test_research_stop_brake_floor.py -q
+.venv/bin/python -m pytest tests/research/test_research_ramp_planner.py tests/research/test_research_pattern_loop_ramp.py \
+  tests/research/test_research_pattern_drive.py tests/research/test_research_model_build.py \
+  tests/research/test_research_fwd_final.py -q
 ```
-（既知: `test_stop_brake_floor_settings_are_validated` は作業ツリーの yaml `stop_brake_floor_offset_pct` が 0.5 のため失敗する。段4 と無関係）
+（既知の失敗。yaml の値に依るもので段2k と無関係: `test_research_config.py` 4 件、
+`test_research_pattern_loop.py::test_governor_reduces_holds_raises_and_releases`、`test_research_mode_drive.py` 3 件）

@@ -14,7 +14,12 @@ from dataclasses import replace
 import numpy as np
 
 from tests.research.ff_model import DEFAULT_DT_S, STOP_SPEED_KMH, group_by_session
-from tests.research.research_types import DriveLog, FeedforwardParams, coast_decel_at
+from tests.research.research_types import (
+    PEDAL_OFF_TOL_PCT,
+    DriveLog,
+    FeedforwardParams,
+    coast_decel_at,
+)
 
 # 物理定数推定用のしきい値（本番と同値。STOP_SPEED_KMH は ff_model のものを使う）
 CREEP_STEADY_TOL_KMHS: float = 0.3  # クリープ定常判定の |加速度| しきい値
@@ -239,7 +244,10 @@ def estimate_dynamics_params(logs: list[DriveLog], current: FeedforwardParams) -
         sp = speed[:-1]  # dv に揃えた始点速度
         # deadband_pct 以下は「ペダルオフ」とみなす。strict < だと deadband=0.0
         # （合法値）のとき常に False になり物理定数推定が無音で全滅する（D5 レビュー指摘）。
-        pedal_off = (accel[:-1] <= accel_db) & (brake[:-1] <= brake_db)
+        # 2026-10-08 段2l-6: 待機位置が min ちょうどなので PEDAL_OFF_TOL_PCT の幅を持たせる
+        pedal_off = (accel[:-1] <= accel_db + PEDAL_OFF_TOL_PCT) & (
+            brake[:-1] <= brake_db + PEDAL_OFF_TOL_PCT
+        )
 
         # 停車保持ブレーキ: 停車中にかけているブレーキ開度
         m_stop = (speed < STOP_SPEED_KMH) & (brake >= brake_db)

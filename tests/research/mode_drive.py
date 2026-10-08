@@ -50,7 +50,11 @@ from tests.research.drive_log import (
     DriveSample,
     SessionLog,
 )
-from tests.research.ff_candidate import CandidateFeedforward, make_candidate
+from tests.research.ff_candidate import (
+    CandidateFeedforward,
+    ForwardMapFeedforward,
+    make_candidate,
+)
 from tests.research.ff_params import research_ff_params
 from tests.research.hardware import ActuatorProtocol, DriveError, ResearchHardware
 from tests.research.pattern_drive import _overcurrent_limit_ma, _release_pedals
@@ -94,7 +98,7 @@ PHASE_COAST = "COAST"
 @dataclass
 class ModeDriveSetup:
     mode: DrivingMode
-    ff: CandidateFeedforward
+    ff: CandidateFeedforward | ForwardMapFeedforward
 
 
 async def load_mode(cfg: ResearchConfig, name: str) -> DrivingMode:
@@ -136,14 +140,26 @@ async def load_mode(cfg: ResearchConfig, name: str) -> DrivingMode:
     )
 
 
-def load_feedforward(cfg: ResearchConfig) -> CandidateFeedforward:
-    """手順 2 で作った FF モデルと物理定数（config_testVehicle.yaml）を読み込む。"""
+def load_feedforward(cfg: ResearchConfig) -> CandidateFeedforward | ForwardMapFeedforward:
+    """手順 2 で作った FF モデルと物理定数（config_testVehicle.yaml）を読み込む。
+
+    C7・C8 は多項式モデルではなく順モデルの pkl（表・モデル版）を読む（物理定数・研究パラメータ・
+    先読みホライズンの検査は多項式モデル用なので通さない）。開度の列は prepare_mode_drive が作る。
+    """
     ff_cfg = cfg.feedforward
     if not ff_cfg.is_model_trained:
         raise ConfigError(
             f"FF モデルがありません: {ff_cfg.model_path}（手順 2 で作成してください）"
         )
-    ff = make_candidate(ff_cfg.candidate)  # V1 案スイッチ（C1〜C6。既定 C1）
+    ff = make_candidate(ff_cfg.candidate)  # V1 案スイッチ（C1〜C5・C7・C8。既定 C1）
+    if isinstance(ff, ForwardMapFeedforward):
+        try:
+            ff.load_model(ff_cfg.model_path)
+        except (OSError, ValueError) as exc:
+            raise ConfigError(
+                f"FF モデルを読み込めません: {ff_cfg.model_path}（{exc}）"
+            ) from exc
+        return ff
     ff.set_params(feedforward_params(cfg))
     ff.set_research_params(research_ff_params(cfg))
     try:
@@ -161,6 +177,57 @@ def load_feedforward(cfg: ResearchConfig) -> CandidateFeedforward:
     return ff
 
 
+def _prepare_forward_map_plan(
+    cfg: ResearchConfig, mode: DrivingMode, ff: ForwardMapFeedforward
+) -> None:
+    """C7・C8: 基準車速から開度の列を作り、中身を表示する（走行前チェックより前。HW 不使用）。"""
+    ff_cfg, fm = cfg.feedforward, cfg.forward_map
+    plan = ff.build_plan(
+        ReferenceSpeed(mode).at,
+        mode.total_duration,
+        accel_deadband_pct=cfg.vehicle.min_accel_opening_pct,
+        brake_deadband_pct=cfg.vehicle.min_brake_opening_pct,
+        stop_brake_opening_pct=cfg.stop_brake_opening_pct,
+        stop_horizon_s=cfg.features.h0_s,
+        period_s=cfg.control.loop_interval_s,
+        accel_lag_s=fm.accel_lag_s,
+        brake_lag_s=fm.brake_lag_s,
+        need_window_s=fm.need_window_s,
+        coast_band_kmhs=fm.coast_band_kmhs,
+    )
+    meta = ff.table.meta
+    # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）
+    lag_a = fm.accel_lag_s if fm.accel_lag_s is not None else meta.get("accel_lag_s")
+    lag_b = fm.brake_lag_s if fm.brake_lag_s is not None else meta.get("brake_lag_s")
+    say(f"FF 候補: {ff.candidate}（順モデルの表）　表: {ff_cfg.model_path}")
+    say(f"  遅れ アクセル {lag_a}s / ブレーキ {lag_b}s・惰行の帯 ±{fm.coast_band_kmhs:g} km/h/s・"
+        f"窓 {fm.need_window_s:g}s")
+    sec = plan.pedal_seconds()
+    say(f"  範囲外を引いた秒数 {plan.out_of_range_s():.1f}s・穴埋めを引いた秒数 "
+        f"{plan.filled_s():.1f}s")
+    say("  " + "・".join(f"{name} {s:.1f}s" for name, s in sec.items())
+        + f"・ペダル切替 {plan.pedal_switches()} 回")
+    mismatches = []
+    # 2026-10-08 段2l-6: pkl の meta のキー名は accel_deadband_pct・brake_deadband_pct のまま、
+    # 値は u の原点（vehicle.min_*_opening_pct）
+    for label, key, cfg_val in (
+        ("アクセル", "accel_deadband_pct", cfg.vehicle.min_accel_opening_pct),
+        ("ブレーキ", "brake_deadband_pct", cfg.vehicle.min_brake_opening_pct),
+    ):
+        table_val = meta.get(key)
+        if table_val is not None and abs(float(table_val) - cfg_val) > 0.01:
+            mismatches.append(f"{label} pkl {float(table_val):.2f} / 設定 {cfg_val:.2f}")
+    if mismatches:
+        # 2026-10-08 段2l-7: 表は u（開度 − min）で持ち、走行時に設定の min ＋ u へ戻すので、
+        # min が違っても警告ではなくお知らせにする（取り付け直し後も手順2 をやり直さない運用）
+        say(f"  お知らせ: u の原点（min）が表を作ったときと違います（{'、'.join(mismatches)}）。"
+            "表は u（開度 − min）で持つので、そのまま使います。"
+            "動きの比率が変わる付け直しをした場合は手順2 をやり直してください")
+    say(f"  待機位置（min） アクセル {cfg.vehicle.min_accel_opening_pct:.2f}% / "
+        f"ブレーキ {cfg.vehicle.min_brake_opening_pct:.2f}%・"
+        f"停車保持 {cfg.stop_brake_opening_pct:.2f}%（min ＋ {ff_cfg.stop_brake_offset_pct:.2f}%）")
+
+
 async def prepare_mode_drive(cfg: ResearchConfig, mode_name: str) -> ModeDriveSetup:
     say(f"走行モードを読み込みます: {mode_name!r}（{cfg.hardware.database_url}）")
     mode = await load_mode(cfg, mode_name)
@@ -174,6 +241,9 @@ async def prepare_mode_drive(cfg: ResearchConfig, mode_name: str) -> ModeDriveSe
     ff = load_feedforward(cfg)
     ff_cfg = cfg.feedforward
     ft = cfg.features
+    if isinstance(ff, ForwardMapFeedforward):
+        _prepare_forward_map_plan(cfg, mode, ff)
+        return ModeDriveSetup(mode=mode, ff=ff)
     if ff.is_pedal_separated:
         # 手順6: アクセル・ブレーキが別々のホライズンを選んだ pkl（horizon_search）
         say(f"FF 候補: {ff.candidate}　モデル: {ff_cfg.model_path}")
@@ -207,8 +277,9 @@ async def prepare_mode_drive(cfg: ResearchConfig, mode_name: str) -> ModeDriveSe
         if ff.spec != ft.to_feature_spec():
             say("  ⚠ 設定 features の特徴量と pkl の特徴量が違います。設定を変えたなら"
                 "手順2（学習）をやり直してください（走行は pkl の特徴量で続けます）")
-    say(f"  不感帯 アクセル {ff_cfg.accel_deadband_pct:.2f}% / "
-        f"ブレーキ {ff_cfg.brake_deadband_pct:.2f}%・停車保持 {ff_cfg.stop_brake_opening_pct:.2f}%")
+    say(f"  待機位置（min） アクセル {cfg.vehicle.min_accel_opening_pct:.2f}% / "
+        f"ブレーキ {cfg.vehicle.min_brake_opening_pct:.2f}%・"
+        f"停車保持 {cfg.stop_brake_opening_pct:.2f}%（min ＋ {ff_cfg.stop_brake_offset_pct:.2f}%）")
     return ModeDriveSetup(mode=mode, ff=ff)
 
 
@@ -274,15 +345,15 @@ class ActualSpeedHistory:
 
 
 def standby_openings(cfg: ResearchConfig) -> tuple[float, float]:
-    """使っていないペダルの待機開度 (アクセル, ブレーキ) [%]。無効なら (0, 0)。"""
-    md = cfg.mode_drive
-    if not md.pedal_standby:
+    """使っていないペダルの待機開度 (アクセル, ブレーキ) [%]。無効なら (0, 0)。
+
+    2026-10-08 段2l-6（ProblemReport_20261001）: 「不感帯 − standby_margin_pct」をやめ、
+    ペダルに触れた位置 vehicle.min_*_opening_pct そのものにした。
+    """
+    if not cfg.mode_drive.pedal_standby:
         return 0.0, 0.0
-    ff = cfg.feedforward
-    return (
-        max(0.0, ff.accel_deadband_pct - md.standby_margin_pct),
-        max(0.0, ff.brake_deadband_pct - md.standby_margin_pct),
-    )
+    v = cfg.vehicle
+    return v.min_accel_opening_pct, v.min_brake_opening_pct
 
 
 def standby_label(cfg: ResearchConfig) -> str:
@@ -290,7 +361,7 @@ def standby_label(cfg: ResearchConfig) -> str:
     if not cfg.mode_drive.pedal_standby:
         return "なし（0%）"
     accel, brake = standby_openings(cfg)
-    return f"{accel:.2f}% / {brake:.2f}%（不感帯 − {cfg.mode_drive.standby_margin_pct:.2f}%）"
+    return f"{accel:.2f}% / {brake:.2f}%（触れた位置 min）"
 
 
 def split_effort(effort: float, max_accel_pct: float, max_brake_pct: float) -> tuple[float, float]:
@@ -397,8 +468,8 @@ class _ModeRun:
         self.accel_standby, self.brake_standby = standby_openings(cfg)
         self.arbiter = PedalArbiter(
             cfg.arbiter,
-            accel_deadband_pct=cfg.feedforward.accel_deadband_pct,
-            brake_deadband_pct=cfg.feedforward.brake_deadband_pct,
+            accel_deadband_pct=cfg.vehicle.min_accel_opening_pct,
+            brake_deadband_pct=cfg.vehicle.min_brake_opening_pct,
             max_accel_opening=cfg.vehicle.max_accel_opening_pct,
             max_brake_opening=cfg.vehicle.max_brake_opening_pct,
             nominal_dt_s=cfg.control.loop_interval_s,
@@ -472,7 +543,8 @@ class _ModeRun:
     def _select_kwargs(self, t: float, v0: float) -> dict[str, float]:
         """ペダル選択の差し替え引数（ProblemReport_20260929 段3）。
 
-        `pedal_select_mode` が window のときは、窓の傾き G と ref(t+L) を渡す。
+        `pedal_select_mode` が window のときは、窓の傾き G と ref(t+L) を渡す
+        （L_b 指定時はブレーキ用に L_b の同じ 2 つも）。
         point のときは、`reach_horizons_s` が空なら `pedal_select_point_s`（hp）先の傾き
         (ref(t+hp) − v0) / hp だけを渡す（惰行加速度は従来どおり v0 で評価するので速度は渡さない。
         モデルの h1 とは独立に先読みを変えられる）。C4 は v0 が実車速で、FF の入力上の偏差が
@@ -487,10 +559,16 @@ class _ModeRun:
             base = self.ref.at(t) if getattr(self.ff, "candidate", "") == "C4" else v0
             return {"select_accel_kmhs": (self.ref.at(t + hp) - base) / hp}
         center, width = ff_cfg.pedal_select_center_s, ff_cfg.pedal_select_width_s
-        return {
+        kwargs = {
             "select_accel_kmhs": window_slope_kmhs(self.ref.at, t, center, width),
             "select_speed_kmh": self.ref.at(t + center),
         }
+        # L_b（ブレーキの判定だけの窓の中心。段2-2）。None なら L と同じ＝何も足さない
+        center_b = ff_cfg.pedal_select_brake_center_s
+        if center_b is not None:
+            kwargs["select_brake_accel_kmhs"] = window_slope_kmhs(self.ref.at, t, center_b, width)
+            kwargs["select_brake_speed_kmh"] = self.ref.at(t + center_b)
+        return kwargs
 
     async def _cycle(self, t: float, now: float) -> None:
         cfg, hw = self.cfg, self.hw
@@ -502,8 +580,12 @@ class _ModeRun:
         self.actual_history.record(t, speed)
 
         ref = self.ref.at(t)
-        v0, future, past = self._ff_inputs(t, ref, speed)
-        ff_effort = self.ff.predict_effort(v0, future, past, **self._select_kwargs(t, v0))
+        if isinstance(self.ff, ForwardMapFeedforward):
+            # C7・C8: 開度の列を時刻で引く（走る前に作り終えている。実測車速は見ない）
+            ff_effort = self.ff.effort_at(t)
+        else:
+            v0, future, past = self._ff_inputs(t, ref, speed)
+            ff_effort = self.ff.predict_effort(v0, future, past, **self._select_kwargs(t, v0))
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
         effort = ff_effort + pid_effort
         # ログの「指示開度 FF」列（FF の出力をペダル別に分けた値。ガバナー・待機位置の前）
@@ -535,7 +617,7 @@ class _ModeRun:
             else PHASE_BRAKE if brake > 0.0
             else PHASE_COAST
         )
-        # 使っていないペダルも不感帯の手前で待たせる（phase は待機位置を掛ける前の選択で決める）
+        # 使っていないペダルも待機位置（min）で待たせる（phase は待機位置を掛ける前の選択で決める）
         accel, brake = max(accel, self.accel_standby), max(brake, self.brake_standby)
         accel_pos, brake_pos = opening_to_pulse(accel), opening_to_pulse(brake)
 
@@ -758,7 +840,7 @@ async def _finish_stopped(
         stop = await decelerate_to_stop(hw, cfg, profile, log=log)
         say(f"停車保持: ブレーキ {stop.hold_pct:.2f}%")
         return
-    hold_pct = min(cfg.feedforward.stop_brake_opening_pct, cfg.vehicle.max_brake_opening_pct)
+    hold_pct = cfg.stop_brake_opening_pct  # min ＋ offset（max で頭打ち。段2l-7）
     log.mark(SECTION_DECEL_TO_STOP, PHASE_STOP_HOLD)
     await run.drive_axis(hw.accel, 0, is_accel=True)
     await run.drive_axis(hw.brake, opening_to_pulse(hold_pct), is_accel=False)

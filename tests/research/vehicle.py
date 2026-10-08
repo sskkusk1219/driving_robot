@@ -3,8 +3,8 @@
 開度の定義（tests 環境。本番のキャリブレーションは使わない）:
     0%   = 原点復帰位置（0 pulse）
     100% = ストローク限界（本番 robot_controller._ACTUATOR_PULSE_MAX = 9500 pulse）
-原点からペダルに触れるまでの隙間とペダル自体の遊びは、不感帯（feedforward.*_deadband_pct）
-として扱い、手順 2-0 のペダル探索で実測する。
+原点からペダルに触れるまでの隙間は、ペダルに触れた位置（vehicle.min_*_opening_pct）として
+tests/hardware/test_calibration.py で手で測る（不感帯の測定は 2026-10-08 段2l-6 でやめた）。
 
 手順 2 以降は本番のドメインコード（LearningDriveManager / model_training）をそのまま呼ぶ
 （走行ループ自体は pattern_loop.py が自前実装）。それらが受け取る VehicleProfile を、
@@ -55,7 +55,13 @@ def calibration_data() -> CalibrationData:
 
 
 def feedforward_params(cfg: ResearchConfig) -> FeedforwardParams:
-    """feedforward セクション → FeedforwardParams（キー名は 1:1）。"""
+    """feedforward セクション → FeedforwardParams（キー名は 1:1）。
+
+    2026-10-08 段2l-6: FeedforwardParams.accel_deadband_pct・brake_deadband_pct は、名前は不感帯の
+    ままだが値は vehicle.min_*_opening_pct（ペダルに触れた位置＝効く開度 u の原点）を入れる。
+    名前を変えると約 40 ファイルと過去の pkl の meta に波及するため、名前の付け替えは実機確認の
+    後に別の段で決める。
+    """
     ff = cfg.feedforward
     return FeedforwardParams(
         creep_speed_kmh=ff.creep_speed_kmh,
@@ -66,9 +72,9 @@ def feedforward_params(cfg: ResearchConfig) -> FeedforwardParams:
         pedal_gain_speeds_kmh=tuple(ff.pedal_gain_speeds_kmh),
         accel_gain_kmhs_per_pct=tuple(ff.accel_gain_kmhs_per_pct),
         brake_gain_kmhs_per_pct=tuple(ff.brake_gain_kmhs_per_pct),
-        stop_brake_opening_pct=ff.stop_brake_opening_pct,
-        brake_deadband_pct=ff.brake_deadband_pct,
-        accel_deadband_pct=ff.accel_deadband_pct,
+        stop_brake_opening_pct=cfg.stop_brake_opening_pct,  # min ＋ offset（段2l-7）
+        brake_deadband_pct=cfg.vehicle.min_brake_opening_pct,
+        accel_deadband_pct=cfg.vehicle.min_accel_opening_pct,
     )
 
 

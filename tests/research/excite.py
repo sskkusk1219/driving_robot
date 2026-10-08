@@ -201,9 +201,9 @@ class _ExciteRun:
         self.interval_s = cfg.control.loop_interval_s
         self.overcurrent_ma = _overcurrent_limit_ma(hw)
         self.safety = AxisSafetyNet(self.interval_s)
-        # ブレーキは待機位置に固定（不感帯 − standby_margin_pct。使わなければ 0%）
+        # ブレーキは待機位置（min）に固定（使わなければ 0%）
         _accel_standby, self.brake_standby = standby_openings(cfg)
-        self.floor_pct = cfg.feedforward.accel_deadband_pct
+        self.floor_pct = cfg.vehicle.min_accel_opening_pct
         self.ceil_pct = cfg.vehicle.max_accel_opening_pct
         self.amplitude_pct = min(self.ex.amplitude_pct, 1.0)  # ハード上限
         self.lpf_alpha = self.interval_s / (self.ex.speed_lpf_tau_s + self.interval_s)

@@ -140,15 +140,67 @@ def test_search_max_s_must_exceed_search_min_s() -> None:
 def test_unknown_candidate_is_rejected() -> None:
     cfg = _load_default()
     # candidate の既定値は config_testVehicle.yaml（ユーザーが書き換えるファイル）依存なので
-    # 決め打ちせず、C9・C6 を弾き C5 を通すことだけを主題にする
+    # 決め打ちせず、C99・C6 を弾き C5 を通すことだけを主題にする
     assert cfg.feedforward.candidate in cfgmod.CANDIDATE_NAMES
-    cfg.feedforward.candidate = "C9"
+    cfg.feedforward.candidate = "C99"
     problems = cfgmod.validate_config(cfg)
     assert any("candidate" in p for p in problems)
     cfg.feedforward.candidate = "C5"
     assert not any("candidate" in p for p in cfgmod.validate_config(cfg))
     cfg.feedforward.candidate = "C6"  # 2026-09-25 段4 で削除（骨格を定速階段にする案）
     assert any("candidate" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_candidate_c7_is_accepted() -> None:
+    cfg = _load_default()
+    cfg.feedforward.candidate = "C7"
+    assert not any("candidate" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_candidate_c8_is_accepted() -> None:
+    cfg = _load_default()
+    cfg.feedforward.candidate = "C8"
+    assert not any("candidate" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_forward_map_section_defaults_without_yaml_section(tmp_path: Path) -> None:
+    """yaml に forward_map 節が無くても既定値で読め、検証も通る。"""
+    lines = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+    start = lines.index("forward_map:\n")
+    end = start + 1
+    while lines[end].startswith((" ", "\t")) or lines[end].strip() == "":
+        end += 1  # 節の中身（インデント行・空行）を飛ばす
+    stripped = "".join(lines[:start] + lines[end:])
+    assert "forward_map:" not in stripped
+    path = tmp_path / "no_fm.yaml"
+    path.write_text(stripped, encoding="utf-8")
+    cfg = cfgmod.load_config(path)
+    fm = cfg.forward_map
+    assert (fm.coast_band_kmhs, fm.need_window_s) == (0.25, 1.0)
+    assert fm.accel_lag_s is None and fm.brake_lag_s is None
+    assert not any("forward_map" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_forward_map_yaml_values_are_loaded() -> None:
+    fm = _load_default().forward_map
+    assert fm.coast_band_kmhs == 0.25 and fm.need_window_s == 1.0
+    assert fm.accel_lag_s is None and fm.brake_lag_s is None
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("coast_band_kmhs", -0.1),
+        ("need_window_s", 0.0),
+        ("accel_lag_s", -0.05),
+        ("brake_lag_s", -0.05),
+    ],
+)
+def test_forward_map_invalid_values_are_rejected(field_name: str, value: float) -> None:
+    cfg = _load_default()
+    setattr(cfg.forward_map, field_name, value)
+    problems = cfgmod.validate_config(cfg)
+    assert any(f"forward_map.{field_name}" in p for p in problems)
 
 
 def test_curve_length_mismatch_is_rejected() -> None:
@@ -279,37 +331,40 @@ def test_decel_stop_thresholds_must_be_ordered() -> None:
     assert any("press_margin_g" in p for p in cfgmod.validate_config(cfg))
 
 
-def test_pedal_search_new_keys_are_validated() -> None:
-    """段1b: onset_accel_kmhs・search_step_mm・deadband_max_pct（新設定）の検証。"""
+def test_pedal_search_brake_step_is_validated_and_search_keys_are_gone() -> None:
+    """段2l-6: 2-0 は不感帯探索をやめた。brake_step_mm（旧 search_step_mm）の検証と、
+    不感帯探索専用キーが無いこと。"""
     cfg = _load_default()
     ps = cfg.pedal_search
-    assert ps.onset_accel_kmhs == 0.2
-    assert ps.search_step_mm == 0.1
-    assert ps.deadband_max_pct == 20.0
+    assert ps.brake_step_mm == 0.1
     assert cfgmod.validate_config(cfg) == []
+    for removed in ("onset_delta_kmh", "onset_confirm_kmh", "confirm_count", "deadband_max_pct",
+                    "accel_max_pct", "search_step_mm"):
+        assert not hasattr(ps, removed), removed
 
     def problems_about(key: str) -> bool:
         return any(key in p for p in cfgmod.validate_config(cfg))
 
-    ps.onset_accel_kmhs = 0.0
-    assert problems_about("onset_accel_kmhs")
-    ps.onset_accel_kmhs = 0.2
-
     # 0.01mm = 1 pulse（PCON-CB の位置指令単位）が機械的な下限
-    ps.search_step_mm = 0.01
+    ps.brake_step_mm = 0.01
     assert cfgmod.validate_config(cfg) == []
-    ps.search_step_mm = 0.009
-    assert problems_about("search_step_mm")
-    ps.search_step_mm = 5.01
-    assert problems_about("search_step_mm")
-    ps.search_step_mm = 0.1
+    ps.brake_step_mm = 0.009
+    assert problems_about("brake_step_mm")
+    ps.brake_step_mm = 5.01
+    assert problems_about("brake_step_mm")
+    ps.brake_step_mm = 0.1
+    # 停止確認の上限は vehicle.max_brake_opening_pct を使う（専用の上限キーは無い）
+    assert not hasattr(ps, "brake_max_pct")
 
-    ps.deadband_max_pct = 0.0
-    assert problems_about("deadband_max_pct")
-    ps.deadband_max_pct = min(ps.accel_max_pct, ps.brake_max_pct) + 0.1
-    assert problems_about("deadband_max_pct")
-    ps.deadband_max_pct = 20.0
-    assert cfgmod.validate_config(cfg) == []
+
+def test_removed_brake_max_pct_key_gives_clear_error(tmp_path: Path) -> None:
+    """2026-10-09: pedal_search.brake_max_pct は廃止。yaml に残っていたら削除を促すエラー。"""
+    path = tmp_path / "old.yaml"
+    path.write_text("pedal_search:\n  brake_max_pct: 50.0\n", encoding="utf-8")
+    with pytest.raises(
+        cfgmod.ConfigError, match="brake_max_pct は廃止されました.*max_brake_opening_pct"
+    ):
+        cfgmod.load_config(path)
 
 
 def test_pedal_search_creep_keys_validate() -> None:
@@ -560,12 +615,43 @@ def test_pedal_gain_curve_still_rejects_zero_value_after_stop_brake_removal() ->
     assert any("pedal_gain" in p for p in cfgmod.validate_config(cfg))
 
 
-def test_negative_standby_margin_is_rejected() -> None:
+def test_min_opening_is_validated_against_max() -> None:
+    """段2l-6: 0 ≤ min ＜ 対応する max（アクセル・ブレーキそれぞれ）。"""
     cfg = _load_default()
-    cfg.mode_drive.standby_margin_pct = -0.5
-    assert any("standby_margin_pct" in p for p in cfgmod.validate_config(cfg))
-    cfg.mode_drive.standby_margin_pct = 0.0
-    assert not any("standby_margin_pct" in p for p in cfgmod.validate_config(cfg))
+    v = cfg.vehicle
+    assert v.min_accel_opening_pct == 6.5 and v.min_brake_opening_pct == 2.9
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    for kind in ("accel", "brake"):
+        min_key, max_key = f"min_{kind}_opening_pct", f"max_{kind}_opening_pct"
+        original = getattr(v, min_key)
+        setattr(v, min_key, -0.1)
+        assert problems_about(min_key)
+        setattr(v, min_key, getattr(v, max_key))  # min == max は不可
+        assert problems_about(min_key)
+        setattr(v, min_key, 0.0)  # 0 は可
+        assert not problems_about(min_key)
+        setattr(v, min_key, original)
+    assert cfgmod.validate_config(cfg) == []
+
+
+def test_removed_deadband_and_standby_margin_keys(tmp_path: Path) -> None:
+    """段2l-6: feedforward.*_deadband_pct・mode_drive.standby_margin_pct は無い。
+    それらを含む古い yaml は「未知のキー」で読めない。"""
+    assert not hasattr(cfgmod.FeedforwardSection(), "accel_deadband_pct")
+    assert not hasattr(cfgmod.FeedforwardSection(), "brake_deadband_pct")
+    assert not hasattr(cfgmod.ModeDriveSection(), "standby_margin_pct")
+    path = tmp_path / "old.yaml"
+    text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    path.write_text(
+        text.replace("  creep_speed_kmh:", "  accel_deadband_pct: 10.5\n  creep_speed_kmh:", 1),
+        encoding="utf-8",
+    )
+    with pytest.raises(cfgmod.ConfigError, match="未知のキー.*feedforward.accel_deadband_pct"):
+        cfgmod.load_config(path)
 
 
 def test_checks_section_loads_from_default_yaml() -> None:
@@ -811,3 +897,160 @@ def test_arbiter_band_and_direction_keys_load_and_are_validated() -> None:
         assert not any(key in p for p in cfgmod.validate_config(cfg))
         setattr(cfg.arbiter, key, 0.0)
         assert any(key in p for p in cfgmod.validate_config(cfg))
+
+
+def test_pedal_select_brake_center_is_validated_and_roundtrips(tmp_path: Path) -> None:
+    """段2-2: L_b は既定 null（None）。指定時は 0<=L_b<=2、point のときの指定はエラー。"""
+    cfg = _load_default()
+    # yaml の現在値（ユーザー決定で 0.0 など）に依らず、null から始めて検証する
+    cfg.feedforward.pedal_select_brake_center_s = None  # 既定は null（＝L と同じ）
+    assert cfgmod.validate_config(cfg) == []
+
+    cfg.feedforward.pedal_select_mode = "window"
+    for ok in (0.0, 0.1, 2.0):
+        cfg.feedforward.pedal_select_brake_center_s = ok
+        assert cfgmod.validate_config(cfg) == []
+    for bad in (-0.1, 2.1):
+        cfg.feedforward.pedal_select_brake_center_s = bad
+        assert any("pedal_select_brake_center_s" in p for p in cfgmod.validate_config(cfg))
+
+    cfg.feedforward.pedal_select_mode = "point"  # point には効かないので指定はエラー
+    cfg.feedforward.pedal_select_brake_center_s = 0.0
+    assert any("pedal_select_brake_center_s" in p for p in cfgmod.validate_config(cfg))
+    cfg.feedforward.pedal_select_brake_center_s = None  # null なら point でも合格
+    assert cfgmod.validate_config(cfg) == []
+
+    # yaml の null/数値の読み込みと、値だけの書き換え（コメント保持）
+    path = tmp_path / "c.yaml"
+    path.write_text(cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    assert "pedal_select_brake_center_s" in path.read_text(encoding="utf-8")
+    cfgmod.update_yaml_values(path, {"feedforward.pedal_select_brake_center_s": 0.1})
+    assert cfgmod.load_config(path).feedforward.pedal_select_brake_center_s == 0.1
+    cfgmod.update_yaml_values(path, {"feedforward.pedal_select_brake_center_s": None})
+    assert cfgmod.load_config(path).feedforward.pedal_select_brake_center_s is None
+    # 他の自動保存（L）がこのキーを落とさない
+    cfgmod.update_yaml_values(path, {"feedforward.pedal_select_center_s": 0.4})
+    assert "pedal_select_brake_center_s" in path.read_text(encoding="utf-8")
+
+
+def test_grid_direction_and_weight_keys_are_validated() -> None:
+    lr = cfgmod.LearningSection()
+    assert (lr.grid_direction_threshold_pct, lr.grid_direction_threshold_kmhs,
+            lr.grid_weight_frac, lr.grid_direction_threshold_accel_pct) == (0.3, 0.3, 0.25, 1.5)
+    for key, bad in (
+        ("grid_direction_threshold_pct", -0.1),
+        ("grid_direction_threshold_kmhs", -0.1),
+        ("grid_direction_threshold_accel_pct", -0.1),
+        ("grid_weight_frac", 1.5),
+        ("grid_weight_frac", -0.1),
+    ):
+        cfg = cfgmod.ResearchConfig()
+        setattr(cfg.learning, key, bad)
+        assert any(key in p for p in cfgmod.validate_config(cfg)), key
+
+
+def test_ramp_settings_are_validated() -> None:
+    """段2k 段A: learning.ramp_g_levels / ramp_mode_min_s / ramp_time_budget_s の検証。"""
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.ramp_g_levels == [0.02, 0.045, 0.08, 0.125, 0.175, 0.25, 0.35]
+    assert lr.ramp_mode_min_s == pytest.approx(2.0)
+    assert lr.ramp_time_budget_s == pytest.approx(1200.0)
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    good = list(lr.ramp_g_levels)
+    too_big = cfg.vehicle.max_decel_g + 0.01
+    for bad in ([], [0.0, 0.1], [-0.1, 0.1], [0.1, 0.1], [0.2, 0.1], [0.1, too_big]):
+        lr.ramp_g_levels = bad
+        assert problems_about("ramp_g_levels"), bad
+    lr.ramp_g_levels = [0.1, cfg.vehicle.max_decel_g]  # 最大が max_decel_g ちょうどは合格
+    assert not problems_about("ramp_g_levels")
+    lr.ramp_g_levels = good
+
+    lr.ramp_mode_min_s = 0.0
+    assert problems_about("ramp_mode_min_s")
+    lr.ramp_mode_min_s = 2.0
+    lr.ramp_time_budget_s = 0.0
+    assert problems_about("ramp_time_budget_s")
+    lr.ramp_time_budget_s = 1200.0
+    assert cfgmod.validate_config(cfg) == []
+
+
+def test_ramp_top_margin_is_loaded_and_validated() -> None:
+    """段2l-4: learning.ramp_top_margin_kmh（選んだモードの最高車速に足す余裕）。"""
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.ramp_top_margin_kmh == pytest.approx(5.0)
+    lr.ramp_top_margin_kmh = -0.1
+    assert any("ramp_top_margin_kmh" in p for p in cfgmod.validate_config(cfg))
+    lr.ramp_top_margin_kmh = 0.0  # 0 は合格
+    assert cfgmod.validate_config(cfg) == []
+
+
+def test_ramp_control_settings_are_validated() -> None:
+    """段2k 段B: learning.ramp_rate_gain_pct_per_g_s・ramp_hold_margin_*・gov_soft_frac の検証。"""
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.ramp_rate_gain_pct_per_g_s == pytest.approx(100.0)
+    assert lr.ramp_settle_time_s == pytest.approx(2.0)
+    assert lr.ramp_hold_margin_frac == pytest.approx(0.10)
+    assert lr.ramp_hold_margin_min_g == pytest.approx(0.005)
+    assert lr.gov_soft_frac == pytest.approx(0.95)
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    for key, bads, good in (
+        ("ramp_rate_gain_pct_per_g_s", (0.0, -1.0), 100.0),
+        ("ramp_settle_time_s", (0.0, -1.0), 2.0),
+        ("ramp_hold_margin_frac", (0.0, 1.0, -0.1), 0.10),
+        ("ramp_hold_margin_min_g", (0.0, -0.01), 0.005),
+        ("gov_soft_frac", (0.0, 1.1, -0.5), 0.95),
+    ):
+        for bad in bads:
+            setattr(lr, key, bad)
+            assert problems_about(key), (key, bad)
+        setattr(lr, key, good)
+    lr.gov_soft_frac = 1.0  # 1 ちょうどは合格
+    assert not problems_about("gov_soft_frac")
+    lr.gov_soft_frac = 0.95
+    assert cfgmod.validate_config(cfg) == []
+
+
+def test_stop_brake_offset_key_loads_and_gives_absolute_opening(tmp_path: Path) -> None:
+    """2026-10-08 段2l-7: yaml は min からの量。絶対開度は min ＋ 量（max で頭打ち）。"""
+    path = tmp_path / "c.yaml"
+    cfg = cfgmod.load_config(path)
+    cfg.save({"vehicle.min_brake_opening_pct": 2.9, "feedforward.stop_brake_offset_pct": 15.73})
+    cfg = cfgmod.load_config(path)
+    assert cfg.feedforward.stop_brake_offset_pct == pytest.approx(15.73)
+    assert cfg.stop_brake_opening_pct == pytest.approx(18.63)
+    assert cfgmod.validate_config(cfg) == []
+    cfg.vehicle.max_brake_opening_pct = 10.0  # 頭打ち
+    assert cfg.stop_brake_opening_pct == pytest.approx(10.0)
+
+
+def test_old_stop_brake_opening_key_is_rejected_with_hint(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    cfgmod.load_config(path)  # 既定からコピーされる
+    text = path.read_text(encoding="utf-8")
+    assert "stop_brake_offset_pct:" in text
+    path.write_text(
+        text.replace("stop_brake_offset_pct:", "stop_brake_opening_pct:", 1), encoding="utf-8"
+    )
+    with pytest.raises(cfgmod.ConfigError, match="stop_brake_offset_pct"):
+        cfgmod.load_config(path)
+
+
+def test_stop_brake_offset_is_validated() -> None:
+    cfg = _load_default()
+    cfg.feedforward.stop_brake_offset_pct = -0.1
+    assert any("stop_brake_offset_pct" in p for p in cfgmod.validate_config(cfg))
+    cfg = _load_default()
+    cfg.vehicle.min_brake_opening_pct = 5.0
+    cfg.feedforward.stop_brake_offset_pct = 96.0  # min ＋ 量 > 100
+    assert any("100 を超え" in p for p in cfgmod.validate_config(cfg))

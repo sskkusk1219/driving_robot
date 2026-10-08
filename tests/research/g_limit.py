@@ -1,9 +1,10 @@
 """上限 G に届く開度の予測マップ（ProblemReport_20260925 段6a・門①）。
 
-手順2 の先頭の G 校正（0.2G 狙いのブレーキ減速・G 比例加速）と、走行中に測れた
-「開度と実測加速度」の組から、車速帯ごとに「そのペダルが上限 G に届くと予測される開度」を返す。
-格子ステップ・発進停車セルの開度の上限として使う（超えてから頭打ちにする G ガバナーだけでは、
-踏んだ直後に一度は超えてしまう。20260926 の実機で 0.47G）。
+走行中に測れた「開度と実測加速度」の組（コーストダウン・G ランプ・高い車速からの停車復帰の
+G 比例ブレーキ）から、車速帯ごとに「そのペダルが上限 G に届くと予測される開度」を返す。
+G ランプの最初の開度の見積もりに使う。当初（段6a）は格子ステップ・発進停車セルの開度の上限
+（超えてから頭打ちにする G ガバナーだけでは、踏んだ直後に一度は超えてしまう。20260926 の実機で
+0.47G）に使っていた（段2k 段E で格子ステップ走行は削除）。
 
 - 車速帯 `bin_kmh` ごとに点を持つ。ペダルの向き（アクセル=加速、ブレーキ=減速）の加速度 [km/h/s]。
 - 惰行の減速（両ペダル 0%）も車速帯ごとに持ち、不感帯の開度での点として使う
@@ -11,13 +12,19 @@
 - 予測は帯内の点から: 上限が点の範囲内なら前後の点の内挿、範囲の外なら割線（一番効いた点と
   開度が一番低い点）で外挿する。ブレーキは踏むほど急に効く（25 km/h の実測で 12→16% が 0.21、
   16→24% が 0.34 km/h/s/%）ので、割線は実際の傾きより緩く、予測開度は大きめ（危険側）になる。
-  上限に `learning.g_cap_g`（本当の上限より低い仮の値）を使うのはそのため。
+  上限には、本当の上限より低い仮の値を使うのがよい（`cap_pct` の `target_kmhs` に渡す）。
 - 点が無い車速帯は、そのペダルが効きやすい側（ブレーキは速い側、アクセルは遅い側）の帯を使う
   （効きやすい側の予測開度は小さくなるので安全側）。
 
 2026-09-27 段7a（ProblemReport_20260925 段7）: `coast_decel_kmhs` で車速帯ごとの惰行の減速の
-中央値を外向けにも返す。格子ステップ走行が「その車速の惰行ステップ」の代わりに、コーストダウン
-で既に測れているこの値を使う（`grid_planner.GridPlanner` の `coast_fn`）ため。
+中央値を外向けにも返す（G ランプの減速の見積もり `_ramp_estimate_u` が、惰行より緩い減速かを
+判定するのに使う）。
+
+2026-10-07 段2l-2: `sensitivity_kmhs_per_pct` で「開度 1% あたり加速度がどれだけ変わるか」を
+返す。G ランプの制御ゲインを、車ごとの固定値ではなく実測の感度から決めるため（今の開度の近くの
+点の最小二乗の傾きと、帯の全点の傾きの大きいほう。どちらも作れなければ他の帯）。感度を小さく
+見積もると開度を速く動かす側（危険側）に外れるので、大きいほうを採る（`062322` に当てた確認で
+極端に小さい値が消えた）。
 """
 
 from __future__ import annotations
@@ -30,10 +37,21 @@ PEDAL_BRAKE = "brake"
 _MAX_POINTS_PER_BIN = 40
 _MIN_OPENING_GAP_PCT = 1.0  # 割線の 2 点の開度がこれ未満なら傾きを作らない（雑音で不安定）
 _MIN_ACCEL_GAP_KMHS = 0.05
+# 仮値。ブレーキは踏むほど急に効くので、今の開度に近い点だけで傾きを出す。
+# 段2l-2（ProblemReport_20261001）
+_SENS_WINDOW_PCT = 5.0
 
 
-def _extrapolate(points: list[tuple[float, float]], target: float) -> float | None:
-    """(開度, 加速度) の点から、加速度が target になる開度。作れなければ None。"""
+def _extrapolate(
+    points: list[tuple[float, float]], target: float, *, extrapolate: bool = True
+) -> float | None:
+    """(開度, 加速度) の点から、加速度が target になる開度。作れなければ None。
+
+    `extrapolate=False` のときは、target が貯めた点のどれより強い場合に割線の外挿をせず、いちばん
+    効いた点（加速度が最大の点）の開度を返す（2026-10-08 段2l-6。G ランプの最初の開度の見積もり
+    用）。
+    補間（target が点の範囲内）と「すべて target 以上」は変わらない。
+    """
     if len(points) < 2:
         return None
     below = [p for p in points if p[1] < target]
@@ -47,15 +65,33 @@ def _extrapolate(points: list[tuple[float, float]], target: float) -> float | No
         return lo[0] + frac * (hi[0] - lo[0])
     if above:  # すべて target 以上: 一番弱い点の開度で既に届く
         return min(above, key=lambda p: p[1])[0]
+    if not extrapolate:  # 外挿しない: いちばん効いた点の開度から始める
+        return max(below, key=lambda p: p[1])[0]
     # 外挿: 加速度が一番大きい点と、開度が一番低い点の割線。近い 2 点の割線は加速度の雑音で
     # 傾きが不安定になる（1 帯に数点しか無く、開度の差は 0.5% 刻み）。遠い点（惰行の基準点＝不感帯）
     # との割線は安定。ブレーキは踏むほど急に効くので割線は実際の傾きより緩く、開度を大きく見積もる
-    # 側になる（`learning.g_cap_g` を上限より低くとる理由）
+    # 側になる（上限を本当の上限より低くとる理由）
     (u1, a1) = max(below, key=lambda p: p[1])
     (u0, a0) = min(below, key=lambda p: p[0])
     if u1 - u0 < _MIN_OPENING_GAP_PCT or a1 - a0 < _MIN_ACCEL_GAP_KMHS:
         return None
     return u1 + (target - a1) * (u1 - u0) / (a1 - a0)
+
+
+def _lsq_slope(points: list[tuple[float, float]], min_points: int) -> float | None:
+    """(開度, 加速度) の最小二乗の傾き（加速度を開度で回帰）。作れない・0 以下なら None。"""
+    if len(points) < min_points:
+        return None
+    us = [p[0] for p in points]
+    if max(us) - min(us) < _MIN_OPENING_GAP_PCT:
+        return None
+    n = len(points)
+    mean_u = sum(us) / n
+    mean_a = sum(p[1] for p in points) / n
+    sxx = sum((u - mean_u) ** 2 for u in us)
+    sxy = sum((u - mean_u) * (a - mean_a) for u, a in points)
+    slope = sxy / sxx
+    return slope if slope > 0.0 else None
 
 
 def _fmt_cap(cap_pct: float | None) -> str:
@@ -99,9 +135,8 @@ class GLimitMap:
     def strongest_point(self, pedal: str, speed_kmh: float) -> tuple[float, float] | None:
         """`speed_kmh` の車速帯で一番効いた実測点 (開度, 加速度)。点が無ければ None。
 
-        2026-09-28 段7c（ProblemReport_20260925 段7）: 格子ステップの最初の感度（未測定のペダル
-        の最初の開度）を、仮定値ではなくその車速で実際に効いた実測から決めるのに使う
-        （`grid_planner.GridPlanner` の `gain_fn`）。惰行の基準点は含めない（呼び出し側が
+        その車速で実際に効いた実測から最初の開度を決めるのに使う（段7c。当初は格子ステップの
+        `GridPlanner` の `gain_fn` だった）。惰行の基準点は含めない（呼び出し側が
         `coast_decel_kmhs` の基準点と組み合わせて割線を作るため）。
         """
         pts = self._points.get((pedal, self._idx(speed_kmh)))
@@ -118,19 +153,19 @@ class GLimitMap:
     def coast_decel_kmhs(self, speed_kmh: float) -> float | None:
         """その車速帯の惰行（両ペダル 0%）の減速の中央値 [km/h/s]（正）。点が無ければ None。
 
-        段7a（ProblemReport_20260925）: 格子ステップの惰行ステップの代わりに、コーストダウンで
-        既に測れているこの値を使う（`grid_planner.GridPlanner` の `coast_fn`）。
+        コーストダウンで測れた惰行の減速。G ランプの減速の見積もり（`_ramp_estimate_u`）が使う。
         """
         return self._coast_median(self._idx(speed_kmh))
 
     def _bin_cap(
-        self, pedal: str, idx: int, target_kmhs: float, deadband_pct: float
+        self, pedal: str, idx: int, target_kmhs: float, deadband_pct: float,
+        *, extrapolate: bool = True,
     ) -> float | None:
         pts = list(self._points.get((pedal, idx), ()))
         c = self._coast_median(idx)
         if c is not None:
             pts.append((deadband_pct, c if pedal == PEDAL_BRAKE else -c))
-        u = _extrapolate(pts, target_kmhs)
+        u = _extrapolate(pts, target_kmhs, extrapolate=extrapolate)
         if u is None:
             return None
         # 実測で「上限に届かなかった」開度は安全と分かっている。予測がそれより低いのは雑音
@@ -138,26 +173,63 @@ class GLimitMap:
         return max(u, safe, deadband_pct)
 
     def cap_pct(
-        self, pedal: str, speed_kmh: float, g_cap_kmhs: float, deadband_pct: float
+        self, pedal: str, speed_kmh: float, g_cap_kmhs: float, deadband_pct: float,
+        *, extrapolate: bool = True,
     ) -> float | None:
         """`speed_kmh` の車速帯で、そのペダルが `g_cap_kmhs`（正）に届くと予測される開度 [%]。
 
         測れていなければ None（上限をかけない）。自分の帯で作れないときは、そのペダルが
         効きやすい側の帯（ブレーキは速い側・アクセルは遅い側）を近い順に探し、無ければ反対側。
+
+        2026-10-08 段2l-6（ProblemReport_20261001）: `extrapolate=False` なら、狙いが貯めた点の
+        どれより強いとき割線の外挿をせず、いちばん効いた点の開度を返す（G ランプの最初の開度の
+        見積もり用。ユーザー決定）。補間は変わらない。
         """
-        own = self._idx(speed_kmh)
-        idxs = sorted({k[1] for k in self._points if k[0] == pedal} | set(self._coast))
-        if not idxs:
-            return None
-        safe_side = [i for i in idxs if (i >= own if pedal == PEDAL_BRAKE else i <= own)]
-        other = [i for i in idxs if i not in safe_side]
-        order = sorted(safe_side, key=lambda i: abs(i - own)) + sorted(
-            other, key=lambda i: abs(i - own)
-        )
-        for i in order:
-            cap = self._bin_cap(pedal, i, g_cap_kmhs, deadband_pct)
+        for i in self._search_order(pedal, self._idx(speed_kmh)):
+            cap = self._bin_cap(pedal, i, g_cap_kmhs, deadband_pct, extrapolate=extrapolate)
             if cap is not None:
                 return cap
+        return None
+
+    def _search_order(self, pedal: str, own: int) -> list[int]:
+        """自分の帯 `own` で作れないときに探す車速帯の順。そのペダルが効きやすい側
+        （ブレーキは速い側・アクセルは遅い側）を近い順、その後に反対側を近い順。"""
+        idxs = sorted({k[1] for k in self._points if k[0] == pedal} | set(self._coast))
+        safe_side = [i for i in idxs if (i >= own if pedal == PEDAL_BRAKE else i <= own)]
+        other = [i for i in idxs if i not in safe_side]
+        return sorted(safe_side, key=lambda i: abs(i - own)) + sorted(
+            other, key=lambda i: abs(i - own)
+        )
+
+    def _bin_sensitivity(
+        self, pedal: str, idx: int, opening_pct: float, deadband_pct: float
+    ) -> float | None:
+        pts = list(self._points.get((pedal, idx), ()))
+        c = self._coast_median(idx)
+        if c is not None:
+            pts.append((deadband_pct, c if pedal == PEDAL_BRAKE else -c))
+        near = [p for p in pts if abs(p[0] - opening_pct) <= _SENS_WINDOW_PCT]
+        # 2026-10-07 段2l-2: 近くの点の傾きと帯の全点の傾きの大きいほう。感度を小さく見積もると
+        # 開度を速く動かす側（危険側）に外れるので、大きいほうを採る（062322 に当てた確認で、
+        # 近くの点だけだと雑音で極端に小さい値が出ていたのが消えた）
+        slopes = [s for s in (_lsq_slope(near, 3), _lsq_slope(pts, 2)) if s is not None]
+        return max(slopes) if slopes else None
+
+    def sensitivity_kmhs_per_pct(
+        self, pedal: str, speed_kmh: float, opening_pct: float, deadband_pct: float
+    ) -> float | None:
+        """`opening_pct` あたりでの開度 1% あたりの加速度の変化（感度）[km/h/s per %]。
+
+        そのペダルの向きの加速度（ブレーキなら減速を正で、踏み増すほど増える向き）。帯内で
+        `opening_pct` から ±`_SENS_WINDOW_PCT` の点（3 点以上）の最小二乗の傾きと、帯の全点
+        （＋惰行の点）の傾きを両方計算し、作れたものの大きいほう（小さく見積もると開度を速く動かす
+        危険側に外れるため）。自分の帯で作れなければ `cap_pct` と同じ順で他の帯。
+        どの帯でも作れなければ None（呼び出し側が既定の速さを使う）。
+        """
+        for i in self._search_order(pedal, self._idx(speed_kmh)):
+            sens = self._bin_sensitivity(pedal, i, opening_pct, deadband_pct)
+            if sens is not None:
+                return sens
         return None
 
     def table(

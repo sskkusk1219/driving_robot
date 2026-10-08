@@ -1,11 +1,14 @@
 """既存の走行 CSV からモデル・カーブだけを作り直すオフライン入口（段2.5。ProblemReport_20260916）。
 
-手順2 を実機で走り直すと不感帯・クリープ速度（2-0 の実測）も同時に変わってしまい、惰行カーブ
-だけを直したいときに 1 変数比較にならない。既存の手順2 ログ（`results/drive_log_real_*.csv`）
-をそのまま使い、`pattern_drive.build_ff_model` を呼ぶだけの薄いエントリポイント。
+手順2 を実機で走り直すと停車保持開度・クリープ速度（2-0 の実測）も同時に変わってしまい、
+惰行カーブだけを直したいときに 1 変数比較にならない。既存の手順2 ログ
+（`results/drive_log_real_*.csv`）をそのまま使い、`pattern_drive.build_ff_model` を呼ぶだけの
+薄いエントリポイント。
 
-`pedal=None` で呼ぶため、不感帯・停車保持開度・クリープ平衡車速（`pattern_drive.MEASURED_KEYS`）は
-書き戻されず、`build_vehicle_profile(cfg)` が設定ファイルの 2-0 実測値をそのまま使う。
+`pedal=None` で呼ぶため、停車保持開度・クリープ平衡車速（`pattern_drive.MEASURED_KEYS`）は
+書き戻されず、`build_vehicle_profile(cfg)` が設定ファイルの値
+（u の原点は vehicle.min_*_opening_pct）をそのまま使う。
+candidate が C1〜C5 のときは ConfigError（段2l-6。C7・C8 のみ対象）。
 
 使い方:
     .venv/bin/python -m tests.research.relearn <csv> --dry-run   # 差分表示だけ（設定不変更）

@@ -1,0 +1,227 @@
+"""fwd_map（順モデルの表・逆引き・pkl）のテスト。合成データだけを使う。"""
+
+from __future__ import annotations
+
+import pickle
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from tests.research.fwd_data import FwdRows, make_speed_edges
+from tests.research.fwd_map import (
+    POINT_FILLED,
+    POINT_MEASURED,
+    POINT_OUT,
+    build_table,
+    load_forward_map,
+    save_table,
+)
+
+DT = 0.05
+
+
+def true_accel(v, u):
+    """既知の関数: u<0 側は傾きを変える。"""
+    u = np.asarray(u, dtype=float)
+    return -2.0 - 0.01 * np.asarray(v, dtype=float) + np.where(u >= 0, 0.3 * u, 0.6 * u)
+
+
+def make_rows(
+    v: np.ndarray, u: np.ndarray, a: np.ndarray, dt: float = DT
+) -> FwdRows:
+    n = len(v)
+    return FwdRows(
+        speed_kmh=np.asarray(v, dtype=float),
+        u_pct=np.asarray(u, dtype=float),
+        accel_kmhs=np.asarray(a, dtype=float),
+        t_s=np.arange(n) * dt,
+        dt_s=dt,
+        source="synthetic",
+        dt_row_s=np.full(n, dt),
+    )
+
+
+@pytest.fixture(scope="module")
+def synth_rows() -> FwdRows:
+    rng = np.random.default_rng(0)
+    n = 80000
+    v = rng.uniform(3.0, 78.0, n)
+    u = rng.uniform(-20.0, 20.0, n)
+    u[rng.random(n) < 0.05] = 0.0  # 惰行の行
+    return make_rows(v, u, true_accel(v, u))
+
+
+@pytest.fixture(scope="module")
+def synth_table(synth_rows):
+    return build_table(synth_rows, speed_edges=make_speed_edges(80.0))
+
+
+def test_accel_matches_true_function(synth_table) -> None:
+    for v in (12.0, 30.0, 52.0, 70.0):
+        for u in (-15.0, -6.0, 0.0, 5.0, 14.0):
+            assert synth_table.accel(v, u) == pytest.approx(float(true_accel(v, u)), abs=0.06)
+
+
+def test_invert_returns_original_u(synth_table) -> None:
+    v = np.array([15.0, 33.0, 47.0, 66.0, 41.0])
+    u = np.array([-12.0, -3.0, 8.0, 15.0, 4.0])
+    a = synth_table.accel(v, u)
+    back, flag = synth_table.invert(v, a)
+    assert np.allclose(back, u, atol=1e-6)
+    assert np.all(flag == POINT_MEASURED)
+
+
+def test_median_ignores_outliers() -> None:
+    n = 400
+    v = np.full(n, 12.0)
+    u = np.full(n, 6.0)  # 1 マスだけ（u=6 は番号 3、中心 5）
+    a = np.full(n, 1.0)
+    a[:30] = 50.0  # 外れ値（平均なら 4.5 になる）
+    other = make_rows(np.full(n, 12.0), np.full(n, -6.0), np.full(n, -1.0))
+    rows = make_rows(np.concatenate([v, other.speed_kmh]), np.concatenate([u, other.u_pct]),
+                     np.concatenate([a, other.accel_kmhs]))
+    t = build_table(rows, speed_edges=np.array([0.0, 5.0, 10.0, 15.0, 20.0]))
+    j = int(np.argmin(np.abs(t.u_grid - 5.0)))
+    assert t.accel_grid[2, j] == pytest.approx(1.0)
+
+
+def test_holes_filled_linearly_between_neighbours() -> None:
+    edges = np.array([0.0, 10.0, 20.0])
+    # 行 1（10〜20）の実測は u = −3, −1, 0, 9, 11（各 100 行 = 5 秒）。1〜7 は穴
+    centers = {-3: -3.0, -1: -1.0, 0: 0.0, 9: 9.0, 11: 11.0}
+    vs, us, as_ = [], [], []
+    for uc, a in centers.items():
+        vs += [15.0] * 100
+        us += [uc if uc != 0 else 0.0] * 100
+        as_ += [0.1 * a] * 100
+    t = build_table(make_rows(np.array(vs), np.array(us, dtype=float), np.array(as_)),
+                    speed_edges=edges, accel_deadband_pct=1.0)
+    row = 1
+    kinds = t.point_kind[row]
+    j = {round(float(g), 3): i for i, g in enumerate(t.u_grid)}
+    # u=−3,−1,0 は実測、0 と 9 の間の穴（1〜7）は穴埋め
+    assert kinds[j[-3.0]] == POINT_MEASURED
+    mid = j[5.0]
+    assert kinds[mid] == POINT_FILLED
+    # 0(=0) と 9(=0.9) の間の直線: u=5 → 0.5
+    assert t.accel_before_mono[row, mid] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_out_of_range_stops_at_end_value_and_flags() -> None:
+    n = 200
+    u = np.repeat([-4.0, -2.0, 0.0, 2.0, 4.0], n // 5)
+    a = 0.5 * u  # 実測の範囲は u=−3(中心)〜+3
+    rows = make_rows(np.full(n, 12.0), u, a)
+    rows2 = make_rows(np.full(n, 22.0), u, a)
+    from tests.research.fwd_data import concat_rows
+    big = concat_rows([rows, rows2])
+    # 実測は ±4 までだが、格子は ±10 まで欲しいので u=±10 のごく短い行を足す（穴になる）
+    tiny = make_rows(np.array([12.0, 12.0]), np.array([10.0, -10.0]), np.array([5.0, -5.0]))
+    t = build_table(concat_rows([big, tiny]), speed_edges=np.array([0.0, 10.0, 20.0, 30.0]))
+    row = 1
+    hi = t.meas_u_max[row]
+    assert t.accel(15.0, 10.0) == pytest.approx(t.accel(15.0, hi))
+    assert t.point_kind[row, -1] == POINT_OUT
+    u_inv, flag = t.invert(15.0, t.accel(15.0, hi) + 5.0)
+    assert u_inv == pytest.approx(hi)
+    assert flag == POINT_OUT
+    u_inv, flag = t.invert(15.0, -1e3)
+    assert flag == POINT_OUT
+    assert u_inv == pytest.approx(t.meas_u_min[row], abs=1.0001)
+
+
+def test_output_is_monotone_even_for_non_monotone_input() -> None:
+    rng = np.random.default_rng(1)
+    n = 30000
+    v = rng.uniform(10.0, 20.0, n)
+    u = rng.uniform(-20.0, 20.0, n)
+    a = 0.1 * u + 2.0 * np.sin(u / 3.0) + rng.normal(0, 0.1, n)  # 単調でない
+    t = build_table(make_rows(v, u, a), speed_edges=np.array([0.0, 10.0, 20.0]))
+    assert np.all(np.diff(t.accel_grid, axis=1) >= -1e-12)
+    # 単調化の前は単調でない
+    assert np.any(np.diff(t.accel_before_mono[1]) < -0.05)
+
+
+def test_flat_region_returns_smaller_abs_u() -> None:
+    n = 12000
+    u = np.tile(np.array([-6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0]), n // 7)
+    a = np.where(np.abs(u) <= 4.0, 0.0, 0.5 * u)  # −4〜+4 は平ら（加速度 0）
+    t = build_table(make_rows(np.full(len(u), 12.0), u, a),
+                    speed_edges=np.array([0.0, 10.0, 20.0]))
+    # 平らな区間 (u 中心 −3..+3 で 0): 加速度 0 を引くと |u| の小さい側 = 0
+    got, flag = t.invert(15.0, 0.0)
+    assert got == pytest.approx(0.0)
+    assert flag == POINT_MEASURED
+    # 平らが 0 をまたがない場合: 加速度 1.0 の平らな区間が u=+2..+6 → 小さい側 2
+    a2 = np.where(u >= 2.0, 1.0, np.where(u < 0.0, -1.0, 0.0))
+    t2 = build_table(make_rows(np.full(len(u), 12.0), u, a2),
+                     speed_edges=np.array([0.0, 10.0, 20.0]))
+    got2, _ = t2.invert(15.0, 1.0)
+    assert got2 == pytest.approx(2.0, abs=1.01)  # 平らの下端（u=2 の中心 1 〜 2 付近）
+    assert got2 < 3.0
+
+
+def test_row_with_too_few_points_copies_nearest_row() -> None:
+    n = 6000
+    u = np.tile(np.array([-4.0, -2.0, 0.0, 2.0, 4.0]), n // 5)
+    a = 0.4 * u
+    rows = make_rows(np.full(n, 12.0), u, a)  # 行 1 だけにデータ
+    edges = np.array([0.0, 10.0, 20.0, 30.0, 40.0])
+    one = make_rows(np.array([35.0]), np.array([0.0]), np.array([9.0]))  # 行 3 に 1 点だけ
+    from tests.research.fwd_data import concat_rows
+    t = build_table(concat_rows([rows, one]), speed_edges=edges)
+    assert t.meta["copied_rows"] == [0, 2, 3]
+    for r in (0, 2, 3):
+        assert np.allclose(t.accel_grid[r], t.accel_grid[1])
+        assert np.all(t.point_kind[r] == POINT_OUT)
+    _, flag = t.invert(35.0, 0.2)
+    assert flag == POINT_OUT
+
+
+def test_uneven_speed_edges_pick_correct_rows() -> None:
+    edges = make_speed_edges(30.0)  # 0,2.5,...,15,20,25,30
+    rep = (edges[:-1] + edges[1:]) / 2.0
+    assert rep[0] == pytest.approx(1.25) and rep[6] == pytest.approx(17.5)
+    # 各行の加速度が行番号になるデータ: v 中心で作る
+    vs, us, as_ = [], [], []
+    for r, c in enumerate(rep):
+        for uu in (-2.0, 0.0, 2.0):
+            vs += [c] * 40
+            us += [uu] * 40
+            as_ += [float(r) + 0.1 * uu] * 40
+    t = build_table(make_rows(np.array(vs), np.array(us), np.array(as_)), speed_edges=edges)
+    for r, c in enumerate(rep):
+        assert t.accel(c, 0.0) == pytest.approx(float(r))
+    # 2.5 と 5 の混在: 代表車速の間は直線補間（行 5 の 13.75 と行 6 の 17.5 の中点）
+    assert t.accel((rep[5] + rep[6]) / 2.0, 0.0) == pytest.approx(5.5)
+    assert t.coast_accel(rep[3]) == pytest.approx(3.0)
+
+
+def test_pkl_roundtrip_and_model_type_check(synth_table, tmp_path: Path) -> None:
+    p = save_table(synth_table, tmp_path / "t.pkl")
+    t2 = load_forward_map(p)
+    v = np.array([10.0, 40.0, 70.0])
+    u = np.array([-5.0, 3.0, 12.0])
+    assert np.allclose(t2.accel(v, u), synth_table.accel(v, u))
+    assert np.allclose(t2.invert(v, t2.accel(v, u))[0], synth_table.invert(v, t2.accel(v, u))[0])
+    assert t2.kind == "table"
+    with p.open("rb") as f:
+        d = pickle.load(f)
+    assert d["model_type"] == "forward_map_v1" and d["kind"] == "table"
+    bad = tmp_path / "bad.pkl"
+    with bad.open("wb") as f:
+        pickle.dump({"model_type": "other"}, f)
+    with pytest.raises(ValueError):
+        load_forward_map(bad)
+
+
+def test_invert_is_fast_for_whole_mode(synth_table) -> None:
+    rng = np.random.default_rng(2)
+    v = rng.uniform(0.0, 80.0, 36000)
+    a = rng.uniform(-4.0, 3.0, 36000)
+    t0 = time.perf_counter()
+    u, flag = synth_table.invert(v, a)
+    assert time.perf_counter() - t0 < 5.0
+    assert u.shape == (36000,) and flag.shape == (36000,)

@@ -347,11 +347,11 @@ def run(new_csv: Path, old_csv: Path, cfg_path: Path, out: Path) -> int:
     cfg = load_config(cfg_path)
     loop_cfg = PatternLoopConfig()
     cap = cfg.vehicle.max_speed_kmh * loop_cfg.accel_speed_cap_frac
-    ff = cfg.feedforward
+    v = cfg.vehicle
     old, new = read_pattern_rows(old_csv), read_pattern_rows(new_csv)
     print(f"前: {old_csv}（{len(old)} 行）\n新: {new_csv}（{len(new)} 行）")
-    print(f"cap = {cap:.1f} km/h / 不感帯 アクセル {ff.accel_deadband_pct:g}% "
-          f"ブレーキ {ff.brake_deadband_pct:g}%（{cfg_path} の値。前後で共通に使う）")
+    print(f"cap = {cap:.1f} km/h / u の原点（min） アクセル {v.min_accel_opening_pct:g}% "
+          f"ブレーキ {v.min_brake_opening_pct:g}%（{cfg_path} の値。前後で共通に使う）")
 
     for label, rows in (("前", old), ("新", new)):
         gates = pattern_gates(rows)
@@ -362,9 +362,9 @@ def run(new_csv: Path, old_csv: Path, cfg_path: Path, out: Path) -> int:
 
     print("\n### ガバナー（前後）\n")
     print(governor_table(governor_stats(old), governor_stats(new)))
-    for label, accel, db in (("アクセル", True, ff.accel_deadband_pct),
-                             ("ブレーキ", False, ff.brake_deadband_pct)):
-        print(f"\n### 学習に効く{label}行（開度 ≥ 不感帯 {db:g}%）\n")
+    for label, accel, db in (("アクセル", True, v.min_accel_opening_pct),
+                             ("ブレーキ", False, v.min_brake_opening_pct)):
+        print(f"\n### 学習に効く{label}行（開度 ≥ min {db:g}%）\n")
         print(rows_table(effective_row_bins(old, db, accel=accel),
                          effective_row_bins(new, db, accel=accel), label))
     path = fig_compare(out, old, new)

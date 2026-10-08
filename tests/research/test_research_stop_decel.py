@@ -25,15 +25,16 @@ FAST = {
     "decel_stop.dwell_s": 0.2,
     "decel_stop.slope_window_s": 0.2,
 }
+# 2026-10-08 段2l-6: 触れた位置 min は yaml の vehicle.min_*_opening_pct（_tmp_cfg で書く）
+MIN_ACCEL_PCT = 6.3
+MIN_BRAKE_PCT = 8.4
 PEDAL = PedalSearchResult(
     creep_speed_kmh=5.0,
-    accel_deadband_pct=6.3,
-    brake_deadband_pct=8.4,
     stop_confirm_pct=12.0,
     stop_brake_opening_pct=22.0,
 )
 STEP = 100  # 1mm [pulse]
-APPROACH = opening_to_pulse(PEDAL.brake_deadband_pct - 1.0)  # 不感帯 − approach_margin_pct
+APPROACH = opening_to_pulse(MIN_BRAKE_PCT - 1.0)  # min − approach_margin_pct
 CEILING = opening_to_pulse(PEDAL.stop_brake_opening_pct)
 
 
@@ -45,6 +46,8 @@ def _tmp_cfg(tmp_path: Path, **extra: float) -> cfgmod.ResearchConfig:
             "output.results_dir": str(tmp_path / "results"),
             "feedforward.model_path": str(tmp_path / "results" / "models" / "ff.pkl"),
             "output.plot": False,
+            "vehicle.min_accel_opening_pct": MIN_ACCEL_PCT,
+            "vehicle.min_brake_opening_pct": MIN_BRAKE_PCT,
             **FAST,
             **extra,
         }

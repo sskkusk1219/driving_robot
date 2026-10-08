@@ -362,7 +362,6 @@ def plot_zoom(
     lo, hi = center_s - ZOOM_HALF_WINDOW_S, center_s + ZOOM_HALF_WINDOW_S
     part = [r for r in rows if lo <= r.t_s <= hi]
     t = [r.t_s for r in part]
-    ff = cfg.feedforward
     k = cfg.kpi
     fig, (ax_v, ax_d, ax_p) = _figure(3, 9.0, sharex=True)
     ax_v.plot(t, [r.ref_kmh for r in part], color=COLOR_REF, linestyle="--", label="基準車速")
@@ -376,10 +375,10 @@ def plot_zoom(
     ax_d.set_ylabel("偏差 [km/h]")
     ax_p.plot(t, [r.accel_pct for r in part], color=COLOR_ACCEL, linewidth=1.8, label="アクセル")
     ax_p.plot(t, [r.brake_pct for r in part], color=COLOR_BRAKE, linewidth=1.8, label="ブレーキ")
-    ax_p.axhline(ff.accel_deadband_pct, color=COLOR_ACCEL, linestyle=":", linewidth=1.0,
-                 label=f"アクセル不感帯 {ff.accel_deadband_pct:.1f}%")
-    ax_p.axhline(ff.brake_deadband_pct, color=COLOR_BRAKE, linestyle=":", linewidth=1.0,
-                 label=f"ブレーキ不感帯 {ff.brake_deadband_pct:.1f}%")
+    ax_p.axhline(cfg.vehicle.min_accel_opening_pct, color=COLOR_ACCEL, linestyle=":", linewidth=1.0,
+                 label=f"アクセル min {cfg.vehicle.min_accel_opening_pct:.1f}%")
+    ax_p.axhline(cfg.vehicle.min_brake_opening_pct, color=COLOR_BRAKE, linestyle=":", linewidth=1.0,
+                 label=f"ブレーキ min {cfg.vehicle.min_brake_opening_pct:.1f}%")
     ax_p.set_ylabel("開度 [%]")
     ax_p.set_xlabel("モード経過時間 [s]")
     ax_p.legend(loc="upper right", fontsize=9)
@@ -470,7 +469,6 @@ def _observations(
     state_of: Callable[[float], str],
     cfg: ResearchConfig,
 ) -> list[str]:
-    ff = cfg.feedforward
     lines = []
     worst = next(r for r in rows if r.t_s == kpi.max_abs_t_s)
     lines.append(
@@ -501,13 +499,14 @@ def _observations(
             f"走行中のブレーキ指令 {pedal.brake_active_moving_s:.0f}s のうち "
             f"{pedal.brake_in_deadband_moving_s:.0f}s"
             f"（{100 * pedal.brake_in_deadband_moving_s / pedal.brake_active_moving_s:.0f}%）は"
-            f"ブレーキ不感帯 {ff.brake_deadband_pct:.2f}% より浅く、制動が出ていない指令だった。"
+            f"ブレーキ min {cfg.vehicle.min_brake_opening_pct:.2f}% より浅く、"
+            "制動が出ていない指令だった。"
         )
     if pedal.accel_active_s > 0:
         lines.append(
             f"アクセル指令 {pedal.accel_active_s:.0f}s のうち {pedal.accel_in_deadband_s:.0f}s"
             f"（{100 * pedal.accel_in_deadband_s / pedal.accel_active_s:.0f}%）は"
-            f"アクセル不感帯 {ff.accel_deadband_pct:.2f}% より浅かった。"
+            f"アクセル min {cfg.vehicle.min_accel_opening_pct:.2f}% より浅かった。"
         )
     if pedal.governor_s > 0:
         lines.append(
@@ -546,7 +545,8 @@ def write_mode_report(
         k.max_abs_deviation_kmh,
     )
     pedal = pedal_stats(
-        rows, ff.accel_deadband_pct, ff.brake_deadband_pct, feedforward_params(cfg)
+        rows, cfg.vehicle.min_accel_opening_pct, cfg.vehicle.min_brake_opening_pct,
+        feedforward_params(cfg),
     )
     chatter = chatter_metrics(
         t, [r.ref_kmh for r in rows], [r.actual_kmh for r in rows],
@@ -634,9 +634,11 @@ def write_mode_report(
                  + (f"・予定 {info.mode_duration_s:.0f}s" if info.mode_duration_s else "")),
                 ("制御構成", info.controller),
                 ("FF モデル", f"`{ff.model_path}`"),
-                ("不感帯（アクセル / ブレーキ）",
-                 f"{ff.accel_deadband_pct:.2f}% / {ff.brake_deadband_pct:.2f}%（手順 2-0 の実測）"),
-                ("停車保持開度", f"{ff.stop_brake_opening_pct:.2f}%"),
+                ("触れた位置 min（アクセル / ブレーキ）",
+                 f"{cfg.vehicle.min_accel_opening_pct:.2f}% / "
+                 f"{cfg.vehicle.min_brake_opening_pct:.2f}%（test_calibration.py で測定）"),
+                ("停車保持開度",
+                 f"{cfg.stop_brake_opening_pct:.2f}%（min ＋ {ff.stop_brake_offset_pct:.2f}%）"),
                 ("待機位置（アクセル / ブレーキ）", standby_label(cfg)),
                 ("開度上限（アクセル / ブレーキ）",
                  f"{cfg.vehicle.max_accel_opening_pct:.0f}% / "
@@ -714,7 +716,7 @@ def write_mode_report(
         f"![最大逸脱付近]({rel['zoom']})",
         "",
         f"図4: 最大逸脱（t={kpi.max_abs_t_s:.1f}s）の前後 {ZOOM_HALF_WINDOW_S:g}s。"
-        "下段の点線はアクセル / ブレーキの不感帯（これより浅い指令はペダルが効かない）。",
+        "下段の点線はアクセル / ブレーキの min（触れた位置。これより浅い指令は効かない）。",
         "",
         "## 5. ペダル指令の特徴",
         "",
@@ -722,10 +724,10 @@ def write_mode_report(
             ("項目", "値"),
             [
                 ("アクセル指令があった時間", f"{pedal.accel_active_s:.0f}s"),
-                (f"　うち不感帯 {ff.accel_deadband_pct:.2f}% より浅い",
+                (f"　うち min {cfg.vehicle.min_accel_opening_pct:.2f}% より浅い",
                  f"{pedal.accel_in_deadband_s:.0f}s"),
                 ("走行中にブレーキ指令があった時間", f"{pedal.brake_active_moving_s:.0f}s"),
-                (f"　うち不感帯 {ff.brake_deadband_pct:.2f}% より浅い",
+                (f"　うち min {cfg.vehicle.min_brake_opening_pct:.2f}% より浅い",
                  f"{pedal.brake_in_deadband_moving_s:.0f}s"),
                 ("アクセル開度の最大", f"{pedal.accel_max_pct:.1f}%"),
                 ("走行中のブレーキ開度の最大", f"{pedal.brake_max_moving_pct:.1f}%"),

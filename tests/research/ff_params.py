@@ -50,6 +50,7 @@ class ResearchFFParams:
     pedal_select_width_s: float = 3.0
     pedal_select_mode: str = "point"
     pedal_select_point_s: float = 1.0
+    pedal_select_brake_center_s: float | None = None
 
 
 def creep_accel_at(research: ResearchFFParams, v_kmh: float) -> float | None:
@@ -89,6 +90,7 @@ def research_ff_params(cfg: ResearchConfig) -> ResearchFFParams:
         pedal_select_width_s=ff.pedal_select_width_s,
         pedal_select_mode=ff.pedal_select_mode,
         pedal_select_point_s=ff.pedal_select_point_s,
+        pedal_select_brake_center_s=ff.pedal_select_brake_center_s,
     )
 
 

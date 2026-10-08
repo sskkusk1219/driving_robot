@@ -202,8 +202,8 @@ def main(argv: list[str] | None = None) -> int:
     say("── パターン単位 GroupKFold 分割検証（そのパターンを学習に使っていないモデルで予測） ──")
     accel_data, brake_data = effective_regime_data(
         logs, patterns, phases,
-        accel_deadband_pct=cfg.feedforward.accel_deadband_pct,
-        brake_deadband_pct=cfg.feedforward.brake_deadband_pct,
+        accel_deadband_pct=cfg.vehicle.min_accel_opening_pct,
+        brake_deadband_pct=cfg.vehicle.min_brake_opening_pct,
         spec=spec,
     )
     for data in (accel_data, brake_data):

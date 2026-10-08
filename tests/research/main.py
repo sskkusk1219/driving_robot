@@ -72,13 +72,23 @@ from tests.research.hardware import (
 from tests.research.learning_patterns import LearningDataError
 from tests.research.mode_drive import ModeDriveSetup, load_mode, prepare_mode_drive, run_mode_drive
 from tests.research.mode_report import RunInfo, rows_from_samples, write_mode_report
-from tests.research.pattern_drive import DriveError, build_ff_model, run_pattern_drive
+from tests.research.pattern_drive import (
+    DriveError,
+    build_ff_model,
+    require_forward_candidate,
+    run_pattern_drive,
+)
 from tests.research.pedal_arbiter import enabled_arbiter_features
 from tests.research.pedal_search import run_pedal_search
 from tests.research.pre_drive_check import PHASE_PRE_CHECK, run_pre_drive_check
+from tests.research.ramp_planner import (
+    count_bands_for_modes,
+    format_plan_table,
+    plan_ramps,
+    top_speed_cap_kmh,
+)
 from tests.research.term import banner, display_width, say
 from tests.research.vehicle import STROKE_LIMIT_PULSE
-from tests.research.wltp_grid import coverage_stats_from_modes, edges_from_config, outside_text
 
 DEFAULT_CONFIG = Path("tests/research/config_testVehicle.yaml")
 
@@ -206,8 +216,8 @@ def _print_summary(cfg: ResearchConfig) -> None:
          f"{cfg.vehicle.max_accel_opening_pct:.0f} / {cfg.vehicle.max_brake_opening_pct:.0f} %"),
         ("開度 0%→100%", f"原点 0 → {STROKE_LIMIT_PULSE} pulse（キャリブレーション不使用）"),
         ("ペダル探索",
-         f"{ps.step_mm:g}mm 刻み・待ち {ps.dwell_s:g}s・判定 ±{ps.onset_margin_kmh:g} km/h × "
-         f"{ps.confirm_count}・停車保持 +{ps.stop_hold_margin_pct:g}%"),
+         f"{ps.step_mm:g}mm 刻み（ブレーキ踏み込み {ps.brake_step_mm:g}mm）・"
+         f"待ち {ps.dwell_s:g}s・停車保持 +{ps.stop_hold_margin_pct:g}%"),
         ("クリープ安定判定",
          f"{ps.creep_window_s:g}s 平均の傾き < {ps.creep_settle_kmhs:g} km/h/s・"
          f"最短 {ps.creep_settle_min_s:g}s・最大 {ps.creep_timeout_s:g}s"),
@@ -219,8 +229,9 @@ def _print_summary(cfg: ResearchConfig) -> None:
         ("FF モデル", ff.model_path),
         ("FF モデル学習済み", "はい" if ff.is_model_trained else "いいえ（手順 2 で作成）"),
         ("FF カーブ同定済み", "はい" if ff.is_curves_identified else "いいえ（手順 2 で同定）"),
-        ("不感帯 (アクセル/ブレーキ)",
-         f"{ff.accel_deadband_pct:.1f} / {ff.brake_deadband_pct:.1f} %"),
+        ("触れた位置 min (アクセル/ブレーキ)",
+         f"{cfg.vehicle.min_accel_opening_pct:.1f} / {cfg.vehicle.min_brake_opening_pct:.1f} %"
+         "（待機位置・u の原点）"),
         ("PID ゲイン", f"Kp={cfg.pid.kp:g}  Ki={cfg.pid.ki:g}  Kd={cfg.pid.kd:g}"),
         ("PID 出力上限", f"{cfg.pid.output_limit_pct:.0f} %"),
         ("調停オプション", _arbiter_summary(cfg)),
@@ -286,7 +297,7 @@ async def step1_initialize(ctx: RunContext) -> None:
 
 PRE_DRIVE_CHECK_TITLE = (
     "走行前チェック（通信確認・車速 0 km/h 確認。ブレーキは次の手順が 2 なら小刻みに、"
-    "それ以外は stop_brake_opening_pct まで一気に踏む）"
+    "それ以外は停車保持開度（min ＋ stop_brake_offset_pct）まで一気に踏む）"
 )
 
 
@@ -307,12 +318,30 @@ async def pre_drive_check(ctx: RunContext, *, has_ref: bool = False, next_step: 
 # ─────────────────────────────────────────────────────────────────────
 
 
+# candidate ごとの、手順2 が作るモデルの種類（表示用）
+_CANDIDATE_KIND: dict[str, str] = {
+    **dict.fromkeys(("C1", "C2", "C3", "C4", "C5"), "2次多項式 Ridge 逆モデル"),
+    "C7": "順モデルの表",
+    "C8": "順モデル",
+}
+
+
+async def prepare_step2(ctx: RunContext) -> None:
+    """走行前チェックの前（ハードを動かす前）に、手順2 の対象外の candidate を止める。"""
+    require_forward_candidate(ctx.config)
+
+
 async def step2_pattern_drive(ctx: RunContext) -> None:
-    """ペダル探索 → 本番の学習運転パターンで走行 → その CSV から 2次多項式 FF モデルを作る。"""
+    """ペダル探索 → G ランプのパターン走行 → その CSV から順モデル（C7・C8）を作る。
+
+    2026-10-08 段2l-6: C1〜C5（多項式）は対象外。走る前に ConfigError で止める。
+    """
+    require_forward_candidate(ctx.config)
     hw = ctx.require_hardware()
     log = ctx.session_log
-    # 段4/段4b（ProblemReport_20260925）: パターン列は選んだモード（modes.coverage_mode_names）の
-    # 車速 × 加速度の格子から作るので、走る前（2-0 の前）に全モードの基準車速を読む
+    # 段2k（ProblemReport_20261001）: G ランプの段と上端の車速は選んだモード
+    # （modes.coverage_mode_names）の車速 × 加速度の秒数から作るので、走る前（2-0 の前）に
+    # 全モードの基準車速を読む
     # （DB が読めないならここで止まる）。wltp_mode は MAE_WLTP（2-2）用
     cfg = ctx.config
     wltp_mode = await load_mode(cfg, cfg.modes.wltp_mode_name)
@@ -321,20 +350,32 @@ async def step2_pattern_drive(ctx: RunContext) -> None:
         for name in cfg.modes.coverage_mode_names
     ]
     lr = cfg.learning
-    wltp_stats, outside = coverage_stats_from_modes(
-        cover_modes, edges_from_config(lr.grid_speed_edges_kmh, lr.grid_accel_edges_kmhs)
+    # 2026-10-07 段2l-4: 上端 = min(モードの最高車速 + 余裕, 車両の最高速)。ランプと惰行で共通
+    top_cap = top_speed_cap_kmh(cover_modes, lr.ramp_top_margin_kmh, cfg.vehicle.max_speed_kmh)
+    plan = plan_ramps(
+        count_bands_for_modes(cover_modes, lr.ramp_g_levels),
+        mode_min_s=lr.ramp_mode_min_s, max_speed_kmh=top_cap,
+        budget_s=lr.ramp_time_budget_s,
     )
-    say("狙うモード（格子の外＝狙えない走りの秒数）:")
-    say(outside_text(outside))
-    say("2-0. ペダル探索（不感帯と停車保持開度を車速応答で測り、停車保持する）")
+    say(f"G ランプの段（モード: {', '.join(cfg.modes.coverage_mode_names)}、"
+        f"最高速 {top_cap:.1f} km/h）:")
+    say(format_plan_table(plan))
+    if not plan.levels:
+        say("警告: 走る段が 1 つもありません（ramp_g_levels・ramp_mode_min_s を確認）")
+    candidate = cfg.feedforward.candidate
+    say(f"feedforward.candidate = {candidate}: "
+        f"この種類のモデルを作ります（{_CANDIDATE_KIND[candidate]}）")
+    say("2-0. ペダル探索（クリープ車速と停車保持開度を車速応答で測り、停車保持する）")
     pedal = await run_pedal_search(hw, ctx.config, log=log)
     say()
-    say("2-1. パターン走行（コースト → 格子ステップ → クリープ。PatternLoop）→ 緩減速で停車保持")
-    drive = await run_pattern_drive(hw, ctx.config, pedal=pedal, log=log, wltp_stats=wltp_stats)
+    say("2-1. パターン走行（コーストダウン → G ランプ。PatternLoop）→ 緩減速で停車保持")
+    drive = await run_pattern_drive(hw, ctx.config, pedal=pedal, log=log,
+                                   ramp_order=plan.execution_order(),
+                                   top_speed_cap_kmh=top_cap)
     if log is not None:
         await log.close()  # 停車保持まで記録したら保存し、その CSV（パターン走行の行）で学習する
     say()
-    say("2-2. 走行結果から 2次多項式 FF モデルを作成")
+    say(f"2-2. 物理定数の推定とモデル作成（candidate={candidate}: {_CANDIDATE_KIND[candidate]}）")
     # 重み付けは sample_weight_enabled のときだけ有効（無効でも wltp_mode を渡すと MAE_WLTP が出る）
     await asyncio.to_thread(
         build_ff_model,
@@ -484,6 +525,7 @@ STEPS: tuple[Step, ...] = (
         "ペダル探索 → 閉ループパターン走行 → 2次多項式 FF モデル作成",
         step2_pattern_drive,
         drives=True,
+        prepare=prepare_step2,
     ),
     Step(
         3,

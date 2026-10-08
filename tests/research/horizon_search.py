@@ -448,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     patterns = read_pattern_groups(args.csv)
     print(f"学習データ: {args.csv}（{len(logs)} 行・{len(np.unique(patterns))} パターン）")
     accel_result, brake_result = search_ff_horizons(
-        logs, patterns, cfg.feedforward.accel_deadband_pct, cfg.feedforward.brake_deadband_pct,
+        logs, patterns, cfg.vehicle.min_accel_opening_pct, cfg.vehicle.min_brake_opening_pct,
         settings,
     )
     for result in (accel_result, brake_result):

@@ -117,7 +117,7 @@ def evaluate_run(
     reached = max(t)
     completed = reached >= completion_threshold_s(duration_s, t)
     pedal = pedal_stats(
-        rows, cfg.feedforward.accel_deadband_pct, cfg.feedforward.brake_deadband_pct,
+        rows, cfg.vehicle.min_accel_opening_pct, cfg.vehicle.min_brake_opening_pct,
         feedforward_params(cfg),
     )
     chatter = chatter_metrics(

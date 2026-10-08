@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from tests.research.coast_curve import estimate_coast_decel_curve
-from tests.research.research_types import DriveLog, FeedforwardParams
+from tests.research.research_types import PEDAL_OFF_TOL_PCT, DriveLog, FeedforwardParams
 
 PARAMS = FeedforwardParams(
     creep_speed_kmh=5.0, accel_deadband_pct=10.0, brake_deadband_pct=12.0,
@@ -167,3 +167,23 @@ def test_estimate_coast_decel_curve_excludes_speeds_at_or_below_creep_speed() ->
     )
     assert not curve.identified
     assert curve.samples == 0
+
+
+def test_estimate_coast_decel_curve_pedal_off_is_min_plus_tolerance() -> None:
+    """ペダルオフは min（名前は不感帯のまま）＋ PEDAL_OFF_TOL_PCT 以下（2026-10-08 段2l-6）。
+
+    待機位置が min ちょうどなので、実位置が幅以内にずれていても惰行の行として数える。"""
+    dt = 0.02
+    speeds = _decel_ramp(15.0, 5.0, 2.0, dt)
+    kw = dict(low_bin_kmh=1.0, low_max_kmh=15.0, low_min_bin_samples=5)
+    inside = estimate_coast_decel_curve(
+        _logs(speeds, dt=dt, accel_pct=10.0 + PEDAL_OFF_TOL_PCT - 0.01,
+              brake_pct=12.0 + PEDAL_OFF_TOL_PCT - 0.01),
+        PARAMS, **kw,
+    )
+    assert inside.identified
+    outside = estimate_coast_decel_curve(
+        _logs(speeds, dt=dt, accel_pct=10.0 + PEDAL_OFF_TOL_PCT + 0.05, brake_pct=12.0),
+        PARAMS, **kw,
+    )
+    assert not outside.identified

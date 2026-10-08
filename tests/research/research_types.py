@@ -34,6 +34,13 @@ ACTUATOR_PULSE_MAX: int = 9500
 # それぞれ独立に 0.5 と定義され、コメントで「同一であること」を頼りに揃えていた。
 VEHICLE_STOP_SPEED_KMH: float = 0.02
 
+# 「ペダルを踏んでいない」とみなす幅 [%]。開度が min（待機位置）+ この値 以下ならペダルオフ。
+# 2026-10-08 段2l-6（ProblemReport_20261001）: 待機位置を min（ペダルに触れた位置）にしたので、
+# 「踏んでいない」のしきい値が待機位置ちょうどになり、実位置のずれ（約 0.02%）で行が割れる。
+# それを防ぐ幅。仮値（実位置のずれより十分大きく、ペダル探索の 1 刻み 0.105% の約 3 倍）。
+# 惰行の行・実測点の行の選別に効く。次の手順2 実機の後に見直す
+PEDAL_OFF_TOL_PCT: float = 0.3
+
 # 1G を km/h/s へ換算する係数（9.81 m/s^2 * 3.6 km/h/(m/s)）。
 # 従来 learning_loop.py・robot_controller.py・pid_tuning.py でそれぞれ独立定義されていた。
 G_TO_KMHS: float = 9.81 * 3.6
@@ -151,8 +158,10 @@ class FeedforwardParams:
     accel_gain_kmhs_per_pct: tuple[float, ...] = ()  # アクセル側ゲイン（正値）
     brake_gain_kmhs_per_pct: tuple[float, ...] = ()  # ブレーキ側ゲイン（正値）
     stop_brake_opening_pct: float = 20.0  # 停車保持に要するブレーキ開度
-    brake_deadband_pct: float = 1.0  # これ未満では制動力が出ないブレーキ遊び
-    accel_deadband_pct: float = 1.0  # これ未満では駆動力が出ないアクセル遊び
+    # 2026-10-08 段2l-6: 名前は不感帯のままだが、値は vehicle.min_*_opening_pct（ペダルに触れた
+    # 位置＝効く開度 u の原点）。不感帯の測定はやめた。pkl の meta も同じキー名で持つ
+    brake_deadband_pct: float = 1.0  # ブレーキの u の原点（ペダルに触れた位置）
+    accel_deadband_pct: float = 1.0  # アクセルの u の原点（ペダルに触れた位置）
     # ── ペダル調停（PedalArbiter）定数 ──────────────────────────────────
     # 振動抑制 KPI（偏差符号反転 ≤1 回/5 秒）をゲイン調整でなく機構で支えるための定数群。
     switch_hysteresis_pct: float = 0.5  # ペダル切替ヒステリシス半幅（努力量 ±この幅は惰行）
@@ -338,18 +347,9 @@ class PatternKind(StrEnum):
     CREEP_SETTLE = "creep_settle"  # アクセル・ブレーキ 0% で車速が安定するまで待機しクリープ計測
     # アクセルで加速→ブレーキ無しで低速まで惰行（エンジンブレーキ減速率を計測）
     COAST_DOWN = "coast_down"
-    # 格子ステップ走行（ProblemReport_20260925 段3。研究側の追加）: WLTP の車速×加速度の格子を
-    # 狙い、開度固定のステップで測る。GRID_STEP は車速ステーション 1 つ、GRID_LAUNCH は
-    # 0〜20km/h の発進・停車セル。CSV の pattern 列で見分けるための種別
-    GRID_STEP = "grid_step"
-    GRID_LAUNCH = "grid_launch"
-    # G 校正（段6a・門①。研究側の追加）: G 比例加速で cap まで上げ、0.2G 狙いの G 比例ブレーキ減速で
-    # 低速まで下りる。各車速で「0.2G を出すブレーキ開度」を測り、上限 G に届く開度の予測に使う
-    G_CALIB = "g_calib"
-    # 通し掃引（段6c。研究側の追加）: 格子ステップで埋まらなかった強い加減速のセルを、
-    # 車速のセルごとに開度を切り替えながら 1 回で複数の車速帯を通り抜けて測る
-    # （穴が無ければ何もしない）
-    GRID_SWEEP = "grid_sweep"
+    # G ランプ走行（段2k 段B。研究側の追加）: 狙いの G で上端の車速まで加速 → 同じ G で減速 →
+    # クリープ域まで下りて停車復帰、を 1 本とする。「効く開度 u」を実測 G を見て動かして作る
+    G_RAMP = "g_ramp"
 
 
 @dataclass(frozen=True)

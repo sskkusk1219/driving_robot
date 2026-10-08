@@ -85,7 +85,7 @@ async def test_brakes_in_steps_until_stopped(tmp_path: Path) -> None:
     step = psmod.search_step_pulse(cfg)
     assert moves == list(range(step, stop_pos + 1, step))
     assert pulse_to_opening(stop_pos) > hwmod.STUB_BRAKE_PLAY_PCT  # 遊びを越えた位置で止まった
-    assert stop_pos < opening_to_pulse(cfg.pedal_search.brake_max_pct)
+    assert stop_pos < opening_to_pulse(cfg.vehicle.max_brake_opening_pct)
     # その位置で保持したまま停車している
     assert hw.brake.position == stop_pos
     assert hw.accel.position == 0
@@ -105,9 +105,12 @@ async def test_already_stopped_is_confirmed_without_pressing(tmp_path: Path) -> 
 
 
 async def test_fails_when_brake_limit_reached_without_stopping(tmp_path: Path) -> None:
-    cfg = _tmp_cfg(tmp_path, **{"pedal_search.brake_max_pct": 5.0})  # スタブの遊び 8% より浅い
+    cfg = _tmp_cfg(tmp_path, **{"vehicle.max_brake_opening_pct": 5.0})  # スタブの遊び 8% より浅い
     hw = await _ready_stub(cfg)
-    with pytest.raises(hwmod.PreDriveCheckError, match="ブレーキを 5% まで踏んでも停車しません"):
+    with pytest.raises(
+        hwmod.PreDriveCheckError,
+        match="ブレーキを開度上限 5%（vehicle.max_brake_opening_pct）まで踏んでも停車しません",
+    ):
         await pcmod.run_pre_drive_check(hw, cfg)
     await hwmod.shutdown(hw)
 
@@ -120,7 +123,7 @@ async def test_brakes_directly_to_target_when_next_step_is_not_2(tmp_path: Path)
     assert await hw.can.read_speed() > 1.0  # クリープ中から始まる
     stepwise_moves = _record_moves(hw.brake)  # type: ignore[arg-type]
     timed_moves = _record_timed_moves(hw.brake)  # type: ignore[arg-type]
-    target = opening_to_pulse(cfg.feedforward.stop_brake_opening_pct)
+    target = opening_to_pulse(cfg.stop_brake_opening_pct)
 
     stop_pos = await pcmod.run_pre_drive_check(hw, cfg, next_step=3)
 
@@ -136,11 +139,12 @@ async def test_brakes_directly_to_target_when_next_step_is_not_2(tmp_path: Path)
 async def test_direct_press_fails_when_target_not_enough_to_stop(tmp_path: Path) -> None:
     """stop_brake_opening_pct まで踏んでも停車しなければ走行前チェックエラーにする
     （段階探索へフォールバックはしない。手順 2 をやり直すよう促す）。"""
-    cfg = _tmp_cfg(tmp_path, **{"feedforward.stop_brake_opening_pct": 5.0})  # 遊び 8% より浅い
+    # 絶対 5.0%（min 2.9 ＋ 2.1）。遊び 8% より浅い
+    cfg = _tmp_cfg(tmp_path, **{"feedforward.stop_brake_offset_pct": 2.1})
     hw = await _ready_stub(cfg)
     with pytest.raises(
         hwmod.PreDriveCheckError,
-        match=r"stop_brake_opening_pct（5\.00%）まで踏んでも停車しません",
+        match=r"停車保持開度（5\.00%）まで踏んでも停車しません",
     ):
         await pcmod.run_pre_drive_check(hw, cfg, next_step=3)
     await hwmod.shutdown(hw)

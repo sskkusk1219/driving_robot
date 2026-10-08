@@ -41,7 +41,7 @@ from tests.research.dynamics_estimation import (
 )
 from tests.research.ff_model import group_by_session
 from tests.research.pedal_gain import _sample_interval_s
-from tests.research.research_types import DriveLog, FeedforwardParams
+from tests.research.research_types import PEDAL_OFF_TOL_PCT, DriveLog, FeedforwardParams
 
 
 @dataclass(frozen=True)
@@ -68,7 +68,8 @@ def estimate_coast_decel_curve(
     低速端（creep_speed_kmh〜low_max_kmh）は細ビンで推定する。
 
     サンプル条件は本番 `estimate_dynamics_params` の `m_eng` と同じ: 両ペダルが不感帯以下
-    （accel<=accel_deadband_pct・brake<=brake_deadband_pct）かつ `sp > params.creep_speed_kmh`
+    （accel<=accel_deadband_pct+PEDAL_OFF_TOL_PCT・brake<=brake_deadband_pct+PEDAL_OFF_TOL_PCT。
+    値は u の原点 min）かつ `sp > params.creep_speed_kmh`
     かつ `dv < 0`。低速側（creep_speed_kmh 〜 low_max_kmh）は `low_bin_kmh` 幅、高速側
     （low_max_kmh 以上）は本番と同じ `COAST_CURVE_BIN_KMH` 幅・`COAST_CURVE_MIN_BIN_SAMPLES`
     点以上で、ビン中心が `low_max_kmh` 以上のものだけを高速側として採る（低速側と重複させない）。
@@ -87,8 +88,10 @@ def estimate_coast_decel_curve(
         dt = _sample_interval_s(session_logs)
         dv = np.diff(speed) / dt  # i→i+1 の加速度 [km/h/s]
         sp = speed[:-1]
-        pedal_off = (accel[:-1] <= params.accel_deadband_pct) & (
-            brake[:-1] <= params.brake_deadband_pct
+        # 2026-10-08 段2l-6: 待機位置が min（=accel/brake_deadband_pct）ちょうどなので、
+        # 実位置のずれで行が割れないよう PEDAL_OFF_TOL_PCT の幅を持たせる
+        pedal_off = (accel[:-1] <= params.accel_deadband_pct + PEDAL_OFF_TOL_PCT) & (
+            brake[:-1] <= params.brake_deadband_pct + PEDAL_OFF_TOL_PCT
         )
         mask = pedal_off & (sp > params.creep_speed_kmh) & (dv < 0.0)
         if not np.any(mask):

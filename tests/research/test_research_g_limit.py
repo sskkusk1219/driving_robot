@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.research.g_limit import PEDAL_ACCEL, PEDAL_BRAKE, GLimitMap
+from tests.research.g_limit import PEDAL_ACCEL, PEDAL_BRAKE, GLimitMap, _lsq_slope
 
 CAP = 0.3 * 35.316  # 0.3G [km/h/s]
 
@@ -26,6 +26,39 @@ def test_brake_extrapolates_secant_from_top_point_and_lowest_opening_point() -> 
     m.add(PEDAL_BRAKE, 25.0, 9.0, 1.0)
     cap = m.cap_pct(PEDAL_BRAKE, 25.0, CAP, 8.0)
     assert cap == pytest.approx(14.0 + (CAP - 7.0) / 1.2)  # (9,1)→(14,7): 1.2 km/h/s per %
+
+
+def test_no_extrapolation_returns_the_opening_of_the_strongest_point() -> None:
+    """2026-10-08 段2l-6: extrapolate=False は、狙いが貯めた点のどれより強いとき割線の外挿を
+    せず、いちばん効いた点の開度を返す。"""
+    m = GLimitMap()
+    m.add(PEDAL_BRAKE, 25.0, 12.0, 4.0)
+    m.add(PEDAL_BRAKE, 25.0, 14.0, 7.0)  # いちばん効いた点
+    m.add(PEDAL_BRAKE, 25.0, 9.0, 1.0)
+    assert CAP > 7.0
+    assert m.cap_pct(PEDAL_BRAKE, 25.0, CAP, 8.0, extrapolate=False) == pytest.approx(14.0)
+    # 既定（外挿あり）は従来どおり。他の呼び出し元の挙動は変わらない
+    assert m.cap_pct(PEDAL_BRAKE, 25.0, CAP, 8.0) == pytest.approx(14.0 + (CAP - 7.0) / 1.2)
+
+
+def test_no_extrapolation_leaves_interpolation_and_weaker_targets_unchanged() -> None:
+    m = GLimitMap()
+    m.add(PEDAL_BRAKE, 25.0, 12.0, 4.0)
+    m.add(PEDAL_BRAKE, 25.0, 20.0, 9.0)
+    for target in (5.0, 6.5, 8.0):  # 点の範囲内: 補間
+        assert m.cap_pct(PEDAL_BRAKE, 25.0, target, 8.0, extrapolate=False) == pytest.approx(
+            m.cap_pct(PEDAL_BRAKE, 25.0, target, 8.0)
+        )
+    # すべての点が狙い以上なら、いちばん弱い点の開度（従来どおり）
+    assert m.cap_pct(PEDAL_BRAKE, 25.0, 1.0, 8.0, extrapolate=False) == pytest.approx(12.0)
+
+
+def test_no_extrapolation_still_needs_two_points_and_works_on_the_accel_side() -> None:
+    m = GLimitMap()
+    m.add(PEDAL_ACCEL, 5.0, 10.0, 3.0)
+    assert m.cap_pct(PEDAL_ACCEL, 5.0, 9.0, 6.0, extrapolate=False) is None  # 点が 1 つだけ
+    m.add(PEDAL_ACCEL, 5.0, 7.0, 1.0)
+    assert m.cap_pct(PEDAL_ACCEL, 5.0, 9.0, 6.0, extrapolate=False) == pytest.approx(10.0)
 
 
 def test_close_points_do_not_make_a_slope() -> None:
@@ -141,3 +174,63 @@ def test_strongest_point_is_none_without_data_and_ignores_other_bins_and_pedal()
     m.add(PEDAL_ACCEL, 25.0, 40.0, 6.35)  # 別の車速帯
     m.add(PEDAL_BRAKE, 15.0, 13.0, 5.4)  # 別のペダル
     assert m.strongest_point(PEDAL_ACCEL, 15.0) is None
+
+
+def test_sensitivity_returns_slope_of_points_on_a_line() -> None:
+    m = GLimitMap()
+    for u, a in ((10.0, 1.0), (12.0, 2.0), (14.0, 3.0), (16.0, 4.0)):
+        m.add(PEDAL_BRAKE, 25.0, u, a)
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 13.0, 8.0) == pytest.approx(0.5)
+
+
+def test_sensitivity_uses_points_near_the_current_opening() -> None:
+    """近くの点の傾きが全点の傾きより大きいときは近くの点の傾き（0.5 側を見分ける）。"""
+    m = GLimitMap()
+    for u in (8.0, 10.0, 12.0, 14.0):  # 傾き 0.2
+        m.add(PEDAL_BRAKE, 25.0, u, 0.2 * (u - 8.0))
+    for u in (16.0, 18.0, 20.0, 22.0, 24.0):  # 傾き 0.5
+        m.add(PEDAL_BRAKE, 25.0, u, 1.2 + 0.5 * (u - 14.0))
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 22.0, 8.0) == pytest.approx(0.5, abs=0.05)
+    # 0.2 側の近くでも、全点の傾き（0.2 と 0.5 の間）のほうが大きいのでそちらが返る
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 10.0, 8.0) > 0.25
+
+
+def test_sensitivity_returns_the_larger_of_near_and_all_points_slopes() -> None:
+    """近くの点の傾きが小さく出ても（雑音）、全点の傾きが大きければそれを返す（危険側を避ける）。"""
+    m = GLimitMap()
+    for u, a in ((10.0, 3.0), (11.0, 3.1), (12.0, 3.0), (30.0, 12.0)):
+        m.add(PEDAL_BRAKE, 25.0, u, a)
+    near_only = [(10.0, 3.0), (11.0, 3.1), (12.0, 3.0)]
+    assert _lsq_slope(near_only, 3) is None or _lsq_slope(near_only, 3) < 0.1  # 近くはほぼ平ら
+    all_slope = _lsq_slope(near_only + [(30.0, 12.0)], 2)
+    assert all_slope is not None and all_slope > 0.3
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 11.0, 8.0) == pytest.approx(all_slope)
+
+
+def test_sensitivity_falls_back_to_all_points_and_coast_when_window_is_sparse() -> None:
+    m = GLimitMap()
+    m.add_coast(25.0, 1.6)
+    m.add(PEDAL_BRAKE, 25.0, 14.0, 7.0)  # 窓（±5%）の中は 1 点だけ（惰行の点 8% は 6 離れている）
+    # 全点: (8, 1.6), (14, 7.0) → 0.9
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 14.0, 8.0) == pytest.approx(0.9)
+
+
+def test_sensitivity_falls_back_to_other_bin_by_pedal_side() -> None:
+    m = GLimitMap()
+    for v, k in ((45.0, 0.8), (15.0, 0.3)):
+        for u in (10.0, 14.0):
+            m.add(PEDAL_BRAKE, v, u, k * (u - 8.0))
+            m.add(PEDAL_ACCEL, v, u, k * (u - 8.0))
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 12.0, 8.0) == pytest.approx(0.8)
+    assert m.sensitivity_kmhs_per_pct(PEDAL_ACCEL, 25.0, 12.0, 8.0) == pytest.approx(0.3)
+
+
+def test_sensitivity_is_none_without_data_with_one_point_or_nonpositive_slope() -> None:
+    m = GLimitMap()
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 12.0, 8.0) is None
+    m.add(PEDAL_BRAKE, 25.0, 12.0, 3.0)
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 12.0, 8.0) is None
+    m.add(PEDAL_BRAKE, 25.0, 16.0, 3.0)  # 傾き 0
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 12.0, 8.0) is None
+    m.add(PEDAL_BRAKE, 25.0, 20.0, 1.0)  # 傾き負
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 12.0, 8.0) is None

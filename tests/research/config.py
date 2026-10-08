@@ -42,6 +42,11 @@ class VehicleSection:
     name: str = "test_vehicle"
     max_speed_kmh: float = 140.0
     max_decel_g: float = 0.4
+    # 2026-10-08 段2l-6（ProblemReport_20261001）: ペダルに触れた位置（手で測る。
+    # tests/hardware/test_calibration.py）。待機位置であり、効く開度 u の原点でもある
+    # （不感帯の測定はやめた）
+    min_accel_opening_pct: float = 6.5
+    min_brake_opening_pct: float = 2.9
     max_accel_opening_pct: float = 80.0
     max_brake_opening_pct: float = 80.0
     stop_deviation_threshold_kmh: float = 2.0
@@ -50,7 +55,9 @@ class VehicleSection:
 
 #: KAIZEN 5.8 節で比べる候補（V1 案スイッチ）。ff_candidate.CANDIDATE_CLASSES のキーと同じ
 #: C6（定速階段の実測テーブルを骨格にする案）は 2026-09-25 段4 で削除した
-CANDIDATE_NAMES: tuple[str, ...] = ("C1", "C2", "C3", "C4", "C5")
+#: C7（順モデルの表を逆に引いて走る前に作った開度の列を FF にする案。段2g）。
+#: C8（同じ格子のモデル版。fwd_model_*.pkl）。C9 は後の段で足す
+CANDIDATE_NAMES: tuple[str, ...] = ("C1", "C2", "C3", "C4", "C5", "C7", "C8")
 
 
 @dataclass
@@ -65,7 +72,10 @@ class FeedforwardSection:
     candidate: str = "C1"  # KAIZEN 表5-5 順7（V1 案スイッチ）。CANDIDATE_NAMES のいずれか
     creep_speed_kmh: float = 5.0
     creep_rate_kmhs: float = 0.5
-    stop_brake_opening_pct: float = 20.0
+    # 2026-10-08 段2l-7: 停車保持ブレーキ開度の「ブレーキの min（vehicle.min_brake_opening_pct）
+    # からの量」[%]。絶対開度は ResearchConfig.stop_brake_opening_pct（min ＋ この値）。
+    # 取り付け直しで min が変わっても手順2 をやり直さずに済ませるため絶対開度から変えた
+    stop_brake_offset_pct: float = 15.0
     engine_brake_decel_kmhs: float = 1.6
     coast_decel_speeds_kmh: list[float] = field(default_factory=list)
     coast_decel_kmhs: list[float] = field(default_factory=list)
@@ -99,11 +109,13 @@ class FeedforwardSection:
     # point の先読み [s]。ペダル選択だけに使う（モデルの h1＝features.h1_s とは別。
     # 1.0 で従来と同じ）
     pedal_select_point_s: float = 1.0
+    # L_b: ブレーキの判定だけに使う窓の中心 [s]（ProblemReport_20260930 段2-2）。window 方式のみ。
+    # アクセルかどうかは L の窓で先に判定し、アクセルでないときだけ、ブレーキか惰行かを
+    # L_b の窓で判定する。None なら L と同じ（従来どおり）。手で決める値（自動保存の対象外）
+    pedal_select_brake_center_s: float | None = None
     pedal_gain_speeds_kmh: list[float] = field(default_factory=list)
     accel_gain_kmhs_per_pct: list[float] = field(default_factory=list)
     brake_gain_kmhs_per_pct: list[float] = field(default_factory=list)
-    accel_deadband_pct: float = 0.5
-    brake_deadband_pct: float = 10.0
 
     @property
     def is_model_trained(self) -> bool:
@@ -175,7 +187,7 @@ class ControlSection:
 class ModesSection:
     wltp_mode_name: str = "01_WLTP_Low,Mid,Hi,ExHi"
     tuning_mode_name: str = "__verify_pattern__"
-    # 2026-09-26 段4b: 手順2 の格子ステップ走行が狙うモード（DB の driving_modes.name）。
+    # 2026-09-26 段4b: 手順2 が狙うモード（DB の driving_modes.name）。
     # 重なる（車速 × 加速度）のマスは 1 回だけ測る（wltp_grid.combined_cell_stats）。
     # wltp_mode_name は手順3 で走るモードと、手順2 の MAE_WLTP 用で、ここには影響しない
     coverage_mode_names: list[str] = field(
@@ -199,9 +211,9 @@ class ModeDriveSection:
     # 1 周期ごとに governor_reduce_step_pct ずつ下げる安全網（手順 2 のパターン走行と同じ規則）
     decel_governor: bool = True
     governor_reduce_step_pct: float = 2.0
-    # 使っていないペダルの待機位置 = 不感帯 − standby_margin_pct（0% から不感帯までの空走をなくす）
+    # 使っていないペダルの待機位置 = vehicle.min_*_opening_pct（0% から触れる位置までの空走を
+    # なくす）。false なら 0%
     pedal_standby: bool = True
-    standby_margin_pct: float = 2.0
 
 
 @dataclass
@@ -253,6 +265,32 @@ class LearningSection:
     # パターン走行全体の打ち切り [s]（2026-09-25 段4: 格子ステップ走行は実車で約 30 分の見込み）
     timeout_s: float = 3600.0
     coast_timeout_s: float = 90.0
+    # 2026-10-06 段2k 段A: G ランプ走行（手順2。ramp_planner が段の計画を作る）
+    # 狙いの G の段 [G]（昇順）。データ由来（WLTP+US06 の加速度の秒数の帯の中ほど）。
+    # 2l の実機後に決め直す
+    ramp_g_levels: list[float] = field(
+        default_factory=lambda: [0.02, 0.045, 0.08, 0.125, 0.175, 0.25, 0.35]
+    )
+    ramp_mode_min_s: float = 2.0  # 上端の車速を決める最小秒数 [s]（仮値）
+    # 選んだモード（modes.coverage_mode_names）の最高車速にこれを足した車速を、コーストダウンと
+    # G ランプの上端にする [km/h]（vehicle.max_speed_kmh で頭打ち）。ユーザー指定 2026-10-07 段2l-4
+    ramp_top_margin_kmh: float = 5.0
+    # G ランプ全体の時間の枠 [s]（モデル作成時間を測って決め直す）
+    ramp_time_budget_s: float = 1200.0
+    # 2026-10-06 段2k 段B: G ランプ走行の制御（pattern_drive が PatternLoopConfig へ渡す）
+    # 効く開度 u の動かす速さ [%/s] = これ ×（狙いの G − 実測の G）。半分データ由来（コーストダウン
+    # 加速と同じ値。前の車で感度 0.004〜0.005 G/%・遅れ約 1 s から決めた）。2l の実機後に決め直す
+    ramp_rate_gain_pct_per_g_s: float = 100.0
+    # G のずれを何秒かけて埋めるか [s]。ゲイン ＝ min(上の上限, 1 ÷（実測の感度[G/%] × これ））。
+    # 2026-10-07 段2l-2。次の手順2 の実機後に決め直す
+    ramp_settle_time_s: float = 2.0
+    # 狙いとの差がこの幅以内なら u を動かさない。幅 = max(狙い × frac, min_g)。仮値
+    # （今の固定 0.02G は 0.02G の段では使えない）。開度の細かい往復に効く。2l の実機後に決め直す
+    ramp_hold_margin_frac: float = 0.10
+    ramp_hold_margin_min_g: float = 0.005
+    # G ガバナーの「踏み増しを止める割合」（上限 G × g_limit_frac に対する割合）。ユーザー決定
+    # （2026-10-06）: 0.85 → 0.95（0.95 × 0.4G × 0.98 ≒ 0.37G。0.35G の段が届くように）
+    gov_soft_frac: float = 0.95
     # ペダルゲイン推定に使うサンプル: 開度 ≥ 不感帯 + この値 [%]（本番は 5%）
     accel_gain_min_offset_pct: float = 0.5
     brake_gain_min_offset_pct: float = 0.5
@@ -313,51 +351,24 @@ class LearningSection:
     # 狙う・穴と判定するマスの最小秒数は、1 ステップで測れる長さ（grid_step_window_s −
     # grid_step_lag_s。`grid_target_min_s`）から自動で決まる（段4b。別の数値は持たない）
     grid_hole_data_max_s: float = 2.0  # 学習データがこれ未満なら穴 [s]
-    # 2026-09-25 格子ステップ走行（ProblemReport_20260925 段3。grid_planner.GridSettings に渡す）:
-    # 車速ステーションごとに PI で保持 → 落ち着いたら開度固定のステップで加速度を測る。
-    # 感度 g は「開度 1% あたりの加速度 [km/h/s per %]」。初期値は大きめ（踏み増し = 狙い ÷ g が
-    # 小さく＝1 回目は弱く外れる側）。PI の kp/ki は g で割って車両に依らないゲインにする
-    # （レート上限は実開度が追従できる速さなので g では割らない）
-    grid_station_min_kmh: float = 10.0  # これ未満の車速帯はステーションを置かない（発進・停車）
+    # 2026-10-01 向きの軸と重さ（段2c-1。wltp_grid）。踏み込みと戻しは別の物理なので網羅も分ける。
+    # 半分データ由来: 段2b で 0〜1% 戻しでもブレーキの効きが半分。位置の揺れより大きく取った
+    # （揺れの実測は 2c-1 で 155259・142410 を見て決める）
+    grid_direction_threshold_pct: float = 0.3  # データ側（ブレーキ）: 山から戻ったら「戻し」[%]
+    # 半分データ由来: アクセルは定速保持の PI のゆらぎ（2 秒窓の山谷差 中央値 0.44%・p90 1.24%）より
+    # 大きく取る。段2b-scratch で効きの落ちは 0〜1% 戻しで 5〜10%、1〜3% で約 20%
+    # → 1.5% 未満は対象外
+    grid_direction_threshold_accel_pct: float = 1.5  # データ側（アクセル）[%]
+    # 仮値: ブレーキ 20〜40 km/h の感度（約 0.7〜1 km/h/s per %）× 0.3%。2c-1 で向き別の秒数を見て
+    grid_direction_threshold_kmhs: float = 0.3  # モード側: |加速度| が山からこれ以上落ちたら戻し
+    # 仮値: 段1 で学習が WLTP の 1/2〜1/5 しかなかったマスで外れていた。2c-3 の所要時間を見て
+    grid_weight_frac: float = 0.25  # 「埋まった」の基準 = max(data_max_s, この割合 × モードの秒数)
+    # 2026-09-25 格子ステップ走行の「落ち着いた」判定の許容幅など。段2k 段E で格子ステップ走行を
+    # 削除した後は、コーストダウンの終了判定（段7c。pattern_loop の `_advance_coast`）と、
+    # WLTP 網羅表の「狙う最小秒数」（`grid_target_min_s` = 窓 − 頭の除外）にだけ使う
     grid_settle_tol_kmh: float = 1.0  # 「落ち着いた」とみなす車速の許容幅 [km/h]
-    grid_settle_s: float = 3.0  # 許容幅の中にこの秒数いたら落ち着いた [s]
-    grid_settle_timeout_s: float = 40.0  # 落ち着かないとき、そのステーションの残りをとばす [s]
-    grid_step_window_s: float = 3.0  # 開度固定の 1 ステップの長さ [s]
-    grid_step_lag_s: float = 0.5  # ステップの頭のこの秒数は傾きの計算から除く [s]
-    grid_step_band_max_kmh: float = 10.0  # ステーションからこれ以上離れたらステップを終える [km/h]
-    # 強いステップの判定（段4b）: 中心から踏んだとき、帯を出るまでに傾きを測れる時間
-    # （帯 ÷ |狙い| − grid_step_lag_s）がこれ未満なら、帯の手前の端まで下がって（上がって）から
-    # 踏む（助走）。1.0s = 0.1s 刻みで約 10 点。
-    grid_step_min_fit_s: float = 1.0
-    grid_overshoot_frac: float = 1.2  # WLTP の最大（最小）加速度のこの倍を超えたら打ち切り
-    grid_max_tries: int = 2  # 1 つの狙いに使う最大回数（やり直しは 1 回）
-    grid_gain_init_kmhs_per_pct: float = 2.0  # アクセルの感度の初期値
-    grid_brake_gain_init_kmhs_per_pct: float = 2.0  # ブレーキの感度の初期値
-    grid_gain_min_kmhs_per_pct: float = 0.05  # 更新した感度のクランプ
-    grid_gain_max_kmhs_per_pct: float = 20.0
-    grid_hold_kp_norm: float = 0.36  # PI 保持: kp = この値 / g_accel（実車 g≈1.2 で kp 0.3 相当）
-    grid_hold_ki_norm: float = 0.06  # ki = この値 / g_accel
-    grid_hold_max_rate_pct_per_s: float = 1.0  # PI の開度変化の上限 [%/s]（実開度が追従できる速さ）
-    grid_launch_end_kmh: float = 20.0  # 発進・停車セルが担当する車速の上端 [km/h]
-    # 2026-09-27 段7b（ProblemReport_20260925 段7）: ステップの後・助走の目標を決めたときの
-    # 「ステーションの目標へ戻る」区間（`_Phase.GRID_RETURN`）。目標から離れていれば固定開度で
-    # 速く戻り、近づいたら PI（CRUISE_HOLD）に切り替える（実測 065502: 戻りが待ち時間の最大要因）。
-    # grid_return_accel_kmhs 2.0 は**半分データ由来**: 薄い +1.5〜+3 km/h/s の列（戻りの行が
-    # この列を埋める）の中で、約 0.06G と上限 G に遠い。実機の戻り時間・網羅表で決め直す
-    grid_return_accel_kmhs: float = 2.0  # GRID_RETURN の狙い加速度（目標より遅いとき）[km/h/s]
-    # grid_return_switch_kmh 1.5 は**仮の値**: 2 km/h/s × 遅れ 0.6s（gov_lead_s の実測）≒ 1.2 km/h
-    # に余裕を見た。実機で切り替え後の行き過ぎ（±1 km/h に入るまでの時間）を見て決め直す
-    grid_return_switch_kmh: float = 1.5  # これ以下まで近づいたら CRUISE_HOLD の PI に切り替える
-    # 段6a（門①）: 手順2 の開度の上限に使う G [G]。G 校正・走行中の実測から「この G に届く開度」を
-    # 車速帯ごとに予測し、格子ステップ・発進停車の開度をそれ以下にする。**仮の値**:
-    # ブレーキは踏むほど急に効く（25 km/h の実測で 12→16% が 0.21・16→24% が 0.34 km/h/s/%、比 1.6）
-    # ので 0.2G の点からの割線外挿は開度を大きく見積もる。0.3G と予測した開度は実際 約 0.36G。
-    # vehicle.max_decel_g（0.4G）との間の余裕。6d の実測点で比を測り直して決める
-    g_cap_g: float = 0.3
-    # 段6c: 通し掃引 1 本の最大回数。0 で通し掃引なし。**仮の値**: 1 回で 1 セルあたり約 1 s
-    # （10 km/h ÷ 約 9 km/h/s）しか取れず、穴の基準（2 s）に 2〜3 回、遅れ・ばらつきの余裕を
-    # 2 倍見て 6。手順2 の実機で「何回で埋まったか・埋まらなかったか」を見て決め直す
-    grid_sweep_max_passes: int = 6
+    grid_step_window_s: float = 3.0  # 1 ステップで測れる長さの元（`grid_target_min_s`）[s]
+    grid_step_lag_s: float = 0.5  # 同・頭の除外 [s]
     # 2026-09-25 学習サンプルの WLTP 重み付け（ProblemReport_20260925 段2）: 重み =
     # clip(WLTP 占有率 / 学習データ占有率, w_min, w_max) をペダルごとに平均 1 へ正規化して
     # fit に渡す（sample_weight.py）。既定 false は今までと完全に同じ結果になる後方互換
@@ -367,16 +378,17 @@ class LearningSection:
 
     @property
     def grid_target_min_s(self) -> float:
-        """狙う・穴と判定するマスの最小秒数 = 1 ステップで測れる長さ（窓 − 頭の除外）[s]。"""
+        """狙う・穴と判定するマスの最小秒数 = 窓 − 頭の除外 [s]（WLTP 網羅表の判定に使う）。"""
         return self.grid_step_window_s - self.grid_step_lag_s
 
 
 @dataclass
 class PedalSearchSection:
-    step_mm: float = 0.5  # 停車保持への刻み送り専用（search_step_pulse）。不感帯探索には使わない
-    dwell_s: float = 1.0  # 反応判定に使う車速サンプルの待ち時間 [s]（傾きの算出窓もこの長さ）
+    """手順 2-0（クリープ車速 → 停車保持開度）の設定。不感帯の探索はやめた（段2l-6）。"""
+
+    step_mm: float = 0.5  # 停車保持への刻み送り・走行前チェックの1刻み（search_step_pulse）
+    dwell_s: float = 1.0  # 1 刻みごとの車速サンプルの待ち時間 [s]
     onset_margin_kmh: float = 0.3  # ブレーキの「減速中は踏み増さない」判定・停止確認の余白 [km/h]
-    confirm_count: int = 2
     # 2026-09-20: クリープ安定判定を「窓平均の変化量」から「窓平均の傾き＋最短時間」へ。
     # 変化量は窓幅を変えると意味が変わるうえ、漸近的に近づく量に対しては収束前に必ず成立して
     # しまう（実測で真の平衡 5.00 に対し 4.88 で確定していた）
@@ -385,20 +397,13 @@ class PedalSearchSection:
     creep_settle_min_s: float = 10.0   # これだけ経つまで確定しない [s]
     creep_min_speed_kmh: float = 1.0
     creep_timeout_s: float = 90.0
-    accel_max_pct: float = 20.0
-    brake_max_pct: float = 50.0  # 停止確認まで踏み続ける上限（不感帯検出の上限は deadband_max_pct）
     stop_hold_margin_pct: float = 10.0
     stop_confirm_max_wait_s: float = 10.0  # 停止確認（走行前チェック）で停車を待つ上限 [s]
-    # 2026-09-17 段1b（ProblemReport_20260916）: 反応判定を「平均車速が基準を超えたか」から
-    # 「車速の傾き」に変える。基準車速との比較をやめるので、クリープのドリフト（実測で踏み込み中
-    # でも−0.4 km/h/sのドリフトが起きていた）を反応と誤検出しなくなる
-    onset_accel_kmhs: float = 0.2  # この傾き[km/h/s]以上（ブレーキは以下の符号反転）で「反応」
-    # 不感帯探索専用の1刻み。停車保持への刻み送り（step_mm）と分離し、探索だけ細かくできるように
-    # する（停車保持まで遅くしないため）。位置指令は0.01mm単位（PCON-CBのPCMD）なので
-    # 0.01mm = 1 pulse が機械的な下限
-    search_step_mm: float = 0.1
-    # 不感帯検出専用の探索上限。brake_max_pct（停止確認まで踏み続ける上限）とは兼用しない
-    deadband_max_pct: float = 20.0
+    # 2026-10-08 段2l-6: 2-0 のブレーキを min から踏む1刻み [mm]。旧 search_step_mm
+    # （不感帯探索専用）を改名。停車保持への刻み送り（step_mm）とは分け、停止確認だけ
+    # 細かく踏む（踏み過ぎ防止）。
+    # 位置指令は 0.01mm 単位（PCON-CB の PCMD）なので 0.01mm = 1 pulse が機械的な下限
+    brake_step_mm: float = 0.1
 
 
 @dataclass
@@ -562,6 +567,20 @@ class FeaturesSection:
 
 
 @dataclass
+class ForwardMapSection:
+    """C7（順モデルの表）の開度の列の作り方（fwd_plan.build_plan へ渡す値）。"""
+
+    # 惰行の帯 [km/h/s]。要る加速度が惰行の加速度から ± この値以内ならペダルを踏まない。
+    # feedforward.coast_band_kmhs（C1 用）とは別物
+    coast_band_kmhs: float = 0.25
+    # 要る加速度を測る窓の幅 [s]
+    need_window_s: float = 1.0
+    # None なら pkl の meta の値（表を作ったときの遅れ）を使う
+    accel_lag_s: float | None = None
+    brake_lag_s: float | None = None
+
+
+@dataclass
 class ResearchConfig:
     """`config_testVehicle.yaml` 全体。`source_path` は読み込み元（保存先）。"""
 
@@ -569,6 +588,7 @@ class ResearchConfig:
     vehicle: VehicleSection = field(default_factory=VehicleSection)
     feedforward: FeedforwardSection = field(default_factory=FeedforwardSection)
     features: FeaturesSection = field(default_factory=FeaturesSection)
+    forward_map: ForwardMapSection = field(default_factory=ForwardMapSection)
     pid: PidSection = field(default_factory=PidSection)
     arbiter: ArbiterSection = field(default_factory=ArbiterSection)
     control: ControlSection = field(default_factory=ControlSection)
@@ -583,6 +603,19 @@ class ResearchConfig:
     checks: ChecksSection = field(default_factory=ChecksSection)
     output: OutputSection = field(default_factory=OutputSection)
     hardware: HardwareSection = field(default_factory=HardwareSection)
+
+    @property
+    def stop_brake_opening_pct(self) -> float:
+        """停車保持ブレーキの絶対開度 [%]（2026-10-08 段2l-7）。
+
+        yaml は min からの量（feedforward.stop_brake_offset_pct）で持ち、ここで
+        `min_brake_opening_pct ＋ 量`（max_brake_opening_pct で頭打ち）に戻す。
+        FeedforwardParams.stop_brake_opening_pct 以降の内部は絶対開度のまま。
+        """
+        return min(
+            self.vehicle.min_brake_opening_pct + self.feedforward.stop_brake_offset_pct,
+            self.vehicle.max_brake_opening_pct,
+        )
 
     @property
     def results_path(self) -> Path:
@@ -603,6 +636,7 @@ _SECTION_TYPES: dict[str, type] = {
     "vehicle": VehicleSection,
     "feedforward": FeedforwardSection,
     "features": FeaturesSection,
+    "forward_map": ForwardMapSection,
     "pid": PidSection,
     "arbiter": ArbiterSection,
     "control": ControlSection,
@@ -665,6 +699,21 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> ResearchConfig:
     return ResearchConfig(**kwargs)
 
 
+#: 廃止したキー → 新しいキー（セクション別）。読み込み時に書き換えを促すエラーにする
+_RENAMED_KEYS: dict[str, dict[str, str]] = {
+    "feedforward": {"stop_brake_opening_pct": "stop_brake_offset_pct"},
+}
+
+
+#: 廃止したキー（置き換え先なし）→ 案内文（セクション別）。読み込み時に削除を促すエラーにする
+_REMOVED_KEYS: dict[str, dict[str, str]] = {
+    "pedal_search": {
+        "brake_max_pct": "上限は vehicle.max_brake_opening_pct を使います。"
+        "この行を削除してください",
+    },
+}
+
+
 def _build_section(section_type: type, raw: Any, name: str, path: Path) -> Any:
     if not is_dataclass(section_type):  # pragma: no cover - 定義ミス防止
         raise ConfigError(f"セクション定義が不正です: {name}")
@@ -672,6 +721,17 @@ def _build_section(section_type: type, raw: Any, name: str, path: Path) -> Any:
         raise ConfigError(f"セクション {name} がマッピングではありません（{path}）")
     known = {f.name: f for f in fields(section_type)}
     unknown = sorted(set(raw) - set(known))
+    # 2026-10-08 段2l-7: 絶対開度で持っていた旧キーは意味が変わるので読み替えず明示エラーにする
+    for old, new in _RENAMED_KEYS.get(name, {}).items():
+        if old in raw:
+            raise ConfigError(
+                f"{name}.{old} は廃止されました。{name}.{new}（min からの量 [%]）に書き換えて"
+                f"ください（旧値 − 該当ペダルの min。{path}）"
+            )
+    # 2026-10-09: 置き換え先のない廃止キーは、未知のキーより分かる文面で知らせる
+    for old, guide in _REMOVED_KEYS.get(name, {}).items():
+        if old in raw:
+            raise ConfigError(f"{name}.{old} は廃止されました。{guide}（{path}）")
     if unknown:
         raise ConfigError(f"未知のキー: {', '.join(f'{name}.{k}' for k in unknown)}（{path}）")
     kwargs = {k: _coerce(f"{name}.{k}", v, known[k].type) for k, v in raw.items()}
@@ -696,6 +756,12 @@ def _coerce(dotted: str, value: Any, declared: Any) -> Any:
         if not isinstance(value, str):
             raise ConfigError(f"{dotted} は文字列で指定してください（現在: {value!r}）")
         return value
+    if declared == "float | None":
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ConfigError(f"{dotted} は数値か null で指定してください（現在: {value!r}）")
+        return float(value)
     if declared == "list[float]":
         if not isinstance(value, list) or any(
             isinstance(v, bool) or not isinstance(v, int | float) for v in value
@@ -731,6 +797,16 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         ("max_brake_opening_pct", v.max_brake_opening_pct),
     ):
         need(0.0 < opening <= 100.0, f"vehicle.{label} が範囲外(0<pct<=100): {opening}")
+    need(
+        0.0 <= v.min_accel_opening_pct < v.max_accel_opening_pct,
+        f"vehicle.min_accel_opening_pct({v.min_accel_opening_pct}) は 0 以上・"
+        f"max_accel_opening_pct({v.max_accel_opening_pct}) 未満",
+    )
+    need(
+        0.0 <= v.min_brake_opening_pct < v.max_brake_opening_pct,
+        f"vehicle.min_brake_opening_pct({v.min_brake_opening_pct}) は 0 以上・"
+        f"max_brake_opening_pct({v.max_brake_opening_pct}) 未満",
+    )
     need(v.stop_deviation_threshold_kmh > 0.0, "vehicle.stop_deviation_threshold_kmh は正値")
     need(v.stop_deviation_duration_s > 0.0, "vehicle.stop_deviation_duration_s は正値")
 
@@ -742,12 +818,15 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     )
     need(ff.creep_speed_kmh >= 0.0, "feedforward.creep_speed_kmh は 0 以上")
     need(ff.engine_brake_decel_kmhs > 0.0, "feedforward.engine_brake_decel_kmhs は正値")
-    for label, opening in (
-        ("accel_deadband_pct", ff.accel_deadband_pct),
-        ("brake_deadband_pct", ff.brake_deadband_pct),
-        ("stop_brake_opening_pct", ff.stop_brake_opening_pct),
-    ):
-        need(0.0 <= opening <= 100.0, f"feedforward.{label} が範囲外(0<=pct<=100): {opening}")
+    need(
+        ff.stop_brake_offset_pct >= 0.0,
+        f"feedforward.stop_brake_offset_pct は 0 以上: {ff.stop_brake_offset_pct}",
+    )
+    need(
+        v.min_brake_opening_pct + ff.stop_brake_offset_pct <= 100.0,
+        f"vehicle.min_brake_opening_pct({v.min_brake_opening_pct}) ＋ "
+        f"feedforward.stop_brake_offset_pct({ff.stop_brake_offset_pct}) が 100 を超えています",
+    )
     # 段2.5（ProblemReport_20260916）: coast_decel_kmhs の先頭・creep_accel_kmhs の末尾は
     # クリープ平衡点（creep_speed_kmh。その速度でペダルを離すと加減速しない＝free_accel_at=0
     # の定義値）を意図的に 0.0 で持つ（coast_curve.estimate_coast_decel_curve /
@@ -781,6 +860,16 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         0.0 < ff.pedal_select_point_s <= 3.0,
         f"feedforward.pedal_select_point_s が範囲外(0<x<=3.0): {ff.pedal_select_point_s}",
     )
+    lb = ff.pedal_select_brake_center_s
+    need(
+        lb is None or 0.0 <= lb <= 2.0,
+        f"feedforward.pedal_select_brake_center_s が範囲外(0<=L_b<=2.0 か null): {lb}",
+    )
+    need(
+        lb is None or ff.pedal_select_mode == "window",
+        "feedforward.pedal_select_brake_center_s は pedal_select_mode: window のときだけ"
+        "指定できます（point には効きません）",
+    )
     need(
         not (ff.pedal_select_mode == "window" and ff.reach_horizons_s),
         "feedforward.pedal_select_mode: window は reach_horizons_s と併用できません",
@@ -796,6 +885,14 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         f"{ff.reach_horizons_s}",
     )
     problems += _validate_features(cfg.features)
+    fm = cfg.forward_map
+    need(
+        fm.coast_band_kmhs >= 0.0,
+        f"forward_map.coast_band_kmhs は 0 以上: {fm.coast_band_kmhs}",
+    )
+    need(fm.need_window_s > 0.0, f"forward_map.need_window_s は正値: {fm.need_window_s}")
+    for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
+        need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")
     need(
         0.0 < ff.reach_step_s <= 0.5,
         f"feedforward.reach_step_s が範囲外(0<刻み<=0.5): {ff.reach_step_s}",
@@ -873,10 +970,6 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         cfg.mode_drive.governor_reduce_step_pct > 0.0,
         "mode_drive.governor_reduce_step_pct は正値",
     )
-    need(
-        cfg.mode_drive.standby_margin_pct >= 0.0,
-        "mode_drive.standby_margin_pct は 0 以上",
-    )
 
     ex = cfg.excite
     need(
@@ -937,6 +1030,33 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
 
     need(cfg.learning.timeout_s > 0.0, "learning.timeout_s は正値")
     need(cfg.learning.coast_timeout_s > 0.0, "learning.coast_timeout_s は正値")
+    rg = cfg.learning.ramp_g_levels
+    need(
+        len(rg) > 0
+        and all(g > 0.0 for g in rg)
+        and all(a < b for a, b in zip(rg, rg[1:], strict=False))
+        and rg[-1] <= cfg.vehicle.max_decel_g,
+        f"learning.ramp_g_levels は空でなく、すべて正・厳密に昇順・最大が "
+        f"vehicle.max_decel_g({cfg.vehicle.max_decel_g}) 以下: {rg}",
+    )
+    need(cfg.learning.ramp_mode_min_s > 0.0, "learning.ramp_mode_min_s は正値")
+    need(cfg.learning.ramp_top_margin_kmh >= 0.0, "learning.ramp_top_margin_kmh は 0 以上")
+    need(cfg.learning.ramp_time_budget_s > 0.0, "learning.ramp_time_budget_s は正値")
+    need(
+        cfg.learning.ramp_rate_gain_pct_per_g_s > 0.0,
+        "learning.ramp_rate_gain_pct_per_g_s は正値",
+    )
+    need(cfg.learning.ramp_settle_time_s > 0.0, "learning.ramp_settle_time_s は正値")
+    need(
+        0.0 < cfg.learning.ramp_hold_margin_frac < 1.0,
+        "learning.ramp_hold_margin_frac は 0 より大きく 1 未満: "
+        f"{cfg.learning.ramp_hold_margin_frac}",
+    )
+    need(cfg.learning.ramp_hold_margin_min_g > 0.0, "learning.ramp_hold_margin_min_g は正値")
+    need(
+        0.0 < cfg.learning.gov_soft_frac <= 1.0,
+        f"learning.gov_soft_frac は 0 より大きく 1 以下: {cfg.learning.gov_soft_frac}",
+    )
     lr = cfg.learning
     for label, offset in (
         ("accel_gain_min_offset_pct", lr.accel_gain_min_offset_pct),
@@ -1002,43 +1122,24 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
             f"learning.{name} は 2 点以上の昇順（現在: {edges}）",
         )
     need(lr.grid_hole_data_max_s >= 0.0, "learning.grid_hole_data_max_s は 0 以上")
-    for name in (
-        "grid_station_min_kmh", "grid_settle_tol_kmh", "grid_settle_s", "grid_settle_timeout_s",
-        "grid_step_window_s", "grid_step_band_max_kmh", "grid_overshoot_frac",
-        "grid_gain_init_kmhs_per_pct", "grid_brake_gain_init_kmhs_per_pct",
-        "grid_gain_min_kmhs_per_pct", "grid_hold_kp_norm", "grid_hold_ki_norm",
-        "grid_hold_max_rate_pct_per_s", "grid_launch_end_kmh",
-        "grid_return_accel_kmhs", "grid_return_switch_kmh",
-    ):
-        need(getattr(lr, name) > 0.0, f"learning.{name} は正値")
     need(
-        lr.grid_return_switch_kmh > lr.grid_settle_tol_kmh,
-        f"learning.grid_return_switch_kmh は grid_settle_tol_kmh（{lr.grid_settle_tol_kmh}）"
-        f"より大きい: {lr.grid_return_switch_kmh}",
+        lr.grid_direction_threshold_pct >= 0.0, "learning.grid_direction_threshold_pct は 0 以上"
     )
+    need(
+        lr.grid_direction_threshold_accel_pct >= 0.0,
+        "learning.grid_direction_threshold_accel_pct は 0 以上",
+    )
+    need(
+        lr.grid_direction_threshold_kmhs >= 0.0,
+        "learning.grid_direction_threshold_kmhs は 0 以上",
+    )
+    need(0.0 <= lr.grid_weight_frac <= 1.0, "learning.grid_weight_frac は 0〜1")
+    for name in ("grid_settle_tol_kmh", "grid_step_window_s"):
+        need(getattr(lr, name) > 0.0, f"learning.{name} は正値")
     need(lr.grid_step_lag_s >= 0.0, "learning.grid_step_lag_s は 0 以上")
     need(
         lr.grid_step_lag_s < lr.grid_step_window_s,
         "learning.grid_step_lag_s は grid_step_window_s より短く",
-    )
-    need(
-        0.0 < lr.grid_step_min_fit_s < lr.grid_step_window_s - lr.grid_step_lag_s,
-        "learning.grid_step_min_fit_s は 0 より大きく、grid_step_window_s − grid_step_lag_s "
-        "より短く",
-    )
-    need(
-        0.0 < lr.g_cap_g < v.max_decel_g,
-        f"learning.g_cap_g は 0 より大きく vehicle.max_decel_g({v.max_decel_g}) 未満: {lr.g_cap_g}",
-    )
-    need(lr.grid_sweep_max_passes >= 0, "learning.grid_sweep_max_passes は 0 以上（0 で掃引なし）")
-    need(lr.grid_overshoot_frac >= 1.0, "learning.grid_overshoot_frac は 1 以上")
-    need(lr.grid_max_tries >= 1, "learning.grid_max_tries は 1 以上")
-    need(
-        lr.grid_gain_min_kmhs_per_pct <= lr.grid_gain_init_kmhs_per_pct
-        <= lr.grid_gain_max_kmhs_per_pct
-        and lr.grid_gain_min_kmhs_per_pct <= lr.grid_brake_gain_init_kmhs_per_pct
-        <= lr.grid_gain_max_kmhs_per_pct,
-        "learning.grid_gain_init/brake_gain_init は grid_gain_min〜max の範囲内",
     )
     need(
         0.0 < lr.sample_weight_min <= 1.0 <= lr.sample_weight_max,
@@ -1050,32 +1151,17 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(0.0 < ps.step_mm <= 5.0, f"pedal_search.step_mm が範囲外(0<mm<=5): {ps.step_mm}")
     need(ps.dwell_s > 0.0, "pedal_search.dwell_s は正値")
     need(ps.onset_margin_kmh > 0.0, "pedal_search.onset_margin_kmh は正値")
-    need(ps.confirm_count >= 1, "pedal_search.confirm_count は 1 以上")
     need(ps.creep_window_s > 0.0, "pedal_search.creep_window_s は正値")
     need(ps.creep_settle_kmhs > 0.0, "pedal_search.creep_settle_kmhs は正値")
     need(ps.creep_settle_min_s >= 0.0, "pedal_search.creep_settle_min_s は 0 以上")
     need(ps.creep_min_speed_kmh >= 0.0, "pedal_search.creep_min_speed_kmh は 0 以上")
     need(ps.creep_timeout_s > 0.0, "pedal_search.creep_timeout_s は正値")
-    need(
-        0.0 < ps.accel_max_pct <= v.max_accel_opening_pct,
-        f"pedal_search.accel_max_pct({ps.accel_max_pct}) は 0 超・アクセル開度上限以下",
-    )
-    need(
-        0.0 < ps.brake_max_pct <= v.max_brake_opening_pct,
-        f"pedal_search.brake_max_pct({ps.brake_max_pct}) は 0 超・ブレーキ開度上限以下",
-    )
     need(ps.stop_hold_margin_pct >= 0.0, "pedal_search.stop_hold_margin_pct は 0 以上")
     need(ps.stop_confirm_max_wait_s > 0.0, "pedal_search.stop_confirm_max_wait_s は正値")
-    need(ps.onset_accel_kmhs > 0.0, "pedal_search.onset_accel_kmhs は正値")
     # 0.01mm = 1 pulse（PCON-CBの位置指令単位）が機械的な下限
     need(
-        0.01 <= ps.search_step_mm <= 5.0,
-        f"pedal_search.search_step_mm が範囲外(0.01<=mm<=5): {ps.search_step_mm}",
-    )
-    need(
-        0.0 < ps.deadband_max_pct <= min(ps.accel_max_pct, ps.brake_max_pct),
-        f"pedal_search.deadband_max_pct({ps.deadband_max_pct}) は 0 超・"
-        f"accel_max_pct/brake_max_pct の小さい方以下",
+        0.01 <= ps.brake_step_mm <= 5.0,
+        f"pedal_search.brake_step_mm が範囲外(0.01<=mm<=5): {ps.brake_step_mm}",
     )
 
     ds = cfg.decel_stop

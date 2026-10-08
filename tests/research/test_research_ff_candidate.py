@@ -675,12 +675,12 @@ PARAMS_WITH_GAIN = FeedforwardParams(
 def test_candidate_classes_registered_with_matching_names() -> None:
     for name, cls in CANDIDATE_CLASSES.items():
         assert cls().candidate == name
-    assert set(CANDIDATE_CLASSES) == {"C1", "C2", "C3", "C4", "C5"}
+    assert set(CANDIDATE_CLASSES) == {"C1", "C2", "C3", "C4", "C5", "C7", "C8"}
 
 
 def test_make_candidate_unknown_name_raises() -> None:
-    with pytest.raises(ValueError, match="C9"):
-        make_candidate("C9")
+    with pytest.raises(ValueError, match="C99"):
+        make_candidate("C99")
 
 
 def test_c3_is_logic_identical_to_c1_except_name() -> None:
@@ -808,3 +808,342 @@ def test_select_kwargs_rejected_with_reach_horizons() -> None:
     future, past = _points(60.0, 0.0)
     with pytest.raises(ValueError, match="reach_horizons_s"):
         ff.predict_effort(60.0, future, past, select_accel_kmhs=0.0, select_speed_kmh=60.0)
+
+
+# ── 段2-2: ブレーキの判定だけ別の窓（select_brake_*） ───────────────────
+
+
+def _legacy_choice(sel_accel: float, sel_coast: float, band: float) -> float:
+    """従来の規則（|diff|<帯 → 惰行、diff>=0 → アクセル、他 → ブレーキ）の符号。"""
+    d = sel_accel - sel_coast
+    if abs(d) < band:
+        return 0.0
+    return 1.0 if d >= 0.0 else -1.0
+
+
+def _sign(x: float) -> float:
+    return 0.0 if x == 0.0 else (1.0 if x > 0.0 else -1.0)
+
+
+@pytest.mark.parametrize("band", [0.0, 0.5])
+def test_select_brake_none_and_same_window_match_legacy(band: float) -> None:
+    """L_b なし・L_b = L（同じ値を渡す）は従来の規則と全く同じ選択（帯 0 の端も含む）。"""
+    ff = _ff_with_research(16.0, 20.0, ResearchFFParams(coast_band_kmhs=band))
+    v0 = 60.0
+    coast = -coast_decel_at(PARAMS, v0)
+    future, past = _points(v0, coast)
+    for off in (-3.0, -band, -band / 2, -1e-12, 0.0, 1e-12, band / 2, band, 3.0):
+        g = coast + off
+        legacy = _legacy_choice(g, coast, band)
+        base = ff.predict_effort(v0, future, past, select_accel_kmhs=g, select_speed_kmh=v0)
+        none_ = ff.predict_effort(
+            v0, future, past, select_accel_kmhs=g, select_speed_kmh=v0,
+            select_brake_accel_kmhs=None, select_brake_speed_kmh=None,
+        )
+        same = ff.predict_effort(
+            v0, future, past, select_accel_kmhs=g, select_speed_kmh=v0,
+            select_brake_accel_kmhs=g, select_brake_speed_kmh=v0,
+        )
+        assert _sign(base) == legacy
+        assert base == none_ == same
+
+
+def test_select_brake_does_not_affect_accel_decision_or_opening() -> None:
+    """アクセルの判定は L の窓だけ。L_b の窓が何であっても、アクセルの行は同じ値。"""
+    ff = _ff_with_research(16.0, 20.0, ResearchFFParams(coast_band_kmhs=0.5))
+    v0 = 60.0
+    coast = -coast_decel_at(PARAMS, v0)
+    future, past = _points(v0, coast)
+    g = coast + 2.0  # L の窓はアクセル
+    ref_eff = ff.predict_effort(v0, future, past, select_accel_kmhs=g, select_speed_kmh=v0)
+    assert ref_eff == pytest.approx(16.0)
+    for gb in (coast - 5.0, coast, coast + 5.0):
+        assert ff.predict_effort(
+            v0, future, past, select_accel_kmhs=g, select_speed_kmh=v0,
+            select_brake_accel_kmhs=gb, select_brake_speed_kmh=v0,
+        ) == ref_eff
+    # L の窓がアクセルでないとき、L_b の窓がアクセル側でも、アクセルにはならない（惰行）
+    assert ff.predict_effort(
+        v0, future, past, select_accel_kmhs=coast, select_speed_kmh=v0,
+        select_brake_accel_kmhs=coast + 5.0, select_brake_speed_kmh=v0,
+    ) == 0.0
+
+
+def test_select_brake_moves_only_the_brake_coast_boundary() -> None:
+    """合成の基準（60→50 km/h を 2s で落とす）で、L_b を小さくするとブレーキの入り・離しだけが
+    時間軸上で後ろへずれ、アクセルの行は 1 行も変わらない。"""
+    ff = _ff_with_research(16.0, 20.0, ResearchFFParams(coast_band_kmhs=0.5))
+    v0 = 60.0
+    coast = -coast_decel_at(PARAMS, v0)
+    future, past = _points(v0, coast)
+
+    def ref_slope(t: float) -> float:  # 基準の傾き: 0〜3s 惰行、3〜6s 減速 -5、以降惰行
+        return coast - 5.0 if 3.0 <= t < 6.0 else coast
+
+    def choices(lag_b: float | None) -> list[float]:
+        out = []
+        for k in range(100):
+            t = k * 0.1
+            kw: dict[str, float] = {
+                "select_accel_kmhs": ref_slope(t + 0.3), "select_speed_kmh": v0,
+            }
+            if lag_b is not None:
+                kw["select_brake_accel_kmhs"] = ref_slope(t + lag_b)
+                kw["select_brake_speed_kmh"] = v0
+            out.append(_sign(ff.predict_effort(v0, future, past, **kw)))
+        return out
+
+    base, lb0 = choices(None), choices(0.0)
+    assert base == choices(0.3)  # L_b = L は従来と同じ
+    assert [c == 1.0 for c in base] == [c == 1.0 for c in lb0]  # アクセルの行は不変
+    first = lambda c: next(i for i, x in enumerate(c) if x < 0)  # noqa: E731
+    last = lambda c: max(i for i, x in enumerate(c) if x < 0)  # noqa: E731
+    assert first(lb0) - first(base) == 3  # 入りが 0.3s 後ろへ
+    assert last(lb0) - last(base) == 3  # 離しも 0.3s 後ろへ
+
+
+def test_select_brake_speed_gets_learning_range_clip() -> None:
+    """select_brake_speed_kmh にも学習域クリップ（上限 cm）を掛ける（select_speed と同じ）。"""
+    ff = _ff_with_research(16.0, 20.0, ResearchFFParams(coast_band_kmhs=0.5))
+    ff._speed_clip_max = 45.0  # noqa: SLF001
+    v0 = 60.0
+    coast_clip = -coast_decel_at(PARAMS, 45.0)
+    coast_raw = -coast_decel_at(PARAMS, 85.0)
+    assert abs(coast_clip - coast_raw) > 0.5
+    future, past = _points(v0, 0.0)
+    # L の窓は惰行（アクセルでない）。L_b の傾きは「45km/h（上限）での惰行」ちょうど:
+    # クリップが効けば帯の中で惰行、効かなければ 140km/h の惰行との差でブレーキ側になる
+    kw = {"select_accel_kmhs": coast_clip, "select_speed_kmh": 45.0}
+    assert ff.predict_effort(
+        v0, future, past, **kw,
+        select_brake_accel_kmhs=coast_clip, select_brake_speed_kmh=85.0,
+    ) == 0.0
+
+
+def test_select_brake_rejected_with_reach_horizons() -> None:
+    research = ResearchFFParams(coast_band_kmhs=0.5, reach_horizons_s=(0.5, 1.0))
+    ff = _ff_with_research(16.0, 20.0, research)
+    future, past = _points(60.0, 0.0)
+    with pytest.raises(ValueError, match="reach_horizons_s"):
+        ff.predict_effort(
+            60.0, future, past, select_brake_accel_kmhs=0.0, select_brake_speed_kmh=60.0
+        )
+
+
+# ── 段2-1: ブレーキモデル入力の差し替え（brake_inputs） ─────────────────
+
+
+class _NegDv:
+    """ブレーキ予測 = −10 × 最短ホライズンの dv（特徴量の 2 列目）。入力が変わると値が変わる。"""
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        return -10.0 * x[:, 1]
+
+
+def _ff_dv_brake() -> CandidateFeedforward:
+    ff = _ff(20.0, 0.0)
+    ff._brake_model = _NegDv()  # noqa: SLF001 - テスト用の差し込み
+    return ff
+
+
+def test_brake_inputs_none_or_same_inputs_matches_baseline() -> None:
+    ff = _ff_dv_brake()
+    v0 = 60.0
+    future, past = _points(v0, -6.0)
+    base = ff.predict_effort(v0, future, past)
+    assert base < 0.0
+    assert ff.predict_effort(v0, future, past, brake_inputs=None) == base
+    assert ff.predict_effort(v0, future, past, brake_inputs=(v0, future, past)) == base
+
+
+def test_brake_inputs_changes_only_brake_magnitude_not_selection() -> None:
+    ff = _ff_dv_brake()
+    v0 = 60.0
+    future, past = _points(v0, -6.0)
+    base = ff.predict_effort(v0, future, past)
+    # ブレーキ用の入力だけ緩い減速にする → 大きさだけ小さくなり、ペダルはブレーキのまま
+    mild = _points(v0, -3.0)
+    eff = ff.predict_effort(v0, future, past, brake_inputs=(v0, *mild))
+    assert eff < 0.0 and abs(eff) < abs(base)
+    # ブレーキ用の入力を加速にしても、主入力がブレーキ要求なら選択は変わらない
+    # （予測が負→不感帯へ切り上げ。アクセルへは切り替わらない）
+    up = _points(v0, +3.0)
+    eff_up = ff.predict_effort(v0, future, past, brake_inputs=(v0, *up))
+    assert eff_up == pytest.approx(-PARAMS.brake_deadband_pct)
+
+
+def test_brake_inputs_do_not_affect_accel_or_stop_hold() -> None:
+    ff = _ff_dv_brake()
+    v0 = 60.0
+    fut, past = _points(v0, +2.0)  # アクセル要求
+    other = _points(v0, -6.0)
+    assert ff.predict_effort(v0, fut, past, brake_inputs=(v0, *other)) == pytest.approx(20.0)
+    sf, sp = _points(0.0, 0.0)  # 停車保持
+    assert ff.predict_effort(0.0, sf, sp, brake_inputs=(60.0, *other)) == pytest.approx(
+        -PARAMS.stop_brake_opening_pct
+    )
+
+
+def test_brake_inputs_get_same_speed_clip() -> None:
+    ff = _ff(0.0, 0.0, clip=100.0)
+    ff._brake_model = _NegDv()  # noqa: SLF001
+    future, past = _points(130.0, -6.0)
+    base = ff.predict_effort(130.0, future, past)
+    # 同じ軌跡を brake_inputs で渡すとクリップ（平行移動）後も同じ
+    assert ff.predict_effort(130.0, future, past, brake_inputs=(130.0, future, past)) == base
+
+
+# ── C7（順モデルの表） ────────────────────────────────────────────────
+
+
+def _write_forward_table_pkl(path: Path) -> object:
+    """小さな合成の順モデルの表（a = −2 − 0.01v + 0.3u（u≥0）/ 0.6u（u<0））を pkl にする。"""
+    from tests.research.fwd_map import POINT_MEASURED, ForwardTable, save_table
+
+    rep = np.array([0.0, 50.0, 100.0, 150.0])
+    grid = np.arange(-30.0, 31.0, 1.0)
+    accel = (-2.0 - 0.01 * rep[:, None]) + np.where(grid >= 0, 0.3 * grid, 0.6 * grid)[None, :]
+    table = ForwardTable(
+        speed_edges=np.array([-25.0, 25.0, 75.0, 125.0, 175.0]),
+        speed_rep=rep,
+        u_grid=grid,
+        accel_grid=accel,
+        seconds=np.full(accel.shape, 10.0),
+        point_kind=np.full(accel.shape, POINT_MEASURED, dtype=int),
+        meas_u_min=np.full(4, -30.0),
+        meas_u_max=np.full(4, 30.0),
+        meta={
+            "accel_deadband_pct": 4.0,
+            "brake_deadband_pct": 7.0,
+            "accel_lag_s": 0.05,
+            "brake_lag_s": 0.05,
+        },
+    )
+    save_table(table, path)
+    return table
+
+
+def _c7_plan_kwargs() -> dict[str, float]:
+    return {
+        "accel_deadband_pct": 4.0,
+        "brake_deadband_pct": 7.0,
+        "stop_brake_opening_pct": 18.0,
+        "stop_horizon_s": 0.5,
+        "period_s": 0.05,
+        "need_window_s": 1.0,
+        "coast_band_kmhs": 0.25,
+    }
+
+
+def _write_poly_pkl(path: Path) -> None:
+    from tests.research.ff_model import MODEL_TYPE, make_estimator
+
+    spec = DEFAULT_FEATURE_SPEC
+    model = make_estimator()
+    x = np.random.default_rng(1).normal(size=(30, len(spec.feature_names())))
+    model.fit(x, x[:, 0])
+    payload = {
+        "model_type": MODEL_TYPE,
+        "accel_model": model,
+        "brake_model": model,
+        "feature_spec": asdict(spec),
+    }
+    with path.open("wb") as f:
+        pickle.dump(payload, f)
+
+
+def test_make_candidate_c7_loads_forward_table(tmp_path: Path) -> None:
+    from tests.research.ff_candidate import ForwardMapFeedforward
+
+    pkl = tmp_path / "fwd_table.pkl"
+    _write_forward_table_pkl(pkl)
+    ff = make_candidate("C7")
+    assert isinstance(ff, ForwardMapFeedforward)
+    assert ff.candidate == "C7" and not ff.uses_actual_speed and not ff.is_pedal_separated
+    assert ff.horizons == () and ff.past_horizons == ()
+    assert not ff.has_model
+    ff.load_model(str(pkl))
+    assert ff.has_model and ff.table.meta["accel_lag_s"] == 0.05
+
+
+def test_c7_rejects_polynomial_pkl(tmp_path: Path) -> None:
+    pkl = tmp_path / "poly.pkl"
+    _write_poly_pkl(pkl)
+    with pytest.raises(ValueError, match="順モデルの表"):
+        make_candidate("C7").load_model(str(pkl))
+
+
+def _write_forward_model_pkl(path: Path) -> None:
+    """合成の表を kind=model にして保存する（C8 用の pkl）。"""
+    from tests.research.fwd_map import KIND_MODEL, save_table
+
+    table = _write_forward_table_pkl(path.with_name("_tmp_table.pkl"))
+    table.kind = KIND_MODEL
+    save_table(table, path)
+
+
+def test_make_candidate_c8_loads_forward_model(tmp_path: Path) -> None:
+    from tests.research.ff_candidate import ForwardMapFeedforward
+
+    pkl = tmp_path / "fwd_model.pkl"
+    _write_forward_model_pkl(pkl)
+    ff = make_candidate("C8")
+    assert isinstance(ff, ForwardMapFeedforward) and ff.candidate == "C8"
+    ff.load_model(str(pkl))
+    assert ff.has_model and ff.table.kind == "model"
+    ff.build_plan(lambda t: 10.0, 3.0, **_c7_plan_kwargs())  # type: ignore[arg-type]
+    assert isinstance(ff.effort_at(1.0), float)
+
+
+def test_c7_rejects_model_pkl_and_c8_rejects_table_pkl(tmp_path: Path) -> None:
+    model_pkl, table_pkl = tmp_path / "fwd_model.pkl", tmp_path / "fwd_table.pkl"
+    _write_forward_model_pkl(model_pkl)
+    _write_forward_table_pkl(table_pkl)
+    with pytest.raises(ValueError, match="C7 は kind='table'"):
+        make_candidate("C7").load_model(str(model_pkl))
+    with pytest.raises(ValueError, match="C8 は kind='model'"):
+        make_candidate("C8").load_model(str(table_pkl))
+    with pytest.raises(ValueError, match="C8 には順モデルのモデルの pkl"):
+        poly = tmp_path / "poly.pkl"
+        _write_poly_pkl(poly)
+        make_candidate("C8").load_model(str(poly))
+
+
+def test_c1_rejects_forward_table_pkl(tmp_path: Path) -> None:
+    """逆向きの食い違い（C1 に表の pkl）。FeedforwardModel.load_model が model_type で弾く。"""
+    pkl = tmp_path / "fwd_table.pkl"
+    _write_forward_table_pkl(pkl)
+    with pytest.raises(ValueError, match="model_type"):
+        make_candidate("C1").load_model(str(pkl))
+
+
+def test_c7_effort_at_matches_build_plan(tmp_path: Path) -> None:
+    from tests.research.fwd_plan import build_plan
+
+    pkl = tmp_path / "fwd_table.pkl"
+    table = _write_forward_table_pkl(pkl)
+    ff = make_candidate("C7")
+    ff.load_model(str(pkl))
+
+    def ref(t: float) -> float:
+        return min(60.0, 10.0 * t) if t < 8.0 else max(0.0, 60.0 - 12.0 * (t - 8.0))
+
+    kw = _c7_plan_kwargs()
+    ff.build_plan(ref, 12.0, **kw)
+    expected = build_plan(ref, 12.0, table, **kw)  # type: ignore[arg-type]
+    for t in (0.0, 0.37, 3.0, 7.9, 9.5, 12.0, 99.0, -1.0):  # 端の外は端で止まる
+        assert ff.effort_at(t) == expected.at(t)
+    assert ff.plan.pedal_switches() == expected.pedal_switches()
+
+
+def test_c7_guards_misuse(tmp_path: Path) -> None:
+    ff = make_candidate("C7")
+    with pytest.raises(RuntimeError, match="load_model"):
+        ff.build_plan(lambda t: 0.0, 1.0, **_c7_plan_kwargs())  # type: ignore[arg-type]
+    pkl = tmp_path / "fwd_table.pkl"
+    _write_forward_table_pkl(pkl)
+    ff.load_model(str(pkl))
+    with pytest.raises(RuntimeError, match="build_plan"):
+        ff.effort_at(0.0)
+    with pytest.raises(NotImplementedError, match="時刻で引きます"):
+        ff.predict_effort(0.0, [], [])

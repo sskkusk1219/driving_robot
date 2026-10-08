@@ -25,6 +25,8 @@ dependencies = [
 research = [
     "pyyaml>=6.0",
     "matplotlib>=3.8.0",
+    # 学習（tests/research/fwd_torch.py）だけに使う。保存する pkl は格子なので実機側には不要
+    "torch>=2.0.0",
 ]
 dev = [
     "pytest>=7.0.0",

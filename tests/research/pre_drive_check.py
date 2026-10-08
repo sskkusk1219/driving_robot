@@ -154,9 +154,10 @@ async def brake_until_stopped(hw: ResearchHardware, cfg: ResearchConfig) -> int:
     """ブレーキを 1 刻みずつ踏み、平均車速が停車しきい値未満になった位置 [pulse] を返す。"""
     s = cfg.pedal_search
     step = search_step_pulse(cfg)
-    limit = opening_to_pulse(s.brake_max_pct)
+    max_pct = cfg.vehicle.max_brake_opening_pct  # 機構保護の上限を探索の上限にも使う
+    limit = opening_to_pulse(max_pct)
     say(f"  {s.step_mm:g}mm（{pulse_to_opening(step):.2f}%）刻み・待ち {s.dwell_s:g}s、"
-        f"平均車速 {VEHICLE_STOP_SPEED_KMH:g} km/h 未満で停止確認（上限 {s.brake_max_pct:g}%）")
+        f"平均車速 {VEHICLE_STOP_SPEED_KMH:g} km/h 未満で停止確認（上限 {max_pct:g}%）")
     pos = await hw.brake.read_position()
     speed = await mean_speed(hw, s.dwell_s)
     say(_line(pos, speed, "現在"))
@@ -167,8 +168,9 @@ async def brake_until_stopped(hw: ResearchHardware, cfg: ResearchConfig) -> int:
         if not holding:
             if pos + step > limit:
                 raise PreDriveCheckError(
-                    f"ブレーキを {s.brake_max_pct:g}% まで踏んでも停車しません"
-                    f"（車速 {speed:.2f} km/h）。pedal_search.brake_max_pct を見直してください"
+                    f"ブレーキを開度上限 {max_pct:g}%（vehicle.max_brake_opening_pct）まで踏んでも"
+                    f"停車しません（車速 {speed:.2f} km/h）。"
+                    "取り付け位置・max の測定を確認してください"
                 )
             pos += step
             await hw.brake.move_to_position(pos, smooth_over_s=s.dwell_s)
@@ -188,11 +190,12 @@ async def brake_to_target(hw: ResearchHardware, cfg: ResearchConfig) -> int:
     平均車速を測り直して待つ（`pedal_search.stop_confirm_max_wait_s` まで。位置は動かさない）。
     """
     s = cfg.pedal_search
-    target = opening_to_pulse(cfg.feedforward.stop_brake_opening_pct)
+    target = opening_to_pulse(cfg.stop_brake_opening_pct)
     current = await hw.brake.read_position()
     distance_mm = abs(target - current) / _PULSE_PER_MM
     duration_s = distance_mm / DIRECT_PRESS_SPEED_MM_S
-    say(f"  停車保持開度 {cfg.feedforward.stop_brake_opening_pct:.2f}%（{target} pulse）まで "
+    say(f"  停車保持開度 {cfg.stop_brake_opening_pct:.2f}%"
+        f"（min ＋ {cfg.feedforward.stop_brake_offset_pct:.2f}%・{target} pulse）まで "
         f"{DIRECT_PRESS_SPEED_MM_S:g}mm/s で踏み込み …")
     await hw.brake.move_to_position_timed(target, current, duration_s)
     speed = await mean_speed(hw, s.dwell_s)
@@ -202,7 +205,7 @@ async def brake_to_target(hw: ResearchHardware, cfg: ResearchConfig) -> int:
     while speed >= VEHICLE_STOP_SPEED_KMH:
         if waited_s >= max_wait_s:
             raise PreDriveCheckError(
-                f"stop_brake_opening_pct（{cfg.feedforward.stop_brake_opening_pct:.2f}%）まで"
+                f"停車保持開度（{cfg.stop_brake_opening_pct:.2f}%）まで"
                 f"踏んでも停車しません（{max_wait_s:g}s 待機・"
                 f"車速 {speed:.2f} km/h）。手順 2（ペダル探索）からやり直してください"
             )

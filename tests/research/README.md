@@ -137,7 +137,7 @@
 - 本番との違い: 2 で `stop_brake_opening_pct` を一気に踏まない（クリープ中に一気に踏むのは危険なため）。
   キャリブレーション項目は除く（tests 環境では使わない）。
 - 始めから車速が 0.02 km/h 未満なら、踏まずに停止確認とする（次の 2-0 ペダル探索でブレーキを離すため）。
-- `pedal_search.brake_max_pct`（50%）まで踏んでも停車しない、または NG 項目があれば終了コード 7 で止まり、
+- ブレーキ開度上限 `vehicle.max_brake_opening_pct` まで踏んでも停車しない、または NG 項目があれば終了コード 7 で止まり、
   走行には進まない（終了処理で原点復帰）。
 - スタブ HW はシャシダイナモ上でクリープ中（`feedforward.creep_speed_kmh`）から始まるので、この段を実際に通る。
 
@@ -192,9 +192,9 @@
 | 1 | クリープ安定待ち | 走行前チェックのブレーキを離し、両ペダル原点で、`creep_window_s` 平均の傾き < `creep_settle_kmhs` かつ `creep_min_speed_kmh` 以上・`creep_settle_min_s` 経過後 → 基準車速 |
 | 2 | アクセル探索 | 基準 + `onset_margin_kmh` を `confirm_count` 刻み連続で超えた最初の位置 = アクセル不感帯 → 原点へ戻して 1 をやり直す |
 | 3 | ブレーキ探索 | 基準 − margin を連続で割った最初の位置 = ブレーキ不感帯。効き始めた後は車速が下がっている間は踏み増さず、0.02 km/h 未満になった位置 = 停止確認開度 |
-| 4 | 停車保持 | 停止確認開度 + `stop_hold_margin_pct`（10%）まで刻んで踏み、保持 = `stop_brake_opening_pct` |
+| 4 | 停車保持 | 停止確認開度 + `stop_hold_margin_pct`（10%）まで刻んで踏み、保持 = 停止確認開度 + マージン（yaml へは `stop_brake_offset_pct` ＝ −min で保存） |
 
-- 実機のときだけ 3 値（`accel_deadband_pct` / `brake_deadband_pct` / `stop_brake_opening_pct`）を走行前に YAML へ保存する。
+- 実機のときだけ 3 値（`accel_deadband_pct` / `brake_deadband_pct` / `stop_brake_offset_pct`）を走行前に YAML へ保存する。
   2-2 の `estimate_dynamics_params` の推定値は表示のみで書き戻さない。
 - 失敗（クリープしない・上限まで踏んでも反応しない・停車しない）は終了コード 5。
 - 検出位置は車速の立ち上がり遅れのぶん真値より深く出る（スタブ・1mm 刻み・0.3s 待ちで +1.4% 程度）。
@@ -213,7 +213,7 @@
 | 2 | `STEP` | `step_mm`（0.5mm）踏む → `dwell_s`（1s）待つ → 直近 `slope_window_s`（1s）の車速の傾き（最小二乗）で減速度を出す。`target_decel_g − press_margin_g`（0.18G）未満なら 1 刻み踏み増し、`release_above_g`（0.3G）を超えたときだけ 1 刻み戻す。それ以外は保持 |
 | 3 | `STOP_HOLD` | 車速が `VEHICLE_STOP_SPEED_KMH`（`research_types.py`）未満で停止確認 → 停車保持開度まで刻んで踏む（通常は到達済み） |
 
-- 踏み増しの上限は `feedforward.stop_brake_opening_pct`。届いても減速が足りなければ「上限で待機」して停車を待つ。
+- 踏み増しの上限は 停車保持開度（`feedforward.stop_brake_offset_pct` ＝ ブレーキ min からの量。絶対開度は ＋ `vehicle.min_brake_opening_pct`）。届いても減速が足りなければ「上限で待機」して停車を待つ。
 - 刻むたびに 車速 / 減速度 G / ブレーキ位置 / 判定（踏み増し・保持・戻し・上限で待機）を print し、
   最後に所要時間・最大減速度・踏み増し/戻しの回数を出す。
 - `timeout_s`（60s）を超えても停車しない、または CAN 車速が読めなければ終了コード 5（終了処理で原点復帰）。

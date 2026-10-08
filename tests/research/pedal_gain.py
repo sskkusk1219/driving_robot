@@ -44,7 +44,7 @@ from tests.research.dynamics_estimation import (
 )
 from tests.research.ff_model import DEFAULT_DT_S, STOP_SPEED_KMH, group_by_session
 from tests.research.ff_params import ResearchFFParams, free_accel_at
-from tests.research.research_types import DriveLog, FeedforwardParams
+from tests.research.research_types import PEDAL_OFF_TOL_PCT, DriveLog, FeedforwardParams
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,7 @@ def estimate_gain_curve(
             opening, db = brake, params.brake_deadband_pct
             other, other_db = accel, params.accel_deadband_pct
         mask = (
-            (other[:-1] <= other_db)
+            (other[:-1] <= other_db + PEDAL_OFF_TOL_PCT)  # 2026-10-08 段2l-6: min ＋ 幅 以下
             & (opening[:-1] - db >= min_offset_pct)
             & _steady_opening_mask(opening, dt)[:-1]
         )

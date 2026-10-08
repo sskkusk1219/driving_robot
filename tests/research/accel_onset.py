@@ -963,7 +963,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     ap.add_argument(
         "--deadband-pct", type=float, default=None,
-        help="アクセル不感帯 [%%]（既定: yaml の feedforward.accel_deadband_pct）",
+        help="アクセル u の原点 [%%]（既定: yaml の vehicle.min_accel_opening_pct）",
     )
     ap.add_argument(
         "--speed-bins", type=_parse_float_list, default=(5.0, 8.0, 12.0, 16.0, 24.0, 35.0, 50.0),

@@ -43,7 +43,8 @@ def _tmp_cfg(tmp_path: Path) -> cfgmod.ResearchConfig:
         {
             "output.results_dir": str(tmp_path / "results"),
             "output.plot": False,
-            "feedforward.stop_brake_opening_pct": HOLD_PCT,
+            # 絶対 22.0%（min 2.9 ＋ 量）。段2l-7
+            "feedforward.stop_brake_offset_pct": HOLD_PCT - 2.9,
             # 走行後の緩減速を短くする（判定ロジックは既定と同じ）
             "decel_stop.step_mm": 1.0,
             "decel_stop.dwell_s": 0.2,
@@ -294,6 +295,166 @@ async def test_prepare_mode_drive_warns_on_h0_h1_mismatch(
     assert "h1_s" in out
 
 
+# ── C7（順モデルの表） ────────────────────────────────────────────────
+
+
+def _write_forward_table_pkl(path: Path, deadbands: tuple[float, float] = (4.0, 7.0)) -> None:
+    """小さな合成の順モデルの表（a = −2 − 0.01v + 0.3u（u≥0）/ 0.6u（u<0））を pkl にする。"""
+    from tests.research.fwd_map import POINT_MEASURED, ForwardTable, save_table
+
+    rep = np.array([0.0, 50.0, 100.0, 150.0])
+    grid = np.arange(-30.0, 31.0, 1.0)
+    accel = (-2.0 - 0.01 * rep[:, None]) + np.where(grid >= 0, 0.3 * grid, 0.6 * grid)[None, :]
+    save_table(
+        ForwardTable(
+            speed_edges=np.array([-25.0, 25.0, 75.0, 125.0, 175.0]),
+            speed_rep=rep,
+            u_grid=grid,
+            accel_grid=accel,
+            seconds=np.full(accel.shape, 10.0),
+            point_kind=np.full(accel.shape, POINT_MEASURED, dtype=int),
+            meas_u_min=np.full(4, -30.0),
+            meas_u_max=np.full(4, 30.0),
+            meta={
+                "accel_deadband_pct": deadbands[0],
+                "brake_deadband_pct": deadbands[1],
+                "accel_lag_s": 0.05,
+                "brake_lag_s": 0.05,
+            },
+        ),
+        path,
+    )
+
+
+def _c7_cfg(tmp_path: Path, deadbands: tuple[float, float] = (4.0, 7.0)) -> cfgmod.ResearchConfig:
+    cfg = _tmp_cfg(tmp_path)
+    cfg.feedforward.candidate = "C7"
+    # 2026-10-08 段2l-6: u の原点は vehicle.min_*_opening_pct（表の meta と比べる）
+    cfg.vehicle.min_accel_opening_pct = 4.0
+    cfg.vehicle.min_brake_opening_pct = 7.0
+    cfg.feedforward.stop_brake_offset_pct = HOLD_PCT - 7.0  # 絶対 HOLD_PCT（段2l-7）
+    cfg.feedforward.model_path = str(tmp_path / "fwd_table.pkl")
+    _write_forward_table_pkl(Path(cfg.feedforward.model_path), deadbands)
+    return cfg
+
+
+def test_load_feedforward_c7_reads_table_and_rejects_mismatch(tmp_path: Path) -> None:
+    cfg = _c7_cfg(tmp_path)
+    ff = mdmod.load_feedforward(cfg)
+    assert isinstance(ff, ff_candidate.ForwardMapFeedforward) and ff.has_model
+    # C7 に多項式モデルの pkl → ConfigError（走り出す前に止まる）
+    poly = tmp_path / "poly.pkl"
+    poly.write_bytes(b"\x80\x04N.")  # pickle(None): model_type を持たない
+    cfg.feedforward.model_path = str(poly)
+    with pytest.raises(cfgmod.ConfigError, match="順モデルの表"):
+        mdmod.load_feedforward(cfg)
+    # 逆向き: C1 に表の pkl → ConfigError
+    cfg2 = _c7_cfg(tmp_path)
+    cfg2.feedforward.candidate = "C1"
+    with pytest.raises(cfgmod.ConfigError, match="model_type"):
+        mdmod.load_feedforward(cfg2)
+
+
+async def test_prepare_mode_drive_c7_builds_plan_and_shows_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _c7_cfg(tmp_path)
+    mode = _mode([(0.0, 0.0), (2.0, 0.0), (8.0, 30.0), (12.0, 30.0), (16.0, 0.0), (18.0, 0.0)])
+
+    async def fake_load_mode(_cfg: cfgmod.ResearchConfig, _name: str) -> object:
+        return mode
+
+    monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+    setup = await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+
+    assert isinstance(setup.ff, ff_candidate.ForwardMapFeedforward)
+    assert setup.ff.plan.t_s[-1] == pytest.approx(mode.total_duration)
+    out = capsys.readouterr().out
+    for word in ("C7", "遅れ", "惰行の帯", "範囲外", "穴埋め", "アクセル", "停車保持"):
+        assert word in out
+    assert "ペダル切替" in out
+    assert "⚠" not in out  # u の原点（min）は表と設定で一致
+    assert "待機位置（min） アクセル 4.00% / ブレーキ 7.00%" in out
+
+
+async def test_prepare_mode_drive_c7_warns_on_deadband_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _c7_cfg(tmp_path, deadbands=(4.0, 9.0))  # 表のブレーキの u の原点だけ設定とずらす
+    mode = _mode([(0.0, 0.0), (10.0, 20.0)])
+
+    async def fake_load_mode(_cfg: cfgmod.ResearchConfig, _name: str) -> object:
+        return mode
+
+    monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+    await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+    out = capsys.readouterr().out
+    # 2026-10-08 段2l-7: 警告（⚠）ではなくお知らせ。表は u で持つのでそのまま使う
+    assert "⚠" not in out and "ブレーキ pkl 9.00 / 設定 7.00" in out
+    assert "u の原点（min）が表を作ったときと違います" in out
+    assert "そのまま使います" in out and "手順2 をやり直してください" in out
+    assert "アクセル pkl" not in out
+
+
+async def test_c7_plan_shifts_exactly_with_min(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-08 段2l-7: 同じ表・同じ offset で min だけ +3% の設定にすると、計画の開度
+    （アクセル・ブレーキ・停車保持）がどれもちょうど +3%（絶対値側へ）ずれる。"""
+    mode = _mode([(0.0, 0.0), (2.0, 0.0), (8.0, 30.0), (12.0, 30.0), (16.0, 0.0), (18.0, 0.0)])
+
+    async def fake_load_mode(_cfg: cfgmod.ResearchConfig, _name: str) -> object:
+        return mode
+
+    monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+    base_cfg = _c7_cfg(tmp_path)
+    shift_cfg = _c7_cfg(tmp_path)  # 同じ表（pkl の meta は min 4.0/7.0 のまま）
+    shift_cfg.vehicle.min_accel_opening_pct += 3.0
+    shift_cfg.vehicle.min_brake_opening_pct += 3.0
+    shift_cfg.feedforward.stop_brake_offset_pct = base_cfg.feedforward.stop_brake_offset_pct
+    base = (await mdmod.prepare_mode_drive(base_cfg, "dummy_mode")).ff.plan.effort_pct
+    shifted = (await mdmod.prepare_mode_drive(shift_cfg, "dummy_mode")).ff.plan.effort_pct
+
+    assert shift_cfg.stop_brake_opening_pct == pytest.approx(base_cfg.stop_brake_opening_pct + 3.0)
+    accel, brake = base > 0, base < 0
+    assert accel.any() and brake.any()
+    assert np.allclose(shifted[accel], base[accel] + 3.0)
+    assert np.allclose(shifted[brake], base[brake] - 3.0)  # 停車保持（負の定数）もここに含まれる
+    assert np.array_equal(shifted == 0, base == 0)
+
+
+async def test_run_mode_drive_c7_uses_plan_for_ff_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """走行ループが C7 のとき、ログの FF 出力（plan_effort）が plan.at(t) と一致する。"""
+    cfg = _c7_cfg(tmp_path)
+    cfg.mode_drive.pedal_standby = False
+    mode = _mode([(0.0, 0.0), (0.6, 0.0), (2.0, 6.0), (3.0, 6.0), (3.6, 0.0), (4.0, 0.0)])
+
+    async def fake_load_mode(_cfg: cfgmod.ResearchConfig, _name: str) -> object:
+        return mode
+
+    monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+    setup = await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+    hw = await _held_stub(cfg)
+    log = dlmod.SessionLog(cfg, hw, has_ref=True)
+    log.start(dlmod.SECTION_MODE_DRIVE, "")
+
+    # モードより長く走っても（端で止まる）落ちない
+    result = await mdmod.run_mode_drive(hw, cfg, setup, log=log)
+    await log.close()
+
+    assert result.completed and result.cycles >= 70
+    plan = setup.ff.plan
+    assert len(result.samples) > 50
+    for sample in result.samples:
+        assert sample.mode_time_s is not None
+        assert sample.data.plan_effort_pct == pytest.approx(plan.at(sample.mode_time_s))
+        assert sample.candidate == "C7"
+    # 停車保持の区間（先頭）は保持ブレーキの開度
+    assert result.samples[0].data.plan_effort_pct == pytest.approx(-HOLD_PCT)
+
+
 # ── KPI ───────────────────────────────────────────────────────────────
 
 
@@ -517,12 +678,12 @@ async def test_zero_current_never_nonzero_does_not_abort(tmp_path: Path) -> None
     assert any(r.accel_pct > 0.0 for r in rows)  # アクセルは実際に開いていた
 
 
-async def test_unused_pedal_waits_at_standby_below_deadband(tmp_path: Path) -> None:
-    """使っていないペダルは 0% ではなく「不感帯 − 余裕」で待つ（phase は FF の選択のまま）。"""
+async def test_unused_pedal_waits_at_standby_at_min(tmp_path: Path) -> None:
+    """使っていないペダルは 0% ではなく min（触れた位置）で待つ（phase は FF の選択のまま）。"""
     cfg = _tmp_cfg(tmp_path)
     accel_sb, brake_sb = mdmod.standby_openings(cfg)
-    assert accel_sb == pytest.approx(cfg.feedforward.accel_deadband_pct - 2.0)
-    assert brake_sb == pytest.approx(cfg.feedforward.brake_deadband_pct - 2.0)
+    assert accel_sb == pytest.approx(cfg.vehicle.min_accel_opening_pct)
+    assert brake_sb == pytest.approx(cfg.vehicle.min_brake_opening_pct)
     assert 0.0 < accel_sb and 0.0 < brake_sb
     hw = await _held_stub(cfg)
     log = dlmod.SessionLog(cfg, hw, has_ref=True)
@@ -601,9 +762,10 @@ async def test_abort_releases_pedals_to_zero_even_with_standby(tmp_path: Path) -
 
 def test_standby_label_and_disabled() -> None:
     cfg = cfgmod.load_config(Path("tests/research/config_testVehicle.yaml"))
-    cfg.feedforward.accel_deadband_pct, cfg.feedforward.brake_deadband_pct = 10.0, 13.16
-    assert mdmod.standby_label(cfg) == "8.00% / 11.16%（不感帯 − 2.00%）"
-    cfg.feedforward.accel_deadband_pct = 1.0  # 余裕より浅い不感帯は 0% で止める
+    cfg.vehicle.min_accel_opening_pct, cfg.vehicle.min_brake_opening_pct = 8.0, 11.16
+    assert mdmod.standby_label(cfg) == "8.00% / 11.16%（触れた位置 min）"
+    assert mdmod.standby_openings(cfg) == (8.0, 11.16)
+    cfg.vehicle.min_accel_opening_pct = 0.0  # min が 0 なら待機位置も 0%
     assert mdmod.standby_openings(cfg)[0] == 0.0
     cfg.mode_drive.pedal_standby = False
     assert mdmod.standby_openings(cfg) == (0.0, 0.0)
@@ -974,6 +1136,17 @@ def test_select_kwargs_point_is_empty_and_window_uses_L_and_H() -> None:
     expected_g = window_slope_kmhs(run.ref.at, 4.0, 0.5, 3.0)
     assert kwargs["select_accel_kmhs"] == pytest.approx(expected_g)
     assert kwargs["select_speed_kmh"] == pytest.approx(run.ref.at(4.5))
+    assert set(kwargs) == {"select_accel_kmhs", "select_speed_kmh"}  # L_b なしなら足さない
+
+    # L_b（段2-2）: ブレーキ用に L_b の傾きと ref(t+L_b) を足す。L 側の 2 つは変わらない
+    cfg.feedforward.pedal_select_brake_center_s = 0.1
+    kwb = run._select_kwargs(4.0, 40.0)  # noqa: SLF001
+    assert kwb["select_accel_kmhs"] == kwargs["select_accel_kmhs"]
+    assert kwb["select_speed_kmh"] == kwargs["select_speed_kmh"]
+    assert kwb["select_brake_accel_kmhs"] == pytest.approx(
+        window_slope_kmhs(run.ref.at, 4.0, 0.1, 3.0)
+    )
+    assert kwb["select_brake_speed_kmh"] == pytest.approx(run.ref.at(4.1))
 
 
 def test_select_kwargs_point_uses_pedal_select_point_s_independent_of_h1() -> None:
