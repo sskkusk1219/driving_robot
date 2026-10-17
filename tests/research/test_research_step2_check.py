@@ -127,6 +127,11 @@ def test_b3_creep_needs_launch_table_but_not_value() -> None:
     with_launch = sc.check_coast(t, v, decel, [0.4, 0.2, 0.0], **_B3)
     assert with_launch.metrics["creep_launch_missing"] == 0.0
     assert with_launch.status == sc.STATUS_OK  # 値の差では判定しない
+    # 停止側の表（2026-10-18 段2o-10）は有無を表示するだけ（NG にしない）
+    assert "停止側の表なし" in with_launch.value
+    t.stop_accel = t.accel_grid.copy()
+    with_stop = sc.check_coast(t, v, decel, [0.4, 0.2, 0.0], **_B3)
+    assert "停止側の表あり" in with_stop.value and with_stop.status == sc.STATUS_OK
     # クリープ加速度に正が無ければ、発進側が無くても NG にしない
     none_positive = sc.check_coast(_table(), v, decel, [0.0, 0.0], **_B3)
     assert none_positive.metrics["creep_launch_missing"] == 0.0

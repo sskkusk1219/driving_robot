@@ -24,6 +24,11 @@ effort は ±100 にクリップする。
 基準が下がっている・変わらない時刻と、停車保持・クリップは本体のまま。launch_accel が None の
 表は今までと同じ計算。
 
+停止側（2026-10-18 段2o-10）: 表が stop_accel を持つとき、停車へ向かう減速の時刻（need < 0・
+基準車速が停止側の表の範囲内・その先 stop_horizon_s 以内に基準が停車速度以下になる）は、発進側と
+同じやり方で停止側の配列を引く。判定は `low_speed_sides`（deviation_offset_detail と共有）。
+stop_accel が None の表は今までと同じ計算。
+
 戻し（2026-10-14 段2o-5）: 表が release_grid を持つとき、ブレーキの時刻を上の計算の後に時刻順に
 解き直す。時刻 i の「直近 RELEASE_WINDOW_S 秒（i を含まない）に計画済みの u の最小」を m とし、
 戻し量 0 で解いた u0 が m 以下（深い）ならそのまま。浅い（u0 > m）ときは u ∈ (m, 0] で
@@ -238,6 +243,9 @@ class ForwardPlan:
     period_s: float = DEFAULT_CONTROL_PERIOD_S
     preposition: PrepositionStats | None = None  # 先置きを有効にしたときだけ入る
     return_gap: ReturnGapStats | None = None  # 切り替えのすき間の確保（段2o-9）
+    # 各時刻で「その先 stop_horizon_s 以内に基準が停車速度以下になる」か（停止側の表を引く条件の
+    # 一部。段2o-10。C10 の上乗せが build_plan と同じ表を引くために持つ）。None ＝ 持たない
+    stops_ahead: np.ndarray | None = None
 
     def index_at(self, t_s: float) -> int:
         """時刻 t に最も近い行の番号（`at` と同じ最近傍）。"""
@@ -341,16 +349,21 @@ def build_plan(
     u_b, kind_b = table.invert(v, need_b)
 
     coast_a = coast_b = coast
-    if table.launch_accel is not None:
-        # 基準が上がっている時刻だけ発進側の表で解く（need > 0）
-        coast_l = np.asarray(table.coast_accel(v, launch=True), dtype=float)
-        u_a_l, kind_a_l = table.invert(v, need_a, launch=True)
-        u_b_l, kind_b_l = table.invert(v, need_b, launch=True)
-        rise_a, rise_b = need_a > 0.0, need_b > 0.0
-        coast_a = np.where(rise_a, coast_l, coast)
-        coast_b = np.where(rise_b, coast_l, coast)
-        u_a, kind_a = np.where(rise_a, u_a_l, u_a), np.where(rise_a, kind_a_l, kind_a)
-        u_b, kind_b = np.where(rise_b, u_b_l, u_b), np.where(rise_b, kind_b_l, kind_b)
+    stops_ahead = ref_stop <= STOP_SPEED_KMH
+    launch_a, stop_a = low_speed_sides(table, need_a, v, stops_ahead)
+    launch_b, stop_b = low_speed_sides(table, need_b, v, stops_ahead)
+    # 発進側（基準が上がっている時刻）・停止側（停車へ向かう減速の時刻）だけ、その表で解く
+    for use_launch, side_a, side_b in ((True, launch_a, launch_b), (False, stop_a, stop_b)):
+        if not (side_a.any() or side_b.any()):
+            continue
+        kw = {"launch": True} if use_launch else {"stop": True}
+        coast_s = np.asarray(table.coast_accel(v, **kw), dtype=float)
+        u_a_s, kind_a_s = table.invert(v, need_a, **kw)
+        u_b_s, kind_b_s = table.invert(v, need_b, **kw)
+        coast_a = np.where(side_a, coast_s, coast_a)
+        coast_b = np.where(side_b, coast_s, coast_b)
+        u_a, kind_a = np.where(side_a, u_a_s, u_a), np.where(side_a, kind_a_s, kind_a)
+        u_b, kind_b = np.where(side_b, u_b_s, u_b), np.where(side_b, kind_b_s, kind_b)
 
     want_accel = need_a - coast_a >= coast_band_kmhs - 1e-12
     want_brake = ~want_accel & (need_b - coast_b <= -coast_band_kmhs + 1e-12)
@@ -368,8 +381,7 @@ def build_plan(
     flag[stop] = FLAG_STOP
     if table.release_grid is not None and table.release_accel is not None:
         redo = is_brake & ~stop
-        if table.launch_accel is not None:
-            redo &= ~(need_b > 0.0)  # 発進側の表で解いた時刻は戻しではない
+        redo &= ~(launch_b | stop_b)  # 発進側・停止側の表で解いた時刻は戻しではない
         _resolve_releases(
             effort, redo, u_b, v, need_b, table, brake_deadband_pct, accel_deadband_pct, period_s
         )
@@ -394,8 +406,35 @@ def build_plan(
     )
     return ForwardPlan(
         t_s=t, effort_pct=effort, need_accel_kmhs=need, flag=flag, period_s=period_s,
-        preposition=stats, return_gap=gap_stats,
+        preposition=stats, return_gap=gap_stats, stops_ahead=stops_ahead,
     )
+
+
+def low_speed_sides(
+    table: ForwardTable,
+    need_kmhs: np.ndarray | float,
+    ref_kmh: np.ndarray | float,
+    stops_ahead: np.ndarray | bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """発進側・停止側のどちらの表を引くかの判定 (launch, stop)（bool の配列。2026-10-18 段2o-10）。
+
+    build_plan と deviation_offset_detail が同じ条件で同じ表を引くための共有関数。
+    - launch: 表が launch_accel を持ち、要る加速度 need > 0（基準が上がっている）。
+    - stop: 表が stop_accel を持ち、need < 0（減速）で、基準車速が停止側の表の車速の範囲
+      （meta の stop_max_speed_kmh 未満）で、その先 stop_horizon_s 以内に基準が停車速度以下に
+      なる（stops_ahead。停車保持の判定 ref(t + stop_horizon_s) <= 停車速度 と同じ）。
+    表が持たない側は全部 False（今までと同じ計算になる）。
+    """
+    need = np.asarray(need_kmhs, dtype=float)
+    ref = np.asarray(ref_kmh, dtype=float)
+    ahead = np.asarray(stops_ahead, dtype=bool)
+    launch = (need > 0.0) if table.launch_accel is not None else np.zeros(need.shape, dtype=bool)
+    if table.stop_accel is not None:
+        top = float(table.meta.get("stop_max_speed_kmh", 0.0))
+        stop = (need < 0.0) & ahead & (ref < top)
+    else:
+        stop = np.zeros(np.broadcast(need, ref, ahead).shape, dtype=bool)
+    return launch, stop
 
 
 def deviation_offset(table: ForwardTable, **kwargs: Any) -> float:
@@ -416,6 +455,7 @@ def deviation_offset_detail(
     tau_brake_s: float | None,
     accel_min_pct: float,
     brake_min_pct: float,
+    stops_ahead: bool = False,
 ) -> tuple[float, bool]:
     """C10: 開度の列の 1 行（effort）に、偏差の分だけ上乗せした effort [%] を返す（段2p）。
 
@@ -429,7 +469,9 @@ def deviation_offset_detail(
       何もしない（effort をそのまま返す）。
     返す値は (上乗せ後の effort [%], min で止めたか)。止めたとは、減らす向きの差が min を
     越えるため min に止めたこと（集計用）。
-    - 表の引き方は build_plan と同じ（need ＞ 0 で表が launch_accel を持つなら発進側）。
+    - 表の引き方は build_plan と同じ（`low_speed_sides`。need ＞ 0 で表が launch_accel を持つなら
+      発進側、停車へ向かう減速なら停止側）。stops_ahead は ForwardPlan.stops_ahead のその時刻の値
+      （省略は False ＝ 停止側を引かない）。基準車速の判定には ref_kmh を使う。
       戻し（release）の引き直しは上乗せの差には使わない。局所の差だけを取る近似。
     """
     if flag in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS) or effort == 0.0:
@@ -438,10 +480,11 @@ def deviation_offset_detail(
     tau = tau_accel_s if is_accel else tau_brake_s
     if tau is None or tau <= 0.0:
         return effort, False
-    launch = table.launch_accel is not None and need_kmhs > 0.0
+    lv, sv = low_speed_sides(table, need_kmhs, ref_kmh, stops_ahead)
+    launch, stop = bool(lv), bool(sv)
     d_a = dev_kmh / tau
-    u0, _ = table.invert(ref_kmh, need_kmhs, launch=launch)
-    u1, _ = table.invert(row_kmh, need_kmhs + d_a, launch=launch)
+    u0, _ = table.invert(ref_kmh, need_kmhs, launch=launch, stop=stop)
+    u1, _ = table.invert(row_kmh, need_kmhs + d_a, launch=launch, stop=stop)
     du = float(u1) - float(u0)
     raw = effort + du
     if is_accel:

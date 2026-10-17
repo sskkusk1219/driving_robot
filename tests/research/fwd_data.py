@@ -30,12 +30,20 @@ import numpy as np
 from tests.research.drive_log import (
     SECTION_MODE_DRIVE,
     SECTION_PATTERN_DRIVE,
+    SECTION_PEDAL_SEARCH,
     actual_opening,
     cmd_opening,
 )
 from tests.research.ff_bias import window_slope
 
 DEFAULT_SECTIONS: tuple[str, ...] = (SECTION_PATTERN_DRIVE, SECTION_MODE_DRIVE)
+# 2026-10-18 段2o-10: 低速の表（発進側・停止側）の行を phase で取るための名前。CSV の `phase` 列と
+# 同じ文字列（pedal_search.PHASE_* と同じ。tests/research 内で pedal_search に依らないよう持ち込み）
+PHASE_CREEP_WAIT = "CREEP_WAIT"  # PEDAL_SEARCH: 両ペダル min・停車からクリープで 5 km/h まで
+PHASE_BRAKE_SEARCH = "BRAKE_SEARCH"  # PEDAL_SEARCH: クリープからブレーキを刻んで踏み増して止める
+PHASE_BRAKE_STEP = "BRAKE_STEP"  # PRE_DRIVE_CHECK: ブレーキを刻んで停止確認
+# PATTERN_DRIVE: G ランプの発進でブレーキをゆっくり離す（動き出す前の）区間
+PHASE_RAMP_LAUNCH_RELEASE = "RAMP_LAUNCH_RELEASE"
 SEGMENT_GAP_S = 0.5  # 仮値: 行間がこれ以上空いたらセグメントを切る
 STOP_SPEED_KMH = 0.5  # 実車速がこれ未満の行は停車として捨てる
 DEFAULT_ACCEL_WINDOW_S = 1.0  # 加速度の窓幅（前後 0.5 秒）
@@ -193,6 +201,7 @@ def read_fwd_rows(
     actuator_lag_tol_pct: float | None = DEFAULT_ACTUATOR_LAG_TOL_PCT,
     keep_stopped: bool = False,
     mark_launch: bool = True,
+    phases: Collection[str] | None = None,
 ) -> FwdRows:
     """走行 CSV 1 本から学習用の行を作る。捨てた行は理由ごとに dropped に数える。
 
@@ -205,6 +214,9 @@ def read_fwd_rows(
     行を印す（2026-10-14 段2o-5）。pattern_drive が発進側の表（attach_launch）に使う行と同じ定義
     （実開度・ずれ許容なし・停車の行を残す・窓 LAUNCH_ACCEL_WINDOW_S で読み直して launch_mask）で
     判定し、時刻が一致する行（elapsed_s の差が刻みの半分未満）に写す。
+    phases: 渡すと、CSV の `phase` 列がこの中にある行だけを読む（sections と両方で絞る。2026-10-18
+    段2o-10。手順2 の CREEP_WAIT・BRAKE_SEARCH など phase 単位で行を取るため）。None（既定）は
+    phase で絞らない（今までと同じ）。
     """
     if opening_source not in (OPENING_CMD, OPENING_ACTUAL):
         raise ValueError(f"opening_source は cmd か actual: {opening_source!r}")
@@ -220,6 +232,8 @@ def read_fwd_rows(
             section = r.get("section") or ""
             t = _num(r.get("elapsed_s"))
             if section not in sections or t is None:
+                continue
+            if phases is not None and (r.get("phase") or "") not in phases:
                 continue
             speed = _num(r.get("actual_speed_kmh"))
             new_seg = (
@@ -339,6 +353,7 @@ def read_fwd_rows(
             actuator_lag_tol_pct=None,
             keep_stopped=True,
             mark_launch=False,
+            phases=phases,
         )
         lm = launch_mask(la) if len(la) else np.zeros(0, dtype=bool)
         if lm.any():
@@ -359,6 +374,9 @@ LAUNCH_ACCEL_WINDOW_S = 0.5
 # 仮値: 発進の区間で「車速が下がっていない」とみなす加速度の下限（−この値）[km/h/s]。
 # 停車中の傾きの雑音ぶん。段2o-4 の確認で発進の区間の行を見て決める
 LAUNCH_ACCEL_TOL_KMHS = 0.05
+# 仮値（stop_approach_rows）: 「停車の手前」とみなす、停車の行までの最大の秒数 [s]。モードの低速の
+# 減速は数秒で止まる。段2o-10 の確認で行数を見て決める
+STOP_LOOKAHEAD_S = 5.0
 
 
 def take_rows(rows: FwdRows, mask: np.ndarray) -> FwdRows:
@@ -407,6 +425,126 @@ def launch_mask(rows: FwdRows, *, gap_s: float = SEGMENT_GAP_S) -> np.ndarray:
         out[i] = inside
         prev_t = t
     return out
+
+
+def stop_approach_rows(
+    rows: FwdRows, *, lookahead_s: float = STOP_LOOKAHEAD_S, gap_s: float = SEGMENT_GAP_S
+) -> np.ndarray:
+    """「停車の手前」の行が True の配列（2026-10-18 段2o-10）。rows は keep_stopped=True で読んだ
+    時刻順の行。動いている行（実車速 >= STOP_SPEED_KMH）のうち、途切れずに lookahead_s 秒以内に
+    停車の行（実車速 < STOP_SPEED_KMH）が来て、かつ u <= 0 の行。減速してブレーキで止まる区間。"""
+    n = len(rows)
+    out = np.zeros(n, dtype=bool)
+    stopped_t = math.nan  # 後ろから見て、途切れずにつながる直近の停車の時刻
+    for i in range(n - 1, -1, -1):
+        t = float(rows.t_s[i])
+        if i + 1 < n and not (0.0 < float(rows.t_s[i + 1]) - t < gap_s):
+            stopped_t = math.nan
+        if rows.speed_kmh[i] < STOP_SPEED_KMH:
+            stopped_t = t
+        elif math.isfinite(stopped_t) and stopped_t - t <= lookahead_s:
+            out[i] = float(rows.u_pct[i]) <= 0.0
+    return out
+
+
+@dataclass(frozen=True)
+class Breakaway:
+    """動き出す開度（ブレーキ。min からの量 u [%]、負）。source は "release" か "brake_search"。"""
+
+    u_pct: float
+    source: str
+    per_segment_u_pct: tuple[float, ...]
+
+
+def _read_plain(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _value_at(ts: list[float], vals: list[float], t: float) -> float | None:
+    """時刻 t 以前でいちばん近い行の値（無ければ None）。"""
+    k = int(np.searchsorted(np.asarray(ts), t, side="right")) - 1
+    return vals[k] if 0 <= k < len(vals) else None
+
+
+def launch_breakaway(
+    path: Path,
+    *,
+    brake_min_pct: float,
+    brake_lag_s: float,
+    min_speed_kmh: float = STOP_SPEED_KMH,
+) -> Breakaway | None:
+    """「動き出す開度」を CSV から求める（2026-10-18 段2o-10）。
+
+    - RAMP_LAUNCH_RELEASE 区間（PATTERN_DRIVE。途切れない連続した行）ごとに、区間の始まり以降で
+      実車速が min_speed_kmh 以上になった最初の行の時刻 t_move を探し、(t_move − brake_lag_s)
+      時点のブレーキ実開度から u ＝ −(実開度 − min) を求める。全区間の中央値が u_pct、
+      source ＝ "release"。
+    - その phase が無い古いログは、BRAKE_SEARCH（PEDAL_SEARCH）の区間ごとに、実車速が
+      STOP_SPEED_KMH 未満になった最初の行（止まった点。踏み増す向き）の (t − brake_lag_s) 時点の
+      ブレーキ実開度から同様に求める。source ＝ "brake_search"。
+    どちらも求まらなければ None。実開度の列が無い・空の行は使わない。
+    """
+    rows = _read_plain(path)
+    t_all: list[float] = []
+    v_all: list[float] = []
+    b_all: list[float] = []
+    sec_all: list[str] = []
+    ph_all: list[str] = []
+    for r in rows:
+        t = _num(r.get("elapsed_s"))
+        v = _num(r.get("actual_speed_kmh"))
+        b = actual_opening(r, "brake")
+        if t is None or v is None or b is None:
+            continue
+        t_all.append(t)
+        v_all.append(v)
+        b_all.append(b)
+        sec_all.append(r.get("section") or "")
+        ph_all.append(r.get("phase") or "")
+
+    def u_at(t: float) -> float | None:
+        b = _value_at(t_all, b_all, t)
+        return None if b is None else -max(b - brake_min_pct, 0.0)
+
+    def segments(section: str, phase: str) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        start = -1
+        for i in range(len(t_all)):
+            inside = sec_all[i] == section and ph_all[i] == phase
+            cut = start >= 0 and not (0.0 < t_all[i] - t_all[i - 1] < SEGMENT_GAP_S * 4)
+            if start >= 0 and (not inside or cut):
+                out.append((start, i - 1))
+                start = -1
+            if inside and start < 0:
+                start = i
+        if start >= 0:
+            out.append((start, len(t_all) - 1))
+        return out
+
+    found: list[float] = []
+    rel = segments(SECTION_PATTERN_DRIVE, PHASE_RAMP_LAUNCH_RELEASE)
+    if rel:
+        for k, (s0, _s1) in enumerate(rel):
+            end = rel[k + 1][0] if k + 1 < len(rel) else len(t_all)
+            for i in range(s0, end):
+                if sec_all[i] == SECTION_PATTERN_DRIVE and v_all[i] >= min_speed_kmh:
+                    u = u_at(t_all[i] - brake_lag_s)
+                    if u is not None:
+                        found.append(u)
+                    break
+        if found:
+            return Breakaway(float(np.median(found)), "release", tuple(found))
+    for s0, s1 in segments(SECTION_PEDAL_SEARCH, PHASE_BRAKE_SEARCH):
+        for i in range(s0, s1 + 1):
+            if v_all[i] < STOP_SPEED_KMH:
+                u = u_at(t_all[i] - brake_lag_s)
+                if u is not None:
+                    found.append(u)
+                break
+    if found:
+        return Breakaway(float(np.median(found)), "brake_search", tuple(found))
+    return None
 
 
 def concat_rows(parts: Sequence[FwdRows], source: str = "") -> FwdRows:

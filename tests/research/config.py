@@ -314,6 +314,13 @@ class LearningSection:
     # 0 にすると基準車速が 0 km/h に着いたあとブレーキが緩み、停車まで長くかかる
     # （スタブで約 30 秒）。仮の値（ユーザー指定 2026-10-09）。次の手順2 実機の後に決め直す
     ramp_edge_g: float = 0.05
+    # 2026-10-18 段2o-10 A: G ランプの発進の離し方。① 停車保持開度 → 止まる点 ＋ margin を fast_rate
+    # [%/s] で一定に離し、② そこから slow_rate [%/s] で車が動き出すまで離す
+    # （発進ごとに配列を順に使う）。
+    # 仮の値。測り方の細かさだけに効き、制御には使わない
+    ramp_launch_fast_rate_pctps: float = 2.0
+    ramp_launch_release_margin_pct: float = 2.0
+    ramp_launch_slow_rates_pctps: list[float] = field(default_factory=lambda: [0.25, 0.5])
     # 2026-10-10 段2l-10: 最高速での保持 [s]（+G → 0 の切り替えの後、0 → -G が始まるまで）。
     # ユーザー決定の仮の値（041505 でアクセルを戻してから減速に転じるまで約 1.4 秒）。長いほど減速に
     # 入る前に車が落ち着くが所要時間が増える。次の手順2 実機の後に決め直す
@@ -1015,6 +1022,19 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(cfg.learning.ramp_turn_time_s >= 0.0, "learning.ramp_turn_time_s は 0 以上")
     need(cfg.learning.ramp_stop_time_s >= 0.0, "learning.ramp_stop_time_s は 0 以上")
     need(cfg.learning.ramp_edge_g >= 0.0, "learning.ramp_edge_g は 0 以上")
+    need(
+        cfg.learning.ramp_launch_fast_rate_pctps > 0.0,
+        "learning.ramp_launch_fast_rate_pctps は正値",
+    )
+    need(
+        cfg.learning.ramp_launch_release_margin_pct >= 0.0,
+        "learning.ramp_launch_release_margin_pct は 0 以上",
+    )
+    need(
+        len(cfg.learning.ramp_launch_slow_rates_pctps) > 0
+        and all(v > 0.0 for v in cfg.learning.ramp_launch_slow_rates_pctps),
+        "learning.ramp_launch_slow_rates_pctps は空でなく、すべて正値",
+    )
     need(cfg.learning.ramp_hold_time_s >= 0.0, "learning.ramp_hold_time_s は 0 以上")
     need(cfg.learning.ramp_cruise_band_g > 0.0, "learning.ramp_cruise_band_g は正値")
     need(cfg.learning.ramp_cruise_hold_s >= 0.0, "learning.ramp_cruise_hold_s は 0 以上")

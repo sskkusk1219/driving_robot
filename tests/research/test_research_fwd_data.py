@@ -20,9 +20,11 @@ from tests.research.fwd_data import (
     cell_counts,
     concat_rows,
     effective_opening,
+    launch_breakaway,
     launch_mask,
     read_fwd_rows,
     release_amount,
+    stop_approach_rows,
     take_rows,
     thin_cells,
     u_cell,
@@ -37,6 +39,7 @@ COLUMNS = [
     "accel_cmd_pct",
     "brake_cmd_pct",
     "section",
+    "phase",
     "governor_active",
 ]
 
@@ -452,3 +455,81 @@ def test_read_fwd_rows_marks_launch_rows_and_carries_them(tmp_path: Path) -> Non
     assert concat_rows([r, r]).launch_row.sum() == 2 * r.launch_row.sum()
     off = read(path, mark_launch=False)
     assert not off.launch_row.any()
+
+
+# ───────── 2026-10-18 段2o-10: phase で絞る・動き出す開度・停車の手前 ─────────
+
+
+def test_read_fwd_rows_phases_filters_rows_and_default_does_not(tmp_path: Path) -> None:
+    a = make_rows(30, lambda t: 20.0 + 2.0 * t, accel=14.0, phase="RAMP_UP")
+    b = make_rows(30, lambda t: 40.0 + 2.0 * (t - 5.0), accel=14.0, t0=5.0, phase="COAST")
+    path = write_csv(tmp_path / "p.csv", a + b)
+    both = read(path)
+    only_b = read(path, phases=("COAST",))
+    none_c = read(path, phases=("NO_SUCH",))
+    assert both.t_s.min() < 1.0 and only_b.t_s.min() >= 5.0
+    assert len(none_c) == 0 and len(both) > len(only_b) > 0
+    assert len(read(path, phases=None)) == len(both)  # 既定は絞らない
+
+
+def _breakaway_rows(section: str, phase: str, brake_at_move: float, t0: float = 0.0):
+    """停車（t0〜t0+1）で brake を 10 → brake_at_move へゆっくり離し、1 秒から動き出す。"""
+    out = []
+    for i in range(30):
+        t = t0 + i * 0.1
+        k = t - t0
+        out.append({
+            "elapsed_s": round(t, 6),
+            "actual_speed_kmh": 0.0 if k < 1.0 else 3.0 * (k - 1.0),
+            "accel_actual_pct": 0.0,
+            "brake_actual_pct": max(10.0 - (10.0 - brake_at_move) * k, brake_at_move),
+            "section": section, "phase": phase, "governor_active": 0,
+        })
+    return out
+
+
+def test_launch_breakaway_release_median_and_brake_search_fallback(tmp_path: Path) -> None:
+    # 区間 2 本: 動き出し（速度 >= 1 は k=1.33 s）の 0.2 s 前のブレーキ実開度から u を求める
+    r1 = _breakaway_rows("PATTERN_DRIVE", "RAMP_LAUNCH_RELEASE", 8.0)
+    r2 = _breakaway_rows("PATTERN_DRIVE", "RAMP_LAUNCH_RELEASE", 9.0, t0=20.0)
+    bk = launch_breakaway(write_csv(tmp_path / "r.csv", r1 + r2), brake_min_pct=BD,
+                          brake_lag_s=0.2, min_speed_kmh=1.0)
+    assert bk is not None and bk.source == "release" and len(bk.per_segment_u_pct) == 2
+    assert all(u < 0.0 for u in bk.per_segment_u_pct)
+    assert bk.u_pct == pytest.approx(float(np.median(bk.per_segment_u_pct)))
+    # phase が無い古いログ: BRAKE_SEARCH の止まった点（速度 < 0.5）の開度
+    def speed(k: float) -> float:
+        return max(5.0 - 5.0 * k, 0.0)
+
+    rows = []
+    for i in range(30):
+        t = i * 0.1
+        rows.append({
+            "elapsed_s": round(t, 6), "actual_speed_kmh": speed(t), "accel_actual_pct": 0.0,
+            "brake_actual_pct": BD + 2.0 * t, "section": "PEDAL_SEARCH", "phase": "BRAKE_SEARCH",
+            "governor_active": 0,
+        })
+    old = launch_breakaway(write_csv(tmp_path / "o.csv", rows), brake_min_pct=BD, brake_lag_s=0.0)
+    assert old is not None and old.source == "brake_search"
+    assert old.u_pct == pytest.approx(-2.0 * 0.9, abs=0.3)  # 速度 0.5 を切る t≈0.9 s
+    # どちらも無ければ None
+    none = launch_breakaway(write_csv(tmp_path / "n.csv", make_rows(10, lambda t: 5.0)),
+                            brake_min_pct=BD, brake_lag_s=0.0)
+    assert none is None
+
+
+def test_stop_approach_rows_only_moving_rows_shortly_before_a_stop() -> None:
+    speed = [8.0, 6.0, 4.0, 2.0, 1.0, 0.0, 0.0, 3.0, 5.0]
+    t = np.arange(len(speed)) * 1.0
+    rows = synth_launch_rows(speed, [-3.0] * len(speed), [-1.0] * len(speed), t=t)
+    m = stop_approach_rows(rows, lookahead_s=3.0, gap_s=1.5)
+    assert m.tolist() == [False, False, True, True, True, False, False, False, False]
+    # アクセルを踏んでいる行（u > 0）は外す
+    rows2 = synth_launch_rows(speed, [-3.0, -3.0, 2.0, -3.0, -3.0, 0.0, 0.0, 0.0, 0.0],
+                              [-1.0] * len(speed), t=t)
+    assert not stop_approach_rows(rows2, lookahead_s=3.0, gap_s=1.5)[2]
+    # 時刻が途切れていれば停車はつながらない
+    t3 = t.copy()
+    t3[5:] += 10.0
+    rows3 = synth_launch_rows(speed, [-3.0] * len(speed), [-1.0] * len(speed), t=t3)
+    assert not stop_approach_rows(rows3, lookahead_s=3.0, gap_s=1.5).any()

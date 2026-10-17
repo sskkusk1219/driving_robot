@@ -99,6 +99,8 @@ from tests.research.creep_curve import estimate_creep_accel_curve
 from tests.research.drive_log import (
     SECTION_DECEL_TO_STOP,
     SECTION_PATTERN_DRIVE,
+    SECTION_PEDAL_SEARCH,
+    SECTION_PRE_DRIVE_CHECK,
     DriveSample,
     SessionLog,
     read_drive_logs,
@@ -558,6 +560,10 @@ def loop_config_from_config(
         ramp_turn_time_s=lr.ramp_turn_time_s,
         ramp_stop_time_s=lr.ramp_stop_time_s,
         ramp_edge_g=lr.ramp_edge_g,
+        # 2026-10-18 段2o-10: 発進のゆっくり離し（① 速く → ② ゆっくり。動き出す開度を測る）
+        ramp_launch_fast_rate_pctps=lr.ramp_launch_fast_rate_pctps,
+        ramp_launch_release_margin_pct=lr.ramp_launch_release_margin_pct,
+        ramp_launch_slow_rates_pctps=tuple(lr.ramp_launch_slow_rates_pctps),
         ramp_launch_g_rate_gps=lr.ramp_launch_g_rate_gps,
         ramp_launch_blend_min_s=lr.ramp_launch_blend_min_s,
         ramp_one_sided=lr.ramp_one_sided,
@@ -989,6 +995,104 @@ def _build_table_model(
     return _BuiltModel(model_path=str(path), metrics={})
 
 
+def _attach_low_speed_tables(
+    table: Any,
+    csv_path: Path,
+    st: Any,
+    *,
+    creep_speed_kmh: float,
+    creep_launch_min_speed_kmh: float | None = None,
+) -> Any:
+    """C8 の表に、発進側（launch_accel）と停止側（stop_accel）を付けて返す（2026-10-18 段2o-10）。
+
+    行の取り方（ニューラルネット本体の学習の行は変えない。表だけ）:
+      発進側 … PATTERN_DRIVE の発進の区間（`launch_mask`）・PEDAL_SEARCH/CREEP_WAIT・
+               PATTERN_DRIVE/RAMP_LAUNCH_RELEASE の停車中の行
+      停止側 … PRE_DRIVE_CHECK/BRAKE_STEP・PEDAL_SEARCH/BRAKE_SEARCH・PATTERN_DRIVE の停車の手前の
+               行（`stop_approach_rows`・停車まぎわの強いブレーキ `stop_approach_mask`）・
+               CREEP_WAIT の u = 0 の行
+    読み方は実開度・ずれ許容なし・停車の行を残す・窓 LAUNCH_ACCEL_WINDOW_S（従来の発進側と同じ）。
+    「動き出す開度」は CSV の RAMP_LAUNCH_RELEASE（無ければ BRAKE_SEARCH）から求める。
+    クリープ車速が 0 以下の車は両方とも作らない（None）。
+    """
+    from tests.research import fwd_tool  # noqa: PLC0415
+    from tests.research.fwd_cv import stop_approach_mask  # noqa: PLC0415
+    from tests.research.fwd_data import (  # noqa: PLC0415
+        PHASE_BRAKE_SEARCH,
+        PHASE_BRAKE_STEP,
+        PHASE_CREEP_WAIT,
+        PHASE_RAMP_LAUNCH_RELEASE,
+        STOP_SPEED_KMH,
+        concat_rows,
+        launch_breakaway,
+        launch_mask,
+        stop_approach_rows,
+        take_rows,
+    )
+    from tests.research.fwd_map import attach_launch, attach_stop  # noqa: PLC0415
+
+    def read(sections: Sequence[str], phases: Sequence[str] | None = None) -> Any:
+        extra: dict[str, Any] = {} if phases is None else {"phases": tuple(phases)}
+        (rows,) = fwd_tool.read_logs(
+            [csv_path], st, opening_source="actual", actuator_lag_tol_pct=None,
+            keep_stopped=True, accel_window_s=LAUNCH_ACCEL_WINDOW_S, sections=tuple(sections),
+            **extra,
+        )
+        return rows
+
+    pattern = read((SECTION_PATTERN_DRIVE,))
+    lm = launch_mask(pattern)
+    creep = read((SECTION_PEDAL_SEARCH,), (PHASE_CREEP_WAIT,))
+    release = read((SECTION_PATTERN_DRIVE,), (PHASE_RAMP_LAUNCH_RELEASE,))
+    release = take_rows(release, release.speed_kmh < STOP_SPEED_KMH)
+    launch_rows = concat_rows([take_rows(pattern, lm), creep, release], "launch")
+
+    brake_step = read((SECTION_PRE_DRIVE_CHECK,), (PHASE_BRAKE_STEP,))
+    brake_search = read((SECTION_PEDAL_SEARCH,), (PHASE_BRAKE_SEARCH,))
+    near_stop = (
+        (stop_approach_rows(pattern) | stop_approach_mask(pattern.speed_kmh, pattern.u_pct))
+        & ~lm & (pattern.speed_kmh >= STOP_SPEED_KMH)
+    )
+    creep_zero = take_rows(
+        creep, (creep.speed_kmh >= STOP_SPEED_KMH) & (np.abs(creep.u_pct) < 1e-9)
+    )
+    stop_rows = concat_rows(
+        [brake_step, brake_search, take_rows(pattern, near_stop), creep_zero], "stop"
+    )
+
+    min_speed = STOP_SPEED_KMH if creep_launch_min_speed_kmh is None else creep_launch_min_speed_kmh
+    breakaway = launch_breakaway(
+        csv_path, brake_min_pct=st.brake_deadband_pct, brake_lag_s=st.brake_lag_s,
+        min_speed_kmh=min_speed,
+    )
+    table = attach_launch(
+        table, launch_rows, creep_speed_kmh=creep_speed_kmh, breakaway=breakaway,
+        accel_window_s=LAUNCH_ACCEL_WINDOW_S,
+    )
+    table = attach_stop(
+        table, stop_rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=LAUNCH_ACCEL_WINDOW_S
+    )
+    if creep_speed_kmh <= 0.0:
+        say("  発進側・停止側: クリープ車速が 0 なので作らない")
+    if table.launch_accel is None:
+        say(f"  発進側: 行が足りないので作らない（{table.meta['launch_rows_s']:.1f} 秒）")
+    else:
+        say(f"  発進側: 動いている行 {table.meta['launch_rows_s']:.1f} 秒、置き換えた車速の行 "
+            f"{[round(x, 2) for x in table.meta['launch_speed_rows']]} km/h")
+    if breakaway is None:
+        say("  動き出す開度: 求まらず（車速 0 付近の深い側を 0 で埋めない）")
+    else:
+        say(f"  動き出す開度: u={breakaway.u_pct:.2f}%（{breakaway.source}、区間ごと "
+            f"{[round(x, 2) for x in breakaway.per_segment_u_pct]}）")
+    if table.stop_accel is None:
+        say(f"  停止側: 行が足りないので作らない（{table.meta['stop_rows_s']:.1f} 秒）")
+    else:
+        say(f"  停止側: 動いている行 {table.meta['stop_rows_s']:.1f} 秒、置き換えた車速の行 "
+            f"{[round(x, 2) for x in table.meta['stop_speed_rows']]} km/h"
+            f"（引く車速の上限 {table.meta['stop_max_speed_kmh']:g} km/h）")
+    return table
+
+
 def _build_forward_model(
     profile: VehicleProfile,
     csv_path: Path,
@@ -999,6 +1103,7 @@ def _build_forward_model(
     seeds: Sequence[int] | None,
     max_iter: int | None,
     lags: MeasuredLags | None = None,
+    creep_launch_min_speed_kmh: float | None = None,
 ) -> _BuiltModel:
     """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
 
@@ -1007,8 +1112,7 @@ def _build_forward_model(
     測れたペダルだけ表に入れる（C7 の表を作るときと同じ）。
     """
     from tests.research import fwd_final, fwd_tool, fwd_torch  # noqa: PLC0415
-    from tests.research.fwd_data import launch_mask, take_rows  # noqa: PLC0415
-    from tests.research.fwd_map import attach_launch, load_forward_map, save_table  # noqa: PLC0415
+    from tests.research.fwd_map import load_forward_map, save_table  # noqa: PLC0415
 
     say("順モデル（C8）: まず C7 の表を作り（格子と設定の元）、続けてニューラルネットを学習 …")
     like = _build_table_model(
@@ -1037,18 +1141,10 @@ def _build_forward_model(
     for seed, sec in secs:
         say(f"    乱数{seed}: 学習 {sec:.1f} 秒")
     say(f"  学習の合計 {sum(s for _, s in secs):.1f} 秒・壁時計 {wall:.1f} 秒")
-    # 発進側（段2o-4）: 停車から基準が上がるときの表。クリープが無い車は行が足りず付かない
-    (launch_all,) = fwd_tool.read_logs(
-        [csv_path], st, opening_source="actual", actuator_lag_tol_pct=None,
-        keep_stopped=True, accel_window_s=LAUNCH_ACCEL_WINDOW_S,
+    table = _attach_low_speed_tables(
+        table, csv_path, st, creep_speed_kmh=profile.feedforward_params.creep_speed_kmh,
+        creep_launch_min_speed_kmh=creep_launch_min_speed_kmh,
     )
-    launch_rows = take_rows(launch_all, launch_mask(launch_all))
-    table = attach_launch(table, launch_rows, accel_window_s=LAUNCH_ACCEL_WINDOW_S)
-    if table.launch_accel is None:
-        say(f"  発進側: 行が足りないので作らない（{table.meta['launch_rows_s']:.1f} 秒）")
-    else:
-        say(f"  発進側: 動いている行 {table.meta['launch_rows_s']:.1f} 秒、置き換えた車速の行 "
-            f"{[round(x, 2) for x in table.meta['launch_speed_rows']]} km/h")
     # 2026-10-14 段2o-5: 戻しの表は build_final_table が付ける（final_config の既定で作る）
     rel_s = float(table.meta.get("release_rows_s", 0.0))
     if table.release_grid is None:
@@ -1235,6 +1331,7 @@ def build_ff_model(
         built = _build_forward_model(
             profile, csv_path, models_dir, hw_mode,
             workers=forward_workers, seeds=forward_seeds, max_iter=forward_max_iter, lags=lags,
+            creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
         )
     else:
         built = _build_poly_model(
@@ -1299,6 +1396,7 @@ def build_ff_model(
         built = _build_forward_model(
             profile, csv_path, models_dir, hw_mode,
             workers=forward_workers, seeds=new_seeds, max_iter=forward_max_iter, lags=lags,
+            creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
         )
         checks = run_checks_now()
     say(step2_check.format_checks(checks))

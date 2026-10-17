@@ -874,6 +874,7 @@ class _ModeRun:
             tau_brake_s=ff.tau_brake_s,
             accel_min_pct=v.min_accel_opening_pct,
             brake_min_pct=v.min_brake_opening_pct,
+            stops_ahead=bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False,
         )
         delta = new - ff_effort
         if ff_effort != 0.0:

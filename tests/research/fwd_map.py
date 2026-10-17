@@ -12,6 +12,11 @@
     4. 単調化: 行ごとに IsotonicRegression(increasing=True)。重みは秒数（穴埋め点は小さい重み）。
        実測の範囲内だけに当て、範囲外は当てた後の端の値で止める。
 
+発進側・停止側（段2o-10。attach_launch・attach_stop）: 低速の車速の行だけ、別の行（発進の区間・
+停止へ向かう区間）から同じ考え方（マスの中央値・穴は直線・単調化）で 0.25% マスで作り直した配列
+（launch_accel・stop_accel）と点の種類（launch_kind・stop_kind）を持つ。実測の外側は端の値で
+止めず、本体の傾きでつなぐ（発進側の車速 0 付近の行は動き出す開度より深い側を 0 で埋める）。
+
 `accel`・`invert`・`coast_accel` の計算は「行 × 格子点の加速度の配列」だけに依る関数
 （grid_accel・grid_invert）で、配列の出どころ（表・モデル・モデル＋差の表）に依らない。
 後の段の C8・C9 はこの 2 関数に自分の配列を渡して使う。
@@ -31,7 +36,9 @@ import numpy as np
 from sklearn.isotonic import IsotonicRegression
 
 from tests.research.fwd_data import (
+    FINE_SPEED_STEP_KMH,
     STOP_SPEED_KMH,
+    Breakaway,
     FwdRows,
     make_speed_edges,
     speed_cell_edges,
@@ -59,6 +66,15 @@ FILLED_WEIGHT_S = 0.1
 # 段2o-4 の確認でマスごとの秒数を見て決める
 LAUNCH_MIN_S = 0.5
 LAUNCH_MIN_TOTAL_S = 5.0
+# 発進側・停止側の表（attach_launch・attach_stop。2026-10-18 段2o-10）:
+#   SIDE_U_STEP_PCT … マス幅 [%]。手順2 の低速の崖は約 1.5% 幅で、0.5% マスでは 1〜3 点しか入らず
+#     2 段の階段になった（段2o-10 の確認）。0.25% にして崖を 6 点で分ける（本体の格子は今のまま）
+#   LOW_SPEED_MARGIN_KMH … 置き換える車速の行は「代表車速 ≦ クリープ車速（手順2 の実測）＋余裕」。
+#     余裕は車速の行 1 マス分（FINE_SPEED_STEP_KMH）。根拠: 表は行の代表車速の間を直線補間するので、
+#     クリープ車速の行の上の行まで置き換えないと、クリープ車速付近で本体と継ぎ目ができる。
+#     車の値は直接置かない（クリープ車速は config から渡る）。仮値。実機の比較で決める
+SIDE_U_STEP_PCT = 0.25
+LOW_SPEED_MARGIN_KMH = FINE_SPEED_STEP_KMH
 # 仮値（戻しの表 attach_release。2026-10-14 段2o-5）:
 #   RELEASE_GRID_PCT … 戻し量 [%] の格子。モードの戻し量は 0.3〜4% 超、山は min＋3〜9%
 #     （段2o-4 の数え）
@@ -91,6 +107,12 @@ class ForwardTable:
     # 発進側（基準車速が上がっているときに引く）の加速度。accel_grid と同じ形で、発進側の実測がある
     # 車速の行だけ置き換えた後の配列。None ＝ 発進側なし（2026-10-14 段2o-4。attach_launch）
     launch_accel: np.ndarray | None = None
+    # 停止側（基準車速が下がって停車へ向かうときに引く。2026-10-18 段2o-10。attach_stop）。
+    # launch_accel と同じ形・同じ置き方。None ＝ 停止側なし
+    stop_accel: np.ndarray | None = None
+    # 発進側・停止側の配列の点の種類（POINT_*。accel_grid と同じ形）。None ＝ 本体の point_kind
+    launch_kind: np.ndarray | None = None
+    stop_kind: np.ndarray | None = None
     # 戻しの表（2026-10-14 段2o-5。attach_release）。release_grid ＝ 戻し量 [%] の格子（昇順・正）、
     # release_accel ＝ (戻し量の数, 行, 格子点) 加速度。戻し量 0 は本体 accel_grid。
     # None ＝ 戻しの表なし（今までと完全に同じ）。戻し量は meta["release_max_pct"] で頭打ちにする
@@ -98,17 +120,20 @@ class ForwardTable:
     release_accel: np.ndarray | None = None
 
     def _release_nodes(
-        self, release: Any, launch: bool, shape: tuple[int, ...]
+        self, release: Any, launch: bool, shape: tuple[int, ...], stop: bool = False
     ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray] | None:
         """戻し量を使うときの (節の配列のリスト, 節の戻し量, 頭打ちした戻し量)。使わないなら None。
 
-        使わない: release が None・戻しの表なし・発進側の表を引くとき（launch=True で
-        launch_accel があるとき。発進は戻しではないので戻し量は無視する）。
+        使わない: release が None・戻しの表なし・発進側／停止側の表を引くとき（launch=True で
+        launch_accel があるとき、stop=True で stop_accel があるとき。発進・停止は戻しではないので
+        戻し量は無視する）。
         節は 0（本体）と release_grid。
         """
+        if launch and stop:
+            raise ValueError("launch と stop は同時に True にできません")
         if release is None or self.release_grid is None or self.release_accel is None:
             return None
-        if launch and self.launch_accel is not None:
+        if (launch and self.launch_accel is not None) or (stop and self.stop_accel is not None):
             return None
         vals = np.concatenate([[0.0], np.asarray(self.release_grid, dtype=float)])
         top = float(vals[-1])
@@ -118,8 +143,21 @@ class ForwardTable:
         r = np.clip(np.broadcast_to(np.asarray(release, dtype=float), shape), 0.0, top)
         return [self.accel_grid, *self.release_accel], vals, r
 
-    def _grid(self, launch: bool) -> np.ndarray:
-        return self.launch_accel if (launch and self.launch_accel is not None) else self.accel_grid
+    def _grid(self, launch: bool, stop: bool = False) -> np.ndarray:
+        if launch and stop:
+            raise ValueError("launch と stop は同時に True にできません")
+        if launch and self.launch_accel is not None:
+            return self.launch_accel
+        if stop and self.stop_accel is not None:
+            return self.stop_accel
+        return self.accel_grid
+
+    def _kind(self, launch: bool, stop: bool = False) -> np.ndarray:
+        if launch and self.launch_accel is not None and self.launch_kind is not None:
+            return self.launch_kind
+        if stop and self.stop_accel is not None and self.stop_kind is not None:
+            return self.stop_kind
+        return self.point_kind
 
     def accel(
         self,
@@ -128,18 +166,22 @@ class ForwardTable:
         *,
         launch: bool = False,
         release: np.ndarray | float | None = None,
+        stop: bool = False,
     ) -> Any:
         """車速 v・効く開度 u での加速度 [km/h/s]（ベクトル入力可）。
 
-        launch=True で発進側の表があればそちらを引く（無ければ本体）。
+        launch=True で発進側の表があればそちらを引く（無ければ本体）。stop=True は停止側
+        （launch と同時に True はエラー）。
         release（戻し量 [%]。スカラーか配列）を渡すと、戻しの表があるとき戻し量の節の間
         （0＝本体、release_grid）を直線補間して引く（release_max_pct で頭打ち）。release が
         None・0、戻しの表なし、発進側の表を引くときは今までと同じ。
         """
         v, u = np.broadcast_arrays(np.asarray(v_kmh, dtype=float), np.asarray(u_pct, dtype=float))
-        nodes = self._release_nodes(release, launch, v.shape)
+        nodes = self._release_nodes(release, launch, v.shape, stop)
         if nodes is None:
-            return grid_accel(self.speed_rep, self.u_grid, self._grid(launch), v_kmh, u_pct)
+            return grid_accel(
+                self.speed_rep, self.u_grid, self._grid(launch, stop), v_kmh, u_pct
+            )
         arrs, vals, r = nodes
         k, w = _release_weights(vals, r)
         out = np.zeros(v.shape)
@@ -156,15 +198,17 @@ class ForwardTable:
         *,
         launch: bool = False,
         release: np.ndarray | float | None = None,
+        stop: bool = False,
     ) -> tuple[Any, Any]:
         """車速 v で加速度 a になる u と点の種類 POINT_*（ベクトル入力可）。launch・release は
         accel と同じ（release は 1 サンプルごとに違う値を渡せる。サンプルごとに補間した列で解く）。
         """
         v, a = np.broadcast_arrays(np.asarray(v_kmh, dtype=float), np.asarray(a_kmhs, dtype=float))
-        nodes = self._release_nodes(release, launch, v.shape)
+        nodes = self._release_nodes(release, launch, v.shape, stop)
         if nodes is None:
             return grid_invert(
-                self.speed_rep, self.u_grid, self._grid(launch), self.point_kind, v_kmh, a_kmhs
+                self.speed_rep, self.u_grid, self._grid(launch, stop), self._kind(launch, stop),
+                v_kmh, a_kmhs,
             )
         arrs, vals, r = nodes
         return grid_invert(
@@ -172,9 +216,11 @@ class ForwardTable:
             release_nodes=arrs, release_node_pct=vals, release=r,
         )
 
-    def coast_accel(self, v_kmh: np.ndarray | float, *, launch: bool = False) -> Any:
-        """u=0（惰行）の加速度 [km/h/s]。launch は accel と同じ。"""
-        return grid_accel(self.speed_rep, self.u_grid, self._grid(launch), v_kmh, 0.0)
+    def coast_accel(
+        self, v_kmh: np.ndarray | float, *, launch: bool = False, stop: bool = False
+    ) -> Any:
+        """u=0（惰行）の加速度 [km/h/s]。launch・stop は accel と同じ。"""
+        return grid_accel(self.speed_rep, self.u_grid, self._grid(launch, stop), v_kmh, 0.0)
 
     def save(self, path: Path | None = None) -> Path:
         return save_table(self, path)
@@ -373,64 +419,209 @@ def refine_u_grid(table: ForwardTable, u_step_pct: float) -> ForwardTable:
         accel_before_mono=before,
         meta=meta,
         kind=table.kind,
-        launch_accel=None,  # 発進側は refine の後に attach_launch で付ける
+        launch_accel=None,  # 発進側・停止側は refine の後に attach_launch・attach_stop で付ける
     )
+
+
+def _side_arrays(
+    table: ForwardTable,
+    rows: FwdRows,
+    *,
+    creep_speed_kmh: float,
+    margin_kmh: float,
+    min_s: float,
+    breakaway_u_pct: float | None,
+    keep_stationary: bool,
+) -> tuple[np.ndarray, np.ndarray, list[int], float] | None:
+    """発進側・停止側の配列を作る（2026-10-18 段2o-10）。作れなければ None。
+
+    返り値: (加速度の配列, 点の種類の配列, 置き換えた行の番号, 動いている行の合計秒数)。
+    手順（置き換えた車速の行ごと。マス幅は SIDE_U_STEP_PCT。C7 の build_table と同じ考え方）:
+      1. 行の u を SIDE_U_STEP_PCT のマスに分け、マスごとの加速度の中央値と秒数。
+      2. 秒数が min_s 以上のマスが実測点。実測点が 2 つ未満の行は置き換えない（本体のまま）。
+         keep_stationary（発進側）で動き出す開度 breakaway_u_pct が分かっているときは、停車中の
+         行のうち u が動き出す開度以下（深い）ものも実測に入れ（加速度 0）、動き出す開度の
+         点 (breakaway, 0) を足す。
+      3. 実測点を単調化（IsotonicRegression。重み＝秒数）し、実測点の間は直線（穴は直線）。
+      4. 範囲外を作らない。実測の外側は、端の値に本体の傾き（本体の値の差）を足してつなぐ
+         （端の値で止めない）。車速 0 付近の行（下端の境界 ＜ 停車の車速）で動き出す開度が分かって
+         いるときは、深い側（実測の外側）を 0 で埋め、行全体を 0 未満にしない。
+      5. 表の u の格子点（本体の 0.5% 刻み）に直線補間してから、行ごとに単調化し直す。
+    使うのは、行の代表車速が creep_speed_kmh + margin_kmh 以下の車速の行。
+    """
+    edges, grid = table.speed_edges, table.u_grid
+    stationary = rows.speed_kmh < STOP_SPEED_KMH
+    moving = ~stationary
+    moving_s = float(np.sum(rows.dt_row_s[moving])) if len(rows) else 0.0
+    if len(rows) == 0 or moving_s < LAUNCH_MIN_TOTAL_S:
+        return None
+    use_zero = keep_stationary and breakaway_u_pct is not None
+    keep = moving.copy()
+    if use_zero:
+        assert breakaway_u_pct is not None  # noqa: S101
+        keep |= stationary & (rows.u_pct <= breakaway_u_pct + _EPS)
+    r_all = take_rows(rows, keep)
+    sc = speed_cell_edges(r_all.speed_kmh, edges)
+    uc = u_cell(r_all.u_pct, SIDE_U_STEP_PCT)
+    out = table.accel_grid.copy()
+    kind_out = table.point_kind.copy()
+    used: list[int] = []
+    for r in np.flatnonzero(table.speed_rep <= creep_speed_kmh + margin_kmh + _EPS):
+        sel = sc == r
+        zero_deep = use_zero and edges[r] < STOP_SPEED_KMH
+        pu: list[float] = []
+        pa: list[float] = []
+        pw: list[float] = []
+        if sel.any():
+            ks = uc[sel]
+            for k in np.unique(ks):
+                m = ks == k
+                sec = float(r_all.dt_row_s[sel][m].sum())
+                if sec >= min_s:
+                    pu.append(float(u_grid_points(int(k), int(k), SIDE_U_STEP_PCT)[0]))
+                    pa.append(float(np.median(r_all.accel_kmhs[sel][m])))
+                    pw.append(sec)
+        meas_u = np.array(pu)
+        if zero_deep:
+            assert breakaway_u_pct is not None  # noqa: S101
+            pu.append(breakaway_u_pct)
+            pa.append(0.0)
+            pw.append(1.0)
+        if len(pu) < 2:
+            continue
+        order = np.argsort(pu, kind="stable")
+        xu, xa, xw = np.array(pu)[order], np.array(pa)[order], np.array(pw)[order]
+        iso = IsotonicRegression(increasing=True).fit_transform(xu, xa, sample_weight=xw)
+        lo, hi = float(xu[0]), float(xu[-1])
+        body = np.interp(grid, grid, table.accel_grid[r])
+        b_lo, b_hi = float(np.interp(lo, grid, body)), float(np.interp(hi, grid, body))
+        val = np.interp(grid, xu, iso)
+        below, above = grid < lo - _EPS, grid > hi + _EPS
+        if zero_deep:
+            val[below] = max(float(iso[0]), 0.0)
+        else:
+            val[below] = iso[0] + np.minimum(body[below] - b_lo, 0.0)
+        val[above] = iso[-1] + np.maximum(body[above] - b_hi, 0.0)
+        if zero_deep:
+            val = np.maximum(val, 0.0)
+        out[r] = IsotonicRegression(increasing=True).fit_transform(grid, val)
+        near = (
+            np.min(np.abs(grid[:, None] - (meas_u if len(meas_u) else np.array([np.inf]))[None]),
+                   axis=1)
+            <= SIDE_U_STEP_PCT + _EPS
+        )
+        if zero_deep:
+            near |= np.abs(grid - float(breakaway_u_pct or 0.0)) <= SIDE_U_STEP_PCT + _EPS
+            near |= grid <= float(breakaway_u_pct or 0.0)
+        kind = np.full(len(grid), POINT_OUT, dtype=int)
+        kind[~below & ~above] = POINT_FILLED
+        if zero_deep:
+            kind[below] = POINT_FILLED
+        kind[near & (~below | zero_deep)] = POINT_MEASURED
+        kind_out[r] = kind
+        used.append(int(r))
+    if not used:
+        return None
+    return out, kind_out, used, moving_s
 
 
 def attach_launch(
     table: ForwardTable,
     launch_rows: FwdRows,
     *,
+    creep_speed_kmh: float,
+    breakaway: Breakaway | None = None,
+    margin_kmh: float = LOW_SPEED_MARGIN_KMH,
     min_s: float = LAUNCH_MIN_S,
     min_total_s: float = LAUNCH_MIN_TOTAL_S,
     accel_window_s: float = math.nan,
 ) -> ForwardTable:
-    """発進側の加速度（launch_accel）を付けた新しい表を返す（2026-10-14 段2o-4）。
+    """発進側の加速度（launch_accel）を付けた新しい表を返す（2026-10-14 段2o-4、10-18 段2o-10 で
+    作り直し）。
 
-    launch_rows: 発進の区間の行（`fwd_data.launch_mask` で絞ったもの。停車の行を含んでよい）。
-    動いている行（実車速 >= STOP_SPEED_KMH）の合計秒数が min_total_s 未満なら launch_accel は None
-    （meta に launch_rows_s だけ残す）。足りれば発進側の行だけで表を作り、実測のマスが 2 つ以上ある
-    車速の行だけ次のように置き換える（それ以外の行は本体のまま）:
-        u <= 0 の列 … 発進側の表をその u で引いた値（範囲外は端の値）
-        u >  0 の列 … max(本体の値, 発進側の u = 0 の値)
-    置き換えた行は単調化（IsotonicRegression）し直す。元の表は書き換えない。
-    accel_window_s は発進側の行を作ったときの加速度の窓で、meta に残すだけ。
+    launch_rows: 発進側の行（発進の区間 `fwd_data.launch_mask` の行・CREEP_WAIT・
+    RAMP_LAUNCH_RELEASE の停車中の行を連結したもの。停車の行を含んでよい）。
+    creep_speed_kmh（手順2 で測ったクリープ車速）が 0 以下なら作らない（クリープの無い車。None）。
+    作る範囲・作り方は `_side_arrays`（車速の行は代表車速が creep_speed_kmh + margin_kmh 以下）。
+    動いている行の合計秒数が min_total_s 未満、または置き換えられる行が無いときも None。
+    breakaway（`fwd_data.launch_breakaway`）があれば車速 0 付近の行の深い側を 0 で埋める。
+    元の表は書き換えない。accel_window_s は発進側の行を作ったときの加速度の窓で、meta に残すだけ。
     """
-    moving = launch_rows.speed_kmh >= STOP_SPEED_KMH
-    moving_s = float(np.sum(launch_rows.dt_row_s[moving])) if len(launch_rows) else 0.0
+    moving_s = (
+        float(np.sum(launch_rows.dt_row_s[launch_rows.speed_kmh >= STOP_SPEED_KMH]))
+        if len(launch_rows) else 0.0
+    )
     meta = dict(table.meta)
     meta.update(
         launch_rows_s=moving_s,
         launch_speed_rows=[],
         launch_min_s=min_s,
         launch_accel_window_s=accel_window_s,
+        launch_u_step_pct=SIDE_U_STEP_PCT,
+        low_speed_margin_kmh=margin_kmh,
+        launch_breakaway_u_pct=None if breakaway is None else breakaway.u_pct,
+        launch_breakaway_source=None if breakaway is None else breakaway.source,
+        launch_breakaway_u_list=[] if breakaway is None else list(breakaway.per_segment_u_pct),
     )
-    if len(launch_rows) == 0 or moving_s < min_total_s:
-        return replace(table, launch_accel=None, meta=meta)
-    try:
-        lt = build_table(
-            take_rows(launch_rows, moving),
-            speed_edges=table.speed_edges,
-            u_step_pct=float(table.meta.get("u_step_pct", DEFAULT_U_STEP_PCT)),
-            min_s=min_s,
-        )
-    except ValueError:  # 実測のマスが 2 つ以上ある行が 1 つも無い
-        return replace(table, launch_accel=None, meta=meta)
-    used = np.flatnonzero((lt.point_kind != POINT_OUT).any(axis=1))
-    if len(used) == 0:
-        return replace(table, launch_accel=None, meta=meta)
-    grid = table.u_grid
-    neg = grid <= 0.0
-    out = table.accel_grid.copy()
-    for r in used:
-        lrow = lt.accel_grid[r]
-        row = out[r].copy()
-        row[neg] = np.interp(grid[neg], lt.u_grid, lrow)
-        a0 = float(np.interp(0.0, lt.u_grid, lrow))
-        row[~neg] = np.maximum(row[~neg], a0)
-        out[r] = IsotonicRegression(increasing=True).fit_transform(grid, row)
+    none = replace(table, launch_accel=None, launch_kind=None, meta=meta)
+    if creep_speed_kmh <= 0.0 or moving_s < min_total_s:
+        return none
+    res = _side_arrays(
+        table, launch_rows, creep_speed_kmh=creep_speed_kmh, margin_kmh=margin_kmh, min_s=min_s,
+        breakaway_u_pct=None if breakaway is None else breakaway.u_pct, keep_stationary=True,
+    )
+    if res is None:
+        return none
+    out, kind, used, _ = res
     meta["launch_speed_rows"] = [float(table.speed_rep[r]) for r in used]
-    return replace(table, launch_accel=out, meta=meta)
+    return replace(table, launch_accel=out, launch_kind=kind, meta=meta)
+
+
+def attach_stop(
+    table: ForwardTable,
+    stop_rows: FwdRows,
+    *,
+    creep_speed_kmh: float,
+    margin_kmh: float = LOW_SPEED_MARGIN_KMH,
+    min_s: float = LAUNCH_MIN_S,
+    min_total_s: float = LAUNCH_MIN_TOTAL_S,
+    accel_window_s: float = math.nan,
+) -> ForwardTable:
+    """停止側の加速度（stop_accel）を付けた新しい表を返す（2026-10-18 段2o-10）。
+
+    stop_rows: 停止側の行（BRAKE_STEP・BRAKE_SEARCH・低速の停車の手前の行・CREEP_WAIT の u = 0 の
+    行を連結したもの）。停車中の行は使わない（停止側は減速している行だけ）。
+    作り方・作らない条件は attach_launch と同じ。違いは、深い側の外側を 0 で埋めず、いちばん深い
+    実測の値に本体の傾きを足してつなぐこと。meta の stop_max_speed_kmh ＝ 置き換えた車速の行の
+    いちばん上の境界（計画が停止側を引く車速の上限）。
+    """
+    moving_s = (
+        float(np.sum(stop_rows.dt_row_s[stop_rows.speed_kmh >= STOP_SPEED_KMH]))
+        if len(stop_rows) else 0.0
+    )
+    meta = dict(table.meta)
+    meta.update(
+        stop_rows_s=moving_s,
+        stop_speed_rows=[],
+        stop_min_s=min_s,
+        stop_accel_window_s=accel_window_s,
+        stop_u_step_pct=SIDE_U_STEP_PCT,
+        stop_max_speed_kmh=0.0,
+        low_speed_margin_kmh=margin_kmh,
+    )
+    none = replace(table, stop_accel=None, stop_kind=None, meta=meta)
+    if creep_speed_kmh <= 0.0 or moving_s < min_total_s:
+        return none
+    res = _side_arrays(
+        table, stop_rows, creep_speed_kmh=creep_speed_kmh, margin_kmh=margin_kmh, min_s=min_s,
+        breakaway_u_pct=None, keep_stationary=False,
+    )
+    if res is None:
+        return none
+    out, kind, used, _ = res
+    meta["stop_speed_rows"] = [float(table.speed_rep[r]) for r in used]
+    meta["stop_max_speed_kmh"] = float(table.speed_edges[max(used) + 1])
+    return replace(table, stop_accel=out, stop_kind=kind, meta=meta)
 
 
 def release_stats(
@@ -627,6 +818,9 @@ def save_table(table: ForwardTable, path: Path | None = None) -> Path:
         "meas_u_max": table.meas_u_max,
         "accel_before_mono": table.accel_before_mono,
         "launch_accel": table.launch_accel,
+        "stop_accel": table.stop_accel,
+        "launch_kind": table.launch_kind,
+        "stop_kind": table.stop_kind,
         "release_grid": table.release_grid,
         "release_accel": table.release_accel,
         "meta": table.meta,
@@ -656,6 +850,9 @@ def load_forward_map(path: Path) -> ForwardTable:
         meta=d.get("meta", {}),
         kind=d.get("kind", KIND_TABLE),
         launch_accel=d.get("launch_accel"),  # 古い pkl（キー無し）は None
+        stop_accel=d.get("stop_accel"),  # 2026-10-18 段2o-10: 古い pkl（キー無し）は None
+        launch_kind=d.get("launch_kind"),
+        stop_kind=d.get("stop_kind"),
         release_grid=d.get("release_grid"),  # 2026-10-14 段2o-5: 古い pkl（キー無し）は None
         release_accel=d.get("release_accel"),
     )

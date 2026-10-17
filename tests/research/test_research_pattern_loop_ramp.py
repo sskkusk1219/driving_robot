@@ -3355,3 +3355,128 @@ def test_release_enabled_false_never_enters_ramp_release() -> None:
     r = loop.ramp_results[0]
     assert (r.release_s, r.release_n, r.release_skipped) == (0.0, 0, 0)
     assert loop._rp_release_done == set()  # 済み・飛ばしの管理にも触らない
+
+
+# ── 発進のゆっくり離し（段2o-10 A） ─────────────────────────────────────
+
+
+def _lr_loop(slow: tuple[float, ...] = (0.25, 0.5), stop: float | None = 5.0) -> PatternLoop:
+    cfg = PatternLoopConfig(
+        ramp_launch_fast_rate_pctps=2.0, ramp_launch_release_margin_pct=2.0,
+        ramp_launch_slow_rates_pctps=slow, stop_confirm_pct=stop,
+        creep_launch_min_speed_kmh=1.0,
+    )
+    return _loop([_ramp(0.1, top_kmh=200.0)], config=cfg, launched=False)
+
+
+def test_launch_release_fast_then_slow_and_phase_name() -> None:
+    p = _ramp(0.1, top_kmh=200.0)
+    loop = _lr_loop()
+    bdb = _deadbands(loop)[1]
+    assert loop._rp_lr_active
+    target_u = -(5.0 + 2.0 - bdb)
+    u0 = loop._rp_u
+    assert u0 < target_u
+    # 最初の周期は動かさない。① は 2.0 %/s
+    _cycle(loop, p, 0.0, 0.0)
+    assert loop._rp_u == pytest.approx(u0)
+    _cycle(loop, p, 0.0, 0.1)
+    assert loop._rp_u == pytest.approx(u0 + 0.2)
+    assert loop._rp_vref == 0.0  # 基準は進めない
+    # ① が終わるまで回す
+    t = 0.2
+    while loop._rp_u < target_u - 1e-9:
+        _cycle(loop, p, 0.0, t)
+        t += 0.1
+        assert loop._rp_lr_active
+    assert loop._rp_u == pytest.approx(target_u)
+    # ② 1 本目は 0.25 %/s
+    _cycle(loop, p, 0.0, t)
+    u1 = loop._rp_u
+    _cycle(loop, p, 0.0, t + 0.1)
+    assert loop._rp_u - u1 == pytest.approx(0.025)
+    assert loop._rp_vref == 0.0 and loop._rp_lr_active
+    assert plmod.RAMP_LAUNCH_RELEASE_PHASE == "RAMP_LAUNCH_RELEASE"
+
+
+def test_launch_release_slow_rates_alternate_per_launch() -> None:
+    p = _ramp(0.1, top_kmh=200.0)
+    rates = []
+    for _ in range(3):
+        loop = _lr_loop()
+        rates.append(loop._rp_lr_slow)
+    assert rates == [0.25, 0.25, 0.25]  # 別の PatternLoop は通し番号を持ち越さない
+    loop = _lr_loop()
+    loop._ramp_up_begin()  # 2 本目の発進
+    loop._ramp_up_begin()  # 3 本目
+    assert loop._rp_lr_slow == 0.25 and loop._rp_launch_seq == 3
+    loop2 = _lr_loop()
+    loop2._ramp_up_begin()
+    assert loop2._rp_lr_slow == 0.5
+    assert p is not None
+
+
+def test_launch_release_moving_hands_over_with_current_opening() -> None:
+    p = _ramp(0.1, top_kmh=200.0)
+    loop = _lr_loop()
+    t = 0.0
+    for _ in range(4):  # ① の途中
+        _cycle(loop, p, 0.0, t)
+        t += 0.1
+    assert loop._rp_lr_active
+    u_before = loop._rp_u
+    speed = 1.2  # creep_launch_min_speed_kmh 以上
+    _cycle(loop, p, speed, t)
+    assert not loop._rp_lr_active
+    assert loop._phase is _Phase.RAMP_UP
+    assert loop._rp_u == pytest.approx(u_before + 0.0, abs=0.21)  # その周期の開度から
+    u_hand = loop._rp_u
+    assert loop._rp_vref_anchored and loop._rp_vref == pytest.approx(speed)
+    assert loop._rp_launch_started == pytest.approx(t)
+    # 以後は今の制御（偏差で離す・踏み直さない）
+    _seed_sensitivity(loop, PEDAL_ACCEL, 0.2, 2.0)
+    _seed_sensitivity(loop, PEDAL_BRAKE, 0.4, 2.0)
+    prev = u_hand
+    for k in range(1, 15):
+        _cycle(loop, p, speed, t + 0.1 * k)
+        assert loop._rp_u >= prev - 1e-9
+        prev = loop._rp_u
+
+
+def test_launch_release_without_creep_goes_to_current_flow_at_min() -> None:
+    p = _ramp(0.1, top_kmh=200.0)
+    loop = _lr_loop(slow=(0.5,))
+    t = 0.0
+    n = 0
+    while loop._rp_lr_active and n < 5000:
+        _cycle(loop, p, 0.0, t)
+        t += 0.1
+        n += 1
+    assert not loop._rp_lr_active and loop._rp_u == pytest.approx(0.0)
+    assert loop._phase is _Phase.RAMP_UP and loop._rp_vref == 0.0
+    # 今と同じ流れ: 次の周期から基準が +G で進む
+    _cycle(loop, p, 0.0, t)
+    t += 0.1
+    _cycle(loop, p, 0.0, t)
+    assert loop._rp_vref > 0.0
+
+
+def test_launch_release_slow_phase_is_capped_by_time_limit() -> None:
+    p = _ramp(0.1, top_kmh=200.0)
+    loop = _lr_loop(slow=(0.25,))
+    bdb = _deadbands(loop)[1]
+    limit = (5.0 + 2.0 - bdb) / 0.25 + 5.0
+    assert loop._rp_lr_limit_s == pytest.approx(limit)
+    # ① を終えた状態から ② を回し、上限を超えたら ③ へ（min に着く前でも）
+    loop._rp_u = loop._rp_lr_target_u
+    loop._rp_lr_limit_s = 1.0
+    t = 0.0
+    while loop._rp_lr_active and t < 10.0:
+        _cycle(loop, p, 0.0, t)
+        t += 0.1
+    assert not loop._rp_lr_active and loop._rp_u < 0.0 and t < 2.0
+
+
+def test_launch_release_disabled_by_empty_rates_keeps_old_flow() -> None:
+    loop = _lr_loop(slow=())
+    assert not loop._rp_lr_active

@@ -19,6 +19,7 @@ from tests.research.fwd_plan import (
     build_plan,
     deviation_offset,
     deviation_offset_detail,
+    low_speed_sides,
     window_slope_vec,
 )
 from tests.research.pedal_select import window_slope_kmhs
@@ -267,6 +268,69 @@ def test_launch_table_used_only_when_reference_rises() -> None:
     assert base.effort_pct[up] > 0.0  # 本体: 上がる基準はアクセル
     assert plan.effort_pct[up] < 0.0  # 発進側は惰行の加速度が高いのでブレーキ
     assert plan.effort_pct[down] == pytest.approx(base.effort_pct[down])  # 下がる所は本体
+
+
+# ───────── 2026-10-18 段2o-10: 停止側の表 ─────────
+
+
+def _stop_variant(max_speed: float = 25.0) -> ForwardTable:
+    """停止側の配列: v=0 の行を全体に +6 km/h/s 持ち上げる。引く車速の上限は max_speed。"""
+    t = linear_table()
+    t.stop_accel = t.accel_grid.copy()
+    t.stop_accel[0] += 6.0
+    t.meta["stop_max_speed_kmh"] = max_speed
+    return t
+
+
+def _decel_to_stop(t: float) -> float:
+    return max(0.0, 10.0 - 2.0 * t)  # t = 5 s で 0。stop_horizon_s=0.5 なので 4.75 s から停車保持
+
+
+def test_stop_accel_none_gives_identical_plan() -> None:
+    base = plan_for(_decel_to_stop, 6.0)
+    t = linear_table()
+    t.stop_accel = None
+    t.meta["stop_max_speed_kmh"] = 25.0
+    same = plan_for(_decel_to_stop, 6.0, t)
+    assert np.array_equal(base.effort_pct, same.effort_pct)
+    assert np.array_equal(base.flag, same.flag)
+
+
+def test_stop_table_used_only_when_decelerating_to_stop_within_range() -> None:
+    base = plan_for(_decel_to_stop, 6.0)
+    plan = plan_for(_decel_to_stop, 6.0, _stop_variant())
+    near, far = idx(plan, 4.5), idx(plan, 2.0)  # 4.5 s は ref(5.0)=0 で停車へ向かう、2 s は違う
+    assert plan.stops_ahead is not None and plan.stops_ahead[near] and not plan.stops_ahead[far]
+    assert plan.effort_pct[far] == pytest.approx(base.effort_pct[far])  # 停車の先が遠い所は本体
+    assert plan.effort_pct[near] < base.effort_pct[near]  # 停止側は惰行が高く、ブレーキが要る
+    assert plan.flag[idx(plan, 5.5)] == FLAG_STOP  # 停車保持は本体のまま
+    # 基準車速が停止側の表の範囲（上限）以上なら本体
+    out = plan_for(_decel_to_stop, 6.0, _stop_variant(max_speed=0.5))
+    assert out.effort_pct[near] == pytest.approx(base.effort_pct[near])
+    # 基準が上がっている所は停止側を引かない（発進側の領分）
+    up = plan_for(lambda t: min(2.0 * t, 10.0), 6.0, _stop_variant())
+    up_base = plan_for(lambda t: min(2.0 * t, 10.0), 6.0)
+    assert np.array_equal(up.effort_pct, up_base.effort_pct)
+
+
+def test_deviation_uses_the_same_stop_table_as_build_plan() -> None:
+    t = linear_table()
+    t.stop_accel = t.accel_grid.copy()
+    cols = t.u_grid < 0
+    base_col = (-2.0 - 0.01 * t.speed_rep)[:, None]
+    t.stop_accel[:, cols] = (t.accel_grid[:, cols] - base_col) * 2.0 + base_col  # 傾き 2 倍
+    t.meta["stop_max_speed_kmh"] = 25.0
+    plain = _dev(linear_table(), effort=-15.0, need=-3.0, ref=10.0, dev=1.0)
+    stop = _dev(t, effort=-15.0, need=-3.0, ref=10.0, dev=1.0, stops_ahead=True)
+    assert stop - (-15.0) == pytest.approx((plain - (-15.0)) / 2.0)  # 傾き 2 倍なので上乗せは半分
+    # 停車へ向かわない・範囲外の車速・減速でない・stops_ahead 省略は本体
+    assert _dev(t, effort=-15.0, need=-3.0, ref=10.0, dev=1.0) == pytest.approx(plain)
+    assert _dev(t, effort=-15.0, need=-3.0, ref=40.0, dev=1.0, stops_ahead=True) == pytest.approx(
+        _dev(linear_table(), effort=-15.0, need=-3.0, ref=40.0, dev=1.0)
+    )
+    # low_speed_sides は build_plan と同じ判定を返す
+    launch, stop_m = low_speed_sides(t, np.array([-3.0, 3.0]), np.array([10.0, 10.0]), True)
+    assert not launch.any() and list(stop_m) == [True, False]
 
 
 # ───────── 2026-10-14 段2o-5: 戻し量を使った解き直し ─────────
@@ -564,11 +628,11 @@ def test_build_plan_gap_default_on_and_disabled_flag() -> None:
 
 
 def _dev(table, *, effort, need=0.0, ref=50.0, row=None, dev=0.0, flag=FLAG_MEASURED,
-         tau_a=5.0, tau_b=5.0):
+         tau_a=5.0, tau_b=5.0, **kw):
     return deviation_offset(
         table, effort=effort, flag=flag, need_kmhs=need, ref_kmh=ref,
         row_kmh=ref if row is None else row, dev_kmh=dev, tau_accel_s=tau_a, tau_brake_s=tau_b,
-        accel_min_pct=AD, brake_min_pct=BD,
+        accel_min_pct=AD, brake_min_pct=BD, **kw,
     )
 
 

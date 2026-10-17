@@ -1071,3 +1071,27 @@ def test_ramp_release_enabled_is_loaded_and_passed_to_the_loop(tmp_path: Path) -
     cfg2 = cfgmod.load_config(path)
     assert cfg2.learning.ramp_release_enabled is False
     assert loop_config_from_config(cfg2).ramp_release_enabled is False
+
+
+def test_ramp_launch_release_settings_are_validated() -> None:
+    """段2o-10 A: G ランプの発進のゆっくり離し。0 以下・空配列は読み込みエラー。"""
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.ramp_launch_fast_rate_pctps == 2.0
+    assert lr.ramp_launch_release_margin_pct == 2.0
+    assert lr.ramp_launch_slow_rates_pctps == [0.25, 0.5]
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    lr.ramp_launch_fast_rate_pctps = 0.0
+    assert problems_about("ramp_launch_fast_rate_pctps")
+    lr.ramp_launch_fast_rate_pctps = 2.0
+    lr.ramp_launch_release_margin_pct = -0.1
+    assert problems_about("ramp_launch_release_margin_pct")
+    lr.ramp_launch_release_margin_pct = 2.0
+    lr.ramp_launch_slow_rates_pctps = []
+    assert problems_about("ramp_launch_slow_rates_pctps")
+    lr.ramp_launch_slow_rates_pctps = [0.25, 0.0]
+    assert problems_about("ramp_launch_slow_rates_pctps")

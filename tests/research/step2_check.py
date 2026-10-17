@@ -243,7 +243,8 @@ def check_coast(
     の点だけで、差 = |coast_accel(v) + 減速量|。差の最大が band_kmhs（手順3 で踏むか惰行かを分ける
     帯の幅。`forward_map.coast_band_kmhs`）を超えたら NG。モードの最高車速が無ければ上限なし。
     クリープ: 値では判定しない。yaml のクリープ加速度に正の値があるのに発進側の表
-    （`table.launch_accel`）が無ければ NG。
+    （`table.launch_accel`）が無ければ NG。停止側の表（`table.stop_accel`）の有無は表示するだけ
+    （2026-10-18 段2o-10）。
     """
     name = "惰行・クリープ"
     if table is None:
@@ -274,6 +275,7 @@ def check_coast(
         metrics["creep_launch_missing"] = 1.0 if missing else 0.0
         parts.append(
             "クリープ加速度あり・発進側の表" + ("なし" if table.launch_accel is None else "あり")
+            + "・停止側の表" + ("なし" if table.stop_accel is None else "あり")
             if positive else "クリープ加速度は正なし"
         )
     if not metrics:

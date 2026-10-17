@@ -9,7 +9,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tests.research.fwd_data import FwdRows, make_speed_edges, u_cell
+from tests.research.fwd_data import (
+    Breakaway,
+    FwdRows,
+    concat_rows,
+    make_speed_edges,
+    u_cell,
+)
 from tests.research.fwd_map import (
     POINT_FILLED,
     POINT_MEASURED,
@@ -18,6 +24,7 @@ from tests.research.fwd_map import (
     ForwardTable,
     attach_launch,
     attach_release,
+    attach_stop,
     build_table,
     load_forward_map,
     refine_u_grid,
@@ -272,11 +279,12 @@ def test_refine_u_grid_rejects_non_integer_ratio(synth_table) -> None:
         refine_u_grid(synth_table, 0.7)
 
 
-def _launch_setup():
-    """本体: v 0〜10 の 4 行（2.5 刻み）、u −8〜+4（0.5 刻み）。本体の u<0 は a = 0.5u。
-    発進側の行: v 0〜2.5 の行と 2.5〜5 の行に、u<0 で a = 1.5 + 0.1u の実測を 20 秒ぶん置く。"""
+def _launch_setup(grid_lo: int = -32):
+    """本体: v 0〜10 の 4 行（2.5 刻み）、u −16〜+4（0.5 刻み）。本体の u<0 は a = 0.5u。
+    発進側の行: v 0〜2.5 の行と 2.5〜5 の行に、u<0 で a = 1.5 + 0.1u の実測を 20 秒ぶん置く。
+    u = 0 のクリープの行（a = 1.5）も置く。"""
     edges = np.array([0.0, 2.5, 5.0, 7.5, 10.0])
-    grid = u_grid_points(-16, 8, 0.5)
+    grid = u_grid_points(grid_lo, 8, 0.5)
     rep = (edges[:-1] + edges[1:]) / 2.0
     acc = np.tile(np.where(grid < 0, 0.5 * grid, 0.3 * grid), (4, 1))
     table = ForwardTable(
@@ -294,6 +302,8 @@ def _launch_setup():
     n = 400
     v = rng.uniform(0.6, 4.9, n)
     u = -rng.choice(np.arange(0.5, 5.01, 0.5), n)
+    v = np.concatenate([v, rng.uniform(0.6, 4.9, 100)])
+    u = np.concatenate([u, np.zeros(100)])
     rows = make_rows(v, u, 1.5 + 0.1 * u, dt=0.1)
     return table, rows
 
@@ -301,59 +311,150 @@ def _launch_setup():
 def test_attach_launch_too_few_rows_leaves_none() -> None:
     table, rows = _launch_setup()
     short = make_rows(rows.speed_kmh[:20], rows.u_pct[:20], rows.accel_kmhs[:20], dt=0.1)  # 2 秒
-    t2 = attach_launch(table, short)
+    t2 = attach_launch(table, short, creep_speed_kmh=5.0)
     assert t2.launch_accel is None
     assert t2.meta["launch_rows_s"] == pytest.approx(2.0)
     empty = make_rows(np.zeros(0), np.zeros(0), np.zeros(0))
-    assert attach_launch(table, empty).launch_accel is None
+    assert attach_launch(table, empty, creep_speed_kmh=5.0).launch_accel is None
     assert table.launch_accel is None  # 元は書き換えない
+
+
+def test_zero_creep_speed_makes_neither_table() -> None:
+    table, rows = _launch_setup()
+    assert attach_launch(table, rows, creep_speed_kmh=0.0).launch_accel is None
+    t2 = attach_stop(table, rows, creep_speed_kmh=0.0)
+    assert t2.stop_accel is None and t2.stop_kind is None
 
 
 def test_attach_launch_replaces_low_speed_rows_only() -> None:
     table, rows = _launch_setup()
-    t2 = attach_launch(table, rows, accel_window_s=0.5)
+    t2 = attach_launch(table, rows, creep_speed_kmh=5.0, accel_window_s=0.5)
     la = t2.launch_accel
     assert la is not None and la.shape == table.accel_grid.shape
-    neg = table.u_grid <= 0
+    neg = (table.u_grid <= 0) & (table.u_grid >= -5.0)
     for r in (0, 1):  # 発進側の実測がある行
-        sel = neg & (table.u_grid >= -5.0)
-        assert np.allclose(la[r, sel], 1.5 + 0.1 * table.u_grid[sel], atol=0.05)
+        assert np.allclose(la[r, neg], 1.5 + 0.1 * table.u_grid[neg], atol=0.05)
         assert np.all(np.diff(la[r]) >= -1e-9)
-        assert np.all(la[r, ~neg] >= la[r, neg].max() - 1e-9)  # u>0 は u=0 以上
-    assert np.array_equal(la[2:], table.accel_grid[2:])  # 高車速の行は本体
+    # 代表車速 6.25（<= クリープ 5 ＋ 余裕 2.5）の行は実測が無いので本体のまま。高車速も本体
+    assert np.array_equal(la[2:], table.accel_grid[2:])
     assert t2.meta["launch_speed_rows"] == [1.25, 3.75]
     assert t2.meta["launch_min_s"] == 0.5 and t2.meta["launch_accel_window_s"] == 0.5
+    assert t2.meta["launch_u_step_pct"] == 0.25
     assert np.array_equal(t2.accel_grid, table.accel_grid)
 
 
-def test_launch_flag_selects_launch_table() -> None:
+def test_launch_deep_side_is_zero_at_breakaway_and_has_no_out_of_range() -> None:
     table, rows = _launch_setup()
-    t2 = attach_launch(table, rows)
+    # 停車中（車速 0.1）の行: u = −8〜−12 で加速度 0（動き出す開度 −8 より深い）。
+    # u = −6 の停車中の行は動き出す開度より浅いので使われない
+    su = -np.arange(8.0, 12.01, 0.5)
+    st_rows = make_rows(np.full(len(su) * 20, 0.1), np.repeat(su, 20), np.zeros(len(su) * 20), 0.1)
+    bad = make_rows(np.full(50, 0.1), np.full(50, -6.0), np.zeros(50), 0.1)
+    all_rows = concat_rows([rows, st_rows, bad], "x")
+    bk = Breakaway(-8.0, "release", (-8.0,))
+    t2 = attach_launch(table, all_rows, creep_speed_kmh=5.0, breakaway=bk)
+    la, kind = t2.launch_accel, t2.launch_kind
+    assert la is not None and kind is not None
+    g = table.u_grid
+    assert np.allclose(la[0, g <= -8.0], 0.0, atol=1e-9)  # 深い側は 0（-16 まで端の値ではなく 0）
+    assert np.all(la[0] >= -1e-9)  # 車速 0 付近の行は 0 未満にしない
+    assert np.all(np.diff(la[0]) >= -1e-9)
+    assert la[0, np.argmin(np.abs(g + 3.0))] == pytest.approx(1.2, abs=0.1)  # 動き出しの後
+    assert not np.any(kind[0, g <= 0.0] == POINT_OUT)  # u <= 0 に範囲外を作らない
+    assert t2.meta["launch_breakaway_u_pct"] == -8.0
+    assert t2.meta["launch_breakaway_source"] == "release"
+    assert t2.meta["launch_breakaway_u_list"] == [-8.0]
+    # 動き出す開度が無いときは 0 で埋めない（深い側は本体の傾きでつなぐ）
+    t3 = attach_launch(table, rows, creep_speed_kmh=5.0)
+    assert t3.launch_accel is not None and t3.meta["launch_breakaway_u_pct"] is None
+    g_deep = np.argmin(np.abs(g + 8.0))
+    assert t3.launch_accel[0, g_deep] < 0.0  # 本体の傾き（0.5/%）で下がっていく
+
+
+def test_attach_launch_hole_is_filled_by_straight_line_on_quarter_cells() -> None:
+    table, _ = _launch_setup()
+    u = np.concatenate([np.full(100, -5.0), np.full(100, -1.0), np.zeros(100)])
+    a = np.concatenate([np.zeros(100), np.full(100, 2.0), np.full(100, 3.0)])
+    rows = make_rows(np.full(300, 1.0), u, a, 0.1)
+    t2 = attach_launch(table, rows, creep_speed_kmh=5.0)
+    la = t2.launch_accel
+    assert la is not None
+    g = table.u_grid
+    assert np.interp(-3.0, g, la[0]) == pytest.approx(1.0, abs=0.1)  # 穴は直線
+    assert np.interp(-1.0, g, la[0]) == pytest.approx(2.0, abs=0.3)
+    assert t2.meta["launch_u_step_pct"] == 0.25
+
+
+def _stop_rows():
+    """停止側の行: v 0.6〜4.9 で u = −1〜−10、a = −0.2 + 0.15u。u = 0 は a = 0.8（クリープ）。"""
+    rng = np.random.default_rng(2)
+    n = 500
+    v = rng.uniform(0.6, 4.9, n)
+    u = -rng.choice(np.arange(1.0, 10.01, 0.5), n)
+    v = np.concatenate([v, rng.uniform(0.6, 4.9, 100)])
+    u = np.concatenate([u, np.zeros(100)])
+    a = np.where(u == 0.0, 0.8, -0.2 + 0.15 * u)
+    return make_rows(v, u, a, 0.1)
+
+
+def test_attach_stop_joins_body_beyond_deepest_measurement() -> None:
+    table, _ = _launch_setup()
+    t2 = attach_stop(table, _stop_rows(), creep_speed_kmh=5.0, accel_window_s=0.5)
+    sa, kind = t2.stop_accel, t2.stop_kind
+    assert sa is not None and kind is not None
+    g = table.u_grid
+    sel = (g <= -1.0) & (g >= -10.0)
+    assert np.allclose(sa[1, sel], -0.2 + 0.15 * g[sel], atol=0.1)
+    assert sa[1, np.argmin(np.abs(g))] == pytest.approx(0.8, abs=0.05)  # u = 0 は実測
+    assert np.all(np.diff(sa[1]) >= -1e-9)
+    # 実測のいちばん深い所（−10）より深い所: 端の値で止めず、本体の傾き（0.5/%）で下がる
+    i10, i14 = np.argmin(np.abs(g + 9.75)), np.argmin(np.abs(g + 14.25))
+    assert sa[1, i14] == pytest.approx(sa[1, i10] - 0.5 * 4.5, abs=0.2)
+    assert kind[1, i14] == POINT_OUT and kind[1, i10] == POINT_MEASURED
+    assert not np.any(kind[1, (g >= -9.0) & (g <= 0.0)] == POINT_OUT)  # 範囲内は範囲外にしない
+    assert t2.meta["stop_speed_rows"] == [1.25, 3.75]
+    assert t2.meta["stop_max_speed_kmh"] == pytest.approx(5.0)
+    assert t2.meta["stop_u_step_pct"] == 0.25
+    assert np.array_equal(t2.accel_grid, table.accel_grid)
+
+
+def test_launch_and_stop_flags_select_tables_and_both_is_error() -> None:
+    table, rows = _launch_setup()
+    t2 = attach_stop(attach_launch(table, rows, creep_speed_kmh=5.0), _stop_rows(),
+                     creep_speed_kmh=5.0)
     v, u = 1.25, -3.0
-    assert float(t2.accel(v, u)) == pytest.approx(-1.5)
-    assert float(t2.accel(v, u, launch=True)) == pytest.approx(1.2, abs=0.05)
-    assert float(t2.coast_accel(v)) == pytest.approx(0.0)
-    assert float(t2.coast_accel(v, launch=True)) == pytest.approx(1.5, abs=0.1)
-    uu, _ = t2.invert(v, 1.2, launch=True)
+    body = float(t2.accel(v, u))
+    assert body == pytest.approx(-1.5)
+    assert float(t2.accel(v, u, launch=True)) == pytest.approx(1.2, abs=0.1)
+    assert float(t2.accel(v, u, stop=True)) == pytest.approx(-0.2 + 0.15 * u, abs=0.1)
+    assert float(t2.coast_accel(v, stop=True)) == pytest.approx(0.8, abs=0.1)
+    uu, kind = t2.invert(v, -0.65, stop=True)
     assert float(uu) == pytest.approx(-3.0, abs=0.3)
-    uu0, _ = t2.invert(v, -1.5)  # launch=False は本体
-    assert float(uu0) == pytest.approx(-3.0, abs=0.01)
-    # 発進側なしの表では launch=True でも本体
-    assert float(table.accel(v, u, launch=True)) == pytest.approx(float(table.accel(v, u)))
+    with pytest.raises(ValueError):
+        t2.accel(v, u, launch=True, stop=True)
+    with pytest.raises(ValueError):
+        t2.invert(v, 0.0, launch=True, stop=True)
+    # 停止側なしの表では stop=True でも本体
+    assert float(table.accel(v, u, stop=True)) == pytest.approx(float(table.accel(v, u)))
 
 
-def test_launch_accel_survives_pkl_and_old_pkl_has_none(tmp_path: Path) -> None:
+def test_launch_and_stop_survive_pkl_and_old_pkl_has_none(tmp_path: Path) -> None:
     table, rows = _launch_setup()
-    t2 = attach_launch(table, rows)
+    t2 = attach_stop(attach_launch(table, rows, creep_speed_kmh=5.0), _stop_rows(),
+                     creep_speed_kmh=5.0)
     t3 = load_forward_map(save_table(t2, tmp_path / "l.pkl"))
     assert t3.launch_accel is not None and np.allclose(t3.launch_accel, t2.launch_accel)
+    assert t3.stop_accel is not None and np.allclose(t3.stop_accel, t2.stop_accel)
+    assert t3.stop_kind is not None and np.array_equal(t3.stop_kind, t2.stop_kind)
     p = save_table(t2, tmp_path / "old.pkl")
     with p.open("rb") as f:
         d = pickle.load(f)
-    del d["launch_accel"]
+    for k in ("launch_accel", "stop_accel", "launch_kind", "stop_kind"):
+        del d[k]
     with p.open("wb") as f:
         pickle.dump(d, f)
-    assert load_forward_map(p).launch_accel is None
+    old = load_forward_map(p)
+    assert old.launch_accel is None and old.stop_accel is None and old.stop_kind is None
 
 
 # ───────── 2026-10-14 段2o-5: 戻しの表 ─────────

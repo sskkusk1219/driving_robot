@@ -569,6 +569,10 @@ class _Phase(Enum):
     DONE = auto()
 
 
+# 発進のゆっくり離し（段2o-10 A）の間の CSV の phase 名。内部のフェーズは RAMP_UP のまま
+# （`_rp_lr_active` が立っている間だけ名前を差し替える）
+RAMP_LAUNCH_RELEASE_PHASE = "RAMP_LAUNCH_RELEASE"
+
 # G ランプの区間（順に RAMP_UP → RAMP_HOLD → RAMP_DOWN。2026-10-10 段2l-10 で RAMP_HOLD を追加）
 _RAMP_PHASES = (
     _Phase.RAMP_UP, _Phase.RAMP_CRUISE, _Phase.RAMP_HOLD, _Phase.HOLD_STEP, _Phase.RAMP_DOWN,
@@ -665,6 +669,13 @@ class PatternLoopConfig:
     # G ランプの発進の最初のブレーキ開度 = 2-0 で測った止まった開度（stop_confirm_pct）。
     # None なら停車保持開度から始める。2026-10-08 段2l-6
     stop_confirm_pct: float | None = field(default=None)
+    # G ランプの発進の離し方（段2o-10 A）。① 停車保持開度 → 止まる点 ＋ margin を fast_rate で一定に
+    # 離し、② そこから slow_rate で車が動き出す（creep_launch_min_speed_kmh 以上）まで離す。
+    # slow_rate は発進ごとに slow_rates を順に使う。動き出したら今の制御（偏差で離す）へ。
+    # slow_rates が空なら使わない（今までどおり偏差だけで離す）。learning.ramp_launch_* から渡す
+    ramp_launch_fast_rate_pctps: float = field(default=2.0)
+    ramp_launch_release_margin_pct: float = field(default=2.0)
+    ramp_launch_slow_rates_pctps: tuple[float, ...] = field(default=())
     # コーストダウン加速の車速の上端 [km/h]（None なら車両の最高速 × accel_speed_cap_frac のまま）。
     # 選んだモードの最高車速 + 余裕（learning.ramp_top_margin_kmh）。2026-10-07 段2l-4
     top_speed_cap_kmh: float | None = field(default=None)
@@ -867,6 +878,14 @@ class PatternLoop:
         # 動き出し（置き直し）の時刻（発進の g_ref を 0 → +G で数える起点）と、折り返した時点の
         # g_ref（切り替えの起点）。None の間は +G 扱い（2026-10-09 段2l-9）
         self._rp_launch_started: float | None = None
+        # 発進のゆっくり離し（段2o-10 A。`_ramp_up_begin` が作り直す。通し番号だけ持ち越す）
+        self._rp_launch_seq = 0
+        self._rp_lr_active = False
+        self._rp_lr_t: float | None = None
+        self._rp_lr_target_u = 0.0
+        self._rp_lr_slow = 0.0
+        self._rp_lr_slow_t0: float | None = None
+        self._rp_lr_limit_s = 0.0
         self._rp_turn_g0: float | None = None
         self._rp_ctl_t: float | None = None  # 直近に u・v_ref を更新した時刻（折り返しをまたぐ）
         self._rp_e_prev: float | None = None  # 前周期の偏差 e [km/h]（生の値。不感帯は引かない）
@@ -1115,7 +1134,7 @@ class PatternLoop:
                 brake_current=brake_current,
             ),
             self._pattern_idx,
-            self._phase.name,
+            RAMP_LAUNCH_RELEASE_PHASE if self._rp_lr_active else self._phase.name,
             self._governor_limiting(),
             alarm_accel,
             alarm_brake,
@@ -1516,7 +1535,8 @@ class PatternLoop:
         self._rp_release_n = 0
         self._rp_release_skipped = 0
         start = self._config.stop_confirm_pct
-        if start is None:
+        if start is None or self._ramp_launch_release_enabled():
+            # 段2o-10 A: ゆっくり離すときは停車保持開度から始め、止まる点は ① の終点に使う
             start = self._stop_return_brake_pct
         calib = self._profile.calibration
         if calib is not None:
@@ -1529,6 +1549,64 @@ class PatternLoop:
         floor = self._profile.feedforward_params.brake_deadband_pct
         self._rp_u = -(max(floor, min(start, self._profile.max_brake_opening)) - floor)
         self._rp_accel_reached = self._rp_u >= 0.0
+        self._ramp_launch_release_begin(floor)
+
+    def _ramp_launch_release_enabled(self) -> bool:
+        cfg = self._config
+        return bool(cfg.ramp_launch_slow_rates_pctps) and cfg.ramp_launch_fast_rate_pctps > 0.0
+
+    def _ramp_launch_release_begin(self, floor: float) -> None:
+        """発進のゆっくり離し（段2o-10 A）の用意。① 止まる点 ＋ margin まで fast_rate、② そこから
+        slow_rate（発進ごとに配列を順に）。止まる点が None なら停車保持開度
+        （`_stop_return_brake_pct`）。
+        u が 0 以上（最初からアクセル側）・slow_rates が空・fast_rate が 0 以下なら使わない。"""
+        cfg = self._config
+        self._rp_lr_active = False
+        self._rp_lr_t = None
+        self._rp_lr_slow_t0 = None
+        rates = cfg.ramp_launch_slow_rates_pctps
+        if not rates:
+            return
+        slow = rates[self._rp_launch_seq % len(rates)]
+        self._rp_launch_seq += 1
+        if self._rp_u >= 0.0 or slow <= 0.0 or cfg.ramp_launch_fast_rate_pctps <= 0.0:
+            return
+        stop = cfg.stop_confirm_pct
+        if stop is None:
+            stop = self._stop_return_brake_pct
+        target_brake = min(
+            stop + cfg.ramp_launch_release_margin_pct, self._profile.max_brake_opening
+        )
+        self._rp_lr_target_u = -(max(floor, target_brake) - floor)
+        self._rp_lr_slow = slow
+        # ② が長すぎるときの上限: (止まる点 ＋ margin − min) ÷ slow_rate ＋ 5 秒
+        self._rp_lr_limit_s = -self._rp_lr_target_u / slow + 5.0
+        self._rp_lr_active = True
+
+    def _ramp_launch_release_step(self, speed: float, now: float) -> bool:
+        """発進のゆっくり離しを 1 周期進める。続けるなら True、③（今の制御）へ進むなら False
+        （動き出した・min に着いた・② の上限を超えた）。③ へはその周期の u のまま渡す。"""
+        cfg = self._config
+        last = self._rp_lr_t
+        self._rp_lr_t = now
+        dt = 0.0 if last is None else min(max(0.0, now - last), 10.0 * self._interval_s)
+        if speed >= cfg.creep_launch_min_speed_kmh:
+            self._rp_lr_active = False
+            return False
+        u = self._rp_u
+        target = self._rp_lr_target_u
+        if u < target:  # ①: 止まる点 ＋ margin まで一定の速さ
+            self._rp_u = min(target, u + cfg.ramp_launch_fast_rate_pctps * dt)
+            return True
+        if self._rp_lr_slow_t0 is None:
+            self._rp_lr_slow_t0 = now
+        u += self._rp_lr_slow * dt  # ②: ゆっくり
+        if u >= 0.0 or now - self._rp_lr_slow_t0 > self._rp_lr_limit_s:
+            self._rp_u = min(u, 0.0)
+            self._rp_lr_active = False
+            return False
+        self._rp_u = u
+        return True
 
     def _ramp_gref(self, pattern: GRampPattern, now: float) -> float:
         """狙いの加速度 g_ref [G]（符号つき）。2026-10-09 段2l-9。G ＝ pattern.target_g。
@@ -2035,6 +2113,10 @@ class PatternLoop:
         accel_kmhs: float | None = None
         if last_t is not None and len(hist) >= 3:
             accel_kmhs = fit_slope([t for t, _ in hist], [v for _, v in hist])
+        if self._rp_lr_active and self._ramp_launch_release_step(speed, now):
+            # 段2o-10 A: 発進のゆっくり離しの間は偏差の項・基準を使わない（v_ref は 0 のまま）。
+            # 過渡の点は上限 G マップにも結果の G にも入れない
+            return None
         if self._phase in (_Phase.HOLD_STEP, _Phase.RAMP_RELEASE):
             # 2026-10-13 段2o-2: 遅れの測定のステップは開度を固定で持つ。偏差の項は使わず、
             # 過渡の点を上限 G マップに貯めない（`_rp_hist` の更新・加速度の測定は上でしている）。

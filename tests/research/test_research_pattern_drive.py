@@ -749,7 +749,8 @@ def _seed_outlier_setup(
     check_calls: list[int] = []
 
     def fake_forward(  # type: ignore[no-untyped-def]
-        profile, csv_path, models_dir, hw_mode, *, workers, seeds, max_iter, lags=None
+        profile, csv_path, models_dir, hw_mode, *, workers, seeds, max_iter, lags=None,
+        creep_launch_min_speed_kmh=None,
     ):
         seeds_seen.append(tuple(seeds))
         path = tmp_path / "results" / "models" / f"fwd_model_fake_{len(seeds_seen)}.pkl"
