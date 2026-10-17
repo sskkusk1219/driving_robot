@@ -422,7 +422,9 @@ class _ExciteRun:
             interval = cfg.output.print_interval_s
             self._next_print = (math.floor(t / interval) + 1) * interval
             say(drive_status_line(
-                t_s=t, ref_kmh=v_star, actual_kmh=speed, kp=0.0, ki=0.0, kd=0.0,
+                t_s=t, ref_kmh=v_star, actual_kmh=speed,
+                accel_kp=0.0, accel_ki=0.0, accel_kd=0.0,
+                brake_kp=0.0, brake_ki=0.0, brake_kd=0.0,
                 accel_pct=accel, brake_pct=self.brake_standby, extra=pattern,
             ))
 

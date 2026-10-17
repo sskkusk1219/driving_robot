@@ -22,7 +22,20 @@ import numpy as np
 
 from tests.research.ff_model import STOP_SPEED_KMH
 
-__all__ = ["WltpWeighting", "compute_weights", "summarize"]
+__all__ = [
+    "SAMPLE_WEIGHT_ENABLED",
+    "SAMPLE_WEIGHT_MAX",
+    "SAMPLE_WEIGHT_MIN",
+    "WltpWeighting",
+    "compute_weights",
+    "summarize",
+]
+
+# C1〜C5（多項式）の学習で重みを渡すか・重みの範囲。実機比較で優位性なしだったので既定 off
+# （2026-10-09: yaml の learning.sample_weight_* を外した。以前の yaml の値）
+SAMPLE_WEIGHT_ENABLED: bool = False
+SAMPLE_WEIGHT_MIN: float = 0.2
+SAMPLE_WEIGHT_MAX: float = 5.0
 
 
 @dataclass(frozen=True)

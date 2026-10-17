@@ -20,12 +20,14 @@ from tests.research import drive_log as dlmod
 from tests.research import hardware as hwmod
 from tests.research import main as mainmod
 from tests.research import pattern_drive as pdmod
+from tests.research import step2_check
 from tests.research.learning_patterns import COAST_DOWN_COUNT, LearningDataError
 from tests.research.live_plot import PlotSample, save_drive_figure
 from tests.research.pattern_loop import (
     CreepLaunchPattern,
     GRampPattern,
     PatternLoopConfig,
+    RampStatus,
 )
 from tests.research.pedal_search import PedalSearchResult
 from tests.research.research_types import (
@@ -98,11 +100,6 @@ def _tmp_cfg(tmp_path: Path) -> cfgmod.ResearchConfig:
             "decel_stop.step_mm": 1.0,
             "decel_stop.dwell_s": 0.2,
             "decel_stop.slope_window_s": 0.2,
-            # 実質Kp 合否条件（ProblemReport_20260921 手順6 段2。案a）は無効化する。この
-            # ヘルパーが作る合成ログ（短時間・少パターン）は実車の物理を表していないため、
-            # deviation_gain の符号が偶然どちらに転んでもおかしくない。この安全網自体は
-            # test_research_horizon_search.py で確認する
-            "features.search_gain_check_speeds_kmh": [],
         }
     )
     return cfgmod.load_config(path)
@@ -209,10 +206,21 @@ def test_build_patterns_layout_is_coast_then_ramps_only() -> None:
     assert all(isinstance(p, GRampPattern) and p.kind is PatternKind.G_RAMP for p in ramps)
     # 段の G と上端の車速は渡した順のまま
     assert [(p.target_g, p.top_kmh) for p in ramps if isinstance(p, GRampPattern)] == RAMP_ORDER
-    assert pdmod.ramp_order_of(patterns) == RAMP_ORDER
+    assert [(g, top) for g, top, _st, _lag in pdmod.ramp_order_of(patterns)] == RAMP_ORDER
     assert not any(isinstance(p, CreepLaunchPattern) for p in patterns)
     assert not any(p.kind.name in {"ACCEL_SWEEP", "BRAKE_HOLD", "CRUISE_TRIM", "CREEP_SETTLE"}
                    for p in patterns)
+
+
+def test_build_patterns_passes_stations_up_only_from_the_fourth_element() -> None:
+    """2026-10-14 段2o-4: 4 つ目があれば stations_up_only に渡り、3 要素・2 要素は False。"""
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    order = [(0.08, 60.0, (10.0, 20.0), True), (0.1, 60.0, (10.0,), False),
+             (0.125, 60.0, (10.0,)), (0.15, 60.0)]
+    ramps = [p for p in pdmod.build_patterns(cfg, _profile(cfg), order)
+             if isinstance(p, GRampPattern) and not p.lag_step]
+    assert [p.stations_up_only for p in ramps] == [True, False, False, False]
+    assert ramps[0].stations_kmh == (10.0, 20.0)
 
 
 def test_build_patterns_matches_ramp_plan_execution_order() -> None:
@@ -236,14 +244,57 @@ def test_build_patterns_matches_ramp_plan_execution_order() -> None:
     ] * 3
 
 
+def test_build_patterns_passes_release_stations_and_defaults_to_empty() -> None:
+    """2026-10-14 段2o-5: execution_order の 5 つ目が release_stations に入る。省略は空。
+    loop_config は learning.ramp_release_* と安全網の車速（クリープ＋5）を渡す。"""
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    order = [(0.08, 90.0, (), True, (15.0, 35.0)), (0.125, 60.0), (0.25, 50.0, (20.0,))]
+    ramps = [
+        p for p in pdmod.build_patterns(cfg, _profile(cfg), order) if isinstance(p, GRampPattern)
+    ]
+    assert [p.release_stations for p in ramps] == [(15.0, 35.0), (), ()]
+    lc = pdmod.loop_config_from_config(cfg)
+    assert lc.ramp_release_fracs == tuple(cfg.learning.ramp_release_fracs)
+    assert lc.ramp_release_hold_s == tuple(cfg.learning.ramp_release_hold_s)
+    assert lc.ramp_release_move_s == cfg.learning.ramp_release_move_s
+    assert lc.ramp_release_min_kmh == pytest.approx(cfg.feedforward.creep_speed_kmh + 5.0)
+
+
+def test_result_table_shows_release_columns() -> None:
+    from tests.research.pattern_loop import RampResult
+
+    results = [RampResult(0, 0.08, 90.0, 40.0, 35.0, 0.081, 0.079, 90.5, release_s=16.5,
+                          release_n=3, release_skipped=1)]
+    text = pdmod.result_table([(0.08, 90.0)], results, 120.0)
+    assert "戻し 秒" in text and "3/1" in text
+
+
 def test_result_table_lists_each_ramp_and_marks_unrun() -> None:
     from tests.research.pattern_loop import RampResult
 
-    results = [RampResult(0, 0.08, 90.0, 40.0, 35.0, 0.081, 0.079, 90.5)]
+    results = [RampResult(0, 0.08, 90.0, 40.0, 35.0, 0.081, 0.079, 90.5, hold_s=9.0)]
     text = pdmod.result_table([(0.08, 90.0), (0.25, 60.0)], results, 120.0)
     assert "0.081" in text and "90.5" in text
     assert "走っていない" in text  # 2 本目は結果が無い
     assert "120 s" in text
+    # 2026-10-10 段2l-10: 保持秒の列が加速秒と減速秒の間にあり、合計に含まれる
+    lines = text.splitlines()
+    head = next(ln for ln in lines if ln.startswith("段 |"))
+    names = [c.strip() for c in head.split("|")]
+    assert names[names.index("加速秒") + 1] == "保持秒"
+    assert names[names.index("保持秒") + 1] == "減速秒"
+    row = next(ln for ln in lines if ln.startswith(" 1 |"))
+    cells = [c.strip() for c in row.split("|")]
+    assert len(cells) == len(names)
+    assert float(cells[names.index("保持秒")]) == pytest.approx(9.0)
+    assert float(cells[names.index("合計秒")]) == pytest.approx(40.0 + 9.0 + 35.0)
+
+
+def test_result_table_estimate_includes_hold_and_two_turns() -> None:
+    plain = pdmod.result_table([(0.08, 90.0)], [], 10.0)
+    longer = pdmod.result_table([(0.08, 90.0)], [], 10.0, hold_s=7.0, turn_s=2.0)
+    est = lambda text: float(text.splitlines()[2].split("|")[3])  # noqa: E731 - 見込み秒の列
+    assert est(longer) - est(plain) == pytest.approx(7.0 + 2 * 2.0, abs=1.0)
 
 
 def test_build_patterns_coast_down_is_vehicle_independent_and_clamped() -> None:
@@ -256,10 +307,8 @@ def test_build_patterns_coast_down_is_vehicle_independent_and_clamped() -> None:
 
 
 def test_build_patterns_ignores_creep_settings() -> None:
-    """creep_launch_count・creep_brake_hold_fracs が残っていても列に入らない（段2l-6）。"""
+    """クリープ発進・クリープ域ブレーキ保持は列に入らない（段2l-6）。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
-    cfg.learning.creep_launch_count = 3
-    cfg.learning.creep_brake_hold_fracs = [0.1, 0.5]
     patterns = pdmod.build_patterns(cfg, _profile(cfg), RAMP_ORDER)
     assert not any(isinstance(p, CreepLaunchPattern) for p in patterns)
     assert len(patterns) == COAST_DOWN_COUNT + len(RAMP_ORDER)
@@ -272,6 +321,16 @@ def test_loop_config_carries_standby_and_stop_confirm() -> None:
     assert loop_cfg.stop_confirm_pct == 12.3
     cfg.mode_drive.pedal_standby = False
     assert pdmod.loop_config_from_config(cfg).pedal_standby is False
+
+
+def test_loop_config_carries_ramp_one_sided_and_levels() -> None:
+    """2026-10-12 段2l-12: 片側調整の有無と、上端を決める段の一覧を PatternLoopConfig へ渡す。"""
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    loop_cfg = pdmod.loop_config_from_config(cfg)
+    assert loop_cfg.ramp_one_sided is True
+    assert loop_cfg.ramp_g_levels == tuple(cfg.learning.ramp_g_levels)
+    cfg.learning.ramp_one_sided = False
+    assert pdmod.loop_config_from_config(cfg).ramp_one_sided is False
 
 
 async def test_run_pattern_drive_requires_patterns_or_ramp_order(tmp_path: Path) -> None:
@@ -375,6 +434,45 @@ async def test_pattern_drive_emergency_releases_pedals(tmp_path: Path) -> None:
     await hwmod.shutdown(hw)
 
 
+def _ramp_monitor(
+    cfg: cfgmod.ResearchConfig, rs: RampStatus | None
+) -> tuple[pdmod._DriveMonitor, list[dict[str, Any]]]:
+    """記録された record の引数を集める偽の走行ログを持つモニター。"""
+    calls: list[dict[str, Any]] = []
+
+    class _FakeLog:
+        def record(self, data: DriveLogData, **kw: Any) -> dlmod.DriveSample:
+            calls.append(kw)
+            return dlmod.DriveSample(
+                elapsed_s=0.0, timestamp=datetime.now(tz=UTC), data=data,
+                section="PATTERN_DRIVE", phase="X",
+                accel_kp=kw["accel_kp"], accel_ki=kw["accel_ki"],
+                brake_kp=kw["brake_kp"], brake_ki=kw["brake_ki"],
+            )
+
+    monitor = pdmod._DriveMonitor(cfg, [], _FakeLog())  # type: ignore[arg-type]
+    monitor.ramp_status = lambda: rs
+    return monitor, calls
+
+
+def test_on_sample_records_ramp_gains_or_none(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    data = DriveLogData(
+        ref_speed_kmh=30.0, actual_speed_kmh=29.5, accel_opening=1.0, brake_opening=0.0,
+        accel_pos=0, brake_pos=0, accel_current=0.0, brake_current=0.0,
+    )
+    rs = RampStatus(ref_kmh=30.0, accel_kp=0.25, accel_ki=0.03125, brake_kp=0.5, brake_ki=0.0625)
+    monitor, _ = _ramp_monitor(cfg, rs)
+    monitor.on_sample(data, 0, "RAMP_UP")
+    s = monitor.samples[-1]
+    assert (s.accel_kp, s.accel_ki, s.brake_kp, s.brake_ki) == (0.25, 0.03125, 0.5, 0.0625)
+
+    monitor, _ = _ramp_monitor(cfg, None)
+    monitor.on_sample(data, 0, "MEASURE")
+    s = monitor.samples[-1]
+    assert (s.accel_kp, s.accel_ki, s.brake_kp, s.brake_ki) == (None, None, None, None)
+
+
 # ── CSV・図 ──────────────────────────────────────────────────────────
 
 
@@ -406,13 +504,20 @@ def test_save_drive_figure_writes_png(tmp_path: Path) -> None:
 def _fake_table_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """C7 の表づくり（fwd_tool）を差し替える。ここで見るのは物理定数の推定と保存の流れ。"""
 
-    def fake(profile, csv_path, models_dir, hw_mode, *, announce=True):  # type: ignore[no-untyped-def]
+    def fake(profile, csv_path, models_dir, hw_mode, *, announce=True, lags=None):  # type: ignore[no-untyped-def]
         path = tmp_path / "results" / "models" / f"fwd_table_fake_{hw_mode}.pkl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x")
         return pdmod._BuiltModel(model_path=str(path), metrics={})
 
     monkeypatch.setattr(pdmod, "_build_table_model", fake)
+    # 偽の pkl（中身 b"x"）は学習結果のチェックでは読めない。チェックそのものは
+    # test_research_step2_check.py で確認するので、ここでは空（NG なし）にする
+    monkeypatch.setattr(pdmod, "_run_step2_checks", lambda **kwargs: [])
+    monkeypatch.setattr(
+        step2_check, "check_model_path",
+        lambda cfg, saved: step2_check.CheckItem("C2", "model_path", step2_check.STATUS_OK),
+    )
 
 
 def test_build_ff_model_real_saves_model_but_not_measured_values(
@@ -531,7 +636,7 @@ def test_build_ff_model_does_not_estimate_stop_brake_floor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """段2l-6: クリープ域ブレーキ保持を列から外したので、stop_brake_floor は推定せず、
-    yaml の stop_brake_floor_offset_pct を据え置く。"""
+    stop_brake_floor_offset_pct は yaml にも書き戻しにも出ない（2026-10-09 に yaml から削除）。"""
     cfg = _tmp_cfg(tmp_path)
     _fake_table_model(monkeypatch, tmp_path)
     csv_path = tmp_path / "drive.csv"
@@ -543,18 +648,9 @@ def test_build_ff_model_does_not_estimate_stop_brake_floor(
     monkeypatch.setattr(pdmod, "_estimate_research_stop_brake_floor", must_not_call)
     result = pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL, pedal=PEDAL)
 
-    saved = cfgmod.load_config(cfg.source_path)
-    assert saved.feedforward.stop_brake_floor_offset_pct == pytest.approx(
-        cfg.feedforward.stop_brake_floor_offset_pct
-    )
-    assert result.research_params.stop_brake_floor_offset_pct == pytest.approx(
-        cfg.feedforward.stop_brake_floor_offset_pct
-    )
-    # brake_trim_max_kmh・brake_trim_ref_kmh は人が決める値なので自動保存の対象外
-    assert saved.feedforward.brake_trim_max_kmh == pytest.approx(
-        cfg.feedforward.brake_trim_max_kmh
-    )
-    assert saved.feedforward.brake_trim_ref_kmh == pytest.approx(cfg.feedforward.brake_trim_ref_kmh)
+    assert result.research_params.stop_brake_floor_offset_pct == 0.0
+    assert "stop_brake_floor_offset_pct" not in pdmod.FF_PARAM_KEYS
+    assert not any("stop_brake_floor_offset_pct" in line for line in result.changed)
 
 
 def test_build_ff_model_stub_does_not_touch_yaml(
@@ -571,6 +667,167 @@ def test_build_ff_model_stub_does_not_touch_yaml(
     assert cfg.source_path.read_text(encoding="utf-8") == before
     assert "_stub" in Path(result.model_path).name
     assert result.changed == []
+
+
+def _ng_item(item_id: str = "B5", **metrics: float) -> step2_check.CheckItem:
+    return step2_check.CheckItem(
+        item_id, "テスト項目", step2_check.STATUS_NG, "値", "相手", "理由", dict(metrics)
+    )
+
+
+def test_build_ff_model_check_ng_real_keeps_yaml_and_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """チェックが NG なら、実機でも yaml を書き換えず Step2CheckError（pkl は残る）。"""
+    cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)
+    monkeypatch.setattr(pdmod, "_run_step2_checks", lambda **kwargs: [_ng_item("B5")])
+    csv_path = tmp_path / "drive.csv"
+    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
+    before = cfg.source_path.read_bytes()
+
+    with pytest.raises(step2_check.Step2CheckError) as info:
+        pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL, pedal=PEDAL)
+
+    assert cfg.source_path.read_bytes() == before
+    assert [i.id for i in info.value.items] == ["B5"]
+    assert (tmp_path / "results" / "models" / "fwd_table_fake_real.pkl").exists()
+
+
+def test_build_ff_model_check_ng_stub_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """スタブは NG でも止めない（表示のみ）。yaml は今までどおり書き換えない。"""
+    cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)
+    monkeypatch.setattr(pdmod, "_run_step2_checks", lambda **kwargs: [_ng_item("B5")])
+    csv_path = tmp_path / "drive.csv"
+    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
+    before = cfg.source_path.read_bytes()
+
+    result = pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_STUB)
+
+    assert cfg.source_path.read_bytes() == before
+    assert result.changed == [] and [c.id for c in result.checks] == ["B5"]
+    assert "スタブのため止めません" in capsys.readouterr().out
+
+
+def test_build_ff_model_post_write_c2_ng_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """yaml を書いた後に読み直した C2 が NG なら Step2CheckError。"""
+    cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        step2_check, "check_model_path",
+        lambda c, saved: step2_check.CheckItem(
+            "C2", "model_path", step2_check.STATUS_NG, "x", "y", "違う", {"path_diff": 1.0}
+        ),
+    )
+    csv_path = tmp_path / "drive.csv"
+    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
+
+    with pytest.raises(step2_check.Step2CheckError) as info:
+        pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL, pedal=PEDAL)
+
+    assert [i.id for i in info.value.items] == ["C2"]
+
+
+def _c8_cfg(tmp_path: Path) -> cfgmod.ResearchConfig:
+    cfg = _tmp_cfg(tmp_path)
+    cfg.save({"feedforward.candidate": "C8"})
+    return cfgmod.load_config(cfg.source_path)
+
+
+def _seed_outlier_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, check_results: list[list[Any]]
+) -> tuple[list[tuple[int, ...]], list[int]]:
+    """C8 の学習（_build_forward_model）とチェックを差し替える。学習に渡った乱数の列と、
+    チェックを呼んだ回数を返す（学習の中身はモック）。"""
+    cfg = _c8_cfg(tmp_path)
+    seeds_seen: list[tuple[int, ...]] = []
+    check_calls: list[int] = []
+
+    def fake_forward(  # type: ignore[no-untyped-def]
+        profile, csv_path, models_dir, hw_mode, *, workers, seeds, max_iter, lags=None
+    ):
+        seeds_seen.append(tuple(seeds))
+        path = tmp_path / "results" / "models" / f"fwd_model_fake_{len(seeds_seen)}.pkl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        return pdmod._BuiltModel(model_path=str(path), metrics={})
+
+    def fake_checks(**kwargs: Any) -> list[Any]:
+        check_calls.append(1)
+        return check_results[min(len(check_calls), len(check_results)) - 1]
+
+    monkeypatch.setattr(pdmod, "_build_forward_model", fake_forward)
+    monkeypatch.setattr(pdmod, "_run_step2_checks", fake_checks)
+    monkeypatch.setattr(pdmod, "_outlier_seeds", lambda model_path: [1])
+    monkeypatch.setattr(
+        step2_check, "check_model_path",
+        lambda c, saved: step2_check.CheckItem("C2", "model_path", step2_check.STATUS_OK),
+    )
+    csv_path = tmp_path / "drive.csv"
+    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
+    return seeds_seen, check_calls
+
+
+def test_build_ff_model_seed_outlier_retrains_once_then_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outlier = _ng_item("B1", seed_outlier_count=1.0)
+    seeds_seen, check_calls = _seed_outlier_setup(tmp_path, monkeypatch, [[outlier], []])
+    cfg = _c8_cfg(tmp_path)
+    result = pdmod.build_ff_model(
+        cfg, tmp_path / "drive.csv", hw_mode=hwmod.HW_REAL, pedal=PEDAL, forward_seeds=(0, 1, 2)
+    )
+    # 学習は 1 回目（_build_forward_model）と、外れた乱数 1 を 101 に替えた 1 回だけ
+    assert seeds_seen == [(0, 1, 2), (0, 101, 2)]
+    assert len(check_calls) == 2
+    assert result.model_path.endswith("fwd_model_fake_2.pkl")
+    assert result.changed  # yaml は書き換えた
+
+
+def test_build_ff_model_seed_outlier_still_ng_raises_without_third_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outlier = _ng_item("B1", seed_outlier_count=1.0)
+    seeds_seen, check_calls = _seed_outlier_setup(tmp_path, monkeypatch, [[outlier], [outlier]])
+    cfg = _c8_cfg(tmp_path)
+    before = cfg.source_path.read_bytes()
+    with pytest.raises(step2_check.Step2CheckError):
+        pdmod.build_ff_model(
+            cfg, tmp_path / "drive.csv", hw_mode=hwmod.HW_REAL, pedal=PEDAL,
+            forward_seeds=(0, 1, 2),
+        )
+    assert len(check_calls) == 2 and len(seeds_seen) == 2  # 学習し直しは 1 回だけ
+    assert seeds_seen[1] == (0, 101, 2)
+    assert cfg.source_path.read_bytes() == before
+
+
+def test_build_ff_model_other_ng_does_not_retrain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1 以外にも NG があるとき、または B1 でも乱数の外れが原因でないときは学習し直さない。"""
+    for results in (
+        [_ng_item("B1", seed_outlier_count=1.0), _ng_item("B5")],
+        [_ng_item("B1", seed_outlier_count=0.0)],
+    ):
+        seeds_seen, check_calls = _seed_outlier_setup(tmp_path, monkeypatch, [results])
+        cfg = _c8_cfg(tmp_path)
+        with pytest.raises(step2_check.Step2CheckError):
+            pdmod.build_ff_model(
+                cfg, tmp_path / "drive.csv", hw_mode=hwmod.HW_REAL, pedal=PEDAL,
+                forward_seeds=(0, 1, 2),
+            )
+        assert len(seeds_seen) == 1 and len(check_calls) == 1
+
+
+def test_replace_seeds_avoids_collisions() -> None:
+    assert pdmod._replace_seeds((0, 1, 2), [1]) == (0, 101, 2)
+    assert pdmod._replace_seeds((0, 100, 200), [0]) == (300, 100, 200)
+    assert pdmod._replace_seeds((0, 1), []) == (0, 1)
 
 
 @pytest.mark.parametrize("candidate", ["C1", "C2", "C3", "C4", "C5"])
@@ -714,3 +971,121 @@ def test_model_error_exit_code_is_6(
     cfg = _tmp_cfg(tmp_path)  # 走行ログを tmp に書く
     assert mainmod.main(["--steps", "1,2", "--config", str(cfg.source_path)]) == 6
     assert "モデル作成エラー" in capsys.readouterr().out
+
+
+def test_step2_check_error_exit_code_is_8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_drive(hw: object, cfg: object, **kwargs: object) -> pdmod.PatternDriveResult:
+        return pdmod.PatternDriveResult(csv_path=tmp_path / "x.csv", samples=[], duration_s=0.0)
+
+    seen: dict[str, object] = {}
+
+    def failing_build(cfg: object, csv_path: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+        raise step2_check.Step2CheckError([_ng_item("B5")])
+
+    monkeypatch.setattr(mainmod, "run_pre_drive_check", _fake_pre_check)
+    monkeypatch.setattr(mainmod, "load_mode", _fake_load_mode)
+    monkeypatch.setattr(mainmod, "run_pedal_search", _fake_search)
+    monkeypatch.setattr(mainmod, "run_pattern_drive", fake_drive)
+    monkeypatch.setattr(mainmod, "build_ff_model", failing_build)
+    cfg = _tmp_cfg(tmp_path)
+    # 手順3 まで指定しても、NG なら手順3 には進まない
+    assert mainmod.main(["--steps", "1,2,3", "--config", str(cfg.source_path)]) == 8
+    out = capsys.readouterr().out
+    assert "学習結果のチェックエラー" in out and "B5" in out
+    assert "手順 3:" not in out
+    assert seen["ramp_results"] == []  # 走行の結果を渡している
+
+
+async def test_pattern_drive_passes_yaml_loop_interval_to_pattern_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """手順2 も yaml の control.loop_interval_ms（50 ms）の周期で回す（段2l-10）。"""
+    cfg = _tmp_cfg(tmp_path)
+    hw = await _held_stub(cfg)
+    seen: dict[str, object] = {}
+
+    class Stop(Exception):
+        pass
+
+    def spy(*args: object, **kwargs: object) -> object:
+        seen.update(kwargs)
+        raise Stop
+
+    monkeypatch.setattr(pdmod, "PatternLoop", spy)
+    with pytest.raises(Stop):
+        await pdmod.run_pattern_drive(
+            hw, cfg, pedal=PEDAL, patterns=SHORT_PATTERNS, loop_config=FAST_LOOP
+        )
+    assert seen["interval_s"] == pytest.approx(cfg.control.loop_interval_s)
+    assert cfg.control.loop_interval_s == pytest.approx(0.05)
+    await hwmod.shutdown(hw)
+
+
+def test_retry_summary_uses_the_difference_from_the_start() -> None:
+    start = {"アクセル": ({"read:MONITOR": 2}, {"read:MONITOR": 100}), "ブレーキ": ({}, {})}
+    end = {
+        "アクセル": ({"read:MONITOR": 5, "move_to_position": 1},
+                  {"read:MONITOR": 1100, "move_to_position": 50}),
+        "ブレーキ": ({}, {"read:MONITOR": 900}),
+    }
+    line = pdmod._retry_summary(start, end)
+    assert "アクセル move_to_position 1/50 回・read:MONITOR 3/1000 回" in line
+    assert "ブレーキ read:MONITOR 0/900 回" in line  # 0 回でも出す
+    assert pdmod._retry_summary({}, {"アクセル": ({}, {})}).endswith("アクセル 通信なし")
+
+
+# ── 遅れの測定の段・途中の保持（2026-10-13 段2o-2）────────────────────────
+
+
+def test_build_patterns_adds_lag_step_ramps_only_when_asked() -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    plain = pdmod.build_patterns(cfg, _profile(cfg), RAMP_ORDER)
+    with_lag = pdmod.build_patterns(cfg, _profile(cfg), RAMP_ORDER, with_lag=True)
+    lr = cfg.learning
+    assert len(with_lag) == len(plain) + len(lr.ramp_lag_speeds_kmh)
+    assert not any(isinstance(p, GRampPattern) and p.lag_step for p in plain)
+    tail = with_lag[len(plain):]
+    assert all(isinstance(p, GRampPattern) and p.lag_step for p in tail)
+    assert [p.top_kmh for p in tail if isinstance(p, GRampPattern)] == [
+        float(v) for v in lr.ramp_lag_speeds_kmh
+    ]
+    assert {p.target_g for p in tail if isinstance(p, GRampPattern)} == {lr.ramp_lag_approach_g}
+    assert [lag for *_, lag in pdmod.ramp_order_of(with_lag)][-len(tail):] == [True] * len(tail)
+
+
+def test_build_patterns_passes_stations_from_three_element_order() -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    order = [(0.02, 100.0, (15.0, 25.0)), (0.08, 90.0, ())]
+    patterns = pdmod.build_patterns(cfg, _profile(cfg), order)
+    ramps = [p for p in patterns if isinstance(p, GRampPattern)]
+    assert [p.stations_kmh for p in ramps] == [(15.0, 25.0), ()]
+
+
+def test_loop_config_carries_cruise_and_lag_settings() -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    lc = pdmod.loop_config_from_config(cfg)
+    lr = cfg.learning
+    assert (lc.ramp_cruise_band_g, lc.ramp_cruise_hold_s, lc.ramp_cruise_timeout_s) == (
+        lr.ramp_cruise_band_g, lr.ramp_cruise_hold_s, lr.ramp_cruise_timeout_s
+    )
+    assert (lc.ramp_lag_step_g, lc.ramp_lag_step_hold_s) == (
+        lr.ramp_lag_step_g, lr.ramp_lag_step_hold_s
+    )
+
+
+def test_result_table_shows_cruise_and_lag_columns() -> None:
+    from tests.research.pattern_loop import RampResult
+
+    r = RampResult(
+        pattern_idx=0, target_g=0.02, top_kmh=100.0, up_s=300.0, down_s=290.0,
+        accel_g_median=0.02, decel_g_median=0.02, max_speed_kmh=100.0, hold_s=9.0,
+        cruise_s=150.0, cruise_n=20, cruise_done=18,
+    )
+    text = pdmod.result_table(
+        [(0.02, 100.0, (15.0,), False), (0.125, 30.0, (), True)], [r], 800.0, hold_s=7.0,
+        turn_s=2.0,
+    )
+    assert "途中保持" in text and "18/20" in text and "30L" in text

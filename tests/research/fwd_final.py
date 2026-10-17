@@ -37,8 +37,15 @@ from tests.research.fwd_cv import (
     stop_approach_mask,
 )
 from tests.research.fwd_data import FwdRows
-from tests.research.fwd_map import ForwardTable, load_forward_map, save_table
-from tests.research.fwd_model import grid_from_raw
+from tests.research.fwd_map import (
+    RELEASE_GRID_PCT,
+    ForwardTable,
+    attach_release,
+    load_forward_map,
+    refine_u_grid,
+    save_table,
+)
+from tests.research.fwd_model import grid_from_raw, monotone_rows
 from tests.research.fwd_tool import (
     DEFAULT_C7_MAP,
     DEFAULT_CHECK,
@@ -47,10 +54,12 @@ from tests.research.fwd_tool import (
     RESULTS,
     Trace,
     _settings,
+    err_stats,
     model_default_path,
     print_eval_block,
     read_logs,
     read_traces,
+    residuals,
     settings_of_table,
     skip_missing,
 )
@@ -71,6 +80,9 @@ def final_config(
     activation: str = "logistic",
     drop_stop_approach: bool = False,
     rollout_s: float = 0.0,
+    table_u_step_pct: float | None = None,
+    release_slices: bool = True,
+    brake_exclude_launch: bool = True,
 ) -> CvConfig:
     """既定は交差検証で良かった `1-1 絶対誤差`（乱数の本数だけ最終用に増やす）。
     層・活性化・停車まぎわ除外を変えたときは設定名を引数から作る。
@@ -92,6 +104,9 @@ def final_config(
         seeds=tuple(seeds),
         drop_stop_approach=drop_stop_approach,
         rollout_s=rollout_s,
+        table_u_step_pct=table_u_step_pct,
+        release_slices=release_slices,
+        brake_exclude_launch=brake_exclude_launch,
     )
 
 
@@ -104,16 +119,24 @@ def build_final_table(
     max_iter: int = fwd_torch.MAX_ITER,
     train_traces: Sequence[Sequence[Trace]] | None = None,
     train_paths: Sequence[str | Path] | None = None,
+    seed_mae: bool = False,
 ) -> tuple[ForwardTable, list[tuple[int, float]]]:
     """全学習ログで乱数ごとに学習 → 単調化前の配列を平均 → 1 回だけ単調化した表と、
     (乱数, 学習秒数) の一覧を返す。cfg.rollout_s > 0 のときは学習ログごとの trace が要る
     （train_traces を渡さなければ train_paths、それも無ければ DEFAULT_TRAIN から読む）。
-    追加学習の info は乱数ごとに表示する。"""
+    追加学習の info は乱数ごとに表示する。
+
+    seed_mae=True のとき、乱数ごとの単調化前の配列（outs[2]）から 1 本ずつ表を作り、学習ログ
+    （train_rows）での MAE を求めて表の meta["seed_mae"]（{乱数: MAE}）に入れる（手順2 の
+    チェック `step2_check` の乱数の外れ用）。既定 False は従来どおり。"""
     like = load_forward_map(Path(like_path))
+    st_like = like  # 設定（遅れ・不感帯）と穴の定義は C7 の表のまま
+    if cfg.table_u_step_pct is not None:
+        like = refine_u_grid(like, cfg.table_u_step_pct)  # worker の raw と同じ格子にする
     threads = 1 if workers > 1 else 0
     tail: tuple = ()
     if cfg.rollout_s > 0:
-        st = settings_of_table(like, _settings())
+        st = settings_of_table(st_like, _settings())
         if train_traces is None:
             train_traces = [read_traces(Path(p), st) for p in (train_paths or DEFAULT_TRAIN)]
         tail = (train_traces, st)
@@ -135,11 +158,20 @@ def build_final_table(
         if cfg.drop_stop_approach
         else {"drop_stop_approach": False}
     )
+    seed_mae_meta: dict[str, object] = {}
+    if seed_mae:
+        mae_by_seed: dict[int, float] = {}
+        for o in outs:
+            res = residuals(grid_from_raw(o[2], like, {}), list(train_rows))
+            st_s = err_stats(res["err"], res["ma"], np.ones(len(res["err"]), dtype=bool))
+            mae_by_seed[int(o[1])] = float(st_s.mae)
+        seed_mae_meta["seed_mae"] = mae_by_seed
     tb = grid_from_raw(
         np.mean([o[2] for o in outs], axis=0),
         like,
         {
             **extra,
+            **seed_mae_meta,
             "coast_from": cfg.coast_from,
             "n_models": len(outs),
             "hidden": cfg.hidden,
@@ -151,6 +183,27 @@ def build_final_table(
             "sources": "+".join(r.source for r in train_rows),
         },
     )
+    if cfg.release_slices and all(o[4] is not None for o in outs):
+        # 2026-10-14 段2o-5: 戻しの表。本体と同じ流れ（乱数の平均 → 行ごとに単調化）。ブレーキの行
+        # （u < 0。停車まぎわ除外のときは学習から外した行も除く）の戻し量で release_max_pct と
+        # 秒数を決め、足りなければ付けない（attach_release）
+        rel_p, rel_dt = [], []
+        for r in train_rows:
+            m = r.u_pct < 0.0
+            if cfg.brake_exclude_launch:
+                m &= ~r.launch_row  # 学習のブレーキ側と同じ行で数える
+            if cfg.drop_stop_approach:
+                m &= ~stop_approach_mask(r.speed_kmh, r.u_pct)
+            rel_p.append(r.release_pct[m])
+            rel_dt.append(r.dt_row_s[m])
+        slices = monotone_rows(np.mean([o[4] for o in outs], axis=0), like.u_grid)
+        tb = attach_release(
+            tb,
+            slices,
+            release_pct=np.concatenate(rel_p) if rel_p else np.zeros(0),
+            dt_row_s=np.concatenate(rel_dt) if rel_dt else np.zeros(0),
+            release_grid=RELEASE_GRID_PCT,
+        )
     return tb, [(o[1], o[3]) for o in outs]
 
 
@@ -227,6 +280,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     for seed, sec in secs:
         print(f"    乱数{seed}: 学習 {sec:.1f} 秒")
     print(f"- 学習の合計 {sum(s for _, s in secs):.1f} 秒・壁時計 {wall:.1f} 秒")
+    print(
+        f"- 戻しの表: {'あり' if tb.release_grid is not None else 'なし'}"
+        f"（戻し量 0.3% 以上のブレーキの行 {tb.meta.get('release_rows_s', 0.0):.1f} 秒、"
+        f"release_max_pct {tb.meta.get('release_max_pct', 0.0):.2f}%）"
+    )
     moved = float(np.abs(tb.accel_grid - tb.accel_before_mono).max())
     print(
         f"- 単調化で動いた量: 最大 {moved:.4f} km/h/s"

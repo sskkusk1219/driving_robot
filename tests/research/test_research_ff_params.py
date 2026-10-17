@@ -120,13 +120,10 @@ def test_research_ff_params_maps_yaml() -> None:
     cfg.feedforward.creep_accel_speeds_kmh = [1.0, 3.0]
     cfg.feedforward.creep_accel_kmhs = [3.0, 1.0]
     cfg.feedforward.coast_band_kmhs = 0.2
-    cfg.feedforward.stop_brake_floor_offset_pct = 8.0
-    cfg.feedforward.brake_trim_max_kmh = 3.0
-    cfg.feedforward.brake_trim_ref_kmh = 0.4
     research = research_ff_params(cfg)
     assert research.creep_accel_speeds_kmh == (1.0, 3.0)
     assert research.creep_accel_kmhs == (3.0, 1.0)
     assert research.coast_band_kmhs == pytest.approx(0.2)
-    assert research.stop_brake_floor_offset_pct == pytest.approx(8.0)
-    assert research.brake_trim_max_kmh == pytest.approx(3.0)
-    assert research.brake_trim_ref_kmh == pytest.approx(0.4)
+    # 停止ブレーキの下限・ブレーキトリムの3キーは yaml から外した（ResearchFFParams の既定＝無効）
+    assert research.stop_brake_floor_offset_pct == 0.0
+    assert research.brake_trim_max_kmh == 0.0

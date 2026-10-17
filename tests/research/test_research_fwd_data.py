@@ -9,16 +9,21 @@ import numpy as np
 import pytest
 
 from tests.research.fwd_data import (
+    DROP_ACTUATOR_LAG,
     DROP_BOTH_PEDALS,
     DROP_GOVERNOR,
     DROP_NO_OPENING,
     DROP_NO_WINDOW,
+    DROP_REASONS,
     DROP_STOPPED,
     FwdRows,
     cell_counts,
     concat_rows,
     effective_opening,
+    launch_mask,
     read_fwd_rows,
+    release_amount,
+    take_rows,
     thin_cells,
     u_cell,
 )
@@ -261,3 +266,189 @@ def test_coast_rows_use_coast_lag(tmp_path: Path) -> None:
     i = int(np.argmin(np.abs(k_default.t_s - 4.4)))
     j = int(np.argmin(np.abs(k_coast.t_s - 4.4)))
     assert k_coast.accel_kmhs[j] > k_default.accel_kmhs[i]  # 0.4 秒先の窓には +3 側が入る
+
+
+# ── 2026-10-10 段2l-10 ウ: 指令と実開度がずれた行を外す ─────────────────────────
+
+
+def _lag_rows(tmp_path: Path, *, actual: object = 14.0, cmd: float = 20.0) -> Path:
+    rows = make_rows(30, lambda t: 20.0 + t, accel=actual, accel_cmd_pct=cmd, brake_cmd_pct=0.0)
+    return write_csv(tmp_path / "lag.csv", rows)
+
+
+def test_rows_with_cmd_actual_gap_over_tolerance_are_dropped(tmp_path: Path) -> None:
+    r = read(_lag_rows(tmp_path, actual=14.0, cmd=20.0), opening_source="cmd")  # ずれ 6%
+    assert r.dropped[DROP_ACTUATOR_LAG] == 30
+    assert len(r) == 0
+    assert r.dropped_seconds()[DROP_ACTUATOR_LAG] == pytest.approx(30 * r.dt_s)
+    assert DROP_ACTUATOR_LAG in DROP_REASONS
+
+
+def test_rows_within_tolerance_are_kept(tmp_path: Path) -> None:
+    r = read(_lag_rows(tmp_path, actual=19.0, cmd=20.0), opening_source="cmd")  # ずれ 1%
+    assert r.dropped[DROP_ACTUATOR_LAG] == 0
+    assert len(r) > 0
+
+
+def test_rows_without_actual_opening_are_not_dropped_for_lag(tmp_path: Path) -> None:
+    r = read(_lag_rows(tmp_path, actual="", cmd=20.0), opening_source="cmd")
+    assert r.dropped[DROP_ACTUATOR_LAG] == 0
+    assert len(r) > 0
+
+
+def test_lag_tolerance_none_disables_the_drop(tmp_path: Path) -> None:
+    r = read(
+        _lag_rows(tmp_path, actual=14.0, cmd=20.0), opening_source="cmd", actuator_lag_tol_pct=None
+    )
+    assert r.dropped[DROP_ACTUATOR_LAG] == 0
+    assert len(r) > 0
+
+
+def test_lag_tolerance_is_adjustable(tmp_path: Path) -> None:
+    path = _lag_rows(tmp_path, actual=14.0, cmd=20.0)
+    r = read(path, opening_source="cmd", actuator_lag_tol_pct=10.0)
+    assert r.dropped[DROP_ACTUATOR_LAG] == 0
+
+
+def test_keep_stopped_keeps_stopped_rows_only_when_asked(tmp_path: Path) -> None:
+    rows = make_rows(30, lambda t: 0.2 if t < 1.0 else 0.2 + 3.0 * (t - 1.0), brake=9.0)
+    path = write_csv(tmp_path / "s.csv", rows)
+    default = read(path)
+    kept = read(path, keep_stopped=True)
+    assert default.dropped[DROP_STOPPED] > 0
+    assert kept.dropped[DROP_STOPPED] == 0
+    assert len(kept) > len(default)
+    assert float(kept.speed_kmh.min()) < 0.5 <= float(default.speed_kmh.min())
+
+
+def synth_launch_rows(speed, u, accel, t=None, dt: float = 0.1) -> FwdRows:
+    n = len(speed)
+    return FwdRows(
+        speed_kmh=np.asarray(speed, dtype=float),
+        u_pct=np.asarray(u, dtype=float),
+        accel_kmhs=np.asarray(accel, dtype=float),
+        t_s=np.arange(n) * dt if t is None else np.asarray(t, dtype=float),
+        dt_s=dt,
+        source="synthetic",
+        dt_row_s=np.full(n, dt),
+    )
+
+
+def test_launch_mask_stop_then_rising_is_true_until_accel_pedal() -> None:
+    speed = [0.0, 0.0, 0.3, 1.0, 2.0, 3.0, 4.0, 5.0]
+    u = [-3.0, -3.0, -3.0, -3.0, -3.0, 2.0, 2.0, 2.0]  # 5 行目からアクセル
+    accel = [0.0, 0.0, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
+    m = launch_mask(synth_launch_rows(speed, u, accel))
+    assert m.tolist() == [True] * 5 + [False] * 3
+
+
+def test_launch_mask_ends_when_slowing_to_stop() -> None:
+    # 走行 → 減速して停車 → ブレーキを緩めて発進
+    speed = [10.0, 5.0, 2.0, 0.8, 0.2, 0.0, 0.6, 1.5]
+    u = [-5.0, -5.0, -5.0, -5.0, -5.0, -3.0, -3.0, -3.0]
+    accel = [-5.0, -4.0, -3.0, -2.0, -0.1, 0.0, 1.5, 1.5]
+    m = launch_mask(synth_launch_rows(speed, u, accel))
+    # 減速して止まる行（0〜3）は False。停車の行 4 から区間が始まる
+    assert m.tolist() == [False, False, False, False, True, True, True, True]
+
+
+def test_launch_mask_cuts_on_time_gap_and_needs_a_stop_row() -> None:
+    speed = [0.0, 0.5, 1.0, 1.5, 2.0]
+    u = [-3.0] * 5
+    accel = [0.0, 1.5, 1.5, 1.5, 1.5]
+    t = [0.0, 0.1, 0.2, 5.0, 5.1]  # 3 行目で時刻が飛ぶ
+    m = launch_mask(synth_launch_rows(speed, u, accel, t=t))
+    assert m.tolist() == [True, True, True, False, False]
+    # 停車の行が無ければ全部 False
+    none = launch_mask(synth_launch_rows([1.0, 2.0, 3.0], [-3.0] * 3, [1.5] * 3))
+    assert not none.any()
+
+
+def test_launch_mask_stopped_row_with_accel_pedal_does_not_start() -> None:
+    speed = [0.0, 0.0, 1.0, 2.0]
+    u = [2.0, 2.0, -3.0, -3.0]  # 停車中にアクセルを踏んでいる
+    accel = [0.0, 0.0, 1.5, 1.5]
+    m = launch_mask(synth_launch_rows(speed, u, accel))
+    assert not m.any()
+
+
+def test_take_rows_selects_by_mask() -> None:
+    r = synth_launch_rows([0.0, 1.0, 2.0], [-1.0, -2.0, -3.0], [0.0, 1.0, 2.0])
+    sub = take_rows(r, np.array([True, False, True]))
+    assert sub.speed_kmh.tolist() == [0.0, 2.0]
+    assert sub.dt_row_s.tolist() == [0.1, 0.1]
+    assert len(sub) == 2
+
+
+# ───────── 2026-10-14 段2o-5: 戻し量 ─────────
+
+
+def test_release_amount_is_distance_from_recent_min_for_negative_u() -> None:
+    t = np.arange(8) * 1.0
+    u = np.array([0.0, -2.0, -6.0, -6.0, -4.0, -3.0, -3.0, -3.0])
+    # 窓 3 秒（その点を含む）: 点 4 の窓は t=1..4 → 最小 −6 → 戻し 2、点 5 は t=2..5 → 3
+    # 点 7 は t=4..7 → 最小 −4 → 戻し 1（山が窓から出ると戻し量が縮む）
+    rel = release_amount(t, u, 3.0)
+    assert rel.tolist() == [0.0, 0.0, 0.0, 0.0, 2.0, 3.0, 3.0, 1.0]
+
+
+def test_release_amount_zero_for_nonnegative_u_and_ignores_nan() -> None:
+    t = np.arange(5) * 1.0
+    u = np.array([-5.0, 0.0, 3.0, np.nan, -1.0])
+    rel = release_amount(t, u, 10.0)
+    # u>=0 の点・NaN の点は 0。最後の点は窓の最小 −5 から 4 戻している
+    assert rel.tolist() == [0.0, 0.0, 0.0, 0.0, 4.0]
+
+
+def test_read_fwd_rows_release_uses_full_series_before_dropping(tmp_path: Path) -> None:
+    # 停車（捨てる行）で深く踏んでいて、動き出してから浅くなる: 捨てた停車の行の u も山に入る
+    def speed(t: float) -> float:
+        return 0.0 if t < 1.0 else 3.0 * (t - 1.0)
+
+    rows = make_rows(40, speed, brake=BD + 6.0)  # u = −6
+    for r in rows:
+        if r["elapsed_s"] >= 2.0:
+            r["brake_actual_pct"] = BD + 3.0  # u = −3（戻した）
+    r = read(write_csv(tmp_path / "r.csv", rows))
+    assert len(r.release_pct) == len(r) > 0
+    after = r.t_s >= 2.0
+    # 山 −6 は t < 1.0 の停車の行（学習では捨てる）にもあり、窓 3 秒の内なら戻し 3
+    assert np.allclose(r.release_pct[after & (r.t_s <= 3.0)], 3.0)
+    assert np.all(r.release_pct[~after] == 0.0)
+    # 窓から山が出れば 0
+    assert np.all(r.release_pct[r.t_s > 4.5] == 0.0)
+
+
+def test_take_and_concat_rows_carry_release() -> None:
+    a = synth_launch_rows([1.0, 2.0, 3.0], [-1.0, -2.0, -3.0], [0.0, 1.0, 2.0])
+    a = FwdRows(**{**a.__dict__, "release_pct": np.array([0.0, 0.5, 1.5])})
+    b = FwdRows(**{**a.__dict__, "release_pct": np.array([2.0, 0.0, 0.1])})
+    sub = take_rows(a, np.array([False, True, True]))
+    assert sub.release_pct.tolist() == [0.5, 1.5]
+    both = concat_rows([a, b])
+    assert both.release_pct.tolist() == [0.0, 0.5, 1.5, 2.0, 0.0, 0.1]
+
+
+def test_fwdrows_without_release_defaults_to_zeros() -> None:
+    r = synth_launch_rows([1.0, 2.0], [-1.0, -2.0], [0.0, 1.0])
+    assert r.release_pct.tolist() == [0.0, 0.0]
+    assert concat_rows([r, r]).release_pct.tolist() == [0.0] * 4
+
+
+def test_read_fwd_rows_marks_launch_rows_and_carries_them(tmp_path: Path) -> None:
+    """2026-10-14 段2o-5: 停車 → ブレーキを踏んだまま動き出す行は launch_row。走行中は False。"""
+
+    def speed(t: float) -> float:
+        return 0.0 if t < 1.0 else min(3.0 * (t - 1.0), 12.0)
+
+    stop = make_rows(30, speed, brake=BD + 6.0)  # 約 0〜3 秒: 発進（アクセルなし・加速中）
+    cruise = make_rows(30, lambda t: 40.0 + 2.0 * (t - 10.0), brake=BD + 3.0, t0=10.0)
+    path = write_csv(tmp_path / "l.csv", stop + cruise)
+    r = read(path)
+    assert len(r.launch_row) == len(r)
+    assert r.launch_row[r.t_s < 3.0].all() and r.launch_row.any()
+    assert not r.launch_row[r.t_s >= 10.0].any()
+    assert take_rows(r, r.launch_row).launch_row.all()
+    assert concat_rows([r, r]).launch_row.sum() == 2 * r.launch_row.sum()
+    off = read(path, mark_launch=False)
+    assert not off.launch_row.any()

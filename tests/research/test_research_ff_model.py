@@ -250,21 +250,11 @@ def test_pkl_is_pedal_separated_and_require_single_spec_pkl() -> None:
         require_single_spec_pkl(different, "test_tool")
 
 
-def test_features_section_default_matches_production_spec() -> None:
-    assert FeaturesSection().to_feature_spec() == DEFAULT_FEATURE_SPEC
-
-
-def test_features_section_case_a() -> None:
-    """案A: dv_0.5 を外し、過去は素の past_speeds。"""
-    spec = FeaturesSection(use_h0=False, past_as_delta=False).to_feature_spec()
+def test_features_section_spec_is_case_a_constants() -> None:
+    """features の特徴量は定数（案A: dv_0.5 を外し、過去は素の past_speeds）。0.5s 先は残る。"""
+    spec = FeaturesSection().to_feature_spec()
     assert spec == FeatureSpec(dv_excluded_horizons_s=(0.5,), past_as_delta=False)
     assert spec.lookahead_horizons_s[0] == 0.5  # 停車保持の判定は 0.5s 先のまま
-
-
-def test_features_section_drops_unused_past_horizon() -> None:
-    spec = FeaturesSection(use_p1=False).to_feature_spec()
-    assert spec.past_horizons_s == (1.0,)
-    assert spec.feature_names()[-1] == "dv_past_1.0"
 
 
 # ── predict_effort（本番 FeedforwardController の移植）────────────────────────

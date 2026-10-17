@@ -298,7 +298,9 @@ async def test_prepare_mode_drive_warns_on_h0_h1_mismatch(
 # ── C7（順モデルの表） ────────────────────────────────────────────────
 
 
-def _write_forward_table_pkl(path: Path, deadbands: tuple[float, float] = (4.0, 7.0)) -> None:
+def _write_forward_table_pkl(
+    path: Path, deadbands: tuple[float, float] = (4.0, 7.0), kind: str = "table"
+) -> None:
     """小さな合成の順モデルの表（a = −2 − 0.01v + 0.3u（u≥0）/ 0.6u（u<0））を pkl にする。"""
     from tests.research.fwd_map import POINT_MEASURED, ForwardTable, save_table
 
@@ -315,6 +317,7 @@ def _write_forward_table_pkl(path: Path, deadbands: tuple[float, float] = (4.0, 
             point_kind=np.full(accel.shape, POINT_MEASURED, dtype=int),
             meas_u_min=np.full(4, -30.0),
             meas_u_max=np.full(4, 30.0),
+            kind=kind,
             meta={
                 "accel_deadband_pct": deadbands[0],
                 "brake_deadband_pct": deadbands[1],
@@ -1188,3 +1191,240 @@ def test_select_kwargs_point_c4_uses_reference_delta() -> None:
     assert kwargs["select_accel_kmhs"] == pytest.approx(
         (run.ref.at(t + 2.0) - run.ref.at(t)) / 2.0
     )
+
+
+# ─── 実開度の安全網（2026-10-17 段2o-9） ───────────────────────────────────
+
+
+def _interlock_run(cfg: cfgmod.ResearchConfig) -> mdmod._ModeRun:
+    """_apply_interlock だけを試すための最小の _ModeRun（コンストラクタを通さない）。"""
+    run = mdmod._ModeRun.__new__(mdmod._ModeRun)
+    run.cfg = cfg
+    run.interlock = (
+        mdmod.InterlockStats(period_s=0.05) if cfg.mode_drive.pedal_interlock_enabled else None
+    )
+    run._last_accel_actual = None
+    run._last_brake_actual = None
+    run._accel_blocked = False
+    run._brake_blocked = False
+    return run
+
+
+def test_interlock_blocks_next_pedal_until_other_actual_returns(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    amin, bmin = cfg.vehicle.min_accel_opening_pct, cfg.vehicle.min_brake_opening_pct
+    run = _interlock_run(cfg)
+    # 実開度が未取得: 止めない
+    assert run._apply_interlock(30.0, 0.0) == (30.0, 0.0)
+    # ブレーキの実開度が min を 0.2% 超えている: アクセルは止める（0 = 待機位置のまま）
+    run._last_brake_actual = bmin + 0.2
+    assert run._apply_interlock(30.0, 0.0) == (0.0, 0.0)
+    assert run._apply_interlock(30.0, 0.0) == (0.0, 0.0)
+    # 戻った（min + 揺れ 0.05% 以内）: 出す
+    run._last_brake_actual = bmin + 0.05
+    assert run._apply_interlock(30.0, 0.0) == (30.0, 0.0)
+    st = run.interlock
+    assert (st.accel_events, st.accel_cycles, st.brake_events, st.brake_cycles) == (1, 2, 0, 0)
+    assert st.accel_s == pytest.approx(0.1)
+    # 逆向き: アクセルの実開度が min を超えている間はブレーキを止める。止め始めは 1 回と数える
+    run._last_accel_actual = amin + 3.0
+    assert run._apply_interlock(0.0, 12.0) == (0.0, 0.0)
+    assert run._apply_interlock(0.0, 12.0) == (0.0, 0.0)
+    assert run.interlock.brake_events == 1 and run.interlock.brake_cycles == 2
+    run._last_accel_actual = amin
+    assert run._apply_interlock(0.0, 12.0) == (0.0, 12.0)
+    # 止め終わったあとの次の止めは別の 1 回
+    run._last_accel_actual = amin + 1.0
+    run._apply_interlock(0.0, 12.0)
+    assert run.interlock.brake_events == 2
+    # 要求のないペダルは何もしない（惰行）
+    assert run._apply_interlock(0.0, 0.0) == (0.0, 0.0)
+
+
+def test_interlock_disabled_passes_through(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    cfg.mode_drive.pedal_interlock_enabled = False
+    run = _interlock_run(cfg)
+    run._last_brake_actual = 50.0
+    run._last_accel_actual = 50.0
+    assert run._apply_interlock(30.0, 12.0) == (30.0, 12.0)
+    assert run.interlock is None
+
+
+def test_interlock_config_default_is_enabled() -> None:
+    assert cfgmod.ModeDriveSection().pedal_interlock_enabled is True
+
+
+async def test_run_mode_drive_reports_interlock_stats(tmp_path: Path) -> None:
+    """走行の結果に安全網の集計が入る（スタブは実開度が指令にすぐ追いつくので止まる回数は少ない）。"""
+    cfg = _tmp_cfg(tmp_path)
+    hw = await _held_stub(cfg)
+    log = dlmod.SessionLog(cfg, hw, has_ref=True)
+    log.start(dlmod.SECTION_MODE_DRIVE, "")
+    mode = _mode([(0.0, 0.0), (0.6, 0.0), (2.0, 6.0), (3.0, 6.0), (3.6, 0.0), (4.0, 0.0)])
+    result = await mdmod.run_mode_drive(hw, cfg, mdmod.ModeDriveSetup(mode, FakeFF()), log=log)  # type: ignore[arg-type]
+    await log.close()
+    assert result.interlock is not None
+    assert result.interlock.accel_cycles >= result.interlock.accel_events >= 0
+    assert result.interlock.period_s == cfg.control.loop_interval_s
+    assert "止めた" in result.interlock.summary()
+
+
+# ─── C10（偏差の上乗せ。2026-10-17 段2p） ────────────────────────────────
+
+
+def _c10_cfg(
+    tmp_path: Path, candidate: str = "C10", c: float = 100.0, row: str = "reference"
+) -> cfgmod.ResearchConfig:
+    """C8/C10 用の設定（kind=model の合成 pkl。表の遅れは両ペダル 0.05s）。"""
+    cfg = _c7_cfg(tmp_path)
+    cfg.feedforward.candidate = candidate
+    cfg.forward_map.deviation_c = c
+    cfg.forward_map.deviation_row = row
+    cfg.mode_drive.pedal_standby = False
+    _write_forward_table_pkl(Path(cfg.feedforward.model_path), kind="model")
+    return cfg
+
+
+_C10_MODE_POINTS = [(0.0, 0.0), (2.0, 0.0), (8.0, 30.0), (12.0, 30.0), (16.0, 0.0), (18.0, 0.0)]
+
+
+async def _c10_run_obj(
+    cfg: cfgmod.ResearchConfig, monkeypatch: pytest.MonkeyPatch
+) -> mdmod._ModeRun:
+    """_c10_offset だけを試すための最小の _ModeRun（prepare_mode_drive で計画と τ を作る）。"""
+    mode = _mode(_C10_MODE_POINTS)
+
+    async def fake_load_mode(_cfg: cfgmod.ResearchConfig, _name: str) -> object:
+        return mode
+
+    monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+    setup = await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+    run = mdmod._ModeRun.__new__(mdmod._ModeRun)
+    run.cfg = cfg
+    run.ff = setup.ff
+    run.c10 = mdmod.C10Stats(period_s=0.05) if cfg.feedforward.candidate == "C10" else None
+    run._c10_prev_clamped = False
+    return run
+
+
+async def test_c10_is_dispatched_like_c8_and_tau_is_c_times_lag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _c10_cfg(tmp_path, c=100.0)
+    ff = mdmod.load_feedforward(cfg)
+    assert isinstance(ff, ff_candidate.DeviationForwardFeedforward)
+    assert isinstance(ff, ff_candidate.ForwardModelFeedforward) and ff.expected_kind == "model"
+    run = await _c10_run_obj(cfg, monkeypatch)
+    assert run.ff.tau_accel_s == pytest.approx(5.0) and run.ff.tau_brake_s == pytest.approx(5.0)
+    out = capsys.readouterr().out
+    assert "c=100・τ アクセル 5.0s / ブレーキ 5.0s・表の行 基準車速（案A）" in out
+    # yaml の遅れの上書きがあれば、そちらが τ の元になる
+    cfg.forward_map.accel_lag_s = 0.1
+    run2 = await _c10_run_obj(cfg, monkeypatch)
+    assert run2.ff.tau_accel_s == pytest.approx(10.0)
+
+
+async def test_c10_without_measured_lag_does_not_correct_that_pedal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _c10_cfg(tmp_path)
+    from tests.research.fwd_map import load_forward_map, save_table
+
+    table = load_forward_map(Path(cfg.feedforward.model_path))
+    del table.meta["brake_lag_s"]
+    save_table(table, Path(cfg.feedforward.model_path))
+    run = await _c10_run_obj(cfg, monkeypatch)
+    assert run.ff.tau_brake_s is None and run.ff.tau_accel_s is not None
+    assert "ブレーキ 上乗せなし（遅れが測れていない）" in capsys.readouterr().out
+    plan = run.ff.plan
+    ib = int(np.flatnonzero((plan.effort_pct < 0.0) & (plan.flag != 4))[0])  # FLAG_STOP 以外
+    t = float(plan.t_s[ib])
+    assert run._c10_offset(t, 20.0, 10.0, float(plan.effort_pct[ib])) == 0.0  # noqa: SLF001
+
+
+async def test_c10_adds_throttle_when_behind_and_row_case_matters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _c10_cfg(tmp_path, row="reference")
+    run_a = await _c10_run_obj(cfg, monkeypatch)
+    plan = run_a.ff.plan
+    ia = int(np.flatnonzero(plan.effort_pct > 4.0 + 1.0)[0])
+    t, e = float(plan.t_s[ia]), float(plan.effort_pct[ia])
+    ref = 40.0
+    # dev = ref − speed = +2 km/h（遅れている）→ 踏み増す。進んでいれば減る
+    d_behind = run_a._c10_offset(t, ref, ref - 2.0, e)  # noqa: SLF001
+    d_ahead = run_a._c10_offset(t, ref, ref + 2.0, e)  # noqa: SLF001
+    assert d_behind > 0.0 and d_ahead < 0.0
+    assert run_a.c10.accel_cycles == 2 and run_a.c10.brake_cycles == 0
+    # 案B（実車速の行）: 低い車速の行のほうが上乗せが小さい（合成の表は速度が高いほど惰行が深い）
+    cfg_b = _c10_cfg(tmp_path, row="actual")
+    run_b = await _c10_run_obj(cfg_b, monkeypatch)
+    assert run_b.ff.deviation_row == "actual"
+    d_behind_b = run_b._c10_offset(t, ref, ref - 2.0, e)  # noqa: SLF001
+    assert 0.0 < d_behind_b < d_behind
+
+
+async def test_c10_zero_c_is_identical_to_c8_and_leaves_ff_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _c10_cfg(tmp_path, c=0.0)
+    run = await _c10_run_obj(cfg, monkeypatch)
+    plan = run.ff.plan
+    for i in range(0, len(plan.t_s), 7):
+        t, e = float(plan.t_s[i]), float(plan.effort_pct[i])
+        assert run._c10_offset(t, 30.0, 10.0, e) == 0.0  # noqa: SLF001
+    # C8 の計画は C10 と同一（C10 は列を変えない）
+    cfg8 = _c10_cfg(tmp_path, candidate="C8")
+    run8 = await _c10_run_obj(cfg8, monkeypatch)
+    assert run8.c10 is None
+    assert np.array_equal(run8.ff.plan.effort_pct, plan.effort_pct)
+
+
+async def test_c10_run_logs_offset_column_and_c8_leaves_it_blank(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    results = {}
+    plans = {}
+    for cand in ("C10", "C8"):
+        cfg = _c10_cfg(tmp_path, candidate=cand)
+        mode = _mode([(0.0, 0.0), (0.6, 0.0), (2.0, 6.0), (3.0, 6.0), (3.6, 0.0), (4.0, 0.0)])
+
+        async def fake_load_mode(
+            _cfg: cfgmod.ResearchConfig, _name: str, _m: object = mode
+        ) -> object:
+            return _m
+
+        monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+        setup = await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+        hw = await _held_stub(cfg)
+        log = dlmod.SessionLog(cfg, hw, has_ref=True)
+        log.start(dlmod.SECTION_MODE_DRIVE, "")
+        result = await mdmod.run_mode_drive(hw, cfg, setup, log=log)
+        await log.close()
+        results[cand] = (result, log.csv_path)
+        plans[cand] = setup.ff.plan
+    r10, csv10 = results["C10"]
+    r8, csv8 = results["C8"]
+    assert r8.c10 is None and r8.c10_settings is None
+    assert r10.c10 is not None and r10.c10_settings is not None and "c=100" in r10.c10_settings
+    with csv10.open(newline="", encoding="utf-8") as f:
+        rows10 = [r for r in csv.DictReader(f) if r["section"] == dlmod.SECTION_MODE_DRIVE]
+    assert any(r["c10_effort_pct"] not in ("", "0.000") for r in rows10)
+    with csv8.open(newline="", encoding="utf-8") as f:
+        assert all(r["c10_effort_pct"] == "" for r in csv.DictReader(f))
+    # FF の列は上乗せで変わらない（ログの plan_effort は plan.at のまま）
+    plan10 = plans["C10"]
+    for sample in r10.samples:
+        assert sample.data.plan_effort_pct == pytest.approx(plan10.at(sample.mode_time_s))
+
+
+def test_forward_map_deviation_settings_are_validated(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    assert cfg.forward_map.deviation_c == 100.0 and cfg.forward_map.deviation_row == "reference"
+    assert not any("deviation" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.deviation_row = "bogus"
+    assert any("deviation_row" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.deviation_row = "actual"
+    cfg.forward_map.deviation_c = -1.0
+    assert any("deviation_c" in p for p in cfgmod.validate_config(cfg))

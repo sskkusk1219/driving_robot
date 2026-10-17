@@ -9,14 +9,20 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tests.research.fwd_data import FwdRows, make_speed_edges
+from tests.research.fwd_data import FwdRows, make_speed_edges, u_cell
 from tests.research.fwd_map import (
     POINT_FILLED,
     POINT_MEASURED,
     POINT_OUT,
+    RELEASE_GRID_PCT,
+    ForwardTable,
+    attach_launch,
+    attach_release,
     build_table,
     load_forward_map,
+    refine_u_grid,
     save_table,
+    u_grid_points,
 )
 
 DT = 0.05
@@ -225,3 +231,253 @@ def test_invert_is_fast_for_whole_mode(synth_table) -> None:
     u, flag = synth_table.invert(v, a)
     assert time.perf_counter() - t0 < 5.0
     assert u.shape == (36000,) and flag.shape == (36000,)
+
+
+def test_refine_u_grid_keeps_range_and_inherits_cells(synth_table) -> None:
+    """2026-10-14 段2o-4: 範囲は元と同じ・0 を 1 点含む・秒数と種類は元のマスの値。"""
+    fine = refine_u_grid(synth_table, 0.5)
+    old = synth_table.u_grid
+    # 元のマスの外側の端（元の端の点 ± 刻みの半分）が同じ
+    assert fine.u_grid[0] == pytest.approx(old[0] - 0.75)
+    assert fine.u_grid[-1] == pytest.approx(old[-1] + 0.75)
+    assert np.all(np.diff(fine.u_grid) > 0)
+    assert int(np.sum(fine.u_grid == 0.0)) == 1
+    assert fine.meta["u_step_pct"] == 0.5 and fine.meta["like_u_step_pct"] == 2.0
+    assert fine.accel_grid.shape == fine.seconds.shape == fine.point_kind.shape
+    shape = (len(fine.speed_rep), len(fine.u_grid))
+    assert fine.accel_grid.shape == fine.accel_before_mono.shape == shape
+    cells = u_cell(fine.u_grid, 2.0)
+    col = cells - int(u_cell(old, 2.0).min())
+    assert np.array_equal(fine.seconds, synth_table.seconds[:, col])
+    assert np.array_equal(fine.point_kind, synth_table.point_kind[:, col])
+    assert np.array_equal(fine.meas_u_min, synth_table.meas_u_min)
+    # 新しい点の値は元の表の直線補間そのもの。元の格子点（折れ点）では新しい点の間を結ぶので
+    # 折れ点を少し丸めるが、ずれは小さい
+    for v in (12.0, 30.0, 52.0, 70.0):
+        for u in old[::3]:
+            a_old = synth_table.accel(v, float(u))
+            assert fine.accel(v, float(u)) == pytest.approx(a_old, abs=0.2)
+    r = 5
+    assert np.allclose(fine.accel_grid[r], np.interp(fine.u_grid, old, synth_table.accel_grid[r]))
+    assert np.all(np.diff(fine.accel_grid, axis=1) >= -1e-9)
+
+
+def test_refine_u_grid_same_or_coarser_step_returns_same_table(synth_table) -> None:
+    assert refine_u_grid(synth_table, 2.0) is synth_table
+    assert refine_u_grid(synth_table, 3.0) is synth_table
+
+
+def test_refine_u_grid_rejects_non_integer_ratio(synth_table) -> None:
+    with pytest.raises(ValueError):
+        refine_u_grid(synth_table, 0.7)
+
+
+def _launch_setup():
+    """本体: v 0〜10 の 4 行（2.5 刻み）、u −8〜+4（0.5 刻み）。本体の u<0 は a = 0.5u。
+    発進側の行: v 0〜2.5 の行と 2.5〜5 の行に、u<0 で a = 1.5 + 0.1u の実測を 20 秒ぶん置く。"""
+    edges = np.array([0.0, 2.5, 5.0, 7.5, 10.0])
+    grid = u_grid_points(-16, 8, 0.5)
+    rep = (edges[:-1] + edges[1:]) / 2.0
+    acc = np.tile(np.where(grid < 0, 0.5 * grid, 0.3 * grid), (4, 1))
+    table = ForwardTable(
+        speed_edges=edges,
+        speed_rep=rep,
+        u_grid=grid,
+        accel_grid=acc,
+        seconds=np.full(acc.shape, 5.0),
+        point_kind=np.full(acc.shape, POINT_MEASURED, dtype=int),
+        meas_u_min=np.full(4, grid[0]),
+        meas_u_max=np.full(4, grid[-1]),
+        meta={"u_step_pct": 0.5},
+    )
+    rng = np.random.default_rng(1)
+    n = 400
+    v = rng.uniform(0.6, 4.9, n)
+    u = -rng.choice(np.arange(0.5, 5.01, 0.5), n)
+    rows = make_rows(v, u, 1.5 + 0.1 * u, dt=0.1)
+    return table, rows
+
+
+def test_attach_launch_too_few_rows_leaves_none() -> None:
+    table, rows = _launch_setup()
+    short = make_rows(rows.speed_kmh[:20], rows.u_pct[:20], rows.accel_kmhs[:20], dt=0.1)  # 2 秒
+    t2 = attach_launch(table, short)
+    assert t2.launch_accel is None
+    assert t2.meta["launch_rows_s"] == pytest.approx(2.0)
+    empty = make_rows(np.zeros(0), np.zeros(0), np.zeros(0))
+    assert attach_launch(table, empty).launch_accel is None
+    assert table.launch_accel is None  # 元は書き換えない
+
+
+def test_attach_launch_replaces_low_speed_rows_only() -> None:
+    table, rows = _launch_setup()
+    t2 = attach_launch(table, rows, accel_window_s=0.5)
+    la = t2.launch_accel
+    assert la is not None and la.shape == table.accel_grid.shape
+    neg = table.u_grid <= 0
+    for r in (0, 1):  # 発進側の実測がある行
+        sel = neg & (table.u_grid >= -5.0)
+        assert np.allclose(la[r, sel], 1.5 + 0.1 * table.u_grid[sel], atol=0.05)
+        assert np.all(np.diff(la[r]) >= -1e-9)
+        assert np.all(la[r, ~neg] >= la[r, neg].max() - 1e-9)  # u>0 は u=0 以上
+    assert np.array_equal(la[2:], table.accel_grid[2:])  # 高車速の行は本体
+    assert t2.meta["launch_speed_rows"] == [1.25, 3.75]
+    assert t2.meta["launch_min_s"] == 0.5 and t2.meta["launch_accel_window_s"] == 0.5
+    assert np.array_equal(t2.accel_grid, table.accel_grid)
+
+
+def test_launch_flag_selects_launch_table() -> None:
+    table, rows = _launch_setup()
+    t2 = attach_launch(table, rows)
+    v, u = 1.25, -3.0
+    assert float(t2.accel(v, u)) == pytest.approx(-1.5)
+    assert float(t2.accel(v, u, launch=True)) == pytest.approx(1.2, abs=0.05)
+    assert float(t2.coast_accel(v)) == pytest.approx(0.0)
+    assert float(t2.coast_accel(v, launch=True)) == pytest.approx(1.5, abs=0.1)
+    uu, _ = t2.invert(v, 1.2, launch=True)
+    assert float(uu) == pytest.approx(-3.0, abs=0.3)
+    uu0, _ = t2.invert(v, -1.5)  # launch=False は本体
+    assert float(uu0) == pytest.approx(-3.0, abs=0.01)
+    # 発進側なしの表では launch=True でも本体
+    assert float(table.accel(v, u, launch=True)) == pytest.approx(float(table.accel(v, u)))
+
+
+def test_launch_accel_survives_pkl_and_old_pkl_has_none(tmp_path: Path) -> None:
+    table, rows = _launch_setup()
+    t2 = attach_launch(table, rows)
+    t3 = load_forward_map(save_table(t2, tmp_path / "l.pkl"))
+    assert t3.launch_accel is not None and np.allclose(t3.launch_accel, t2.launch_accel)
+    p = save_table(t2, tmp_path / "old.pkl")
+    with p.open("rb") as f:
+        d = pickle.load(f)
+    del d["launch_accel"]
+    with p.open("wb") as f:
+        pickle.dump(d, f)
+    assert load_forward_map(p).launch_accel is None
+
+
+# ───────── 2026-10-14 段2o-5: 戻しの表 ─────────
+
+REL_SLOPE = 0.05  # 戻し 1% あたり、u < 0 の側の加速度が |u| に比例して上がる量（ブレーキが弱まる）
+
+
+def release_table(max_pct: float = 8.0, with_release: bool = True) -> ForwardTable:
+    """a = −2 − 0.01v + (u>=0: 0.3u / u<0: 0.6u)。戻しの表: u<0 の列に REL_SLOPE×戻し量×|u| を足す
+    （u=0 では本体と同じ。単調のまま）。"""
+    rep = np.array([0.0, 50.0, 100.0])
+    grid = np.arange(-20.0, 21.0, 0.5)
+    base = -2.0 - 0.01 * rep[:, None] + np.where(grid >= 0, 0.3 * grid, 0.6 * grid)[None, :]
+    kind = np.full(base.shape, POINT_MEASURED, dtype=int)
+    tb = ForwardTable(
+        speed_edges=np.array([-25.0, 25.0, 75.0, 125.0]),
+        speed_rep=rep,
+        u_grid=grid,
+        accel_grid=base,
+        seconds=np.full(base.shape, 10.0),
+        point_kind=kind,
+        meas_u_min=np.full(3, -20.0),
+        meas_u_max=np.full(3, 20.0),
+    )
+    if not with_release:
+        return tb
+    slices = np.stack(
+        [base + np.where(grid < 0, REL_SLOPE * r * -grid, 0.0)[None, :] for r in RELEASE_GRID_PCT]
+    )
+    rel = np.full(1000, 1.0)  # 戻し量 1% の行が 1000 行 × 0.05 s = 50 秒
+    return attach_release(tb, slices, release_pct=rel, dt_row_s=np.full(1000, 0.05))
+
+
+def test_release_none_or_zero_is_identical_to_main() -> None:
+    tb = release_table()
+    v = np.array([10.0, 40.0, 70.0])
+    u = np.array([-8.0, -3.0, 5.0])
+    base = tb.accel(v, u)
+    assert np.array_equal(tb.accel(v, u, release=None), base)
+    assert np.array_equal(tb.accel(v, u, release=0.0), base)
+    a = np.array([-4.0, -3.0, 0.5])
+    assert np.array_equal(tb.invert(v, a, release=0.0)[0], tb.invert(v, a)[0])
+    # 戻しの表が無い表は release を渡しても変わらない
+    plain = release_table(with_release=False)
+    assert plain.release_grid is None
+    assert np.array_equal(plain.accel(v, u, release=3.0), plain.accel(v, u))
+    assert np.array_equal(plain.invert(v, a, release=3.0)[0], plain.invert(v, a)[0])
+
+
+def test_release_interpolates_linearly_between_slices() -> None:
+    tb = release_table()
+    tb.meta["release_max_pct"] = 8.0  # 頭打ちを格子の端まで広げる（頭打ちは別のテスト）
+    for r in (0.25, 0.5, 1.0, 1.5, 3.0):
+        got = tb.accel(30.0, -6.0, release=r)
+        assert got == pytest.approx(tb.accel(30.0, -6.0) + REL_SLOPE * r * 6.0, abs=1e-9)
+    # u > 0 は戻し量に依らない
+    assert tb.accel(30.0, 5.0, release=2.0) == pytest.approx(tb.accel(30.0, 5.0))
+    # 配列の戻し量（サンプルごと）
+    rr = np.array([0.0, 1.0, 2.0])
+    got = tb.accel(np.full(3, 30.0), np.full(3, -6.0), release=rr)
+    assert np.allclose(got, tb.accel(30.0, -6.0) + REL_SLOPE * rr * 6.0)
+
+
+def test_release_is_clamped_to_release_max_pct() -> None:
+    tb = release_table()
+    assert tb.meta["release_max_pct"] == pytest.approx(1.0)
+    at_max = tb.accel(30.0, -6.0, release=1.0)
+    assert tb.accel(30.0, -6.0, release=5.0) == pytest.approx(at_max)  # 外挿しない
+    u_max, _ = tb.invert(30.0, -3.0, release=1.0)
+    u_big, _ = tb.invert(30.0, -3.0, release=7.0)
+    assert u_big == pytest.approx(u_max)
+
+
+def test_invert_with_release_is_inverse_of_accel_per_sample() -> None:
+    tb = release_table()
+    tb.meta["release_max_pct"] = 8.0
+    v = np.array([20.0, 30.0, 60.0, 90.0])
+    u = np.array([-12.0, -6.0, -2.5, -9.0])
+    r = np.array([0.0, 1.0, 2.5, 6.0])
+    a = tb.accel(v, u, release=r)
+    back, flag = tb.invert(v, a, release=r)
+    assert np.allclose(back, u, atol=1e-6)
+    assert np.all(flag == POINT_MEASURED)
+
+
+def test_launch_table_ignores_release() -> None:
+    tb = release_table()
+    tb.launch_accel = tb.accel_grid + 1.0
+    assert tb.accel(30.0, -6.0, launch=True, release=2.0) == pytest.approx(
+        tb.accel(30.0, -6.0, launch=True)
+    )
+    assert tb.accel(30.0, -6.0, release=2.0) != pytest.approx(tb.accel(30.0, -6.0))
+
+
+def test_attach_release_needs_enough_release_seconds() -> None:
+    tb = release_table(with_release=False)
+    slices = np.stack([tb.accel_grid] * len(RELEASE_GRID_PCT))
+    few = attach_release(tb, slices, release_pct=np.full(100, 1.0), dt_row_s=np.full(100, 0.05))
+    assert few.release_grid is None and few.release_accel is None  # 5 秒 < 10 秒
+    assert few.meta["release_rows_s"] == pytest.approx(5.0)
+    # 戻し量が 0.3% 未満の行は秒数に数えない
+    tiny = attach_release(tb, slices, release_pct=np.full(1000, 0.1), dt_row_s=np.full(1000, 0.05))
+    assert tiny.release_grid is None
+    rel = np.concatenate([np.full(400, 1.0), np.zeros(100), np.linspace(0.0, 4.0, 100)])
+    ok = attach_release(tb, slices, release_pct=rel, dt_row_s=np.full(len(rel), 0.05))
+    assert ok.release_grid is not None and ok.release_accel.shape == slices.shape
+    assert ok.meta["release_max_pct"] == pytest.approx(float(np.quantile(rel, 0.95)))
+    with pytest.raises(ValueError):
+        attach_release(tb, slices[:2], release_pct=rel, dt_row_s=np.full(len(rel), 0.05))
+
+
+def test_release_pkl_roundtrip_and_old_pkl_loads(tmp_path: Path) -> None:
+    tb = release_table()
+    back = load_forward_map(save_table(tb, tmp_path / "r.pkl"))
+    assert np.array_equal(back.release_grid, tb.release_grid)
+    assert np.array_equal(back.release_accel, tb.release_accel)
+    assert back.accel(30.0, -6.0, release=1.0) == pytest.approx(tb.accel(30.0, -6.0, release=1.0))
+    # 古い pkl（キーが無い）は None で、今までと同じに読める
+    with (tmp_path / "r.pkl").open("rb") as f:
+        d = pickle.load(f)
+    del d["release_grid"], d["release_accel"]
+    old_path = tmp_path / "old.pkl"
+    with old_path.open("wb") as f:
+        pickle.dump(d, f)
+    old = load_forward_map(old_path)
+    assert old.release_grid is None and old.release_accel is None
+    assert old.accel(30.0, -6.0, release=1.0) == pytest.approx(old.accel(30.0, -6.0))

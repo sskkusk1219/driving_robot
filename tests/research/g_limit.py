@@ -42,6 +42,18 @@ _MIN_ACCEL_GAP_KMHS = 0.05
 _SENS_WINDOW_PCT = 5.0
 
 
+def _interpolate(
+    below: list[tuple[float, float]], above: list[tuple[float, float]], target: float
+) -> float:
+    """target をはさむ点（below: 加速度が target 未満、above: 以上。どちらも空でない）の内挿。"""
+    lo = max(below, key=lambda p: p[1])
+    hi = min(above, key=lambda p: p[1])
+    if hi[1] - lo[1] < _MIN_ACCEL_GAP_KMHS:
+        return min(lo[0], hi[0])
+    frac = (target - lo[1]) / (hi[1] - lo[1])
+    return lo[0] + frac * (hi[0] - lo[0])
+
+
 def _extrapolate(
     points: list[tuple[float, float]], target: float, *, extrapolate: bool = True
 ) -> float | None:
@@ -57,12 +69,7 @@ def _extrapolate(
     below = [p for p in points if p[1] < target]
     above = [p for p in points if p[1] >= target]
     if above and below:  # 内挿: target の直前・直後の点
-        lo = max(below, key=lambda p: p[1])
-        hi = min(above, key=lambda p: p[1])
-        if hi[1] - lo[1] < _MIN_ACCEL_GAP_KMHS:
-            return min(lo[0], hi[0])
-        frac = (target - lo[1]) / (hi[1] - lo[1])
-        return lo[0] + frac * (hi[0] - lo[0])
+        return _interpolate(below, above, target)
     if above:  # すべて target 以上: 一番弱い点の開度で既に届く
         return min(above, key=lambda p: p[1])[0]
     if not extrapolate:  # 外挿しない: いちばん効いた点の開度から始める
@@ -78,8 +85,15 @@ def _extrapolate(
     return u1 + (target - a1) * (u1 - u0) / (a1 - a0)
 
 
-def _lsq_slope(points: list[tuple[float, float]], min_points: int) -> float | None:
-    """(開度, 加速度) の最小二乗の傾き（加速度を開度で回帰）。作れない・0 以下なら None。"""
+def _lsq_slope(
+    points: list[tuple[float, float]], min_points: int, min_accel_span_kmhs: float = 0.0
+) -> float | None:
+    """(開度, 加速度) の最小二乗の傾き（加速度を開度で回帰）。作れない・0 以下なら None。
+
+    2026-10-10 段2l-11: `min_accel_span_kmhs` ＞ 0 のときは、傾き × 使った点の開度の幅
+    （max − min）＝ その点たちが見分けた加速度の差 がこれ未満なら None（測れていない傾き）。
+    既定 0 は今までと同じ。
+    """
     if len(points) < min_points:
         return None
     us = [p[0] for p in points]
@@ -91,7 +105,11 @@ def _lsq_slope(points: list[tuple[float, float]], min_points: int) -> float | No
     sxx = sum((u - mean_u) ** 2 for u in us)
     sxy = sum((u - mean_u) * (a - mean_a) for u, a in points)
     slope = sxy / sxx
-    return slope if slope > 0.0 else None
+    if slope <= 0.0:
+        return None
+    if min_accel_span_kmhs > 0.0 and slope * (max(us) - min(us)) < min_accel_span_kmhs:
+        return None
+    return slope
 
 
 def _fmt_cap(cap_pct: float | None) -> str:
@@ -157,6 +175,22 @@ class GLimitMap:
         """
         return self._coast_median(self._idx(speed_kmh))
 
+    def coast_curve(self) -> tuple[list[float], list[float]]:
+        """惰行の減速のカーブ（車速帯の中心 [km/h] の昇順, その帯の中央値 [km/h/s]。正）。
+
+        2026-10-16 段2o-6: 効き始めの折れ点（`play_onset`）が「惰行との差」を取るのに使う。
+        点が無ければ空のリスト 2 つ。
+        """
+        speeds: list[float] = []
+        decels: list[float] = []
+        for idx in sorted(self._coast):
+            med = self._coast_median(idx)
+            if med is None:
+                continue
+            speeds.append((idx + 0.5) * self._bin)
+            decels.append(med)
+        return speeds, decels
+
     def _bin_cap(
         self, pedal: str, idx: int, target_kmhs: float, deadband_pct: float,
         *, extrapolate: bool = True,
@@ -171,6 +205,29 @@ class GLimitMap:
         # 実測で「上限に届かなかった」開度は安全と分かっている。予測がそれより低いのは雑音
         safe = max((o for o, a in pts if a <= target_kmhs), default=deadband_pct)
         return max(u, safe, deadband_pct)
+
+    def interp_pct(
+        self, pedal: str, speed_kmh: float, target_kmhs: float, deadband_pct: float
+    ) -> float | None:
+        """自分の車速帯の中で、加速度が `target_kmhs`（正）になる開度を内挿で返す [%]。
+
+        2026-10-10 段2l-10（ProblemReport_20261001。G ランプの減速の頭の寄せ用）。自分の帯の
+        点と惰行の基準点（`_bin_cap` と同じ作り方）のうち、target 未満の点と target 以上の点の
+        両方があるときだけ、`_extrapolate` の内挿の枝と同じ計算で返す。他の帯は探さない・外挿
+        しない・
+        「いちばん効いた点」を返さない・実測の安全側への底上げ（`_bin_cap` の safe）もしない。
+        それ以外は None。
+        """
+        idx = self._idx(speed_kmh)
+        pts = list(self._points.get((pedal, idx), ()))
+        c = self._coast_median(idx)
+        if c is not None:
+            pts.append((deadband_pct, c if pedal == PEDAL_BRAKE else -c))
+        below = [p for p in pts if p[1] < target_kmhs]
+        above = [p for p in pts if p[1] >= target_kmhs]
+        if not below or not above:
+            return None
+        return _interpolate(below, above, target_kmhs)
 
     def cap_pct(
         self, pedal: str, speed_kmh: float, g_cap_kmhs: float, deadband_pct: float,
@@ -202,7 +259,8 @@ class GLimitMap:
         )
 
     def _bin_sensitivity(
-        self, pedal: str, idx: int, opening_pct: float, deadband_pct: float
+        self, pedal: str, idx: int, opening_pct: float, deadband_pct: float,
+        min_accel_span_kmhs: float = 0.0,
     ) -> float | None:
         pts = list(self._points.get((pedal, idx), ()))
         c = self._coast_median(idx)
@@ -212,11 +270,18 @@ class GLimitMap:
         # 2026-10-07 段2l-2: 近くの点の傾きと帯の全点の傾きの大きいほう。感度を小さく見積もると
         # 開度を速く動かす側（危険側）に外れるので、大きいほうを採る（062322 に当てた確認で、
         # 近くの点だけだと雑音で極端に小さい値が出ていたのが消えた）
-        slopes = [s for s in (_lsq_slope(near, 3), _lsq_slope(pts, 2)) if s is not None]
+        # 2026-10-10 段2l-11: 傾きを作った点の加速度の差が min_accel_span_kmhs 未満の候補は外す
+        slopes = [
+            s for s in (
+                _lsq_slope(near, 3, min_accel_span_kmhs),
+                _lsq_slope(pts, 2, min_accel_span_kmhs),
+            ) if s is not None
+        ]
         return max(slopes) if slopes else None
 
     def sensitivity_kmhs_per_pct(
-        self, pedal: str, speed_kmh: float, opening_pct: float, deadband_pct: float
+        self, pedal: str, speed_kmh: float, opening_pct: float, deadband_pct: float,
+        *, min_accel_span_kmhs: float = 0.0,
     ) -> float | None:
         """`opening_pct` あたりでの開度 1% あたりの加速度の変化（感度）[km/h/s per %]。
 
@@ -225,9 +290,16 @@ class GLimitMap:
         （＋惰行の点）の傾きを両方計算し、作れたものの大きいほう（小さく見積もると開度を速く動かす
         危険側に外れるため）。自分の帯で作れなければ `cap_pct` と同じ順で他の帯。
         どの帯でも作れなければ None（呼び出し側が既定の速さを使う）。
+
+        2026-10-10 段2l-11（ProblemReport_20261001）: `min_accel_span_kmhs`（既定 0 ＝ 従来）。
+        2 つの候補それぞれについて「傾き × その候補に使った点の開度の幅」がこれ未満なら候補から
+        外す（点が近すぎて加速度の差が雑音と区別できないとき、傾きが 0 に近い正の値になり
+        Kp ＝ 1 ÷（感度 × T）が跳ねるため）。両方外れた帯は None で、次の帯を探す。
         """
         for i in self._search_order(pedal, self._idx(speed_kmh)):
-            sens = self._bin_sensitivity(pedal, i, opening_pct, deadband_pct)
+            sens = self._bin_sensitivity(
+                pedal, i, opening_pct, deadband_pct, min_accel_span_kmhs
+            )
             if sens is not None:
                 return sens
         return None

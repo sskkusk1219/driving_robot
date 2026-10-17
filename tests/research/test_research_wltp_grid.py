@@ -169,9 +169,9 @@ def test_coverage_table_shows_data_seconds_with_one_decimal() -> None:
 
 
 def test_default_grid_treats_plus_minus_half_as_one_cruise_column() -> None:
-    from tests.research.config import LearningSection
+    from tests.research.wltp_grid import GRID_ACCEL_EDGES_KMHS
 
-    edges = LearningSection().grid_accel_edges_kmhs
+    edges = GRID_ACCEL_EDGES_KMHS
     assert -0.5 in edges
     assert 0.5 in edges
     assert not any(-0.5 < e < 0.5 for e in edges)

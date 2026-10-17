@@ -36,6 +36,8 @@ class FakeAxis:
 
     def __init__(self, current_ma: float = 0.0) -> None:
         self.position = 0
+        # 送り方の記録: ("timed" | "smooth", 目標位置, 時間引数)
+        self.calls: list[tuple[str, int, float | None]] = []
         self.current_ma = current_ma
         self.alarm = False
         self.current_script: list[float] | None = None
@@ -44,6 +46,13 @@ class FakeAxis:
         self, target_pos: int, current_pos: int, duration_s: float
     ) -> None:
         self.position = target_pos
+        self.calls.append(("timed", target_pos, duration_s))
+
+    async def move_to_position(
+        self, pos: int, *, smooth_over_s: float | None = None
+    ) -> None:
+        self.position = pos
+        self.calls.append(("smooth", pos, smooth_over_s))
 
     async def read_monitor(self) -> AxisMonitor:
         current = self.current_script.pop(0) if self.current_script else self.current_ma
@@ -150,23 +159,48 @@ def test_governor_reduces_holds_raises_and_releases() -> None:
     assert limit == pytest.approx(0.4 * G_TO_KMHS * 0.98)
     cfg = loop._config
 
-    # 上限以上: 最初は現在開度で頭打ち → 以降 2%/周期で下げる（本番と同じ）
+    # 上限以上: 最初は現在開度で頭打ち → 以降 2%/0.1 秒（この周期 0.02 秒なら 0.4%/周期）で下げる
     cap = loop._next_gov_cap(None, limit + 1.0, 0.0, current=30.0, request=30.0)
     assert cap == pytest.approx(30.0)
     cap = loop._next_gov_cap(cap, limit + 1.0, 0.0, current=30.0, request=30.0)
-    assert cap == pytest.approx(30.0 - cfg.gov_reduce_step_pct)
+    assert cap == pytest.approx(30.0 - cfg.gov_reduce_step_pct * 0.02 / 0.1)
     # 上限 × 0.7〜1.0: 保持
     held = loop._next_gov_cap(cap, limit * 0.8, 0.0, current=28.0, request=30.0)
     assert held == pytest.approx(cap)
-    # 上限 × 0.7 未満: 0.5%/周期で戻す
+    # 上限 × 0.7 未満: 0.5%/0.1 秒（この周期 0.02 秒なら 0.1%/周期）で戻す
     raised = loop._next_gov_cap(cap, limit * 0.5, 0.0, current=28.0, request=30.0)
-    assert raised == pytest.approx(cap + cfg.gov_raise_step_pct)
+    assert raised == pytest.approx(cap + cfg.gov_raise_step_pct * 0.02 / 0.1)
     # 指令に届いたら解除
     assert loop._next_gov_cap(29.8, limit * 0.5, 0.0, current=29.8, request=30.0) is None
     # 頭打ちが無く上限未満なら何もしない
     assert loop._next_gov_cap(None, limit * 0.5, 0.0, current=30.0, request=30.0) is None
     # 下限は 0%
     assert loop._next_gov_cap(1.0, limit + 1.0, 0.0, current=1.0, request=30.0) == 0.0
+
+
+def test_governor_steps_are_per_second_regardless_of_the_cycle() -> None:
+    """段2l-11: 下げ・戻しの刻みは 0.1 秒周期での 1 周期ぶん。周期 0.05 秒と 0.1 秒で
+    1 秒あたりの量が同じ（下げ 20 %/秒・戻し 5 %/秒）。"""
+    per_second = {}
+    for interval in (0.05, 0.1):
+        loop, *_ = _loop(
+            [_pattern(PatternKind.COAST_DOWN, accel=40.0)], interval_s=interval
+        )
+        limit = loop._g_limit_kmhs
+        n = round(1.0 / interval)
+        cap: float | None = 30.0
+        for _ in range(n):
+            cap = loop._next_gov_cap(cap, limit + 1.0, 0.0, current=30.0, request=30.0)
+        assert cap is not None
+        down = 30.0 - cap
+        for _ in range(n):
+            cap = loop._next_gov_cap(cap, limit * 0.5, 0.0, current=10.0, request=60.0)
+        assert cap is not None
+        per_second[interval] = (down, cap - (30.0 - down))
+    assert per_second[0.05][0] == pytest.approx(20.0)
+    assert per_second[0.1][0] == pytest.approx(20.0)
+    assert per_second[0.05][1] == pytest.approx(5.0)
+    assert per_second[0.1][1] == pytest.approx(5.0)
 
 
 def test_update_governor_uses_brake_deceleration_in_drive_brake() -> None:
@@ -178,10 +212,10 @@ def test_update_governor_uses_brake_deceleration_in_drive_brake() -> None:
     loop._update_governor(-(limit + 1.0))  # 減速が上限超え
     assert loop._brake_gov_cap == pytest.approx(30.0)
     loop._update_governor(-(limit + 1.0))
-    assert loop._brake_gov_cap == pytest.approx(28.0)
+    assert loop._brake_gov_cap == pytest.approx(30.0 - 0.4)  # 2%/0.1 秒 × 周期 0.02 秒
     assert loop._governor_limiting()
     loop._update_governor(-1.0)  # 減速が十分小さい → 戻す
-    assert loop._brake_gov_cap == pytest.approx(28.5)
+    assert loop._brake_gov_cap == pytest.approx(30.0 - 0.4 + 0.1)
     assert loop._accel_gov_cap is None  # ブレーキ中はアクセル側を触らない
 
 
@@ -200,7 +234,7 @@ def test_governor_predicts_ahead_and_freezes_the_press_before_the_limit() -> Non
     # 見込みが上限に届くなら下げる（頭打ち済み）
     over = (limit - 0.5 * limit) / cfg.gov_lead_s + 0.1
     assert loop._next_gov_cap(12.0, 0.5 * limit, over, current=12.0, request=30.0) == pytest.approx(
-        12.0 - cfg.gov_reduce_step_pct
+        12.0 - cfg.gov_reduce_step_pct * 0.02 / 0.1
     )
     # G が減っていく（負の速さ）ときは見込みを増やさない
     assert loop._next_gov_cap(None, 0.5 * limit, -50.0, current=12.0, request=30.0) is None
@@ -292,6 +326,50 @@ def test_coast_accel_holds_within_margin_and_backs_off_above_target() -> None:
     before = loop._ca_opening
     _run_ramp(loop, pattern, t0 + 4.1, t0 + 5.0, too_fast, 10.0)
     assert loop._ca_opening < before
+
+
+def test_coast_accel_command_waits_for_lagging_actual_opening() -> None:
+    loop, pattern, approach = _coast_loop()
+    cfg = loop._config
+    t0 = cfg.accel_ramp_time_s
+    _run_ramp(loop, pattern, 0.0, t0, 0.0, 10.0)
+    loop._accel_actual_pct = approach  # 実開度が動かない（遅れている）
+    _run_ramp(loop, pattern, t0 + 0.1, t0 + 10.0, 0.0, 10.0)  # G=0 で長く流す
+    assert loop._ca_opening <= approach + cfg.ramp_actuator_lag_tol_pct + 1e-9
+    assert loop._ca_opening > approach  # 許容ずれぶんまでは踏む
+
+
+def test_coast_accel_not_limited_when_actual_follows_command() -> None:
+    loop, pattern, approach = _coast_loop()
+    cfg = loop._config
+    t0 = cfg.accel_ramp_time_s
+    _run_ramp(loop, pattern, 0.0, t0, 0.0, 10.0)
+    loop._accel_actual_pct = loop._ca_opening
+    t = t0 + 0.1
+    while t <= t0 + 1.0 + 1e-9:
+        _feed(loop, pattern, round(t, 6), 10.0)
+        loop._accel_actual_pct = loop._ca_opening  # 実開度が指令に追従
+        t += 0.1
+    assert loop._ca_opening == pytest.approx(
+        approach + cfg.coast_accel_rate_gain * cfg.coast_accel_target_g, rel=0.15
+    )
+
+
+def test_coast_accel_limit_does_not_hold_back_or_lower_command() -> None:
+    loop, pattern, approach = _coast_loop()
+    cfg = loop._config
+    t0 = cfg.accel_ramp_time_s
+    _run_ramp(loop, pattern, 0.0, t0, 0.0, 10.0)
+    loop._accel_actual_pct = approach
+    start = approach + cfg.ramp_actuator_lag_tol_pct + 10.0  # 許容ずれより先行済み
+    # G 不足: 踏み増しは止まるが、指令は下がらない（据え置き）
+    loop._ca_opening = start
+    _run_ramp(loop, pattern, t0 + 0.1, t0 + 2.0, 0.0, 10.0)
+    assert loop._ca_opening == pytest.approx(start)
+    # G 超過: 従来どおり下がる
+    too_fast = (cfg.coast_accel_target_g + 0.1) * G_TO_KMHS
+    _run_ramp(loop, pattern, t0 + 2.1, t0 + 3.0, too_fast, 10.0)
+    assert loop._ca_opening < start
 
 
 def test_coast_accel_never_exceeds_pattern_accel_opening() -> None:
@@ -857,12 +935,60 @@ def test_coast_finishes_when_settled_near_creep_speed_even_if_not_exactly_at_it(
     loop, pattern = _calib_loop()
     loop._profile.feedforward_params.creep_speed_kmh = 5.0
     loop._enter_phase(_Phase.COAST, 0.0)
-    now = 0.0
+    # 平衡(5.0)の少し上で釣り合っている（傾き ≈ 0）。毎周期 _advance を呼ぶ。
+    # 段2l-11: 判定専用の履歴 _coast_hist に creep_launch_settle_s（2 秒）ぶん溜まってから終わる
+    # （_speed_hist は 0.4 秒で刈られるので使えなかった）
+    window = loop._config.creep_launch_settle_s
     for i in range(30):
-        now = i * 0.2
-        loop._speed_hist.append((now, 5.5))  # 平衡(5.0)の少し上で釣り合っている（傾き ≈ 0）
-    loop._advance(pattern, 5.5, 0.0, now)
+        now = i * 0.1
+        loop._advance(pattern, 5.5, 0.0, now)
+        if now < window - 1e-9:
+            assert loop._phase is _Phase.COAST  # 2 秒ぶん溜まる前は終わらない
+        if loop._phase is _Phase.DRIVE_BRAKE:
+            break
     assert loop._phase is _Phase.DRIVE_BRAKE
+    assert now >= window - 1e-9
+
+
+def test_coast_settle_history_is_separate_from_speed_hist_and_cleared_on_entry() -> None:
+    """段2l-11: 終了判定は判定専用の履歴で見る。_speed_hist は 0.4 秒で刈られても 2 秒ぶん溜まる。
+    COAST に入り直したら空にする。"""
+    loop, pattern = _calib_loop()
+    loop._profile.feedforward_params.creep_speed_kmh = 5.0
+    loop._enter_phase(_Phase.COAST, 0.0)
+    for i in range(10):
+        loop._speed_hist.append((i * 0.1, 5.5))
+        loop._advance(pattern, 5.5, 0.0, i * 0.1)
+    assert len(loop._coast_hist) > 0 and loop._coast_hist[0][0] >= 0.0
+    loop._enter_phase(_Phase.COAST, 5.0)
+    assert len(loop._coast_hist) == 0
+
+
+def test_coast_does_not_finish_when_speed_is_still_dropping_near_creep() -> None:
+    """平衡の近くでも傾きが 0.1 km/h/s 以上ある間は終わらない。"""
+    loop, pattern = _calib_loop()
+    loop._profile.feedforward_params.creep_speed_kmh = 3.0
+    loop._enter_phase(_Phase.COAST, 0.0)
+    for i in range(30):  # 天井(4.0)以下から −0.3 km/h/s で下がる（まだ平衡 3.0 に届かない）
+        loop._advance(pattern, 4.0 - 0.3 * i * 0.1, 0.0, i * 0.1)
+    assert loop._phase is _Phase.COAST
+
+
+def test_coast_finishes_with_a_non_dividing_cycle_after_the_window_fills() -> None:
+    """周期が窓（2 秒）を割り切らなくても（0.07 秒）、窓ぶん溜まったら終わる
+    （窓の端をまたぐ点を残さないと先頭がいつも窓より新しく、成立しない）。"""
+    loop, pattern = _calib_loop()
+    loop._profile.feedforward_params.creep_speed_kmh = 5.0
+    loop._enter_phase(_Phase.COAST, 0.0)
+    window = loop._config.creep_launch_settle_s
+    finished_at = None
+    for i in range(100):
+        now = i * 0.07
+        loop._advance(pattern, 5.5, 0.0, now)
+        if loop._phase is _Phase.DRIVE_BRAKE:
+            finished_at = now
+            break
+    assert finished_at is not None and window <= finished_at <= window + 0.07 + 1e-9
 
 
 def test_coast_does_not_finish_above_the_creep_ceiling_even_if_settled() -> None:
@@ -870,11 +996,9 @@ def test_coast_does_not_finish_above_the_creep_ceiling_even_if_settled() -> None
     loop, pattern = _calib_loop()
     loop._profile.feedforward_params.creep_speed_kmh = 5.0
     loop._enter_phase(_Phase.COAST, 0.0)
-    now = 0.0
     for i in range(30):
-        now = i * 0.2
-        loop._speed_hist.append((now, 20.0))  # 天井よりずっと上。傾き 0 でも終わらない
-    loop._advance(pattern, 20.0, 0.0, now)
+        # 天井よりずっと上。傾き 0 でも終わらない
+        loop._advance(pattern, 20.0, 0.0, i * 0.1)
     assert loop._phase is _Phase.COAST
 
 
@@ -1004,15 +1128,16 @@ async def _one_cycle_openings(
 ) -> tuple[float, float]:
     """phase に入れて 1 周期だけ走らせ、記録された (アクセル, ブレーキ) 指令開度を返す。
 
-    launch_done=True は G ランプの発進の段階を終えた状態（ブレーキが min に着いた後）にする。"""
+    launch_done=True は G ランプの発進（ブレーキを離す場面）を終えた状態（u ＝ 0）にする。"""
     pat = pattern or _pattern(PatternKind.COAST_DOWN, accel=30.0)
     config = PatternLoopConfig(pedal_standby=standby, accel_ramp_time_s=0.0,
                                brake_ramp_time_s=0.0)
     loop, rec, *_ = _loop([pat], speed_kmh=speed_kmh, config=config)
     loop._running = True
     loop._enter_phase(phase, asyncio.get_running_loop().time())
-    if launch_done:
-        loop._rp_launch = False
+    if launch_done:  # 2026-10-09 段2l-8: ブレーキを離し終えた状態（u ＝ 0・アクセル側）
+        loop._rp_u = 0.0
+        loop._rp_accel_reached = True
     await loop._execute_one_cycle()
     data = rec.rows[-1][0]
     return data.accel_opening, data.brake_opening
@@ -1218,3 +1343,66 @@ def test_creep_press_falls_back_to_the_ramp_when_calib_dwell_is_not_positive() -
     assert not loop._db_creep_press
     brake = loop._command_openings(pattern, loop._config.brake_ramp_time_s)[1]
     assert brake == pytest.approx(loop._stop_return_brake_pct)
+
+
+# ── 2026-10-10 段2l-10: 周期・送り方・書き込み後の待ち ──────────────────────
+
+
+async def test_ramp_phase_sends_with_smooth_over_interval_times_duty() -> None:
+    """G ランプの区間は手順3 と同じ move_to_position(smooth_over_s=周期×0.8) で送る。"""
+    p = plmod.GRampPattern(PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0,
+                           hold_duration_s=0.0, target_g=0.1, top_kmh=60.0)
+    config = PatternLoopConfig(pedal_standby=True, stop_confirm_pct=12.0, brake_ramp_time_s=0.0)
+    loop, _rec, _can, accel, brake = _loop([p], speed_kmh=0.0, config=config, interval_s=0.05)
+    loop._running = True
+    loop._enter_phase(_Phase.RAMP_UP, asyncio.get_running_loop().time())
+    await loop._execute_one_cycle()
+    calls = accel.calls + brake.calls
+    assert calls, "位置が変わる周期のはず"
+    assert all(kind == "smooth" for kind, _pos, _arg in calls)
+    assert all(arg == pytest.approx(0.05 * plmod.AXIS_SMOOTH_DUTY) for _k, _p, arg in calls)
+
+
+async def test_non_ramp_phase_still_sends_with_move_to_position_timed() -> None:
+    pat = _pattern(PatternKind.COAST_DOWN, accel=30.0)
+    config = PatternLoopConfig(pedal_standby=True, accel_ramp_time_s=0.0, brake_ramp_time_s=0.0)
+    loop, _rec, _can, accel, brake = _loop([pat], speed_kmh=50.0, config=config)
+    loop._running = True
+    loop._enter_phase(_Phase.DRIVE_ACCEL, asyncio.get_running_loop().time())
+    await loop._execute_one_cycle()
+    calls = accel.calls + brake.calls
+    assert calls
+    assert all(kind == "timed" for kind, _pos, _arg in calls)
+
+
+async def test_wait_between_write_and_read_only_when_position_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def spy_sleep(delay: float, *a: object, **k: object) -> None:
+        waits.append(delay)
+        await real_sleep(0)
+
+    pat = _pattern(PatternKind.COAST_DOWN, accel=30.0)
+    config = PatternLoopConfig(pedal_standby=True, accel_ramp_time_s=0.0, brake_ramp_time_s=0.0)
+    loop, *_ = _loop([pat], speed_kmh=50.0, config=config)
+    monkeypatch.setattr(plmod.asyncio, "sleep", spy_sleep)
+    loop._running = True
+    loop._enter_phase(_Phase.DRIVE_ACCEL, asyncio.get_running_loop().time())
+    await loop._execute_one_cycle()
+    assert plmod.AXIS_PRE_READ_DELAY_S in waits  # 位置が変わった周期は 2 ms 待つ
+    assert plmod.AXIS_PRE_READ_DELAY_S == pytest.approx(0.002)
+    # 位置が変わらない周期（同じ指令）は読むだけで待たない
+    waits.clear()
+    await loop._drive_or_sense(loop._accel_pos_cmd, loop._brake_pos_cmd)
+    assert waits == []
+
+
+def test_skip_consecutive_required_keeps_its_length_in_seconds() -> None:
+    """設定は 0.1 秒周期での周期数。50 ms 周期では 2 倍の回数にして秒を保つ。"""
+    pat = _pattern(PatternKind.COAST_DOWN, accel=30.0)
+    for interval, expect in ((0.1, 2), (0.05, 4)):
+        loop, *_ = _loop([pat], interval_s=interval)
+        assert loop._skip_required == expect

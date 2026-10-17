@@ -22,7 +22,7 @@ from __future__ import annotations
 import csv
 import math
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +45,9 @@ DEFAULT_ACCEL_WINDOW_S = 1.0  # 加速度の窓幅（前後 0.5 秒）
 # アクセルの L を使う）。ブレーキは 0.05〜0.15 でほぼ平ら（p95 0.479〜0.483）。
 DEFAULT_ACCEL_LAG_S = 0.05
 DEFAULT_BRAKE_LAG_S = 0.05
+# 指令開度と実開度のずれ [%] がこれを超えた行は学習から外す。表の開度のマス幅（u_step_pct＝2%）に
+# 合わせた。これ以上ずれると、指令で数えた行が隣のマスに入ってしまう。2026-10-10 段2l-10
+DEFAULT_ACTUATOR_LAG_TOL_PCT = 2.0
 OPENING_CMD = "cmd"
 OPENING_ACTUAL = "actual"
 
@@ -52,6 +55,7 @@ DROP_STOPPED = "停車（実車速 < 0.5 km/h）"
 DROP_NO_OPENING = "実開度が空"
 DROP_NO_SPEED = "実車速が空"
 DROP_GOVERNOR = "減速Gガバナー作動"
+DROP_ACTUATOR_LAG = "指令と実開度がずれた"
 DROP_BOTH_PEDALS = "両ペダルが不感帯超え"
 DROP_NO_WINDOW = "加速度の窓が取れない（セグメント端）"
 DROP_REASONS: tuple[str, ...] = (
@@ -59,6 +63,7 @@ DROP_REASONS: tuple[str, ...] = (
     DROP_NO_SPEED,
     DROP_STOPPED,
     DROP_GOVERNOR,
+    DROP_ACTUATOR_LAG,
     DROP_BOTH_PEDALS,
     DROP_NO_WINDOW,
 )
@@ -79,6 +84,21 @@ class FwdRows:
     dropped: dict[str, int] = field(default_factory=dict)
     sections: tuple[str, ...] = ()  # 使えた行の section
     dt_row_s: np.ndarray = field(default_factory=lambda: np.zeros(0))  # 行ごとの秒数
+    # 2026-10-14 段2o-5: 各行の「戻し量」[%]。直近 RELEASE_WINDOW_S 秒（その行を含む）の u の
+    # 最小からの戻り量で、u < 0 の行だけ正（u − 最小）、それ以外は 0。行を捨てる前の
+    # 全時系列で計算する（release_amount）。省略（長さ 0）なら全行 0（古い呼び出し・テスト用）
+    release_pct: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    # 2026-10-14 段2o-5: 「発進の区間」（launch_mask）の行が True。C8 のブレーキ側の学習から外すため
+    # （発進は戻しではなく attach_launch の別の表が受け持つ）。read_fwd_rows が mark_launch=True で
+    # 作る。省略（長さ 0）なら全行 False
+    launch_row: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+
+    def __post_init__(self) -> None:
+        n = len(self.speed_kmh)
+        if len(self.release_pct) == 0 and n > 0:
+            object.__setattr__(self, "release_pct", np.zeros(n))
+        if len(self.launch_row) == 0 and n > 0:
+            object.__setattr__(self, "launch_row", np.zeros(n, dtype=bool))
 
     def __len__(self) -> int:
         return len(self.speed_kmh)
@@ -90,6 +110,33 @@ class FwdRows:
 
     def dropped_seconds(self) -> dict[str, float]:
         return {k: n * self.dt_s for k, n in self.dropped.items()}
+
+
+# 仮値（戻し量 release_amount）: 「山」を見る窓の長さ [s]。根拠: モード（WLTP）のブレーキの戻しは
+# 1〜3 秒で終わる（段2o-4 の数え）。実機の後に決め直す。fwd_plan の再解も同じ値を使う
+RELEASE_WINDOW_S = 3.0
+
+
+def release_amount(
+    t_s: np.ndarray, u_pct: np.ndarray, window_s: float = RELEASE_WINDOW_S
+) -> np.ndarray:
+    """戻し量 [%]（2026-10-14 段2o-5）。1 本の連続した時系列（時刻昇順）について、各点の
+    「直近 window_s 秒（その点を含む）の u の最小からの戻り量」を、u < 0 の点だけ u − 最小として返す
+    （u >= 0 の点は 0）。u が NaN の点は最小の計算から外す（その点自身の戻し量は 0）。
+    例: u = −6 から −4 へ戻した点は 2、−6 のままなら 0。
+    """
+    t = np.asarray(t_s, dtype=float)
+    u = np.asarray(u_pct, dtype=float)
+    out = np.zeros(len(t))
+    start = 0
+    for i in range(len(t)):
+        while t[start] < t[i] - window_s - 1e-9:
+            start += 1
+        if not (u[i] < 0.0):  # NaN も含めて 0
+            continue
+        win = u[start : i + 1]
+        out[i] = u[i] - float(np.nanmin(win))
+    return out
 
 
 def effective_opening(
@@ -143,15 +190,29 @@ def read_fwd_rows(
     brake_lag_s: float = DEFAULT_BRAKE_LAG_S,
     coast_lag_s: float | None = None,
     opening_source: str = OPENING_CMD,
+    actuator_lag_tol_pct: float | None = DEFAULT_ACTUATOR_LAG_TOL_PCT,
+    keep_stopped: bool = False,
+    mark_launch: bool = True,
 ) -> FwdRows:
-    """走行 CSV 1 本から学習用の行を作る。捨てた行は理由ごとに dropped に数える。"""
+    """走行 CSV 1 本から学習用の行を作る。捨てた行は理由ごとに dropped に数える。
+
+    actuator_lag_tol_pct: アクセルかブレーキのどちらかで |指令開度 − 実開度| がこれを超えた行を
+    捨てる（DROP_ACTUATOR_LAG）。None なら外さない。実開度の列が無い・空の行は捨てない。
+    指令（`*_cmd_pct`）も実開度（`*_actual_pct`）も同じ物差し（待機位置 min を含む %）。
+    keep_stopped: True なら停車（実車速 < STOP_SPEED_KMH）の行も捨てない（DROP_STOPPED に数えない。
+    発進の区間 `launch_mask` を作るため。2026-10-14 段2o-4）。既定 False は今までどおり。
+    mark_launch: True（既定。keep_stopped=False のときだけ働く）なら、`launch_row` に発進の区間の
+    行を印す（2026-10-14 段2o-5）。pattern_drive が発進側の表（attach_launch）に使う行と同じ定義
+    （実開度・ずれ許容なし・停車の行を残す・窓 LAUNCH_ACCEL_WINDOW_S で読み直して launch_mask）で
+    判定し、時刻が一致する行（elapsed_s の差が刻みの半分未満）に写す。
+    """
     if opening_source not in (OPENING_CMD, OPENING_ACTUAL):
         raise ValueError(f"opening_source は cmd か actual: {opening_source!r}")
     pick = _cmd_or_none if opening_source == OPENING_CMD else actual_opening
     lag_coast = accel_lag_s if coast_lag_s is None else coast_lag_s
     dropped = dict.fromkeys(DROP_REASONS, 0)
-    # セグメントごとの行: (t, 実車速, accel実開度, brake実開度, ガバナー, section)
-    segments: list[list[tuple[float, float, float | None, float | None, bool, str]]] = []
+    # セグメントごとの行: (t, 実車速, accel実開度, brake実開度, ガバナー, section, ずれ超え)
+    segments: list[list[tuple[float, float, float | None, float | None, bool, str, bool]]] = []
     prev_t = math.nan
     prev_section = ""
     with path.open(newline="", encoding="utf-8") as f:
@@ -169,6 +230,14 @@ def read_fwd_rows(
             if new_seg:
                 segments.append([])
             prev_t, prev_section = t, section
+            lagged = False
+            if actuator_lag_tol_pct is not None:
+                for axis in ("accel", "brake"):
+                    cmd, act = _cmd_or_none(r, axis), actual_opening(r, axis)
+                    if cmd is None or act is None:
+                        continue
+                    if abs(cmd - act) > actuator_lag_tol_pct:
+                        lagged = True
             segments[-1].append(
                 (
                     t,
@@ -177,6 +246,7 @@ def read_fwd_rows(
                     pick(r, "brake"),
                     _truthy(r.get("governor_active")),
                     section,
+                    lagged,
                 )
             )
 
@@ -184,6 +254,7 @@ def read_fwd_rows(
     u_o: list[float] = []
     acc_o: list[float] = []
     t_o: list[float] = []
+    rel_o: list[float] = []
     secs: set[str] = set()
     all_dt: list[float] = []
     for seg in segments:
@@ -193,18 +264,30 @@ def read_fwd_rows(
         ok = np.array([np.isfinite(x[1]) for x in seg])
         sp = np.array([x[1] for x in seg])
         us: list[float | None] = []
-        for i, (_t, v, ap, bp, gov, _s) in enumerate(seg):
+        # 2026-10-14 段2o-5: 戻し量は行を捨てる前の全時系列の u で計算する（開度が読めた行は
+        # 停車・ガバナー・ずれ超えで捨てる行も含める。両ペダルが不感帯超えの行は NaN）
+        u_full = np.full(len(seg), np.nan)
+        for i, x in enumerate(seg):
+            if x[2] is not None and x[3] is not None:
+                uf = effective_opening(x[2], x[3], accel_deadband_pct, brake_deadband_pct)
+                if uf is not None:
+                    u_full[i] = uf
+        rel_full = release_amount(ts, u_full)
+        for i, (_t, v, ap, bp, gov, _s, lagged) in enumerate(seg):
             if ap is None or bp is None:
                 dropped[DROP_NO_OPENING] += 1
                 us.append(None)
             elif not ok[i]:
                 dropped[DROP_NO_SPEED] += 1
                 us.append(None)
-            elif v < STOP_SPEED_KMH:
+            elif v < STOP_SPEED_KMH and not keep_stopped:
                 dropped[DROP_STOPPED] += 1
                 us.append(None)
             elif gov:
                 dropped[DROP_GOVERNOR] += 1
+                us.append(None)
+            elif lagged:
+                dropped[DROP_ACTUATOR_LAG] += 1
                 us.append(None)
             else:
                 u = effective_opening(ap, bp, accel_deadband_pct, brake_deadband_pct)
@@ -226,10 +309,11 @@ def read_fwd_rows(
             u_o.append(float(u_arr[j]))
             acc_o.append(float(slope[j]))
             t_o.append(float(t_keep[j]))
+            rel_o.append(float(rel_full[i]))
             secs.add(seg[i][5])
     dt = float(np.median(all_dt)) if all_dt else 0.0
     n = len(speed_o)
-    return FwdRows(
+    out = FwdRows(
         speed_kmh=np.array(speed_o, dtype=float),
         u_pct=np.array(u_o, dtype=float),
         accel_kmhs=np.array(acc_o, dtype=float),
@@ -239,7 +323,90 @@ def read_fwd_rows(
         dropped=dropped,
         sections=tuple(sorted(secs)),
         dt_row_s=np.full(n, dt),
+        release_pct=np.array(rel_o, dtype=float),
     )
+    if mark_launch and not keep_stopped and n > 0:
+        la = read_fwd_rows(
+            path,
+            accel_deadband_pct=accel_deadband_pct,
+            brake_deadband_pct=brake_deadband_pct,
+            sections=sections,
+            accel_window_s=LAUNCH_ACCEL_WINDOW_S,
+            accel_lag_s=accel_lag_s,
+            brake_lag_s=brake_lag_s,
+            coast_lag_s=coast_lag_s,
+            opening_source=OPENING_ACTUAL,
+            actuator_lag_tol_pct=None,
+            keep_stopped=True,
+            mark_launch=False,
+        )
+        lm = launch_mask(la) if len(la) else np.zeros(0, dtype=bool)
+        if lm.any():
+            flag = np.zeros(n, dtype=bool)
+            tl = la.t_s
+            for i, ti in enumerate(out.t_s.tolist()):
+                k = int(np.searchsorted(tl, ti))
+                near = [j for j in (k - 1, k) if 0 <= j < len(tl)]
+                j = min(near, key=lambda q: abs(tl[q] - ti))
+                flag[i] = bool(lm[j]) and abs(tl[j] - ti) < max(dt, 1e-9) / 2.0
+            out = replace(out, launch_row=flag)
+    return out
+
+
+# 発進の区間を読み直すときの加速度の窓 [s]。pattern_drive.LAUNCH_ACCEL_WINDOW_S と同じ値
+# （tests/research は pattern_drive を import しないので持ち込み。変えるときは両方）
+LAUNCH_ACCEL_WINDOW_S = 0.5
+# 仮値: 発進の区間で「車速が下がっていない」とみなす加速度の下限（−この値）[km/h/s]。
+# 停車中の傾きの雑音ぶん。段2o-4 の確認で発進の区間の行を見て決める
+LAUNCH_ACCEL_TOL_KMHS = 0.05
+
+
+def take_rows(rows: FwdRows, mask: np.ndarray) -> FwdRows:
+    """mask（bool、長さ len(rows)）が True の行だけの FwdRows。dropped・dt_s・source は引き継ぐ。"""
+    m = np.asarray(mask, dtype=bool)
+    return FwdRows(
+        speed_kmh=rows.speed_kmh[m],
+        u_pct=rows.u_pct[m],
+        accel_kmhs=rows.accel_kmhs[m],
+        t_s=rows.t_s[m],
+        dt_s=rows.dt_s,
+        source=rows.source,
+        dropped=dict(rows.dropped),
+        sections=rows.sections,
+        dt_row_s=rows.dt_row_s[m],
+        release_pct=rows.release_pct[m],
+        launch_row=rows.launch_row[m],
+    )
+
+
+def launch_mask(rows: FwdRows, *, gap_s: float = SEGMENT_GAP_S) -> np.ndarray:
+    """「発進の区間」の行が True の配列（2026-10-14 段2o-4）。
+    rows は keep_stopped=True で読んだ時刻順の行。
+
+    区間の始まりは停車の行（実車速 < STOP_SPEED_KMH。ただし u <= 0 のとき。停車中に
+    アクセルを踏んでいる行は False で、区間も始めない）。続く行は、前の行から途切れていない
+    （時刻の間隔 < gap_s）・アクセルを踏んでいない（u <= 0）・車速が下がっていない
+    （加速度 >= −LAUNCH_ACCEL_TOL_KMHS）のすべてを満たす間だけ True。
+    外れた行で区間は終わり、次に停車の行が来るまで False。
+    """
+    n = len(rows)
+    out = np.zeros(n, dtype=bool)
+    inside = False
+    prev_t = math.nan
+    for i in range(n):
+        t = float(rows.t_s[i])
+        u = float(rows.u_pct[i])
+        if rows.speed_kmh[i] < STOP_SPEED_KMH:
+            inside = u <= 0.0
+        elif inside:
+            inside = (
+                0.0 < t - prev_t < gap_s
+                and u <= 0.0
+                and float(rows.accel_kmhs[i]) >= -LAUNCH_ACCEL_TOL_KMHS
+            )
+        out[i] = inside
+        prev_t = t
+    return out
 
 
 def concat_rows(parts: Sequence[FwdRows], source: str = "") -> FwdRows:
@@ -263,6 +430,8 @@ def concat_rows(parts: Sequence[FwdRows], source: str = "") -> FwdRows:
         dropped=dropped,
         sections=tuple(sorted({s for p in parts for s in p.sections})),
         dt_row_s=dt_row,
+        release_pct=cat("release_pct"),
+        launch_row=cat("launch_row").astype(bool),
     )
 
 

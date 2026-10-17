@@ -443,6 +443,55 @@ def hold_durations_s(values: Floats, *, dt: float, tol: float) -> list[float]:
 
 
 @dataclass(frozen=True)
+class PedalOverlap:
+    """アクセルとブレーキの実開度が両方とも待機位置を超えた（同時踏み）の集計。"""
+
+    total_s: float  # 合計時間 [s]（行数 × 行の刻み）
+    count: int  # 連続した行のかたまりの数
+    max_depth_pct: float  # 重なりの深さの最大 [%]
+    max_depth_t_s: float | None  # その時刻（重なりが無ければ None）
+
+
+def pedal_overlap(
+    t_s: Sequence[float],
+    accel_actual_pct: Sequence[float | None],
+    brake_actual_pct: Sequence[float | None],
+    *,
+    accel_min_pct: float,
+    brake_min_pct: float,
+    margin_pct: float,
+) -> PedalOverlap | None:
+    """実開度が両方とも 待機位置＋margin を超えた行（同時踏み）を数える。
+
+    重なりの深さ = min(アクセル実開度 − accel_min, ブレーキ実開度 − brake_min)。
+    実開度が 1 行でも None（旧形式 CSV・モニタ無し）なら計算できないので None を返す。
+    """
+    if any(a is None for a in accel_actual_pct) or any(b is None for b in brake_actual_pct):
+        return None
+    dt = sample_interval_s(t_s)
+    count = 0
+    n_rows = 0
+    prev = False
+    best_depth = 0.0
+    best_t: float | None = None
+    for t, a, b in zip(t_s, accel_actual_pct, brake_actual_pct, strict=True):
+        assert a is not None and b is not None
+        da, db = a - accel_min_pct, b - brake_min_pct
+        hit = da > margin_pct and db > margin_pct
+        if hit:
+            n_rows += 1
+            if not prev:
+                count += 1
+            depth = min(da, db)
+            if best_t is None or depth > best_depth:
+                best_depth, best_t = depth, t
+        prev = hit
+    return PedalOverlap(
+        total_s=n_rows * dt, count=count, max_depth_pct=best_depth, max_depth_t_s=best_t
+    )
+
+
+@dataclass(frozen=True)
 class ChatterMetrics:
     """1.4Hz 付近のばたつきをまとめて測る指標（読み取り専用解析。プライマリー KPI とは別枠）。"""
 

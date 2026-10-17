@@ -197,6 +197,20 @@ claude --version
    ##   開度は 原点 = 0% / 9500 pulse = 100%（キャリブレーションは使わない）
    ##   ペダル探索の 3 値（不感帯 2 つ・停車保持開度）は走行前に、
    ##   feedforward.model_path と物理定数は走行後に config_testVehicle.yaml へ保存される
+   ##   2026-10-13 段2o-2（ProblemReport_20261001）: いちばん弱い G の段（0.02G）の途中で定速の保持
+   ##   （15〜95 km/h は 10 km/h 刻み・110・130 km/h。上り下り）を挟み、G ランプの後に 30・60 km/h で
+   ##   遅れの測定（アクセルを踏む → 戻す → 離す → ブレーキを踏む → 離す を 2.5 秒ずつ）を走る。
+   ##   feedforward.candidate が C8 なら relu（2 層 50 個）のモデルを作る。全体で約 34 分
+   ##   2026-10-14 段2o-4: 0.045G 以上の段にも、モードで「走行中から加速が始まる車速」に保持を挟む
+   ##   （上りだけ。0.045G 9 回×2 周・0.08G 4 回・0.125G 2 回×2 周・0.175G 1 回）。全体で約 40 分。
+   ##   C8 の表は u を 0.5% 刻みにし、発進側の表（launch_accel）を pkl に足す
+   ##   2026-10-14 段2o-5: 0.045〜0.175G の下りに「戻し」（半分まで離す → 保持 → 待機位置まで離す →
+   ##   惰行 → 踏み直す）を 24 か所。C8 のブレーキ側に戻し量（release_accel）を足す。全体で約 43 分
+   ##   2026-10-16 段2o-6: G ランプが 1 本終わるたびに「効き始め」（遊びの終わり）を折れ点で計算し直し、
+   ##   ブレーキの遅れのステップ（効き始め → ＋Δb → 効き始め）と戻しの目標に使う。pkl の meta に効き始めを入れる。
+   ##   戻しを切って比べるときは learning.ramp_release_enabled: false（周回は変わらない）
+   ##   前回の手順2 の効き始めを見る（走らない）: `.venv/bin/python -m tests.research.play_onset <手順2 の CSV>`
+   ##   走る前に段と保持・戻す車速を確認（走らない）: `.venv/bin/python -m tests.research.ramp_planner`
    `.venv/bin/python -m tests.research.main --steps 1,2 --hw real; echo "exit=$?"`
 
    ## 走行後: アクセル 0% → ブレーキ不感帯の手前まで一発 → 0.5mm 刻み・1s 待ちで 0.2G 付近の緩減速 → 停車保持
@@ -209,8 +223,12 @@ claude --version
 
    ## 終了コード: 5 走行エラー（ペダル探索の失敗・非常停止・タイムアウト） / 6 モデル作成エラー（サンプル不足）
    ##            / 7 走行前チェックエラー（NG 項目あり・ブレーキを上限まで踏んでも停車しない）
+   ##            / 8 手順2 の学習結果のチェックが NG（段2o-7。yaml は書き換えない・pkl は残る。表の NG の行と理由を見る。
+   ##              手順3 は前のモデルのまま走れる。作り直しは `--retrain <手順2 の CSV> --hw real`）
 
   # 手順 3 を実行（FF のみで WLTP モード走行 → CSV / 図 / レポート）
+   ## 2026-10-16 段2o-6: pkl に効き始めがあれば、踏み出しの 0.2 秒前から次のペダルを効き始め − 0.5% へ先に置く
+   ##   （もう一方が min になってから。forward_map.preposition_*。起動時に「先置き」の回数を表示）
    ## 実行順: 手順 1（初期化）→ 準備（走行モードを DB から・FF モデルを読む）→ 走行前チェック → 手順 3
    ##   準備に失敗したら HW に触らず終了コード 2（DB に繋がらない・モード名が無い・FF モデルが無い）
    ##   制御: FF（手順 2 のモデル）→ effort の符号でアクセル/ブレーキに振り分け（Kp=Ki=Kd=0、
@@ -777,3 +795,26 @@ cp tests/research/config_testVehicle.yaml /tmp/config_stub.yaml
 ```
 （既知の失敗。yaml の値に依るもので段2k と無関係: `test_research_config.py` 4 件、
 `test_research_pattern_loop.py::test_governor_reduces_holds_raises_and_releases`、`test_research_mode_drive.py` 3 件）
+
+## 両踏みを無くす（ProblemReport_20261001 段2o-9。2026-10-17）
+
+- 手順2 のモデル作成で、ペダルが min に戻るまでの時間（遅れ・戻る速さ）を測り、pkl の meta に入れる。表示は「戻る時間[アクセル]: 遅れ … 秒・… %/秒（場面 … 件）」。チェック表の B6 で計算し直しと照合する。
+- 手順3 の準備の表示「切り替えのすき間: 切り替え … 回・前倒し … 回・次を遅らせ … 回・不足の残り … 回」。不足の残りは 0 のはず（D1 で NG になる）。「戻る時間は仮値」と出たら、pkl に測定値が無い（古い pkl）。`--retrain <手順2 の CSV> --hw real` で作り直す。
+- 走行の最後とレポート 5 章の「実開度の安全網で止めた回数・秒数」: もう一方のペダルの実開度が min ＋ 0.05% を超えている間、次のペダルを止めた量。0 に近いほどよい（大きければ列の待ちが短い）。`mode_drive.pedal_interlock_enabled: false` で切れる。
+
+```bash
+.venv/bin/python -m tests.research.main --retrain tests/research/results/drive_log_real_20261016_200434_lap1.csv --hw real; echo "exit=$?"
+.venv/bin/python -m tests.research.main --steps 1,3 --hw real; echo "exit=$?"
+```
+
+
+## C10（偏差の上乗せ。段2p）
+
+- 切り替え: yaml の `feedforward.candidate: C10`（pkl は C8 と同じモデルの pkl のまま）。C8 に戻せば今までと同じ。
+- 強さ: `forward_map.deviation_c`（既定 100。τ ＝ c × pkl の遅れ。小さいほど強い。0 なら C8 と同じ出力）。
+- 表の行: `forward_map.deviation_row: reference`（案A・基準車速）／`actual`（案B・実車速）。
+- 確かめ方: レポート 5 章の「C10」行、CSV の `c10_effort_pct` 列と candidate 列。
+
+```bash
+.venv/bin/python -m tests.research.main --steps 1,3 --hw real; echo "exit=$?"
+```

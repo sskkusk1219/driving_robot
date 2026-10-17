@@ -27,10 +27,11 @@
 終了コード:
     0 成功 / 2 設定エラー / 3 未実装の手順に到達 / 4 初期化エラー / 5 走行エラー
     / 6 モデル作成エラー / 7 走行前チェックエラー
+    / 8 手順2 の学習結果のチェックが NG（yaml は書き換えていない。後の手順には進まない）
 
 安全上の注意:
-    `--hw real` は実アクチュエータを物理的に動かす。**ユーザーが自分で指定する**もので、
-    既定は `stub`（本番と同じスタブ HW）。
+    `--hw real` は実アクチュエータを物理的に動かす。既定は `stub`（本番と同じスタブ HW）。
+    Claude が無人で実行してよい条件は `.claude/skills/bench-verification/SKILL.md` に従う。
 """
 
 from __future__ import annotations
@@ -83,10 +84,12 @@ from tests.research.pedal_search import run_pedal_search
 from tests.research.pre_drive_check import PHASE_PRE_CHECK, run_pre_drive_check
 from tests.research.ramp_planner import (
     count_bands_for_modes,
+    cruise_kwargs,
     format_plan_table,
     plan_ramps,
     top_speed_cap_kmh,
 )
+from tests.research.step2_check import Step2CheckError
 from tests.research.term import banner, display_width, say
 from tests.research.vehicle import STROKE_LIMIT_PULSE
 
@@ -323,6 +326,7 @@ _CANDIDATE_KIND: dict[str, str] = {
     **dict.fromkeys(("C1", "C2", "C3", "C4", "C5"), "2次多項式 Ridge 逆モデル"),
     "C7": "順モデルの表",
     "C8": "順モデル",
+    "C10": "順モデル（C8 と同じ pkl。走行中に偏差の分を上乗せする）",  # 2026-10-17 段2p
 }
 
 
@@ -353,9 +357,15 @@ async def step2_pattern_drive(ctx: RunContext) -> None:
     # 2026-10-07 段2l-4: 上端 = min(モードの最高車速 + 余裕, 車両の最高速)。ランプと惰行で共通
     top_cap = top_speed_cap_kmh(cover_modes, lr.ramp_top_margin_kmh, cfg.vehicle.max_speed_kmh)
     plan = plan_ramps(
-        count_bands_for_modes(cover_modes, lr.ramp_g_levels),
+        count_bands_for_modes(
+            cover_modes, lr.ramp_g_levels, cruise_kwargs(cfg)["cruise_min_kmh"]
+        ),  # 2026-10-14 段2o-5: 戻しの数えは クリープ ＋ 5 km/h 以上で終わる減速
         mode_min_s=lr.ramp_mode_min_s, max_speed_kmh=top_cap,
         budget_s=lr.ramp_time_budget_s,
+        max_passes=lr.ramp_max_passes,  # 2026-10-17 段2o-8
+        hold_s=lr.ramp_hold_time_s, turn_s=lr.ramp_turn_time_s,
+        min_at_g_s=lr.ramp_min_at_g_s, launch_s=lr.ramp_launch_time_s, edge_g=lr.ramp_edge_g,
+        **cruise_kwargs(cfg),  # 2026-10-13 段2o-2: いちばん弱い段の途中の定速保持
     )
     say(f"G ランプの段（モード: {', '.join(cfg.modes.coverage_mode_names)}、"
         f"最高速 {top_cap:.1f} km/h）:")
@@ -376,10 +386,11 @@ async def step2_pattern_drive(ctx: RunContext) -> None:
         await log.close()  # 停車保持まで記録したら保存し、その CSV（パターン走行の行）で学習する
     say()
     say(f"2-2. 物理定数の推定とモデル作成（candidate={candidate}: {_CANDIDATE_KIND[candidate]}）")
-    # 重み付けは sample_weight_enabled のときだけ有効（無効でも wltp_mode を渡すと MAE_WLTP が出る）
+    # 重み付けは SAMPLE_WEIGHT_ENABLED のときだけ有効（無効でも wltp_mode を渡すと MAE_WLTP が出る）
     await asyncio.to_thread(
         build_ff_model,
         ctx.config, drive.csv_path, hw_mode=hw.hw_mode, pedal=pedal, wltp_mode=wltp_mode,
+        ramp_results=drive.ramp_results,  # チェック B5① 用（走行中の最後の効き始め）
     )
     if hw.is_real:
         ctx.config = load_config(ctx.config.source_path)  # 以降の手順は書き戻した値で走る
@@ -448,6 +459,14 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
         abort_reason=result.abort_reason,
         cycles=result.cycles,
         overruns=result.overruns,
+        interlock=(
+            None if result.interlock is None else (
+                result.interlock.accel_events, result.interlock.accel_s,
+                result.interlock.brake_events, result.interlock.brake_s,
+            )
+        ),
+        c10_settings=result.c10_settings,
+        c10_summary=None if result.c10 is None else result.c10.summary(),
         notes=notes,
     )
     rows = rows_from_samples(result.samples)
@@ -697,13 +716,19 @@ def retrain_only(args: argparse.Namespace) -> int:
         say(f"設定の読み込みに失敗しました: {exc}")
         return 2
     say(f"ハードウェアモード: {args.hw}（走行はしません）")
-    # 段2（ProblemReport_20260925）: sample_weight_enabled のときだけ WLTP の基準車速を読む。
-    # retrain_only は asyncio ループの外（同期関数）から呼ばれるので asyncio.run でよい
+    # WLTP の基準車速は DB から読む（学習結果のチェック D1・B3 と重み付けに使う）。読めなければ
+    # None（D1 は SKIP）。retrain_only は asyncio ループの外（同期関数）から呼ばれるので asyncio.run
     wltp_mode = None
-    if config.learning.sample_weight_enabled:
-        wltp_mode = asyncio.run(load_mode(config, config.modes.wltp_mode_name))
     try:
+        wltp_mode = asyncio.run(load_mode(config, config.modes.wltp_mode_name))
+    except Exception as exc:  # noqa: BLE001 - DB が無くても作り直しは続ける
+        say(f"注: WLTP のモードを DB から読めません（{type(exc).__name__}）→ チェック D1 は SKIP")
+    try:
+        # 走行の材料（ramp_results・pedal）は無い。それを使う項目（B5①・C1）は SKIP
         build_ff_model(config, csv_path, hw_mode=args.hw, pedal=None, wltp_mode=wltp_mode)
+    except Step2CheckError as exc:
+        say(f"手順2 の学習結果のチェックエラー: {exc}")
+        return 8
     except LearningDataError as exc:
         say(f"モデル作成エラー: {exc}")
         return 6
@@ -760,6 +785,11 @@ async def run_steps(ctx: RunContext, steps: list[Step]) -> int:
             except DriveError as exc:
                 say(f"走行エラー: {exc}")
                 exit_code = 5
+                break
+            except Step2CheckError as exc:
+                say(f"手順2 の学習結果のチェックエラー: {exc}")
+                say("yaml は書き換えていません。後の手順には進みません。")
+                exit_code = 8
                 break
             except LearningDataError as exc:
                 say(f"モデル作成エラー: {exc}")

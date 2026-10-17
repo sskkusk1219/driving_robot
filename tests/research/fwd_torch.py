@@ -93,9 +93,13 @@ def split_indices(
     )
 
 
-def make_net(hidden: Sequence[int], activation: str = "logistic") -> nn.Sequential:
+def make_net(
+    hidden: Sequence[int], activation: str = "logistic", n_inputs: int = 2
+) -> nn.Sequential:
+    """n_inputs: 入力の数（アクセル側は 2＝車速・u、ブレーキ側は 2026-10-14 段2o-5 から
+    3＝＋戻し量）。"""
     layers: list[nn.Module] = []
-    n_in = 2
+    n_in = n_inputs
     for h in hidden:
         layers += [nn.Linear(n_in, h), ACTIVATIONS[activation]()]
         n_in = h
@@ -105,7 +109,8 @@ def make_net(hidden: Sequence[int], activation: str = "logistic") -> nn.Sequenti
 
 @dataclass
 class TorchSide:
-    """片側の学習済みネット。predict は (N, 2)（車速・u）→ 加速度 [km/h/s]。"""
+    """片側の学習済みネット。predict は (N, 2)（車速・u）→ 加速度 [km/h/s]。
+    ブレーキ側は (N, 3)（車速・u・戻し量。2026-10-14 段2o-5）。"""
 
     net: nn.Sequential
     x_mean: np.ndarray
@@ -113,6 +118,10 @@ class TorchSide:
     y_mean: float
     y_std: float
     n_iter: int = 0
+
+    @property
+    def n_inputs(self) -> int:
+        return len(self.x_mean)
 
     def predict(self, x: np.ndarray) -> np.ndarray:
         zx = (np.asarray(x, dtype=float) - self.x_mean) / self.x_std
@@ -163,7 +172,7 @@ def fit_side(
 
     gen = torch.Generator().manual_seed(seed)
     torch.manual_seed(seed)
-    net = make_net(hidden, activation)
+    net = make_net(hidden, activation, n_inputs=x.shape[1])
     opt = torch.optim.Adam(net.parameters(), lr=LEARNING_RATE)
     lf = _loss_fn(loss)
 
@@ -265,8 +274,10 @@ class WindowGroup:
 
 
 def _side_accel(side: TorchSide, v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-    """片側のネットを物理単位（km/h/s）で評価する。"""
-    x = torch.stack([v, u], dim=1)
+    """片側のネットを物理単位（km/h/s）で評価する。入力が 3 つの側（ブレーキ側）は
+    戻し量 0 で評価する（積み上げの追加学習は戻し量を使わない。2026-10-14 段2o-5）。"""
+    cols = [v, u] if side.n_inputs == 2 else [v, u, torch.zeros_like(v)]
+    x = torch.stack(cols, dim=1)
     xm = torch.as_tensor(side.x_mean, dtype=x.dtype)
     xs = torch.as_tensor(side.x_std, dtype=x.dtype)
     return side.net((x - xm) / xs).squeeze(1) * side.y_std + side.y_mean

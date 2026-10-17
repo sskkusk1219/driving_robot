@@ -8,6 +8,7 @@
     - 実開度           … 両軸を 0x9000 から 14 レジスタまとめ読みした実位置 PNOW [%]・[mm]
     - ステータス       … 区間・段・ガバナー・アラーム ＋ 軸ごとのサーボON・移動中・
                          位置決め完了・アラームコード
+    - accel_kp 等      … G ランプの偏差の項のゲイン Kp・Ki（ペダル別。G ランプの行だけ）
     - cycle_ms         … その行の読み取り（パターン・モード走行は 1 周期の処理）の実時間
 旧形式（〜A6 の `accel_opening`・`ff_effort_pct` などの列）の CSV も `cmd_opening`・
 `ff_effort` などで読める。
@@ -76,6 +77,13 @@ CSV_COLUMNS: tuple[str, ...] = (
     # 指示開度 FF（FF の出力をペダル別に分けた値。モード走行の行だけ）
     "accel_ff_pct",
     "brake_ff_pct",
+    # G ランプの偏差の項のゲイン（その走行で測った感度から毎周期計算した直近の値。G ランプの行だけ。
+    # 0 は感度がまだ無く最小刻みで動かしている。Kp [%/(km/h)]・Ki [%/(km/h·s)]。使っていない
+    # ペダルの値は最後に使ったときのまま）
+    "accel_kp",
+    "accel_ki",
+    "brake_kp",
+    "brake_ki",
     # 指示開度 FF・PID（アクチュエータへ送った最終指令。ガバナーで削った後・待機位置を含む）
     "accel_cmd_pct",
     "brake_cmd_pct",
@@ -105,6 +113,9 @@ CSV_COLUMNS: tuple[str, ...] = (
     "brake_moving",
     "brake_pos_done",
     "brake_alarm_code",
+    # 2026-10-17 段2p: C10 が開度の列に上乗せした effort [%]（正＝アクセル側へ増やした・
+    # 負＝ブレーキ側へ増やした。モード走行の C10 の行だけ。他の候補・他の区間・旧 CSV は空欄）
+    "c10_effort_pct",
 )
 
 
@@ -130,6 +141,12 @@ class DriveSample:
     monitor_brake: AxisMonitor | None = None
     cycle_ms: float | None = None
     candidate: str = ""  # V1: FF 候補名（C1〜C5）。モード走行だけ入れる
+    # G ランプの偏差の項のゲイン（G ランプの行だけ。他は None ＝ 空欄）
+    accel_kp: float | None = None
+    accel_ki: float | None = None
+    brake_kp: float | None = None
+    brake_ki: float | None = None
+    c10_effort_pct: float | None = None  # C10 の上乗せ分（C10 の行だけ。他は None ＝ 空欄）
 
 
 class SessionLog:
@@ -201,6 +218,11 @@ class SessionLog:
         monitor_brake: AxisMonitor | None = None,
         cycle_ms: float | None = None,
         candidate: str = "",
+        accel_kp: float | None = None,
+        accel_ki: float | None = None,
+        brake_kp: float | None = None,
+        brake_ki: float | None = None,
+        c10_effort_pct: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -220,6 +242,11 @@ class SessionLog:
             monitor_brake=monitor_brake,
             cycle_ms=cycle_ms,
             candidate=candidate,
+            accel_kp=accel_kp,
+            accel_ki=accel_ki,
+            brake_kp=brake_kp,
+            brake_ki=brake_ki,
+            c10_effort_pct=c10_effort_pct,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -339,6 +366,13 @@ def _mm(pulse: int) -> str:
     return f"{pulse / PULSE_PER_MM:.2f}"
 
 
+def monitor_opening_pct(m: AxisMonitor | None) -> float | None:
+    """モニタの読み戻し位置を実開度 [%] にする（CSV の *_actual_pct 列と同じ値、小数 3 桁）。"""
+    if m is None:
+        return None
+    return round(pulse_to_opening(m.position_pulse), 3)
+
+
 def _actual_cells(m: AxisMonitor | None) -> tuple[str, str]:
     if m is None:
         return "", ""
@@ -370,6 +404,10 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(deviation),
                 _fmt(s.accel_ff_pct),
                 _fmt(s.brake_ff_pct),
+                _fmt(s.accel_kp, 5),
+                _fmt(s.accel_ki, 5),
+                _fmt(s.brake_kp, 5),
+                _fmt(s.brake_ki, 5),
                 f"{d.accel_opening:.3f}",
                 f"{d.brake_opening:.3f}",
                 _mm(d.accel_pos),
@@ -389,6 +427,7 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt_bool(s.alarm_brake),
                 *_status_cells(s.monitor_accel),
                 *_status_cells(s.monitor_brake),
+                _fmt(s.c10_effort_pct),
             ])
 
 

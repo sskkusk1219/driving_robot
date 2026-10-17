@@ -1,7 +1,8 @@
 """G ランプ走行をスタブ HW で通しで走らせる動作確認 CLI（段2k 段B）。
 
 走る列: `pattern_drive.build_patterns`（手順2 と同じ。コーストダウン ×1 → `ramp_planner.plan_ramps`
-の `execution_order()` の段。2026-10-08 段2l-6 でクリープ域ブレーキ保持は列から外した）。
+の `execution_order()` の段。2026-10-08 段2l-6 でクリープ域ブレーキ保持は列から外した。
+2026-10-13 段2o-2: --lag で遅れの測定の段（HOLD_STEP）も足し、走り終えたら推定を表示する）。
 --full なしのときだけ段を絞る。PatternLoopConfig も `pattern_drive.loop_config_from_config` を
 共有する。
 
@@ -12,7 +13,7 @@ vehicle.min_*_opening_pct を上書き。yaml は書き換えない）と止ま�
 スタブ車両は実車と別物（応答は実車の約 1/5）。ここで見るのは「流れ」だけで、制御性能・秒数は実車の
 値ではない: 全段が走る／狙いの G に届く／上端で減速へ切り替わる／停車復帰して次へ進む。
 `--gain-scale 5` はスタブ車両のアクセル・ブレーキゲインを 5 倍にして実車の応答に近づける
-（旧 grid_stub_run と同じ意味。`ramp_rate_gain` には掛けない）。
+（旧 grid_stub_run と同じ意味）。
 
 使い方:
     .venv/bin/python -m tests.research.ramp_stub_run --full --gain-scale 5
@@ -28,22 +29,29 @@ import csv
 import math
 import sys
 from pathlib import Path
+from typing import Any
 
 from tests.research import hardware as hwmod
 from tests.research.app_settings import SafetySettings
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.config import DEFAULT_CONFIG_PATH, ConfigError, ResearchConfig, load_config
 from tests.research.mode_drive import load_mode
-from tests.research.pattern_drive import build_patterns, loop_config_from_config, result_table
+from tests.research.pattern_drive import (
+    build_patterns,
+    loop_config_from_config,
+    ramp_order_of,
+    result_table,
+)
 from tests.research.pattern_loop import PatternLoop
 from tests.research.pedal_search import PedalSearchResult
-from tests.research.ramp_planner import RampPlan, count_bands_for_modes, plan_ramps
+from tests.research.ramp_planner import RampPlan, count_bands_for_modes, cruise_kwargs, plan_ramps
 from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, DriveLogData
-from tests.research.term import say
+from tests.research.term import drive_status_line, say
 from tests.research.vehicle import build_vehicle_profile, feedforward_params, opening_to_pulse
 
 STUB_STOP_HOLD_OFFSET_PCT = 8.0  # 停車保持ブレーキ = スタブのブレーキの遊び + これ
 SHORT_LEVELS = (0.08, 0.25)  # --full なし・--levels なしのときの段（短い確認用）
+STATUS_PRINT_INTERVAL_S = 3.0  # 1 行表示（acc/brk の Kp・Ki の変化を見る）の間隔 [s]
 STUB_NOTE = "注意: スタブの秒数は実車の値ではありません（スタブ車両は実車と応答が違う）。"
 
 
@@ -68,13 +76,14 @@ async def _wait_stopped(hw: hwmod.ResearchHardware, timeout_s: float = 60.0) -> 
 
 def select_order(
     plan: RampPlan, *, full: bool, levels: list[float] | None
-) -> list[tuple[float, float]]:
-    """走る段（G, 上端の車速）。--full は全段、無ければ levels（既定 SHORT_LEVELS）だけ。"""
+) -> list[tuple[float, float, tuple[float, ...], bool, tuple[float, ...]]]:
+    """走る段（G, 上端, 保持する車速, 上りだけか, 戻す車速）。--full は全段、無ければ levels
+    （既定 SHORT_LEVELS）だけ。"""
     order = plan.execution_order()
     if full:
         return order
     wanted = levels if levels else list(SHORT_LEVELS)
-    picked = [(g, top) for g, top in order if any(math.isclose(g, w) for w in wanted)]
+    picked = [x for x in order if any(math.isclose(x[0], w) for w in wanted)]
     return list(dict.fromkeys(picked))  # 短い確認用は 1 周目だけ（2 周目の重複は除く）
 
 
@@ -87,10 +96,13 @@ async def _run(args: argparse.Namespace) -> int:
     lr = cfg.learning
     names = cfg.modes.coverage_mode_names
     modes = [await load_mode(cfg, n) for n in names]
-    counts = count_bands_for_modes(modes, lr.ramp_g_levels)
+    counts = count_bands_for_modes(modes, lr.ramp_g_levels, cruise_kwargs(cfg)["cruise_min_kmh"])
     plan = plan_ramps(
         counts, mode_min_s=lr.ramp_mode_min_s, max_speed_kmh=cfg.vehicle.max_speed_kmh,
-        budget_s=lr.ramp_time_budget_s,
+        budget_s=lr.ramp_time_budget_s, max_passes=lr.ramp_max_passes,
+        hold_s=lr.ramp_hold_time_s, turn_s=lr.ramp_turn_time_s,
+        min_at_g_s=lr.ramp_min_at_g_s, launch_s=lr.ramp_launch_time_s, edge_g=lr.ramp_edge_g,
+        **cruise_kwargs(cfg),  # 2026-10-13 段2o-2
     )
     levels = [float(v) for v in args.levels.split(",")] if args.levels else None
     order = select_order(plan, full=args.full, levels=levels)
@@ -98,7 +110,9 @@ async def _run(args: argparse.Namespace) -> int:
         say("走る段が 1 つもありません（--levels の指定を確認）")
         return 2
     say(f"モード: {', '.join(names)}")
-    say("走る段 (G, 上端 km/h): " + ", ".join(f"({g:g}, {t:g})" for g, t in order))
+    say("走る段 (G, 上端 km/h): " + ", ".join(
+        f"({g:g}, {t:g}, 保持 {len(st)}{'・上りだけ' if up_only else ''}, 戻し {len(rel)})"
+        for g, t, st, up_only, rel in order))  # 2026-10-14 段2o-5: 5 つ目は戻す車速
 
     hw = hwmod.build_hardware(cfg, hwmod.HW_STUB)
     vehicle = hw.can.vehicle  # type: ignore[attr-defined]
@@ -109,10 +123,11 @@ async def _run(args: argparse.Namespace) -> int:
     await hwmod.run_initialize(hw)
     pedal = _stub_pedal(cfg)
     profile = pedal.apply_to_profile(build_vehicle_profile(cfg))
-    patterns = build_patterns(cfg, profile, order)
+    patterns = build_patterns(cfg, profile, order, with_lag=args.lag)
 
+    started = asyncio.get_running_loop().time()
     finished = asyncio.Event()
-    state = {"emergency": False, "idx": -1}
+    state: dict[str, Any] = {"emergency": False, "idx": -1, "last_print": -1e9}
     rows: list[tuple[float, int, str, float, float, float, bool]] = []  # --csv 用の生データ
 
     def on_sample(
@@ -120,9 +135,22 @@ async def _run(args: argparse.Namespace) -> int:
         alarm_accel: bool | None, alarm_brake: bool | None,
         monitor_accel: AxisMonitor, monitor_brake: AxisMonitor, cycle_ms: float,
     ) -> None:
-        if args.csv is not None:
+        if args.csv is not None or args.lag:
             rows.append((asyncio.get_running_loop().time(), idx, phase, data.actual_speed_kmh,
                          data.accel_opening, data.brake_opening, governed))
+        now = asyncio.get_running_loop().time()
+        if now - state["last_print"] >= STATUS_PRINT_INTERVAL_S:  # 手順2 と同じ 1 行表示
+            state["last_print"] = now
+            rs = loop.ramp_status()
+            say(drive_status_line(
+                t_s=now - started, ref_kmh=data.ref_speed_kmh, actual_kmh=data.actual_speed_kmh,
+                accel_kp=0.0 if rs is None else rs.accel_kp,
+                accel_ki=0.0 if rs is None else rs.accel_ki, accel_kd=0.0,
+                brake_kp=0.0 if rs is None else rs.brake_kp,
+                brake_ki=0.0 if rs is None else rs.brake_ki, brake_kd=0.0,
+                accel_pct=data.accel_opening, brake_pct=data.brake_opening,
+                extra=f"{idx + 1}/{len(patterns)} {phase}",
+            ))
         if idx != state["idx"]:  # パターンが変わったとき 1 行（進み具合の確認用）
             state["idx"] = idx
             kind = patterns[idx].kind.value if idx < len(patterns) else "-"
@@ -144,9 +172,9 @@ async def _run(args: argparse.Namespace) -> int:
         ),
         on_complete=on_complete, on_emergency=on_emergency, on_sample=on_sample,
         config=loop_config_from_config(cfg, stop_confirm_pct=pedal.stop_confirm_pct),
+        interval_s=cfg.control.loop_interval_s,  # yaml の周期（50 ms）
     )
     exit_code = 0
-    started = asyncio.get_running_loop().time()
     try:
         await hw.brake.move_to_position(opening_to_pulse(pedal.stop_brake_opening_pct))
         await _wait_stopped(hw)
@@ -178,11 +206,42 @@ async def _run(args: argparse.Namespace) -> int:
                              "accel_opening", "brake_opening", "governed"])
             writer.writerows((f"{t - started:.3f}", *rest) for t, *rest in rows)
         say(f"生データ: {args.csv}（{len(rows)} 行）")
+    if args.lag:
+        _report_lag(rows, started)
     say("\n── G ランプの結果 ──")
-    say(result_table(order, loop.ramp_results, total_s))
+    ran = ramp_order_of(patterns)  # 遅れの測定の段（--lag）を含む、走った順の全段
+    say(result_table(
+        ran, loop.ramp_results, total_s,
+        hold_s=lr.ramp_hold_time_s, turn_s=lr.ramp_turn_time_s,
+    ))
     say(STUB_NOTE)
-    say(f"走った段 {len(loop.ramp_results)} / {len(order)}、exit={exit_code}")
+    say(f"走った段 {len(loop.ramp_results)} / {len(ran)}、exit={exit_code}")
     return exit_code
+
+
+def _report_lag(rows: list[tuple[float, int, str, float, float, float, bool]], t0: float) -> None:
+    """メモリ上の生データから HOLD_STEP の遅れを推定して表示する（スタブの値は実車と別物）。"""
+    import numpy as np  # noqa: PLC0415
+
+    from tests.research import pedal_lag  # noqa: PLC0415
+
+    step_rows = pedal_lag.StepRows(
+        t_s=np.array([r[0] - t0 for r in rows]),
+        speed_kmh=np.array([r[3] for r in rows]),
+        accel_cmd_pct=np.array([r[4] for r in rows]),
+        brake_cmd_pct=np.array([r[5] for r in rows]),
+        phase=[r[2] for r in rows],
+    )
+    res = pedal_lag.estimate_hold_step_lag(step_rows)
+    say("\n── 遅れの測定（pedal_lag.estimate_hold_step_lag）──")
+    say(f"HOLD_STEP の区間 {res.n_steps_total} 件・採用 {res.n_used} 件・"
+        f"全体の中央値 {res.lag_s if res.lag_s is None else round(res.lag_s, 3)}"
+        f"{'' if not res.reason else '（' + res.reason + '）'}")
+    for key, (n, med) in sorted(res.by_pedal_dir.items()):
+        say(f"  {key}: {n} 件 中央値 {med:.3f} s")
+    for st in res.steps:
+        say(f"  {st.pedal:>5} {'踏み増し' if st.press else '戻し  '} "
+            f"車速 {st.speed_kmh:5.1f} km/h  遅れ {st.lag_s:.3f} s")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -192,6 +251,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--levels", default="", help="走る段の G を絞る（例 0.08,0.25）")
     parser.add_argument("--gain-scale", type=float, default=1.0,
                         help="スタブのアクセル・ブレーキゲインの倍率（実車の約 1/5 → 5 を推奨）")
+    parser.add_argument("--lag", action="store_true",
+                        help="G ランプの後ろに遅れの測定の段（ramp_lag_speeds_kmh）を足し、"
+                             "走り終えたら pedal_lag の推定を表示する（2026-10-13 段2o-2）")
     parser.add_argument("--csv", type=Path, default=None,
                         help="毎周期の生データ（経過秒・フェーズ・車速・開度）を書き出す CSV")
     parser.add_argument("--timeout-s", type=float, default=3600.0,

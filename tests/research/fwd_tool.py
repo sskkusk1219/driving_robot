@@ -31,6 +31,7 @@ from tests.research.ff_params import free_accel_at, research_ff_params
 from tests.research.fwd_data import (
     DEFAULT_ACCEL_LAG_S,
     DEFAULT_ACCEL_WINDOW_S,
+    DEFAULT_ACTUATOR_LAG_TOL_PCT,
     DEFAULT_BRAKE_LAG_S,
     DEFAULT_SECTIONS,
     DROP_REASONS,
@@ -159,6 +160,7 @@ def run_cells(args: argparse.Namespace) -> int:
     kw = {
         "accel_deadband_pct": veh.min_accel_opening_pct,
         "brake_deadband_pct": veh.min_brake_opening_pct,
+        "actuator_lag_tol_pct": args.u_step,  # 表のマス幅に合わせる（ずれ超えの行は外す）
     }
     train_logs = [read_fwd_rows(Path(p), **kw) for p in args.train]
     check_logs = [read_fwd_rows(Path(p), **kw) for p in skip_missing(args.check, "検証ログ")]
@@ -305,6 +307,8 @@ class DeadbandLag:
     brake_lag_s: float = DEFAULT_BRAKE_LAG_S
     coast_lag_s: float | None = None  # None = accel_lag_s と同じ（惰行行は u = 0 で、アクセル側）
     opening_source: str = OPENING_CMD
+    # 指令と実開度のずれでその行を学習から外す許容 [%]。表のマス幅に合わせる。None で外さない
+    actuator_lag_tol_pct: float | None = DEFAULT_ACTUATOR_LAG_TOL_PCT
 
 
 def _settings(cfg_path: Path = DEFAULT_CONFIG_PATH) -> DeadbandLag:
@@ -336,6 +340,7 @@ def read_logs(paths: Sequence[str | Path], st: DeadbandLag, **over: object) -> l
         "brake_lag_s": st.brake_lag_s,
         "coast_lag_s": st.coast_lag_s,
         "opening_source": st.opening_source,
+        "actuator_lag_tol_pct": st.actuator_lag_tol_pct,
     }
     kw.update(over)
     return [read_fwd_rows(Path(p), **kw) for p in paths]  # type: ignore[arg-type]

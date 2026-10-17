@@ -32,7 +32,7 @@ ProblemReport_20260916 段4）: クリープ平衡 4.77 km/h からブレーキ�
     `phase` 列は `tests.research.drive_log.read_drive_logs` が `DriveLog` に読み戻さない
     （CSV には残るが読み込み時に捨てられ常に None）ため、走行時の意図（保持中か刻み送り中か）
     をログから復元できない。そこで代わりに、**手順2 が指令した候補開度**
-    （`learning.creep_brake_hold_fracs` から `creep_brake_hold_openings` で作った開度列）を
+    （`CREEP_BRAKE_HOLD_FRACS` から `creep_brake_hold_openings` で作った開度列）を
     呼び出し側から渡す設計にし、
     候補開度ごとに実際に保持できていた区間（プラトー）だけを抽出する。
 
@@ -74,6 +74,10 @@ from tests.research.drive_log import read_drive_logs
 from tests.research.ff_model import STOP_SPEED_KMH, group_by_session
 from tests.research.research_types import DriveLog, FeedforwardParams
 from tests.research.vehicle import build_vehicle_profile
+
+# クリープ域ブレーキ保持の frac 列（停車保持開度に対する割合）。手順2 のパターン列から外したので
+# 今は使われない（2026-10-09: yaml の learning.creep_brake_hold_fracs を外した。以前の yaml の値）
+CREEP_BRAKE_HOLD_FRACS: tuple[float, ...] = (0.05, 0.15, 0.25, 0.45, 0.55, 0.7, 0.9, 1.0)
 
 
 @dataclass(frozen=True)
@@ -201,7 +205,12 @@ def creep_brake_hold_openings(
     return tuple(round(brake_deadband_pct + frac * span, 2) for frac in fracs)
 
 
-__all__ = ["StopBrakeFloor", "creep_brake_hold_openings", "estimate_stop_brake_floor"]
+__all__ = [
+    "CREEP_BRAKE_HOLD_FRACS",
+    "StopBrakeFloor",
+    "creep_brake_hold_openings",
+    "estimate_stop_brake_floor",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -217,7 +226,7 @@ def run(csv_path: Path, config_path: Path) -> int:
     ff = cfg.feedforward
 
     candidate_openings_pct = list(creep_brake_hold_openings(
-        ff.brake_deadband_pct, ff.stop_brake_opening_pct, lr.creep_brake_hold_fracs
+        ff.brake_deadband_pct, ff.stop_brake_opening_pct, CREEP_BRAKE_HOLD_FRACS
     ))
 
     floor = estimate_stop_brake_floor(

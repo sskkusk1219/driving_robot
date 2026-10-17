@@ -152,10 +152,19 @@ PEDAL_ACCEL = "A"
 PEDAL_BRAKE = "B"
 PEDAL_COAST = "-"
 
-DIRECTION_THRESHOLD_KMHS: float = 0.3  # yaml の learning.grid_direction_threshold_kmhs の既定
-DIRECTION_THRESHOLD_PCT: float = 0.3  # 同 grid_direction_threshold_pct（ブレーキ）
-DIRECTION_THRESHOLD_ACCEL_PCT: float = 1.5  # 同 grid_direction_threshold_accel_pct（アクセル）
-WEIGHT_FRAC: float = 0.25  # 同 grid_weight_frac
+# 網羅表の設定。2026-10-09: yaml の learning.grid_* を外し、以前の yaml の値をここに持つ
+DIRECTION_THRESHOLD_KMHS: float = 0.3  # モード側: |加速度| が山からこれ以上落ちたら戻し [km/h/s]
+DIRECTION_THRESHOLD_PCT: float = 0.3  # データ側（ブレーキ）: 山から戻ったら「戻し」[%]
+DIRECTION_THRESHOLD_ACCEL_PCT: float = 1.5  # データ側（アクセル）[%]
+WEIGHT_FRAC: float = 0.25  # 「埋まった」の基準 = max(HOLE_DATA_MAX_S, この割合 × モードの秒数)
+# 車速 × 加速度の格子の境界（昇順）。加速度は FF の regime ホライズン先との差
+GRID_SPEED_EDGES_KMH: list[float] = [float(v) for v in range(0, 150, 10)]  # [km/h]
+GRID_ACCEL_EDGES_KMHS: list[float] = [
+    -14.0, -7.0, -3.0, -1.5, -0.5, 0.5, 1.5, 3.0, 7.0, 14.0
+]  # [km/h/s]。外側の端 ±14 は max_decel_g 0.4G ≒ 14.1
+HOLE_DATA_MAX_S: float = 2.0  # 学習データがこれ未満なら穴 [s]
+# 狙う・穴と判定するマスの最小秒数 = 1 ステップで測れる長さ 3.0s − 頭の除外 0.5s [s]
+TARGET_MIN_S: float = 2.5
 _A_REQ_EPS_KMHS: float = 1e-6  # |a_req| がこれ未満は「ゼロ」として episode を区切る
 
 
@@ -395,11 +404,10 @@ def coverage_stats_for_config(
     格子・向きのしきい値・ペダル別の戻しの判定（`pedal_rule`）をすべて config から決める。
     pedal_rule を渡し忘れると戻しの秒数（ペダル別）が作られず、戻しの穴が数えられない。
     """
-    lr = cfg.learning
     return coverage_stats_from_modes(
         modes,
-        edges_from_config(lr.grid_speed_edges_kmh, lr.grid_accel_edges_kmhs),
-        lr.grid_direction_threshold_kmhs,
+        edges_from_config(GRID_SPEED_EDGES_KMH, GRID_ACCEL_EDGES_KMHS),
+        DIRECTION_THRESHOLD_KMHS,
         pedal_rule_from_config(cfg),
     )
 
@@ -811,13 +819,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         cfg = load_config(DEFAULT_CONFIG_PATH)
-        lr = cfg.learning
         rule = pedal_rule_from_config(cfg)
-        edges = edges_from_config(lr.grid_speed_edges_kmh, lr.grid_accel_edges_kmhs)
+        edges = edges_from_config(GRID_SPEED_EDGES_KMH, GRID_ACCEL_EDGES_KMHS)
         if args.ref_csv is not None:
             mode = mode_from_csv(args.ref_csv)
             stats = wltp_cell_stats(
-                mode, edges, direction_threshold_kmhs=lr.grid_direction_threshold_kmhs,
+                mode, edges, direction_threshold_kmhs=DIRECTION_THRESHOLD_KMHS,
                 pedal_rule=rule,
             )
             outside = [(mode.name, outside_seconds(mode, edges))]
@@ -832,40 +839,40 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{args.csv} に手順2（PATTERN_DRIVE）の行がありません")
         return 2
     wltp = stats.seconds
-    min_s = lr.grid_target_min_s
+    min_s = TARGET_MIN_S
     data = data_cells(
         logs, ff.accel_deadband_pct, ff.brake_deadband_pct, edges,
-        direction_threshold_pct=lr.grid_direction_threshold_pct,
-        direction_threshold_accel_pct=lr.grid_direction_threshold_accel_pct,
+        direction_threshold_pct=DIRECTION_THRESHOLD_PCT,
+        direction_threshold_accel_pct=DIRECTION_THRESHOLD_ACCEL_PCT,
     )
-    holes = find_holes(wltp, data, edges, min_s, lr.grid_hole_data_max_s)
+    holes = find_holes(wltp, data, edges, min_s, HOLE_DATA_MAX_S)
     print(f"CSV: {args.csv.name}（不感帯 アクセル {ff.accel_deadband_pct:g}% / "
           f"ブレーキ {ff.brake_deadband_pct:g}%。config の値で判定）")
     print("セル = 「モードが要る秒（複数モードは最大） / 学習データの秒」、* = 穴")
     print(
-        f"注: 穴の判定は「モードが {min_s:g}s（grid_step_window_s − grid_step_lag_s）以上"
+        f"注: 穴の判定は「モードが {min_s:g}s（窓 3.0s − 頭の除外 0.5s）以上"
         "要る」マス。"
         "「埋まっている割合」はモデル精度の保証ではない。"
         "データのペダルは合算（アクセル/ブレーキ/惰行）"
     )
     print("格子の外（数えられていない走り）:")
     print(outside_text(outside) + "\n")
-    print(coverage_table(wltp, data, edges, min_s, lr.grid_hole_data_max_s))
+    print(coverage_table(wltp, data, edges, min_s, HOLE_DATA_MAX_S))
     print()
-    print(summary_text(wltp, data, holes, min_s, lr.grid_hole_data_max_s))
+    print(summary_text(wltp, data, holes, min_s, HOLE_DATA_MAX_S))
     print(holes_text(holes))
     print(
-        f"\n===== 向き別（戻し判定: データ ブレーキ {lr.grid_direction_threshold_pct:g}% / "
-        f"アクセル {lr.grid_direction_threshold_accel_pct:g}% / "
-        f"モード {lr.grid_direction_threshold_kmhs:g} km/h/s、"
-        f"要る秒 = max({lr.grid_hole_data_max_s:g}s, {lr.grid_weight_frac:g}×モード) ====="
+        f"\n===== 向き別（戻し判定: データ ブレーキ {DIRECTION_THRESHOLD_PCT:g}% / "
+        f"アクセル {DIRECTION_THRESHOLD_ACCEL_PCT:g}% / "
+        f"モード {DIRECTION_THRESHOLD_KMHS:g} km/h/s、"
+        f"要る秒 = max({HOLE_DATA_MAX_S:g}s, {WEIGHT_FRAC:g}×モード) ====="
     )
     if rule is None:
         print("警告: 惰行カーブからペダル選択の規則を作れないため、戻しは両ペダル合算で判定します")
     print(direction_report(
-        stats, data, edges, min_s, lr.grid_hole_data_max_s, lr.grid_weight_frac))
+        stats, data, edges, min_s, HOLE_DATA_MAX_S, WEIGHT_FRAC))
     print(holes_text(find_holes_by_direction(
-        stats, data, edges, min_s, lr.grid_hole_data_max_s, lr.grid_weight_frac)))
+        stats, data, edges, min_s, HOLE_DATA_MAX_S, WEIGHT_FRAC)))
     return 0
 
 

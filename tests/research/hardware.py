@@ -63,6 +63,9 @@ class DriveError(Exception):
 class ActuatorProtocol(Protocol):
     # 最後に送った目標位置 [pulse]（未指令なら None）。ログの「指令」列に使う（A7）
     last_command_pos: int | None
+    # op 名ごとの再送した通信の回数・実行回数（スタブは空）。走行の最後の再送表示に使う
+    retry_counts: dict[str, int]
+    op_counts: dict[str, int]
 
     async def connect(self) -> None: ...
 
@@ -129,6 +132,9 @@ class StubActuator:
     connected: bool = False
     homed: bool = False
     last_command_pos: int | None = None
+    # 通信を持たないので常に空（ActuatorProtocol の再送回数の読み出し口）
+    retry_counts: dict[str, int] = field(default_factory=dict)
+    op_counts: dict[str, int] = field(default_factory=dict)
 
     async def connect(self) -> None:
         self.connected = True

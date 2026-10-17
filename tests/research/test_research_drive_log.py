@@ -330,6 +330,25 @@ def test_csv_columns_replace_signed_effort_and_split_command_actual() -> None:
         } <= cols
     assert {"cycle_ms", "mode_time_s", "deviation_kmh", "section", "pattern", "phase",
             "governor_active"} <= cols
+    assert {"accel_kp", "accel_ki", "brake_kp", "brake_ki"} <= cols
+
+
+def test_write_csv_writes_ramp_gains_with_five_decimals_or_blank(tmp_path: Path) -> None:
+    def sample(t: float, **kw: float) -> dlmod.DriveSample:
+        return dlmod.DriveSample(
+            elapsed_s=t, timestamp=datetime.now(tz=UTC), data=_data(0.0),
+            section=dlmod.SECTION_PATTERN_DRIVE, phase="RAMP_UP", pattern="1:G_RAMP", **kw,
+        )
+
+    path = tmp_path / "log.csv"
+    dlmod.write_csv(
+        [sample(1.0, accel_kp=0.25, accel_ki=0.03125, brake_kp=0.0, brake_ki=0.0), sample(1.1)],
+        path,
+    )
+    rows = _rows(path)
+    cols = ("accel_kp", "accel_ki", "brake_kp", "brake_ki")
+    assert [rows[0][c] for c in cols] == ["0.25000", "0.03125", "0.00000", "0.00000"]
+    assert [rows[1][c] for c in cols] == ["", "", "", ""]
 
 
 def test_write_csv_writes_ff_command_actual_and_status(tmp_path: Path) -> None:

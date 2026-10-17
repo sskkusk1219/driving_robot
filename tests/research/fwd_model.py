@@ -50,9 +50,14 @@ RANDOM_STATE = 0  # 固定（再現のため）
 
 
 def poly_features(x: np.ndarray) -> np.ndarray:
-    """(車速, u) → 車速・u・車速²・u²・車速×u。"""
+    """(車速, u) → 車速・u・車速²・u²・車速×u。
+    3 列（車速, u, 戻し量 r。ブレーキ側。2026-10-14 段2o-5）のときは r・r²・r×u・r×車速 を足す。"""
     v, u = x[:, 0], x[:, 1]
-    return np.column_stack([v, u, v * v, u * u, v * u])
+    cols = [v, u, v * v, u * u, v * u]
+    if x.shape[1] >= 3:
+        r = x[:, 2]
+        cols += [r, r * r, r * u, r * v]
+    return np.column_stack(cols)
 
 
 @dataclass
@@ -71,7 +76,8 @@ class FittedModel:
 def _xy(
     rows_list: Sequence[FwdRows], side: str, *, coast_in_brake: bool = True
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """片側の行（accel: u >= 0、brake: u <= 0）の入力 (N, 2)・加速度・ログ番号（グループ）。
+    """片側の行（accel: u >= 0、brake: u <= 0）の入力・加速度・ログ番号（グループ）。
+    入力は accel が (N, 2)（車速・u）、brake が (N, 3)（車速・u・戻し量。2026-10-14 段2o-5）。
     coast_in_brake=False のときブレーキ側は u < 0 の行だけ（惰行の行を入れない）。"""
     xs, ys, gs = [], [], []
     for g, r in enumerate(rows_list):
@@ -79,7 +85,10 @@ def _xy(
             m = r.u_pct >= 0
         else:
             m = r.u_pct <= 0 if coast_in_brake else r.u_pct < 0
-        xs.append(np.column_stack([r.speed_kmh[m], r.u_pct[m]]))
+        cols = [r.speed_kmh[m], r.u_pct[m]]
+        if side != "accel":
+            cols.append(r.release_pct[m])
+        xs.append(np.column_stack(cols))
         ys.append(r.accel_kmhs[m])
         gs.append(np.full(int(m.sum()), g))
     return np.concatenate(xs), np.concatenate(ys), np.concatenate(gs)
@@ -87,6 +96,12 @@ def _xy(
 
 def _poly_pipe(est: Any) -> Pipeline:
     return make_pipeline(FunctionTransformer(poly_features), StandardScaler(), est)
+
+
+def _tagged(model: Any, x: np.ndarray) -> Any:
+    """学習に使った入力の列数を n_inputs に残す（raw_grid が 2 列か 3 列かを見分けるため）。"""
+    model.n_inputs = x.shape[1]
+    return model
 
 
 def _mlp_pipe(hidden: tuple[int, ...], max_iter: int) -> Pipeline:
@@ -106,8 +121,11 @@ def _fit_scaled_target(make: Callable[[], Pipeline], x: np.ndarray, y: np.ndarra
     """加速度を標準化して学習し、予測で戻す（MLP の収束を安定させる）。"""
     mu, sd = float(y.mean()), float(y.std()) or 1.0
     pipe = make().fit(x, (y - mu) / sd)
+    n_in = x.shape[1]
 
     class _Scaled:
+        n_inputs = n_in
+
         def predict(self, xx: np.ndarray) -> np.ndarray:
             return pipe.predict(xx) * sd + mu
 
@@ -153,8 +171,8 @@ def fit_models(
     t0 = time.perf_counter()
     out[NAME_LINEAR] = FittedModel(
         NAME_LINEAR,
-        _poly_pipe(LinearRegression()).fit(xa, ya),
-        _poly_pipe(LinearRegression()).fit(xb, yb),
+        _tagged(_poly_pipe(LinearRegression()).fit(xa, ya), xa),
+        _tagged(_poly_pipe(LinearRegression()).fit(xb, yb), xb),
         train_time_s=time.perf_counter() - t0,
         sources=sources,
     )
@@ -163,8 +181,8 @@ def fit_models(
     alpha, _ = select_ridge_alpha(parts, alphas)
     out[NAME_RIDGE] = FittedModel(
         NAME_RIDGE,
-        _poly_pipe(Ridge(alpha=alpha)).fit(xa, ya),
-        _poly_pipe(Ridge(alpha=alpha)).fit(xb, yb),
+        _tagged(_poly_pipe(Ridge(alpha=alpha)).fit(xa, ya), xa),
+        _tagged(_poly_pipe(Ridge(alpha=alpha)).fit(xb, yb), xb),
         alpha=alpha,
         train_time_s=time.perf_counter() - t0,
         sources=sources,
@@ -203,33 +221,90 @@ _COPY_META = (
     "coast_lag_s",
     "opening_source",
     "u_step_pct",
+    "like_u_step_pct",  # 2026-10-14 段2o-4: 細かくした表のとき、元（C7）の刻み
     "min_s",
 )
 
 
-def raw_grid(fitted: FittedModel, like: ForwardTable, *, coast_from: str = "mean") -> np.ndarray:
+def _n_inputs(side: Any) -> int:
+    """片側の式の入力の数（2 か 3）。分からなければ 2（古い式・テスト用のスタブ）。"""
+    n = getattr(side, "n_inputs", None)
+    if n is None:
+        n = getattr(side, "n_features_in_", None)
+    return 3 if n == 3 else 2
+
+
+def _predict_grid(
+    side: Any, rep: np.ndarray, ug: np.ndarray, release_pct: float = 0.0
+) -> np.ndarray:
+    """片側の式を格子（行 = 車速、列 = u）で評価する。
+    入力が 3 つの式は戻し量 release_pct を入れる。"""
+    vv = np.repeat(rep, len(ug))
+    uu = np.tile(ug, len(rep))
+    cols = [vv, uu]
+    if _n_inputs(side) == 3:
+        cols.append(np.full(len(vv), float(release_pct)))
+    x = np.column_stack(cols)
+    return np.asarray(side.predict(x)).reshape(len(rep), len(ug))
+
+
+def raw_grid(
+    fitted: FittedModel,
+    like: ForwardTable,
+    *,
+    coast_from: str = "mean",
+    release_pct: float = 0.0,
+) -> np.ndarray:
     """学習済みモデルを like（C7 の表）と同じ格子で評価した、単調化する前の配列。
     行 = 車速、列 = u。
-    coast_from: u = 0 の取り方。"mean" は 2 式の平均、"accel" はアクセル側の式。"""
+    coast_from: u = 0 の取り方。"mean" は 2 式の平均、"accel" はアクセル側の式。
+    release_pct: ブレーキ側に入れる戻し量 [%]（2026-10-14 段2o-5。既定 0 ＝ 本体の配列）。
+    アクセル側（u > 0）は戻し量に依らない。"""
     if coast_from not in ("mean", "accel"):
         raise ValueError(f"coast_from が不明: {coast_from}")
     rep, ug = like.speed_rep, like.u_grid
-    vv = np.repeat(rep, len(ug))
-    uu = np.tile(ug, len(rep))
-    x = np.column_stack([vv, uu])
-    acc = np.asarray(fitted.accel_side.predict(x)).reshape(len(rep), len(ug))
-    brk = np.asarray(fitted.brake_side.predict(x)).reshape(len(rep), len(ug))
+    acc = _predict_grid(fitted.accel_side, rep, ug)
+    brk = _predict_grid(fitted.brake_side, rep, ug, release_pct)
     zero = acc if coast_from == "accel" else (acc + brk) / 2.0
     return np.where(ug[None, :] > 0, acc, np.where(ug[None, :] < 0, brk, zero))
+
+
+def raw_release_slices(
+    fitted: FittedModel,
+    like: ForwardTable,
+    release_grid: Sequence[float],
+    *,
+    coast_from: str = "mean",
+) -> np.ndarray:
+    """戻し量ごとの、単調化する前の配列 (戻し量の数, 行, u)（2026-10-14 段2o-5）。
+    u <= 0 の列はブレーキ側の式にその戻し量を入れた値、u > 0 の列は本体（戻し量 0）と同じ
+    （アクセル側は戻し量に依らない）。ブレーキ側の式の入力が 2 つの古いモデルは
+    全スライスが本体と同じ。
+    """
+    return np.stack(
+        [
+            raw_grid(fitted, like, coast_from=coast_from, release_pct=float(r))
+            for r in release_grid
+        ]
+    )
+
+
+def monotone_rows(raw: np.ndarray, u_grid: np.ndarray) -> np.ndarray:
+    """行ごとの IsotonicRegression（重みは一様）で単調化した配列（grid_from_raw と同じ）。
+    raw が 3 次元（スライス, 行, u）なら最後の 2 軸ごとに行う。"""
+    if raw.ndim == 3:
+        return np.stack([monotone_rows(x, u_grid) for x in raw])
+    mono = np.empty_like(raw)
+    for r in range(raw.shape[0]):
+        mono[r] = IsotonicRegression(increasing=True).fit_transform(u_grid, raw[r])
+    return mono
 
 
 def grid_from_raw(raw: np.ndarray, like: ForwardTable, meta_extra: dict[str, Any]) -> ForwardTable:
     """単調化する前の配列を、行ごとの IsotonicRegression（重みは一様）で単調化して
     ForwardTable にする。"""
     rep, ug = like.speed_rep, like.u_grid
-    mono = np.empty_like(raw)
-    for r in range(len(rep)):
-        mono[r] = IsotonicRegression(increasing=True).fit_transform(ug, raw[r])
+    mono = monotone_rows(raw, ug)
     meta: dict[str, Any] = {k: like.meta[k] for k in _COPY_META if k in like.meta}
     meta.update(meta_extra)
     tb = ForwardTable(

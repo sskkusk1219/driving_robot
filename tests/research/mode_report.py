@@ -32,8 +32,10 @@ from tests.research.config import ResearchConfig, load_config
 from tests.research.drive_log import (
     SECTION_MODE_DRIVE,
     DriveSample,
+    actual_opening,
     cmd_opening,
     ff_effort,
+    monitor_opening_pct,
     pid_effort,
     total_effort,
 )
@@ -45,6 +47,7 @@ from tests.research.kpi import (
     KpiResult,
     chatter_metrics,
     compute_kpi,
+    pedal_overlap,
     sample_interval_s,
     speed_band_label,
     speed_band_order,
@@ -92,6 +95,9 @@ class ModeRow:
     effort_pct: float
     segment: str
     phase: str
+    # 実開度（アクチュエータの読み戻し）。旧形式 CSV・モニタ無しは None
+    accel_actual_pct: float | None = None
+    brake_actual_pct: float | None = None
 
     @property
     def deviation_kmh(self) -> float:
@@ -116,6 +122,13 @@ class RunInfo:
     abort_reason: str = ""
     cycles: int | None = None
     overruns: int | None = None
+    # 2026-10-17 段2o-9: 実開度の安全網が止めた
+    # (アクセル回数, アクセル秒, ブレーキ回数, ブレーキ秒)。
+    # None は不明（CSV から作り直した）か安全網が切れていた
+    interlock: tuple[int, float, int, float] | None = None
+    # 2026-10-17 段2p: C10（偏差の上乗せ）の設定と集計の表示。None は C10 でない（または不明）
+    c10_settings: str | None = None
+    c10_summary: str | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -141,6 +154,8 @@ def rows_from_samples(samples: Sequence[DriveSample]) -> list[ModeRow]:
             effort_pct=d.applied_effort_pct or 0.0,
             segment=s.pattern,
             phase=s.phase,
+            accel_actual_pct=monitor_opening_pct(s.monitor_accel),
+            brake_actual_pct=monitor_opening_pct(s.monitor_brake),
         ))
     return rows
 
@@ -166,6 +181,8 @@ def rows_from_csv(path: Path) -> list[ModeRow]:
                 effort_pct=ff + pid if total is None else total,
                 segment=r["pattern"],
                 phase=r["phase"],
+                accel_actual_pct=actual_opening(r, "accel"),
+                brake_actual_pct=actual_opening(r, "brake"),
             ))
     return rows
 
@@ -581,6 +598,26 @@ def write_mode_report(
         chatter.pedal_reversal_per_s <= k.pedal_reversal_limit_per_s
         and chatter.pedal_reversal_window_max_per_s <= k.pedal_reversal_window_limit_per_s
     )
+    overlap = pedal_overlap(
+        t, [r.accel_actual_pct for r in rows], [r.brake_actual_pct for r in rows],
+        accel_min_pct=cfg.vehicle.min_accel_opening_pct,
+        brake_min_pct=cfg.vehicle.min_brake_opening_pct,
+        margin_pct=k.pedal_overlap_margin_pct,
+    )
+    if overlap is None:
+        overlap_text, overlap_ok = "—（実開度の記録なし）", "—"
+    elif overlap.total_s == 0.0:
+        overlap_text, overlap_ok = "0.00 s", _ok(True)
+    else:
+        overlap_text = (
+            f"{overlap.total_s:.2f} s・{overlap.count} 回・"
+            f"重なり最大 {overlap.max_depth_pct:.2f}%（t={overlap.max_depth_t_s:.1f}s）"
+        )
+        overlap_ok = _ok(False)
+    overlap_base = (
+        "待機位置" if k.pedal_overlap_margin_pct == 0.0
+        else f"待機位置 ＋ {k.pedal_overlap_margin_pct:g}%"
+    )
 
     md: list[str] = [
         f"# {info.title} — {info.started_at:%Y-%m-%d %H:%M}",
@@ -614,11 +651,13 @@ def write_mode_report(
                  f"全体 {chatter.pedal_reversal_per_s:.2f} 回/s・"
                  f"{k.pedal_reversal_window_s:g}s ごとの最大 "
                  f"{chatter.pedal_reversal_window_max_per_s:.2f} 回/s", _ok(pedal_ok)),
+                (f"同時踏み（アクセル・ブレーキの実開度が両方とも{overlap_base}を超えた時間）",
+                 "0 s", overlap_text, overlap_ok),
             ],
         ),
         "",
-        "- ペダル操作の滑らかさは上の 3 項目の総合判定・満たした項目数には含めず、別枠で判定する"
-        "（ProblemReport_20260921 手順3）。",
+        "- ペダル操作の滑らかさと同時踏みは上の 3 項目の総合判定・満たした項目数には含めず、"
+        "別枠で判定する（ProblemReport_20260921 手順3、同時踏みは ProblemReport_20261001）。",
         f"- 判定は MODE_DRIVE の 0.1s 刻みの行（{kpi.n_samples} 行、CSV と同じ）で計算"
         "（`tests/research/kpi.py`、定義は本番 `kpi_monitor.py` と同じ）。",
         "",
@@ -732,8 +771,17 @@ def write_mode_report(
                 ("アクセル開度の最大", f"{pedal.accel_max_pct:.1f}%"),
                 ("走行中のブレーキ開度の最大", f"{pedal.brake_max_moving_pct:.1f}%"),
                 ("アクセル ⇔ ブレーキの切り替え", f"{pedal.switches} 回"),
+                ("同時踏み（実開度）", overlap_text),
                 ("惰行（どちらのペダルも使わなかった時間）", f"{pedal.coast_s:.1f}s"),
                 ("減速G ガバナー作動", f"{pedal.governor_s:.1f}s"),
+                ("実開度の安全網で止めた回数・秒数（次のペダルを待たせた）",
+                 "不明（CSV からの作り直し、または無効）" if info.interlock is None
+                 else f"アクセル {info.interlock[0]} 回・{info.interlock[1]:.2f}s／"
+                      f"ブレーキ {info.interlock[2]} 回・{info.interlock[3]:.2f}s"),
+                ("C10（偏差の上乗せ）の設定",
+                 "なし" if info.c10_settings is None else info.c10_settings),
+                ("C10 の上乗せ（ペダル別の秒数・上乗せ量・min で止めた回数）",
+                 "なし" if info.c10_summary is None else info.c10_summary),
                 ("ブレーキ寄与ほぼ0（指令はあるが惰行カーブ相当しか効いていない）",
                  f"{pedal.brake_ineffective_s:.1f}s"),
                 (f"ばたつき（実車速 {CHATTER_BAND_HZ[0]:g}〜{CHATTER_BAND_HZ[1]:g}Hz の帯 RMS・"

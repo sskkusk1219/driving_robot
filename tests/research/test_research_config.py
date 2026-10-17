@@ -61,6 +61,13 @@ def test_pedal_reversal_kpi_settings_are_validated() -> None:
     assert any("pedal_reversal_min_window_s" in p for p in cfgmod.validate_config(cfg))
 
 
+def test_pedal_overlap_margin_is_validated() -> None:
+    cfg = _load_default()
+    assert not any("pedal_overlap" in p for p in cfgmod.validate_config(cfg))
+    cfg.kpi.pedal_overlap_margin_pct = -0.1
+    assert any("pedal_overlap_margin_pct" in p for p in cfgmod.validate_config(cfg))
+
+
 def test_features_section_is_case_a_and_validated() -> None:
     """手順5-1 案A: dv_0.5 を外し、過去は素の past_speeds。設定の不整合は検証で落ちる。"""
     cfg = _load_default()
@@ -69,36 +76,14 @@ def test_features_section_is_case_a_and_validated() -> None:
     assert spec.feature_names()[-2:] == ["past_0.5", "past_1.0"]
     assert cfgmod.validate_config(cfg) == []
 
-    cfg.features.use_h1 = False  # レジーム判定に使うので外せない
-    assert any("use_h1" in p for p in cfgmod.validate_config(cfg))
-    cfg.features.use_h1 = True
-    cfg.features.p1_s = 2.0  # 過去が昇順でない
-    assert any("p1_s" in p for p in cfgmod.validate_config(cfg))
-    cfg.features.p1_s = 0.5
-    cfg.features.h2_s = 0.8  # 先読みが昇順でない
-    assert any("features" in p for p in cfgmod.validate_config(cfg))
+    cfg.features.h0_s = 0.0  # 停車保持の判定ホライズンは正値
+    assert any("h0_s" in p for p in cfgmod.validate_config(cfg))
 
 
 def test_search_grid_matches_min_max_step() -> None:
-    """手順6: ホライズン自動選択の探索格子。0.1刻みの浮動小数丸め誤差が出ないこと。"""
-    ft = cfgmod.FeaturesSection(search_min_s=0.1, search_max_s=1.0, search_step_s=0.1)
-    grid = ft.search_grid()
-    assert grid == pytest.approx(tuple(round(0.1 * i, 1) for i in range(1, 11)))
-
-
-def test_search_grid_excludes_below_min_horizon() -> None:
-    ft = cfgmod.FeaturesSection(
-        search_min_s=0.1, search_max_s=1.0, search_step_s=0.1, search_min_horizon_s=0.5
-    )
-    grid = ft.search_grid()
-    assert min(grid) == pytest.approx(0.5)
-    assert 0.3 not in [round(g, 1) for g in grid]
-
-
-def test_search_grid_rejects_nonpositive_step() -> None:
-    ft = cfgmod.FeaturesSection(search_step_s=0.0)
-    with pytest.raises(ValueError, match="search_step_s"):
-        ft.search_grid()
+    """手順6: ホライズン自動選択の探索格子（定数）。0.1刻みの浮動小数丸め誤差が出ないこと。"""
+    grid = cfgmod.FeaturesSection().search_grid()
+    assert grid == pytest.approx(tuple(round(0.1 * i, 1) for i in range(1, 31)))
 
 
 def test_default_config_has_horizon_search_settings_validated() -> None:
@@ -107,34 +92,6 @@ def test_default_config_has_horizon_search_settings_validated() -> None:
     assert cfgmod.validate_config(cfg) == []
     assert cfg.features.search_max_s > cfg.features.search_min_s
     assert len(cfg.features.search_grid()) > 0
-
-
-@pytest.mark.parametrize(
-    ("field", "value", "match"),
-    [
-        ("search_min_s", 0.0, "search_min_s"),
-        ("search_step_s", -0.1, "search_step_s"),
-        ("search_max_horizons", 0, "search_max_horizons"),
-        ("search_min_improvement", 1.0, "search_min_improvement"),
-        ("search_min_improvement", -0.1, "search_min_improvement"),
-        ("search_min_horizon_s", -1.0, "search_min_horizon_s"),
-        ("search_cv_splits", 1, "search_cv_splits"),
-    ],
-)
-def test_horizon_search_settings_out_of_range_are_rejected(
-    field: str, value: float, match: str
-) -> None:
-    cfg = _load_default()
-    setattr(cfg.features, field, value)
-    problems = cfgmod.validate_config(cfg)
-    assert any(match in p for p in problems), problems
-
-
-def test_search_max_s_must_exceed_search_min_s() -> None:
-    cfg = _load_default()
-    cfg.features.search_max_s = cfg.features.search_min_s
-    problems = cfgmod.validate_config(cfg)
-    assert any("search_max_s" in p for p in problems)
 
 
 def test_unknown_candidate_is_rejected() -> None:
@@ -401,30 +358,6 @@ def test_gain_min_offsets_are_validated() -> None:
     assert any("brake_gain_min_offset_pct" in p for p in cfgmod.validate_config(cfg))
 
 
-def test_sample_weight_settings_are_validated() -> None:
-    """段2（ProblemReport_20260925。学習サンプルの WLTP 重み付け）: 既定は無効（後方互換）、
-    範囲は 0 < min <= 1 <= max。"""
-    cfg = _load_default()
-    lr = cfg.learning
-    assert lr.sample_weight_enabled is False
-    assert (lr.sample_weight_min, lr.sample_weight_max) == (0.2, 5.0)
-    assert cfgmod.validate_config(cfg) == []
-
-    lr.sample_weight_min = 0.0  # 0 < min でなければならない
-    assert any("sample_weight" in p for p in cfgmod.validate_config(cfg))
-
-    lr.sample_weight_min = 1.5  # min <= 1 でなければならない
-    assert any("sample_weight" in p for p in cfgmod.validate_config(cfg))
-
-    lr.sample_weight_min = 0.2
-    lr.sample_weight_max = 0.5  # 1 <= max でなければならない
-    assert any("sample_weight" in p for p in cfgmod.validate_config(cfg))
-
-    lr.sample_weight_min = 1.0
-    lr.sample_weight_max = 1.0  # 境界（min=1=max）は合格
-    assert cfgmod.validate_config(cfg) == []
-
-
 def test_creep_launch_settings_are_validated() -> None:
     """段1（ProblemReport_20260916 課題#2）: クリープ発進・クリープ域ブレーキ保持の新設定。
 
@@ -438,39 +371,14 @@ def test_creep_launch_settings_are_validated() -> None:
     """
     cfg = _load_default()
     lr = cfg.learning
-    # 2026-09-27 段7a（ProblemReport_20260925 段7）: 手順2 の計測効率化のため 3→0
-    assert lr.creep_launch_count == 0
-    assert lr.creep_launch_target_kmh == 15.0
-    assert lr.creep_launch_timeout_s == 60.0
     assert lr.creep_launch_settle_kmhs == 0.1
     assert lr.creep_launch_settle_s == 2.0
-    assert lr.creep_launch_min_speed_kmh == 1.0
-    assert lr.creep_launch_settle_min_s == 5.0
-    # 2026-09-25 段4: 「不感帯 + frac × (停車保持開度 − 不感帯)」の frac 列（1.0 = 停車保持開度）。
-    # 修理後の実測（不感帯 7.26・停車保持 18.63）で +0.6〜+11.4% になり、停止境界をはさむ
-    assert lr.creep_brake_hold_fracs == [0.05, 0.15, 0.25, 0.45, 0.55, 0.7, 0.9, 1.0]
     assert lr.creep_curve_bin_kmh == 1.0
     assert lr.creep_curve_min_bin_samples == 5
     assert cfgmod.validate_config(cfg) == []
 
     def problems_about(key: str) -> bool:
         return any(key in p for p in cfgmod.validate_config(cfg))
-
-    lr.creep_launch_count = -1
-    assert problems_about("creep_launch_count")
-    lr.creep_launch_count = 0
-    lr.creep_brake_hold_fracs = []
-    assert cfgmod.validate_config(cfg) == []  # 両方 0/空でも可（足さない）
-
-    lr.creep_launch_target_kmh = 0.0
-    assert problems_about("creep_launch_target_kmh")
-    lr.creep_launch_target_kmh = cfg.vehicle.max_speed_kmh
-    assert problems_about("creep_launch_target_kmh")
-    lr.creep_launch_target_kmh = 15.0
-
-    lr.creep_launch_timeout_s = 0.0
-    assert problems_about("creep_launch_timeout_s")
-    lr.creep_launch_timeout_s = 60.0
 
     lr.creep_launch_settle_kmhs = 0.0
     assert problems_about("creep_launch_settle_kmhs")
@@ -479,24 +387,6 @@ def test_creep_launch_settings_are_validated() -> None:
     lr.creep_launch_settle_s = 0.0
     assert problems_about("creep_launch_settle_s")
     lr.creep_launch_settle_s = 2.0
-
-    lr.creep_launch_min_speed_kmh = -1.0
-    assert problems_about("creep_launch_min_speed_kmh")
-    lr.creep_launch_min_speed_kmh = lr.creep_launch_target_kmh  # target 未満でなければ不可
-    assert problems_about("creep_launch_min_speed_kmh")
-    lr.creep_launch_min_speed_kmh = 1.0
-
-    lr.creep_launch_settle_min_s = -1.0
-    assert problems_about("creep_launch_settle_min_s")
-    lr.creep_launch_settle_min_s = 5.0
-
-    lr.creep_brake_hold_fracs = [0.5, 0.2]  # 昇順でない
-    assert problems_about("creep_brake_hold_fracs")
-    lr.creep_brake_hold_fracs = [0.0, 0.5]  # 0 は不可（0<frac<=1.2）
-    assert problems_about("creep_brake_hold_fracs")
-    lr.creep_brake_hold_fracs = [0.5, 1.3]  # 停車保持開度の 1.2 倍を超える
-    assert problems_about("creep_brake_hold_fracs")
-    lr.creep_brake_hold_fracs = [0.2, 0.5]
 
     lr.creep_curve_bin_kmh = 0.0
     assert problems_about("creep_curve_bin_kmh")
@@ -543,14 +433,10 @@ def test_coast_curve_low_settings_are_validated() -> None:
 
 def test_stop_brake_floor_settings_are_validated() -> None:
     """段4改訂（クリープ域ブレーキの下限。ProblemReport_20260916）:
-    stop_brake_floor_offset_pct・brake_trim_max_kmh・brake_trim_ref_kmh、
-    learning.stop_brake_floor_* の範囲検証。
+    learning.stop_brake_floor_* の範囲検証（feedforward 側の3キーは2026-10-09 に yaml から削除）。
     """
     cfg = _load_default()
-    ff = cfg.feedforward
     lr = cfg.learning
-    assert ff.brake_trim_max_kmh == 5.0  # 2026-09-19 段4 で有効化済み（0.0 なら無効）
-    assert ff.stop_brake_floor_offset_pct == pytest.approx(8.0)
     assert lr.stop_brake_floor_start_tol_kmh == pytest.approx(1.5)
     assert lr.stop_brake_floor_min_float_s == pytest.approx(5.0)
     assert lr.stop_brake_floor_opening_tol_pct == pytest.approx(0.3)
@@ -558,32 +444,6 @@ def test_stop_brake_floor_settings_are_validated() -> None:
 
     def problems_about(key: str) -> bool:
         return any(key in p for p in cfgmod.validate_config(cfg))
-
-    # stop_brake_floor_offset_pct の範囲（0<=pct<20.0）
-    ff.stop_brake_floor_offset_pct = -0.1
-    assert problems_about("stop_brake_floor_offset_pct")
-    ff.stop_brake_floor_offset_pct = 20.0  # 上限（未満でなければならない）
-    assert problems_about("stop_brake_floor_offset_pct")
-    ff.stop_brake_floor_offset_pct = 0.0  # 未同定は合格
-    assert cfgmod.validate_config(cfg) == []
-    ff.stop_brake_floor_offset_pct = 8.0
-
-    # brake_trim_max_kmh の範囲（0<=km/h<20.0）
-    ff.brake_trim_max_kmh = -0.1
-    assert problems_about("brake_trim_max_kmh")
-    ff.brake_trim_max_kmh = 20.0  # 上限（未満でなければならない）
-    assert problems_about("brake_trim_max_kmh")
-    ff.brake_trim_max_kmh = 5.0
-    assert cfgmod.validate_config(cfg) == []
-    ff.brake_trim_max_kmh = 0.0
-
-    # brake_trim_ref_kmh の範囲（0<km/h<=2.0）
-    ff.brake_trim_ref_kmh = 0.0
-    assert problems_about("brake_trim_ref_kmh")
-    ff.brake_trim_ref_kmh = 2.1
-    assert problems_about("brake_trim_ref_kmh")
-    ff.brake_trim_ref_kmh = 0.3
-    assert cfgmod.validate_config(cfg) == []
 
     # learning.stop_brake_floor_* の範囲（すべて正値）
     lr.stop_brake_floor_start_tol_kmh = 0.0
@@ -857,10 +717,12 @@ def test_coverage_mode_names_are_validated() -> None:
 
 
 def test_default_coverage_modes_and_grid_edges_include_us06_range() -> None:
-    from tests.research.config import LearningSection, ModesSection
+    from tests.research.config import ModesSection
 
     assert ModesSection().coverage_mode_names == ["01_WLTP_Low,Mid,Hi,ExHi"]
-    edges = LearningSection().grid_accel_edges_kmhs
+    from tests.research.wltp_grid import GRID_ACCEL_EDGES_KMHS
+
+    edges = GRID_ACCEL_EDGES_KMHS
     assert edges[0] == -14.0 and edges[-1] == 14.0  # max_decel_g 0.4G ≒ 14.1 km/h/s
 
 
@@ -870,7 +732,6 @@ def test_grid_hole_wltp_min_s_key_is_gone(tmp_path: Path) -> None:
     path.write_text("learning:\n  grid_hole_wltp_min_s: 5.0\n", encoding="utf-8")
     with pytest.raises(cfgmod.ConfigError, match="grid_hole_wltp_min_s"):
         cfgmod.load_config(path)
-    assert cfgmod.LearningSection().grid_target_min_s == pytest.approx(2.5)
 
 
 def test_arbiter_band_and_direction_keys_load_and_are_validated() -> None:
@@ -933,29 +794,13 @@ def test_pedal_select_brake_center_is_validated_and_roundtrips(tmp_path: Path) -
     assert "pedal_select_brake_center_s" in path.read_text(encoding="utf-8")
 
 
-def test_grid_direction_and_weight_keys_are_validated() -> None:
-    lr = cfgmod.LearningSection()
-    assert (lr.grid_direction_threshold_pct, lr.grid_direction_threshold_kmhs,
-            lr.grid_weight_frac, lr.grid_direction_threshold_accel_pct) == (0.3, 0.3, 0.25, 1.5)
-    for key, bad in (
-        ("grid_direction_threshold_pct", -0.1),
-        ("grid_direction_threshold_kmhs", -0.1),
-        ("grid_direction_threshold_accel_pct", -0.1),
-        ("grid_weight_frac", 1.5),
-        ("grid_weight_frac", -0.1),
-    ):
-        cfg = cfgmod.ResearchConfig()
-        setattr(cfg.learning, key, bad)
-        assert any(key in p for p in cfgmod.validate_config(cfg)), key
-
-
 def test_ramp_settings_are_validated() -> None:
     """段2k 段A: learning.ramp_g_levels / ramp_mode_min_s / ramp_time_budget_s の検証。"""
     cfg = _load_default()
     lr = cfg.learning
     assert lr.ramp_g_levels == [0.02, 0.045, 0.08, 0.125, 0.175, 0.25, 0.35]
     assert lr.ramp_mode_min_s == pytest.approx(2.0)
-    assert lr.ramp_time_budget_s == pytest.approx(1200.0)
+    assert lr.ramp_time_budget_s == pytest.approx(2060.0)  # 段2o-5: 1910 → 2060
     assert cfgmod.validate_config(cfg) == []
 
     def problems_about(key: str) -> bool:
@@ -976,6 +821,12 @@ def test_ramp_settings_are_validated() -> None:
     lr.ramp_time_budget_s = 0.0
     assert problems_about("ramp_time_budget_s")
     lr.ramp_time_budget_s = 1200.0
+    assert lr.ramp_max_passes == 2  # 2026-10-17 段2o-8
+    lr.ramp_max_passes = 0
+    assert problems_about("ramp_max_passes")
+    lr.ramp_max_passes = 1
+    assert not problems_about("ramp_max_passes")
+    lr.ramp_max_passes = 2
     assert cfgmod.validate_config(cfg) == []
 
 
@@ -991,13 +842,12 @@ def test_ramp_top_margin_is_loaded_and_validated() -> None:
 
 
 def test_ramp_control_settings_are_validated() -> None:
-    """段2k 段B: learning.ramp_rate_gain_pct_per_g_s・ramp_hold_margin_*・gov_soft_frac の検証。"""
+    """段2k 段B: learning.ramp_settle_time_s・gov_soft_frac の検証（段2l-8 で固定ゲイン・
+    保持幅のキーを削除）。"""
     cfg = _load_default()
     lr = cfg.learning
-    assert lr.ramp_rate_gain_pct_per_g_s == pytest.approx(100.0)
     assert lr.ramp_settle_time_s == pytest.approx(2.0)
-    assert lr.ramp_hold_margin_frac == pytest.approx(0.10)
-    assert lr.ramp_hold_margin_min_g == pytest.approx(0.005)
+    assert not hasattr(lr, "ramp_rate_gain_pct_per_g_s")
     assert lr.gov_soft_frac == pytest.approx(0.95)
     assert cfgmod.validate_config(cfg) == []
 
@@ -1005,10 +855,7 @@ def test_ramp_control_settings_are_validated() -> None:
         return any(key in p for p in cfgmod.validate_config(cfg))
 
     for key, bads, good in (
-        ("ramp_rate_gain_pct_per_g_s", (0.0, -1.0), 100.0),
         ("ramp_settle_time_s", (0.0, -1.0), 2.0),
-        ("ramp_hold_margin_frac", (0.0, 1.0, -0.1), 0.10),
-        ("ramp_hold_margin_min_g", (0.0, -0.01), 0.005),
         ("gov_soft_frac", (0.0, 1.1, -0.5), 0.95),
     ):
         for bad in bads:
@@ -1019,6 +866,87 @@ def test_ramp_control_settings_are_validated() -> None:
     assert not problems_about("gov_soft_frac")
     lr.gov_soft_frac = 0.95
     assert cfgmod.validate_config(cfg) == []
+
+
+def test_ramp_gref_time_settings_are_loaded_and_validated() -> None:
+    """2026-10-09 段2l-9: G ランプの発進・切り替え・停止の時間（0 以上。0 は丸めない）。"""
+    cfg = _load_default()
+    lr = cfg.learning
+    for key in ("ramp_launch_time_s", "ramp_stop_time_s"):
+        assert getattr(lr, key) == pytest.approx(1.0)
+    assert lr.ramp_turn_time_s == pytest.approx(2.0)  # 2026-10-10 段2l-10: 1.0 → 2.0
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    for key in ("ramp_launch_time_s", "ramp_turn_time_s", "ramp_stop_time_s"):
+        setattr(lr, key, -0.1)
+        assert problems_about(key), key
+        setattr(lr, key, 0.0)  # 0 ちょうどは合格（丸めない）
+        assert not problems_about(key), key
+        setattr(lr, key, 2.0 if key == "ramp_turn_time_s" else 1.0)
+    assert cfgmod.validate_config(cfg) == []
+
+
+def test_ramp_hold_deadband_and_lag_tolerance_are_loaded_and_validated() -> None:
+    """2026-10-10 段2l-10: 保持時間（0 以上）・偏差の不感帯（0 以上）・アクチュエータの遅れの
+    許容（正値）。"""
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.ramp_hold_time_s == pytest.approx(7.0)
+    assert lr.ramp_dev_deadband_kmh == pytest.approx(0.5)
+    assert lr.ramp_actuator_lag_tol_pct == pytest.approx(2.0)
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    for key, good in (("ramp_hold_time_s", 7.0), ("ramp_dev_deadband_kmh", 0.5)):
+        setattr(lr, key, -0.1)
+        assert problems_about(key), key
+        setattr(lr, key, 0.0)  # 0 ちょうどは合格（保持なし・不感帯なし）
+        assert not problems_about(key), key
+        setattr(lr, key, good)
+    lr.ramp_actuator_lag_tol_pct = 0.0
+    assert problems_about("ramp_actuator_lag_tol_pct")
+    lr.ramp_actuator_lag_tol_pct = 2.0
+    assert cfgmod.validate_config(cfg) == []
+
+
+def test_ramp_one_sided_is_loaded_from_yaml_and_defaults_to_true(tmp_path: Path) -> None:
+    """2026-10-12 段2l-12: G ランプの片側調整。yaml は true、キーが無ければ既定の True。"""
+    cfg = _load_default()
+    assert cfg.learning.ramp_one_sided is True
+    assert cfgmod.LearningSection().ramp_one_sided is True
+    text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    assert "  ramp_one_sided: true\n" in text
+    off = tmp_path / "off.yaml"
+    off.write_text(text.replace("  ramp_one_sided: true\n", "  ramp_one_sided: false\n"),
+                   encoding="utf-8")
+    assert cfgmod.load_config(off).learning.ramp_one_sided is False
+
+
+def test_ramp_edge_g_is_loaded_and_validated() -> None:
+    """2026-10-09 段2l-9: 発進の始まり・停止の終わりの狙いの G（0 以上。0 は下げ止めなし）。"""
+    cfg = _load_default()
+    assert cfg.learning.ramp_edge_g == pytest.approx(0.05)
+    assert cfgmod.validate_config(cfg) == []
+    cfg.learning.ramp_edge_g = -0.01
+    assert any("ramp_edge_g" in p for p in cfgmod.validate_config(cfg))
+    cfg.learning.ramp_edge_g = 0.0
+    assert not any("ramp_edge_g" in p for p in cfgmod.validate_config(cfg))
+
+
+@pytest.mark.parametrize(
+    "key", ["ramp_rate_gain_pct_per_g_s", "ramp_hold_margin_frac", "ramp_hold_margin_min_g"]
+)
+def test_removed_ramp_keys_give_clear_error(tmp_path: Path, key: str) -> None:
+    """2026-10-09 段2l-8: 固定ゲイン・保持幅は廃止。yaml に残っていたら案内つきエラー。"""
+    path = tmp_path / "c.yaml"
+    path.write_text(f"learning:\n  {key}: 1.0\n", encoding="utf-8")
+    with pytest.raises(cfgmod.ConfigError, match=f"{key} は廃止されました.*削除してください"):
+        cfgmod.load_config(path)
 
 
 def test_stop_brake_offset_key_loads_and_gives_absolute_opening(tmp_path: Path) -> None:
@@ -1054,3 +982,92 @@ def test_stop_brake_offset_is_validated() -> None:
     cfg.vehicle.min_brake_opening_pct = 5.0
     cfg.feedforward.stop_brake_offset_pct = 96.0  # min ＋ 量 > 100
     assert any("100 を超え" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_ramp_min_at_g_s_is_loaded_and_validated() -> None:
+    """2026-10-10 段2l-11: 強い G の段で基準が狙いの G にいる時間の下限（0 以上。0 は無効）。"""
+    cfg = _load_default()
+    assert cfg.learning.ramp_min_at_g_s == pytest.approx(3.25)
+    assert cfgmod.validate_config(cfg) == []
+    cfg.learning.ramp_min_at_g_s = -0.1
+    assert any("ramp_min_at_g_s" in p for p in cfgmod.validate_config(cfg))
+    cfg.learning.ramp_min_at_g_s = 0.0  # 0 ちょうどは合格（最小の上端を使わない）
+    assert not any("ramp_min_at_g_s" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_ramp_cruise_and_lag_settings_are_loaded_and_validated() -> None:
+    """2026-10-13 段2o-2: 途中の定速保持と遅れの測定のキー。yaml の値を読み、不正値は弾く。"""
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.ramp_cruise_band_g == pytest.approx(0.005)
+    assert lr.ramp_cruise_hold_s == pytest.approx(7.0)
+    assert lr.ramp_cruise_timeout_s == pytest.approx(15.0)
+    assert lr.ramp_cruise_fine_max_kmh == pytest.approx(100.0)
+    assert lr.ramp_cruise_coarse_step_kmh == pytest.approx(20.0)
+    assert list(lr.ramp_lag_speeds_kmh) == [30.0, 60.0]
+    assert lr.ramp_lag_step_g == pytest.approx(0.05)
+    assert lr.ramp_lag_step_hold_s == pytest.approx(2.5)
+    assert lr.ramp_lag_approach_g == pytest.approx(0.125)
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    for key, good in (
+        ("ramp_cruise_band_g", 0.005), ("ramp_cruise_fine_max_kmh", 100.0),
+        ("ramp_cruise_coarse_step_kmh", 20.0), ("ramp_lag_step_g", 0.05),
+        ("ramp_lag_step_hold_s", 2.5), ("ramp_lag_approach_g", 0.125),
+    ):
+        setattr(lr, key, 0.0)
+        assert problems_about(key), key
+        setattr(lr, key, good)
+    lr.ramp_cruise_hold_s = -1.0
+    assert problems_about("ramp_cruise_hold_s")
+    lr.ramp_cruise_hold_s = 7.0
+    lr.ramp_lag_speeds_kmh = [30.0, -5.0]
+    assert problems_about("ramp_lag_speeds_kmh")
+    lr.ramp_lag_speeds_kmh = []  # 空は「測らない」で合格
+    assert not problems_about("ramp_lag_speeds_kmh")
+
+
+def test_ramp_release_settings_are_loaded_and_validated() -> None:
+    """2026-10-14 段2o-5: 下りの戻しのキー。yaml の値を読み、不正値は弾く（空は戻し無しで合格）。"""
+    cfg = _load_default()
+    lr = cfg.learning
+    assert list(lr.ramp_release_fracs) == [0.5, 0.0]
+    assert lr.ramp_release_move_s == pytest.approx(1.0)
+    assert list(lr.ramp_release_hold_s) == [1.5, 2.0]
+    assert lr.ramp_release_enabled is True  # 2026-10-16 段2o-6（既定 true）
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    lr.ramp_release_hold_s = [1.5]  # 長さが合わない
+    assert problems_about("ramp_release_fracs")
+    lr.ramp_release_hold_s = [1.5, 2.0]
+    lr.ramp_release_fracs = [0.0, 0.5]  # 降順でない
+    assert problems_about("ramp_release_fracs")
+    lr.ramp_release_fracs = [1.0, 0.0]  # 1 以上
+    assert problems_about("ramp_release_fracs")
+    lr.ramp_release_fracs = []  # 空は戻し無しで合格（保持も空）
+    lr.ramp_release_hold_s = []
+    assert not problems_about("ramp_release")
+    lr.ramp_release_fracs = [0.5, 0.0]
+    lr.ramp_release_hold_s = [1.5, 2.0]
+    lr.ramp_release_move_s = 0.0
+    assert problems_about("ramp_release_move_s")
+
+
+def test_ramp_release_enabled_is_loaded_and_passed_to_the_loop(tmp_path: Path) -> None:
+    """2026-10-16 段2o-6: learning.ramp_release_enabled を yaml から読み、ループの設定へ渡す。"""
+    from tests.research.pattern_drive import loop_config_from_config
+
+    path = tmp_path / "cfg.yaml"
+    cfg = cfgmod.load_config(path)  # 無ければ既定 yaml から作られる
+    assert cfg.learning.ramp_release_enabled is True
+    assert loop_config_from_config(cfg).ramp_release_enabled is True
+    cfg.save({"learning.ramp_release_enabled": False})
+    cfg2 = cfgmod.load_config(path)
+    assert cfg2.learning.ramp_release_enabled is False
+    assert loop_config_from_config(cfg2).ramp_release_enabled is False

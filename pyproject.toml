@@ -28,6 +28,10 @@ research = [
     # 学習（tests/research/fwd_torch.py）だけに使う。保存する pkl は格子なので実機側には不要
     "torch>=2.0.0",
 ]
+# 走行ログ分析の作業用（Claude のスクラッチ分析）。src/ と tests/ では import しない。
+analysis = [
+    "pandas>=2.2",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

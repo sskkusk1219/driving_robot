@@ -675,7 +675,7 @@ PARAMS_WITH_GAIN = FeedforwardParams(
 def test_candidate_classes_registered_with_matching_names() -> None:
     for name, cls in CANDIDATE_CLASSES.items():
         assert cls().candidate == name
-    assert set(CANDIDATE_CLASSES) == {"C1", "C2", "C3", "C4", "C5", "C7", "C8"}
+    assert set(CANDIDATE_CLASSES) == {"C1", "C2", "C3", "C4", "C5", "C7", "C8", "C10"}
 
 
 def test_make_candidate_unknown_name_raises() -> None:

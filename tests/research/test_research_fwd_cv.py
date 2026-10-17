@@ -233,3 +233,32 @@ def test_fit_one_info_without_rollout_returns_none_info():
     )
     fm, info = fit_one_info(CvConfig("t", (3,)), [rows], 0, max_iter=2)
     assert info is None and fm.accel_side is not None
+
+
+def test_side_rows_brake_has_release_column_accel_does_not():
+    """2026-10-14 段2o-5: ブレーキ側の入力は (車速, u, 戻し量) の 3 列、アクセル側は 2 列。"""
+    base = _rows()
+    r = FwdRows(**{**base.__dict__, "release_pct": np.array([0.0, 0.0, 0.0, 0.0, 1.5])})
+    xb, _, _, _ = side_rows([r], "brake", coast_in_brake=True)
+    xa, _, _, _ = side_rows([r], "accel", coast_in_brake=True)
+    assert xb.shape[1] == 3 and xa.shape[1] == 2
+    assert xb[:, 2].tolist() == [0.0, 0.0, 0.0, 1.5]  # u <= 0 の 4 行
+
+
+def test_side_rows_exclude_launch_only_on_brake_side():
+    base = _rows()
+    r = FwdRows(**{**base.__dict__, "launch_row": np.array([True, False, False, True, True])})
+    xb, _, _, _ = side_rows([r], "brake", coast_in_brake=True, exclude_launch=True)
+    assert xb[:, 1].tolist() == [0.0, 0.0]  # u<=0 の 4 行から launch の 2 行（添字 0・4）を除く
+    xb_all, _, _, _ = side_rows([r], "brake", coast_in_brake=True)
+    assert len(xb_all) == 4
+    xa, _, _, _ = side_rows([r], "accel", coast_in_brake=True, exclude_launch=True)
+    assert len(xa) == 3  # アクセル側は発進の行も残す（u=3 の行は launch_row でも残る）
+
+
+def test_cvconfig_brake_exclude_launch_default_on_and_key_compatible():
+    assert CvConfig("t", (3,)).brake_exclude_launch is True
+    assert "brake_exclude_launch" not in CvConfig("t", (3,)).key()
+    assert CvConfig("t", (3,), brake_exclude_launch=False).key().endswith(
+        "|brake_exclude_launch=False"
+    )

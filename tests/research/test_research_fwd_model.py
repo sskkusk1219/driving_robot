@@ -22,8 +22,11 @@ from tests.research.fwd_model import (
     fit_models,
     mean_grid,
     model_to_grid,
+    monotone_rows,
     monotone_violation,
+    poly_features,
     raw_grid,
+    raw_release_slices,
 )
 
 DT = 0.05
@@ -77,9 +80,10 @@ def test_fit_recovers_quadratic_surface(fitted):
     v = np.array([10.0, 40.0, 70.0, 25.0])
     u = np.array([5.0, 15.0, 2.0, -12.0])
     x = np.column_stack([v, u])
+    x3 = np.column_stack([v, u, np.zeros_like(v)])  # ブレーキ側は 3 列（戻し量 0）
     for name in (NAME_LINEAR, NAME_RIDGE):
         f = fitted[name]
-        side = np.where(u >= 0, f.accel_side.predict(x), f.brake_side.predict(x))
+        side = np.where(u >= 0, f.accel_side.predict(x), f.brake_side.predict(x3))
         assert np.allclose(side, true_accel(v, u), atol=0.05), name
     assert fitted[NAME_RIDGE].alpha in (0.01, 0.1, 1.0, 10.0, 100.0)
     assert fitted[NAME_MLP].hidden == (10,)
@@ -99,7 +103,8 @@ def test_grid_copies_like_and_zero_is_mean(fitted, like):
     j0 = int(np.argmin(np.abs(tb.u_grid)))
     rep = tb.speed_rep
     x = np.column_stack([rep, np.zeros_like(rep)])
-    mean0 = (f.accel_side.predict(x) + f.brake_side.predict(x)) / 2.0
+    x3 = np.column_stack([rep, np.zeros_like(rep), np.zeros_like(rep)])
+    mean0 = (f.accel_side.predict(x) + f.brake_side.predict(x3)) / 2.0
     assert np.allclose(tb.accel_before_mono[:, j0], mean0)
     assert tb.meta["model_name"] == NAME_LINEAR
 
@@ -181,3 +186,36 @@ def test_mean_grid_differs_from_mean_of_monotonized():
     grid_b = model_to_grid(b, like_tb).accel_grid
     mono_then_avg = (grid_a + grid_b) / 2
     assert not np.allclose(avg_then_mono, mono_then_avg)
+
+
+# ───────── 2026-10-14 段2o-5: ブレーキ側の入力に戻し量 ─────────
+
+
+def test_poly_features_accepts_three_columns():
+    x2 = np.array([[10.0, -2.0], [20.0, -3.0]])
+    x3 = np.column_stack([x2, [1.0, 2.0]])
+    assert poly_features(x2).shape == (2, 5)
+    f3 = poly_features(x3)
+    assert f3.shape == (2, 9)
+    assert np.array_equal(f3[:, :5], poly_features(x2))
+
+
+def test_brake_side_has_three_inputs_and_release_slices_follow_main(like):
+    from tests.research.test_research_fwd_final import make_release_rows  # noqa: PLC0415
+
+    rows = [make_release_rows(i, f"r{i}", release_gain=0.05) for i in range(2)]
+    fs = fit_models(rows, mlp_max_iter=30)
+    for name in (NAME_LINEAR, NAME_RIDGE, NAME_MLP):
+        assert fs[name].accel_side.predict(np.zeros((1, 2))).shape == (1,)
+        assert fs[name].brake_side.predict(np.zeros((1, 3))).shape == (1,)
+    f = fs[NAME_RIDGE]
+    grid = (0.5, 1.0, 4.0)
+    sl = raw_release_slices(f, like, grid)
+    assert sl.shape == (3, *like.accel_grid.shape)
+    main = raw_grid(f, like)
+    ug = like.u_grid
+    assert np.allclose(sl[:, :, ug > 0], main[None, :, ug > 0])  # u > 0 は本体と同じ
+    assert np.allclose(raw_grid(f, like, release_pct=0.0), main)
+    assert not np.allclose(sl[:, :, ug < 0], main[None, :, ug < 0])  # u < 0 は戻し量で変わる
+    mono = monotone_rows(sl, ug)
+    assert np.all(np.diff(mono, axis=2) >= -1e-9)

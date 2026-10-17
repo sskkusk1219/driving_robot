@@ -36,8 +36,8 @@ import numpy as np
 
 from tests.research import fwd_torch
 from tests.research.fwd_data import STOP_SPEED_KMH, FwdRows
-from tests.research.fwd_map import ForwardTable, load_forward_map
-from tests.research.fwd_model import FittedModel, grid_from_raw, raw_grid
+from tests.research.fwd_map import RELEASE_GRID_PCT, ForwardTable, load_forward_map, refine_u_grid
+from tests.research.fwd_model import FittedModel, grid_from_raw, raw_grid, raw_release_slices
 from tests.research.fwd_plan import lagged_input
 from tests.research.fwd_tool import (
     DEFAULT_C7_MAP,
@@ -112,15 +112,31 @@ class CvConfig:
     drop_stop_approach: bool = False
     # 追加学習（段4）で車速を積み上げる窓の長さ [s]。0 は追加学習なし
     rollout_s: float = 0.0
+    # 2026-10-14 段2o-4: C8 の表の u の刻み [%]。None は C7 の表（like）と同じ刻み。
+    # 学習（行の作り方・NN）は変えず、表の格子だけ細かくする（fwd_map.refine_u_grid）
+    table_u_step_pct: float | None = None
+    # 2026-10-14 段2o-5: True（既定）なら乱数ごとに戻し量ごとの配列（raw_release_slices）も作って
+    # 返す（C8 の表に戻しの表を付けるため。fwd_final.build_final_table）。C7 には関係しない
+    release_slices: bool = True
+    # 2026-10-14 段2o-5: True（既定）ならブレーキ側の学習から「発進の区間」の行
+    # （FwdRows.launch_row。
+    # 停止保持のブレーキを離しながら動き出す行）を外す。発進は attach_launch の別の表が受け持ち、
+    # ここに混ぜると「戻し ⇒ ブレーキが弱い」を過大に教えるため。アクセル側は変えない
+    brake_exclude_launch: bool = True
 
     def key(self) -> str:
         """全フィールドから作る文字列（結果ファイルで同じ設定を見分ける）。
-        time_weight・drop_stop_approach・rollout_s は既定値（False／0）のとき含めない
+        time_weight・drop_stop_approach・rollout_s・table_u_step_pct は既定値（False／0／None）の
+        とき含めない
         （足す前の結果を読み直せるようにするため）。"""
         d = asdict(self)
-        for k in ("time_weight", "drop_stop_approach", "rollout_s"):
+        for k in ("time_weight", "drop_stop_approach", "rollout_s", "table_u_step_pct"):
             if not d[k]:
                 del d[k]
+        if d["release_slices"]:  # 既定（True）は含めない（足す前の結果を読み直せるように）
+            del d["release_slices"]
+        if d["brake_exclude_launch"]:
+            del d["brake_exclude_launch"]
         return "|".join(f"{k}={v}" for k, v in d.items())
 
 
@@ -136,17 +152,24 @@ def fold_name(held: Path) -> str:
 
 
 def side_rows(
-    rows_list: Sequence[FwdRows], side: str, *, coast_in_brake: bool
+    rows_list: Sequence[FwdRows], side: str, *, coast_in_brake: bool, exclude_launch: bool = False
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """片側の行の x (N, 2)・加速度 y・ログ番号・時刻 t_s。選び方は fwd_model._xy と同じ
-    （accel: u >= 0、brake: u <= 0。coast_in_brake=False なら brake は u < 0）。"""
+    """片側の行の x・加速度 y・ログ番号・時刻 t_s。選び方は fwd_model._xy と同じ
+    （accel: u >= 0、brake: u <= 0。coast_in_brake=False なら brake は u < 0）。
+    exclude_launch=True はブレーキ側から発進の区間の行（launch_row）を除く（アクセル側は除かない）。
+    x は accel が (N, 2)（車速・u）、brake が (N, 3)（車速・u・戻し量。2026-10-14 段2o-5）。"""
     xs, ys, gs, ts = [], [], [], []
     for g, r in enumerate(rows_list):
         if side == "accel":
             m = r.u_pct >= 0
         else:
             m = r.u_pct <= 0 if coast_in_brake else r.u_pct < 0
-        xs.append(np.column_stack([r.speed_kmh[m], r.u_pct[m]]))
+            if exclude_launch:
+                m = m & ~r.launch_row
+        cols = [r.speed_kmh[m], r.u_pct[m]]
+        if side != "accel":
+            cols.append(r.release_pct[m])
+        xs.append(np.column_stack(cols))
         ys.append(r.accel_kmhs[m])
         gs.append(np.full(int(m.sum()), g))
         ts.append(r.t_s[m])
@@ -254,7 +277,12 @@ def fit_one_info(
     sides = {}
     point_data = {}
     for side in ("accel", "brake"):
-        x, y, g, t = side_rows(train_rows, side, coast_in_brake=cfg.coast_from != "accel")
+        x, y, g, t = side_rows(
+            train_rows,
+            side,
+            coast_in_brake=cfg.coast_from != "accel",
+            exclude_launch=cfg.brake_exclude_launch,
+        )
         if cfg.drop_stop_approach:  # 重み 0 ではなく行そのものを除く（検証の分け方も変わる）
             keep = ~stop_approach_mask(x[:, 0], x[:, 1])
             x, y, g, t = x[keep], y[keep], g[keep], t[keep]
@@ -380,8 +408,9 @@ def _agg(per_fold: dict[str, dict], how: str) -> dict[str, float]:
 # ─────────────────────────── 学習・集計 ───────────────────────────
 
 
-def _worker(args: tuple) -> tuple[int, int, np.ndarray, float]:
-    """(分割番号, 乱数) 1 タスク。単調化前の配列と学習秒数を返す。pickle できるようトップレベル。
+def _worker(args: tuple) -> tuple[int, int, np.ndarray, float, np.ndarray | None]:
+    """(分割番号, 乱数) 1 タスク。単調化前の配列・学習秒数・戻し量ごとの単調化前の配列
+    （cfg.release_slices でなければ None。2026-10-14 段2o-5）を返す。pickle できるようトップレベル。
     末尾の (学習ログごとの trace, DeadbandLag) は rollout_s > 0 のときだけ使う（省略可）。
     追加学習の info はここで表示する。"""
     cfg, fold_idx, seed, train_rows, like_path, max_iter, n_threads, *rest = args
@@ -389,6 +418,8 @@ def _worker(args: tuple) -> tuple[int, int, np.ndarray, float]:
     if n_threads:
         fwd_torch.set_threads(n_threads)
     like = load_forward_map(Path(like_path))
+    if cfg.table_u_step_pct is not None:
+        like = refine_u_grid(like, cfg.table_u_step_pct)
     t0 = time.perf_counter()
     epochs = SMOKE_ROLLOUT_EPOCHS if max_iter == SMOKE_MAX_ITER else fwd_torch.ROLLOUT_MAX_EPOCHS
     fm, info = fit_one_info(
@@ -403,7 +434,12 @@ def _worker(args: tuple) -> tuple[int, int, np.ndarray, float]:
     if info is not None:
         print(f"    分割{fold_idx} 乱数{seed}: {format_rollout_info(info)}", flush=True)
     raw = raw_grid(fm, like, coast_from=cfg.coast_from)
-    return fold_idx, seed, raw, time.perf_counter() - t0
+    rel = (
+        raw_release_slices(fm, like, RELEASE_GRID_PCT, coast_from=cfg.coast_from)
+        if cfg.release_slices
+        else None
+    )
+    return fold_idx, seed, raw, time.perf_counter() - t0, rel
 
 
 @dataclass
@@ -459,14 +495,18 @@ def run_model_config(cfg: CvConfig, ctx: Context, workers: int, max_iter: int) -
             outs = list(ex.map(_worker, tasks))
     else:
         outs = [_worker(t) for t in tasks]
-    for fold_idx, seed, _, sec in outs:
+    for fold_idx, seed, _, sec, _rel in outs:
         print(f"    タスク 分割{fold_idx} 乱数{seed}: {sec:.1f} 秒", flush=True)
     per_fold: dict[str, dict] = {}
     for i, (_, held) in enumerate(ctx.fold_rows):
         raws = [o[2] for o in outs if o[0] == i]
+        # raw は worker が細かい格子（table_u_step_pct）で評価した値。採点の like は C7 のまま
+        like_raw = ctx.like
+        if cfg.table_u_step_pct is not None:
+            like_raw = refine_u_grid(ctx.like, cfg.table_u_step_pct)
         tb = grid_from_raw(
             np.mean(raws, axis=0),
-            ctx.like,
+            like_raw,
             {"coast_from": cfg.coast_from, "n_models": len(raws), "hidden": cfg.hidden},
         )
         per_fold[fold_name(held)] = score_table(tb, ctx.like, held, ctx.st)

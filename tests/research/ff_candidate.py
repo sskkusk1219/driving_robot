@@ -90,6 +90,7 @@ __all__ = [
     "CandidateFeedforward",
     "ForwardMapFeedforward",
     "ForwardModelFeedforward",
+    "DeviationForwardFeedforward",
     "CANDIDATE_CLASSES",
     "make_candidate",
     "train_inverse_model_effective",
@@ -765,6 +766,9 @@ class ForwardMapFeedforward:
         brake_lag_s: float | None = None,
         need_window_s: float,
         coast_band_kmhs: float,
+        preposition_enabled: bool = False,
+        preposition_margin_pct: float = 0.5,
+        preposition_lead_s: float = 0.2,
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。"""
         from tests.research.fwd_plan import build_plan  # noqa: PLC0415
@@ -782,6 +786,9 @@ class ForwardMapFeedforward:
             brake_lag_s=brake_lag_s,
             need_window_s=need_window_s,
             coast_band_kmhs=coast_band_kmhs,
+            preposition_enabled=preposition_enabled,
+            preposition_margin_pct=preposition_margin_pct,
+            preposition_lead_s=preposition_lead_s,
         )
         return self._plan
 
@@ -804,6 +811,33 @@ class ForwardModelFeedforward(ForwardMapFeedforward):
     expected_kind = "model"  # fwd_map.KIND_MODEL
 
 
+class DeviationForwardFeedforward(ForwardModelFeedforward):
+    """C10: C8 の開度の列に、走行中に偏差の分だけ上乗せする（2026-10-17 段2p）。
+
+    読む pkl・開度の列の作り方・`effort_at` は C8 と同じ（`effort_at` は上乗せ前の列を返す）。
+    上乗せの計算は `fwd_plan.deviation_offset`、呼ぶのは走行ループ（mode_drive）。
+    τ ＝ c × 遅れ（ペダル別）と表の行の案は、走行前に mode_drive が `set_deviation` で持たせる。
+    """
+
+    candidate = "C10"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.deviation_c: float = 0.0
+        self.deviation_row: str = "reference"  # reference＝案A・actual＝案B
+        self.tau_accel_s: float | None = None  # None ＝ そのペダルは上乗せしない（遅れが測れない）
+        self.tau_brake_s: float | None = None
+
+    def set_deviation(
+        self, *, c: float, row: str, lag_accel_s: float | None, lag_brake_s: float | None
+    ) -> None:
+        """c・表の行の案・ペダル別の遅れから τ を決める。遅れが None のペダルの τ は None。"""
+        self.deviation_c = c
+        self.deviation_row = row
+        self.tau_accel_s = None if lag_accel_s is None else c * lag_accel_s
+        self.tau_brake_s = None if lag_brake_s is None else c * lag_brake_s
+
+
 #: V1 案スイッチ: config の feedforward.candidate 名 → クラス
 CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedforward]] = {
     "C1": CandidateFeedforward,
@@ -813,6 +847,7 @@ CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedfor
     "C5": CandidateC5,
     "C7": ForwardMapFeedforward,
     "C8": ForwardModelFeedforward,
+    "C10": DeviationForwardFeedforward,
 }
 
 

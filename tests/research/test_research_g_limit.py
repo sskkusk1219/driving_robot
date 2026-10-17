@@ -234,3 +234,113 @@ def test_sensitivity_is_none_without_data_with_one_point_or_nonpositive_slope() 
     assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 12.0, 8.0) is None
     m.add(PEDAL_BRAKE, 25.0, 20.0, 1.0)  # 傾き負
     assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 12.0, 8.0) is None
+
+
+def test_sensitivity_min_accel_span_drops_candidates_with_small_accel_difference() -> None:
+    """段2l-11: 傾き × 点の開度の幅（加速度の差）が下限未満の候補は採らない。
+    開度 10〜12% の点で加速度が 0.05 しか変わらない帯は、傾きが小さな正の値でも None。"""
+    m = GLimitMap()
+    for u, a in ((10.0, 3.00), (11.0, 3.03), (12.0, 3.05)):  # 傾き 0.025、差 0.05
+        m.add(PEDAL_BRAKE, 25.0, u, a)
+    assert m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 11.0, 8.0) == pytest.approx(0.025)
+    assert m.sensitivity_kmhs_per_pct(
+        PEDAL_BRAKE, 25.0, 11.0, 8.0, min_accel_span_kmhs=0.25
+    ) is None
+
+
+def test_sensitivity_min_accel_span_keeps_the_same_value_when_the_span_is_enough() -> None:
+    m = GLimitMap()
+    for u, a in ((10.0, 1.0), (12.0, 2.0), (14.0, 3.0), (16.0, 4.0)):  # 傾き 0.5、差 3
+        m.add(PEDAL_BRAKE, 25.0, u, a)
+    base = m.sensitivity_kmhs_per_pct(PEDAL_BRAKE, 25.0, 13.0, 8.0)
+    assert m.sensitivity_kmhs_per_pct(
+        PEDAL_BRAKE, 25.0, 13.0, 8.0, min_accel_span_kmhs=0.25
+    ) == pytest.approx(base)
+    # 既定 0 は従来と完全に同じ
+    assert m.sensitivity_kmhs_per_pct(
+        PEDAL_BRAKE, 25.0, 13.0, 8.0, min_accel_span_kmhs=0.0
+    ) == pytest.approx(base)
+
+
+def test_sensitivity_min_accel_span_falls_back_to_the_other_candidate_then_other_bin() -> None:
+    """近くの点だけ差が足りなければ全点の傾きを採る。両方足りなければ次の帯を探す。"""
+    m = GLimitMap()
+    for u, a in ((10.0, 3.0), (11.0, 3.02), (12.0, 3.04), (30.0, 12.0)):
+        m.add(PEDAL_BRAKE, 25.0, u, a)
+    near = [(10.0, 3.0), (11.0, 3.02), (12.0, 3.04)]
+    all_slope = _lsq_slope(near + [(30.0, 12.0)], 2)
+    assert all_slope is not None
+    assert m.sensitivity_kmhs_per_pct(
+        PEDAL_BRAKE, 25.0, 11.0, 8.0, min_accel_span_kmhs=0.25
+    ) == pytest.approx(all_slope)
+    # 自分の帯が両方足りない → 他の帯（ブレーキは速い側）の傾き
+    m2 = GLimitMap()
+    for u, a in ((10.0, 3.00), (11.0, 3.03), (12.0, 3.05)):
+        m2.add(PEDAL_BRAKE, 25.0, u, a)
+    for u, a in ((10.0, 1.0), (14.0, 3.0)):
+        m2.add(PEDAL_BRAKE, 45.0, u, a)
+    assert m2.sensitivity_kmhs_per_pct(
+        PEDAL_BRAKE, 25.0, 11.0, 8.0, min_accel_span_kmhs=0.25
+    ) == pytest.approx(0.5)
+
+
+# ── interp_pct（2026-10-10 段2l-10: 自分の車速帯の内挿だけ）──────────────────────
+
+
+def test_interp_pct_interpolates_between_points_that_straddle_the_target() -> None:
+    m = GLimitMap()
+    m.add(PEDAL_BRAKE, 45.0, 12.0, 4.0)
+    m.add(PEDAL_BRAKE, 45.0, 20.0, 9.0)
+    assert m.interp_pct(PEDAL_BRAKE, 47.0, 6.5, 8.0) == pytest.approx(16.0)  # 同じ帯（40〜50）
+    # 既存の cap_pct の内挿の枝と同じ値
+    same = m.cap_pct(PEDAL_BRAKE, 45.0, 6.5, 8.0)
+    assert m.interp_pct(PEDAL_BRAKE, 45.0, 6.5, 8.0) == pytest.approx(same)
+
+
+def test_interp_pct_uses_the_coast_point_as_the_lower_end() -> None:
+    m = GLimitMap()
+    m.add_coast(45.0, 1.0)  # 開度 ＝ 不感帯 8.0 で減速 1.0
+    m.add(PEDAL_BRAKE, 45.0, 18.0, 6.0)
+    assert m.interp_pct(PEDAL_BRAKE, 45.0, 3.5, 8.0) == pytest.approx(13.0)
+    # アクセル側の惰行は負の加速度の点
+    m.add(PEDAL_ACCEL, 45.0, 14.0, 1.0)
+    expected = 6.0 + (14.0 - 6.0) * 0.5 / 2.0
+    assert m.interp_pct(PEDAL_ACCEL, 45.0, -0.5, 6.0) == pytest.approx(expected)
+
+
+def test_interp_pct_is_none_without_points_on_both_sides_or_without_points() -> None:
+    m = GLimitMap()
+    assert m.interp_pct(PEDAL_BRAKE, 45.0, 3.0, 8.0) is None  # 点なし
+    m.add(PEDAL_BRAKE, 45.0, 12.0, 4.0)
+    m.add(PEDAL_BRAKE, 45.0, 20.0, 9.0)
+    assert m.interp_pct(PEDAL_BRAKE, 45.0, 10.0, 8.0) is None  # すべて target 未満（外挿しない）
+    assert m.interp_pct(PEDAL_BRAKE, 45.0, 2.0, 8.0) is None  # すべて target 以上（片側だけ）
+
+
+def test_interp_pct_does_not_borrow_other_bins_other_pedals_or_raise_to_safe_opening() -> None:
+    m = GLimitMap()
+    m.add(PEDAL_BRAKE, 25.0, 12.0, 4.0)
+    m.add(PEDAL_BRAKE, 25.0, 20.0, 9.0)
+    assert m.cap_pct(PEDAL_BRAKE, 45.0, 6.5, 8.0) is not None  # cap_pct は借用する
+    assert m.interp_pct(PEDAL_BRAKE, 45.0, 6.5, 8.0) is None  # interp_pct は借用しない
+    assert m.interp_pct(PEDAL_ACCEL, 25.0, 6.5, 8.0) is None  # 別のペダルの点は使わない
+    # 内挿値が実測で安全と分かっている開度より低くても、底上げしない
+    m2 = GLimitMap()
+    m2.add(PEDAL_BRAKE, 45.0, 10.0, 5.0)
+    m2.add(PEDAL_BRAKE, 45.0, 20.0, 5.5)
+    m2.add(PEDAL_BRAKE, 45.0, 30.0, 9.0)
+    assert m2.interp_pct(PEDAL_BRAKE, 45.0, 5.2, 8.0) == pytest.approx(10.0 + 10.0 * 0.2 / 0.5)
+
+
+def test_coast_curve_returns_bin_centres_and_medians_sorted() -> None:
+    """2026-10-16 段2o-6: 惰行カーブ ＝ (車速帯の中心, 中央値)。昇順。点が無ければ空。"""
+    m = GLimitMap(bin_kmh=10.0)
+    assert m.coast_curve() == ([], [])
+    m.add_coast(35.0, 1.2)  # 帯 3（中心 35）
+    m.add_coast(31.0, 1.0)
+    m.add_coast(39.0, 3.0)  # 中央値 1.2
+    m.add_coast(5.0, 0.8)  # 帯 0（中心 5）
+    m.add_coast(100.0, float("nan"))  # NaN は貯めない
+    speeds, decels = m.coast_curve()
+    assert speeds == [5.0, 35.0]
+    assert decels == pytest.approx([0.8, 1.2])

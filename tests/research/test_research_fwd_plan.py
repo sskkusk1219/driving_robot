@@ -11,10 +11,14 @@ from tests.research.fwd_map import POINT_FILLED, POINT_MEASURED, POINT_OUT, Forw
 from tests.research.fwd_plan import (
     FLAG_COAST,
     FLAG_FILLED,
+    FLAG_MEASURED,
     FLAG_OUT,
+    FLAG_PREPOS,
     FLAG_STOP,
     ForwardPlan,
     build_plan,
+    deviation_offset,
+    deviation_offset_detail,
     window_slope_vec,
 )
 from tests.research.pedal_select import window_slope_kmhs
@@ -49,6 +53,7 @@ def plan_for(ref, dur, table=None, **kw):
         stop_brake_opening_pct=STOP_PCT,
         stop_horizon_s=0.5,
     )
+    kwargs.setdefault("return_gap_enabled", False)  # 段2o-9 のすき間の確保は別のテストで見る
     kwargs.update(kw)
     return build_plan(ref, dur, table or linear_table(), **kwargs)
 
@@ -231,3 +236,406 @@ def test_out_of_range_and_filled_flags_come_from_table() -> None:
     p = plan_for(lambda x: 100.0 - 1000.0 * x, 0.2)
     assert p.out_of_range_s() > 0.0
     assert POINT_OUT == FLAG_OUT
+
+
+def _launch_variant() -> ForwardTable:
+    """発進側の配列: v=0 の行を全体に +6 km/h/s 持ち上げる（車速 10 では重み 0.8 で効く）。"""
+    t = linear_table()
+    t.launch_accel = t.accel_grid.copy()
+    t.launch_accel[0] += 6.0
+    return t
+
+
+def test_launch_accel_none_gives_identical_plan() -> None:
+    ref = lambda t: max(0.0, 3.0 * (t - 1.0)) if t < 5.0 else 12.0  # noqa: E731
+    base = plan_for(ref, 6.0)
+    t = linear_table()
+    t.launch_accel = None
+    same = plan_for(ref, 6.0, t)
+    assert np.array_equal(base.effort_pct, same.effort_pct)
+    assert np.array_equal(base.flag, same.flag)
+
+
+def test_launch_table_used_only_when_reference_rises() -> None:
+    # 基準が 10 km/h から緩く上がり、その後同じ傾きで下がる
+    def ref(t: float) -> float:
+        return 10.0 + 0.5 * t if t < 2.0 else 11.0 - 0.5 * (t - 2.0)
+
+    base = plan_for(ref, 4.0)
+    plan = plan_for(ref, 4.0, _launch_variant())
+    up, down = idx(plan, 1.0), idx(plan, 3.0)
+    assert base.effort_pct[up] > 0.0  # 本体: 上がる基準はアクセル
+    assert plan.effort_pct[up] < 0.0  # 発進側は惰行の加速度が高いのでブレーキ
+    assert plan.effort_pct[down] == pytest.approx(base.effort_pct[down])  # 下がる所は本体
+
+
+# ───────── 2026-10-14 段2o-5: 戻し量を使った解き直し ─────────
+
+
+def _release_ref(t: float) -> float:
+    """80 km/h から −10 km/h/s で 2 秒（強いブレーキ）→ −3 km/h/s で 8 秒（浅くして戻す）。"""
+    return 80.0 - 10.0 * t if t < 2.0 else 60.0 - 3.0 * (t - 2.0)
+
+
+def _release_plan(table):
+    return plan_for(_release_ref, 8.0, table)
+
+
+def test_plan_without_release_table_is_unchanged() -> None:
+    from tests.research.test_research_fwd_map import release_table  # noqa: PLC0415
+
+    plain = release_table(with_release=False)
+    base = _release_plan(plain)
+    # 戻しの列が付いていても release_grid が None なら同じ（付かなかった表と同じ）
+    tb = release_table()
+    tb.release_grid = None
+    tb.release_accel = None
+    same = _release_plan(tb)
+    assert np.array_equal(same.effort_pct, base.effort_pct)
+    assert np.array_equal(same.flag, base.flag)
+    # 頭打ちが 0 なら戻し量は常に 0 ＝ 解き直しても結果は変わらない
+    zero = release_table()
+    zero.meta["release_max_pct"] = 0.0
+    res = _release_plan(zero)
+    assert np.allclose(res.effort_pct, base.effort_pct, atol=1e-9)
+    assert np.array_equal(res.flag, base.flag)
+
+
+def test_plan_with_weaker_braking_on_release_brakes_deeper_when_releasing() -> None:
+    from tests.research.test_research_fwd_map import REL_SLOPE, release_table  # noqa: PLC0415
+
+    base = _release_plan(release_table(with_release=False))
+    tb = release_table()
+    tb.meta["release_max_pct"] = 8.0
+    plan = _release_plan(tb)
+    # 山の間（戻す前）は同じ
+    for t in (0.5, 1.0, 1.4):
+        assert plan.effort_pct[idx(plan, t)] == pytest.approx(base.effort_pct[idx(base, t)])
+    # 戻している間は、戻しで効きが弱まる表なので踏みが深い（effort がより負）
+    for t in (3.0, 3.5, 4.0):
+        i = idx(plan, t)
+        assert plan.effort_pct[i] < base.effort_pct[i] - 0.3, t
+        # 解き直した u が表を満たす: accel(v, u, release = u − m) = 要る加速度
+        w = int(round(3.0 / plan.period_s))
+        u_all = np.where(plan.effort_pct < -BD, plan.effort_pct + BD, 0.0)
+        m = float(u_all[i - w : i].min())
+        u = float(u_all[i])
+        assert u > m  # 戻している
+        got = tb.accel(_release_ref(t), u, release=u - m)
+        assert got == pytest.approx(plan.need_accel_kmhs[i], abs=0.02)
+    assert REL_SLOPE > 0
+    # 戻しに入らない時刻（アクセル側）は影響されない
+    up = plan_for(lambda t: 30.0 + 3.0 * t, 4.0, tb)
+    up0 = plan_for(lambda t: 30.0 + 3.0 * t, 4.0, release_table(with_release=False))
+    assert np.array_equal(up.effort_pct, up0.effort_pct)
+
+
+# ─── 先置き（2026-10-16 段2o-6） ────────────────────────────────────────
+
+DT = 0.05
+
+
+def _pre(effort_list, accel_pre=5.0, brake_pre=8.0, lead=0.2, clear=0.1, flag=None):
+    from tests.research.fwd_plan import FLAG_PREPOS, ReturnTime, preposition  # noqa: PLC0415
+
+    effort = np.array(effort_list, dtype=float)
+    fl = np.full(len(effort), FLAG_COAST, dtype=int) if flag is None else np.array(flag)
+    # 戻る時間 T が深さによらず clear 秒になる ReturnTime（T = 遅れ + 0 + 1 周期 = clear）
+    ret = ReturnTime(
+        accel_min_pct=0.0, brake_min_pct=0.0, accel_delay_s=clear - DT, brake_delay_s=clear - DT,
+        accel_rate_pct_s=1e12, brake_rate_pct_s=1e12, accel_default=False, brake_default=False,
+    )
+    st = preposition(
+        effort, fl, accel_pre_pct=accel_pre, brake_pre_pct=brake_pre,
+        lead_s=lead, ret=ret, period_s=DT,
+    )
+    return effort, fl, st, FLAG_PREPOS
+
+
+def test_preposition_starts_exactly_lead_before_press() -> None:
+    # 0 が 10 点続いたあとアクセル 12% → 4 点（0.2 秒）前から 5% を置く
+    e, fl, st, PRE = _pre([0.0] * 10 + [12.0, 12.0])
+    assert list(e[:6]) == [0.0] * 6
+    assert list(e[6:10]) == [5.0] * 4
+    assert list(fl[6:10]) == [PRE] * 4 and fl[5] == FLAG_COAST
+    assert (st.n_placed, st.n_short, st.n_no_time) == (1, 0, 0)
+    assert st.prepos_s == pytest.approx(0.2)
+
+
+def test_preposition_brake_sign() -> None:
+    e, _, st, _ = _pre([0.0] * 10 + [-12.0])
+    assert list(e[6:10]) == [-8.0] * 4 and st.n_placed == 1
+
+
+def test_preposition_waits_clear_after_other_pedal_release() -> None:
+    # ブレーキ指令が 2 点前に min になった: 0 は 3 点、clear=0.1(2点) 待つと 1 点だけ
+    e, _, st, _ = _pre([-10.0, -10.0, 0.0, 0.0, 0.0, 12.0])
+    assert list(e) == [-10.0, -10.0, 0.0, 0.0, 5.0, 12.0]
+    assert (st.n_placed, st.n_short, st.n_no_time) == (0, 1, 0)
+    assert st.prepos_s == pytest.approx(DT)
+
+
+def test_preposition_no_time_when_no_room() -> None:
+    # 停車保持（ブレーキ）→ 発進（アクセル）は 0 を挟まない: 置く場所なし
+    e, _, st, _ = _pre([-18.0, -18.0, 12.0], flag=[FLAG_STOP, FLAG_STOP, 0])
+    assert list(e) == [-18.0, -18.0, 12.0] and st.n_no_time == 1 and st.prepos_s == 0.0
+    # 0 が 1 点だけで clear に食われる場合も間に合わず
+    e, _, st, _ = _pre([-10.0, 0.0, 12.0])
+    assert list(e) == [-10.0, 0.0, 12.0] and st.n_no_time == 1
+
+
+def test_preposition_no_onset_and_not_needed_leave_effort_unchanged() -> None:
+    base = [0.0] * 10 + [12.0, 12.0]
+    e, _, st, _ = _pre(base, accel_pre=None)
+    assert list(e) == base and st.n_no_onset == 1
+    e, _, st, _ = _pre(base, accel_pre=12.0)  # 置く開度が踏み出し以上
+    assert list(e) == base and st.n_not_needed == 1
+
+
+def test_preposition_does_not_overwrite_nonzero_and_start_of_series() -> None:
+    # 系列の先頭から 0 が 3 点: lead 4 点だが先頭までしか遡らない
+    e, _, st, _ = _pre([0.0, 0.0, 0.0, 12.0])
+    assert list(e) == [5.0, 5.0, 5.0, 12.0] and st.n_short == 1 and st.n_placed == 0
+
+
+def _wltp_like_ref(t: float) -> float:
+    return 30.0 + 10.0 * math.sin(t / 3.0)
+
+
+def test_build_plan_preposition_disabled_is_identical_and_switches_unchanged() -> None:
+    table = linear_table()
+    table.meta["accel_onset_u_pct"] = 3.0
+    table.meta["brake_onset_u_pct"] = 2.0
+    off = plan_for(_wltp_like_ref, 40.0, table)
+    on = plan_for(_wltp_like_ref, 40.0, table, preposition_enabled=True)
+    assert off.preposition is None and on.preposition is not None
+    assert on.preposition.prepos_s == pytest.approx(on.pedal_seconds()["先置き"])
+    # 先置きの行以外は同じ列
+    from tests.research.fwd_plan import FLAG_PREPOS  # noqa: PLC0415
+
+    keep = on.flag != FLAG_PREPOS
+    assert np.array_equal(on.effort_pct[keep], off.effort_pct[keep])
+    assert on.pedal_switches() == off.pedal_switches()
+    # 効き始めが無ければ有効でも同じ
+    t2 = linear_table()
+    same = plan_for(_wltp_like_ref, 40.0, t2, preposition_enabled=True)
+    assert np.array_equal(same.effort_pct, off.effort_pct)
+    assert same.preposition.n_no_onset > 0
+
+
+# ─── 切り替えのすき間（2026-10-17 段2o-9） ───────────────────────────────
+
+def _ret(delay=0.1, rate=100.0, amin=4.0, bmin=4.0):
+    from tests.research.fwd_plan import ReturnTime  # noqa: PLC0415
+
+    return ReturnTime(
+        accel_min_pct=amin, brake_min_pct=bmin, accel_delay_s=delay, accel_rate_pct_s=rate,
+        brake_delay_s=delay, brake_rate_pct_s=rate, accel_default=False, brake_default=False,
+    )
+
+
+def _gap(effort_list, flag=None, ret=None):
+    from tests.research.fwd_plan import ensure_return_gap  # noqa: PLC0415
+
+    effort = np.array(effort_list, dtype=float)
+    fl = np.full(len(effort), FLAG_COAST, dtype=int) if flag is None else np.array(flag)
+    st = ensure_return_gap(effort, fl, ret=ret or _ret(), period_s=DT)
+    return effort, fl, st
+
+
+def test_return_time_depends_on_depth_and_includes_one_period() -> None:
+    r = _ret()
+    # 深さ 0（min ちょうど）: 0.1 + 0 + 0.05 = 0.15s → 3 行
+    assert r.seconds(4.0, DT) == pytest.approx(0.15) and r.gap_rows(4.0, DT) == 3
+    # 深さ 20%: 0.1 + 0.2 + 0.05 = 0.35s → 7 行（浮動小数の端数で 8 にならない）
+    assert r.seconds(24.0, DT) == pytest.approx(0.35) and r.gap_rows(24.0, DT) == 7
+    assert r.gap_rows(-24.0, DT) == 7  # ブレーキも同じ式
+
+
+def test_return_time_of_uses_meta_or_defaults() -> None:
+    from tests.research.fwd_plan import (  # noqa: PLC0415
+        DEFAULT_RETURN_DELAY_S,
+        DEFAULT_RETURN_RATE_PCT_S,
+        return_time_of,
+    )
+
+    t = linear_table()
+    r = return_time_of(t, AD, BD)
+    assert r.defaults_used() == ("アクセル", "ブレーキ")
+    assert r.accel_delay_s == DEFAULT_RETURN_DELAY_S
+    assert r.brake_rate_pct_s == DEFAULT_RETURN_RATE_PCT_S
+    t.meta.update({"accel_return_delay_s": 0.1, "accel_return_rate_pct_s": 99.0})
+    r = return_time_of(t, AD, BD)
+    assert r.defaults_used() == ("ブレーキ",) and r.accel_rate_pct_s == 99.0
+    # 片方のキーだけでは測定値とみなさない
+    t.meta.pop("accel_return_rate_pct_s")
+    assert return_time_of(t, AD, BD).defaults_used() == ("アクセル", "ブレーキ")
+
+
+def test_gap_direct_switch_cuts_leaving_tail() -> None:
+    # アクセル 24%（深さ 20 → T 7 行）の直後にブレーキ。すき間 0 → 戻す側の最後を前倒しで 0 に
+    acc = [24.0] * 20
+    e, fl, st = _gap(acc + [-24.0] * 5)
+    assert st.n_switches == 1 and st.n_cut == 1 and st.n_delayed == 0 and st.n_violations == 0
+    assert st.cut_s == pytest.approx(7 * DT)
+    assert np.all(e[13:20] == 0.0) and np.all(fl[13:20] == FLAG_COAST)
+    assert np.all(e[:13] == 24.0) and np.all(e[20:] == -24.0)
+
+
+def test_gap_short_coast_is_extended_by_cutting() -> None:
+    # 惰行 2 行しかない: あと 5 行ぶん前倒し
+    e, _, st = _gap([24.0] * 20 + [0.0] * 2 + [-24.0] * 5)
+    assert st.n_cut == 1 and st.cut_s == pytest.approx(5 * DT) and st.n_violations == 0
+    assert np.all(e[15:22] == 0.0) and e[14] == 24.0
+
+
+def test_gap_recomputes_depth_while_cutting() -> None:
+    # 末尾が浅い（深さ 5 → T 0.1+0.05+0.05=0.2s=4 行）ので 4 行ぶん削れば足りる
+    # 深い所（24%）まで食い込まない
+    e, _, st = _gap([24.0] * 10 + [9.0] * 6 + [-24.0] * 5)
+    assert st.n_cut == 1 and st.n_violations == 0
+    assert np.all(e[:10] == 24.0)
+    assert np.count_nonzero(e[10:16] == 0.0) == 4 and st.cut_s == pytest.approx(4 * DT)
+
+
+def test_gap_sufficient_is_untouched() -> None:
+    base = [24.0] * 5 + [0.0] * 7 + [-24.0] * 5
+    e, _, st = _gap(base)
+    assert list(e) == base and st.n_switches == 1 and st.n_cut == 0 and st.n_delayed == 0
+    # 同じペダルの間の惰行は切り替えではない
+    e, _, st = _gap([24.0] * 3 + [0.0] + [24.0] * 3)
+    assert st.n_switches == 0
+
+
+def test_gap_stop_hold_to_launch_delays_entering_pedal() -> None:
+    # 停車保持（ブレーキ −18、深さ 14 → T = 0.1+0.14+0.05 = 0.29s → 6 行）→ 発進。停車保持は
+    # 早く離さず、アクセルを遅らせる
+    e, fl, st = _gap([-18.0] * 10 + [12.0] * 10, flag=[FLAG_STOP] * 10 + [FLAG_COAST] * 10)
+    assert np.all(e[:10] == -18.0) and np.all(fl[:10] == FLAG_STOP)
+    assert np.all(e[10:16] == 0.0) and np.all(e[16:] == 12.0)
+    assert st.n_delayed == 1 and st.n_cut == 0 and st.delayed_s == pytest.approx(6 * DT)
+    assert st.n_violations == 0
+
+
+def test_gap_delays_when_leaving_run_too_short_to_cut() -> None:
+    # 戻す側が 2 行しかなく、先頭 1 行を残すと足りない → 次のペダルを遅らせる
+    e, _, st = _gap([0.0, 24.0, 24.0, -24.0, -24.0] + [-24.0] * 10)
+    assert np.all(e[1:3] == 24.0)
+    assert st.n_delayed == 1 and st.n_cut == 0 and st.n_violations == 0
+    assert np.all(e[3:10] == 0.0) and e[10] == -24.0
+
+
+def test_gap_entering_run_shorter_than_delay_disappears_cleanly() -> None:
+    # 停車保持→発進が 2 行だけ: 遅らせる行数が連なりを超える → 連なりは消え、違反は残らない
+    e, _, st = _gap([-18.0] * 4 + [12.0] * 2 + [0.0] * 3, flag=[FLAG_STOP] * 4 + [FLAG_COAST] * 5)
+    assert np.all(e[4:] == 0.0) and st.n_violations == 0
+
+
+def test_gap_handles_chain_of_switches_and_counts_zero_violations() -> None:
+    from tests.research.fwd_plan import count_gap_violations  # noqa: PLC0415
+
+    seq = ([24.0] * 6 + [-20.0] * 6 + [30.0] * 6 + [0.0] + [-10.0] * 6) * 3
+    e, _, st = _gap(seq)
+    assert st.n_switches > 0 and st.n_violations == 0
+    assert count_gap_violations(e, ret=_ret(), period_s=DT) == 0
+    assert count_gap_violations(np.array(seq), ret=_ret(), period_s=DT) > 0
+
+
+def test_build_plan_gap_default_on_and_disabled_flag() -> None:
+    table = linear_table()
+    table.meta["accel_onset_u_pct"] = 3.0
+    table.meta["brake_onset_u_pct"] = 2.0
+    on = build_plan(
+        _wltp_like_ref, 40.0, table, accel_deadband_pct=AD, brake_deadband_pct=BD,
+        stop_brake_opening_pct=STOP_PCT, stop_horizon_s=0.5, preposition_enabled=True,
+    )
+    off = plan_for(_wltp_like_ref, 40.0, table, preposition_enabled=True)
+    assert on.return_gap is not None and on.return_gap.n_violations == 0
+    assert off.return_gap is None
+    assert "仮値" in on.return_gap.summary()  # meta に戻る時間が無い
+    # 先置きは戻る時間の後にだけ置かれる（すき間不足の切り替えは残らない）
+    from tests.research.fwd_plan import count_gap_violations, return_time_of  # noqa: PLC0415
+
+    ret = return_time_of(table, AD, BD)
+    assert count_gap_violations(on.effort_pct, ret=ret, period_s=DT) == 0
+
+
+# ─── C10: 偏差の上乗せ（deviation_offset。2026-10-17 段2p） ─────────────────
+
+
+def _dev(table, *, effort, need=0.0, ref=50.0, row=None, dev=0.0, flag=FLAG_MEASURED,
+         tau_a=5.0, tau_b=5.0):
+    return deviation_offset(
+        table, effort=effort, flag=flag, need_kmhs=need, ref_kmh=ref,
+        row_kmh=ref if row is None else row, dev_kmh=dev, tau_accel_s=tau_a, tau_brake_s=tau_b,
+        accel_min_pct=AD, brake_min_pct=BD,
+    )
+
+
+def test_deviation_zero_returns_effort_unchanged_for_both_cases() -> None:
+    t = linear_table()
+    for e in (12.0, -15.0):
+        assert _dev(t, effort=e, need=0.5) == e
+        # 案B（実車速の行）でも dev=0 なら実車速＝基準車速なので同じ
+        assert _dev(t, effort=e, need=0.5, ref=47.0, row=47.0) == e
+
+
+def test_deviation_behind_adds_throttle_ahead_reduces_and_stops_at_min() -> None:
+    t = linear_table()
+    # dev=+2 km/h・τ=5s → Δa=0.4 km/h/s → Δu=0.4/0.3
+    assert _dev(t, effort=12.0, dev=2.0) == pytest.approx(12.0 + 0.4 / ACCEL_SLOPE)
+    # 進んでいれば減る（Δu=−1.0/0.3）。深く進むと min（AD）で止まりブレーキ側へ行かない
+    assert _dev(t, effort=12.0, dev=-1.5) == pytest.approx(12.0 - 0.3 / ACCEL_SLOPE)
+    assert _dev(t, effort=6.0, dev=-20.0) == AD
+    _, clamped = deviation_offset_detail(
+        t, effort=6.0, flag=FLAG_MEASURED, need_kmhs=0.0, ref_kmh=50.0, row_kmh=50.0,
+        dev_kmh=-20.0, tau_accel_s=5.0, tau_brake_s=5.0, accel_min_pct=AD, brake_min_pct=BD,
+    )
+    assert clamped
+
+
+def test_deviation_brake_row_behind_makes_brake_shallower_and_stops_at_min() -> None:
+    t = linear_table()
+    e = -15.0
+    out = _dev(t, effort=e, need=-3.0, dev=1.0)  # 遅れている → ブレーキを浅く（0.2/0.6 浅く）
+    assert out == pytest.approx(e + 0.2 / BRAKE_SLOPE)
+    assert _dev(t, effort=e, need=-3.0, dev=-1.0) == pytest.approx(e - 0.2 / BRAKE_SLOPE)  # 深く
+    assert _dev(t, effort=-9.0, need=-3.0, dev=50.0) == -BD  # アクセルには移らない
+
+
+def test_deviation_skips_coast_stop_prepos_zero_and_missing_tau() -> None:
+    t = linear_table()
+    for flag in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS):
+        assert _dev(t, effort=12.0, dev=3.0, flag=flag) == 12.0
+    assert _dev(t, effort=0.0, dev=3.0) == 0.0
+    assert _dev(t, effort=12.0, dev=3.0, tau_a=None) == 12.0  # アクセルの τ なし
+    assert _dev(t, effort=-12.0, need=-3.0, dev=3.0, tau_b=None) == -12.0
+    assert _dev(t, effort=12.0, dev=3.0, tau_b=None) != 12.0  # 反対のペダルの τ は関係ない
+
+
+def test_deviation_uses_launch_table_when_need_positive() -> None:
+    t = linear_table()
+    # 発進側の表は傾きが 2 倍（ブレーキ側の「発進」と「停止へ」の違いを模す）
+    t.launch_accel = t.accel_grid.copy()
+    t.launch_accel[:, t.u_grid >= 0] = (
+        t.launch_accel[:, t.u_grid >= 0] - (-2.0 - 0.01 * t.speed_rep[:, None])
+    ) * 2.0 + (-2.0 - 0.01 * t.speed_rep[:, None])
+    plain = _dev(linear_table(), effort=12.0, need=0.5, dev=2.0)
+    launch = _dev(t, effort=12.0, need=0.5, dev=2.0)
+    assert launch - 12.0 == pytest.approx((plain - 12.0) / 2.0)  # 傾き 2 倍なので上乗せは半分
+    # need <= 0 のときは本体の表（発進側を引かない）
+    assert _dev(t, effort=12.0, need=-0.5, dev=2.0) == pytest.approx(plain)
+
+
+def test_deviation_case_b_lower_speed_row_gives_smaller_offset() -> None:
+    # 速度が高いほど踏み込みの効きが大きい表（傾き 0.3·(1+v/100)）: 同じ Δa を出すのに要る
+    # 開度の差は、効きが大きい高い車速の行ほど小さい。案B で実車速が低い（遅れている）と、
+    # 表の行が低い車速になり、案A より上乗せが大きくなる（向きの確認。行が違うと惰行の差も
+    # 入るので、近い車速どうしで比べる）。
+    t = linear_table()
+    slope = 0.3 * (1.0 + t.speed_rep / 100.0)[:, None]
+    base = (-2.0 - 0.01 * t.speed_rep)[:, None]
+    t.accel_grid = base + np.where(t.u_grid >= 0, slope * t.u_grid, 0.6 * t.u_grid)
+    a_case = _dev(t, effort=12.0, need=0.5, ref=100.0, row=100.0, dev=2.0)
+    b_slow = _dev(t, effort=12.0, need=0.5, ref=100.0, row=97.0, dev=2.0)
+    assert 12.0 < a_case < b_slow  # 低い車速の行のほうが効きが小さい → 上乗せは大きい

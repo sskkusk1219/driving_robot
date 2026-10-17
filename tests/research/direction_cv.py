@@ -42,7 +42,11 @@ from tests.research.ff_model import (
 )
 from tests.research.model_analysis import CV_SPLITS, RegimeData, load_training_rows
 from tests.research.train_candidate_model import V0_SPEED_BANDS
-from tests.research.wltp_grid import pedal_release
+from tests.research.wltp_grid import (
+    DIRECTION_THRESHOLD_ACCEL_PCT,
+    DIRECTION_THRESHOLD_PCT,
+    pedal_release,
+)
 
 #: 学習側の行がこれより少ない fold は式を作らず、その fold のテスト行は nan（数えない）
 MIN_TRAIN_ROWS = 30
@@ -274,7 +278,6 @@ def main(argv: list[str] | None = None) -> int:
     if not logs:
         print(f"{args.csv} に手順2（PATTERN_DRIVE）の行がありません")
         return 2
-    lr = cfg.learning
     veh = cfg.vehicle
     epochs = np.array([lg.timestamp.timestamp() for lg in logs])
     diffs = np.diff(epochs)
@@ -284,8 +287,8 @@ def main(argv: list[str] | None = None) -> int:
         logs, patterns, phases,
         accel_deadband_pct=veh.min_accel_opening_pct,
         brake_deadband_pct=veh.min_brake_opening_pct,
-        accel_threshold_pct=lr.grid_direction_threshold_accel_pct,
-        brake_threshold_pct=lr.grid_direction_threshold_pct,
+        accel_threshold_pct=DIRECTION_THRESHOLD_ACCEL_PCT,
+        brake_threshold_pct=DIRECTION_THRESHOLD_PCT,
         accel_spec=accel_spec,
         brake_spec=brake_spec,
     )
@@ -300,8 +303,8 @@ def main(argv: list[str] | None = None) -> int:
           f"周期の中央値 {period_s:.3f}s、label=cmd）")
     print(f"u の原点（min） アクセル {veh.min_accel_opening_pct:g}% / "
           f"ブレーキ {veh.min_brake_opening_pct:g}%、"
-          f"戻し判定しきい値 アクセル {lr.grid_direction_threshold_accel_pct:g}% / "
-          f"ブレーキ {lr.grid_direction_threshold_pct:g}%")
+          f"戻し判定しきい値 アクセル {DIRECTION_THRESHOLD_ACCEL_PCT:g}% / "
+          f"ブレーキ {DIRECTION_THRESHOLD_PCT:g}%")
     print("誤差 = 予測 − 実測。正 = 式が開度を多めに出す")
     for data, release in pairs:
         print()

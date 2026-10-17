@@ -471,3 +471,32 @@ async def test_research_driver_acmd_reproduces_real_log_case() -> None:
     await driver.move_to_position(_pct_to_pulse(17.101), smooth_over_s=0.04)
 
     assert _last_written_accel(client) != 1
+
+
+async def test_research_driver_counts_retries_per_op() -> None:
+    """再送した通信（再送上限到達を含む）と実行回数を op 名ごとに数える（段2l-10）。"""
+    driver, _client = _research_driver()
+
+    class Resp:
+        def __init__(self, retries: int) -> None:
+            self.retries = retries
+
+    async def ok(retries: int):
+        return Resp(retries)
+
+    await driver._execute("read:MONITOR", lambda: ok(0))
+    await driver._execute("read:MONITOR", lambda: ok(2))
+    await driver._execute("move_to_position", lambda: ok(1))
+
+    async def fail():
+        raise OSError("timeout")
+
+    with pytest.raises(OSError):
+        await driver._execute("move_to_position", fail)
+    assert driver.retry_counts == {"read:MONITOR": 1, "move_to_position": 2}
+    assert driver.op_counts == {"read:MONITOR": 2, "move_to_position": 2}
+
+
+def test_stub_actuator_exposes_empty_retry_counts() -> None:
+    stub = hwmod.StubActuator("accel")
+    assert stub.retry_counts == {} and stub.op_counts == {}

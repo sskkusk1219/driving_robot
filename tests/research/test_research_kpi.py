@@ -221,3 +221,38 @@ def test_chatter_metrics_reports_pedal_reversal_rates() -> None:
     # 合成走行のアクセル指令は 0.5Hz・振幅 0.5% の正弦波 → 1 秒に約 1 回向きが変わる
     assert m.pedal_reversal_per_s == pytest.approx(1.0, abs=0.15)
     assert m.pedal_reversal_window_max_per_s == pytest.approx(1.0, abs=0.15)
+
+
+def _overlap(accel, brake, margin=0.0):
+    t = [i * 0.1 for i in range(len(accel))]
+    return kpi.pedal_overlap(
+        t, accel, brake, accel_min_pct=4.0, brake_min_pct=4.0, margin_pct=margin
+    )
+
+
+def test_pedal_overlap_none_when_no_double_press() -> None:
+    r = _overlap([10.0, 4.0, 4.0, 12.0], [4.0, 4.0, 9.0, 4.0])
+    assert r == kpi.PedalOverlap(total_s=0.0, count=0, max_depth_pct=0.0, max_depth_t_s=None)
+
+
+def test_pedal_overlap_counts_clusters_and_max_depth() -> None:
+    accel = [4.0, 5.0, 6.0, 4.0, 4.0, 8.0, 4.0]
+    brake = [4.0, 9.0, 5.0, 4.0, 4.5, 4.5, 4.0]
+    r = _overlap(accel, brake)
+    # 行 1,2 が 1 かたまり、行 4,5 が 2 かたまり。行 1 の深さ min(1,5)=1、行 2 は min(2,1)=1、
+    # 行 4 は min(0,0.5)=0 で数えない（アクセル 4.0 は待機位置ちょうど）、行 5 は min(4,0.5)=0.5
+    assert r is not None
+    assert r.count == 2
+    assert r.total_s == pytest.approx(0.3)
+    assert r.max_depth_pct == pytest.approx(1.0)
+    assert r.max_depth_t_s == pytest.approx(0.1)
+
+
+def test_pedal_overlap_margin_removes_shallow_overlap() -> None:
+    accel, brake = [4.0, 4.3, 4.0], [4.0, 4.2, 4.0]
+    assert _overlap(accel, brake, 0.0).count == 1
+    assert _overlap(accel, brake, 0.3).total_s == 0.0
+
+
+def test_pedal_overlap_returns_none_when_actual_missing() -> None:
+    assert _overlap([4.0, None, 5.0], [4.0, 4.0, 5.0]) is None

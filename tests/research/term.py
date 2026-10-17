@@ -38,26 +38,38 @@ def display_width(text: str) -> int:
     return sum(2 if ord(ch) > 0x2E80 else 1 for ch in text)
 
 
+def _gain(value: float) -> str:
+    """ゲインの表示用の丸め（有効 3 桁。0 は「0」）。"""
+    return f"{value:.3g}"
+
+
 def drive_status_line(
     *,
     t_s: float,
     ref_kmh: float | None,
     actual_kmh: float,
-    kp: float,
-    ki: float,
-    kd: float,
+    accel_kp: float,
+    accel_ki: float,
+    accel_kd: float,
+    brake_kp: float,
+    brake_ki: float,
+    brake_kd: float,
     accel_pct: float,
     brake_pct: float,
     extra: str = "",
 ) -> str:
-    """走行中の 1 行表示（基準車速・実車速・偏差・Kp/Ki/Kd・開度・その他）。
+    """走行中の 1 行表示（基準車速・実車速・偏差・アクセル／ブレーキ別の Kp/Ki/Kd・開度・その他）。
 
-    基準車速を持たない走行（手順 2 のパターン走行）は基準・偏差を「---」で表す。
+    基準車速を持たない走行（手順 2 のコーストダウンなど）は基準・偏差を「---」で表す。
+    手順 2 の G ランプ中は基準車速 v_ref を渡し、Kp・Ki はそのペダルで直近に計算した値
+    （感度がまだ無いペダルは 0）。偏差は 実 − 基準。
     """
     ref = "   ---" if ref_kmh is None else f"{ref_kmh:6.2f}"
     dev = "   ---" if ref_kmh is None else f"{actual_kmh - ref_kmh:+6.2f}"
     return (
         f"t={t_s:6.1f}s 基準={ref} 実={actual_kmh:6.2f} 偏差={dev} km/h "
-        f"Kp={kp:g} Ki={ki:g} Kd={kd:g} | アクセル={accel_pct:5.1f}% ブレーキ={brake_pct:5.1f}%"
+        f"acc Kp={_gain(accel_kp)} Ki={_gain(accel_ki)} Kd={_gain(accel_kd)} "
+        f"brk Kp={_gain(brake_kp)} Ki={_gain(brake_ki)} Kd={_gain(brake_kd)} "
+        f"| acc={accel_pct:5.1f}% brk={brake_pct:5.1f}%"
         f"{f' | {extra}' if extra else ''}"
     )

@@ -196,6 +196,10 @@ class ActuatorDriver:
         # フラッシュ → トランザクション」を不可分に行うためのロック。フラッシュと
         # 送信の間に別コルーチンのトランザクションが割り込むのを防ぐ。
         self._bus_lock = asyncio.Lock()
+        # op 名ごとの再送した通信の回数（再送上限到達も含む）と実行回数。段2l-10: 警告は表示から
+        # 外してあるので、走行の最後にまとめて表示するために数える
+        self.retry_counts: dict[str, int] = {}
+        self.op_counts: dict[str, int] = {}
         # 直近に送った目標位置 [pulse]。移動距離から ACMD を決めるのに使う（acmd_for_move）。
         self._last_commanded_pos: int | None = None
         self._lead_mm = lead_mm
@@ -236,11 +240,13 @@ class ActuatorDriver:
         ストール切り分け（.steering/20260620-modbus-retry-cycle-stall）用の計装。
         """
         start = time.perf_counter()
+        self.op_counts[op_name] = self.op_counts.get(op_name, 0) + 1
         try:
             async with self._bus_op():
                 result = await call()
         except Exception:
             elapsed = time.perf_counter() - start
+            self.retry_counts[op_name] = self.retry_counts.get(op_name, 0) + 1
             logger.warning(
                 "Modbus再送上限到達: axis=%s slave_id=%d op=%s elapsed=%.3fs retries=%d(上限)",
                 self._axis_name,
@@ -256,6 +262,7 @@ class ActuatorDriver:
         retries_raw = getattr(result, "retries", 0)
         retries = retries_raw if isinstance(retries_raw, int) else 0
         if retries > 0:
+            self.retry_counts[op_name] = self.retry_counts.get(op_name, 0) + 1
             logger.warning(
                 "Modbus再送検知: axis=%s slave_id=%d op=%s elapsed=%.3fs retries=%d",
                 self._axis_name,

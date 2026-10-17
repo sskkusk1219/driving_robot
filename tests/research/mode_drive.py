@@ -52,6 +52,7 @@ from tests.research.drive_log import (
 )
 from tests.research.ff_candidate import (
     CandidateFeedforward,
+    DeviationForwardFeedforward,
     ForwardMapFeedforward,
     make_candidate,
 )
@@ -73,7 +74,12 @@ from tests.research.research_types import (
 )
 from tests.research.stop_decel import PHASE_APPROACH, PHASE_STOP_HOLD, decelerate_to_stop
 from tests.research.term import drive_status_line, say
-from tests.research.vehicle import build_vehicle_profile, feedforward_params, opening_to_pulse
+from tests.research.vehicle import (
+    build_vehicle_profile,
+    feedforward_params,
+    opening_to_pulse,
+    pulse_to_opening,
+)
 
 # 本番 drive_loop と同じ: 1 周期のうち軸の移動にかける割合と、書き込み直後の読み取りまでの待ち
 AXIS_SMOOTH_DUTY = 0.8
@@ -194,6 +200,9 @@ def _prepare_forward_map_plan(
         brake_lag_s=fm.brake_lag_s,
         need_window_s=fm.need_window_s,
         coast_band_kmhs=fm.coast_band_kmhs,
+        preposition_enabled=fm.preposition_enabled,
+        preposition_margin_pct=fm.preposition_margin_pct,
+        preposition_lead_s=fm.preposition_lead_s,
     )
     meta = ff.table.meta
     # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）
@@ -202,11 +211,30 @@ def _prepare_forward_map_plan(
     say(f"FF 候補: {ff.candidate}（順モデルの表）　表: {ff_cfg.model_path}")
     say(f"  遅れ アクセル {lag_a}s / ブレーキ {lag_b}s・惰行の帯 ±{fm.coast_band_kmhs:g} km/h/s・"
         f"窓 {fm.need_window_s:g}s")
+    if isinstance(ff, DeviationForwardFeedforward):
+        # 2026-10-17 段2p: τ ＝ c × 上の遅れ（yaml の上書き、なければ pkl の meta）。
+        # どちらにも無いペダルは None で、fwd_plan の既定値には落とさない（上乗せしない）
+        ff.set_deviation(
+            c=fm.deviation_c, row=fm.deviation_row,
+            lag_accel_s=None if lag_a is None else float(lag_a),
+            lag_brake_s=None if lag_b is None else float(lag_b),
+        )
+        say(f"  C10（偏差の上乗せ）: {c10_settings_text(ff)}")
     sec = plan.pedal_seconds()
     say(f"  範囲外を引いた秒数 {plan.out_of_range_s():.1f}s・穴埋めを引いた秒数 "
         f"{plan.filled_s():.1f}s")
     say("  " + "・".join(f"{name} {s:.1f}s" for name, s in sec.items())
         + f"・ペダル切替 {plan.pedal_switches()} 回")
+    if plan.preposition is not None:
+        say(f"  先置き（効き始め−{fm.preposition_margin_pct:g}% を踏み出しの"
+            f"{fm.preposition_lead_s:g}s 前から）: {plan.preposition.summary()}")
+    else:
+        say("  先置き: なし（forward_map.preposition_enabled: false）")
+    if plan.return_gap is not None:
+        say(f"  切り替えのすき間（戻る時間 T 以上に）: {plan.return_gap.summary()}")
+        if plan.return_gap.defaults_used:
+            say("  注: pkl に戻る時間の測定値が無いので仮値（遅れ 0.15s・50%/s）で待つ。"
+                "手順2 の再学習（--retrain）で測定値が入る")
     mismatches = []
     # 2026-10-08 段2l-6: pkl の meta のキー名は accel_deadband_pct・brake_deadband_pct のまま、
     # 値は u の原点（vehicle.min_*_opening_pct）
@@ -427,6 +455,114 @@ class DecelGovernor:
 # ─────────────────────────────────────────────────────────────────────
 
 
+# 実開度の安全網で「もう一方のペダルが min を超えている」とみなす幅 [%]（止まっているときの
+# 読みの揺れ 4.19〜4.24% より少し大きい値。`pedal_lag.RETURN_SETTLE_TOL_PCT` と同じ）
+INTERLOCK_TOL_PCT = 0.05
+
+
+@dataclass
+class InterlockStats:
+    """実開度の安全網（pedal_interlock_enabled。2026-10-17 段2o-9）の集計。"""
+
+    accel_events: int = 0  # アクセルを止め始めた回数（ブレーキの実開度が min を超えていた）
+    accel_cycles: int = 0  # アクセルを止めた周期数
+    brake_events: int = 0
+    brake_cycles: int = 0
+    period_s: float = 0.05
+
+    @property
+    def accel_s(self) -> float:
+        return self.accel_cycles * self.period_s
+
+    @property
+    def brake_s(self) -> float:
+        return self.brake_cycles * self.period_s
+
+    def summary(self) -> str:
+        return (
+            f"アクセルを止めた {self.accel_events} 回・{self.accel_s:.2f}s／"
+            f"ブレーキを止めた {self.brake_events} 回・{self.brake_s:.2f}s"
+        )
+
+
+@dataclass
+class C10Stats:
+    """C10（偏差の上乗せ。2026-10-17 段2p）の集計。ペダル別（行のペダル）に数える。"""
+
+    accel_cycles: int = 0  # 上乗せで effort が変わった周期数
+    brake_cycles: int = 0
+    accel_abs_sum_pct: float = 0.0  # |上乗せ| の合計（平均の計算用）
+    brake_abs_sum_pct: float = 0.0
+    accel_max_pct: float = 0.0  # |上乗せ| の最大
+    brake_max_pct: float = 0.0
+    accel_clamp_events: int = 0  # 減らす向きで min に止めた回数（止め始めの数）
+    accel_clamp_cycles: int = 0
+    brake_clamp_events: int = 0
+    brake_clamp_cycles: int = 0
+    period_s: float = 0.05
+
+    def add(self, *, is_accel: bool, delta_pct: float, clamped: bool, prev_clamped: bool) -> None:
+        """1 周期ぶんを足す。delta_pct は上乗せ後 − 今の列（変わらなければ 0）。"""
+        if is_accel:
+            if delta_pct != 0.0:
+                self.accel_cycles += 1
+                self.accel_abs_sum_pct += abs(delta_pct)
+                self.accel_max_pct = max(self.accel_max_pct, abs(delta_pct))
+            if clamped:
+                self.accel_clamp_cycles += 1
+                self.accel_clamp_events += 0 if prev_clamped else 1
+        else:
+            if delta_pct != 0.0:
+                self.brake_cycles += 1
+                self.brake_abs_sum_pct += abs(delta_pct)
+                self.brake_max_pct = max(self.brake_max_pct, abs(delta_pct))
+            if clamped:
+                self.brake_clamp_cycles += 1
+                self.brake_clamp_events += 0 if prev_clamped else 1
+
+    @property
+    def accel_s(self) -> float:
+        return self.accel_cycles * self.period_s
+
+    @property
+    def brake_s(self) -> float:
+        return self.brake_cycles * self.period_s
+
+    @property
+    def accel_mean_pct(self) -> float:
+        return self.accel_abs_sum_pct / self.accel_cycles if self.accel_cycles else 0.0
+
+    @property
+    def brake_mean_pct(self) -> float:
+        return self.brake_abs_sum_pct / self.brake_cycles if self.brake_cycles else 0.0
+
+    def summary(self) -> str:
+        p = self.period_s
+        return (
+            f"アクセル {self.accel_s:.1f}s（上乗せ量の平均 {self.accel_mean_pct:.2f}%・"
+            f"最大 {self.accel_max_pct:.2f}%・min で止めた {self.accel_clamp_events} 回/"
+            f"{self.accel_clamp_cycles * p:.1f}s）／"
+            f"ブレーキ {self.brake_s:.1f}s（平均 {self.brake_mean_pct:.2f}%・"
+            f"最大 {self.brake_max_pct:.2f}%・min で止めた {self.brake_clamp_events} 回/"
+            f"{self.brake_clamp_cycles * p:.1f}s）"
+        )
+
+
+def c10_settings_text(ff: object) -> str:
+    """C10 の設定の表示（走行前とレポートで同じ文）。C10 でなければ「なし」。"""
+    if not isinstance(ff, DeviationForwardFeedforward):
+        return "なし"
+    case = "基準車速（案A）" if ff.deviation_row == "reference" else "実車速（案B）"
+
+    def tau(v: float | None) -> str:
+        return f"{v:.1f}s" if v is not None else "上乗せなし（遅れが測れていない）"
+
+    return (
+        f"c={ff.deviation_c:g}・τ アクセル {tau(ff.tau_accel_s)} / ブレーキ {tau(ff.tau_brake_s)}"
+        f"・表の行 {case}"
+    )
+
+
 @dataclass
 class ModeDriveResult:
     mode_name: str
@@ -437,6 +573,12 @@ class ModeDriveResult:
     cycles: int = 0
     overruns: int = 0  # 1 周期以上遅れた回数
     governor_cycles: int = 0
+    # 2026-10-17 段2o-9: 実開度の安全網（pedal_interlock_enabled）が出そうとしたペダルを止めた回数
+    # （止め始めの数）と周期数。None は安全網が切れていた
+    interlock: InterlockStats | None = None
+    # 2026-10-17 段2p: C10（偏差の上乗せ）の設定の表示と集計。C10 でなければ None
+    c10_settings: str | None = None
+    c10: C10Stats | None = None
     samples: list[DriveSample] = field(default_factory=list)  # MODE_DRIVE の行（0.1s 刻み）
 
 
@@ -481,6 +623,21 @@ class _ModeRun:
         self.cycles = 0
         self.overruns = 0
         self.governor_cycles = 0
+        # 実開度の安全網: 前の周期のまとめ読みの実開度（None は未取得 = 止めない）
+        self.interlock: InterlockStats | None = (
+            InterlockStats(period_s=self.interval_s) if cfg.mode_drive.pedal_interlock_enabled
+            else None
+        )
+        # C10（偏差の上乗せ）: C10 のときだけ集計を持つ
+        self.c10: C10Stats | None = (
+            C10Stats(period_s=self.interval_s)
+            if isinstance(self.ff, DeviationForwardFeedforward) else None
+        )
+        self._c10_prev_clamped = False
+        self._last_accel_actual: float | None = None
+        self._last_brake_actual: float | None = None
+        self._accel_blocked = False
+        self._brake_blocked = False
         self.cycle_ms: list[float] = []  # 全周期の処理時間（A7 の関門: 周期を超えないか）
         self.samples: list[DriveSample] = []
         self._accel_cmd: int | None = None
@@ -586,8 +743,13 @@ class _ModeRun:
         else:
             v0, future, past = self._ff_inputs(t, ref, speed)
             ff_effort = self.ff.predict_effort(v0, future, past, **self._select_kwargs(t, v0))
+        c10_effort: float | None = None
+        if self.c10 is not None:
+            c10_effort = self._c10_offset(t, ref, speed, ff_effort)
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
-        effort = ff_effort + pid_effort
+        # C10 の上乗せは FF の列（accel_ff・brake_ff・plan_effort）には入れない（作ったずれが
+        # 今までと同じ意味で比べられるように）。実際に出す effort にだけ足す
+        effort = ff_effort + (c10_effort or 0.0) + pid_effort
         # ログの「指示開度 FF」列（FF の出力をペダル別に分けた値。ガバナー・待機位置の前）
         accel_ff, brake_ff = split_effort(
             ff_effort, cfg.vehicle.max_accel_opening_pct, cfg.vehicle.max_brake_opening_pct
@@ -611,6 +773,7 @@ class _ModeRun:
         brake, governed = self.governor.apply(now, speed, brake)
         if governed:
             self.governor_cycles += 1
+        accel, brake = self._apply_interlock(accel, brake)
         phase = (
             PHASE_ACCEL if accel > 0.0
             else PHASE_BRAKE_GOVERNED if governed
@@ -630,6 +793,8 @@ class _ModeRun:
             raise DriveError(
                 f"アクチュエータ通信に失敗しました（{type(exc).__name__}: {exc}）"
             ) from exc
+        self._last_accel_actual = pulse_to_opening(monitor_accel.position_pulse)
+        self._last_brake_actual = pulse_to_opening(monitor_brake.position_pulse)
         cycle_ms = 1000.0 * (time.perf_counter() - cycle_started)
         self.cycle_ms.append(cycle_ms)
         accel_current, brake_current = monitor_accel.current_ma, monitor_brake.current_ma
@@ -664,7 +829,7 @@ class _ModeRun:
                     alarm_accel=alarm_accel, alarm_brake=alarm_brake,
                     accel_ff_pct=accel_ff, brake_ff_pct=brake_ff,
                     monitor_accel=monitor_accel, monitor_brake=monitor_brake, cycle_ms=cycle_ms,
-                    candidate=self.ff.candidate,
+                    candidate=self.ff.candidate, c10_effort_pct=c10_effort,
                 )
             )
         if segment != self._segment:
@@ -675,12 +840,78 @@ class _ModeRun:
             self._next_print = (math.floor(t / interval) + 1) * interval
             gov = "  減速Gガバナー作動" if governed else ""
             say(drive_status_line(
-                t_s=t, ref_kmh=ref, actual_kmh=speed, kp=0.0, ki=0.0, kd=0.0,
+                t_s=t, ref_kmh=ref, actual_kmh=speed,
+                accel_kp=0.0, accel_ki=0.0, accel_kd=0.0,
+                brake_kp=0.0, brake_ki=0.0, brake_kd=0.0,
                 accel_pct=accel, brake_pct=brake,
                 extra=(f"FF={ff_effort:+6.1f}% {segment} "
                        f"max|偏差|={self.max_abs_dev:.2f} "
                        f"{100.0 * t / self.duration_s:4.1f}%{gov}"),
             ))
+
+    def _c10_offset(self, t: float, ref: float, speed: float, ff_effort: float) -> float:
+        """C10: 今の列の effort に偏差の分を上乗せしたときの差（上乗せ後 − 今の列）[%]。
+        偏差は今の周期の CAN 車速から（dev ＝ 基準 − 実車速）。表を引く車速の行は案A が基準、
+        案B が実車速。惰行・停車保持・先置き・τ なしは 0。"""
+        # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
+        from tests.research.fwd_plan import deviation_offset_detail  # noqa: PLC0415
+
+        ff = self.ff
+        assert isinstance(ff, DeviationForwardFeedforward)
+        assert self.c10 is not None
+        plan = ff.plan
+        i = plan.index_at(t)
+        v = self.cfg.vehicle
+        new, clamped = deviation_offset_detail(
+            ff.table,
+            effort=ff_effort,
+            flag=int(plan.flag[i]),
+            need_kmhs=float(plan.need_accel_kmhs[i]),
+            ref_kmh=ref,
+            row_kmh=ref if ff.deviation_row == "reference" else speed,
+            dev_kmh=ref - speed,
+            tau_accel_s=ff.tau_accel_s,
+            tau_brake_s=ff.tau_brake_s,
+            accel_min_pct=v.min_accel_opening_pct,
+            brake_min_pct=v.min_brake_opening_pct,
+        )
+        delta = new - ff_effort
+        if ff_effort != 0.0:
+            self.c10.add(
+                is_accel=ff_effort > 0.0, delta_pct=delta, clamped=clamped,
+                prev_clamped=self._c10_prev_clamped,
+            )
+        self._c10_prev_clamped = clamped
+        return delta
+
+    def _apply_interlock(self, accel: float, brake: float) -> tuple[float, float]:
+        """実開度の安全網（2026-10-17 段2o-9）: もう一方のペダルの実開度（前の周期のまとめ読み）が
+        min ＋ INTERLOCK_TOL_PCT を超えている間は、出そうとしているペダルを 0（待機位置のまま）に
+        する。アクセルでもブレーキでも同じ。止める上限時間は持たない（実位置が戻らないのは
+        アクチュエータの故障で、axis_safety・偏差の停止が拾う）。切っているとき・実開度が未取得の
+        ときは何もしない。"""
+        stats = self.interlock
+        if stats is None:
+            return accel, brake
+        v = self.cfg.vehicle
+        block_accel = (
+            accel > 0.0 and self._last_brake_actual is not None
+            and self._last_brake_actual > v.min_brake_opening_pct + INTERLOCK_TOL_PCT
+        )
+        block_brake = (
+            brake > 0.0 and self._last_accel_actual is not None
+            and self._last_accel_actual > v.min_accel_opening_pct + INTERLOCK_TOL_PCT
+        )
+        if block_accel:
+            stats.accel_cycles += 1
+            stats.accel_events += 0 if self._accel_blocked else 1
+            accel = 0.0
+        if block_brake:
+            stats.brake_cycles += 1
+            stats.brake_events += 0 if self._brake_blocked else 1
+            brake = 0.0
+        self._accel_blocked, self._brake_blocked = block_accel, block_brake
+        return accel, brake
 
     async def drive_axis(
         self, axis: ActuatorProtocol, pos: int, *, is_accel: bool
@@ -806,11 +1037,20 @@ async def run_mode_drive(
         cycles=run.cycles,
         overruns=run.overruns,
         governor_cycles=run.governor_cycles,
+        interlock=run.interlock,
+        c10_settings=None if run.c10 is None else c10_settings_text(run.ff),
+        c10=run.c10,
         samples=run.samples,
     )
     say(f"モード走行 {'完了' if result.completed else '中断'}: {run_s:.1f}s・{run.cycles} 周期"
         f"（1 周期以上の遅れ {run.overruns} 回・減速G ガバナー作動 {run.governor_cycles} 周期）"
         f"・最大 |偏差| {run.max_abs_dev:.2f} km/h")
+    if run.interlock is not None:
+        say(f"  実開度の安全網（両踏みを防ぐために次のペダルを止めた）: {run.interlock.summary()}")
+    else:
+        say("  実開度の安全網: 無効（mode_drive.pedal_interlock_enabled: false）")
+    if run.c10 is not None:
+        say(f"  C10（偏差の上乗せ。{c10_settings_text(run.ff)}）: {run.c10.summary()}")
     if run.cycle_ms:
         say(f"  1 周期の処理時間: {cycle_time_text(run.cycle_ms, run.interval_s)}")
     if result.completed:
