@@ -703,3 +703,48 @@ def test_deviation_case_b_lower_speed_row_gives_smaller_offset() -> None:
     a_case = _dev(t, effort=12.0, need=0.5, ref=100.0, row=100.0, dev=2.0)
     b_slow = _dev(t, effort=12.0, need=0.5, ref=100.0, row=97.0, dev=2.0)
     assert 12.0 < a_case < b_slow  # 低い車速の行のほうが効きが小さい → 上乗せは大きい
+
+
+# ─── C11: DOB の分（deviation_offset の dob_kmhs。2026-10-18 段2q） ───────────
+
+
+def test_deviation_dob_zero_is_identical_to_c10() -> None:
+    t = linear_table()
+    for e, need in ((12.0, 0.5), (-15.0, -3.0)):
+        base = _dev(t, effort=e, need=need, dev=1.0)
+        assert _dev(t, effort=e, need=need, dev=1.0, dob_kmhs=0.0) == base
+
+
+def test_deviation_dob_negative_accel_row_presses_more() -> None:
+    t = linear_table()
+    # 表より 0.3 km/h/s 加速していない（d=−0.3）→ 要る加速度に +0.3 → Δu=0.3/0.3=+1%
+    assert _dev(t, effort=12.0, dev=0.0, dob_kmhs=-0.3) == pytest.approx(12.0 + 0.3 / ACCEL_SLOPE)
+    # 逆（表より出ている）なら減る。深く出ていれば min で止まりブレーキへ移らない
+    assert _dev(t, effort=12.0, dev=0.0, dob_kmhs=0.3) == pytest.approx(12.0 - 0.3 / ACCEL_SLOPE)
+    assert _dev(t, effort=6.0, dev=0.0, dob_kmhs=50.0) == AD
+
+
+def test_deviation_dob_positive_brake_row_goes_deeper() -> None:
+    t = linear_table()
+    # ブレーキ行で表より減速が浅い（d>0）→ need − d が負に深くなる → 深く踏む
+    out = _dev(t, effort=-15.0, need=-3.0, dev=0.0, dob_kmhs=0.3)
+    assert out == pytest.approx(-15.0 - 0.3 / BRAKE_SLOPE)
+    # 表より減速が深い（d<0）なら浅くなり、-BD で止まってアクセルへ移らない
+    assert _dev(t, effort=-15.0, need=-3.0, dev=0.0, dob_kmhs=-0.3) == pytest.approx(
+        -15.0 + 0.3 / BRAKE_SLOPE
+    )
+    assert _dev(t, effort=-9.0, need=-3.0, dev=0.0, dob_kmhs=-50.0) == -BD
+
+
+def test_deviation_dob_adds_to_p_and_skips_coast_and_missing_tau() -> None:
+    t = linear_table()
+    both = _dev(t, effort=12.0, dev=2.0, dob_kmhs=-0.3)
+    assert both == pytest.approx(12.0 + (0.4 + 0.3) / ACCEL_SLOPE)
+    for flag in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS):
+        assert _dev(t, effort=12.0, dob_kmhs=-0.3, flag=flag) == 12.0
+    assert _dev(t, effort=0.0, dob_kmhs=-0.3) == 0.0
+    assert _dev(t, effort=12.0, dob_kmhs=-0.3, tau_a=None) == 12.0  # τ なしのペダルは何もしない
+    # τ=0（deviation_c=0）でも DOB は効き、偏差の項は 0
+    assert _dev(t, effort=12.0, dev=5.0, dob_kmhs=-0.3, tau_a=0.0) == pytest.approx(
+        12.0 + 0.3 / ACCEL_SLOPE
+    )

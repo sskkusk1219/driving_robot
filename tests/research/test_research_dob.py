@@ -1,0 +1,141 @@
+"""C11 の外乱オブザーバ（dob.PedalDisturbanceObserver）と C11 の接続のテスト。2026-10-18 段2q。"""
+
+from __future__ import annotations
+
+import pytest
+
+from tests.research.dob import PEDAL_ACCEL, PEDAL_BRAKE, PedalDisturbanceObserver
+from tests.research.ff_candidate import (
+    DeviationForwardFeedforward,
+    DisturbanceObserverFeedforward,
+    make_candidate,
+)
+
+DT = 0.1
+
+
+class _Table:
+    """a = −1 + 0.3u（u≥0）/ 0.6u（u<0）。速度に依らない合成の表。"""
+
+    def accel(self, v: float, u: float, *, launch: bool = False, stop: bool = False) -> float:
+        return -1.0 + (0.3 * u if u >= 0 else 0.6 * u)
+
+
+def _obs(tq_a: float | None = 1.0, tq_b: float | None = 1.0,
+         la: float | None = 0.0, lb: float | None = 0.0) -> PedalDisturbanceObserver:
+    return PedalDisturbanceObserver(
+        _Table(), tq_accel_s=tq_a, tq_brake_s=tq_b, lag_accel_s=la, lag_brake_s=lb
+    )
+
+
+def _run(obs: PedalDisturbanceObserver, n: int, *, u: float, extra: float = 0.0,
+         t0: float = 0.0, v0: float = 50.0, **kw: object) -> tuple[float, float]:
+    """表どおり＋extra [km/h/s] の加速度で n 周期進める。(次の時刻, 次の車速) を返す。"""
+    t, v = t0, v0
+    args = {"governed": False, "at_limit_now": False, "launch": False, "stop": False}
+    args.update(kw)
+    for _ in range(n):
+        obs.update(t=t, speed_kmh=v, u_now=u, **args)  # type: ignore[arg-type]
+        t += DT
+        v += (_Table().accel(v, u) + extra) * DT
+    return t, v
+
+
+def test_constant_error_converges_with_time_constant_tq() -> None:
+    obs = _obs(tq_a=1.0)
+    # 10 周期（1 s = Tq）で 1 − e^−1 ≒ 0.63 に近づく（離散一次遅れ: 1 − 0.9^10 ≒ 0.65）
+    _run(obs, 11, u=10.0, extra=-0.4)
+    assert obs.d_accel == pytest.approx(-0.4 * (1 - 0.9**10), abs=0.02)
+    _run(obs, 150, u=10.0, extra=-0.4, t0=1.1)
+    assert obs.d_accel == pytest.approx(-0.4, abs=0.01)
+    assert obs.d_brake == 0.0 and obs.n_brake == 0 and obs.n_accel > 100
+
+
+def test_per_pedal_separation_and_return_value() -> None:
+    obs = _obs()
+    t, v = _run(obs, 80, u=10.0, extra=-0.3)
+    d_accel = obs.d_accel
+    assert d_accel == pytest.approx(-0.3, abs=0.01)
+    # ブレーキ側: 表より 0.2 浅い（+0.2）。アクセルの推定は動かない
+    _run(obs, 80, u=-10.0, extra=0.2, t0=t, v0=v)
+    assert obs.d_brake == pytest.approx(0.2, abs=0.01)
+    assert obs.d_accel == d_accel
+    pedal = obs.update(t=100.0, speed_kmh=50.0, u_now=-5.0, governed=False,
+                       at_limit_now=False, launch=False, stop=False)
+    assert pedal in (PEDAL_BRAKE, None)
+
+
+def test_holds_on_coast_governor_launch_stop_and_limit() -> None:
+    obs = _obs()
+    t, v = _run(obs, 40, u=10.0, extra=-0.3)
+    base = obs.d_accel
+    n = obs.n_accel
+    # 惰行（u=0）では車速が変わっても更新しない
+    t, v = _run(obs, 20, u=0.0, extra=-1.0, t0=t, v0=v)
+    assert (obs.d_accel, obs.n_accel) == (base, n)
+    for kw in ({"governed": True}, {"launch": True}, {"stop": True}, {"at_limit_now": True}):
+        t, v = _run(obs, 20, u=10.0, extra=1.0, t0=t, v0=v, **kw)
+        assert (obs.d_accel, obs.n_accel) == (base, n), kw
+
+
+def test_holds_when_tq_is_none_for_that_pedal() -> None:
+    obs = _obs(tq_a=None)
+    _run(obs, 30, u=10.0, extra=-0.3)
+    assert obs.d_accel == 0.0 and obs.n_accel == 0
+    _run(obs, 30, u=-10.0, extra=0.3)
+    assert obs.n_brake > 0
+
+
+def test_uses_input_delayed_by_lag() -> None:
+    # アクセルの遅れ 0.5 s: u を踏んでから 0.5 s 後の加速度で更新が始まる
+    obs = _obs(la=0.5, lb=0.5)
+    t = 0.0
+    updates = []
+    for k in range(20):
+        u = 10.0 if k >= 5 else 0.0  # 0.5 s で踏み始める
+        r = obs.update(t=t, speed_kmh=50.0 + 0.0 * k, u_now=u, governed=False,
+                       at_limit_now=False, launch=False, stop=False)
+        updates.append(r)
+        t += DT
+    first = updates.index(PEDAL_ACCEL)
+    assert first == 10  # 踏み始め k=5 の 0.5 s 後（5 周期）
+    # 踏み終わって（u=0）も、遅れの分だけ更新が続く
+    last_press = 5 + 15
+    obs2 = _obs(la=0.5, lb=0.5)
+    t = 0.0
+    seq = []
+    for k in range(30):
+        u = 10.0 if 5 <= k < last_press else 0.0
+        seq.append(obs2.update(t=t, speed_kmh=50.0, u_now=u, governed=False,
+                               at_limit_now=False, launch=False, stop=False))
+        t += DT
+    assert seq.index(PEDAL_ACCEL) == 10 and max(
+        i for i, r in enumerate(seq) if r == PEDAL_ACCEL
+    ) == last_press + 4
+
+
+def test_delayed_governor_and_limit_hold_updates() -> None:
+    # ガバナー・最大開度は「遅れた u を出した周期」の状態でも止める
+    obs = _obs(la=0.3, lb=0.3)
+    t = 0.0
+    out = []
+    for k in range(15):
+        out.append(obs.update(t=t, speed_kmh=50.0, u_now=-5.0, governed=(k == 3),
+                              at_limit_now=False, launch=False, stop=False))
+        t += DT
+    assert out[6] is None  # k=3 のガバナー作動の u が効く周期（3 周期遅れ）
+    assert out[5] is PEDAL_BRAKE and out[7] is PEDAL_BRAKE
+
+
+# ─── C11 の候補クラス ────────────────────────────────────────────────────
+
+
+def test_make_candidate_c11_and_set_dob() -> None:
+    ff = make_candidate("C11")
+    assert isinstance(ff, DisturbanceObserverFeedforward)
+    assert isinstance(ff, DeviationForwardFeedforward)  # C10 の上乗せをそのまま使う
+    assert ff.candidate == "C11"
+    assert ff.tq_accel_s is None and ff.tq_brake_s is None
+    ff.set_dob(tq_coef=40.0, lag_accel_s=0.25, lag_brake_s=None)
+    assert ff.tq_accel_s == pytest.approx(10.0) and ff.tq_brake_s is None
+    assert ff.dob_tq_coef == 40.0 and ff.dob_lag_accel_s == 0.25

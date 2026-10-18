@@ -1095,3 +1095,25 @@ def test_ramp_launch_release_settings_are_validated() -> None:
     assert problems_about("ramp_launch_slow_rates_pctps")
     lr.ramp_launch_slow_rates_pctps = [0.25, 0.0]
     assert problems_about("ramp_launch_slow_rates_pctps")
+
+
+def test_candidate_c11_is_accepted_and_dob_tq_coef_default_is_40() -> None:
+    cfg = _load_default()
+    cfg.feedforward.candidate = "C11"
+    assert not any("candidate" in p for p in cfgmod.validate_config(cfg))
+    assert "C11" in cfgmod.CANDIDATE_NAMES
+    assert cfgmod.ForwardMapSection().dob_tq_coef == 40.0  # 2026-10-18 段2q（仮の全車共通係数）
+
+
+def test_dob_tq_coef_is_loaded_from_yaml_and_validated(tmp_path: Path) -> None:
+    text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    assert "forward_map:\n" in text
+    path = tmp_path / "dob.yaml"
+    path.write_text(text.replace("forward_map:\n", "forward_map:\n  dob_tq_coef: 25.0\n", 1),
+                    encoding="utf-8")
+    cfg = cfgmod.load_config(path)
+    assert cfg.forward_map.dob_tq_coef == 25.0
+    assert not any("dob_tq_coef" in p for p in cfgmod.validate_config(cfg))
+    for bad in (0.0, -1.0):
+        cfg.forward_map.dob_tq_coef = bad
+        assert any("forward_map.dob_tq_coef" in p for p in cfgmod.validate_config(cfg))

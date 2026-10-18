@@ -116,6 +116,11 @@ CSV_COLUMNS: tuple[str, ...] = (
     # 2026-10-17 段2p: C10 が開度の列に上乗せした effort [%]（正＝アクセル側へ増やした・
     # 負＝ブレーキ側へ増やした。モード走行の C10 の行だけ。他の候補・他の区間・旧 CSV は空欄）
     "c10_effort_pct",
+    # 2026-10-18 段2q: C11（DOB）の外乱の推定 d ＝ 実測 − 表の予測 [km/h/s]（ペダル別）と、
+    # 開度の上乗せのうち DOB の分 [%]（c10_effort_pct は P＋DOB の合計）。C11 の行だけ、他は空欄
+    "dob_accel_kmhs",
+    "dob_brake_kmhs",
+    "dob_effort_pct",
 )
 
 
@@ -147,6 +152,10 @@ class DriveSample:
     brake_kp: float | None = None
     brake_ki: float | None = None
     c10_effort_pct: float | None = None  # C10 の上乗せ分（C10 の行だけ。他は None ＝ 空欄）
+    # C11（DOB）の外乱の推定（アクセル側・ブレーキ側）[km/h/s] と上乗せのうち DOB の分 [%]
+    dob_accel_kmhs: float | None = None
+    dob_brake_kmhs: float | None = None
+    dob_effort_pct: float | None = None
 
 
 class SessionLog:
@@ -223,6 +232,9 @@ class SessionLog:
         brake_kp: float | None = None,
         brake_ki: float | None = None,
         c10_effort_pct: float | None = None,
+        dob_accel_kmhs: float | None = None,
+        dob_brake_kmhs: float | None = None,
+        dob_effort_pct: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -247,6 +259,9 @@ class SessionLog:
             brake_kp=brake_kp,
             brake_ki=brake_ki,
             c10_effort_pct=c10_effort_pct,
+            dob_accel_kmhs=dob_accel_kmhs,
+            dob_brake_kmhs=dob_brake_kmhs,
+            dob_effort_pct=dob_effort_pct,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -428,6 +443,9 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 *_status_cells(s.monitor_accel),
                 *_status_cells(s.monitor_brake),
                 _fmt(s.c10_effort_pct),
+                _fmt(s.dob_accel_kmhs),
+                _fmt(s.dob_brake_kmhs),
+                _fmt(s.dob_effort_pct),
             ])
 
 

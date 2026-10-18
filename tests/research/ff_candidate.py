@@ -838,6 +838,36 @@ class DeviationForwardFeedforward(ForwardModelFeedforward):
         self.tau_brake_s = None if lag_brake_s is None else c * lag_brake_s
 
 
+class DisturbanceObserverFeedforward(DeviationForwardFeedforward):
+    """C11: C10（C8 の列 ＋ 偏差の上乗せ）に、外乱オブザーバ（DOB）の分を足す（2026-10-18 段2q）。
+
+    読む pkl・開度の列・偏差の上乗せは C10 と同じ。足すのは、押しているペダルの行だけ、
+    「表が予測する加速度と実測の差」のならした推定（`dob.PedalDisturbanceObserver`）。
+    Tq ＝ dob_tq_coef × 遅れ（ペダル別）は、走行前に mode_drive が `set_dob` で持たせる。
+    """
+
+    candidate = "C11"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dob_tq_coef: float = 0.0
+        # None ＝ そのペダルは DOB を使わない（遅れが測れない）
+        self.tq_accel_s: float | None = None
+        self.tq_brake_s: float | None = None
+        self.dob_lag_accel_s: float | None = None  # 推定が u を遅らせるときの遅れ（Tq の元と同じ）
+        self.dob_lag_brake_s: float | None = None
+
+    def set_dob(
+        self, *, tq_coef: float, lag_accel_s: float | None, lag_brake_s: float | None
+    ) -> None:
+        """係数とペダル別の遅れから Tq を決める。遅れが None のペダルの Tq は None。"""
+        self.dob_tq_coef = tq_coef
+        self.tq_accel_s = None if lag_accel_s is None else tq_coef * lag_accel_s
+        self.tq_brake_s = None if lag_brake_s is None else tq_coef * lag_brake_s
+        self.dob_lag_accel_s = lag_accel_s
+        self.dob_lag_brake_s = lag_brake_s
+
+
 #: V1 案スイッチ: config の feedforward.candidate 名 → クラス
 CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedforward]] = {
     "C1": CandidateFeedforward,
@@ -848,6 +878,7 @@ CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedfor
     "C7": ForwardMapFeedforward,
     "C8": ForwardModelFeedforward,
     "C10": DeviationForwardFeedforward,
+    "C11": DisturbanceObserverFeedforward,
 }
 
 

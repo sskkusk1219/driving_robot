@@ -40,10 +40,12 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.axis_safety import AxisSafetyNet
 from tests.research.config import ConfigError, ResearchConfig
+from tests.research.dob import PEDAL_ACCEL, PedalDisturbanceObserver
 from tests.research.drive_log import (
     SECTION_DECEL_TO_STOP,
     SECTION_MODE_DRIVE,
@@ -53,6 +55,7 @@ from tests.research.drive_log import (
 from tests.research.ff_candidate import (
     CandidateFeedforward,
     DeviationForwardFeedforward,
+    DisturbanceObserverFeedforward,
     ForwardMapFeedforward,
     make_candidate,
 )
@@ -220,6 +223,15 @@ def _prepare_forward_map_plan(
             lag_brake_s=None if lag_b is None else float(lag_b),
         )
         say(f"  C10（偏差の上乗せ）: {c10_settings_text(ff)}")
+    if isinstance(ff, DisturbanceObserverFeedforward):
+        # 2026-10-18 段2q: Tq ＝ dob_tq_coef × 上の遅れ（C10 の τ と同じ元）。
+        # どちらにも無いペダルは None で、そのペダルは DOB を使わない
+        ff.set_dob(
+            tq_coef=fm.dob_tq_coef,
+            lag_accel_s=None if lag_a is None else float(lag_a),
+            lag_brake_s=None if lag_b is None else float(lag_b),
+        )
+        say(f"  C11（DOB）: {dob_settings_text(ff)}")
     sec = plan.pedal_seconds()
     say(f"  範囲外を引いた秒数 {plan.out_of_range_s():.1f}s・穴埋めを引いた秒数 "
         f"{plan.filled_s():.1f}s")
@@ -564,6 +576,95 @@ def c10_settings_text(ff: object) -> str:
 
 
 @dataclass
+class DobStats:
+    """C11（DOB。2026-10-18 段2q）の集計。ペダル別。推定は更新した周期、上乗せ量は DOB の分が
+    出た周期（押している行）で数える。"""
+
+    accel_cycles: int = 0  # 推定を更新した周期数
+    brake_cycles: int = 0
+    accel_sum: float = 0.0  # 推定 d の合計（平均の計算用）
+    brake_sum: float = 0.0
+    accel_min: float = 0.0
+    accel_max: float = 0.0
+    brake_min: float = 0.0
+    brake_max: float = 0.0
+    accel_final: float = 0.0
+    brake_final: float = 0.0
+    accel_effort_cycles: int = 0  # DOB の上乗せが 0 でなかった周期数
+    brake_effort_cycles: int = 0
+    accel_effort_abs_sum: float = 0.0
+    brake_effort_abs_sum: float = 0.0
+    accel_effort_max: float = 0.0
+    brake_effort_max: float = 0.0
+    period_s: float = 0.05
+
+    def add_estimate(self, *, is_accel: bool, d: float) -> None:
+        """推定を更新した周期の d [km/h/s] を足す。"""
+        if is_accel:
+            self.accel_cycles += 1
+            self.accel_sum += d
+            self.accel_min = d if self.accel_cycles == 1 else min(self.accel_min, d)
+            self.accel_max = d if self.accel_cycles == 1 else max(self.accel_max, d)
+            self.accel_final = d
+        else:
+            self.brake_cycles += 1
+            self.brake_sum += d
+            self.brake_min = d if self.brake_cycles == 1 else min(self.brake_min, d)
+            self.brake_max = d if self.brake_cycles == 1 else max(self.brake_max, d)
+            self.brake_final = d
+
+    def add_effort(self, *, is_accel: bool, effort_pct: float) -> None:
+        """DOB の上乗せ量 [%]（P を除いた分）を足す。0 は数えない。"""
+        if effort_pct == 0.0:
+            return
+        if is_accel:
+            self.accel_effort_cycles += 1
+            self.accel_effort_abs_sum += abs(effort_pct)
+            self.accel_effort_max = max(self.accel_effort_max, abs(effort_pct))
+        else:
+            self.brake_effort_cycles += 1
+            self.brake_effort_abs_sum += abs(effort_pct)
+            self.brake_effort_max = max(self.brake_effort_max, abs(effort_pct))
+
+    def _text(self, name: str, is_accel: bool) -> str:
+        p = self.period_s
+        n = self.accel_cycles if is_accel else self.brake_cycles
+        ne = self.accel_effort_cycles if is_accel else self.brake_effort_cycles
+        if is_accel:
+            total, lo, hi, fin = self.accel_sum, self.accel_min, self.accel_max, self.accel_final
+            esum, emax = self.accel_effort_abs_sum, self.accel_effort_max
+        else:
+            total, lo, hi, fin = self.brake_sum, self.brake_min, self.brake_max, self.brake_final
+            esum, emax = self.brake_effort_abs_sum, self.brake_effort_max
+        if n == 0:
+            est = "更新なし"
+        else:
+            est = (
+                f"推定 最終 {fin:+.3f}・平均 {total / n:+.3f}・"
+                f"最小 {lo:+.3f}・最大 {hi:+.3f} km/h/s"
+            )
+        eff = f"上乗せ 平均 {esum / ne:.2f}%・最大 {emax:.2f}%" if ne else "上乗せなし"
+        return f"{name} 更新 {n * p:.1f}s（{est}／{eff}）"
+
+    def summary(self) -> str:
+        return f"{self._text('アクセル', True)}／{self._text('ブレーキ', False)}"
+
+
+def dob_settings_text(ff: object) -> str:
+    """C11 の設定の表示（走行前とレポートで同じ文）。C11 でなければ「なし」。"""
+    if not isinstance(ff, DisturbanceObserverFeedforward):
+        return "なし"
+
+    def tq(v: float | None) -> str:
+        return f"{v:.1f}s" if v is not None else "DOB なし（遅れが測れていない）"
+
+    return (
+        f"Tq 係数 {ff.dob_tq_coef:g}・"
+        f"Tq アクセル {tq(ff.tq_accel_s)} / ブレーキ {tq(ff.tq_brake_s)}"
+    )
+
+
+@dataclass
 class ModeDriveResult:
     mode_name: str
     mode_duration_s: float  # 走らせる予定だった長さ（--limit-s で縮めたらその値）
@@ -579,6 +680,9 @@ class ModeDriveResult:
     # 2026-10-17 段2p: C10（偏差の上乗せ）の設定の表示と集計。C10 でなければ None
     c10_settings: str | None = None
     c10: C10Stats | None = None
+    # 2026-10-18 段2q: C11（DOB）の設定の表示と集計。C11 でなければ None
+    dob_settings: str | None = None
+    dob: DobStats | None = None
     samples: list[DriveSample] = field(default_factory=list)  # MODE_DRIVE の行（0.1s 刻み）
 
 
@@ -634,6 +738,17 @@ class _ModeRun:
             if isinstance(self.ff, DeviationForwardFeedforward) else None
         )
         self._c10_prev_clamped = False
+        # C11（DOB）: C11 のときだけ推定器と集計を持つ
+        self.dob: PedalDisturbanceObserver | None = None
+        self.dob_stats: DobStats | None = None
+        self._dob_effort: float | None = None  # 今の周期の上乗せのうち DOB の分 [%]
+        if isinstance(self.ff, DisturbanceObserverFeedforward):
+            self.dob = PedalDisturbanceObserver(
+                self.ff.table,
+                tq_accel_s=self.ff.tq_accel_s, tq_brake_s=self.ff.tq_brake_s,
+                lag_accel_s=self.ff.dob_lag_accel_s, lag_brake_s=self.ff.dob_lag_brake_s,
+            )
+            self.dob_stats = DobStats(period_s=self.interval_s)
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
         self._accel_blocked = False
@@ -774,6 +889,8 @@ class _ModeRun:
         if governed:
             self.governor_cycles += 1
         accel, brake = self._apply_interlock(accel, brake)
+        if self.dob is not None:
+            self._dob_update(t, ref, speed, accel, brake, governed)
         phase = (
             PHASE_ACCEL if accel > 0.0
             else PHASE_BRAKE_GOVERNED if governed
@@ -830,6 +947,9 @@ class _ModeRun:
                     accel_ff_pct=accel_ff, brake_ff_pct=brake_ff,
                     monitor_accel=monitor_accel, monitor_brake=monitor_brake, cycle_ms=cycle_ms,
                     candidate=self.ff.candidate, c10_effort_pct=c10_effort,
+                    dob_accel_kmhs=None if self.dob is None else self.dob.d_accel,
+                    dob_brake_kmhs=None if self.dob is None else self.dob.d_brake,
+                    dob_effort_pct=self._dob_effort,
                 )
             )
         if segment != self._segment:
@@ -862,21 +982,30 @@ class _ModeRun:
         plan = ff.plan
         i = plan.index_at(t)
         v = self.cfg.vehicle
-        new, clamped = deviation_offset_detail(
-            ff.table,
-            effort=ff_effort,
-            flag=int(plan.flag[i]),
-            need_kmhs=float(plan.need_accel_kmhs[i]),
-            ref_kmh=ref,
-            row_kmh=ref if ff.deviation_row == "reference" else speed,
-            dev_kmh=ref - speed,
-            tau_accel_s=ff.tau_accel_s,
-            tau_brake_s=ff.tau_brake_s,
-            accel_min_pct=v.min_accel_opening_pct,
-            brake_min_pct=v.min_brake_opening_pct,
-            stops_ahead=bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False,
-        )
+        kwargs: dict[str, Any] = {
+            "effort": ff_effort,
+            "flag": int(plan.flag[i]),
+            "need_kmhs": float(plan.need_accel_kmhs[i]),
+            "ref_kmh": ref,
+            "row_kmh": ref if ff.deviation_row == "reference" else speed,
+            "dev_kmh": ref - speed,
+            "tau_accel_s": ff.tau_accel_s,
+            "tau_brake_s": ff.tau_brake_s,
+            "accel_min_pct": v.min_accel_opening_pct,
+            "brake_min_pct": v.min_brake_opening_pct,
+            "stops_ahead": bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False,
+        }
+        dob = self.dob
+        # C11: 押しているペダルの行にだけ、そのペダルの外乱の推定を引いて表を引く。
+        # DOB の分は「P ＋ DOB の上乗せ − P だけの上乗せ」で別に出す（ログ・集計用）
+        d_row = 0.0 if dob is None or ff_effort == 0.0 else dob.estimate(is_accel=ff_effort > 0.0)
+        new, clamped = deviation_offset_detail(ff.table, dob_kmhs=d_row, **kwargs)
         delta = new - ff_effort
+        if dob is not None:
+            p_only, _ = deviation_offset_detail(ff.table, **kwargs)
+            self._dob_effort = (new - p_only) if ff_effort != 0.0 else 0.0
+            if self.dob_stats is not None and ff_effort != 0.0:
+                self.dob_stats.add_effort(is_accel=ff_effort > 0.0, effort_pct=self._dob_effort)
         if ff_effort != 0.0:
             self.c10.add(
                 is_accel=ff_effort > 0.0, delta_pct=delta, clamped=clamped,
@@ -884,6 +1013,45 @@ class _ModeRun:
             )
         self._c10_prev_clamped = clamped
         return delta
+
+    def _dob_update(
+        self, t: float, ref: float, speed: float, accel: float, brake: float, governed: bool
+    ) -> None:
+        """C11: 今の周期で出した開度（調停・ガバナー・安全網の後、待機位置の前）で推定器を進める。
+        u ＝ 開度 − min（アクセル正・ブレーキ負・min 以下は 0）。発進側・停止側の行では更新しない
+        （今の計画の行で `low_speed_sides` を引く。C10 の上乗せと同じ条件）。"""
+        # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
+        from tests.research.fwd_plan import low_speed_sides  # noqa: PLC0415
+
+        ff, dob, v = self.ff, self.dob, self.cfg.vehicle
+        assert isinstance(ff, DisturbanceObserverFeedforward)
+        assert dob is not None and self.dob_stats is not None
+        plan = ff.plan
+        i = plan.index_at(t)
+        ahead = bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False
+        launch, stop = low_speed_sides(ff.table, float(plan.need_accel_kmhs[i]), ref, ahead)
+        # 発進側は need > 0 の行すべてで True になる（表を引く車速の範囲は表の中で決まる）ので、
+        # 止めるのは発進側の表が置き換えた車速の行（meta の launch_speed_rows）の中だけにする
+        rows = ff.table.meta.get("launch_speed_rows") or []
+        edges = ff.table.speed_edges
+        launch_top = min((float(x) for x in edges if x > max(rows)), default=0.0) if rows else 0.0
+        launch = bool(launch) and speed < launch_top
+        if accel > v.min_accel_opening_pct:
+            u = accel - v.min_accel_opening_pct
+        elif brake > v.min_brake_opening_pct:
+            u = -(brake - v.min_brake_opening_pct)
+        else:
+            u = 0.0
+        pedal = dob.update(
+            t=t, speed_kmh=speed, u_now=u, governed=governed,
+            at_limit_now=(
+                accel >= v.max_accel_opening_pct or brake >= v.max_brake_opening_pct
+            ),
+            launch=bool(launch), stop=bool(stop),
+        )
+        if pedal is not None:
+            is_accel = pedal == PEDAL_ACCEL
+            self.dob_stats.add_estimate(is_accel=is_accel, d=dob.estimate(is_accel=is_accel))
 
     def _apply_interlock(self, accel: float, brake: float) -> tuple[float, float]:
         """実開度の安全網（2026-10-17 段2o-9）: もう一方のペダルの実開度（前の周期のまとめ読み）が
@@ -1041,6 +1209,8 @@ async def run_mode_drive(
         interlock=run.interlock,
         c10_settings=None if run.c10 is None else c10_settings_text(run.ff),
         c10=run.c10,
+        dob_settings=None if run.dob is None else dob_settings_text(run.ff),
+        dob=run.dob_stats,
         samples=run.samples,
     )
     say(f"モード走行 {'完了' if result.completed else '中断'}: {run_s:.1f}s・{run.cycles} 周期"
@@ -1052,6 +1222,8 @@ async def run_mode_drive(
         say("  実開度の安全網: 無効（mode_drive.pedal_interlock_enabled: false）")
     if run.c10 is not None:
         say(f"  C10（偏差の上乗せ。{c10_settings_text(run.ff)}）: {run.c10.summary()}")
+    if run.dob_stats is not None:
+        say(f"  C11（DOB。{dob_settings_text(run.ff)}）: {run.dob_stats.summary()}")
     if run.cycle_ms:
         say(f"  1 周期の処理時間: {cycle_time_text(run.cycle_ms, run.interval_s)}")
     if result.completed:

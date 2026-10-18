@@ -24,6 +24,7 @@ from tests.research import main as mainmod
 from tests.research import mode_drive as mdmod
 from tests.research import mode_report as mrmod
 from tests.research.axis_safety import ALARM_CHECK_INTERVAL_S
+from tests.research.dob import PedalDisturbanceObserver
 from tests.research.research_types import (
     G_TO_KMHS,
     DriveLogData,
@@ -1303,8 +1304,22 @@ async def _c10_run_obj(
     run = mdmod._ModeRun.__new__(mdmod._ModeRun)
     run.cfg = cfg
     run.ff = setup.ff
-    run.c10 = mdmod.C10Stats(period_s=0.05) if cfg.feedforward.candidate == "C10" else None
+    is_c11 = cfg.feedforward.candidate == "C11"
+    run.c10 = (
+        mdmod.C10Stats(period_s=0.05) if cfg.feedforward.candidate in ("C10", "C11") else None
+    )
     run._c10_prev_clamped = False
+    # C11（DOB）: _ModeRun.__init__ と同じ持ち物
+    run.dob = None
+    run.dob_stats = None
+    run._dob_effort = None
+    if is_c11:
+        ff = run.ff
+        run.dob = PedalDisturbanceObserver(
+            ff.table, tq_accel_s=ff.tq_accel_s, tq_brake_s=ff.tq_brake_s,
+            lag_accel_s=ff.dob_lag_accel_s, lag_brake_s=ff.dob_lag_brake_s,
+        )
+        run.dob_stats = mdmod.DobStats(period_s=0.05)
     return run
 
 
@@ -1428,3 +1443,86 @@ def test_forward_map_deviation_settings_are_validated(tmp_path: Path) -> None:
     cfg.forward_map.deviation_row = "actual"
     cfg.forward_map.deviation_c = -1.0
     assert any("deviation_c" in p for p in cfgmod.validate_config(cfg))
+
+
+# ─── C11（DOB。2026-10-18 段2q） ─────────────────────────────────────────
+
+
+async def test_c11_sets_tq_from_coef_and_lag_and_prints_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _c10_cfg(tmp_path, candidate="C11")
+    run = await _c10_run_obj(cfg, monkeypatch)
+    # 遅れ 0.05 s × 係数 40 ＝ 2.0 s。C10 の τ（c=100 → 5.0 s）はそのまま
+    assert run.ff.tq_accel_s == pytest.approx(2.0) and run.ff.tq_brake_s == pytest.approx(2.0)
+    assert run.ff.tau_accel_s == pytest.approx(5.0)
+    out = capsys.readouterr().out
+    assert "C11（DOB）: Tq 係数 40・Tq アクセル 2.0s / ブレーキ 2.0s" in out
+    assert "C10（偏差の上乗せ）" in out
+    assert run.dob is not None and run.dob_stats is not None
+
+
+async def test_c11_dob_part_is_separated_and_signs_are_right(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _c10_cfg(tmp_path, candidate="C11")
+    run = await _c10_run_obj(cfg, monkeypatch)
+    plan = run.ff.plan
+    ia = int(np.flatnonzero(plan.effort_pct > 4.0 + 1.0)[0])
+    t, e = float(plan.t_s[ia]), float(plan.effort_pct[ia])
+    ref = 40.0
+    # 推定 0 のときは C10 と同じで、DOB の分は 0
+    d0 = run._c10_offset(t, ref, ref, e)  # noqa: SLF001
+    assert run._dob_effort == 0.0  # noqa: SLF001
+    assert d0 == 0.0
+    # 表より加速していない（d<0）→ 踏み増す。合計の上乗せ ＝ DOB の分（偏差 0 なので P は 0）
+    run.dob.d_accel = -0.3
+    d1 = run._c10_offset(t, ref, ref, e)  # noqa: SLF001
+    assert d1 > 0.0 and run._dob_effort == pytest.approx(d1)  # noqa: SLF001
+    assert run.dob_stats.accel_effort_cycles == 1
+    # 偏差があるときは、合計 ＝ P ＋ DOB。DOB の分だけが _dob_effort に入る
+    d2 = run._c10_offset(t, ref, ref - 2.0, e)  # noqa: SLF001
+    assert d2 > d1 and 0.0 < run._dob_effort < d2  # noqa: SLF001
+    # ブレーキの行（減速が浅い d>0）→ 深く踏む（負）
+    ib = int(np.flatnonzero((plan.effort_pct < -7.0 - 1.0) & (plan.flag != 4))[0])
+    tb, eb = float(plan.t_s[ib]), float(plan.effort_pct[ib])
+    run.dob.d_brake = 0.3
+    db = run._c10_offset(tb, ref, ref, eb)  # noqa: SLF001
+    assert db < 0.0 and run._dob_effort == pytest.approx(db)  # noqa: SLF001
+
+
+async def test_c11_run_logs_dob_columns_and_c10_leaves_them_blank(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    results = {}
+    for cand in ("C11", "C10"):
+        cfg = _c10_cfg(tmp_path, candidate=cand)
+        mode = _mode([(0.0, 0.0), (0.6, 0.0), (2.0, 6.0), (3.0, 6.0), (3.6, 0.0), (4.0, 0.0)])
+
+        async def fake_load_mode(
+            _cfg: cfgmod.ResearchConfig, _name: str, _m: object = mode
+        ) -> object:
+            return _m
+
+        monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+        setup = await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+        hw = await _held_stub(cfg)
+        log = dlmod.SessionLog(cfg, hw, has_ref=True)
+        log.start(dlmod.SECTION_MODE_DRIVE, "")
+        result = await mdmod.run_mode_drive(hw, cfg, setup, log=log)
+        await log.close()
+        results[cand] = (result, log.csv_path)
+    r11, csv11 = results["C11"]
+    r10, csv10 = results["C10"]
+    assert r10.dob is None and r10.dob_settings is None
+    assert r11.dob is not None and r11.dob_settings is not None
+    assert "Tq 係数 40" in r11.dob_settings and "更新" in r11.dob.summary()
+    with csv11.open(newline="", encoding="utf-8") as f:
+        rows11 = [r for r in csv.DictReader(f) if r["section"] == dlmod.SECTION_MODE_DRIVE]
+    assert all(r["dob_accel_kmhs"] != "" and r["dob_effort_pct"] != "" for r in rows11)
+    with csv10.open(newline="", encoding="utf-8") as f:
+        rows10 = list(csv.DictReader(f))
+    assert all(
+        r["dob_accel_kmhs"] == "" and r["dob_brake_kmhs"] == "" and r["dob_effort_pct"] == ""
+        for r in rows10
+    )

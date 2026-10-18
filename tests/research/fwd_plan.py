@@ -456,6 +456,7 @@ def deviation_offset_detail(
     accel_min_pct: float,
     brake_min_pct: float,
     stops_ahead: bool = False,
+    dob_kmhs: float = 0.0,
 ) -> tuple[float, bool]:
     """C10: 開度の列の 1 行（effort）に、偏差の分だけ上乗せした effort [%] を返す（段2p）。
 
@@ -473,18 +474,24 @@ def deviation_offset_detail(
       発進側、停車へ向かう減速なら停止側）。stops_ahead は ForwardPlan.stops_ahead のその時刻の値
       （省略は False ＝ 停止側を引かない）。基準車速の判定には ref_kmh を使う。
       戻し（release）の引き直しは上乗せの差には使わない。局所の差だけを取る近似。
+    - dob_kmhs（C11。2026-10-18 段2q）: その行のペダルの外乱の推定 d ＝ 実測 − 表の予測 [km/h/s]。
+      表が予測するより加速度が出ていない（d ＜ 0）なら多く踏む必要があるので、要る加速度から d を
+      引いて表を引く: invert(row, need ＋ Δa − d)。ブレーキの行は d ＞ 0（減速が浅い）で
+      need − d がより負になり、深く踏む。既定 0 は C10 と同じ出力。
+      τ が None の行（遅れが測れない）は dob_kmhs ≠ 0 でも何もしない。
+      τ ≦ 0（deviation_c ＝ 0）のときは偏差の項 Δa ＝ 0 で DOB だけ効く。
     """
     if flag in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS) or effort == 0.0:
         return effort, False
     is_accel = effort > 0.0
     tau = tau_accel_s if is_accel else tau_brake_s
-    if tau is None or tau <= 0.0:
+    if tau is None or (tau <= 0.0 and dob_kmhs == 0.0):
         return effort, False
     lv, sv = low_speed_sides(table, need_kmhs, ref_kmh, stops_ahead)
     launch, stop = bool(lv), bool(sv)
-    d_a = dev_kmh / tau
+    d_a = dev_kmh / tau if tau > 0.0 else 0.0
     u0, _ = table.invert(ref_kmh, need_kmhs, launch=launch, stop=stop)
-    u1, _ = table.invert(row_kmh, need_kmhs + d_a, launch=launch, stop=stop)
+    u1, _ = table.invert(row_kmh, need_kmhs + d_a - dob_kmhs, launch=launch, stop=stop)
     du = float(u1) - float(u0)
     raw = effort + du
     if is_accel:

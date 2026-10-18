@@ -58,7 +58,8 @@ class VehicleSection:
 #: C7（順モデルの表を逆に引いて走る前に作った開度の列を FF にする案。段2g）。
 #: C8（同じ格子のモデル版。fwd_model_*.pkl）。C9 は後の段で足す。
 #: C10（C8 の開度の列 ＋ 走行中に偏差の分だけ上乗せ。pkl は C8 と同じ。2026-10-17 段2p）
-CANDIDATE_NAMES: tuple[str, ...] = ("C1", "C2", "C3", "C4", "C5", "C7", "C8", "C10")
+#: C11（C10 ＋ 外乱オブザーバ DOB。pkl は C8 と同じ。2026-10-18 段2q）
+CANDIDATE_NAMES: tuple[str, ...] = ("C1", "C2", "C3", "C4", "C5", "C7", "C8", "C10", "C11")
 
 # C10 が表を引く車速の行（forward_map.deviation_row）。reference＝案A・actual＝案B
 DEVIATION_ROWS: tuple[str, ...] = ("reference", "actual")
@@ -556,6 +557,11 @@ class ForwardMapSection:
     deviation_c: float = 100.0
     # 表を引く車速の行。"reference"＝基準車速（案A）／"actual"＝実車速（案B）
     deviation_row: str = "reference"
+    # 2026-10-18 段2q（C11 のときだけ効く）: 外乱オブザーバ（DOB）の時定数
+    # Tq ＝ dob_tq_coef × 手順2 の遅れ（ペダル別）。単位なし。
+    # 仮の全車共通係数（段2s で決め直す）。40 は遅れ約 0.25 s で Tq ≈ 10 s
+    # （加速度の乱れ ±0.4〜0.5 km/h/s をならして、推定の幅 ±0.2 程度）
+    dob_tq_coef: float = 40.0
 
 
 @dataclass
@@ -880,6 +886,7 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")
     need(fm.deviation_c >= 0.0, f"forward_map.deviation_c は 0 以上: {fm.deviation_c}")
+    need(fm.dob_tq_coef > 0.0, f"forward_map.dob_tq_coef は正値: {fm.dob_tq_coef}")
     need(
         fm.deviation_row in DEVIATION_ROWS,
         f"forward_map.deviation_row が不正です: {fm.deviation_row!r}"
