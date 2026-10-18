@@ -19,6 +19,7 @@
     .venv/bin/python -m tests.research.main --steps 1,2 --hw real  # 実機でパターン走行→FF モデル
     .venv/bin/python -m tests.research.main --steps 1,3 --hw real  # 実機で FF のみ WLTP モード走行
     .venv/bin/python -m tests.research.main --steps 1,3 --limit-s 60  # スタブで先頭 60s だけ
+    .venv/bin/python -m tests.research.main --steps 1,12 --hw real  # FEL の補正表だけ付け直す
 
 実行順:
     手順 1（初期化）→ 走行前チェック（通信確認・車速 0 km/h 確認）→ 手順 2 以降（走行）
@@ -41,7 +42,7 @@ import asyncio
 import sys
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -53,6 +54,7 @@ from tests.research.config import (
 )
 from tests.research.drive_log import (
     SECTION_EXCITE,
+    SECTION_FEL_DRIVE,
     SECTION_MODE_DRIVE,
     SECTION_PRE_DRIVE_CHECK,
     SessionLog,
@@ -60,6 +62,15 @@ from tests.research.drive_log import (
 from tests.research.excite import _format_table as excite_format_table
 from tests.research.excite import analyze as excite_analyze
 from tests.research.excite import run_excite
+from tests.research.fel import (
+    FelParams,
+    attach_fel,
+    fel_rows,
+    format_coverage,
+    wltp_coverage,
+)
+from tests.research.fel_pattern import FelPattern, format_pattern, make_pattern
+from tests.research.fwd_map import load_forward_map, save_table
 from tests.research.hardware import (
     HW_REAL,
     HW_STUB,
@@ -71,7 +82,14 @@ from tests.research.hardware import (
     shutdown,
 )
 from tests.research.learning_patterns import LearningDataError
-from tests.research.mode_drive import ModeDriveSetup, load_mode, prepare_mode_drive, run_mode_drive
+from tests.research.mode_drive import (
+    ModeDriveSetup,
+    fel_text,
+    load_mode,
+    prepare_mode_drive,
+    prepare_mode_drive_from,
+    run_mode_drive,
+)
 from tests.research.mode_report import RunInfo, rows_from_samples, write_mode_report
 from tests.research.pattern_drive import (
     DriveError,
@@ -89,7 +107,8 @@ from tests.research.ramp_planner import (
     plan_ramps,
     top_speed_cap_kmh,
 )
-from tests.research.step2_check import Step2CheckError
+from tests.research.research_types import DrivingMode
+from tests.research.step2_check import Step2CheckError, check_fel_coverage, format_checks
 from tests.research.term import banner, display_width, say
 from tests.research.vehicle import STROKE_LIMIT_PULSE
 
@@ -120,6 +139,8 @@ class RunContext:
     mode_setup: ModeDriveSetup | None = None
     # 設定検証を済ませたか。手順0 を含まない実行でも run_steps の冒頭で 1 回だけ行う
     config_validated: bool = False
+    # 手順 12（FEL の学習の走りだけ）の準備（走行前チェックより前に読み込む）
+    fel_setup: FelRunSetup | None = None
 
     @property
     def is_real_hw(self) -> bool:
@@ -389,15 +410,150 @@ async def step2_pattern_drive(ctx: RunContext) -> None:
     say()
     say(f"2-2. 物理定数の推定とモデル作成（candidate={candidate}: {_CANDIDATE_KIND[candidate]}）")
     # 重み付けは SAMPLE_WEIGHT_ENABLED のときだけ有効（無効でも wltp_mode を渡すと MAE_WLTP が出る）
-    await asyncio.to_thread(
+    built = await asyncio.to_thread(
         build_ff_model,
         ctx.config, drive.csv_path, hw_mode=hw.hw_mode, pedal=pedal, wltp_mode=wltp_mode,
         ramp_results=drive.ramp_results,  # チェック B5① 用（走行中の最後の効き始め）
     )
     if hw.is_real:
         ctx.config = load_config(ctx.config.source_path)  # 以降の手順は書き戻した値で走る
+    # 2026-10-19 段2s-2b: 2-2 のチェックが NG なら build_ff_model が Step2CheckError を出すので
+    # ここには来ない（学習の走りは走らない）。スタブは yaml を書かないので、2-2 が作った pkl の
+    # パスを直接渡す
+    say()
+    say(f"2-3. 学習用パターン（FEL。手順3 と同じ候補 {candidate} で走り、"
+        f"補正表を {built.model_path} に付ける）")
+    fel_run = _prepare_fel_run(ctx.config, built.model_path, cover_modes, top_cap)
+    await _run_fel_learning(ctx, hw, fel_run, wltp_mode, checks=built.checks)
     say()
     say("手順 2 完了。次は手順 3（FF のみで WLTP モード走行）です。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 学習用パターン（FEL）の走り: 手順2 の 2-3 と手順 12 が共有する
+# ─────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class FelRunSetup:
+    """学習の走りの準備: 走る設定（FEL なし・表は model_path）・パターン・走行の準備・表。"""
+
+    cfg: ResearchConfig
+    model_path: str
+    pattern: FelPattern
+    setup: ModeDriveSetup
+    wltp_mode: DrivingMode
+
+
+def _prepare_fel_run(
+    cfg: ResearchConfig, model_path: str, cover_modes: list[DrivingMode], top_cap: float,
+    wltp_mode: DrivingMode | None = None,
+) -> FelRunSetup:
+    """パターンを作り、手順3 と同じ候補（cfg.feedforward.candidate）で走る準備をする。
+
+    走る設定は model_path の表を使い、FEL は fel.enabled に関係なく使わない（この走りは
+    補正表を作る側。新しい pkl にはまだ補正表が無い）。ここで失敗しても HW には触れない。
+    """
+    table = load_forward_map(Path(model_path))
+    pattern = make_pattern(cfg, cover_modes, top_cap_kmh=top_cap, table=table)
+    say(format_pattern(pattern))
+    run_cfg = replace(
+        cfg,
+        feedforward=replace(cfg.feedforward, model_path=str(model_path)),
+        fel=replace(cfg.fel, enabled=False),
+    )
+    say(f"走行の準備（候補 {run_cfg.feedforward.candidate}・FEL なし）:")
+    setup = prepare_mode_drive_from(run_cfg, pattern.mode)
+    return FelRunSetup(
+        cfg=run_cfg, model_path=str(model_path), pattern=pattern, setup=setup,
+        wltp_mode=wltp_mode if wltp_mode is not None else cover_modes[0],
+    )
+
+
+async def _run_fel_learning(
+    ctx: RunContext,
+    hw: ResearchHardware,
+    run: FelRunSetup,
+    wltp_mode: DrivingMode,
+    *,
+    checks: list | None = None,
+    limit_s: float | None = None,
+) -> None:
+    """学習用パターンを走り、その CSV から補正表（cell・nn）を作って pkl に付ける。
+
+    走りが止まった・補正表を作れなかったときは、pkl を補正表なしのまま残して DriveError にする
+    （手順2 の 2-2 の結果は消さない）。埋まり方（WLTP が通るマスの割合）を出して、お知らせとして
+    step2_check の項目 F1 に足す（NG にはしない）。
+    """
+    try:
+        log = _session_log_for_drive(ctx, hw, section=SECTION_FEL_DRIVE, has_ref=True)
+        result = await run_mode_drive(
+            hw, run.cfg, run.setup, log=log, limit_s=limit_s, section=SECTION_FEL_DRIVE
+        )
+        await log.close()  # 停車保持まで記録したら保存し、その CSV で補正表を作る
+        if not result.completed:
+            raise DriveError(f"学習の走りが中断しました: {result.abort_reason}")
+        params = FelParams.from_config(run.cfg.fel)
+        table = load_forward_map(Path(run.model_path))
+        rows = await asyncio.to_thread(fel_rows, log.csv_path, table, params)
+        if len(rows) == 0:
+            raise DriveError("学習の走りの行がありません（補正表を作れません）")
+        new = await asyncio.to_thread(
+            attach_fel, table, rows, params, source=log.csv_path.name
+        )
+        path = save_table(new, Path(run.model_path))
+        info = new.meta["fel"]
+        say(f"補正表を付けて保存: {path}")
+        say(f"  学習 {info['source_csv']}・行 {info['rows']}（{info['total_seconds']:.0f} 秒）・"
+            f"マス {info['occupied_cells']}・補正あり(cell) "
+            f"{info['cells_with_correction']['cell']}・offset {info['offset_kmhs']}")
+        cov = wltp_coverage(new, wltp_mode, params)
+        say()
+        if cov is not None:
+            say(format_coverage(cov))
+        item = check_fel_coverage(cov)
+        say()
+        say("手順2 の学習結果のチェック（お知らせ）:")
+        say(format_checks([item]))
+        if checks is not None:
+            checks.append(item)
+    except DriveError as exc:
+        say(f"学習の走りを完了できませんでした: {exc}")
+        say(f"手順2 の結果（pkl {run.model_path}）は補正表なしのまま残してあります。")
+        raise
+    except Exception as exc:  # noqa: BLE001 - どんな失敗でも 2-2 の結果は残して走行エラーで終える
+        say(f"学習の走りを完了できませんでした（{type(exc).__name__}: {exc}）")
+        say(f"手順2 の結果（pkl {run.model_path}）は補正表なしのまま残してあります。")
+        raise DriveError(f"学習の走り（FEL）: {type(exc).__name__}: {exc}") from exc
+
+
+async def prepare_step12(ctx: RunContext) -> None:
+    """走行前チェックの前に、モード（DB）と今の pkl からパターンと走行の準備を作っておく。"""
+    cfg = ctx.config
+    require_forward_candidate(cfg)
+    wltp_mode = await load_mode(cfg, cfg.modes.wltp_mode_name)
+    cover_modes = [
+        wltp_mode if name == cfg.modes.wltp_mode_name else await load_mode(cfg, name)
+        for name in cfg.modes.coverage_mode_names
+    ]
+    top_cap = top_speed_cap_kmh(
+        cover_modes, cfg.learning.ramp_top_margin_kmh, cfg.vehicle.max_speed_kmh
+    )
+    model_path = cfg.feedforward.model_path
+    if not Path(model_path).exists():
+        raise ConfigError(f"feedforward.model_path の pkl がありません: {model_path}")
+    ctx.fel_setup = _prepare_fel_run(cfg, model_path, cover_modes, top_cap, wltp_mode)
+
+
+async def step12_fel_learning(ctx: RunContext) -> None:
+    """学習用パターンだけを走り、今の pkl（yaml の model_path）に補正表を付け直す。"""
+    hw = ctx.require_hardware()
+    run = ctx.fel_setup
+    if run is None:  # prepare_step12 が走行前チェックの前に作る
+        raise ConfigError("学習用パターンと FF モデルが読み込まれていません")
+    await _run_fel_learning(ctx, hw, run, run.wltp_mode, limit_s=ctx.limit_s)
+    say()
+    say("手順 12 完了。補正表を付け直しました（次は手順 3 で fel.enabled を切り替えて比べます）。")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -425,6 +581,12 @@ def _session_log_for_drive(
         log.start(section, "")
         ctx.session_log = log
     return log
+
+
+def _fel_text_of(cfg: ResearchConfig, setup: ModeDriveSetup) -> str | None:
+    """レポート 5 章の FEL の 1 行。表の候補（補正表を持てる FF）でなければ None。"""
+    table = getattr(setup.ff, "table", None)
+    return None if table is None else fel_text(cfg, table)
 
 
 async def step3_mode_drive_ff(ctx: RunContext) -> None:
@@ -473,6 +635,7 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
         dob_summary=None if result.dob is None else result.dob.summary(),
         coast_settings=result.coast_settings,
         coast_summary=None if result.coast_stats is None else result.coast_stats.summary(),
+        fel_text=_fel_text_of(ctx.config, setup),
         notes=notes,
     )
     rows = rows_from_samples(result.samples)
@@ -572,6 +735,14 @@ STEPS: tuple[Step, ...] = (
         "加振走行（ペダル→車速の周波数応答）",
         step11_excite,
         drives=True,
+    ),
+    Step(
+        12,
+        "学習用パターンだけを走り、今の pkl（yaml の model_path）に補正表を付け直す",
+        step12_fel_learning,
+        drives=True,
+        prepare=prepare_step12,
+        has_ref=True,
     ),
 )
 _STEP_BY_NUMBER = {step.number: step for step in STEPS}

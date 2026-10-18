@@ -295,6 +295,15 @@ def _prepare_forward_map_plan(
 async def prepare_mode_drive(cfg: ResearchConfig, mode_name: str) -> ModeDriveSetup:
     say(f"走行モードを読み込みます: {mode_name!r}（{cfg.hardware.database_url}）")
     mode = await load_mode(cfg, mode_name)
+    return prepare_mode_drive_from(cfg, mode)
+
+
+def prepare_mode_drive_from(cfg: ResearchConfig, mode: DrivingMode) -> ModeDriveSetup:
+    """DB を引かずに、渡された DrivingMode で走行の準備（FF モデルの読み込みと開度の列）をする。
+
+    2026-10-19 段2s-2b: FEL の学習用パターン（fel_pattern.py が作る DrivingMode）を同じ流れで
+    走るために `prepare_mode_drive` から切り出した。
+    """
     say(f"  {len(mode.reference_speed)} 点・{mode.total_duration:.0f}s・"
         f"最高 {mode.max_speed:.1f} km/h")
     if mode.max_speed > cfg.vehicle.max_speed_kmh:
@@ -771,9 +780,11 @@ class _ModeRun:
         setup: ModeDriveSetup,
         log: SessionLog,
         duration_s: float,
+        section: str = SECTION_MODE_DRIVE,
     ) -> None:
         self.hw = hw
         self.cfg = cfg
+        self.section = section  # CSV の section 列（FEL の学習用パターンは別の名前）
         self.ff = setup.ff
         self.mode = setup.mode
         self.ref = ReferenceSpeed(setup.mode)
@@ -1039,7 +1050,7 @@ class _ModeRun:
             )
             self.samples.append(
                 self.log.record(
-                    data, section=SECTION_MODE_DRIVE, phase=phase, pattern=segment,
+                    data, section=self.section, phase=phase, pattern=segment,
                     mode_time_s=t, governor_active=governed,
                     alarm_accel=alarm_accel, alarm_brake=alarm_brake,
                     accel_ff_pct=accel_ff, brake_ff_pct=brake_ff,
@@ -1339,12 +1350,14 @@ async def run_mode_drive(
     *,
     log: SessionLog,
     limit_s: float | None = None,
+    section: str = SECTION_MODE_DRIVE,
 ) -> ModeDriveResult:
     """停車保持の状態からモードを走り、停車保持で終える。
 
     異常（CAN・通信・過電流・最高速超え・逸脱）は例外にせず、ペダルを離してから
     abort_reason 付きの結果を返す（途中までのレポートを作れるように）。
-    `limit_s` はモードの先頭だけ走る動作確認用。
+    `limit_s` はモードの先頭だけ走る動作確認用。`section` は CSV の section 列（既定 MODE_DRIVE。
+    FEL の学習用パターンは FEL_DRIVE。2026-10-19 段2s-2b）。
     """
     mode = setup.mode
     duration = mode.total_duration if limit_s is None else min(limit_s, mode.total_duration)
@@ -1362,9 +1375,9 @@ async def run_mode_drive(
         say(f"*** 実機モード: 車両が最高 {mode.max_speed:.0f} km/h まで走ります。"
             "シャシダイナモ上で実施してください ***")
 
-    run = _ModeRun(hw, cfg, setup, log, duration)
+    run = _ModeRun(hw, cfg, setup, log, duration, section=section)
     await log.stop_sampler()  # 50ms の制御ループと Modbus を取り合わない（記録はループから）
-    log.mark(SECTION_MODE_DRIVE, "")
+    log.mark(section, "")
     loop = asyncio.get_running_loop()
     started = loop.time()
     abort_reason = ""

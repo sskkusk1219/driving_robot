@@ -585,7 +585,9 @@ class ForwardMapSection:
 class FelSection:
     """フィードバック誤差学習 FEL（2026-10-19 段2s-2）。fel.py が補正表を作り、走行で f + c を引く。
 
-    2s-2b で学習用パターンの設定もこのセクションに足す。
+    2026-10-19 段2s-2b: 学習用パターン（fel_pattern.py）の設定もこのセクションに置く。
+    すべて全車共通の仮値。何に効くか＝補正表のマスの埋まり方、決める時期＝2s-3 の実機の手順2 の
+    後の「埋まり方」の表示を見てから。
     """
 
     # 補正表を使うか（false または pkl に補正表なしなら今と完全に同じ）
@@ -605,6 +607,22 @@ class FelSection:
     # マスの u の幅 [%]
     accel_u_bin_pct: float = 1.0
     brake_u_bin_pct: float = 0.5
+    # ── 学習用パターン（fel_pattern.py。2026-10-19 段2s-2b） ──
+    stop_hold_s: float = 5.0  # 頭とトリップの間の停車 [s]
+    ease_start_kmh: float = 15.0  # 停車前の形 B で G を緩め始める車速／減速の G を数える下限 [km/h]
+    stop_end_window_s: float = 3.0  # 停車前の G（g_end）を数える、各停車の直前の窓 [s]
+    low_trip_max_kmh: float = 60.0  # 低速の短い走りに使うトリップの最高車速の上限 [km/h]
+    low_trip_count: int = 8  # 低速の短い走りの本数
+    cruise_s: float = 5.0  # 各段の定速 [s]
+    mid_step_kmh: float = 15.0  # 中速の車速変化の幅 ±[km/h]
+    mid_round_trips: int = 3  # 中速の車速変化の往復回数
+    mid_speed_min_kmh: float = 20.0  # 中速の上の車速（中央値）を数える下限 [km/h]
+    high_speed_quantile: float = 0.9  # 高速の上の車速＝走っている間の基準車速のこの分位
+    high_coast_s: float = 6.0  # 高速の惰行 [s]
+    half_g_s: float = 3.0  # 形 C で G を半分にしている時間 [s]
+    coast_s: float = 4.0  # 形 D の惰行 [s]
+    accel_min_g: float = 0.02  # 加速の G の標本に入れる下限 [G]
+    pattern_dt_s: float = 0.1  # 学習用パターンの基準車速の刻み [s]
 
 
 @dataclass
@@ -943,6 +961,18 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         and edges[0] > 0.0
         and all(b > a for a, b in zip(edges, edges[1:], strict=False)),
         f"fel.speed_edges_kmh は 2 個以上・正値・厳密に昇順: {edges}",
+    )
+    for label in (
+        "stop_hold_s", "ease_start_kmh", "stop_end_window_s", "low_trip_max_kmh", "cruise_s",
+        "mid_step_kmh", "mid_speed_min_kmh", "high_coast_s", "half_g_s", "coast_s", "accel_min_g",
+        "pattern_dt_s",
+    ):
+        need(getattr(fe, label) > 0.0, f"fel.{label} は正値: {getattr(fe, label)}")
+    need(fe.low_trip_count >= 1, f"fel.low_trip_count は 1 以上: {fe.low_trip_count}")
+    need(fe.mid_round_trips >= 1, f"fel.mid_round_trips は 1 以上: {fe.mid_round_trips}")
+    need(
+        0.0 < fe.high_speed_quantile <= 1.0,
+        f"fel.high_speed_quantile は 0 より大きく 1 以下: {fe.high_speed_quantile}",
     )
     need(fm.dob_tq_coef > 0.0, f"forward_map.dob_tq_coef は正値: {fm.dob_tq_coef}")
     need(fm.coast_on_kmh > 0.0, f"forward_map.coast_on_kmh は正値: {fm.coast_on_kmh}")

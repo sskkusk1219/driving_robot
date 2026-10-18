@@ -687,6 +687,34 @@ def run_checks_for_paths(
     return run_checks(cfg=cfg, csv_path=csv_path, table_c8=table_c8, table_c7=table_c7, **kwargs)
 
 
+def check_fel_coverage(coverage: Any | None) -> CheckItem:
+    """FEL の埋まり方（2026-10-19 段2s-2b）。WLTP が通るマスのうち補正のあるマスにいる時間の割合。
+
+    お知らせであって NG にはしない（しきい値なし。足りない場面は次の手順2 で学習用パターンの
+    規則の係数を変えて増やす）。補正表が無いとき（学習の走りが止まった・走らなかった）は SKIP。
+    reason に足りないマスの上位を入れる。
+    """
+    name = "FEL の埋まり方"
+    if coverage is None:
+        return _skip("F1", name, "補正表なし（学習の走りが無い・止まった）")
+    parts = []
+    metrics: dict[str, float] = {}
+    keys = {"全体": "all", "アクセル": "accel", "ブレーキ": "brake",
+            "ブレーキ<20 km/h": "brake_lt20", "停車前<20 km/h": "stop_lt20"}
+    for nm, tot, cov in coverage.groups:
+        r = cov / tot if tot > 0.0 else math.nan
+        parts.append(f"{nm} {_f(r * 100, 0)}%")
+        metrics[f"covered_{keys.get(nm, nm)}"] = r
+    miss = coverage.missing[:3]
+    reason = "お知らせ（NG にしない）。足りないマス上位: " + (
+        "／".join(f"{m.text}（WLTP {m.wltp_s:.1f}s）" for m in miss) if miss else "なし"
+    )
+    return CheckItem(
+        "F1", name, STATUS_OK, "・".join(parts), f"補正は学習 {coverage.min_cell_s:g}s 以上のマス",
+        reason, metrics,
+    )
+
+
 def format_checks(items: Sequence[CheckItem]) -> str:
     """表（id・名前・判定・値・比べた相手・理由）と、数値の差（metrics）の一覧。"""
     head = ("id", "名前", "判定", "値", "比べた相手", "理由")

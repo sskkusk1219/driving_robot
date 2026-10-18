@@ -311,6 +311,9 @@ class FelFit:
     cell_seconds: np.ndarray  # その秒数
     nn: list[tuple[StandardScaler, MLPRegressor]] | None
     n_rows: int
+    # 行が 1 行でもあるマス（occupied）ごとの秒数（埋まり方の表示用。2026-10-19 段2s-2b。
+    # 古い pkl は None）
+    occupied_seconds: np.ndarray | None = None
 
     def cell_value(
         self, v: np.ndarray, u: np.ndarray, pedal: np.ndarray, rel: np.ndarray
@@ -371,7 +374,7 @@ def fit(rows: FelRows, params: FelParams | None = None) -> FelFit:
             models.append((sc, m))
     return FelFit(
         params=p, offset=off, occupied=uniq, cell_keys=uniq[keep], cell_vals=vals,
-        cell_seconds=sec[keep], nn=models, n_rows=len(rows),
+        cell_seconds=sec[keep], nn=models, n_rows=len(rows), occupied_seconds=sec,
     )
 
 
@@ -437,6 +440,141 @@ def attach_fel(
         fel_nn_main=g["nn_main"], fel_nn_rel=g["nn_rel"],
         fel_fit=model, meta=meta,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 埋まり方（WLTP が通るマスに補正があるか。2026-10-19 段2s-2b）
+# ─────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class MissingCell:
+    """補正の無いマス 1 つ（WLTP が通るのに学習が足りなかった所）。"""
+
+    text: str  # 「車速 a〜b km/h・ブレーキ・開度 x〜y%・戻し中」などの表示
+    wltp_s: float  # WLTP がこのマスにいる秒数
+    learn_s: float  # 学習の走りがこのマスにいた秒数（min_cell_s 未満）
+
+
+@dataclass
+class FelCoverage:
+    """WLTP が走っている時間のうち、補正（cell で min_cell_s 以上）のあるマスにいる時間の割合。"""
+
+    groups: list[tuple[str, float, float]]  # (群の名前, WLTP の秒数, 補正のあるマスの秒数)
+    missing: list[MissingCell]  # WLTP の秒数の多い順
+    min_cell_s: float
+
+    def ratio(self, name: str) -> float:
+        for nm, tot, cov in self.groups:
+            if nm == name:
+                return cov / tot if tot > 0.0 else float("nan")
+        return float("nan")
+
+
+def _describe_key(key: int, p: FelParams) -> str:
+    ub = int(key % _U_SPAN) - _U_OFF
+    rest = int(key // _U_SPAN)
+    rel = rest % 2
+    rest //= 2
+    ped = rest % 3 - 1
+    vb = rest // 3
+    e = p.speed_edges_kmh
+    lo = "0" if vb == 0 else f"{e[vb - 1]:g}"
+    v_text = f"{lo}〜{e[vb]:g}" if vb < len(e) else f"{e[-1]:g}〜"
+    if ped > 0:
+        u_text = f"アクセル u {ub * p.accel_u_bin_pct:g}〜{(ub + 1) * p.accel_u_bin_pct:g}%"
+    elif ped < 0:
+        # ブレーキの u は負。深さ（絶対値）で書く
+        d0, d1 = -(ub + 1) * p.brake_u_bin_pct, -ub * p.brake_u_bin_pct
+        u_text = f"ブレーキ 深さ {d0:g}〜{d1:g}%"
+    else:
+        u_text = "惰行"
+    return f"{v_text} km/h・{u_text}{'・戻し中' if rel else ''}"
+
+
+def wltp_coverage(
+    table: ForwardTable,
+    mode: Any,
+    params: FelParams | None = None,
+    *,
+    dt_s: float = 0.1,
+    top_n: int = 10,
+) -> FelCoverage | None:
+    """WLTP の基準車速から、補正（cell）のあるマスにいる時間の割合を出す。
+
+    要る加速度 ＝ 基準の 1 秒移動平均の勾配 → 表 f の invert で u・ペダル → 戻し中か（u の列から
+    fel_rows と同じ定義: 遅れ分前の u、戻し量 ＝ u − 直近 RELEASE_WINDOW_S の u の最小）→ マス。
+    補正表（pkl の fel_fit）が無ければ None。停車（基準 ≤ 0.01）と最小の車速帯より遅い所は数えない。
+    群: 全体・アクセル・ブレーキ・ブレーキ<20 km/h・停車前<20 km/h（基準が 5 秒以内に停車）。
+    """
+    fit = table.fel_fit
+    if not isinstance(fit, FelFit):
+        return None
+    p = params or fit.params
+    t_ref = np.array([x.time_s for x in mode.reference_speed], dtype=float)
+    v_ref = np.array([x.speed_kmh for x in mode.reference_speed], dtype=float)
+    grid = np.arange(t_ref[0], t_ref[-1] + 1e-9, dt_s)
+    ref = np.interp(grid, t_ref, v_ref)
+    n = len(ref)
+    vs = _centered_mean(ref, max(1, int(round(1.0 / dt_s))))
+    acc = np.gradient(vs, dt_s)
+    u_raw, _ = table.invert(ref, acc)
+    u_raw = np.asarray(u_raw, dtype=float)
+    meta = table.meta
+    sa = int(round(float(meta["accel_lag_s"]) / dt_s))
+    sb = int(round(float(meta["brake_lag_s"]) / dt_s))
+    ua = _delay(np.maximum(u_raw, 0.0), sa, 0.0)
+    ub = _delay(np.maximum(-u_raw, 0.0), sb, 0.0)
+    pedal = np.where(ua > 0, 1, np.where(ub > 0, -1, 0))
+    u = np.where(pedal > 0, ua, np.where(pedal < 0, -ub, 0.0))
+    k = int(round(RELEASE_WINDOW_S / dt_s))
+    release = np.where(pedal < 0, u - _trailing_min(u, k), 0.0)
+    rel = (release > REL_ON_PCT).astype(int)
+    stop_soon = np.zeros(n, bool)
+    h = int(round(STOP_LOOKAHEAD_S / dt_s))
+    for i in np.flatnonzero((ref[1:] <= 0.01) & (ref[:-1] > 0.01)) + 1:
+        stop_soon[max(i - h, 0) : i + 1] = True
+    ok = (ref > 0.01) & (ref > p.speed_edges_kmh[0])
+    _, found = fit.cell_value(ref, u, pedal, rel)
+    low = ref < 20.0
+    sel = {
+        "全体": ok,
+        "アクセル": ok & (pedal == 1),
+        "ブレーキ": ok & (pedal == -1),
+        "ブレーキ<20 km/h": ok & (pedal == -1) & low,
+        "停車前<20 km/h": ok & (pedal == -1) & low & stop_soon,
+    }
+    groups = [(nm, float(m.sum() * dt_s), float((m & found).sum() * dt_s)) for nm, m in sel.items()]
+    keys = cell_keys(ref, u, pedal, rel, p)
+    miss_keys, cnt = np.unique(keys[ok & ~found], return_counts=True)
+    order = np.argsort(-cnt, kind="stable")[:top_n]
+    learn = {}
+    if fit.occupied_seconds is not None:
+        learn = dict(zip(fit.occupied.tolist(), fit.occupied_seconds.tolist(), strict=True))
+    missing = [
+        MissingCell(
+            _describe_key(int(miss_keys[i]), p), float(cnt[i] * dt_s),
+            float(learn.get(int(miss_keys[i]), 0.0)),
+        )
+        for i in order
+    ]
+    return FelCoverage(groups=groups, missing=missing, min_cell_s=p.min_cell_s)
+
+
+def format_coverage(cov: FelCoverage) -> str:
+    """埋まり方の表示（群別の割合と、足りないマスの上位）。"""
+    lines = [f"FEL の埋まり方（WLTP が走っている時間のうち、補正のあるマス＝学習で "
+             f"{cov.min_cell_s:g} 秒以上いたマスにいる時間の割合）:"]
+    for nm, tot, c in cov.groups:
+        r = f"{c / tot * 100:5.1f}%" if tot > 0.0 else "   -  "
+        lines.append(f"  {nm:12s} {r}（{c:6.1f} / {tot:6.1f} s）")
+    if cov.missing:
+        lines.append("  足りないマス（WLTP の秒数の多い順。学習の秒数は min_cell_s 未満）:")
+        for i, m in enumerate(cov.missing, 1):
+            lines.append(f"    {i:2d}. {m.text}　WLTP {m.wltp_s:5.1f}s・学習 {m.learn_s:4.2f}s")
+    else:
+        lines.append("  足りないマスはありません")
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────

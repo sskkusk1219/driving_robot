@@ -98,6 +98,14 @@ class ModeRow:
     # 実開度（アクチュエータの読み戻し）。旧形式 CSV・モニタ無しは None
     accel_actual_pct: float | None = None
     brake_actual_pct: float | None = None
+    # 2026-10-19 段2s-2b: FB が直した量の材料（CSV の列。無い・空欄の行は None）。
+    # FF の開度（FB を足す前。ペダル別）・C10 の上乗せ合計（P ＋ DOB。惰行の補助の周期は補助の分）・
+    # DOB の分・惰行の補助の分
+    accel_ff_pct: float | None = None
+    brake_ff_pct: float | None = None
+    c10_effort_pct: float | None = None
+    dob_effort_pct: float | None = None
+    coast_effort_pct: float | None = None
 
     @property
     def deviation_kmh(self) -> float:
@@ -135,12 +143,19 @@ class RunInfo:
     # 2026-10-18 段2r: C12（惰行の補助）の設定と集計の表示。None は C12 でない（または不明）
     coast_settings: str | None = None
     coast_summary: str | None = None
+    # 2026-10-19 段2s-2b: FEL の 1 行（mode_drive.fel_text）。None は不明（CSV からの作り直し）か
+    # FF が表の候補でない
+    fel_text: str | None = None
     notes: list[str] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────
 # 行の読み込み
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _num(text: str | None) -> float | None:
+    return float(text) if text not in (None, "") else None
 
 
 def rows_from_samples(samples: Sequence[DriveSample]) -> list[ModeRow]:
@@ -162,6 +177,11 @@ def rows_from_samples(samples: Sequence[DriveSample]) -> list[ModeRow]:
             phase=s.phase,
             accel_actual_pct=monitor_opening_pct(s.monitor_accel),
             brake_actual_pct=monitor_opening_pct(s.monitor_brake),
+            accel_ff_pct=s.accel_ff_pct,
+            brake_ff_pct=s.brake_ff_pct,
+            c10_effort_pct=s.c10_effort_pct,
+            dob_effort_pct=s.dob_effort_pct,
+            coast_effort_pct=s.coast_effort_pct,
         ))
     return rows
 
@@ -189,6 +209,11 @@ def rows_from_csv(path: Path) -> list[ModeRow]:
                 phase=r["phase"],
                 accel_actual_pct=actual_opening(r, "accel"),
                 brake_actual_pct=actual_opening(r, "brake"),
+                accel_ff_pct=_num(r.get("accel_ff_pct")),
+                brake_ff_pct=_num(r.get("brake_ff_pct")),
+                c10_effort_pct=_num(r.get("c10_effort_pct")),
+                dob_effort_pct=_num(r.get("dob_effort_pct")),
+                coast_effort_pct=_num(r.get("coast_effort_pct")),
             ))
     return rows
 
@@ -328,6 +353,78 @@ def pedal_stats(
 # ─────────────────────────────────────────────────────────────────────
 # 図
 # ─────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class FbEffect:
+    """FB が直した量（FF の開度に足された分）の 1 項目。ペダル別の |値| の平均と p95。"""
+
+    name: str
+    # "アクセル" / "ブレーキ" / "全体" → (行数, |値| の平均 [%], p95 [%])。行が無ければ入れない
+    stats: dict[str, tuple[int, float, float]]
+
+    def text(self, dt_s: float) -> str:
+        if not self.stats:
+            return "なし（列が空）"
+        return "／".join(
+            f"{k} {n * dt_s:.0f}s・|平均| {m:.2f}%・p95 {p:.2f}%"
+            for k, (n, m, p) in self.stats.items()
+        )
+
+
+def _abs_stats(values: Sequence[tuple[str, float]]) -> dict[str, tuple[int, float, float]]:
+    out: dict[str, tuple[int, float, float]] = {}
+    for key in ("アクセル", "ブレーキ", "全体"):
+        a = np.array([abs(v) for g, v in values if key == "全体" or g == key], dtype=float)
+        if a.size:
+            out[key] = (int(a.size), float(a.mean()), float(np.percentile(a, 95)))
+    return out
+
+
+def fb_effect(
+    rows: Sequence[ModeRow], accel_min_pct: float, brake_min_pct: float
+) -> list[FbEffect]:
+    """レポート 5 章「FB が直した量」（2026-10-19 段2s-2b）。FEL の効きを比べる物差し。
+
+    走っている行（基準 > 停車 または 実車速 > 停車）だけ、ペダル別（FF がアクセル／ブレーキを
+    選んだ行。惰行は全体にだけ入る）に、次の |値| の平均と p95 を出す:
+      P（C10 の偏差の上乗せ）＝ c10_effort − dob_effort − coast_effort（C10 の列がある行）
+      DOB の上乗せ ＝ dob_effort（C11 以降の行）
+      惰行の補助の上乗せ ＝ coast_effort（C12 の行）
+      最終の指令と FF の開度の差 ＝ （最終指令 − FF の開度）。符号つきの開度（アクセル＋・
+        ブレーキ−）で引く。FB を足す前の FF の列（accel_ff・brake_ff）との差で、調停・ガバナー・
+        安全網の分も含む。「FB がどれだけ手を入れたか」の合計の目安
+    """
+    def group(r: ModeRow) -> str:
+        return "アクセル" if _uses_accel(r) else "ブレーキ" if _uses_brake(r) else "惰行"
+
+    run = [r for r in rows if r.ref_kmh > VEHICLE_STOP_SPEED_KMH or r.actual_kmh > 0.5]
+    p_vals, dob_vals, coast_vals, diff_vals = [], [], [], []
+    for r in run:
+        g = group(r)
+        if r.c10_effort_pct is not None:
+            dob = r.dob_effort_pct or 0.0
+            coast = r.coast_effort_pct or 0.0
+            p_vals.append((g, r.c10_effort_pct - dob - coast))
+            if r.dob_effort_pct is not None:
+                dob_vals.append((g, dob))
+            if r.coast_effort_pct is not None:
+                coast_vals.append((g, coast))
+        if r.accel_ff_pct is not None or r.brake_ff_pct is not None:
+            ff = (r.accel_ff_pct or 0.0) - (r.brake_ff_pct or 0.0)
+            if r.accel_pct > accel_min_pct + 1e-6:
+                cmd = r.accel_pct
+            elif r.brake_pct > brake_min_pct + 1e-6:
+                cmd = -r.brake_pct
+            else:
+                cmd = 0.0
+            diff_vals.append((g, cmd - ff))
+    return [
+        FbEffect("P（C10 の偏差の上乗せ）", _abs_stats(p_vals)),
+        FbEffect("DOB の上乗せ", _abs_stats(dob_vals)),
+        FbEffect("惰行の補助の上乗せ", _abs_stats(coast_vals)),
+        FbEffect("最終の指令 − FF の開度（FB を足す前）", _abs_stats(diff_vals)),
+    ]
 
 
 def _figure(nrows: int, height: float, **kwargs: Any) -> tuple[Any, Any]:
@@ -576,6 +673,10 @@ def write_mode_report(
         [r.accel_pct for r in rows], [r.brake_pct for r in rows], [r.phase for r in rows], k,
     )
     state_at = dict(zip(t, state_keys, strict=True))
+    dt_s = sample_interval_s(t)
+    fb_effects = fb_effect(
+        rows, cfg.vehicle.min_accel_opening_pct, cfg.vehicle.min_brake_opening_pct
+    )
 
     say(f"レポートの図を作成します: {fig_dir}/ …")
     import matplotlib  # noqa: PLC0415
@@ -792,6 +893,11 @@ def write_mode_report(
                  "なし" if info.dob_settings is None else info.dob_settings),
                 ("C11 の外乱の推定（ペダル別の更新秒数・推定の最終/平均/最小/最大・上乗せ量）",
                  "なし" if info.dob_summary is None else info.dob_summary),
+                ("FEL（学習の補正表。研究系の設定はログに残らないのでここで確かめる）",
+                 "不明（CSV からの作り直し、または表の候補でない）" if info.fel_text is None
+                 else info.fel_text.strip()),
+                *[(f"FB が直した量: {e.name}（走っている行・ペダル別）", e.text(dt_s))
+                  for e in fb_effects],
                 ("C12（惰行の補助）の設定",
                  "なし" if info.coast_settings is None else info.coast_settings),
                 ("C12 の惰行の補助（ペダル別の入った回数・秒数・入れなかった理由別・離した回数）",
