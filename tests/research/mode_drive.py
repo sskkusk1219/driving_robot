@@ -1021,7 +1021,8 @@ class _ModeRun:
         u ＝ 開度 − min（アクセル正・ブレーキ負・min 以下は 0）。発進側・停止側の行では更新しない
         （今の計画の行で `low_speed_sides` を引く。C10 の上乗せと同じ条件）。"""
         # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
-        from tests.research.fwd_plan import low_speed_sides  # noqa: PLC0415
+        from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+        from tests.research.fwd_plan import FLAG_STOP, low_speed_sides  # noqa: PLC0415
 
         ff, dob, v = self.ff, self.dob, self.cfg.vehicle
         assert isinstance(ff, DisturbanceObserverFeedforward)
@@ -1036,6 +1037,14 @@ class _ModeRun:
         edges = ff.table.speed_edges
         launch_top = min((float(x) for x in edges if x > max(rows)), default=0.0) if rows else 0.0
         launch = bool(launch) and speed < launch_top
+        # 2026-10-18 段2q ① `121218` の修正: 停車中（停車保持の深いブレーキ）は表が強い減速を
+        # 予測し、実測は 0 なので、ブレーキの推定が +9 km/h/s まで積み上がって次の減速で踏み過ぎた。
+        # 停車保持の行・停車速度以下・発進側／停止側の表が置き換えた車速の行（meta の
+        # stop_max_speed_kmh と launch_top の大きいほう）より下では更新しない
+        low_top = max(launch_top, float(ff.table.meta.get("stop_max_speed_kmh", 0.0) or 0.0))
+        held = (
+            int(plan.flag[i]) == FLAG_STOP or speed <= STOP_SPEED_KMH or speed < low_top
+        )
         if accel > v.min_accel_opening_pct:
             u = accel - v.min_accel_opening_pct
         elif brake > v.min_brake_opening_pct:
@@ -1047,7 +1056,7 @@ class _ModeRun:
             at_limit_now=(
                 accel >= v.max_accel_opening_pct or brake >= v.max_brake_opening_pct
             ),
-            launch=bool(launch), stop=bool(stop),
+            launch=bool(launch), stop=bool(stop) or held,
         )
         if pedal is not None:
             is_accel = pedal == PEDAL_ACCEL

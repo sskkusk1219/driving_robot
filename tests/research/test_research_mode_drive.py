@@ -1491,6 +1491,22 @@ async def test_c11_dob_part_is_separated_and_signs_are_right(
     assert db < 0.0 and run._dob_effort == pytest.approx(db)  # noqa: SLF001
 
 
+async def test_c11_dob_holds_while_stopped_and_updates_while_moving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """段2q ① `121218` の修正: 停車中の深いブレーキでは推定を更新しない（実測 0・表は強い減速で
+    ブレーキの推定が積み上がっていた）。走っている間のブレーキでは更新する。"""
+    cfg = _c10_cfg(tmp_path, candidate="C11")
+    run = await _c10_run_obj(cfg, monkeypatch)
+    brake = cfg.vehicle.min_brake_opening_pct + 10.0
+    for k in range(200):  # 10 秒、停車のまま深いブレーキ
+        run._dob_update(k * 0.05, 0.0, 0.0, 0.0, brake, False)  # noqa: SLF001
+    assert run.dob.d_brake == 0.0 and run.dob.n_brake == 0
+    for k in range(200, 400):  # 40 km/h で一定のまま（表は減速を言う → d > 0）
+        run._dob_update(k * 0.05, 40.0, 40.0, 0.0, brake, False)  # noqa: SLF001
+    assert run.dob.n_brake > 0 and run.dob.d_brake > 0.0
+
+
 async def test_c11_run_logs_dob_columns_and_c10_leaves_them_blank(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
