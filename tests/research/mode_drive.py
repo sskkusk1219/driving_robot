@@ -743,10 +743,14 @@ class _ModeRun:
         self.dob_stats: DobStats | None = None
         self._dob_effort: float | None = None  # 今の周期の上乗せのうち DOB の分 [%]
         if isinstance(self.ff, DisturbanceObserverFeedforward):
+            # fwd_data → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
+            from tests.research.fwd_data import RELEASE_WINDOW_S  # noqa: PLC0415
+
             self.dob = PedalDisturbanceObserver(
                 self.ff.table,
                 tq_accel_s=self.ff.tq_accel_s, tq_brake_s=self.ff.tq_brake_s,
                 lag_accel_s=self.ff.dob_lag_accel_s, lag_brake_s=self.ff.dob_lag_brake_s,
+                release_window_s=RELEASE_WINDOW_S,
             )
             self.dob_stats = DobStats(period_s=self.interval_s)
         self._last_accel_actual: float | None = None

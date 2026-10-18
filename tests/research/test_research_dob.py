@@ -139,3 +139,36 @@ def test_make_candidate_c11_and_set_dob() -> None:
     ff.set_dob(tq_coef=40.0, lag_accel_s=0.25, lag_brake_s=None)
     assert ff.tq_accel_s == pytest.approx(10.0) and ff.tq_brake_s is None
     assert ff.dob_tq_coef == 40.0 and ff.dob_lag_accel_s == 0.25
+
+
+class _ReleaseTable(_Table):
+    """戻しの表つき: 戻し量 r だけ減速が弱まる（a ＝ 本体 ＋ 0.1r）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[float | None] = []
+
+    def accel(self, v: float, u: float, *, launch: bool = False, stop: bool = False,
+              release: float | None = None) -> float:
+        self.calls.append(release)
+        return super().accel(v, u) + 0.1 * (release or 0.0)
+
+
+def test_brake_prediction_uses_release_amount_like_the_plan() -> None:
+    """段2q ①' の修正: ブレーキを戻している間は、戻し量（遅れた u − 直近の窓の最小）で
+    戻しの表を引く。窓 0（既定）なら release を渡さない（今までと同じ）。"""
+    tb = _ReleaseTable()
+    obs = PedalDisturbanceObserver(
+        tb, tq_accel_s=1.0, tq_brake_s=1.0, lag_accel_s=0.0, lag_brake_s=0.0,
+        release_window_s=1.0,
+    )
+    args = {"governed": False, "at_limit_now": False, "launch": False, "stop": False}
+    t, v = 0.0, 50.0
+    for _ in range(5):  # −10 で踏んでから
+        obs.update(t=t, speed_kmh=v, u_now=-10.0, **args)  # type: ignore[arg-type]
+        t += DT
+    tb.calls.clear()
+    obs.update(t=t, speed_kmh=v, u_now=-6.0, **args)  # type: ignore[arg-type]
+    assert tb.calls[-1] == pytest.approx(4.0)  # −6 − (−10)
+    plain = _obs()
+    _run(plain, 5, u=-10.0)  # release の引数を持たない表でも動く（窓 0）
+    assert plain.n_brake > 0

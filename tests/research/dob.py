@@ -8,6 +8,10 @@ deviation_offset_detail(dob_kmhs=d)` で「要る加速度から d を引いて�
 - 推定に使う開度は、実際に出した開度から min を引いた u（アクセル正・ブレーキ負・min 以下は 0）
 - u は遅れ L だけ過去のもの（アクセルの u はアクセルの遅れ、ブレーキの u はブレーキの遅れ。
   `fwd_plan.lagged_input` と同じ向きと優先順）を使う
+- ブレーキの予測は、計画（`fwd_plan._resolve_releases`）と同じく戻しの表を引く。戻し量 ＝ 遅れた u −
+  その時刻までの直近 release_window_s 秒の u の最小（`fwd_data.release_amount` と同じ定義）。
+  2026-10-18 段2q ①' `124859` の修正: 本体の表だけで予測すると、戻している低速のブレーキで
+  「表ほど減速しない」（+0.2〜+0.4 km/h/s）と読み、踏み増して遅くなった
 - 更新しない（値を保つ）条件: 遅れた u が 0（惰行・停車保持）／ガバナー作動／遅れた u が最大開度／
   発進側・停止側の表の行／そのペダルの Tq が None
 - numpy 以外は import しない（fwd_plan を読むと mode_drive との循環になる。発進・停止の判定は
@@ -34,6 +38,7 @@ class PedalDisturbanceObserver:
         tq_brake_s: float | None,
         lag_accel_s: float | None,
         lag_brake_s: float | None,
+        release_window_s: float = 0.0,
     ) -> None:
         self.table = table
         self.tq_accel_s = tq_accel_s
@@ -41,6 +46,7 @@ class PedalDisturbanceObserver:
         # 遅れが測れていないペダルは更新しない（Tq も None のはずだが、ここでも守る）
         self.lag_accel_s = lag_accel_s
         self.lag_brake_s = lag_brake_s
+        self.release_window_s = release_window_s  # 0 ＝ 戻しの表を引かない
         self.d_accel = 0.0
         self.d_brake = 0.0
         self.n_accel = 0  # 推定を更新した周期数
@@ -71,6 +77,16 @@ class PedalDisturbanceObserver:
             if e[0] < 0.0:
                 return e
         return 0.0, False, False
+
+    def _release(self, tau: float, u_d: float) -> float:
+        """ブレーキの遅れた u（< 0）の戻し量 ＝ u_d − 時刻 τ − lb までの直近 release_window_s 秒の
+        u の最小（その時刻を含む）。アクセル・窓 0 は 0。"""
+        if u_d >= 0.0 or self.release_window_s <= 0.0 or self.lag_brake_s is None:
+            return 0.0
+        t1 = tau - self.lag_brake_s
+        t0 = t1 - self.release_window_s
+        m = min((u for ht, u, _, _ in self._hist if t0 - 1e-9 <= ht <= t1 + 1e-9), default=u_d)
+        return max(u_d - m, 0.0)
 
     def _at(self, t: float) -> tuple[float, bool, bool] | None:
         """時刻 t 以前で最新の履歴の (u, 最大開度か, ガバナーか)。t が履歴より前なら None。"""
@@ -103,7 +119,7 @@ class PedalDisturbanceObserver:
         prev_t, prev_v = self._prev_t, self._prev_speed
         self._prev_t, self._prev_speed = t, speed_kmh
         # 履歴は最大の遅れ + 余裕より古いものを捨てる（遅れ以前の 1 点は残す）
-        keep = max(self.lag_accel_s or 0.0, self.lag_brake_s or 0.0) + 0.5
+        keep = max(self.lag_accel_s or 0.0, (self.lag_brake_s or 0.0) + self.release_window_s) + 0.5
         while len(self._hist) > 2 and self._hist[1][0] <= t - keep:
             self._hist.popleft()
         if prev_t is None or prev_v is None:
@@ -122,7 +138,13 @@ class PedalDisturbanceObserver:
         if tq is None or tq <= 0.0:
             return None
         meas = (speed_kmh - prev_v) / dt
-        pred = float(self.table.accel(speed_kmh, u_d, launch=False, stop=False))
+        release = self._release(t, u_d)
+        if release > 0.0:
+            pred = float(
+                self.table.accel(speed_kmh, u_d, launch=False, stop=False, release=release)
+            )
+        else:
+            pred = float(self.table.accel(speed_kmh, u_d, launch=False, stop=False))
         e = meas - pred
         alpha = min(1.0, dt / tq)
         if is_accel:
