@@ -701,6 +701,7 @@ def coast_params(ff: CoastAssistFeedforward, cfg: ResearchConfig) -> dict[str, A
         "hold_brake_s": hold(ff.dob_lag_brake_s, brk_on),
         "ret": ret, "period_s": period,
         "accel_onset_effort": acc_on, "brake_onset_effort": brk_on,
+        "one_pedal_per_section": cfg.forward_map.coast_one_pedal_per_section,
     }
 
 
@@ -714,6 +715,7 @@ def coast_settings_of(ff: object, cfg: ResearchConfig) -> str:
     return coast_settings_text(
         ff.coast_on_kmh, ff.coast_off_kmh, ff.coast_hold_coef, p["hold_accel_s"], p["hold_brake_s"],
         floor_onset=cfg.forward_map.coast_floor_onset,
+        one_pedal_per_section=cfg.forward_map.coast_one_pedal_per_section,
     )
 
 

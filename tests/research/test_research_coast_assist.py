@@ -104,6 +104,51 @@ def test_one_pedal_per_coast_section_and_cleared_on_non_coast_row() -> None:
     assert _step(ca, 55, -0.8) == PEDAL_BRAKE  # 前のアクセルが戻り、保持も済んだ後
 
 
+def _two_pedal(effort: float = 24.0) -> CoastAssist:
+    n = 100
+    ca = CoastAssist(
+        np.zeros(n), np.array([FLAG_COAST] * n), np.arange(n) * DT,
+        on_kmh=ON, off_kmh=OFF, hold_accel_s=HOLD, hold_brake_s=HOLD, ret=RET, period_s=DT,
+        accel_onset_effort=ACCEL_ONSET, brake_onset_effort=BRAKE_ONSET,
+        one_pedal_per_section=False,
+    )
+    assert _step(ca, 0, 0.6) == PEDAL_ACCEL
+    ca.note_effort(effort)
+    for i in range(1, 11):
+        _step(ca, i, 0.1)
+        ca.note_effort(effort)
+    assert ca.pedal is None and ca.t_off == pytest.approx(1.0)  # t=1.0 で離す
+    return ca
+
+
+def test_default_keeps_one_pedal_per_section() -> None:
+    assert _all_coast().one_pedal_per_section is True  # 既定は今まで通り
+    ca = _all_coast()
+    _step(ca, 0, 0.6)
+    for i in range(1, 11):
+        _step(ca, i, 0.1)
+    assert _step(ca, 30, -0.8) is None
+    assert ca.stats.blocked_section == 1 and ca.stats.blocked_switch_wait == 0
+
+
+def test_switch_to_opposite_pedal_after_hold_when_allowed() -> None:
+    ca = _two_pedal()
+    assert ca.last_effort == pytest.approx(24.0)  # 離すとき覚える
+    assert _step(ca, 15, -0.8) is None  # 0.5 s ＜ 保持 1.0 s
+    assert ca.stats.blocked_switch_wait == 1 and ca.stats.blocked_section == 0
+    assert _step(ca, 20, -0.8) == PEDAL_BRAKE  # 1.0 s ≥ 保持・戻り 0.4 s
+    assert ca.stats.blocked_switch_wait == 1
+
+
+def test_switch_waits_for_previous_pedal_return() -> None:
+    ca = _two_pedal(effort=120.0)  # 戻り T ＝ 0.1 ＋ 116/100 ＋ 0.1 ＝ 1.36 s
+    assert _step(ca, 20, -0.8) is None  # 保持は済んだが 1.0 s ＜ 1.36 s
+    assert ca.stats.blocked_switch_wait == 1
+    assert _step(ca, 23, -0.8) is None
+    assert _step(ca, 24, -0.8) == PEDAL_BRAKE  # 1.4 s ≥ 1.36 s
+    assert ca.stats.blocked_switch_wait == 2
+
+
 def test_no_reentry_before_hold_after_release() -> None:
     ca = _all_coast()
     _step(ca, 0, 0.6)
@@ -181,6 +226,11 @@ def test_stats_summary_and_settings_text() -> None:
     assert "入る 0.5 km/h" in text and "保持 アクセル 1.50s / ブレーキ 2.00s" in text
     assert "効き始めの下限 なし" in text
     assert "効き始めの下限 あり" in coast_settings_text(0.5, 0.2, 4.0, 1.5, 2.0, floor_onset=True)
+    assert "区間で片方のペダルだけ あり" in text
+    assert "区間で片方のペダルだけ なし" in coast_settings_text(
+        0.5, 0.2, 4.0, 1.5, 2.0, one_pedal_per_section=False
+    )
+    assert "反対ペダルへ替える待ち" in CoastStats(period_s=0.05, blocked_switch_wait=20).summary()
 
 
 def test_make_candidate_c12_and_set_coast() -> None:

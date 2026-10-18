@@ -39,6 +39,7 @@ class CoastStats:
     brake_s: float = 0.0
     # 入る条件（偏差 ≥ on）は満たしたが入れなかった周期数。最初に外れた理由で数える
     blocked_section: int = 0  # この惰行の区間で反対のペダルを使った
+    blocked_switch_wait: int = 0  # 反対のペダルに替える待ち（保持時間・前のペダルの戻り）
     blocked_reentry: int = 0  # 離してから hold_p たっていない
     blocked_prev_return: int = 0  # 前の反対のペダルが min に戻っていない
     blocked_next_return: int = 0  # 次の反対のペダルまでに保持して戻る時間がない
@@ -56,6 +57,7 @@ class CoastStats:
             f"入った アクセル {self.accel_entries} 回（{self.accel_s:.1f}s）／"
             f"ブレーキ {self.brake_entries} 回（{self.brake_s:.1f}s）・"
             f"入れなかった（周期）区間の反対ペダル {self.blocked_section * p:.1f}s・"
+            f"反対ペダルへ替える待ち {self.blocked_switch_wait * p:.1f}s・"
             f"入り直しの間隔 {self.blocked_reentry * p:.1f}s・"
             f"前の戻り待ち {self.blocked_prev_return * p:.1f}s・"
             f"次の戻り待ち {self.blocked_next_return * p:.1f}s・"
@@ -65,13 +67,14 @@ class CoastStats:
 
 def coast_settings_text(
     on_kmh: float, off_kmh: float, hold_coef: float, hold_accel_s: float, hold_brake_s: float,
-    floor_onset: bool = False,
+    floor_onset: bool = False, one_pedal_per_section: bool = True,
 ) -> str:
     """C12 の設定の表示（走行前とレポートで同じ文）。"""
     return (
         f"入る {on_kmh:g} km/h・離す {off_kmh:g} km/h・保持係数 {hold_coef:g}"
         f"（保持 アクセル {hold_accel_s:.2f}s / ブレーキ {hold_brake_s:.2f}s）"
         f"・効き始めの下限 {'あり' if floor_onset else 'なし'}"
+        f"・区間で片方のペダルだけ {'あり' if one_pedal_per_section else 'なし'}"
     )
 
 
@@ -97,7 +100,9 @@ class CoastAssist:
         period_s: float,
         accel_onset_effort: float,
         brake_onset_effort: float,
+        one_pedal_per_section: bool = True,
     ) -> None:
+        self.one_pedal_per_section = one_pedal_per_section
         self.flag = np.asarray(plan_flag)
         self.on_kmh = on_kmh
         self.off_kmh = off_kmh
@@ -131,12 +136,16 @@ class CoastAssist:
         self.t_off = -math.inf
         self.section_pedal: str | None = None  # この惰行の区間で使ったペダル
         self._effort = 0.0  # 今の補助の effort（mode_drive が note_effort で渡す）
+        self.last_effort = 0.0  # 最後に補助で出した effort（離すときに覚える）
 
     def note_effort(self, effort: float) -> None:
         """今の周期で出した補助の effort（(a) の戻り時間の計算に使う）。"""
         self._effort = effort
 
     def _release(self, t: float) -> None:
+        if self.pedal is not None:
+            onset = self.onset_effort[self.pedal]
+            self.last_effort = self._effort if self._effort != 0.0 else onset
         self.pedal = None
         self.t_off = t
 
@@ -185,8 +194,14 @@ class CoastAssist:
         hold = self.hold_s[pedal]
         st = self.stats
         if self.section_pedal is not None and self.section_pedal != pedal:
-            st.blocked_section += 1
-            return None
+            if self.one_pedal_per_section:
+                st.blocked_section += 1
+                return None
+            if t - self.t_off < hold - 1e-9 or (
+                t - self.t_off < self.ret.seconds(self.last_effort, self.period_s)
+            ):
+                st.blocked_switch_wait += 1
+                return None
         if t - self.t_off < hold - 1e-9:
             st.blocked_reentry += 1
             return None

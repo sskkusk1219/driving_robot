@@ -1127,6 +1127,7 @@ def test_candidate_c12_is_accepted_and_coast_defaults() -> None:
     fm = cfgmod.ForwardMapSection()  # 2026-10-18 段2r（仮の全車共通の値）
     assert (fm.coast_on_kmh, fm.coast_off_kmh, fm.coast_hold_coef) == (0.5, 0.2, 4.0)
     assert fm.coast_floor_onset is False  # 既定は今まで通り
+    assert fm.coast_one_pedal_per_section is True
 
 
 def test_coast_floor_onset_is_loaded_and_must_be_bool(tmp_path: Path) -> None:
@@ -1135,6 +1136,17 @@ def test_coast_floor_onset_is_loaded_and_must_be_bool(tmp_path: Path) -> None:
     cfg.save({"forward_map.coast_floor_onset": True})
     assert cfgmod.load_config(path).forward_map.coast_floor_onset is True
     path.write_text(path.read_text().replace("coast_floor_onset: true", "coast_floor_onset: 1"))
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.load_config(path)
+
+
+def test_coast_one_pedal_per_section_is_loaded_and_must_be_bool(tmp_path: Path) -> None:
+    path = tmp_path / "onepedal.yaml"
+    cfg = cfgmod.load_config(path)
+    cfg.save({"forward_map.coast_one_pedal_per_section": False})
+    assert cfgmod.load_config(path).forward_map.coast_one_pedal_per_section is False
+    key = "coast_one_pedal_per_section"
+    path.write_text(path.read_text().replace(f"{key}: false", f"{key}: 0"))
     with pytest.raises(cfgmod.ConfigError):
         cfgmod.load_config(path)
 

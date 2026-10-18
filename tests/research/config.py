@@ -576,6 +576,9 @@ class ForwardMapSection:
     # 段2r ②。true なら、補助中のペダルの u を手順2 で測った効き始め以上にする
     # （遊びの中で効かないのを防ぐ）
     coast_floor_onset: bool = False
+    # 段2r ③。true なら 1 つの惰行の区間で使うペダルは 1 つだけ。false なら、前の補助のペダルが
+    # min に戻り保持時間がたてば反対のペダルにも入る
+    coast_one_pedal_per_section: bool = True
 
 
 @dataclass
