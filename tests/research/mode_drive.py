@@ -712,7 +712,8 @@ def coast_settings_of(ff: object, cfg: ResearchConfig) -> str:
 
     p = coast_params(ff, cfg)
     return coast_settings_text(
-        ff.coast_on_kmh, ff.coast_off_kmh, ff.coast_hold_coef, p["hold_accel_s"], p["hold_brake_s"]
+        ff.coast_on_kmh, ff.coast_off_kmh, ff.coast_hold_coef, p["hold_accel_s"], p["hold_brake_s"],
+        floor_onset=cfg.forward_map.coast_floor_onset,
     )
 
 
@@ -1130,6 +1131,10 @@ class _ModeRun:
             "brake_min_pct": v.min_brake_opening_pct,
             "stops_ahead": bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False,
         }
+        if self.cfg.forward_map.coast_floor_onset:
+            # 段2r ②: 補助中のそのペダルは手順2 の効き始め以上に置く（meta に無ければ下限なし）
+            on = ff.table.meta.get("accel_onset_u_pct" if is_accel else "brake_onset_u_pct")
+            kwargs["onset_u_pct"] = None if on is None else float(on)
         low = self._dob_low_speed(speed, int(plan.flag[i]))
         d = 0.0 if low else dob.estimate(is_accel=is_accel)
         with_dob = coast_assist_effort(ff.table, dob_kmhs=d, **kwargs)

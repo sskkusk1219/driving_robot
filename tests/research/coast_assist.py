@@ -64,12 +64,14 @@ class CoastStats:
 
 
 def coast_settings_text(
-    on_kmh: float, off_kmh: float, hold_coef: float, hold_accel_s: float, hold_brake_s: float
+    on_kmh: float, off_kmh: float, hold_coef: float, hold_accel_s: float, hold_brake_s: float,
+    floor_onset: bool = False,
 ) -> str:
     """C12 の設定の表示（走行前とレポートで同じ文）。"""
     return (
         f"入る {on_kmh:g} km/h・離す {off_kmh:g} km/h・保持係数 {hold_coef:g}"
         f"（保持 アクセル {hold_accel_s:.2f}s / ブレーキ {hold_brake_s:.2f}s）"
+        f"・効き始めの下限 {'あり' if floor_onset else 'なし'}"
     )
 
 

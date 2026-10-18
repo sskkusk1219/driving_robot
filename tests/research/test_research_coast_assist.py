@@ -179,6 +179,8 @@ def test_stats_summary_and_settings_text() -> None:
     assert "アクセル 2 回（3.0s）" in st.summary() and "1.0s" in st.summary()
     text = coast_settings_text(0.5, 0.2, 4.0, 1.5, 2.0)
     assert "入る 0.5 km/h" in text and "保持 アクセル 1.50s / ブレーキ 2.00s" in text
+    assert "効き始めの下限 なし" in text
+    assert "効き始めの下限 あり" in coast_settings_text(0.5, 0.2, 4.0, 1.5, 2.0, floor_onset=True)
 
 
 def test_make_candidate_c12_and_set_coast() -> None:

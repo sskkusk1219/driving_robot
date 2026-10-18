@@ -793,6 +793,24 @@ def test_coast_assist_effort_dob_and_zero_tau_and_clip() -> None:
     assert abs(_coast(t, is_accel=True, dev=5000.0, tau=0.5)) <= 100.0
 
 
+def test_coast_assist_effort_onset_floor() -> None:
+    """段2r ②: onset_u_pct を渡すと u の大きさが効き始め以上になる。None は今まで通り。"""
+    t = linear_table()
+    shallow = 0.4 / BRAKE_SLOPE  # 効き始めより浅い u
+    on = shallow + 1.0
+    base = _coast(t, is_accel=False, dev=-2.0)
+    assert base == pytest.approx(-(BD + shallow))
+    assert _coast(t, is_accel=False, dev=-2.0, onset_u_pct=None) == base
+    assert _coast(t, is_accel=False, dev=-2.0, onset_u_pct=on) == pytest.approx(-(BD + on))
+    # 効き始めより深ければそのまま
+    assert _coast(t, is_accel=False, dev=-2.0, onset_u_pct=0.1) == base
+    # アクセル側も同じ
+    assert _coast(t, is_accel=True, dev=2.0, onset_u_pct=5.0) == pytest.approx(AD + 5.0)
+    # 逆の符号で min に止めた場合も、効き始めに置く
+    assert _coast(t, is_accel=True, dev=-20.0, onset_u_pct=3.0) == pytest.approx(AD + 3.0)
+    assert _coast(t, is_accel=False, dev=50.0, onset_u_pct=3.0) == pytest.approx(-(BD + 3.0))
+
+
 def test_coast_assist_effort_uses_same_effort_u_relation_as_build_plan() -> None:
     """effort ＝ ±(min ＋ |u|)。build_plan が u を逆に引いて出す effort と同じ関係で、
     同じ要る加速度なら coast_assist_effort（dev=0）は build_plan の effort と一致する。"""

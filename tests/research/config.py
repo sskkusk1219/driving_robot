@@ -573,6 +573,9 @@ class ForwardMapSection:
     # 保持時間 ＝ coast_hold_coef × (手順2 の遅れ ＋ 効き始めまでの戻り時間)（ペダル別）。単位なし。
     # 押した効果が出てから判断するため。2r で決める
     coast_hold_coef: float = 4.0
+    # 段2r ②。true なら、補助中のペダルの u を手順2 で測った効き始め以上にする
+    # （遊びの中で効かないのを防ぐ）
+    coast_floor_onset: bool = False
 
 
 @dataclass

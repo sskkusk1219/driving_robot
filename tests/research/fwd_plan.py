@@ -514,6 +514,7 @@ def coast_assist_effort(
     brake_min_pct: float,
     stops_ahead: bool = False,
     dob_kmhs: float = 0.0,
+    onset_u_pct: float | None = None,
 ) -> float:
     """C12: 惰行の行で補助に使うペダルの effort [%] を返す（段2r。正＝アクセル・負＝ブレーキ）。
 
@@ -525,6 +526,9 @@ def coast_assist_effort(
     移らない。u と effort の関係（effort ＝ ±(min ＋ |u|)）は build_plan と同じ。
     τ ≦ 0 なら偏差の項は 0。表の引き方（発進側・停止側）は deviation_offset_detail と同じ
     （`low_speed_sides`。ref_kmh と stops_ahead で決める）。row_kmh は表を引く車速。
+    onset_u_pct（そのペダルの効き始め。min からの量）を渡すと、u の大きさをそれ以上にする
+    （段2r ②。遊びの中に入って効かないのを防ぐ。逆の符号で min に止めた場合も効き始めに置く）。
+    None なら下限なし。
     """
     lv, sv = low_speed_sides(table, need_kmhs, ref_kmh, stops_ahead)
     d_a = dev_kmh / tau_s if tau_s > 0.0 else 0.0
@@ -532,10 +536,11 @@ def coast_assist_effort(
         row_kmh, need_kmhs + d_a - dob_kmhs, launch=bool(lv), stop=bool(sv)
     )
     u = float(u1)
+    floor = 0.0 if onset_u_pct is None or not np.isfinite(onset_u_pct) else float(onset_u_pct)
     if is_accel:
-        effort = accel_min_pct + max(u, 0.0)
+        effort = accel_min_pct + max(u, floor, 0.0)
     else:
-        effort = -(brake_min_pct + max(-u, 0.0))
+        effort = -(brake_min_pct + max(-u, floor, 0.0))
     return float(np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT))
 
 
