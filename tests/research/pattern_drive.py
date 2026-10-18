@@ -1318,7 +1318,7 @@ def build_ff_model(
     models_dir = Path(cfg.feedforward.model_path).parent
     lags: MeasuredLags | None = None
     # 2026-10-13 段2o-2: 遅れの測定（HOLD_STEP）を表の遅れ L に入れる（C10 は C8 と同じ。段2p）
-    if candidate in ("C7", "C8", "C10", "C11"):
+    if candidate in ("C7", "C8", "C10", "C11", "C12"):
         lags = measure_pedal_lags(
             csv_path,
             accel_min_pct=profile.feedforward_params.accel_deadband_pct,
@@ -1327,7 +1327,7 @@ def build_ff_model(
         _say_pedal_lags(lags, cfg.learning.ramp_lag_speeds_kmh)
     if candidate == "C7":
         built = _build_table_model(profile, csv_path, models_dir, hw_mode, lags=lags)
-    elif candidate in ("C8", "C10", "C11"):  # C10・C11 は C8 と同じ pkl（段2p・段2q）
+    elif candidate in ("C8", "C10", "C11", "C12"):  # C10〜C12 は C8 と同じ pkl（段2p〜2r）
         built = _build_forward_model(
             profile, csv_path, models_dir, hw_mode,
             workers=forward_workers, seeds=forward_seeds, max_iter=forward_max_iter, lags=lags,
@@ -1384,7 +1384,7 @@ def build_ff_model(
     say()
     say("手順2 の学習結果のチェック（手順3 に影響する範囲）:")
     checks = run_checks_now()
-    if candidate in ("C8", "C10", "C11") and _only_seed_outliers_ng(checks):
+    if candidate in ("C8", "C10", "C11", "C12") and _only_seed_outliers_ng(checks):
         outliers = _outlier_seeds(built.model_path)
         from tests.research import fwd_final  # noqa: PLC0415
 

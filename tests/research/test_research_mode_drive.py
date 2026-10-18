@@ -1546,3 +1546,51 @@ async def test_c11_run_logs_dob_columns_and_c10_leaves_them_blank(
         r["dob_accel_kmhs"] == "" and r["dob_brake_kmhs"] == "" and r["dob_effort_pct"] == ""
         for r in rows10
     )
+
+
+# ─── C12（惰行の補助。2026-10-18 段2r） ──────────────────────────────────
+
+
+async def test_c12_assists_in_coast_rows_and_logs_coast_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """表の惰行の加速度（≒ −2.3 km/h/s）で基準を下げる区間は計画が惰行になる。実車速を基準と
+    ずれる 30 km/h に固定したスタブで、偏差が 0.5 を超えた周期に
+    補助が入り、coast_effort_pct に出る。C11 の行は空欄。"""
+    results = {}
+    for cand in ("C12", "C11"):
+        cfg = _c10_cfg(tmp_path, candidate=cand)
+        mode = _mode([(0.0, 0.0), (2.0, 0.0), (6.0, 40.0), (8.0, 40.0), (14.0, 26.0), (16.0, 26.0)])
+
+        async def fake_load_mode(
+            _cfg: cfgmod.ResearchConfig, _name: str, _m: object = mode
+        ) -> object:
+            return _m
+
+        monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+        setup = await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+        assert np.count_nonzero(setup.ff.plan.flag == 3) > 0  # 惰行の行がある（FLAG_COAST）
+        hw = await _held_stub(cfg)
+        hw.can.speed_kmh = 30.0  # 基準が 40 → 26 の間は偏差 +10〜−4（動かない車速）
+        log = dlmod.SessionLog(cfg, hw, has_ref=True)
+        log.start(dlmod.SECTION_MODE_DRIVE, "")
+        result = await mdmod.run_mode_drive(hw, cfg, setup, log=log)
+        await log.close()
+        results[cand] = (result, log.csv_path)
+    r12, csv12 = results["C12"]
+    r11, csv11 = results["C11"]
+    assert r11.coast_stats is None and r11.coast_settings is None
+    assert r12.coast_stats is not None and "入る 0.5 km/h" in (r12.coast_settings or "")
+    st = r12.coast_stats
+    assert st.accel_entries + st.brake_entries >= 1 and st.accel_s + st.brake_s > 0.0
+    out = capsys.readouterr().out
+    assert "C12（惰行の補助）:" in out
+    with csv12.open(newline="", encoding="utf-8") as f:
+        rows12 = [r for r in csv.DictReader(f) if r["section"] == dlmod.SECTION_MODE_DRIVE]
+    vals = [float(r["coast_effort_pct"]) for r in rows12]
+    # 補助した周期は min 以上の絶対開度が出る。この惰行の区間では片方のペダルだけ
+    assert any(abs(v) >= min(cfg.vehicle.min_accel_opening_pct, 4.0) for v in vals)
+    assert not (any(v > 0.0 for v in vals) and any(v < 0.0 for v in vals))
+    with csv11.open(newline="", encoding="utf-8") as f:
+        rows11 = list(csv.DictReader(f))
+    assert all(r["coast_effort_pct"] == "" for r in rows11)

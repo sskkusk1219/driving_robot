@@ -54,6 +54,7 @@ from tests.research.drive_log import (
 )
 from tests.research.ff_candidate import (
     CandidateFeedforward,
+    CoastAssistFeedforward,
     DeviationForwardFeedforward,
     DisturbanceObserverFeedforward,
     ForwardMapFeedforward,
@@ -232,6 +233,12 @@ def _prepare_forward_map_plan(
             lag_brake_s=None if lag_b is None else float(lag_b),
         )
         say(f"  C11（DOB）: {dob_settings_text(ff)}")
+    if isinstance(ff, CoastAssistFeedforward):
+        # 2026-10-18 段2r: 惰行の補助。保持時間 ＝ 係数 × (遅れ ＋ 効き始めまでの戻り時間)
+        ff.set_coast(
+            on_kmh=fm.coast_on_kmh, off_kmh=fm.coast_off_kmh, hold_coef=fm.coast_hold_coef
+        )
+        say(f"  C12（惰行の補助）: {coast_settings_of(ff, cfg)}")
     sec = plan.pedal_seconds()
     say(f"  範囲外を引いた秒数 {plan.out_of_range_s():.1f}s・穴埋めを引いた秒数 "
         f"{plan.filled_s():.1f}s")
@@ -664,6 +671,51 @@ def dob_settings_text(ff: object) -> str:
     )
 
 
+def coast_params(ff: CoastAssistFeedforward, cfg: ResearchConfig) -> dict[str, Any]:
+    """C12 の CoastAssist に渡す値（保持時間・戻り時間・効き始めの開度）。
+    保持時間 hold_p ＝ coast_hold_coef × (遅れ_p ＋ p の効き始めの開度が min へ戻る時間)。
+    効き始めの開度は、アクセル ＝ min ＋ accel_onset_u_pct、
+    ブレーキ ＝ −(min ＋ brake_onset_u_pct)。
+    pkl の meta に効き始めが無ければ min を使う。遅れが測れていないペダルは補助しないので 0。"""
+    # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
+    from tests.research.fwd_plan import return_time_of  # noqa: PLC0415
+
+    v, period = cfg.vehicle, cfg.control.loop_interval_s
+    ret = return_time_of(ff.table, v.min_accel_opening_pct, v.min_brake_opening_pct)
+
+    def onset(key: str) -> float:
+        x = ff.table.meta.get(key)
+        return float(x) if x is not None and math.isfinite(float(x)) else 0.0
+
+    acc_on = v.min_accel_opening_pct + onset("accel_onset_u_pct")
+    brk_on = -(v.min_brake_opening_pct + onset("brake_onset_u_pct"))
+
+    def hold(lag: float | None, effort: float) -> float:
+        if lag is None:
+            return 0.0
+        return ff.coast_hold_coef * (lag + ret.seconds(effort, period))
+
+    return {
+        "on_kmh": ff.coast_on_kmh, "off_kmh": ff.coast_off_kmh,
+        "hold_accel_s": hold(ff.dob_lag_accel_s, acc_on),
+        "hold_brake_s": hold(ff.dob_lag_brake_s, brk_on),
+        "ret": ret, "period_s": period,
+        "accel_onset_effort": acc_on, "brake_onset_effort": brk_on,
+    }
+
+
+def coast_settings_of(ff: object, cfg: ResearchConfig) -> str:
+    """C12 の設定の表示（走行前とレポートで同じ文）。C12 でなければ「なし」。"""
+    if not isinstance(ff, CoastAssistFeedforward):
+        return "なし"
+    from tests.research.coast_assist import coast_settings_text  # noqa: PLC0415
+
+    p = coast_params(ff, cfg)
+    return coast_settings_text(
+        ff.coast_on_kmh, ff.coast_off_kmh, ff.coast_hold_coef, p["hold_accel_s"], p["hold_brake_s"]
+    )
+
+
 @dataclass
 class ModeDriveResult:
     mode_name: str
@@ -683,6 +735,9 @@ class ModeDriveResult:
     # 2026-10-18 段2q: C11（DOB）の設定の表示と集計。C11 でなければ None
     dob_settings: str | None = None
     dob: DobStats | None = None
+    # 2026-10-18 段2r: C12（惰行の補助）の設定の表示と集計。C12 でなければ None
+    coast_settings: str | None = None
+    coast_stats: Any = None  # coast_assist.CoastStats（循環 import を避けるため型は書かない）
     samples: list[DriveSample] = field(default_factory=list)  # MODE_DRIVE の行（0.1s 刻み）
 
 
@@ -753,6 +808,18 @@ class _ModeRun:
                 release_window_s=RELEASE_WINDOW_S,
             )
             self.dob_stats = DobStats(period_s=self.interval_s)
+        # C12（惰行の補助）: C12 のときだけ状態機械と集計を持つ
+        self.coast: Any = None
+        self.coast_settings: str | None = None
+        self._coast_effort = 0.0  # 今の周期の惰行の補助の開度 [%]（補助しない周期は 0）
+        if isinstance(self.ff, CoastAssistFeedforward):
+            from tests.research.coast_assist import CoastAssist  # noqa: PLC0415
+
+            plan = self.ff.plan
+            self.coast = CoastAssist(
+                plan.effort_pct, plan.flag, plan.t_s, **coast_params(self.ff, cfg)
+            )
+            self.coast_settings = coast_settings_of(self.ff, cfg)
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
         self._accel_blocked = False
@@ -865,6 +932,13 @@ class _ModeRun:
         c10_effort: float | None = None
         if self.c10 is not None:
             c10_effort = self._c10_offset(t, ref, speed, ff_effort)
+        coast_active = False
+        if self.coast is not None:
+            # C12: 惰行の行（計画が 0）で偏差が積み上がったら、浅く踏んで詰める
+            self._coast_effort = 0.0
+            coast_effort = self._coast_assist(t, ref, speed, ff_effort)
+            if coast_effort != 0.0:
+                c10_effort, coast_active = coast_effort, True
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
         # C10 の上乗せは FF の列（accel_ff・brake_ff・plan_effort）には入れない（作ったずれが
         # 今までと同じ意味で比べられるように）。実際に出す effort にだけ足す
@@ -894,7 +968,7 @@ class _ModeRun:
             self.governor_cycles += 1
         accel, brake = self._apply_interlock(accel, brake)
         if self.dob is not None:
-            self._dob_update(t, ref, speed, accel, brake, governed)
+            self._dob_update(t, ref, speed, accel, brake, governed, coast_active)
         phase = (
             PHASE_ACCEL if accel > 0.0
             else PHASE_BRAKE_GOVERNED if governed
@@ -954,6 +1028,7 @@ class _ModeRun:
                     dob_accel_kmhs=None if self.dob is None else self.dob.d_accel,
                     dob_brake_kmhs=None if self.dob is None else self.dob.d_brake,
                     dob_effort_pct=self._dob_effort,
+                    coast_effort_pct=None if self.coast is None else self._coast_effort,
                 )
             )
         if segment != self._segment:
@@ -1023,6 +1098,47 @@ class _ModeRun:
         self._c10_prev_clamped = clamped
         return delta
 
+    def _coast_assist(self, t: float, ref: float, speed: float, ff_effort: float) -> float:
+        """C12: 惰行の行の補助の開度 [%]（正＝アクセル・負＝ブレーキ。補助しなければ 0）。
+        入る・離すは `CoastAssist.step`（毎周期呼ぶ）、踏む量は `fwd_plan.coast_assist_effort`。
+        τ が None のペダル（遅れが測れない）は踏まない。DOB の分は
+        「推定を引いた開度 − 引かない開度」を `_dob_effort` に入れる
+        （低速の行では推定を使わない。C11 と同じ）。"""
+        # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
+        from tests.research.fwd_plan import coast_assist_effort  # noqa: PLC0415
+
+        ff, coast, dob = self.ff, self.coast, self.dob
+        assert isinstance(ff, CoastAssistFeedforward) and coast is not None and dob is not None
+        plan = ff.plan
+        i = plan.index_at(t)
+        pedal = coast.step(t=t, i=i, dev_kmh=ref - speed, speed_kmh=speed, ref_kmh=ref)
+        if pedal is None or ff_effort != 0.0:
+            return 0.0
+        is_accel = pedal == PEDAL_ACCEL
+        tau = ff.tau_accel_s if is_accel else ff.tau_brake_s
+        if tau is None:
+            return 0.0
+        v = self.cfg.vehicle
+        kwargs: dict[str, Any] = {
+            "is_accel": is_accel,
+            "need_kmhs": float(plan.need_accel_kmhs[i]),
+            "ref_kmh": ref,
+            "row_kmh": ref if ff.deviation_row == "reference" else speed,
+            "dev_kmh": ref - speed,
+            "tau_s": tau,
+            "accel_min_pct": v.min_accel_opening_pct,
+            "brake_min_pct": v.min_brake_opening_pct,
+            "stops_ahead": bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False,
+        }
+        low = self._dob_low_speed(speed, int(plan.flag[i]))
+        d = 0.0 if low else dob.estimate(is_accel=is_accel)
+        with_dob = coast_assist_effort(ff.table, dob_kmhs=d, **kwargs)
+        without = coast_assist_effort(ff.table, **kwargs) if d != 0.0 else with_dob
+        self._dob_effort = with_dob - without
+        self._coast_effort = with_dob
+        coast.note_effort(with_dob)
+        return with_dob
+
     def _dob_launch_top(self) -> float:
         """発進側の表が置き換えた車速の行の上の境界 [km/h]（無ければ 0）"""
         table = self.ff.table  # type: ignore[attr-defined]
@@ -1042,7 +1158,14 @@ class _ModeRun:
         return flag == FLAG_STOP or speed <= STOP_SPEED_KMH or speed < low_top
 
     def _dob_update(
-        self, t: float, ref: float, speed: float, accel: float, brake: float, governed: bool
+        self,
+        t: float,
+        ref: float,
+        speed: float,
+        accel: float,
+        brake: float,
+        governed: bool,
+        coast_active: bool = False,
     ) -> None:
         """C11: 今の周期で出した開度（調停・ガバナー・安全網の後、待機位置の前）で推定器を進める。
         u ＝ 開度 − min（アクセル正・ブレーキ負・min 以下は 0）。発進側・停止側の行では更新しない
@@ -1064,6 +1187,9 @@ class _ModeRun:
         # 予測し、実測は 0 なので、ブレーキの推定が +9 km/h/s まで積み上がって次の減速で踏み過ぎた。
         # 停車保持の行・停車速度以下・低速の表の車速の行では更新しない（`_dob_low_speed`）
         held = self._dob_low_speed(speed, int(plan.flag[i]))
+        # 2026-10-18 段2r: 惰行の補助をしている周期も更新しない。浅い踏み込みは表がいちばん不確かな
+        # 所なので、推定を FF の行から作ったままにする
+        held = held or coast_active
         if accel > v.min_accel_opening_pct:
             u = accel - v.min_accel_opening_pct
         elif brake > v.min_brake_opening_pct:
@@ -1239,6 +1365,8 @@ async def run_mode_drive(
         c10=run.c10,
         dob_settings=None if run.dob is None else dob_settings_text(run.ff),
         dob=run.dob_stats,
+        coast_settings=run.coast_settings,
+        coast_stats=None if run.coast is None else run.coast.stats,
         samples=run.samples,
     )
     say(f"モード走行 {'完了' if result.completed else '中断'}: {run_s:.1f}s・{run.cycles} 周期"
@@ -1252,6 +1380,8 @@ async def run_mode_drive(
         say(f"  C10（偏差の上乗せ。{c10_settings_text(run.ff)}）: {run.c10.summary()}")
     if run.dob_stats is not None:
         say(f"  C11（DOB。{dob_settings_text(run.ff)}）: {run.dob_stats.summary()}")
+    if run.coast is not None:
+        say(f"  C12（惰行の補助。{run.coast_settings}）: {run.coast.stats.summary()}")
     if run.cycle_ms:
         say(f"  1 周期の処理時間: {cycle_time_text(run.cycle_ms, run.interval_s)}")
     if result.completed:

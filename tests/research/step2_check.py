@@ -475,7 +475,7 @@ def check_model_path(cfg: ResearchConfig, saved_path: str | Path | None) -> Chec
         table = load_forward_map(yaml_path)
         metrics["readable"] = 1.0
         notes.append(f"読めた（kind={table.kind}）")
-        want = {"C7": "table", "C8": "model", "C10": "model", "C11": "model"}.get(
+        want = {"C7": "table", "C8": "model", "C10": "model", "C11": "model", "C12": "model"}.get(
             cfg.feedforward.candidate
         )
         if want is not None and table.kind != want:

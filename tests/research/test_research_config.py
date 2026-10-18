@@ -1117,3 +1117,33 @@ def test_dob_tq_coef_is_loaded_from_yaml_and_validated(tmp_path: Path) -> None:
     for bad in (0.0, -1.0):
         cfg.forward_map.dob_tq_coef = bad
         assert any("forward_map.dob_tq_coef" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_candidate_c12_is_accepted_and_coast_defaults() -> None:
+    cfg = _load_default()
+    cfg.feedforward.candidate = "C12"
+    assert not any("candidate" in p for p in cfgmod.validate_config(cfg))
+    assert "C12" in cfgmod.CANDIDATE_NAMES
+    fm = cfgmod.ForwardMapSection()  # 2026-10-18 段2r（仮の全車共通の値）
+    assert (fm.coast_on_kmh, fm.coast_off_kmh, fm.coast_hold_coef) == (0.5, 0.2, 4.0)
+
+
+def test_coast_settings_are_loaded_from_yaml_and_validated(tmp_path: Path) -> None:
+    path = tmp_path / "coast.yaml"
+    cfg = cfgmod.load_config(path)
+    cfg.save({
+        "forward_map.coast_on_kmh": 0.8,
+        "forward_map.coast_off_kmh": 0.3,
+        "forward_map.coast_hold_coef": 2.0,
+    })
+    cfg = cfgmod.load_config(path)
+    fm = cfg.forward_map
+    assert (fm.coast_on_kmh, fm.coast_off_kmh, fm.coast_hold_coef) == (0.8, 0.3, 2.0)
+    assert not any("coast_" in p for p in cfgmod.validate_config(cfg))
+    for name, bad in (
+        ("coast_on_kmh", 0.0), ("coast_hold_coef", 0.0), ("coast_hold_coef", -1.0),
+        ("coast_off_kmh", -0.1), ("coast_off_kmh", 0.8),  # off は 0 以上 on 未満
+    ):
+        cfg = cfgmod.load_config(path)
+        setattr(cfg.forward_map, name, bad)
+        assert any(f"forward_map.{name}" in p for p in cfgmod.validate_config(cfg)), (name, bad)

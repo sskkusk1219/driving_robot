@@ -121,6 +121,9 @@ CSV_COLUMNS: tuple[str, ...] = (
     "dob_accel_kmhs",
     "dob_brake_kmhs",
     "dob_effort_pct",
+    # 2026-10-18 段2r: C12（惰行の補助）が惰行の行に出した開度 [%]（正＝アクセル・負＝ブレーキ。
+    # 補助していない周期は 0。C12 の行だけ、他は空欄）。c10_effort_pct にも同じ値が入る
+    "coast_effort_pct",
 )
 
 
@@ -156,6 +159,7 @@ class DriveSample:
     dob_accel_kmhs: float | None = None
     dob_brake_kmhs: float | None = None
     dob_effort_pct: float | None = None
+    coast_effort_pct: float | None = None  # C12 の惰行の補助の開度（C12 の行だけ。他は None）
 
 
 class SessionLog:
@@ -235,6 +239,7 @@ class SessionLog:
         dob_accel_kmhs: float | None = None,
         dob_brake_kmhs: float | None = None,
         dob_effort_pct: float | None = None,
+        coast_effort_pct: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -262,6 +267,7 @@ class SessionLog:
             dob_accel_kmhs=dob_accel_kmhs,
             dob_brake_kmhs=dob_brake_kmhs,
             dob_effort_pct=dob_effort_pct,
+            coast_effort_pct=coast_effort_pct,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -446,6 +452,7 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.dob_accel_kmhs),
                 _fmt(s.dob_brake_kmhs),
                 _fmt(s.dob_effort_pct),
+                _fmt(s.coast_effort_pct),
             ])
 
 

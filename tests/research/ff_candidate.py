@@ -868,6 +868,29 @@ class DisturbanceObserverFeedforward(DeviationForwardFeedforward):
         self.dob_lag_brake_s = lag_brake_s
 
 
+class CoastAssistFeedforward(DisturbanceObserverFeedforward):
+    """C12: C11 に、惰行の行の補助（coast assist）を足す（2026-10-18 段2r）。
+
+    読む pkl・開度の列・偏差の上乗せ・DOB は C11 と同じ。足すのは、計画が惰行（ペダルを踏まない）の
+    行で偏差が積み上がったときの浅い踏み込み（`coast_assist.CoastAssist` が入る・離すを決め、
+    `fwd_plan.coast_assist_effort` が踏む量を出す）。入る・離す偏差と保持の係数は、走行前に
+    mode_drive が `set_coast` で持たせる。
+    """
+
+    candidate = "C12"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.coast_on_kmh: float = 0.0
+        self.coast_off_kmh: float = 0.0
+        self.coast_hold_coef: float = 0.0
+
+    def set_coast(self, *, on_kmh: float, off_kmh: float, hold_coef: float) -> None:
+        self.coast_on_kmh = on_kmh
+        self.coast_off_kmh = off_kmh
+        self.coast_hold_coef = hold_coef
+
+
 #: V1 案スイッチ: config の feedforward.candidate 名 → クラス
 CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedforward]] = {
     "C1": CandidateFeedforward,
@@ -879,6 +902,7 @@ CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedfor
     "C8": ForwardModelFeedforward,
     "C10": DeviationForwardFeedforward,
     "C11": DisturbanceObserverFeedforward,
+    "C12": CoastAssistFeedforward,
 }
 
 

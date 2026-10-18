@@ -17,6 +17,7 @@ from tests.research.fwd_plan import (
     FLAG_STOP,
     ForwardPlan,
     build_plan,
+    coast_assist_effort,
     deviation_offset,
     deviation_offset_detail,
     low_speed_sides,
@@ -747,4 +748,60 @@ def test_deviation_dob_adds_to_p_and_skips_coast_and_missing_tau() -> None:
     # τ=0（deviation_c=0）でも DOB は効き、偏差の項は 0
     assert _dev(t, effort=12.0, dev=5.0, dob_kmhs=-0.3, tau_a=0.0) == pytest.approx(
         12.0 + 0.3 / ACCEL_SLOPE
+    )
+
+
+# ─── C12: 惰行の補助の開度（coast_assist_effort。2026-10-18 段2r） ─────────────
+
+
+def _coast(table, *, is_accel, dev, need=-2.5, ref=50.0, row=None, tau=5.0, **kw):
+    return coast_assist_effort(
+        table, is_accel=is_accel, need_kmhs=need, ref_kmh=ref,
+        row_kmh=ref if row is None else row, dev_kmh=dev, tau_s=tau,
+        accel_min_pct=AD, brake_min_pct=BD, **kw,
+    )
+
+
+def test_coast_assist_effort_signs_and_amounts() -> None:
+    t = linear_table()
+    # 遅れ +2 km/h・τ=5s → Δa=0.4 → アクセル min ＋ 0.4/0.3（正）
+    assert _coast(t, is_accel=True, dev=2.0) == pytest.approx(AD + 0.4 / ACCEL_SLOPE)
+    # 速すぎ −2 km/h → Δa=−0.4 → ブレーキ −(min ＋ 0.4/0.6)（負）
+    assert _coast(t, is_accel=False, dev=-2.0) == pytest.approx(-(BD + 0.4 / BRAKE_SLOPE))
+
+
+def test_coast_assist_effort_stops_at_min_and_never_switches_pedal() -> None:
+    t = linear_table()
+    # アクセルを選んだのに u が負になる（進んでいる）→ min で止まる（ブレーキ側へ移らない）
+    assert _coast(t, is_accel=True, dev=-20.0) == AD
+    assert _coast(t, is_accel=False, dev=50.0) == -BD
+
+
+def test_coast_assist_effort_dob_and_zero_tau_and_clip() -> None:
+    t = linear_table()
+    # 表より加速していない（dob < 0）→ アクセルは踏み増す
+    base = _coast(t, is_accel=True, dev=2.0)
+    assert _coast(t, is_accel=True, dev=2.0, dob_kmhs=-0.3) == pytest.approx(
+        base + 0.3 / ACCEL_SLOPE
+    )
+    # τ ≦ 0 なら偏差の項は 0（DOB だけ）
+    assert _coast(t, is_accel=True, dev=9.0, tau=0.0) == pytest.approx(AD)
+    assert _coast(t, is_accel=True, dev=9.0, tau=0.0, dob_kmhs=-0.3) == pytest.approx(
+        AD + 0.3 / ACCEL_SLOPE
+    )
+    # 100% で頭打ち
+    assert abs(_coast(t, is_accel=True, dev=5000.0, tau=0.5)) <= 100.0
+
+
+def test_coast_assist_effort_uses_same_effort_u_relation_as_build_plan() -> None:
+    """effort ＝ ±(min ＋ |u|)。build_plan が u を逆に引いて出す effort と同じ関係で、
+    同じ要る加速度なら coast_assist_effort（dev=0）は build_plan の effort と一致する。"""
+    t = linear_table()
+    # 要る加速度が惰行より +1.0 km/h/s（アクセル）／−1.0（ブレーキ）の行を、dev=0 で引き直す
+    coast_a = float(t.coast_accel(50.0))
+    ua, _ = t.invert(50.0, coast_a + 1.0)
+    ub, _ = t.invert(50.0, coast_a - 1.0)
+    assert _coast(t, is_accel=True, dev=0.0, need=coast_a + 1.0) == pytest.approx(AD + float(ua))
+    assert _coast(t, is_accel=False, dev=0.0, need=coast_a - 1.0) == pytest.approx(
+        -(BD + abs(float(ub)))
     )

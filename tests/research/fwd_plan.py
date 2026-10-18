@@ -501,6 +501,44 @@ def deviation_offset_detail(
     return float(np.clip(new, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)), clamped
 
 
+def coast_assist_effort(
+    table: ForwardTable,
+    *,
+    is_accel: bool,
+    need_kmhs: float,
+    ref_kmh: float,
+    row_kmh: float,
+    dev_kmh: float,
+    tau_s: float,
+    accel_min_pct: float,
+    brake_min_pct: float,
+    stops_ahead: bool = False,
+    dob_kmhs: float = 0.0,
+) -> float:
+    """C12: 惰行の行で補助に使うペダルの effort [%] を返す（段2r。正＝アクセル・負＝ブレーキ）。
+
+    惰行の行は計画が 0 なので、`deviation_offset_detail` のような「列に足す」ことができない。
+    代わりに、偏差 dev を τ 秒で 0 に戻す加速度を要る加速度に足して、表を直接逆に引く:
+        u1 ＝ invert(row_kmh, need ＋ dev ÷ τ − dob)
+    アクセル（遅れている側）なら effort ＝ accel_min ＋ max(u1, 0)、ブレーキなら
+    effort ＝ −(brake_min ＋ max(−u1, 0))。u1 が反対の符号なら min で止め、反対のペダルには
+    移らない。u と effort の関係（effort ＝ ±(min ＋ |u|)）は build_plan と同じ。
+    τ ≦ 0 なら偏差の項は 0。表の引き方（発進側・停止側）は deviation_offset_detail と同じ
+    （`low_speed_sides`。ref_kmh と stops_ahead で決める）。row_kmh は表を引く車速。
+    """
+    lv, sv = low_speed_sides(table, need_kmhs, ref_kmh, stops_ahead)
+    d_a = dev_kmh / tau_s if tau_s > 0.0 else 0.0
+    u1, _ = table.invert(
+        row_kmh, need_kmhs + d_a - dob_kmhs, launch=bool(lv), stop=bool(sv)
+    )
+    u = float(u1)
+    if is_accel:
+        effort = accel_min_pct + max(u, 0.0)
+    else:
+        effort = -(brake_min_pct + max(-u, 0.0))
+    return float(np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT))
+
+
 def _pre_opening(
     table: ForwardTable, key: str, min_pct: float, margin_pct: float
 ) -> float | None:

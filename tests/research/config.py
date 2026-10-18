@@ -59,7 +59,10 @@ class VehicleSection:
 #: C8（同じ格子のモデル版。fwd_model_*.pkl）。C9 は後の段で足す。
 #: C10（C8 の開度の列 ＋ 走行中に偏差の分だけ上乗せ。pkl は C8 と同じ。2026-10-17 段2p）
 #: C11（C10 ＋ 外乱オブザーバ DOB。pkl は C8 と同じ。2026-10-18 段2q）
-CANDIDATE_NAMES: tuple[str, ...] = ("C1", "C2", "C3", "C4", "C5", "C7", "C8", "C10", "C11")
+#: C12（C11 ＋ 惰行の行の補助。pkl は C8 と同じ。2026-10-18 段2r）
+CANDIDATE_NAMES: tuple[str, ...] = (
+    "C1", "C2", "C3", "C4", "C5", "C7", "C8", "C10", "C11", "C12",
+)
 
 # C10 が表を引く車速の行（forward_map.deviation_row）。reference＝案A・actual＝案B
 DEVIATION_ROWS: tuple[str, ...] = ("reference", "actual")
@@ -562,6 +565,14 @@ class ForwardMapSection:
     # 仮の全車共通係数（段2s で決め直す）。40 は遅れ約 0.25 s で Tq ≈ 10 s
     # （加速度の乱れ ±0.4〜0.5 km/h/s をならして、推定の幅 ±0.2 程度）
     dob_tq_coef: float = 40.0
+    # 2026-10-18 段2r（C12 のときだけ効く）: 惰行の行の補助（coast assist）
+    # on／off ＝ 入る／離す偏差の大きさ [km/h]。仮の全車共通の値（KPI の |偏差|>1 km/h の帯の
+    # 半分と 2 割）。入る・離すのばたつきに効く（2r の実機で 1〜2 通り試して決める）
+    coast_on_kmh: float = 0.5
+    coast_off_kmh: float = 0.2
+    # 保持時間 ＝ coast_hold_coef × (手順2 の遅れ ＋ 効き始めまでの戻り時間)（ペダル別）。単位なし。
+    # 押した効果が出てから判断するため。2r で決める
+    coast_hold_coef: float = 4.0
 
 
 @dataclass
@@ -887,6 +898,13 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")
     need(fm.deviation_c >= 0.0, f"forward_map.deviation_c は 0 以上: {fm.deviation_c}")
     need(fm.dob_tq_coef > 0.0, f"forward_map.dob_tq_coef は正値: {fm.dob_tq_coef}")
+    need(fm.coast_on_kmh > 0.0, f"forward_map.coast_on_kmh は正値: {fm.coast_on_kmh}")
+    need(
+        0.0 <= fm.coast_off_kmh < fm.coast_on_kmh,
+        f"forward_map.coast_off_kmh は 0 以上 coast_on_kmh 未満: {fm.coast_off_kmh}"
+        f"（coast_on_kmh={fm.coast_on_kmh}）",
+    )
+    need(fm.coast_hold_coef > 0.0, f"forward_map.coast_hold_coef は正値: {fm.coast_hold_coef}")
     need(
         fm.deviation_row in DEVIATION_ROWS,
         f"forward_map.deviation_row が不正です: {fm.deviation_row!r}"

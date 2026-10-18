@@ -132,6 +132,9 @@ class RunInfo:
     # 2026-10-18 段2q: C11（DOB）の設定と集計の表示。None は C11 でない（または不明）
     dob_settings: str | None = None
     dob_summary: str | None = None
+    # 2026-10-18 段2r: C12（惰行の補助）の設定と集計の表示。None は C12 でない（または不明）
+    coast_settings: str | None = None
+    coast_summary: str | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -789,6 +792,10 @@ def write_mode_report(
                  "なし" if info.dob_settings is None else info.dob_settings),
                 ("C11 の外乱の推定（ペダル別の更新秒数・推定の最終/平均/最小/最大・上乗せ量）",
                  "なし" if info.dob_summary is None else info.dob_summary),
+                ("C12（惰行の補助）の設定",
+                 "なし" if info.coast_settings is None else info.coast_settings),
+                ("C12 の惰行の補助（ペダル別の入った回数・秒数・入れなかった理由別・離した回数）",
+                 "なし" if info.coast_summary is None else info.coast_summary),
                 ("ブレーキ寄与ほぼ0（指令はあるが惰行カーブ相当しか効いていない）",
                  f"{pedal.brake_ineffective_s:.1f}s"),
                 (f"ばたつき（実車速 {CHATTER_BAND_HZ[0]:g}〜{CHATTER_BAND_HZ[1]:g}Hz の帯 RMS・"

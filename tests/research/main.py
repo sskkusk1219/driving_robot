@@ -328,6 +328,7 @@ _CANDIDATE_KIND: dict[str, str] = {
     "C8": "順モデル",
     "C10": "順モデル（C8 と同じ pkl。走行中に偏差の分を上乗せする）",  # 2026-10-17 段2p
     "C11": "順モデル（C8 と同じ pkl。C10 に外乱オブザーバ DOB の分を足す）",  # 2026-10-18 段2q
+    "C12": "順モデル（C8 と同じ pkl。C11 に惰行の行の補助を足す）",  # 2026-10-18 段2r
 }
 
 
@@ -470,6 +471,8 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
         c10_summary=None if result.c10 is None else result.c10.summary(),
         dob_settings=result.dob_settings,
         dob_summary=None if result.dob is None else result.dob.summary(),
+        coast_settings=result.coast_settings,
+        coast_summary=None if result.coast_stats is None else result.coast_stats.summary(),
         notes=notes,
     )
     rows = rows_from_samples(result.samples)
