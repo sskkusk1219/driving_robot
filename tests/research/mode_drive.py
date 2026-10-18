@@ -1003,6 +1003,11 @@ class _ModeRun:
         # C11: 押しているペダルの行にだけ、そのペダルの外乱の推定を引いて表を引く。
         # DOB の分は「P ＋ DOB の上乗せ − P だけの上乗せ」で別に出す（ログ・集計用）
         d_row = 0.0 if dob is None or ff_effort == 0.0 else dob.estimate(is_accel=ff_effort > 0.0)
+        # 2026-10-18 段2q ③ `135125` の修正: 推定を更新しない低速の行（発進の前のブレーキを離す所
+        # など）では使わない。そこで持ち越したブレーキの推定（−0.05〜−0.35）がブレーキを浅くし、
+        # 発進で早く動き出した（アクセルを踏み始めた瞬間の偏差 +0.04〜+0.37 → +0.32〜+0.90）
+        if dob is not None and self._dob_low_speed(speed, int(plan.flag[i])):
+            d_row = 0.0
         new, clamped = deviation_offset_detail(ff.table, dob_kmhs=d_row, **kwargs)
         delta = new - ff_effort
         if dob is not None:
@@ -1018,6 +1023,24 @@ class _ModeRun:
         self._c10_prev_clamped = clamped
         return delta
 
+    def _dob_launch_top(self) -> float:
+        """発進側の表が置き換えた車速の行の上の境界 [km/h]（無ければ 0）"""
+        table = self.ff.table  # type: ignore[attr-defined]
+        rows = table.meta.get("launch_speed_rows") or []
+        if not rows:
+            return 0.0
+        return min((float(x) for x in table.speed_edges if x > max(rows)), default=0.0)
+
+    def _dob_low_speed(self, speed: float, flag: int) -> bool:
+        """C11 の推定を更新せず、使いもしない行か（停車保持の行・停車速度以下・発進側／停止側の表が
+        置き換えた車速（launch_top と meta の stop_max_speed_kmh の大きいほう）未満）。"""
+        from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+        from tests.research.fwd_plan import FLAG_STOP  # noqa: PLC0415
+
+        meta = self.ff.table.meta  # type: ignore[attr-defined]
+        low_top = max(self._dob_launch_top(), float(meta.get("stop_max_speed_kmh", 0.0) or 0.0))
+        return flag == FLAG_STOP or speed <= STOP_SPEED_KMH or speed < low_top
+
     def _dob_update(
         self, t: float, ref: float, speed: float, accel: float, brake: float, governed: bool
     ) -> None:
@@ -1025,8 +1048,7 @@ class _ModeRun:
         u ＝ 開度 − min（アクセル正・ブレーキ負・min 以下は 0）。発進側・停止側の行では更新しない
         （今の計画の行で `low_speed_sides` を引く。C10 の上乗せと同じ条件）。"""
         # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
-        from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
-        from tests.research.fwd_plan import FLAG_STOP, low_speed_sides  # noqa: PLC0415
+        from tests.research.fwd_plan import low_speed_sides  # noqa: PLC0415
 
         ff, dob, v = self.ff, self.dob, self.cfg.vehicle
         assert isinstance(ff, DisturbanceObserverFeedforward)
@@ -1037,18 +1059,11 @@ class _ModeRun:
         launch, stop = low_speed_sides(ff.table, float(plan.need_accel_kmhs[i]), ref, ahead)
         # 発進側は need > 0 の行すべてで True になる（表を引く車速の範囲は表の中で決まる）ので、
         # 止めるのは発進側の表が置き換えた車速の行（meta の launch_speed_rows）の中だけにする
-        rows = ff.table.meta.get("launch_speed_rows") or []
-        edges = ff.table.speed_edges
-        launch_top = min((float(x) for x in edges if x > max(rows)), default=0.0) if rows else 0.0
-        launch = bool(launch) and speed < launch_top
+        launch = bool(launch) and speed < self._dob_launch_top()
         # 2026-10-18 段2q ① `121218` の修正: 停車中（停車保持の深いブレーキ）は表が強い減速を
         # 予測し、実測は 0 なので、ブレーキの推定が +9 km/h/s まで積み上がって次の減速で踏み過ぎた。
-        # 停車保持の行・停車速度以下・発進側／停止側の表が置き換えた車速の行（meta の
-        # stop_max_speed_kmh と launch_top の大きいほう）より下では更新しない
-        low_top = max(launch_top, float(ff.table.meta.get("stop_max_speed_kmh", 0.0) or 0.0))
-        held = (
-            int(plan.flag[i]) == FLAG_STOP or speed <= STOP_SPEED_KMH or speed < low_top
-        )
+        # 停車保持の行・停車速度以下・低速の表の車速の行では更新しない（`_dob_low_speed`）
+        held = self._dob_low_speed(speed, int(plan.flag[i]))
         if accel > v.min_accel_opening_pct:
             u = accel - v.min_accel_opening_pct
         elif brake > v.min_brake_opening_pct:

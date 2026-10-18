@@ -1489,6 +1489,10 @@ async def test_c11_dob_part_is_separated_and_signs_are_right(
     run.dob.d_brake = 0.3
     db = run._c10_offset(tb, ref, ref, eb)  # noqa: SLF001
     assert db < 0.0 and run._dob_effort == pytest.approx(db)  # noqa: SLF001
+    # 段2q ③ の修正: 推定を更新しない低速（停車速度以下）では使わない
+    run.dob.d_accel = -0.3
+    run._c10_offset(t, 0.0, 0.0, e)  # noqa: SLF001
+    assert run._dob_effort == 0.0  # noqa: SLF001
 
 
 async def test_c11_dob_holds_while_stopped_and_updates_while_moving(
