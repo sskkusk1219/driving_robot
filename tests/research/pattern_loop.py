@@ -862,6 +862,8 @@ class PatternLoop:
         # コーストダウンの停車復帰のクリープ域で、停車保持開度まで徐々に踏むか（段2l-6b）
         self._db_creep_press = False
         self._db_press_reached_at: float | None = None  # 停車保持開度に届いた時刻
+        # 2026-10-19 段2s-2: 踏み上げ中に停車した（立つと保持開度へすぐ指令。フェーズ毎に下ろす）
+        self._db_stopped = False
         self._cb_start_pct = 0.0  # G 比例ブレーキの最初の開度（接近ランプの目標）
         # G ランプ走行（段2k 段B）。RAMP_UP に入るたびに _enter_phase が作り直す
         self._rp_u = 0.0  # 効く開度 u [%]（正がアクセル・負がブレーキ。RAMP_UP の頭で作り直す）
@@ -1189,8 +1191,14 @@ class PatternLoop:
             rate = self._stop_return_press_rate_pctps()
             assert rate is not None
             target_brake = self._stop_return_brake_pct
-            ramped = min(target_brake, self._brake_ramp_from + rate * elapsed)
-            ramped = max(ramped, min(self._brake_ramp_from, target_brake))
+            # 2026-10-19 段2s-2: 起点は max(今の開度, ブレーキ min)。min の手前を踏み上げの速さで
+            # 待たない。停車した後は速さを待たずに停車保持開度へすぐ指令する（単調は守る）
+            start = max(self._brake_ramp_from, self._profile.feedforward_params.brake_deadband_pct)
+            if self._db_stopped:
+                ramped = target_brake
+            else:
+                ramped = min(target_brake, start + rate * elapsed)
+            ramped = max(ramped, min(start, target_brake))
             self._brake_request = ramped
             if self._brake_gov_cap is not None:
                 ramped = min(ramped, self._brake_gov_cap)
@@ -1247,6 +1255,8 @@ class PatternLoop:
                     self._phase_started_at = now
                     elapsed = 0.0
             if self._db_creep_press:
+                if speed <= STOP_SPEED_KMH:
+                    self._db_stopped = True  # 2026-10-19 段2s-2: 停車したら保持開度へすぐ指令
                 # 段2l-6b: 停車かつ停車保持開度に届いてから次へ。時間切れも届いてから数える
                 # （踏み上げに 30 秒以上かかるため、届く前には中断しない）
                 if (
@@ -3094,6 +3104,7 @@ class PatternLoop:
             phase is _Phase.DRIVE_BRAKE and not self._db_gprop and self._creep_press_applies()
         )
         self._db_press_reached_at = None
+        self._db_stopped = False
         self._rp_hist.clear()
         self._rp_open_hist.clear()
         self._rp_last_t = None

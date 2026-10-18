@@ -169,6 +169,9 @@ def load_feedforward(cfg: ResearchConfig) -> CandidateFeedforward | ForwardMapFe
             raise ConfigError(
                 f"FF モデルを読み込めません: {ff_cfg.model_path}（{exc}）"
             ) from exc
+        # 2026-10-19 段2s-2: FEL（補正表 c）。有効で pkl に補正表があるときだけ f + c の表にする
+        if cfg.fel.enabled:
+            ff.apply_fel(cfg.fel.method)
         return ff
     ff.set_params(feedforward_params(cfg))
     ff.set_research_params(research_ff_params(cfg))
@@ -185,6 +188,19 @@ def load_feedforward(cfg: ResearchConfig) -> CandidateFeedforward | ForwardMapFe
             f"{list(ff.horizons)} に含まれていません"
         )
     return ff
+
+
+def fel_text(cfg: ResearchConfig, table: Any) -> str:
+    """prepare の表示 1 行: FEL の有効無効・方法・補正のあるマス数・学習 CSV（段2s-2）"""
+    info = table.meta.get("fel") or {}
+    src = info.get("source_csv", "なし")
+    if not cfg.fel.enabled:
+        has = f"あり {src}" if info else "なし"
+        return f"  FEL: 無効（fel.enabled=false。pkl の補正表: {has}）"
+    if table.meta.get("fel_applied") != cfg.fel.method:
+        return f"  FEL: 有効だが pkl に補正表なし（補正しない。方法 {cfg.fel.method}）"
+    cells = (info.get("cells_with_correction") or {}).get(cfg.fel.method, "?")
+    return f"  FEL: 有効・方法 {cfg.fel.method}・補正のあるマス {cells}・学習 CSV {src}"
 
 
 def _prepare_forward_map_plan(
@@ -213,6 +229,7 @@ def _prepare_forward_map_plan(
     lag_a = fm.accel_lag_s if fm.accel_lag_s is not None else meta.get("accel_lag_s")
     lag_b = fm.brake_lag_s if fm.brake_lag_s is not None else meta.get("brake_lag_s")
     say(f"FF 候補: {ff.candidate}（順モデルの表）　表: {ff_cfg.model_path}")
+    say(fel_text(cfg, ff.table))
     say(f"  遅れ アクセル {lag_a}s / ブレーキ {lag_b}s・惰行の帯 ±{fm.coast_band_kmhs:g} km/h/s・"
         f"窓 {fm.need_window_s:g}s")
     if isinstance(ff, DeviationForwardFeedforward):

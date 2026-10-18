@@ -582,6 +582,32 @@ class ForwardMapSection:
 
 
 @dataclass
+class FelSection:
+    """フィードバック誤差学習 FEL（2026-10-19 段2s-2）。fel.py が補正表を作り、走行で f + c を引く。
+
+    2s-2b で学習用パターンの設定もこのセクションに足す。
+    """
+
+    # 補正表を使うか（false または pkl に補正表なしなら今と完全に同じ）
+    enabled: bool = False
+    # 補正の作り方: "cell"（マスの平均）か "nn"（小さなニューラルネット）
+    method: str = "cell"
+    # 補正の上限 ±[km/h/s]
+    c_max_kmhs: float = 0.5
+    # cell で補正を出すマスの最小秒数 [s]
+    min_cell_s: float = 2.0
+    # マスの車速の境界 [km/h]（昇順）
+    speed_edges_kmh: list[float] = field(
+        default_factory=lambda: [
+            0.3, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 140.0,
+        ]
+    )
+    # マスの u の幅 [%]
+    accel_u_bin_pct: float = 1.0
+    brake_u_bin_pct: float = 0.5
+
+
+@dataclass
 class ResearchConfig:
     """`config_testVehicle.yaml` 全体。`source_path` は読み込み元（保存先）。"""
 
@@ -590,6 +616,7 @@ class ResearchConfig:
     feedforward: FeedforwardSection = field(default_factory=FeedforwardSection)
     features: FeaturesSection = field(default_factory=FeaturesSection)
     forward_map: ForwardMapSection = field(default_factory=ForwardMapSection)
+    fel: FelSection = field(default_factory=FelSection)
     pid: PidSection = field(default_factory=PidSection)
     arbiter: ArbiterSection = field(default_factory=ArbiterSection)
     control: ControlSection = field(default_factory=ControlSection)
@@ -638,6 +665,7 @@ _SECTION_TYPES: dict[str, type] = {
     "feedforward": FeedforwardSection,
     "features": FeaturesSection,
     "forward_map": ForwardMapSection,
+    "fel": FelSection,
     "pid": PidSection,
     "arbiter": ArbiterSection,
     "control": ControlSection,
@@ -903,6 +931,19 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")
     need(fm.deviation_c >= 0.0, f"forward_map.deviation_c は 0 以上: {fm.deviation_c}")
+    fe = cfg.fel  # 2026-10-19 段2s-2
+    need(fe.method in ("cell", "nn"), f"fel.method は cell か nn: {fe.method!r}")
+    need(fe.c_max_kmhs > 0.0, f"fel.c_max_kmhs は正値: {fe.c_max_kmhs}")
+    need(fe.min_cell_s > 0.0, f"fel.min_cell_s は正値: {fe.min_cell_s}")
+    need(fe.accel_u_bin_pct > 0.0, f"fel.accel_u_bin_pct は正値: {fe.accel_u_bin_pct}")
+    need(fe.brake_u_bin_pct > 0.0, f"fel.brake_u_bin_pct は正値: {fe.brake_u_bin_pct}")
+    edges = fe.speed_edges_kmh
+    need(
+        len(edges) >= 2
+        and edges[0] > 0.0
+        and all(b > a for a, b in zip(edges, edges[1:], strict=False)),
+        f"fel.speed_edges_kmh は 2 個以上・正値・厳密に昇順: {edges}",
+    )
     need(fm.dob_tq_coef > 0.0, f"forward_map.dob_tq_coef は正値: {fm.dob_tq_coef}")
     need(fm.coast_on_kmh > 0.0, f"forward_map.coast_on_kmh は正値: {fm.coast_on_kmh}")
     need(

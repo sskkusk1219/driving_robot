@@ -1276,7 +1276,9 @@ def test_creep_domain_stop_return_presses_monotonically_at_the_calib_step_rate()
             assert b - prev <= rate * 0.1 + 1e-9  # 1 周期あたりの増分は速さ以下
         prev, t = b, round(t + 0.1, 6)
     assert prev == pytest.approx(loop._stop_return_brake_pct)
-    assert loop._command_openings(pattern, 0.0)[1] == pytest.approx(4.0)
+    # 2026-10-19 段2s-2: 起点は max(今の開度 4.0, ブレーキ min)
+    bmin = loop._profile.feedforward_params.brake_deadband_pct
+    assert loop._command_openings(pattern, 0.0)[1] == pytest.approx(max(4.0, bmin))
 
 
 def test_creep_press_does_not_advance_until_the_hold_opening_is_reached() -> None:
@@ -1310,6 +1312,44 @@ def test_creep_press_timeout_counts_from_reaching_the_hold_opening() -> None:
     loop._command_openings(pattern, t_reach + 0.2 + cfg.brake_stop_timeout_s)
     loop._advance(pattern, 2.0, 0.0, t_reach + 0.2 + cfg.brake_stop_timeout_s)
     assert loop._pending_abort is not None and "停車しません" in loop._pending_abort
+
+
+def test_creep_press_starts_from_max_of_current_opening_and_brake_min() -> None:
+    """2026-10-19 段2s-2: 踏み上げの起点は max(今の開度, ブレーキ min)。min の手前を待たない。"""
+    loop, pattern = _creep_press_loop()
+    bmin = loop._profile.feedforward_params.brake_deadband_pct
+    loop._last_speed = 3.0
+    loop._current_brake_opening = 0.0  # min より手前
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 0.0)
+    assert loop._db_creep_press
+    first = loop._command_openings(pattern, 0.0)[1]
+    assert first == pytest.approx(min(bmin, loop._stop_return_brake_pct))
+    # 今の開度が min より深ければ、そこから（今までと同じ）
+    loop2, pattern2 = _creep_press_loop()
+    loop2._last_speed = 3.0
+    loop2._current_brake_opening = bmin + 1.0
+    loop2._enter_phase(_Phase.DRIVE_BRAKE, 0.0)
+    assert loop2._command_openings(pattern2, 0.0)[1] == pytest.approx(
+        min(bmin + 1.0, loop2._stop_return_brake_pct)
+    )
+
+
+def test_creep_press_jumps_to_the_hold_opening_once_stopped_and_stays_monotonic() -> None:
+    """2026-10-19 段2s-2: 停車した後は踏み上げの速さを待たず停車保持開度へすぐ指令する。"""
+    loop, pattern = _creep_press_loop()
+    loop._last_speed = 3.0
+    loop._current_brake_opening = 4.0
+    loop._enter_phase(_Phase.DRIVE_BRAKE, 0.0)
+    prev = loop._command_openings(pattern, 1.0)[1]
+    assert prev < loop._stop_return_brake_pct  # 動いている間は速さで踏む
+    loop._advance(pattern, 2.0, 0.0, 1.0)
+    assert not loop._db_stopped
+    loop._advance(pattern, 0.0, 0.0, 1.1)  # 停車
+    assert loop._db_stopped
+    b = loop._command_openings(pattern, 1.2)[1]
+    assert b == pytest.approx(loop._stop_return_brake_pct) and b >= prev
+    loop._advance(pattern, 0.0, 0.0, 1.2)  # 届いた。停車しているので次へ
+    assert loop._pattern_idx == 1
 
 
 def test_stop_return_boundary_follows_the_creep_speed_of_the_vehicle() -> None:

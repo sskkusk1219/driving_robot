@@ -752,6 +752,19 @@ class ForwardMapFeedforward:
         self._table = table
         self._plan = None
 
+    def apply_fel(self, method: str) -> bool:
+        """FEL の補正表があれば、表を f + c の表（with_fel）に置き換える（2026-10-19 段2s-2）。
+
+        置き換えるのは load_model の後・build_plan の前。開度の列・C10 の上乗せ・C11 の DOB は
+        すべて self.table を引くので、これで f + c になる。補正表が無ければ何もしない。
+        戻り値: 置き換えたか。
+        """
+        if not self.table.has_fel(method):
+            return False
+        self._table = self.table.with_fel(method)
+        self._plan = None
+        return True
+
     def build_plan(
         self,
         ref_at: Callable[[float], float],

@@ -118,6 +118,54 @@ class ForwardTable:
     # None ＝ 戻しの表なし（今までと完全に同じ）。戻し量は meta["release_max_pct"] で頭打ちにする
     release_grid: np.ndarray | None = None
     release_accel: np.ndarray | None = None
+    # FEL の補正表（2026-10-19 段2s-2。fel.py の attach が付ける）。格子点ごとの補正 [km/h/s]。
+    # *_main は本体・停止側・発進側に足す（戻し量 0）、*_rel は戻しの表の全層に足す（戻し中）。
+    # cell ＝ マスの平均、nn ＝ 小さなニューラルネット。None ＝ 補正なし（今までと完全に同じ）。
+    # 元の accel_grid 等は書き換えない。足すのは with_fel
+    fel_cell_main: np.ndarray | None = None
+    fel_cell_rel: np.ndarray | None = None
+    fel_nn_main: np.ndarray | None = None
+    fel_nn_rel: np.ndarray | None = None
+    # FEL を作ったときの学習器（マスの平均・ニューラルネット。fel.py の FelFit）。机上の score が
+    # 行に直接当てるのに使う。走行では使わない。None ＝ なし
+    fel_fit: Any = None
+
+    def has_fel(self, method: str | None = None) -> bool:
+        """補正表があるか（method を渡すとその方法の補正があるか）。"""
+        names = (method,) if method is not None else ("cell", "nn")
+        return any(
+            getattr(self, f"fel_{m}_main") is not None or getattr(self, f"fel_{m}_rel") is not None
+            for m in names
+        )
+
+    def with_fel(self, method: str) -> ForwardTable:
+        """補正 c を足した新しい表を返す（2026-10-19 段2s-2）。補正表が無ければ self のまま。
+
+        accel_grid・stop_accel・launch_accel（あるものだけ）に c_main、release_accel の全層に
+        c_rel を足し、各車速の行で u に対して単調（加速度が u とともに増える）になるよう
+        build_table と同じ IsotonicRegression（重み一様）でそろえる。point_kind 等はそのまま。
+        """
+        if method not in ("cell", "nn"):
+            raise ValueError(f"method は cell か nn: {method!r}")
+        c_main = getattr(self, f"fel_{method}_main")
+        c_rel = getattr(self, f"fel_{method}_rel")
+        if c_main is None and c_rel is None:
+            return self
+        meta = dict(self.meta)
+        meta["fel_applied"] = method
+        out = replace(self, meta=meta)
+        if c_main is not None:
+            ug = self.u_grid
+            out.accel_grid = _monotone_rows(self.accel_grid + c_main, ug)
+            if self.stop_accel is not None:
+                out.stop_accel = _monotone_rows(self.stop_accel + c_main, ug)
+            if self.launch_accel is not None:
+                out.launch_accel = _monotone_rows(self.launch_accel + c_main, ug)
+        if c_rel is not None and self.release_accel is not None:
+            out.release_accel = np.stack(
+                [_monotone_rows(layer + c_rel, self.u_grid) for layer in self.release_accel]
+            )
+        return out
 
     def _release_nodes(
         self, release: Any, launch: bool, shape: tuple[int, ...], stop: bool = False
@@ -224,6 +272,14 @@ class ForwardTable:
 
     def save(self, path: Path | None = None) -> Path:
         return save_table(self, path)
+
+
+def _monotone_rows(arr: np.ndarray, u_grid: np.ndarray) -> np.ndarray:
+    """行ごとに u に対して単調（増加）にそろえる（IsotonicRegression・重み一様）。"""
+    out = np.empty_like(arr, dtype=float)
+    for r in range(arr.shape[0]):
+        out[r] = IsotonicRegression(increasing=True).fit_transform(u_grid, arr[r])
+    return out
 
 
 def _row_weights(speed_rep: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -823,6 +879,11 @@ def save_table(table: ForwardTable, path: Path | None = None) -> Path:
         "stop_kind": table.stop_kind,
         "release_grid": table.release_grid,
         "release_accel": table.release_accel,
+        "fel_cell_main": table.fel_cell_main,  # 2026-10-19 段2s-2
+        "fel_cell_rel": table.fel_cell_rel,
+        "fel_nn_main": table.fel_nn_main,
+        "fel_nn_rel": table.fel_nn_rel,
+        "fel_fit": table.fel_fit,
         "meta": table.meta,
     }
     with out.open("wb") as f:
@@ -855,4 +916,9 @@ def load_forward_map(path: Path) -> ForwardTable:
         stop_kind=d.get("stop_kind"),
         release_grid=d.get("release_grid"),  # 2026-10-14 段2o-5: 古い pkl（キー無し）は None
         release_accel=d.get("release_accel"),
+        fel_cell_main=d.get("fel_cell_main"),  # 2026-10-19 段2s-2: 古い pkl（キー無し）は None
+        fel_cell_rel=d.get("fel_cell_rel"),
+        fel_nn_main=d.get("fel_nn_main"),
+        fel_nn_rel=d.get("fel_nn_rel"),
+        fel_fit=d.get("fel_fit"),
     )

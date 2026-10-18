@@ -1000,7 +1000,7 @@ def test_ramp_cruise_and_lag_settings_are_loaded_and_validated() -> None:
     cfg = _load_default()
     lr = cfg.learning
     assert lr.ramp_cruise_band_g == pytest.approx(0.005)
-    assert lr.ramp_cruise_hold_s == pytest.approx(7.0)
+    assert lr.ramp_cruise_hold_s == pytest.approx(5.0)  # 2026-10-19 段2s-2 短縮 7 → 5
     assert lr.ramp_cruise_timeout_s == pytest.approx(15.0)
     assert lr.ramp_cruise_fine_max_kmh == pytest.approx(100.0)
     assert lr.ramp_cruise_coarse_step_kmh == pytest.approx(20.0)
@@ -1023,7 +1023,7 @@ def test_ramp_cruise_and_lag_settings_are_loaded_and_validated() -> None:
         setattr(lr, key, good)
     lr.ramp_cruise_hold_s = -1.0
     assert problems_about("ramp_cruise_hold_s")
-    lr.ramp_cruise_hold_s = 7.0
+    lr.ramp_cruise_hold_s = 5.0
     lr.ramp_lag_speeds_kmh = [30.0, -5.0]
     assert problems_about("ramp_lag_speeds_kmh")
     lr.ramp_lag_speeds_kmh = []  # 空は「測らない」で合格
