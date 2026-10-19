@@ -131,6 +131,10 @@ CSV_COLUMNS: tuple[str, ...] = (
     "speed_est_kmh",
     "speed_pred_kmh",
     "pred_dev_kmh",
+    # 2026-10-19 段3: 目標側に使った「ぼかした基準」[km/h]（feedforward.ref_smooth_sigma_s。
+    # σ=0 のときは ref_speed_kmh と同じ値。ref_speed_kmh・deviation_kmh は元の基準のまま）。
+    # モード走行の行だけ
+    "ref_smooth_kmh",
 )
 
 
@@ -171,6 +175,7 @@ class DriveSample:
     speed_est_kmh: float | None = None
     speed_pred_kmh: float | None = None
     pred_dev_kmh: float | None = None
+    ref_smooth_kmh: float | None = None  # 目標側に使ったぼかした基準（モード走行の行だけ）
 
 
 class SessionLog:
@@ -254,6 +259,7 @@ class SessionLog:
         speed_est_kmh: float | None = None,
         speed_pred_kmh: float | None = None,
         pred_dev_kmh: float | None = None,
+        ref_smooth_kmh: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -285,6 +291,7 @@ class SessionLog:
             speed_est_kmh=speed_est_kmh,
             speed_pred_kmh=speed_pred_kmh,
             pred_dev_kmh=pred_dev_kmh,
+            ref_smooth_kmh=ref_smooth_kmh,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -473,6 +480,7 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.speed_est_kmh),
                 _fmt(s.speed_pred_kmh),
                 _fmt(s.pred_dev_kmh),
+                _fmt(s.ref_smooth_kmh),
             ])
 
 

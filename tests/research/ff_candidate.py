@@ -782,8 +782,12 @@ class ForwardMapFeedforward:
         preposition_enabled: bool = False,
         preposition_margin_pct: float = 0.5,
         preposition_lead_s: float = 0.2,
+        stop_ref_at: Callable[[float], float] | None = None,
     ) -> ForwardPlan:
-        """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。"""
+        """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
+
+        stop_ref_at（2026-10-19 段3）: ref_at をぼかした基準にするとき、停車の判定に使う
+        元の基準。"""
         from tests.research.fwd_plan import build_plan  # noqa: PLC0415
 
         self._plan = build_plan(
@@ -802,6 +806,7 @@ class ForwardMapFeedforward:
             preposition_enabled=preposition_enabled,
             preposition_margin_pct=preposition_margin_pct,
             preposition_lead_s=preposition_lead_s,
+            stop_ref_at=stop_ref_at,
         )
         return self._plan
 

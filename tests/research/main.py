@@ -638,6 +638,7 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
         coast_summary=None if result.coast_stats is None else result.coast_stats.summary(),
         predictor_settings=result.predictor_settings,
         predictor_summary=None if result.predictor is None else result.predictor.summary(),
+        ref_smooth_sigma_s=ctx.config.feedforward.ref_smooth_sigma_s,
         fel_text=_fel_text_of(ctx.config, setup),
         notes=notes,
     )

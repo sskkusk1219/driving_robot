@@ -319,8 +319,13 @@ def build_plan(
     preposition_margin_pct: float = 0.5,
     preposition_lead_s: float = 0.2,
     return_gap_enabled: bool = True,
+    stop_ref_at: Callable[[float], float] | None = None,
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
+
+    2026-10-19 段3: `stop_ref_at` は停車保持・停止側の表の判定（stop・stops_ahead）だけに使う
+    基準。`ref_at` をぼかした基準にするとき、停車の始まり・終わりがずれないよう元の基準を渡す。
+    None なら `ref_at` と同じ（今までと完全に同じ計算）。
 
     accel_lag_s・brake_lag_s が None なら表の meta（表を作ったときの L）、それも無ければ既定値。
     preposition_enabled なら、最後に `preposition` で次に踏むペダルを先に置く
@@ -336,8 +341,12 @@ def build_plan(
 
     # 1. 停車保持
     ref_now = _eval_ref(ref_at, t)
-    ref_stop = _eval_ref(ref_at, t + stop_horizon_s)
-    stop = (ref_now <= STOP_SPEED_KMH) & (ref_stop <= STOP_SPEED_KMH)
+    if stop_ref_at is None:
+        stop_now, ref_stop = ref_now, _eval_ref(ref_at, t + stop_horizon_s)
+    else:  # 停車の判定は元の基準（ぼかした基準では判定しない）
+        stop_now = _eval_ref(stop_ref_at, t)
+        ref_stop = _eval_ref(stop_ref_at, t + stop_horizon_s)
+    stop = (stop_now <= STOP_SPEED_KMH) & (ref_stop <= STOP_SPEED_KMH)
 
     # 表の定義: 時刻 t の車速 ref(t)・指令 → 時刻 t + L の加速度。だから車速は ref(t)、
     # 要る加速度は t + L を中心にした窓の傾き

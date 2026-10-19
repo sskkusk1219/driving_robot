@@ -61,7 +61,7 @@ from tests.research.live_plot import (
     PlotSample,
     save_drive_figure,
 )
-from tests.research.mode_drive import standby_label
+from tests.research.mode_drive import ref_smooth_text, standby_label
 from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, FeedforwardParams, coast_decel_at
 from tests.research.term import say
 from tests.research.vehicle import feedforward_params
@@ -147,6 +147,9 @@ class RunInfo:
     # ない・予測器が無効（または不明）。研究系の設定はログに残らないので、ここで確かめる
     predictor_settings: str | None = None
     predictor_summary: str | None = None
+    # 2026-10-19 段3: 基準のぼかし σ [s]（feedforward.ref_smooth_sigma_s。0 ＝ なし）。None は不明
+    # （CSV からの作り直し）。研究系の設定はログに残らないので、ここで確かめる
+    ref_smooth_sigma_s: float | None = None
     # 2026-10-19 段2s-2b: FEL の 1 行（mode_drive.fel_text）。None は不明（CSV からの作り直し）か
     # FF が表の候補でない
     fel_text: str | None = None
@@ -908,6 +911,9 @@ def write_mode_report(
                  "なし" if info.coast_summary is None else info.coast_summary),
                 ("C13（予測器・車速のフィルタ）の設定（遅れ L・Q・R）",
                  "なし" if info.predictor_settings is None else info.predictor_settings),
+                ("基準のぼかし（段3。目標側だけ。KPI・偏差は元の基準）",
+                 "不明（CSV からの作り直し）" if info.ref_smooth_sigma_s is None
+                 else ref_smooth_text(info.ref_smooth_sigma_s)),
                 ("C13 の集計（推定と CAN の差の RMS・予測の当たり具合＝L 秒後の実車速との差）",
                  "なし" if info.predictor_summary is None else info.predictor_summary),
                 ("ブレーキ寄与ほぼ0（指令はあるが惰行カーブ相当しか効いていない）",

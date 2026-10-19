@@ -79,6 +79,11 @@ class FeedforwardSection:
     # からの量」[%]。絶対開度は ResearchConfig.stop_brake_opening_pct（min ＋ この値）。
     # 取り付け直しで min が変わっても手順2 をやり直さずに済ませるため絶対開度から変えた
     stop_brake_offset_pct: float = 15.0
+    # 2026-10-19 段3（G6）: 基準車速をガウスでぼかす幅 σ [s]（0.0 ＝ ぼかさない。今と完全に同じ）。
+    # ぼかした基準を使うのは「目標」側だけ（開度の列を作る基準・C10 の P の偏差・C11 の DOB の
+    # 表の行・C12 の惰行の補助・C13 の予測の偏差）。KPI・偏差の記録・停車の判定・ガバナー・安全網・
+    # 調停は元の基準のまま
+    ref_smooth_sigma_s: float = 0.0
     engine_brake_decel_kmhs: float = 1.6
     coast_decel_speeds_kmh: list[float] = field(default_factory=list)
     coast_decel_kmhs: list[float] = field(default_factory=list)
@@ -189,6 +194,11 @@ class ModesSection:
     # モード走行レポートの区間別集計（WLTP の Low/Mid/High/ExHi）。境界は区間数 − 1 個
     segment_names: list[str] = field(default_factory=lambda: ["Low", "Mid", "High", "ExHi"])
     segment_bounds_s: list[float] = field(default_factory=lambda: [589.0, 1022.0, 1477.0])
+    # 2026-10-19 段3b: 研究コード側の合成モード（DB は変えない）。1 件は
+    # {name: 合成後の名前, source: DB の元のモード名, windows_s: [[開始秒, 終了秒], ...]}。
+    # 走る直前に元のモードの基準車速を区間ごとに切り出して時刻をつなぐ（mode_drive.compose_mode）。
+    # wltp_mode_name などに name を書くと、DB より先にここを見る
+    composed_modes: list[dict[str, Any]] = field(default_factory=list)
 
     def segment_at(self, t_s: float) -> str:
         """モード経過時間 [s] が属する区間名。"""
@@ -858,6 +868,10 @@ def _coerce(dotted: str, value: Any, declared: Any) -> Any:
         ):
             raise ConfigError(f"{dotted} は数値のリストで指定してください（現在: {value!r}）")
         return [float(v) for v in value]
+    if declared == "list[dict[str, Any]]":
+        if not isinstance(value, list) or any(not isinstance(v, dict) for v in value):
+            raise ConfigError(f"{dotted} はマッピングのリストで指定してください（現在: {value!r}）")
+        return value
     if declared == "list[str]":
         if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
             raise ConfigError(f"{dotted} は文字列のリストで指定してください（現在: {value!r}）")
@@ -868,6 +882,37 @@ def _coerce(dotted: str, value: Any, declared: Any) -> Any:
 # ─────────────────────────────────────────────────────────────────────
 # 検証
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _check_composed_modes(composed: list[dict[str, Any]], problems: list[str]) -> None:
+    """modes.composed_modes の形（name・source・windows_s）と区間の昇順・重なりなしを検証する。"""
+    seen: set[str] = set()
+    for i, item in enumerate(composed):
+        label = f"modes.composed_modes[{i}]"
+        extra = sorted(set(item) - {"name", "source", "windows_s"})
+        if extra:
+            problems.append(f"{label} に未知のキー: {', '.join(extra)}")
+        name, source, wins = item.get("name"), item.get("source"), item.get("windows_s")
+        if not (isinstance(name, str) and name.strip() and isinstance(source, str)
+                and source.strip()):
+            problems.append(f"{label} は name と source（空でない文字列）が必要です")
+            continue
+        if name in seen or name == source:
+            problems.append(f"{label}: name {name!r} は重複・source と同名にできません")
+        seen.add(name)
+        ok = isinstance(wins, list) and bool(wins) and all(
+            isinstance(w, list) and len(w) == 2
+            and all(isinstance(x, int | float) and not isinstance(x, bool) for x in w)
+            for w in wins
+        )
+        if not ok:
+            problems.append(f"{label}.windows_s は [[開始秒, 終了秒], ...] で指定してください")
+            continue
+        flat = [float(x) for w in wins for x in w]
+        if flat[0] < 0.0 or any(b <= a for a, b in zip(flat, flat[1:], strict=False)):
+            problems.append(
+                f"{label}.windows_s は各区間が 開始 < 終了 で、昇順・重なりなしにしてください"
+            )
 
 
 def validate_config(cfg: ResearchConfig) -> list[str]:
@@ -1086,6 +1131,11 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
 
     need(bool(cfg.modes.wltp_mode_name.strip()), "modes.wltp_mode_name が空です")
     need(bool(cfg.modes.tuning_mode_name.strip()), "modes.tuning_mode_name が空です")
+    need(
+        0.0 <= ff.ref_smooth_sigma_s <= 2.0,
+        f"feedforward.ref_smooth_sigma_s は 0〜2 秒（0 ＝ ぼかさない）: {ff.ref_smooth_sigma_s}",
+    )
+    _check_composed_modes(cfg.modes.composed_modes, problems)
     names = cfg.modes.coverage_mode_names
     need(
         bool(names) and all(n.strip() for n in names) and len(set(names)) == len(names),

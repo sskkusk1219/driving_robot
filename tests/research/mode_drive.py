@@ -42,6 +42,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.axis_safety import AxisSafetyNet
 from tests.research.config import ConfigError, ResearchConfig
@@ -115,9 +117,23 @@ PHASE_COAST = "COAST"
 class ModeDriveSetup:
     mode: DrivingMode
     ff: CandidateFeedforward | ForwardMapFeedforward
+    # 2026-10-19 段3: 開度の列を作ったときの「目標の基準」（ぼかした基準。σ=0 なら元の基準）。
+    # 走行中の目標側（C10 の P など）が同じものを使えるよう持ち回る。表の候補以外は None
+    target_ref: Any = None
 
 
 async def load_mode(cfg: ResearchConfig, name: str) -> DrivingMode:
+    """走行モードを名前で読む。modes.composed_modes にある名前なら、DB の元のモードを読んで
+    区間を切り出してつないだ合成モードを返す（2026-10-19 段3b。DB は変えない）。無ければ DB から。
+    """
+    composed = next((c for c in cfg.modes.composed_modes if c.get("name") == name), None)
+    if composed is None:
+        return await _load_mode_from_db(cfg, name)
+    source = await _load_mode_from_db(cfg, str(composed["source"]))
+    return compose_mode(source, composed["windows_s"], name)
+
+
+async def _load_mode_from_db(cfg: ResearchConfig, name: str) -> DrivingMode:
     """走行モード管理（PostgreSQL の driving_modes）からモードを名前で読む。"""
     import asyncpg  # noqa: PLC0415 - DB を使わないテスト・手順で import を要求しない
 
@@ -153,6 +169,59 @@ async def load_mode(cfg: ResearchConfig, name: str) -> DrivingMode:
         max_speed=float(row["max_speed"]),
         created_at=row["created_at"],
         is_system=bool(row["is_system"]),
+    )
+
+
+def compose_mode(
+    source: DrivingMode,
+    windows_s: list[list[float]],
+    name: str,
+    *,
+    stop_kmh: float = 0.5,
+) -> DrivingMode:
+    """元のモードの基準車速を区間 [開始秒, 終了秒] ごとに切り出し、時刻をつないで 1 本にする。
+
+    2026-10-19 段3b: モード別の表の外れの偏りを見るための短縮版（例 12_AMA → 12_AMA_short）。
+    区間の端の基準は線形補間で作る。つなぎ目で車速が飛ばないよう、各区間の両端の基準が
+    stop_kmh 以下（停車の途中）でなければ ConfigError にする。つなぎ目の 2 点は時刻が重なるので
+    後のほうを捨てる。時刻は 0 から始め、区間の幅の合計が総時間になる。
+    """
+    if not windows_s:
+        raise ConfigError(f"合成モード {name!r}: windows_s が空です")
+    ref = ReferenceSpeed(source)
+    points: list[SpeedPoint] = []
+    offset = 0.0
+    prev_end = -1.0
+    for a, b in ((float(w[0]), float(w[1])) for w in windows_s):
+        if not (0.0 <= a < b <= source.total_duration + 1e-9) or a < prev_end:
+            raise ConfigError(
+                f"合成モード {name!r}: 区間 [{a:g}, {b:g}] が不正です（開始 < 終了・昇順・"
+                f"元のモード {source.name!r} の長さ {source.total_duration:g}s 以内）"
+            )
+        for edge in (a, b):
+            if ref.at(edge) > stop_kmh:
+                raise ConfigError(
+                    f"合成モード {name!r}: 区間の端 {edge:g}s の基準が {ref.at(edge):.1f} km/h です"
+                    f"（停車の途中 {stop_kmh:g} km/h 以下で切ってください）"
+                )
+        inner = [(p.time_s, p.speed_kmh) for p in source.reference_speed if a < p.time_s < b]
+        for t, v in [(a, ref.at(a)), *inner, (b, ref.at(b))]:
+            t_out = t - a + offset
+            if points and t_out <= points[-1].time_s + 1e-9:
+                continue  # つなぎ目の重なった点（どちらも停車）
+            points.append(SpeedPoint(time_s=t_out, speed_kmh=v))
+        offset += b - a
+        prev_end = b
+    return DrivingMode(
+        id=f"composed:{name}",
+        name=name,
+        description=f"{source.name} から {len(windows_s)} 区間を切り出してつないだ合成モード"
+                    "（研究コード側。DB は変えない）",
+        reference_speed=points,
+        total_duration=points[-1].time_s,
+        max_speed=max(p.speed_kmh for p in points),
+        created_at=source.created_at,
+        is_system=False,
     )
 
 
@@ -211,11 +280,15 @@ def fel_text(cfg: ResearchConfig, table: Any) -> str:
 
 def _prepare_forward_map_plan(
     cfg: ResearchConfig, mode: DrivingMode, ff: ForwardMapFeedforward
-) -> None:
+) -> Any:
     """C7・C8: 基準車速から開度の列を作り、中身を表示する（走行前チェックより前。HW 不使用）。"""
     ff_cfg, fm = cfg.feedforward, cfg.forward_map
+    # 2026-10-19 段3: 開度の列は「ぼかした基準」で作る（σ=0 なら元の基準そのもの）。停車の判定
+    # （停車保持・停止側の表）だけは元の基準のまま（stop_ref_at）
+    orig_ref = ReferenceSpeed(mode)
+    target_ref = make_target_reference(mode, ff_cfg.ref_smooth_sigma_s)
     plan = ff.build_plan(
-        ReferenceSpeed(mode).at,
+        target_ref.at,
         mode.total_duration,
         accel_deadband_pct=cfg.vehicle.min_accel_opening_pct,
         brake_deadband_pct=cfg.vehicle.min_brake_opening_pct,
@@ -229,12 +302,14 @@ def _prepare_forward_map_plan(
         preposition_enabled=fm.preposition_enabled,
         preposition_margin_pct=fm.preposition_margin_pct,
         preposition_lead_s=fm.preposition_lead_s,
+        stop_ref_at=None if target_ref is orig_ref else orig_ref.at,
     )
     meta = ff.table.meta
     # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）
     lag_a = fm.accel_lag_s if fm.accel_lag_s is not None else meta.get("accel_lag_s")
     lag_b = fm.brake_lag_s if fm.brake_lag_s is not None else meta.get("brake_lag_s")
     say(f"FF 候補: {ff.candidate}（順モデルの表）　表: {ff_cfg.model_path}")
+    say(f"  {ref_smooth_text(ff_cfg.ref_smooth_sigma_s)}")
     say(fel_text(cfg, ff.table))
     say(f"  遅れ アクセル {lag_a}s / ブレーキ {lag_b}s・惰行の帯 ±{fm.coast_band_kmhs:g} km/h/s・"
         f"窓 {fm.need_window_s:g}s")
@@ -304,6 +379,7 @@ def _prepare_forward_map_plan(
     say(f"  待機位置（min） アクセル {cfg.vehicle.min_accel_opening_pct:.2f}% / "
         f"ブレーキ {cfg.vehicle.min_brake_opening_pct:.2f}%・"
         f"停車保持 {cfg.stop_brake_opening_pct:.2f}%（min ＋ {ff_cfg.stop_brake_offset_pct:.2f}%）")
+    return target_ref
 
 
 async def prepare_mode_drive(cfg: ResearchConfig, mode_name: str) -> ModeDriveSetup:
@@ -328,9 +404,12 @@ def prepare_mode_drive_from(cfg: ResearchConfig, mode: DrivingMode) -> ModeDrive
     ff = load_feedforward(cfg)
     ff_cfg = cfg.feedforward
     ft = cfg.features
+    if ff_cfg.ref_smooth_sigma_s > 0.0 and not isinstance(ff, ForwardMapFeedforward):
+        say(f"  注: feedforward.ref_smooth_sigma_s={ff_cfg.ref_smooth_sigma_s:g} は表の候補"
+            "（C7〜C13）だけに効きます。この候補では基準をぼかしません")
     if isinstance(ff, ForwardMapFeedforward):
-        _prepare_forward_map_plan(cfg, mode, ff)
-        return ModeDriveSetup(mode=mode, ff=ff)
+        target_ref = _prepare_forward_map_plan(cfg, mode, ff)
+        return ModeDriveSetup(mode=mode, ff=ff, target_ref=target_ref)
     if ff.is_pedal_separated:
         # 手順6: アクセル・ブレーキが別々のホライズンを選んだ pkl（horizon_search）
         say(f"FF 候補: {ff.candidate}　モデル: {ff_cfg.model_path}")
@@ -395,6 +474,58 @@ class ReferenceSpeed:
         if dt <= 0.0:
             return speeds[i + 1]
         return speeds[i] + (t_s - times[i]) / dt * (speeds[i + 1] - speeds[i])
+
+
+def ref_smooth_text(sigma_s: float) -> str:
+    """基準のぼかし（feedforward.ref_smooth_sigma_s）の 1 行表示（走行前の表示・レポート 5 章）。"""
+    if sigma_s <= 0.0:
+        return "基準のぼかし: なし（σ=0。目標も元の基準）"
+    return (f"基準のぼかし: σ={sigma_s:g}s のガウス（開度の列・C10 の P・DOB の表の行・"
+            "C12 の惰行の補助・C13 の予測の偏差の目標だけ。KPI・偏差の記録・停車の判定・"
+            "ガバナー・安全網・調停は元の基準）")
+
+
+class SmoothedReference:
+    """基準車速をガウス（標準偏差 σ 秒）で畳み込んだ「目標の基準」（2026-10-19 段3・G6）。
+
+    左右対称なので遅れを足さない。走行前に 0.01s 刻みで全体を作り、`at` は線形補間で引く。
+    停車の扱い: 元の基準が 0 の区間（停車）では、ぼかした基準も元の基準（0）に戻す。そうしないと
+    停車の手前で基準が 0 より大きいまま長く残り、停車の始まり・終わりがずれて見える。
+    戻した端では、ぼかした値との間に最大 約 0.4σ × 傾き の段差が出る（σ 0.5s・傾き 1.5 km/h/s
+    で 0.3 km/h 程度。停車の中は停車保持の行なので目標としては使わない）。
+    範囲外は元の基準と同じく端点値。
+    """
+
+    GRID_S = 0.01  # 畳み込みの刻み [s]
+    KERNEL_SPAN_SIGMA = 4.0  # カーネルの半幅 [σ]
+    ZERO_KMH = 1e-6  # 元の基準がこれ以下の時刻は停車（0）として戻す
+
+    def __init__(self, mode: DrivingMode, sigma_s: float) -> None:
+        if sigma_s <= 0.0:
+            raise ValueError("sigma_s は正値（0 ならぼかさない = ReferenceSpeed を使う）")
+        self.sigma_s = sigma_s
+        times = np.array([p.time_s for p in mode.reference_speed], dtype=float)
+        speeds = np.array([p.speed_kmh for p in mode.reference_speed], dtype=float)
+        half = int(math.ceil(self.KERNEL_SPAN_SIGMA * sigma_s / self.GRID_S))
+        n = int(round((times[-1] - times[0]) / self.GRID_S)) + 1
+        grid = times[0] + (np.arange(n + 2 * half) - half) * self.GRID_S
+        orig = np.interp(grid, times, speeds)  # 範囲外は端点値（ReferenceSpeed と同じ）
+        x = np.arange(-half, half + 1) * self.GRID_S
+        kernel = np.exp(-0.5 * (x / sigma_s) ** 2)
+        kernel /= kernel.sum()
+        blurred = np.convolve(orig, kernel, mode="valid")  # 長さ n（grid[half:-half] の位置）
+        inner = grid[half:half + n]
+        orig_inner = orig[half:half + n]
+        self._grid = inner
+        self._vals = np.where(orig_inner <= self.ZERO_KMH, orig_inner, blurred)
+
+    def at(self, t_s: float) -> float:
+        return float(np.interp(t_s, self._grid, self._vals))
+
+
+def make_target_reference(mode: DrivingMode, sigma_s: float) -> ReferenceSpeed | SmoothedReference:
+    """目標側の基準。σ が 0 以下なら元の基準（ReferenceSpeed）をそのまま返す（今と完全に同じ）。"""
+    return ReferenceSpeed(mode) if sigma_s <= 0.0 else SmoothedReference(mode, sigma_s)
 
 
 class ActualSpeedHistory:
@@ -823,7 +954,12 @@ class _ModeRun:
         self.section = section  # CSV の section 列（FEL の学習用パターンは別の名前）
         self.ff = setup.ff
         self.mode = setup.mode
-        self.ref = ReferenceSpeed(setup.mode)
+        self.ref = ReferenceSpeed(setup.mode)  # 元の基準（KPI・偏差の記録・停車の判定・安全網）
+        # 目標の基準（段3。開度の列と同じもの。σ=0 なら self.ref と同じ値）
+        self.ref_t = (
+            setup.target_ref if setup.target_ref is not None
+            else make_target_reference(setup.mode, cfg.feedforward.ref_smooth_sigma_s)
+        )
         self.log = log
         self.duration_s = duration_s
         self.interval_s = cfg.control.loop_interval_s
@@ -1013,6 +1149,7 @@ class _ModeRun:
         self.actual_history.record(t, speed)
 
         ref = self.ref.at(t)
+        ref_t = self.ref_t.at(t)  # 目標側の基準（ぼかし。σ=0 なら ref と同じ）
         if isinstance(self.ff, ForwardMapFeedforward):
             # C7・C8: 開度の列を時刻で引く（走る前に作り終えている。実測車速は見ない）
             ff_effort = self.ff.effort_at(t)
@@ -1021,15 +1158,15 @@ class _ModeRun:
             ff_effort = self.ff.predict_effort(v0, future, past, **self._select_kwargs(t, v0))
         if self.pred is not None:
             # C13: 車速のフィルタを進め、L 秒先の予測から P の上乗せに使う偏差を決める
-            self._predictor_step(t, ref, speed, ff_effort)
+            self._predictor_step(t, ref_t, speed, ff_effort)
         c10_effort: float | None = None
         if self.c10 is not None:
-            c10_effort = self._c10_offset(t, ref, speed, ff_effort)
+            c10_effort = self._c10_offset(t, ref_t, speed, ff_effort)
         coast_active = False
         if self.coast is not None:
             # C12: 惰行の行（計画が 0）で偏差が積み上がったら、浅く踏んで詰める
             self._coast_effort = 0.0
-            coast_effort = self._coast_assist(t, ref, speed, ff_effort)
+            coast_effort = self._coast_assist(t, ref, ref_t, speed, ff_effort)
             if coast_effort != 0.0:
                 c10_effort, coast_active = coast_effort, True
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
@@ -1061,7 +1198,7 @@ class _ModeRun:
             self.governor_cycles += 1
         accel, brake = self._apply_interlock(accel, brake)
         if self.dob is not None:
-            self._dob_update(t, ref, speed, accel, brake, governed, coast_active)
+            self._dob_update(t, ref_t, speed, accel, brake, governed, coast_active)
         phase = (
             PHASE_ACCEL if accel > 0.0
             else PHASE_BRAKE_GOVERNED if governed
@@ -1125,6 +1262,7 @@ class _ModeRun:
                     speed_est_kmh=self._speed_est,
                     speed_pred_kmh=self._speed_pred,
                     pred_dev_kmh=self._pred_row_dev,
+                    ref_smooth_kmh=ref_t,
                 )
             )
         if segment != self._segment:
@@ -1162,6 +1300,7 @@ class _ModeRun:
     def _predictor_step(self, t: float, ref: float, speed: float, ff_effort: float) -> None:
         """C13（段2u）: 車速のフィルタを 1 周期進め、L 秒先の予測と P の上乗せの偏差を決める。
 
+        `ref` は目標の基準（ぼかした基準。2026-10-19 段3。σ=0 なら元の基準）。
         どこを予測に変えたか: C10 の P の上乗せの偏差だけ（dev ＝ 基準の L 秒先 − 予測）。
         低速の行（停車保持・停車速度以下・発進側／停止側の表の車速）は C11 の DOB を使わない行と同じ
         なので、予測も使わず今の偏差（基準 − CAN 車速）のまま。ペダルの遅れが測れない行も同じ。
@@ -1190,12 +1329,13 @@ class _ModeRun:
             v_hat = pred.predict_ahead(t=t, lag_s=lag, launch=launch, stop=stop, held=held)
             if v_hat is not None:
                 self._speed_pred = v_hat
-                self._pred_dev = self.ref.at(t + lag) - v_hat
+                self._pred_dev = self.ref_t.at(t + lag) - v_hat  # 目標はぼかした基準（段3）
                 pred.stats.add_prediction(t=t, lag_s=lag, pred_kmh=v_hat, can_kmh=speed)
         self._pred_row_dev = ref - speed if self._pred_dev is None else self._pred_dev
 
     def _c10_offset(self, t: float, ref: float, speed: float, ff_effort: float) -> float:
         """C10: 今の列の effort に偏差の分を上乗せしたときの差（上乗せ後 − 今の列）[%]。
+        `ref` は目標の基準（ぼかした基準。2026-10-19 段3。開度の列を作った基準と同じ）。
         偏差は今の周期の CAN 車速から（dev ＝ 基準 − 実車速）。表を引く車速の行は案A が基準、
         案B が実車速。惰行・停車保持・先置き・τ なしは 0。"""
         # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
@@ -1245,12 +1385,16 @@ class _ModeRun:
         self._c10_prev_clamped = clamped
         return delta
 
-    def _coast_assist(self, t: float, ref: float, speed: float, ff_effort: float) -> float:
+    def _coast_assist(
+        self, t: float, ref: float, ref_t: float, speed: float, ff_effort: float
+    ) -> float:
         """C12: 惰行の行の補助の開度 [%]（正＝アクセル・負＝ブレーキ。補助しなければ 0）。
         入る・離すは `CoastAssist.step`（毎周期呼ぶ）、踏む量は `fwd_plan.coast_assist_effort`。
         τ が None のペダル（遅れが測れない）は踏まない。DOB の分は
         「推定を引いた開度 − 引かない開度」を `_dob_effort` に入れる
-        （低速の行では推定を使わない。C11 と同じ）。"""
+        （低速の行では推定を使わない。C11 と同じ）。
+        2026-10-19 段3: 目標（偏差 dev・表の行 ref_kmh）は `ref_t`（ぼかした基準）。入る・離すの
+        停車の判定（元の基準が停車速度を超えているか）は `ref`（元の基準）のまま。"""
         # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
         from tests.research.fwd_plan import coast_assist_effort  # noqa: PLC0415
 
@@ -1258,7 +1402,7 @@ class _ModeRun:
         assert isinstance(ff, CoastAssistFeedforward) and coast is not None and dob is not None
         plan = ff.plan
         i = plan.index_at(t)
-        pedal = coast.step(t=t, i=i, dev_kmh=ref - speed, speed_kmh=speed, ref_kmh=ref)
+        pedal = coast.step(t=t, i=i, dev_kmh=ref_t - speed, speed_kmh=speed, ref_kmh=ref)
         if pedal is None or ff_effort != 0.0:
             return 0.0
         is_accel = pedal == PEDAL_ACCEL
@@ -1269,9 +1413,9 @@ class _ModeRun:
         kwargs: dict[str, Any] = {
             "is_accel": is_accel,
             "need_kmhs": float(plan.need_accel_kmhs[i]),
-            "ref_kmh": ref,
-            "row_kmh": ref if ff.deviation_row == "reference" else speed,
-            "dev_kmh": ref - speed,
+            "ref_kmh": ref_t,
+            "row_kmh": ref_t if ff.deviation_row == "reference" else speed,
+            "dev_kmh": ref_t - speed,
             "tau_s": tau,
             "accel_min_pct": v.min_accel_opening_pct,
             "brake_min_pct": v.min_brake_opening_pct,
@@ -1319,6 +1463,8 @@ class _ModeRun:
         coast_active: bool = False,
     ) -> None:
         """C11: 今の周期で出した開度（調停・ガバナー・安全網の後、待機位置の前）で推定器を進める。
+        `ref` は目標の基準（ぼかした基準。表の側を選ぶ low_speed_sides が開度の列と同じ基準で
+        判定するため。2026-10-19 段3）。停車の判定は計画の stops_ahead（元の基準）。
         u ＝ 開度 − min（アクセル正・ブレーキ負・min 以下は 0）。発進側・停止側の行では更新しない
         （今の計画の行で `low_speed_sides` を引く。C10 の上乗せと同じ条件）。"""
         # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
