@@ -244,6 +244,18 @@ class ExciteSection:
     trim_gain_pct_per_kmh_s: float = 0.05      # 加振中の「遅いトリム」の積分ゲイン
     speed_lpf_tau_s: float = 1.0      # トリムに使う車速の1次ローパス時定数 [s]（1.4Hz を通さない）
     abort_band_kmh: float = 8.0       # 目標速度からこれだけ外れたら中止（過速は両フェーズで見る）
+    # 2026-10-19 段2t: 周波数点が低いときも周期が足りるようにする最低周期数、ブレーキの加振
+    min_periods: int = 1              # 1 ブロックの最低周期数（低周波で 1 周期だけを避ける）
+    brake_enabled: bool = False       # true なら、各速度でアクセルの後にブレーキの加振も行う
+    brake_frequencies_hz: list[float] = field(
+        default_factory=lambda: [0.1, 0.2, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0]
+    )
+    brake_amplitude_pct: float = 0.3        # ブレーキ開度に重ねる正弦波の振幅 [%]（ハード上限 1.0）
+    brake_extra_decel_kmhs: float = 0.5     # 惰行より強く減速させる量 [km/h/s]
+    brake_start_offset_kmh: float = 8.0     # ブレーキを始める車速 = 目標 + この値 [km/h]
+    brake_coast_s: float = 3.0              # ブレーキ前に惰行の減速を測る秒数 [s]
+    brake_ramp_pct_s: float = 0.5           # ブレーキを踏み足す速さ [%/s]
+    brake_ramp_max_pct: float = 12.0        # 踏み足す量の上限（min から）[%]
 
 
 @dataclass
@@ -1096,6 +1108,27 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(ex.trim_gain_pct_per_kmh_s > 0.0, "excite.trim_gain_pct_per_kmh_s は正値")
     need(ex.speed_lpf_tau_s > 0.0, "excite.speed_lpf_tau_s は正値")
     need(ex.abort_band_kmh > 0.0, "excite.abort_band_kmh は正値")
+    need(ex.min_periods >= 1, "excite.min_periods は 1 以上")
+    if ex.brake_enabled:
+        need(
+            bool(ex.brake_frequencies_hz) and all(f > 0.0 for f in ex.brake_frequencies_hz)
+            and max(ex.brake_frequencies_hz) <= nyquist_quarter_hz,
+            f"excite.brake_frequencies_hz は空でなく全て正で Nyquist の 1/4 以下: "
+            f"{ex.brake_frequencies_hz}",
+        )
+        need(
+            0.0 < ex.brake_amplitude_pct <= 1.0,
+            f"excite.brake_amplitude_pct が範囲外(0<pct<=1.0): {ex.brake_amplitude_pct}",
+        )
+        need(ex.brake_extra_decel_kmhs > 0.0, "excite.brake_extra_decel_kmhs は正値")
+        need(ex.brake_start_offset_kmh >= 0.0, "excite.brake_start_offset_kmh は 0 以上")
+        need(
+            max(ex.speeds_kmh) + ex.brake_start_offset_kmh <= v.max_speed_kmh,
+            "excite.speeds_kmh の最大 + brake_start_offset_kmh は vehicle.max_speed_kmh 以下",
+        )
+        need(ex.brake_coast_s >= 2.0, "excite.brake_coast_s は 2 以上（減速の測定窓が 2 秒）")
+        need(ex.brake_ramp_pct_s > 0.0, "excite.brake_ramp_pct_s は正値")
+        need(ex.brake_ramp_max_pct > 0.0, "excite.brake_ramp_max_pct は正値")
 
     t = cfg.tuning
     need(t.max_runs >= 1, f"tuning.max_runs は 1 以上: {t.max_runs}")

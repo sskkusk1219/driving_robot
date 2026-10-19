@@ -25,7 +25,11 @@ from tests.research.drive_log import SECTION_EXCITE, SessionLog
 def _tmp_cfg(tmp_path: Path) -> cfgmod.ResearchConfig:
     path = tmp_path / "cfg.yaml"
     cfg = cfgmod.load_config(path)
-    cfg.save({"output.results_dir": str(tmp_path / "results"), "output.plot": False})
+    # 既定の yaml はブレーキの加振も含む（2026-10-19 段2t）ので、試験はアクセルだけにする
+    cfg.save({
+        "output.results_dir": str(tmp_path / "results"), "output.plot": False,
+        "excite.brake_enabled": False, "excite.min_periods": 1,
+    })
     return cfgmod.load_config(path)
 
 
@@ -548,3 +552,76 @@ async def test_control_abort_decelerates_to_stop_instead_of_releasing_pedals(
     assert "approach_timeout_s" in result.abort_reason
     assert decel_calls == 1  # 緩減速で止めた
     assert release_calls == 0  # ペダルは離していない
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-10-19 段2t: 最低周期数・ブレーキの加振の解析・所要時間の見込み
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_block_duration_min_periods_keeps_two_periods_at_low_frequency() -> None:
+    # 0.05 Hz × 12 s = 0.6 周期 → 既定（1 周期）は 20 s、min_periods=2 なら 40 s
+    assert excitemod._block_duration_s(12.0, 0.05) == (1, pytest.approx(20.0))
+    n, dur = excitemod._block_duration_s(12.0, 0.05, min_periods=2)
+    assert n == 2 and dur == pytest.approx(40.0)
+    # 周期数が足りている周波数は変わらない
+    assert excitemod._block_duration_s(12.0, 1.0, min_periods=2)[0] == 12
+
+
+def test_analyze_brake_block_uses_signed_opening_so_gain_matches_accel_convention(
+    tmp_path: Path,
+) -> None:
+    """ブレーキの加振は u ＝ −ブレーキ開度。ブレーキを踏む（開度増）と減速 → 車速は逆向きに動く。
+
+    y ＝ −g・∫(ブレーキ開度の増分) なら、符号つき u に対しては正のゲイン・位相 −90°
+    （アクセルと同じ）。
+    """
+    freq_hz, g, amp = 0.5, 0.4, 0.3
+    dt = 0.05
+    t = np.arange(round(24.0 / dt)) * dt
+    omega = 2.0 * np.pi * freq_hz
+    brake = 8.0 + amp * np.sin(omega * t)  # ブレーキ開度 [%]
+    # d y/dt = −g・(brake − 8) → y ＝ +(g・amp/ω)・cos(ωt)（減速側へ積分）に、下がるトレンドを足す
+    y = (g * amp / omega) * np.cos(omega * t) + 60.0 - 0.4 * t
+    csv_path = tmp_path / "brake.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["section", "pattern", "mode_time_s", "actual_speed_kmh",
+                    "accel_cmd_pct", "brake_cmd_pct"])
+        for i in range(len(t)):
+            w.writerow([SECTION_EXCITE, "60kmh_0.50Hz_brake", f"{t[i]:.3f}", f"{y[i]:.5f}",
+                        "4.2", f"{brake[i]:.5f}"])
+    blocks = excitemod.analyze(csv_path, skip_s=2.0)
+    assert len(blocks) == 1
+    b = blocks[0]
+    assert b.pedal == "brake"
+    assert b.gain_kmh_per_pct == pytest.approx(g / omega, rel=0.05)
+    assert b.phase_deg == pytest.approx(-90.0, abs=8.0)
+
+
+def test_estimate_duration_counts_accel_and_brake_blocks() -> None:
+    ex = cfgmod.ExciteSection(
+        speeds_kmh=[30.0], frequencies_hz=[1.0], hold_s=12.0, min_periods=2,
+        brake_enabled=False,
+    )
+    base = excitemod.estimate_duration_s(ex)
+    assert base == pytest.approx(excitemod._EST_APPROACH_S + 12.0)
+    ex.brake_enabled = True
+    ex.brake_frequencies_hz = [1.0]
+    with_brake = excitemod.estimate_duration_s(ex)
+    assert with_brake == pytest.approx(
+        base + excitemod._EST_APPROACH_S + ex.brake_coast_s + excitemod._EST_BRAKE_RAMP_S + 12.0
+    )
+
+
+def test_config_validates_brake_excite_settings(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    cfg.excite.brake_enabled = True
+    assert cfgmod.validate_config(cfg) == [] or all(
+        "excite" not in p for p in cfgmod.validate_config(cfg)
+    )
+    cfg.excite.brake_coast_s = 1.0
+    assert any("brake_coast_s" in p for p in cfgmod.validate_config(cfg))
+    cfg.excite.brake_coast_s = 3.0
+    cfg.excite.brake_amplitude_pct = 2.0
+    assert any("brake_amplitude_pct" in p for p in cfgmod.validate_config(cfg))
