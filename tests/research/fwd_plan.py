@@ -246,6 +246,9 @@ class ForwardPlan:
     # 各時刻で「その先 stop_horizon_s 以内に基準が停車速度以下になる」か（停止側の表を引く条件の
     # 一部。段2o-10。C10 の上乗せが build_plan と同じ表を引くために持つ）。None ＝ 持たない
     stops_ahead: np.ndarray | None = None
+    # 停A（C15。2026-10-20 段4-2）で停車保持へ早めに入れた時刻（停A が無ければ全部 False、
+    # None ＝ 持たない）。flag は FLAG_STOP のまま、通常の入る時刻より前の行だけ True
+    stop_lead: np.ndarray | None = None
 
     def index_at(self, t_s: float) -> int:
         """時刻 t に最も近い行の番号（`at` と同じ最近傍）。"""
@@ -320,8 +323,14 @@ def build_plan(
     preposition_lead_s: float = 0.2,
     return_gap_enabled: bool = True,
     stop_ref_at: Callable[[float], float] | None = None,
+    stop_lead: bool = False,
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
+
+    2026-10-20 段4-2 停A: `stop_lead` が True のとき、停車保持に入る時刻を「ブレーキの遅れ
+    （brake_lag_s）先の基準が停車速度以下」に早める（遅れの分だけ早く停車保持の開度を指令する）。
+    抜ける時刻（発進側）は変えない: 早めた入りは、基準が上がっていて（発進）その先 stop_horizon_s
+    が停車速度を超えるときは入れない。False は今までと完全に同じ。
 
     2026-10-19 段3: `stop_ref_at` は停車保持・停止側の表の判定（stop・stops_ahead）だけに使う
     基準。`ref_at` をぼかした基準にするとき、停車の始まり・終わりがずれないよう元の基準を渡す。
@@ -347,6 +356,15 @@ def build_plan(
         stop_now = _eval_ref(stop_ref_at, t)
         ref_stop = _eval_ref(stop_ref_at, t + stop_horizon_s)
     stop = (stop_now <= STOP_SPEED_KMH) & (ref_stop <= STOP_SPEED_KMH)
+    lead_mask = np.zeros(n, dtype=bool)
+    if stop_lead:  # 停A: 遅れ lb 先の基準が停車速度以下なら、停車保持に早く入る
+        ref_lead = _eval_ref(stop_ref_at if stop_ref_at is not None else ref_at, t + lb)
+        # 抜ける側（発進）は変えない: その先 stop_horizon_s の基準が停車速度を超え、かつ今より
+        # 上がっている（発進）なら入れない。減速で停車へ向かう間は、その先が今より下がっている
+        # ので入れる（stop_horizon_s が遅れより短くても、遅れ分早く入れるため）
+        not_launching = (ref_stop <= STOP_SPEED_KMH) | (ref_stop <= stop_now)
+        lead_mask = (ref_lead <= STOP_SPEED_KMH) & not_launching & ~stop
+        stop = stop | lead_mask
 
     # 表の定義: 時刻 t の車速 ref(t)・指令 → 時刻 t + L の加速度。だから車速は ref(t)、
     # 要る加速度は t + L を中心にした窓の傾き
@@ -416,6 +434,7 @@ def build_plan(
     return ForwardPlan(
         t_s=t, effort_pct=effort, need_accel_kmhs=need, flag=flag, period_s=period_s,
         preposition=stats, return_gap=gap_stats, stops_ahead=stops_ahead,
+        stop_lead=lead_mask,
     )
 
 

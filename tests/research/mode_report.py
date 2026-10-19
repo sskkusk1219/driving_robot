@@ -150,6 +150,11 @@ class RunInfo:
     # 2026-10-19 段3a: C14（停車の最後のブレーキの下限）の設定と集計。C14 でなければ None
     creep_floor_settings: str | None = None
     creep_floor_summary: str | None = None
+    # 2026-10-20 段4-2: C15（停A 停車保持を早める・停C 停車まぎわの P）の設定と集計。
+    # C15 でなければ None
+    stop_end_settings: str | None = None
+    stop_lead_summary: str | None = None
+    stop_end_summary: str | None = None
     # 2026-10-19 段3: 基準のぼかし σ [s]（feedforward.ref_smooth_sigma_s。0 ＝ なし）。None は不明
     # （CSV からの作り直し）。研究系の設定はログに残らないので、ここで確かめる
     ref_smooth_sigma_s: float | None = None
@@ -918,6 +923,12 @@ def write_mode_report(
                  "なし" if info.creep_floor_settings is None else info.creep_floor_settings),
                 ("C14 の下限の集計（掛けた回数・秒数・上げた量）",
                  "なし" if info.creep_floor_summary is None else info.creep_floor_summary),
+                ("C15 の停C（停車まぎわの P）の設定",
+                 "なし" if info.stop_end_settings is None else info.stop_end_settings),
+                ("C15 の停A（停車保持を早める）の集計（働いた回数・秒数）",
+                 "なし" if info.stop_lead_summary is None else info.stop_lead_summary),
+                ("C15 の停C の集計（働いた回数・秒数・ブレーキ開度の変化）",
+                 "なし" if info.stop_end_summary is None else info.stop_end_summary),
                 ("基準のぼかし（段3。目標側だけ。KPI・偏差は元の基準）",
                  "不明（CSV からの作り直し）" if info.ref_smooth_sigma_s is None
                  else ref_smooth_text(info.ref_smooth_sigma_s)),

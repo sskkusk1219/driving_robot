@@ -783,11 +783,12 @@ class ForwardMapFeedforward:
         preposition_margin_pct: float = 0.5,
         preposition_lead_s: float = 0.2,
         stop_ref_at: Callable[[float], float] | None = None,
+        stop_lead: bool = False,
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
 
         stop_ref_at（2026-10-19 段3）: ref_at をぼかした基準にするとき、停車の判定に使う
-        元の基準。"""
+        元の基準。stop_lead（2026-10-20 段4-2 停A）: 停車保持へ入るのをブレーキの遅れ分早める。"""
         from tests.research.fwd_plan import build_plan  # noqa: PLC0415
 
         self._plan = build_plan(
@@ -807,6 +808,7 @@ class ForwardMapFeedforward:
             preposition_margin_pct=preposition_margin_pct,
             preposition_lead_s=preposition_lead_s,
             stop_ref_at=stop_ref_at,
+            stop_lead=stop_lead,
         )
         return self._plan
 
@@ -959,6 +961,30 @@ class CreepFloorFeedforward(CoastAssistFeedforward):
         self.creep_floor_lead_s = lead_s
 
 
+class StopEndFeedforward(CoastAssistFeedforward):
+    """C15: C12 に、停車まぎわの 停A（停車保持を早める）と 停C（P の τ を残り時間にする）を足す
+    （2026-10-20 段4-2）。
+
+    読む pkl・開度の列・偏差の上乗せ・DOB・惰行の補助は C12 と同じ（C13・C14 は継がない）。
+    停A は開度の列を作るとき（`build_plan(stop_lead=...)`）、停C は走行中の C10 の上乗せ
+    （`stop_end.StopEndP`）に効く。使うかは走行前に mode_drive が `set_stop_end` で持たせる。
+    両方 False なら C12 と同じ指令になる。
+    """
+
+    candidate = "C15"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stop_lead_enabled: bool = True
+        self.stop_end_p_enabled: bool = True
+        self.stop_end_lead_s: float = 5.0  # 停C の区間: 基準が 0 になるまでこの秒数以内
+
+    def set_stop_end(self, *, lead_enabled: bool, p_enabled: bool, lead_s: float) -> None:
+        self.stop_lead_enabled = lead_enabled
+        self.stop_end_p_enabled = p_enabled
+        self.stop_end_lead_s = lead_s
+
+
 #: V1 案スイッチ: config の feedforward.candidate 名 → クラス
 CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedforward]] = {
     "C1": CandidateFeedforward,
@@ -973,6 +999,7 @@ CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedfor
     "C12": CoastAssistFeedforward,
     "C13": PredictorFeedforward,
     "C14": CreepFloorFeedforward,
+    "C15": StopEndFeedforward,
 }
 
 

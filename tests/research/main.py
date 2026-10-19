@@ -352,6 +352,8 @@ _CANDIDATE_KIND: dict[str, str] = {
     "C12": "順モデル（C8 と同じ pkl。C11 に惰行の行の補助を足す）",  # 2026-10-18 段2r
     "C13": "順モデル（C8 と同じ pkl。C12 に遅れの予測器と車速のフィルタを足す）",  # 2026-10-19 段2u
     "C14": "順モデル（C8 と同じ pkl。C12 に停車の最後のブレーキの下限を足す）",  # 段3a
+    # 段4-2
+    "C15": "順モデル（C8 と同じ pkl。C12 に停A（停車保持を早める）・停C（停車まぎわの P）を足す）",
 }
 
 
@@ -642,6 +644,13 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
         creep_floor_settings=result.creep_floor_settings,
         creep_floor_summary=(
             None if result.creep_floor_stats is None else result.creep_floor_stats.summary()
+        ),
+        stop_end_settings=result.stop_end_settings,
+        stop_lead_summary=(
+            None if result.stop_lead_stats is None else result.stop_lead_stats.summary()
+        ),
+        stop_end_summary=(
+            None if result.stop_end_stats is None else result.stop_end_stats.summary()
         ),
         ref_smooth_sigma_s=ctx.config.feedforward.ref_smooth_sigma_s,
         fel_text=_fel_text_of(ctx.config, setup),

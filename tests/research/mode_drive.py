@@ -63,6 +63,7 @@ from tests.research.ff_candidate import (
     DisturbanceObserverFeedforward,
     ForwardMapFeedforward,
     PredictorFeedforward,
+    StopEndFeedforward,
     make_candidate,
 )
 from tests.research.ff_params import research_ff_params
@@ -87,6 +88,7 @@ from tests.research.speed_predictor import (
     accel_error_var_from_meta,
 )
 from tests.research.stop_decel import PHASE_APPROACH, PHASE_STOP_HOLD, decelerate_to_stop
+from tests.research.stop_end import StopEndP, StopEndStats, StopLeadStats
 from tests.research.term import drive_status_line, say
 from tests.research.vehicle import (
     build_vehicle_profile,
@@ -305,6 +307,8 @@ def _prepare_forward_map_plan(
         preposition_margin_pct=fm.preposition_margin_pct,
         preposition_lead_s=fm.preposition_lead_s,
         stop_ref_at=None if target_ref is orig_ref else orig_ref.at,
+        # 2026-10-20 段4-2 停A: C15 で stop_lead_enabled のとき、停車保持へ遅れ分早く入る
+        stop_lead=isinstance(ff, StopEndFeedforward) and fm.stop_lead_enabled,
     )
     meta = ff.table.meta
     # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）
@@ -352,6 +356,19 @@ def _prepare_forward_map_plan(
         ff.set_creep_floor(lead_s=fm.creep_floor_lead_s)
         cf_text = make_creep_floor(ff, cfg, mode).settings_text()
         say(f"  C14（停車の最後のブレーキの下限）: {cf_text}")
+    if isinstance(ff, StopEndFeedforward):
+        # 2026-10-20 段4-2: 停A（停車保持を早める）・停C（停車まぎわの P）。値は pkl の meta から
+        ff.set_stop_end(
+            lead_enabled=fm.stop_lead_enabled, p_enabled=fm.stop_end_p_enabled,
+            lead_s=fm.creep_floor_lead_s,
+        )
+        lead_rows = 0 if plan.stop_lead is None else int(plan.stop_lead.sum())
+        say(f"  C15 停A（停車保持をブレーキの遅れ {float(lag_b or 0.0):.3f}s 早める）: "
+            f"{'有効' if fm.stop_lead_enabled else '無効'}・早めた行 {lead_rows} 行"
+            f"（{lead_rows * plan.period_s:.1f}s）")
+        se_text = make_stop_end(ff, cfg, mode).settings_text()
+        say(f"  C15 停C（停車まぎわの P）: "
+            f"{'有効' if fm.stop_end_p_enabled else '無効'}・{se_text}")
     sec = plan.pedal_seconds()
     say(f"  範囲外を引いた秒数 {plan.out_of_range_s():.1f}s・穴埋めを引いた秒数 "
         f"{plan.filled_s():.1f}s")
@@ -413,7 +430,7 @@ def prepare_mode_drive_from(cfg: ResearchConfig, mode: DrivingMode) -> ModeDrive
     ft = cfg.features
     if ff_cfg.ref_smooth_sigma_s > 0.0 and not isinstance(ff, ForwardMapFeedforward):
         say(f"  注: feedforward.ref_smooth_sigma_s={ff_cfg.ref_smooth_sigma_s:g} は表の候補"
-            "（C7〜C14）だけに効きます。この候補では基準をぼかしません")
+            "（C7〜C15）だけに効きます。この候補では基準をぼかしません")
     if isinstance(ff, ForwardMapFeedforward):
         target_ref = _prepare_forward_map_plan(cfg, mode, ff)
         return ModeDriveSetup(mode=mode, ff=ff, target_ref=target_ref)
@@ -886,6 +903,29 @@ def make_creep_floor(
     )
 
 
+def make_stop_end(ff: StopEndFeedforward, cfg: ResearchConfig, mode: DrivingMode) -> StopEndP:
+    """C15 の停C を作る。区間の上の車速 ＝ meta の stop_max_speed_kmh、τ の下限 ＝ ブレーキの遅れ
+    （yaml の上書き、なければ meta の brake_lag_s）、開度の範囲 ＝ ブレーキ min 〜 停車保持。
+    停C を使わない設定（stop_end_p_enabled が false）や meta に値が無いときは、区間なし
+    （C12 と同じ指令）。"""
+    meta = ff.table.meta
+    lag = cfg.forward_map.brake_lag_s
+    if lag is None:
+        lag = meta.get("brake_lag_s")
+    top = meta.get("stop_max_speed_kmh")
+    return StopEndP(
+        top_kmh=float(top) if ff.stop_end_p_enabled and top is not None else None,
+        lead_s=ff.stop_end_lead_s,
+        brake_lag_s=None if lag is None else float(lag),
+        hold_pct=cfg.stop_brake_opening_pct,
+        brake_min_pct=cfg.vehicle.min_brake_opening_pct,
+        arrivals=StopArrivals(
+            [p.time_s for p in mode.reference_speed], [p.speed_kmh for p in mode.reference_speed]
+        ),
+        period_s=cfg.control.loop_interval_s,
+    )
+
+
 def coast_params(ff: CoastAssistFeedforward, cfg: ResearchConfig) -> dict[str, Any]:
     """C12 の CoastAssist に渡す値（保持時間・戻り時間・効き始めの開度）。
     保持時間 hold_p ＝ coast_hold_coef × (遅れ_p ＋ p の効き始めの開度が min へ戻る時間)。
@@ -963,6 +1003,10 @@ class ModeDriveResult:
     # 2026-10-19 段3a: C14（停車の最後のブレーキの下限）の設定と集計。C14 でなければ None
     creep_floor_settings: str | None = None
     creep_floor_stats: Any = None  # creep_floor.CreepFloorStats
+    # 2026-10-20 段4-2: C15（停A・停C）の設定と集計。C15 でなければ None
+    stop_end_settings: str | None = None
+    stop_lead_stats: StopLeadStats | None = None
+    stop_end_stats: StopEndStats | None = None
     samples: list[DriveSample] = field(default_factory=list)  # MODE_DRIVE の行（0.1s 刻み）
 
 
@@ -972,6 +1016,11 @@ class _ModeRun:
     # C13（段2u）の今の周期の値の既定。C13 以外・予測器が無効のときは動かさない（None のまま）
     _speed_est: float | None = None
     _pred_dev: float | None = None
+    # C15（段4-2）の既定。C15 以外は持たない（None のまま）
+    stop_end: StopEndP | None = None
+    stop_lead_stats: StopLeadStats | None = None
+    _stop_lead_now: bool | None = None
+    _stop_end_tau_s: float | None = None
 
     def __init__(
         self,
@@ -1084,6 +1133,14 @@ class _ModeRun:
             make_creep_floor(self.ff, cfg, setup.mode)
             if isinstance(self.ff, CreepFloorFeedforward) else None
         )
+        # C15（停A・停C。2026-10-20 段4-2）: C15 のときだけ
+        self.stop_end: StopEndP | None = None
+        self.stop_lead_stats: StopLeadStats | None = None
+        self._stop_lead_now: bool | None = None  # 今の周期が停A の行か（C15 以外は None）
+        self._stop_end_tau_s: float | None = None  # 今の周期の停C の τ（区間外は None）
+        if isinstance(self.ff, StopEndFeedforward):
+            self.stop_end = make_stop_end(self.ff, cfg, setup.mode)
+            self.stop_lead_stats = StopLeadStats(period_s=self.interval_s)
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
         self._accel_blocked = False
@@ -1198,6 +1255,12 @@ class _ModeRun:
             # C13: 車速のフィルタを進め、L 秒先の予測から P の上乗せに使う偏差を決める
             self._predictor_step(t, ref_t, speed, ff_effort)
         c10_effort: float | None = None
+        self._stop_end_tau_s = None
+        if self.stop_lead_stats is not None:
+            # C15 停A: 計画が、停車保持へ遅れ分早く入れた行か
+            lead = self.ff.plan.stop_lead
+            self._stop_lead_now = bool(lead is not None and lead[self.ff.plan.index_at(t)])
+            self.stop_lead_stats.add(self._stop_lead_now)
         if self.c10 is not None:
             c10_effort = self._c10_offset(t, ref_t, speed, ff_effort)
         coast_active = False
@@ -1314,6 +1377,8 @@ class _ModeRun:
                     pred_dev_kmh=self._pred_row_dev,
                     ref_smooth_kmh=ref_t,
                     creep_floor_pct=floor_raise,
+                    stop_lead_active=self._stop_lead_now,
+                    stop_end_tau_s=self._stop_end_tau_s,
                 )
             )
         if segment != self._segment:
@@ -1390,7 +1455,12 @@ class _ModeRun:
         偏差は今の周期の CAN 車速から（dev ＝ 基準 − 実車速）。表を引く車速の行は案A が基準、
         案B が実車速。惰行・停車保持・先置き・τ なしは 0。"""
         # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
-        from tests.research.fwd_plan import deviation_offset_detail  # noqa: PLC0415
+        from tests.research.fwd_plan import (  # noqa: PLC0415
+            FLAG_COAST,
+            FLAG_PREPOS,
+            FLAG_STOP,
+            deviation_offset_detail,
+        )
 
         ff = self.ff
         assert isinstance(ff, DeviationForwardFeedforward)
@@ -1422,6 +1492,23 @@ class _ModeRun:
         if dob is not None and self._dob_low_speed(speed, int(plan.flag[i])):
             d_row = 0.0
         new, clamped = deviation_offset_detail(ff.table, dob_kmhs=d_row, **kwargs)
+        if self.stop_end is not None:
+            # C15 停C: 停車まぎわのブレーキの行は、P の τ を「基準が 0 になるまでの残り時間
+            # （ブレーキの遅れより短くしない）」にして引き直し、開度の範囲に収める
+            tau_end = (
+                self.stop_end.tau_s(t, self.ref.at(t), int(plan.flag[i]) == FLAG_STOP)
+                if ff_effort < 0.0 and int(plan.flag[i]) not in (FLAG_COAST, FLAG_PREPOS)
+                else None
+            )
+            if tau_end is None:
+                self.stop_end.stats.add(False)
+            else:
+                normal = new
+                kwargs["tau_brake_s"] = tau_end  # p_only（DOB の分けるとき）も同じ τ で出す
+                new, clamped = deviation_offset_detail(ff.table, dob_kmhs=d_row, **kwargs)
+                new = self.stop_end.clamp(new, ff_effort)
+                self._stop_end_tau_s = tau_end
+                self.stop_end.stats.add(True, normal - new)  # 深い向きが正
         delta = new - ff_effort
         if dob is not None:
             p_only, _ = deviation_offset_detail(ff.table, **kwargs)
@@ -1723,6 +1810,9 @@ async def run_mode_drive(
         predictor=None if run.pred is None else run.pred.stats,
         creep_floor_settings=None if run.cfloor is None else run.cfloor.settings_text(),
         creep_floor_stats=None if run.cfloor is None else run.cfloor.stats,
+        stop_end_settings=None if run.stop_end is None else run.stop_end.settings_text(),
+        stop_lead_stats=run.stop_lead_stats,
+        stop_end_stats=None if run.stop_end is None else run.stop_end.stats,
         samples=run.samples,
     )
     say(f"モード走行 {'完了' if result.completed else '中断'}: {run_s:.1f}s・{run.cycles} 周期"
@@ -1744,6 +1834,10 @@ async def run_mode_drive(
     if run.cfloor is not None:
         say(f"  C14（停車の最後のブレーキの下限。{run.cfloor.settings_text()}）: "
             f"{run.cfloor.stats.summary()}")
+    if run.stop_end is not None and run.stop_lead_stats is not None:
+        say(f"  C15 停A（停車保持を早める）: {run.stop_lead_stats.summary()}")
+        say(f"  C15 停C（停車まぎわの P。{run.stop_end.settings_text()}）: "
+            f"{run.stop_end.stats.summary()}")
     if run.cycle_ms:
         say(f"  1 周期の処理時間: {cycle_time_text(run.cycle_ms, run.interval_s)}")
     if result.completed:
