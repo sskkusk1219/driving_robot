@@ -609,8 +609,14 @@ def test_estimate_duration_counts_accel_and_brake_blocks() -> None:
     ex.brake_enabled = True
     ex.brake_frequencies_hz = [1.0]
     with_brake = excitemod.estimate_duration_s(ex)
+    plan = excitemod._brake_block_plan(
+        12.0, 1.0, 2, excitemod._EST_BRAKE_DECEL_KMHS, ex.abort_band_kmh, ex.brake_band_margin_kmh
+    )
+    assert plan is not None
+    rise = excitemod._EST_BRAKE_DECEL_KMHS * plan[1] / excitemod._EST_RISE_KMHS
     assert with_brake == pytest.approx(
-        base + excitemod._EST_APPROACH_S + ex.brake_coast_s + excitemod._EST_BRAKE_RAMP_S + 12.0
+        base + excitemod._EST_APPROACH_S + ex.brake_coast_s + excitemod._EST_BRAKE_RAMP_S
+        + 1.0 + rise + ex.approach_settle_s + plan[1]
     )
 
 
@@ -625,3 +631,145 @@ def test_config_validates_brake_excite_settings(tmp_path: Path) -> None:
     cfg.excite.brake_coast_s = 3.0
     cfg.excite.brake_amplitude_pct = 2.0
     assert any("brake_amplitude_pct" in p for p in cfgmod.validate_config(cfg))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-10-19 段2t 直し: ブレーキ加振の始める車速・見込み車速での中止・周期数・打ち切り・戻し
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_brake_start_speed_puts_block_center_on_target() -> None:
+    """始める車速 = 目標 + d × T / 2。ブロックの中央（T/2 後）の見込み車速がちょうど目標になる。"""
+    start = excitemod._brake_start_speed(30.0, 1.15, 20.0)
+    assert start == pytest.approx(30.0 + 1.15 * 10.0)
+    assert excitemod._brake_expected_speed(start, 1.15, 10.0) == pytest.approx(30.0)
+    assert excitemod._brake_expected_speed(start, 1.15, 0.0) == pytest.approx(start)
+
+
+def test_brake_block_plan_reduces_periods_then_skips() -> None:
+    # 0.1 Hz・既定 hold 12s: 2 周期 = 20s × 1.15 = 23 > 2×8−2=14 → 1 周期（10s × 1.15 = 11.5）
+    assert excitemod._brake_block_plan(12.0, 0.1, 2, 1.15, 8.0, 2.0) == (1, pytest.approx(10.0))
+    # 1.0 Hz: 12 周期 = 12s × 1.15 = 13.8 <= 14 でそのまま
+    assert excitemod._brake_block_plan(12.0, 1.0, 2, 1.15, 8.0, 2.0) == (12, pytest.approx(12.0))
+    # 0.7 Hz: 9 周期（12.86s → 14.8 > 14）→ 8 周期（11.43s → 13.1）
+    n, t = excitemod._brake_block_plan(12.0, 0.7, 2, 1.15, 8.0, 2.0)
+    assert n == 8 and t == pytest.approx(8 / 0.7)
+    # 1 周期でも入らない（0.1 Hz・減速 2.0: 10s × 2.0 = 20 > 14）は None（飛ばす）
+    assert excitemod._brake_block_plan(12.0, 0.1, 2, 2.0, 8.0, 2.0) is None
+
+
+def test_brake_backoff_is_detection_delay_times_ramp_speed() -> None:
+    # (窓 2s の半分 1s + ブレーキの遅れ 0.5s) × 0.5%/s = 0.75%
+    assert excitemod._brake_backoff_pct(2.0, 0.5, 0.5) == pytest.approx(0.75)
+    assert excitemod._brake_backoff_pct(2.0, 0.0, 1.0) == pytest.approx(1.0)
+
+
+def test_brake_over_decel_cutoff_is_ratio_of_aim() -> None:
+    assert excitemod._brake_over_decel(1.8, 1.15, 1.5)  # 実機 112326 の踏み過ぎ（約 1.56 倍）
+    assert not excitemod._brake_over_decel(1.7, 1.15, 1.5)
+    assert not excitemod._brake_over_decel(None, 1.15, 1.5)
+
+
+def test_brake_low_side_abort_uses_expected_speed(tmp_path: Path) -> None:
+    """ブレーキのブロックの遅い側の中止は目標ではなく見込み車速 − abort_band で判定する。"""
+    cfg = _tmp_cfg(tmp_path)
+    hw = hwmod.build_hardware(cfg, hwmod.HW_STUB)
+    run = excitemod._ExciteRun(hw, cfg, SessionLog(cfg, hw, has_ref=False))
+    band = cfg.excite.abort_band_kmh
+    kw = dict(
+        accel_current=0.0, brake_current=0.0, accel_pos=0, brake_pos=0,
+        alarm_accel=False, alarm_brake=False, check_abort_band=True,
+    )
+
+    def low_ref(t: float) -> float:
+        return excitemod._brake_expected_speed(40.0, 1.0, t)
+
+    # 目標 30 に対し 25 km/h は見込み車速（t=2s で 38）からは 13 低いので中止
+    with pytest.raises(excitemod._ControlAbort):
+        run._check_safety(2.0, 30.0, 25.0, low_ref=low_ref, **kw)
+    # 目標からは外れていても、見込み車速の帯の中（t=10s で見込み 30）なら中止しない
+    run._check_safety(10.0, 30.0, 30.0 - band + 0.5, low_ref=low_ref, **kw)
+    # 見込みより高い側は遅い側の中止に当たらない（過速は over_limit_ref=始めの車速で見る）
+    run._check_safety(2.0, 30.0, 39.0, low_ref=low_ref, over_limit_ref=40.0, **kw)
+
+
+def _brake_run(tmp_path: Path, speed_of_t) -> tuple[excitemod._ExciteRun, SessionLog]:
+    """`_brake_block` を単独で回す `_ExciteRun`。探索と到達は省き、基準は cache に入れる。"""
+    cfg = _tmp_cfg(tmp_path)
+    cfg.control.loop_interval_ms = 20
+    cfg.control.log_interval_ms = 20
+    cfg.excite.hold_s = 2.0
+    cfg.excite.min_periods = 1
+    hw = hwmod.build_hardware(cfg, hwmod.HW_STUB)
+    log = SessionLog(cfg, hw, has_ref=False)
+    run = _bare_run(hw, cfg, log)
+    run._brake_cache[30.0] = (1.0, 8.0)  # (狙いの減速, 基準開度)
+
+    async def no_approach(*_a, **_k) -> None:
+        return None
+
+    run._approach = no_approach  # type: ignore[method-assign]
+
+    async def read_speed() -> float:
+        return speed_of_t(run.t)
+
+    hw.can.read_speed = read_speed  # type: ignore[method-assign]
+    return run, log
+
+
+async def test_brake_block_runs_to_the_end_when_decel_matches_aim(tmp_path: Path) -> None:
+    # 始める車速 = 30 + 1.0 × 2 / 2 = 31。見込みどおり 1.0 km/h/s で落ちる
+    run, log = _brake_run(tmp_path, lambda t: 31.0 - 1.0 * t)
+    await hwmod.run_initialize(run.hw)
+    await run._brake_block(30.0, 1.0)
+    await log.close()
+    assert len(run.blocks) == 1 and 30.0 in run._brake_cache
+    assert run.brake_base == pytest.approx(8.0)
+
+
+async def test_brake_block_stops_when_decel_exceeds_aim_without_aborting(tmp_path: Path) -> None:
+    """実際の減速が狙いの 1.5 倍を超えたら中止にせずブロックを打ち切り、基準を探索し直す。"""
+    run, log = _brake_run(tmp_path, lambda t: 31.0 - 1.8 * t)
+    await hwmod.run_initialize(run.hw)
+    await run._brake_block(30.0, 1.0)  # _ControlAbort を投げない
+    await log.close()
+    assert run.blocks == []
+    assert 30.0 not in run._brake_cache  # 次のブロックで探索し直す
+
+
+async def test_brake_block_skipped_when_search_failed(tmp_path: Path) -> None:
+    run, log = _brake_run(tmp_path, lambda t: 30.0)
+    run._brake_cache[30.0] = None  # 探索が届かなかった速度
+    await hwmod.run_initialize(run.hw)
+    await run._brake_block(30.0, 1.0)
+    await log.close()
+    assert run.blocks == []
+
+
+def test_estimate_duration_brake_uses_planned_blocks_and_rise_time() -> None:
+    ex = cfgmod.ExciteSection(
+        speeds_kmh=[30.0], frequencies_hz=[1.0], hold_s=12.0, min_periods=2,
+        brake_enabled=True, brake_frequencies_hz=[1.0, 0.05],
+    )
+    plan = excitemod._brake_block_plan(
+        12.0, 1.0, 2, excitemod._EST_BRAKE_DECEL_KMHS, ex.abort_band_kmh, ex.brake_band_margin_kmh
+    )
+    assert plan is not None
+    dur = plan[1]
+    rise = excitemod._EST_BRAKE_DECEL_KMHS * dur / excitemod._EST_RISE_KMHS
+    expect = (
+        excitemod._EST_APPROACH_S + 12.0  # アクセル
+        + excitemod._EST_APPROACH_S + ex.brake_coast_s + excitemod._EST_BRAKE_RAMP_S  # 探索
+        + 1.0 + rise + ex.approach_settle_s + dur  # 1.0 Hz。0.05 Hz は 1 周期 20s でも入らず飛ばす
+    )
+    assert excitemod.estimate_duration_s(ex) == pytest.approx(expect)
+
+
+def test_config_validates_brake_fix_keys(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    cfg.excite.brake_enabled = True
+    cfg.excite.brake_decel_cutoff_ratio = 1.0
+    assert any("brake_decel_cutoff_ratio" in p for p in cfgmod.validate_config(cfg))
+    cfg.excite.brake_decel_cutoff_ratio = 1.5
+    cfg.excite.brake_band_margin_kmh = 100.0
+    assert any("brake_band_margin_kmh" in p for p in cfgmod.validate_config(cfg))

@@ -41,14 +41,21 @@
     - 中断時は `pattern_drive._release_pedals` でペダルを解放してから結果を返す
     - アクセルの加振中、ブレーキは待機位置（`mode_drive.standby_openings`）で固定し踏まない
     - ブレーキの加振（2026-10-19 段2t。`excite.brake_enabled`）: 各速度のアクセルの後、周波数ごとに
-      (1) アクセルを min に離して目標 + `brake_start_offset_kmh` まで定速の到達フェーズで上げる
-      (2) 惰行で減速を測り（`brake_coast_s`）、(3) ブレーキを min から `brake_ramp_pct_s` で
-      踏み足して「惰行の減速 + `brake_extra_decel_kmhs`」に達した開度を基準にし、
-      (4) その基準に正弦波を重ねる。
-      車速は一定に保てず約 `brake_extra_decel_kmhs` で下がり続ける（3 次トレンドとして解析で除く）。
-      安全網はアクセルと同じ（過速・過電流・アラーム）。遅い側（目標 − `abort_band_kmh`）に落ちたら
-      制御側の中断として緩減速で止める。踏み足しが `brake_ramp_max_pct` までで目標の減速に
-      届かないブロックは測れないので飛ばす。基準は車の値を置かず、実測の減速から決める
+      （2026-10-19 段2t 直し: 実機 112326 で踏み過ぎ・帯外れの中止が出たため作りを変えた）
+      速度ごとに 1 回だけ「基準の探索」: 目標 + `brake_start_offset_kmh` まで上げ →
+      惰行の減速 d0 を測り（`brake_coast_s`）→ ブレーキを min から
+      `brake_ramp_pct_s` で踏み足して減速が d0 + `brake_extra_decel_kmhs` に達した開度を求め、
+      判定の遅れ（窓の半分 + `brake_response_lag_s`）×踏み足しの速さだけ戻して基準とする。
+      以降の周波数のブロックは探索を省いて基準を使う。
+      ブロック: 車速は一定に保てず狙いの減速 d で下がり続ける（3 次トレンドとして解析で除く）ので、
+      ブロックの中央が目標になるよう **始める車速 = 目標 + d × T / 2**（T = ブロックの長さ）へ
+      到達フェーズで上げ、基準 + 正弦波を重ねる。d × T が帯に入らない（2 × `abort_band_kmh` −
+      `brake_band_margin_kmh` を超える）ときは周期数を減らし、1 周期でも入らなければ飛ばす。
+      安全網はアクセルと同じ（過速・過電流・アラーム）。遅い側の中止はブレーキのブロックの間だけ
+      「その時刻に見込む車速（始めの車速 − d × 経過）− `abort_band_kmh`」で判定する。実際の減速が
+      狙いの `brake_decel_cutoff_ratio` 倍を超えたらそのブロックを打ち切って次へ進む（中止にしない・
+      基準は探索し直す）。探索が `brake_ramp_max_pct` までで届かない速度は測れないので飛ばす。
+      基準は車の値を置かず、実測の減速から決める
 
 CLI（解析のみ。車両には触らない）:
     .venv/bin/python -m tests.research.excite --analyze <CSV> [--pkl <pkl>] [--report]
@@ -143,16 +150,70 @@ def _block_duration_s(
     return n_periods, n_periods / freq_hz
 
 
+# 加速度（減速）の測定窓 [s]（`_ExciteRun._decel_kmhs` の既定）
+_DECEL_WINDOW_S = 2.0
+
+
+def _brake_backoff_pct(window_s: float, lag_s: float, ramp_pct_s: float) -> float:
+    """基準ブレーキ開度の探索で、判定の遅れのぶん踏み過ぎた量 [%]（見つけた開度から戻す量）。
+
+    判定の遅れ = 減速の測定窓の半分 + ブレーキの遅れ。その間も踏み足しは続くので
+    遅れ × 踏み足しの速さだけ開度が先へ進んでいる（2026-10-19 段2t）。
+    """
+    return (window_s / 2.0 + lag_s) * ramp_pct_s
+
+
+def _brake_block_plan(
+    hold_s: float, freq_hz: float, min_periods: int, decel_kmhs: float,
+    abort_band_kmh: float, margin_kmh: float,
+) -> tuple[int, float] | None:
+    """ブレーキのブロックの (周期数, 長さ[s])。車速の落ち d × T が帯に入るまで周期数を減らす。
+
+    帯に入る条件は d × T <= 2 × abort_band − margin（ブロックの中央が目標なら両側に半分ずつ）。
+    1 周期でも入らなければ None（そのブロックは飛ばす）。min_periods は帯に入らないときは諦める
+    （落ちが帯に入ることを優先。解析はトレンドと分けにくいが、飛ばすよりは測れる）。
+    """
+    n_periods, _ = _block_duration_s(hold_s, freq_hz, min_periods)
+    limit = 2.0 * abort_band_kmh - margin_kmh
+    while n_periods >= 1:
+        duration_s = n_periods / freq_hz
+        if decel_kmhs * duration_s <= limit:
+            return n_periods, duration_s
+        n_periods -= 1
+    return None
+
+
+def _brake_start_speed(v_star: float, decel_kmhs: float, duration_s: float) -> float:
+    """ブレーキのブロックを始める車速。ブロックの中央が目標になる: 目標 + d × T / 2。"""
+    return v_star + decel_kmhs * duration_s / 2.0
+
+
+def _brake_expected_speed(start_kmh: float, decel_kmhs: float, elapsed_s: float) -> float:
+    """ブレーキのブロックの間に見込む車速（始めの車速 − d × 経過）。遅い側の中止の基準。"""
+    return start_kmh - decel_kmhs * elapsed_s
+
+
+def _brake_over_decel(decel_kmhs: float | None, aim_kmhs: float, ratio: float) -> bool:
+    """実際の減速が狙いの ratio 倍を超えたか（超えたらブロックを打ち切る）。"""
+    return decel_kmhs is not None and decel_kmhs > aim_kmhs * ratio
+
+
 # 実機の所要時間の見込みに使う仮値（到達フェーズ 1 回の秒数。2026-09-24 の実機では 25〜60 秒だった）
 _EST_APPROACH_S = 40.0
 _EST_BRAKE_RAMP_S = 10.0
+# ブレーキのブロックの見込み用（2026-10-19 実機 112326: 38 km/h への上げは 0.55 km/h/s・減速は
+# 1.15 km/h/s 前後。見込みにだけ使い、制御には使わない）
+_EST_RISE_KMHS = 0.55
+_EST_BRAKE_DECEL_KMHS = 1.2
 
 
 def estimate_duration_s(ex: ExciteSection) -> float:
     """加振走行の所要時間の見込み [s]（到達フェーズは仮値 `_EST_APPROACH_S`。実機の後に見直す）。
 
-    アクセル: 速度ごとに 到達 1 回 + 全周波数のブロック。ブレーキ: 速度ごと・周波数ごとに
-    到達 1 回 + 惰行 + 踏み足し + ブロック。最後の停車は含めない。
+    アクセル: 速度ごとに 到達 1 回 + 全周波数のブロック。ブレーキ: 速度ごとに 探索 1 回
+    （到達 + 惰行 + 踏み足し）+ 周波数ごとに（離し 1 秒 + 始める車速への上げ直し + 整定 +
+    ブロック）。
+    上げ直しは直前のブロックで落ちた量 d × T を `_EST_RISE_KMHS` で上げる。最後の停車は含めない。
     """
     total = 0.0
     for _v in ex.speeds_kmh:
@@ -161,11 +222,17 @@ def estimate_duration_s(ex: ExciteSection) -> float:
             _block_duration_s(ex.hold_s, f, ex.min_periods)[1] for f in ex.frequencies_hz
         )
         if ex.brake_enabled:
+            total += _EST_APPROACH_S + ex.brake_coast_s + _EST_BRAKE_RAMP_S
             for f in ex.brake_frequencies_hz:
-                total += (
-                    _EST_APPROACH_S + ex.brake_coast_s + _EST_BRAKE_RAMP_S
-                    + _block_duration_s(ex.hold_s, f, ex.min_periods)[1]
+                plan = _brake_block_plan(
+                    ex.hold_s, f, ex.min_periods, _EST_BRAKE_DECEL_KMHS,
+                    ex.abort_band_kmh, ex.brake_band_margin_kmh,
                 )
+                if plan is None:
+                    continue
+                duration_s = plan[1]
+                rise_s = _EST_BRAKE_DECEL_KMHS * duration_s / _EST_RISE_KMHS
+                total += 1.0 + rise_s + ex.approach_settle_s + duration_s
     return total
 
 
@@ -266,6 +333,8 @@ class _ExciteRun:
         self.samples: list[DriveSample] = []
         self.blocks: list[tuple[float, float, float, float]] = []
         self.control_abort = False  # run()が_ControlAbortで止まったか（run_exciteが緩減速に使う）
+        # 速度ごとの基準ブレーキ（狙いの減速, 基準開度）。None は探索失敗（その速度は飛ばす）
+        self._brake_cache: dict[float, tuple[float, float] | None] = {}
         self._brake_active = False  # ブレーキ加振でブレーキを踏んだまま（次の到達の前に離す）
         self._accel_cmd: int | None = None
         self._brake_cmd: int | None = None
@@ -407,7 +476,7 @@ class _ExciteRun:
             self.base = _clamp(self.base, self.floor_pct, self.ceil_pct)
         self.blocks.append((v_star, freq_hz, block_start, self.t))
 
-    def _decel_kmhs(self, window_s: float = 2.0) -> float | None:
+    def _decel_kmhs(self, window_s: float = _DECEL_WINDOW_S) -> float | None:
         """直近 window_s 秒の減速 [km/h/s]（正＝遅い向き）。履歴が窓の 8 割に満たなければ None。"""
         if len(self.speed_hist) < 2:
             return None
@@ -434,21 +503,18 @@ class _ExciteRun:
             if self.t - t0 >= duration_s:
                 return
 
-    async def _brake_block(self, v_star: float, freq_hz: float) -> None:
-        """ブレーキの加振 1 ブロック（2026-10-19 段2t）。手順は本ファイルの docstring のとおり。
+    async def _brake_search(self, v_star: float) -> bool:
+        """基準ブレーキ開度の探索（速度ごとに 1 回。2026-10-19 段2t）。成功したら cache に入れる。
 
-        目標 + `brake_start_offset_kmh` へアクセルで上げ → アクセルを min に離して惰行の減速 d0 を
-        測り → ブレーキを min から踏み足して減速が d0 + `brake_extra_decel_kmhs` に達した開度を
-        基準にし → 基準 + 正弦波。踏み足しが上限までで届かなければこのブロックは飛ばす（測れない）。
+        目標 + `brake_start_offset_kmh` へ上げ → 惰行の減速 d0 → ブレーキを踏み足して減速が
+        d0 + `brake_extra_decel_kmhs` に達した開度を求め、判定の遅れのぶん戻して基準にする。
+        踏み足しが上限までで届かない・車速が目標から帯の半分以上落ちたら失敗（False）。
         """
         ex = self.ex
-        n_periods, duration_s = _block_duration_s(ex.hold_s, freq_hz, ex.min_periods)
-        over_ref = v_star + ex.brake_start_offset_kmh
-        say(f"ブレーキ加振フェーズ: {v_star:.1f} km/h × {freq_hz:g} Hz "
-            f"（振幅 ±{self.brake_amplitude_pct:g}%・{duration_s:.2f}s = {n_periods} 周期。"
-            f"始める車速 {over_ref:.1f} km/h）")
+        start_ref = v_star + ex.brake_start_offset_kmh
+        say(f"ブレーキの基準の探索: {v_star:.1f} km/h（{start_ref:.1f} km/h から惰行 → 踏み足し）")
         await self._release_brake(v_star)
-        await self._approach(over_ref, pattern=f"{v_star:.0f}kmh_brake_approach")
+        await self._approach(start_ref, pattern=f"{v_star:.0f}kmh_brake_approach")
 
         # 惰行の減速 d0 を測る（アクセル min・ブレーキ min）
         self.speed_hist.clear()
@@ -457,47 +523,105 @@ class _ExciteRun:
         while True:
             await self._cycle(
                 v_star=v_star, pattern=pattern, command=lambda _t: self.floor_pct,
-                check_abort_band=False, over_limit_ref=over_ref,
+                check_abort_band=False, over_limit_ref=start_ref,
             )
             if self.t - t0 >= ex.brake_coast_s:
                 break
         d0 = self._decel_kmhs() or 0.0
         target = d0 + ex.brake_extra_decel_kmhs
 
-        # ブレーキを踏み足して、減速が target に達した開度を基準にする
+        # ブレーキを踏み足して、減速が target に達した開度を探す
         cap = min(self.brake_floor_pct + ex.brake_ramp_max_pct, self.brake_ceil_pct)
         pattern = f"{v_star:.0f}kmh_brake_ramp"
         ramp_t0 = self.t
         self._brake_active = True
-        base: float | None = None
-        while base is None:
+        found: float | None = None
+        while found is None:
             level = min(self.brake_floor_pct + ex.brake_ramp_pct_s * (self.t - ramp_t0), cap)
-            await self._cycle(
+            speed = await self._cycle(
                 v_star=v_star, pattern=pattern, command=lambda _t: self.floor_pct,
-                brake_command=lambda _t, lv=level: lv, check_abort_band=True,
-                over_limit_ref=over_ref,
+                brake_command=lambda _t, lv=level: lv, check_abort_band=False,
+                over_limit_ref=start_ref,
             )
             decel = self._decel_kmhs()
-            if self.t - ramp_t0 >= 2.0 and decel is not None and decel >= target:
-                base = level
+            if self.t - ramp_t0 >= _DECEL_WINDOW_S and decel is not None and decel >= target:
+                found = level
             elif level >= cap:
                 say(f"  ブレーキを {cap:.2f}% まで踏み足しても減速 {decel} が目標 "
-                    f"{target:.2f} km/h/s に届かないので、このブロックは飛ばします")
-                return
-        self.brake_base = base
-        say(f"  惰行の減速 {d0:.2f} → 目標 {target:.2f} km/h/s・基準ブレーキ {base:.2f}%")
+                    f"{target:.2f} km/h/s に届かないので、この速度のブレーキ加振は飛ばします")
+                return False
+            elif v_star - speed > ex.abort_band_kmh / 2.0:
+                say(f"  探索中に車速が {speed:.1f} km/h まで落ちたので、この速度のブレーキ加振は"
+                    f"飛ばします")
+                return False
+        backoff = _brake_backoff_pct(_DECEL_WINDOW_S, ex.brake_response_lag_s, ex.brake_ramp_pct_s)
+        base = max(found - backoff, self.brake_floor_pct)
+        self._brake_cache[v_star] = (target, base)
+        say(f"  惰行の減速 {d0:.2f} → 狙い {target:.2f} km/h/s・見つけた開度 {found:.2f}% から "
+            f"{backoff:.2f}% 戻して基準ブレーキ {base:.2f}%")
+        return True
 
+    async def _brake_block(self, v_star: float, freq_hz: float) -> None:
+        """ブレーキの加振 1 ブロック（2026-10-19 段2t）。手順は本ファイルの docstring のとおり。
+
+        速度ごとの最初のブロックの前に基準の探索（`_brake_search`）。ブロックは周期数を帯に
+        収めてから、始める車速 = 目標 + d × T / 2 へ上げ、基準 + 正弦波を重ねる。
+        """
+        ex = self.ex
+        if v_star not in self._brake_cache:
+            if not await self._brake_search(v_star):
+                self._brake_cache[v_star] = None
+        entry = self._brake_cache.get(v_star)
+        if entry is None:
+            say(f"ブレーキ加振フェーズ: {v_star:.1f} km/h × {freq_hz:g} Hz は基準が無いので"
+                f"飛ばします")
+            return
+        aim, base = entry
+        plan = _brake_block_plan(
+            ex.hold_s, freq_hz, ex.min_periods, aim, ex.abort_band_kmh, ex.brake_band_margin_kmh
+        )
+        if plan is None:
+            say(f"ブレーキ加振フェーズ: {v_star:.1f} km/h × {freq_hz:g} Hz は 1 周期でも車速の落ち "
+                f"{aim:.2f} km/h/s × {1.0 / freq_hz:.1f}s が帯に入らないので飛ばします")
+            return
+        n_periods, duration_s = plan
+        start = _brake_start_speed(v_star, aim, duration_s)
+        if start > self.cfg.vehicle.max_speed_kmh:
+            say(f"ブレーキ加振フェーズ: {v_star:.1f} km/h × {freq_hz:g} Hz は始める車速 "
+                f"{start:.1f} km/h が最高速を超えるので飛ばします")
+            return
+        say(f"ブレーキ加振フェーズ: {v_star:.1f} km/h × {freq_hz:g} Hz "
+            f"（振幅 ±{self.brake_amplitude_pct:g}%・{duration_s:.2f}s = {n_periods} 周期。"
+            f"始める車速 {start:.1f} km/h・基準 {base:.2f}%・狙いの減速 {aim:.2f} km/h/s）")
+        await self._release_brake(v_star)
+        await self._approach(start, pattern=f"{v_star:.0f}kmh_brake_approach")
+
+        self.brake_base = base
+        self.speed_hist.clear()
         block_start = self.t
         pattern = f"{v_star:.0f}kmh_{freq_hz:.2f}Hz_brake"
+        self._brake_active = True
 
         def brake_cmd(t: float) -> float:
             return _sine_opening(base, self.brake_amplitude_pct, freq_hz, t - block_start)
 
+        def low_ref(t: float) -> float:
+            return _brake_expected_speed(start, aim, t - block_start)
+
         while self.t - block_start < duration_s:
             await self._cycle(
                 v_star=v_star, pattern=pattern, command=lambda _t: self.floor_pct,
-                brake_command=brake_cmd, check_abort_band=True, over_limit_ref=over_ref,
+                brake_command=brake_cmd, check_abort_band=True, over_limit_ref=start,
+                low_ref=low_ref,
             )
+            if self.t - block_start >= _DECEL_WINDOW_S and _brake_over_decel(
+                self._decel_kmhs(), aim, ex.brake_decel_cutoff_ratio
+            ):
+                say(f"  実際の減速 {self._decel_kmhs():.2f} km/h/s が狙い {aim:.2f} km/h/s の "
+                    f"{ex.brake_decel_cutoff_ratio:g} 倍を超えたので、このブロックを打ち切って"
+                    f"次へ進みます（基準は探索し直します）")
+                del self._brake_cache[v_star]
+                return
         self.blocks.append((v_star, freq_hz, block_start, self.t))
 
     async def _cycle(
@@ -509,11 +633,14 @@ class _ExciteRun:
         check_abort_band: bool,
         brake_command: Callable[[float], float] | None = None,
         over_limit_ref: float | None = None,
+        low_ref: Callable[[float], float] | None = None,
     ) -> float:
         """1 周期進める（速度読み取り → 指令 → 安全確認 → ログ → 次周期まで待つ）。実車速を返す。
 
         command はアクセルの指令。brake_command を渡すとブレーキの指令（ブレーキ加振。渡さなければ
         待機位置）。over_limit_ref は過速の判定の基準（省略は v_star。ブレーキ加振は始める車速）。
+        low_ref は遅い側の中止の基準を時刻から返す関数（省略は v_star。ブレーキのブロックは
+        「その時刻に見込む車速」）。
         """
         if self.limit_s is not None and self.t >= self.limit_s:
             raise _LimitReached
@@ -617,6 +744,7 @@ class _ExciteRun:
         self, t: float, v_star: float, speed: float, accel_current: float, brake_current: float,
         accel_pos: int, brake_pos: int, alarm_accel: bool | None, alarm_brake: bool | None,
         *, check_abort_band: bool, over_limit_ref: float | None = None,
+        low_ref: Callable[[float], float] | None = None,
     ) -> None:
         v = self.cfg.vehicle
         for label, current in (("アクセル", accel_current), ("ブレーキ", brake_current)):
@@ -646,10 +774,11 @@ class _ExciteRun:
                 f"（しきい値 {self.ex.abort_band_kmh:g} km/h、t={t:.1f}s）"
             )
         # 遅い側は加振中だけ見る（到達フェーズは整定前で目標との差が大きいのが前提のため）
-        if check_abort_band and v_star - speed > self.ex.abort_band_kmh:
+        low = v_star if low_ref is None else low_ref(t)
+        if check_abort_band and low - speed > self.ex.abort_band_kmh:
             raise _ControlAbort(
-                f"加振中に車速が目標から {v_star - speed:.2f} km/h 低く外れました"
-                f"（目標 {v_star:.1f} km/h、しきい値 {self.ex.abort_band_kmh:g} km/h、t={t:.1f}s）"
+                f"加振中に車速が目標から {low - speed:.2f} km/h 低く外れました"
+                f"（目標 {low:.1f} km/h、しきい値 {self.ex.abort_band_kmh:g} km/h、t={t:.1f}s）"
             )
 
 
@@ -676,7 +805,8 @@ async def run_excite(
     if ex.brake_enabled:
         say(f"ブレーキの加振: 周波数 {ex.brake_frequencies_hz} Hz（振幅 ±"
             f"{min(ex.brake_amplitude_pct, 1.0):g}%・惰行 + {ex.brake_extra_decel_kmhs:g} km/h/s の"
-            f"減速。目標 + {ex.brake_start_offset_kmh:g} km/h から始める）")
+            f"減速。探索は目標 + {ex.brake_start_offset_kmh:g} km/h から。ブロックはブロック中央が"
+            f"目標になる車速から始める）")
     say(f"所要時間の見込み: 約 {estimate_duration_s(ex) / 60.0:.0f} 分（到達フェーズを"
         f"{_EST_APPROACH_S:g} 秒と仮定。実機の後に見直す）")
     say(f"ペダルの待機位置（使わない側=ブレーキ）: {standby_label(cfg)}")

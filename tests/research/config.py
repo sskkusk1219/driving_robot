@@ -252,10 +252,15 @@ class ExciteSection:
     )
     brake_amplitude_pct: float = 0.3        # ブレーキ開度に重ねる正弦波の振幅 [%]（ハード上限 1.0）
     brake_extra_decel_kmhs: float = 0.5     # 惰行より強く減速させる量 [km/h/s]
-    brake_start_offset_kmh: float = 8.0     # ブレーキを始める車速 = 目標 + この値 [km/h]
+    brake_start_offset_kmh: float = 8.0     # 基準の探索を始める車速 = 目標 + この値 [km/h]
     brake_coast_s: float = 3.0              # ブレーキ前に惰行の減速を測る秒数 [s]
     brake_ramp_pct_s: float = 0.5           # ブレーキを踏み足す速さ [%/s]
     brake_ramp_max_pct: float = 12.0        # 踏み足す量の上限（min から）[%]
+    # 2026-10-19 段2t 直し（実機 112326）。仮値: 探索で見つけた開度を戻す量の元（ブレーキの遅れ）、
+    # 帯の余裕、狙いの何倍の減速でブロックを打ち切るか
+    brake_response_lag_s: float = 0.5       # ブレーキの遅れ [s]（探索の戻し量の元）
+    brake_band_margin_kmh: float = 2.0      # 車速の落ち d×T を帯 2×abort_band から引く余裕 [km/h]
+    brake_decel_cutoff_ratio: float = 1.5   # 実際の減速が狙いのこの倍を超えたらブロックを打ち切る
 
 
 @dataclass
@@ -1129,6 +1134,12 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         need(ex.brake_coast_s >= 2.0, "excite.brake_coast_s は 2 以上（減速の測定窓が 2 秒）")
         need(ex.brake_ramp_pct_s > 0.0, "excite.brake_ramp_pct_s は正値")
         need(ex.brake_ramp_max_pct > 0.0, "excite.brake_ramp_max_pct は正値")
+        need(ex.brake_response_lag_s >= 0.0, "excite.brake_response_lag_s は 0 以上")
+        need(
+            0.0 <= ex.brake_band_margin_kmh < 2.0 * ex.abort_band_kmh,
+            "excite.brake_band_margin_kmh は 0 以上 abort_band_kmh の 2 倍未満",
+        )
+        need(ex.brake_decel_cutoff_ratio > 1.0, "excite.brake_decel_cutoff_ratio は 1 より大きい")
 
     t = cfg.tuning
     need(t.max_runs >= 1, f"tuning.max_runs は 1 以上: {t.max_runs}")
