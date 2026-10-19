@@ -940,6 +940,25 @@ class PredictorFeedforward(CoastAssistFeedforward):
         self.filter_accel_sigma = accel_sigma
 
 
+class CreepFloorFeedforward(CoastAssistFeedforward):
+    """C14: C12 に、停車の最後のブレーキの下限を足す（2026-10-19 段3a）。
+
+    読む pkl・開度の列・偏差の上乗せ・DOB・惰行の補助は C12 と同じ（C13 は継がない）。足すのは、
+    基準が停車へ向かう最後でクリープが効く車速帯のとき、ブレーキを「動き出す開度」より浅くしない
+    下限（`creep_floor.CreepFloor`）。次の停車までの秒数は走行前に mode_drive が
+    `set_creep_floor` で持たせる。
+    """
+
+    candidate = "C14"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.creep_floor_lead_s: float = 5.0
+
+    def set_creep_floor(self, *, lead_s: float) -> None:
+        self.creep_floor_lead_s = lead_s
+
+
 #: V1 案スイッチ: config の feedforward.candidate 名 → クラス
 CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedforward]] = {
     "C1": CandidateFeedforward,
@@ -953,6 +972,7 @@ CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedfor
     "C11": DisturbanceObserverFeedforward,
     "C12": CoastAssistFeedforward,
     "C13": PredictorFeedforward,
+    "C14": CreepFloorFeedforward,
 }
 
 

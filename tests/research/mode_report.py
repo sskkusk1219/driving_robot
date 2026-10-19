@@ -147,6 +147,9 @@ class RunInfo:
     # ない・予測器が無効（または不明）。研究系の設定はログに残らないので、ここで確かめる
     predictor_settings: str | None = None
     predictor_summary: str | None = None
+    # 2026-10-19 段3a: C14（停車の最後のブレーキの下限）の設定と集計。C14 でなければ None
+    creep_floor_settings: str | None = None
+    creep_floor_summary: str | None = None
     # 2026-10-19 段3: 基準のぼかし σ [s]（feedforward.ref_smooth_sigma_s。0 ＝ なし）。None は不明
     # （CSV からの作り直し）。研究系の設定はログに残らないので、ここで確かめる
     ref_smooth_sigma_s: float | None = None
@@ -911,6 +914,10 @@ def write_mode_report(
                  "なし" if info.coast_summary is None else info.coast_summary),
                 ("C13（予測器・車速のフィルタ）の設定（遅れ L・Q・R）",
                  "なし" if info.predictor_settings is None else info.predictor_settings),
+                ("C14（停車の最後のブレーキの下限）の設定",
+                 "なし" if info.creep_floor_settings is None else info.creep_floor_settings),
+                ("C14 の下限の集計（掛けた回数・秒数・上げた量）",
+                 "なし" if info.creep_floor_summary is None else info.creep_floor_summary),
                 ("基準のぼかし（段3。目標側だけ。KPI・偏差は元の基準）",
                  "不明（CSV からの作り直し）" if info.ref_smooth_sigma_s is None
                  else ref_smooth_text(info.ref_smooth_sigma_s)),

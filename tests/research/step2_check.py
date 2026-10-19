@@ -477,7 +477,7 @@ def check_model_path(cfg: ResearchConfig, saved_path: str | Path | None) -> Chec
         notes.append(f"読めた（kind={table.kind}）")
         want = {
             "C7": "table", "C8": "model", "C10": "model", "C11": "model", "C12": "model",
-            "C13": "model",
+            "C13": "model", "C14": "model",
         }.get(cfg.feedforward.candidate)
         if want is not None and table.kind != want:
             metrics["kind_mismatch"] = 1.0

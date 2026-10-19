@@ -47,6 +47,7 @@ import numpy as np
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.axis_safety import AxisSafetyNet
 from tests.research.config import ConfigError, ResearchConfig
+from tests.research.creep_floor import CreepFloor, StopArrivals, creep_floor_opening_pct
 from tests.research.dob import PEDAL_ACCEL, PedalDisturbanceObserver
 from tests.research.drive_log import (
     SECTION_DECEL_TO_STOP,
@@ -57,6 +58,7 @@ from tests.research.drive_log import (
 from tests.research.ff_candidate import (
     CandidateFeedforward,
     CoastAssistFeedforward,
+    CreepFloorFeedforward,
     DeviationForwardFeedforward,
     DisturbanceObserverFeedforward,
     ForwardMapFeedforward,
@@ -345,6 +347,11 @@ def _prepare_forward_map_plan(
             r_floor=fm.speed_filter_r_floor, accel_sigma=fm.speed_filter_accel_sigma,
         )
         say(f"  C13（予測器・車速のフィルタ）: {predictor_config_text(ff)}")
+    if isinstance(ff, CreepFloorFeedforward):
+        # 2026-10-19 段3a: 停車の最後のブレーキの下限。値は pkl の meta（手順2 の測定）から
+        ff.set_creep_floor(lead_s=fm.creep_floor_lead_s)
+        cf_text = make_creep_floor(ff, cfg, mode).settings_text()
+        say(f"  C14（停車の最後のブレーキの下限）: {cf_text}")
     sec = plan.pedal_seconds()
     say(f"  範囲外を引いた秒数 {plan.out_of_range_s():.1f}s・穴埋めを引いた秒数 "
         f"{plan.filled_s():.1f}s")
@@ -406,7 +413,7 @@ def prepare_mode_drive_from(cfg: ResearchConfig, mode: DrivingMode) -> ModeDrive
     ft = cfg.features
     if ff_cfg.ref_smooth_sigma_s > 0.0 and not isinstance(ff, ForwardMapFeedforward):
         say(f"  注: feedforward.ref_smooth_sigma_s={ff_cfg.ref_smooth_sigma_s:g} は表の候補"
-            "（C7〜C13）だけに効きます。この候補では基準をぼかしません")
+            "（C7〜C14）だけに効きます。この候補では基準をぼかしません")
     if isinstance(ff, ForwardMapFeedforward):
         target_ref = _prepare_forward_map_plan(cfg, mode, ff)
         return ModeDriveSetup(mode=mode, ff=ff, target_ref=target_ref)
@@ -856,6 +863,29 @@ def predictor_config_text(ff: object) -> str:
     )
 
 
+def make_creep_floor(
+    ff: CreepFloorFeedforward, cfg: ResearchConfig, mode: DrivingMode
+) -> CreepFloor:
+    """C14 の下限を作る。下限 ＝ ブレーキ min ＋ |meta の動き出す開度|（停車保持より深くしない）。
+    しきい値 ＝ cfg.feedforward.creep_speed_kmh（手順2 の測定値）＋ meta の low_speed_margin_kmh
+    （無ければ 0）。meta に動き出す開度が無ければ下限なし。"""
+    meta = ff.table.meta
+    margin = meta.get("low_speed_margin_kmh")
+    margin = float(margin) if margin is not None and math.isfinite(float(margin)) else 0.0
+    return CreepFloor(
+        floor_pct=creep_floor_opening_pct(
+            meta, cfg.vehicle.min_brake_opening_pct, cfg.stop_brake_opening_pct
+        ),
+        lead_s=ff.creep_floor_lead_s,
+        speed_limit_kmh=cfg.feedforward.creep_speed_kmh + margin,
+        arrivals=StopArrivals(
+            [p.time_s for p in mode.reference_speed], [p.speed_kmh for p in mode.reference_speed]
+        ),
+        accel_min_pct=cfg.vehicle.min_accel_opening_pct,
+        period_s=cfg.control.loop_interval_s,
+    )
+
+
 def coast_params(ff: CoastAssistFeedforward, cfg: ResearchConfig) -> dict[str, Any]:
     """C12 の CoastAssist に渡す値（保持時間・戻り時間・効き始めの開度）。
     保持時間 hold_p ＝ coast_hold_coef × (遅れ_p ＋ p の効き始めの開度が min へ戻る時間)。
@@ -930,6 +960,9 @@ class ModeDriveResult:
     # ない・predictor_enabled が false なら None
     predictor_settings: str | None = None
     predictor: PredictorStats | None = None
+    # 2026-10-19 段3a: C14（停車の最後のブレーキの下限）の設定と集計。C14 でなければ None
+    creep_floor_settings: str | None = None
+    creep_floor_stats: Any = None  # creep_floor.CreepFloorStats
     samples: list[DriveSample] = field(default_factory=list)  # MODE_DRIVE の行（0.1s 刻み）
 
 
@@ -1046,6 +1079,11 @@ class _ModeRun:
                 coast_lag_s=self.ff.dob_lag_accel_s if coast_lag is None else float(coast_lag),
                 accel_var_note=note,
             )
+        # C14（停車の最後のブレーキの下限。2026-10-19 段3a）: C14 のときだけ
+        self.cfloor: CreepFloor | None = (
+            make_creep_floor(self.ff, cfg, setup.mode)
+            if isinstance(self.ff, CreepFloorFeedforward) else None
+        )
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
         self._accel_blocked = False
@@ -1173,9 +1211,21 @@ class _ModeRun:
         # C10 の上乗せは FF の列（accel_ff・brake_ff・plan_effort）には入れない（作ったずれが
         # 今までと同じ意味で比べられるように）。実際に出す effort にだけ足す
         effort = ff_effort + (c10_effort or 0.0) + pid_effort
+        ff_shown = ff_effort  # ログの FF 列に出す値（C14 の下限を掛けたもの）
+        floor_raise: float | None = None
+        if self.cfloor is not None:
+            # C14: 最終の指令（FB の上乗せ・惰行の補助を足した後、調停・安全網の前）に下限を掛ける。
+            # FF 列にも同じ条件で掛ける（plan_effort_pct は掛ける前の FF のまま）
+            args = (t, ref, speed)
+            ff_shown = self.cfloor.apply(
+                *args, ff_effort, self._last_accel_actual, record=False
+            )
+            floored = self.cfloor.apply(*args, effort, self._last_accel_actual)
+            floor_raise = effort - floored
+            effort = floored
         # ログの「指示開度 FF」列（FF の出力をペダル別に分けた値。ガバナー・待機位置の前）
         accel_ff, brake_ff = split_effort(
-            ff_effort, cfg.vehicle.max_accel_opening_pct, cfg.vehicle.max_brake_opening_pct
+            ff_shown, cfg.vehicle.max_accel_opening_pct, cfg.vehicle.max_brake_opening_pct
         )
         # 調停の dt は前サイクルからの経過。初回は公称周期（arbitrate が dt<=0 で置き換える）
         arb_dt = 0.0 if self._prev_now is None else now - self._prev_now
@@ -1263,6 +1313,7 @@ class _ModeRun:
                     speed_pred_kmh=self._speed_pred,
                     pred_dev_kmh=self._pred_row_dev,
                     ref_smooth_kmh=ref_t,
+                    creep_floor_pct=floor_raise,
                 )
             )
         if segment != self._segment:
@@ -1670,6 +1721,8 @@ async def run_mode_drive(
         coast_stats=None if run.coast is None else run.coast.stats,
         predictor_settings=None if run.pred is None else run.pred.settings_text(),
         predictor=None if run.pred is None else run.pred.stats,
+        creep_floor_settings=None if run.cfloor is None else run.cfloor.settings_text(),
+        creep_floor_stats=None if run.cfloor is None else run.cfloor.stats,
         samples=run.samples,
     )
     say(f"モード走行 {'完了' if result.completed else '中断'}: {run_s:.1f}s・{run.cycles} 周期"
@@ -1688,6 +1741,9 @@ async def run_mode_drive(
     if run.pred is not None:
         say(f"  C13（予測器・車速のフィルタ。{run.pred.settings_text()}）: "
             f"{run.pred.stats.summary()}")
+    if run.cfloor is not None:
+        say(f"  C14（停車の最後のブレーキの下限。{run.cfloor.settings_text()}）: "
+            f"{run.cfloor.stats.summary()}")
     if run.cycle_ms:
         say(f"  1 周期の処理時間: {cycle_time_text(run.cycle_ms, run.interval_s)}")
     if result.completed:

@@ -135,6 +135,9 @@ CSV_COLUMNS: tuple[str, ...] = (
     # σ=0 のときは ref_speed_kmh と同じ値。ref_speed_kmh・deviation_kmh は元の基準のまま）。
     # モード走行の行だけ
     "ref_smooth_kmh",
+    # 2026-10-19 段3a: C14 の停車の最後のブレーキの下限が指令を上げた量 [%]（ブレーキの深さの増分。
+    # 掛けなかった周期は 0。C14 の行だけ、他は空欄）。brake_ff_pct にも下限は入っている
+    "creep_floor_pct",
 )
 
 
@@ -176,6 +179,7 @@ class DriveSample:
     speed_pred_kmh: float | None = None
     pred_dev_kmh: float | None = None
     ref_smooth_kmh: float | None = None  # 目標側に使ったぼかした基準（モード走行の行だけ）
+    creep_floor_pct: float | None = None  # C14 の下限が上げた量（C14 の行だけ。他は None）
 
 
 class SessionLog:
@@ -260,6 +264,7 @@ class SessionLog:
         speed_pred_kmh: float | None = None,
         pred_dev_kmh: float | None = None,
         ref_smooth_kmh: float | None = None,
+        creep_floor_pct: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -292,6 +297,7 @@ class SessionLog:
             speed_pred_kmh=speed_pred_kmh,
             pred_dev_kmh=pred_dev_kmh,
             ref_smooth_kmh=ref_smooth_kmh,
+            creep_floor_pct=creep_floor_pct,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -481,6 +487,7 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.speed_pred_kmh),
                 _fmt(s.pred_dev_kmh),
                 _fmt(s.ref_smooth_kmh),
+                _fmt(s.creep_floor_pct),
             ])
 
 

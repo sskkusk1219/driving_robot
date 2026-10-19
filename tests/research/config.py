@@ -61,8 +61,9 @@ class VehicleSection:
 #: C11（C10 ＋ 外乱オブザーバ DOB。pkl は C8 と同じ。2026-10-18 段2q）
 #: C12（C11 ＋ 惰行の行の補助。pkl は C8 と同じ。2026-10-18 段2r）
 #: C13（C12 ＋ 遅れの予測器 ＋ 車速のフィルタ。pkl は C8 と同じ。2026-10-19 段2u）
+#: C14（C12 ＋ 停車の最後のブレーキの下限。pkl は C8 と同じ。C13 は含まない。2026-10-19 段3a）
 CANDIDATE_NAMES: tuple[str, ...] = (
-    "C1", "C2", "C3", "C4", "C5", "C7", "C8", "C10", "C11", "C12", "C13",
+    "C1", "C2", "C3", "C4", "C5", "C7", "C8", "C10", "C11", "C12", "C13", "C14",
 )
 
 # C10 が表を引く車速の行（forward_map.deviation_row）。reference＝案A・actual＝案B
@@ -624,6 +625,12 @@ class ForwardMapSection:
     # pkl に seed_mae が無いときの σ_a [km/h/s]。仮値 0.2（094422 の pkl の MAE 0.147 から換算した
     # σ 0.185 より少し大きい）。決める時期: 実機 1〜2 本の後
     speed_filter_accel_sigma: float = 0.2
+    # 2026-10-19 段3a（C14 のときだけ効く）: 停車の最後のブレーキの下限。元の基準が次に停車
+    # （0 km/h）へ着くまでこの秒数以内のとき「停車へ向かっている」とみなす [s]。
+    # 仮値 5 s（停車保持の先読み features.h0_s と同じ考え。実際に掛かる範囲は、これに
+    # 「基準・実車速がクリープ車速＋余裕以下」が重なって決まる）。
+    # 効く先: 長いほど下限が早くから掛かる。決める時期: C14 の実機 1 本の後
+    creep_floor_lead_s: float = 5.0
 
 
 @dataclass
@@ -1072,6 +1079,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         fm.speed_filter_r_floor > 0.0,
         f"forward_map.speed_filter_r_floor は正値: {fm.speed_filter_r_floor}",
+    )
+    need(
+        fm.creep_floor_lead_s > 0.0,
+        f"forward_map.creep_floor_lead_s は正値: {fm.creep_floor_lead_s}",
     )
     need(
         fm.speed_filter_accel_sigma > 0.0,
