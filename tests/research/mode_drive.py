@@ -58,6 +58,7 @@ from tests.research.ff_candidate import (
     DeviationForwardFeedforward,
     DisturbanceObserverFeedforward,
     ForwardMapFeedforward,
+    PredictorFeedforward,
     make_candidate,
 )
 from tests.research.ff_params import research_ff_params
@@ -75,6 +76,11 @@ from tests.research.research_types import (
     DriveLogData,
     DrivingMode,
     SpeedPoint,
+)
+from tests.research.speed_predictor import (
+    PredictorStats,
+    SpeedFilterPredictor,
+    accel_error_var_from_meta,
 )
 from tests.research.stop_decel import PHASE_APPROACH, PHASE_STOP_HOLD, decelerate_to_stop
 from tests.research.term import drive_status_line, say
@@ -256,6 +262,14 @@ def _prepare_forward_map_plan(
             on_kmh=fm.coast_on_kmh, off_kmh=fm.coast_off_kmh, hold_coef=fm.coast_hold_coef
         )
         say(f"  C12（惰行の補助）: {coast_settings_of(ff, cfg)}")
+    if isinstance(ff, PredictorFeedforward):
+        # 2026-10-19 段2u: 遅れの予測器 ＋ 車速のフィルタ。Q は pkl の meta、R は最初の停車保持で
+        # 決まる（走り出してから）ので、ここでは yaml の値だけ表示する
+        ff.set_predictor(
+            enabled=fm.predictor_enabled, q=fm.speed_filter_q, r=fm.speed_filter_r,
+            r_floor=fm.speed_filter_r_floor, accel_sigma=fm.speed_filter_accel_sigma,
+        )
+        say(f"  C13（予測器・車速のフィルタ）: {predictor_config_text(ff)}")
     sec = plan.pedal_seconds()
     say(f"  範囲外を引いた秒数 {plan.out_of_range_s():.1f}s・穴埋めを引いた秒数 "
         f"{plan.filled_s():.1f}s")
@@ -697,6 +711,20 @@ def dob_settings_text(ff: object) -> str:
     )
 
 
+def predictor_config_text(ff: object) -> str:
+    """C13 の yaml の設定の表示（走行前）。C13 でなければ「なし」。Q・R の実値は走行後に出る。"""
+    if not isinstance(ff, PredictorFeedforward):
+        return "なし"
+    if not ff.predictor_enabled:
+        return "無効（forward_map.predictor_enabled: false。C12 と同じ指令）"
+    q = "pkl の meta から" if ff.filter_q is None else f"yaml の上書き σ_a² {ff.filter_q:g}"
+    r = "最初の停車保持で測る" if ff.filter_r is None else f"yaml の上書き {ff.filter_r:g}"
+    return (
+        f"有効・Q {q}（meta に無ければ σ_a {ff.filter_accel_sigma:g} km/h/s）"
+        f"・R {r}（下限 {ff.filter_r_floor:g} (km/h)²）"
+    )
+
+
 def coast_params(ff: CoastAssistFeedforward, cfg: ResearchConfig) -> dict[str, Any]:
     """C12 の CoastAssist に渡す値（保持時間・戻り時間・効き始めの開度）。
     保持時間 hold_p ＝ coast_hold_coef × (遅れ_p ＋ p の効き始めの開度が min へ戻る時間)。
@@ -767,11 +795,19 @@ class ModeDriveResult:
     # 2026-10-18 段2r: C12（惰行の補助）の設定の表示と集計。C12 でなければ None
     coast_settings: str | None = None
     coast_stats: Any = None  # coast_assist.CoastStats（循環 import を避けるため型は書かない）
+    # 2026-10-19 段2u: C13（予測器・車速のフィルタ）の設定（走行後の Q・R を含む）と集計。C13 で
+    # ない・predictor_enabled が false なら None
+    predictor_settings: str | None = None
+    predictor: PredictorStats | None = None
     samples: list[DriveSample] = field(default_factory=list)  # MODE_DRIVE の行（0.1s 刻み）
 
 
 class _ModeRun:
     """1 本のモード走行の状態。run() が 50ms 周期でモード終わりまで回す。"""
+
+    # C13（段2u）の今の周期の値の既定。C13 以外・予測器が無効のときは動かさない（None のまま）
+    _speed_est: float | None = None
+    _pred_dev: float | None = None
 
     def __init__(
         self,
@@ -851,6 +887,29 @@ class _ModeRun:
                 plan.effort_pct, plan.flag, plan.t_s, **coast_params(self.ff, cfg)
             )
             self.coast_settings = coast_settings_of(self.ff, cfg)
+        # C13（予測器・車速のフィルタ。2026-10-19 段2u）: C13 で predictor_enabled のときだけ
+        self.pred: SpeedFilterPredictor | None = None
+        self._speed_est: float | None = None  # 今の周期のフィルタの推定車速（DOB の実加速度に使う）
+        self._speed_pred: float | None = None  # 今の周期の L 秒先の予測（使わない周期は None）
+        # 今の周期の予測の偏差（基準の L 秒先 − 予測。使わなければ None）
+        self._pred_dev: float | None = None
+        self._pred_row_dev: float | None = None  # ログ用: P の上乗せに使った偏差
+        self._first_hold = True  # 走行の最初の停車保持の間か（フィルタの R を測る）
+        if isinstance(self.ff, PredictorFeedforward) and self.ff.predictor_enabled:
+            assert self.dob is not None
+            meta = self.ff.table.meta
+            if self.ff.filter_q is not None:
+                accel_var, note = self.ff.filter_q, f"yaml の上書き σ_a² {self.ff.filter_q:g}"
+            else:
+                accel_var, note = accel_error_var_from_meta(meta, self.ff.filter_accel_sigma)
+            coast_lag = meta.get("coast_lag_s")
+            self.pred = SpeedFilterPredictor(
+                self.dob, period_s=self.interval_s, accel_var=accel_var,
+                r_override=self.ff.filter_r, r_floor=self.ff.filter_r_floor,
+                lag_accel_s=self.ff.dob_lag_accel_s, lag_brake_s=self.ff.dob_lag_brake_s,
+                coast_lag_s=self.ff.dob_lag_accel_s if coast_lag is None else float(coast_lag),
+                accel_var_note=note,
+            )
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
         self._accel_blocked = False
@@ -960,6 +1019,9 @@ class _ModeRun:
         else:
             v0, future, past = self._ff_inputs(t, ref, speed)
             ff_effort = self.ff.predict_effort(v0, future, past, **self._select_kwargs(t, v0))
+        if self.pred is not None:
+            # C13: 車速のフィルタを進め、L 秒先の予測から P の上乗せに使う偏差を決める
+            self._predictor_step(t, ref, speed, ff_effort)
         c10_effort: float | None = None
         if self.c10 is not None:
             c10_effort = self._c10_offset(t, ref, speed, ff_effort)
@@ -1060,6 +1122,9 @@ class _ModeRun:
                     dob_brake_kmhs=None if self.dob is None else self.dob.d_brake,
                     dob_effort_pct=self._dob_effort,
                     coast_effort_pct=None if self.coast is None else self._coast_effort,
+                    speed_est_kmh=self._speed_est,
+                    speed_pred_kmh=self._speed_pred,
+                    pred_dev_kmh=self._pred_row_dev,
                 )
             )
         if segment != self._segment:
@@ -1078,6 +1143,56 @@ class _ModeRun:
                        f"max|偏差|={self.max_abs_dev:.2f} "
                        f"{100.0 * t / self.duration_s:4.1f}%{gov}"),
             ))
+
+    def _low_flags(self, t: float, ref: float, speed: float) -> tuple[bool, bool, bool]:
+        """今の計画の行の (発進側か, 停止側か, 低速の行か)。`_dob_update` と同じ条件
+        （発進側は発進側の表が置き換えた車速の行の中だけ。低速の行は `_dob_low_speed`）。"""
+        # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
+        from tests.research.fwd_plan import low_speed_sides  # noqa: PLC0415
+
+        ff = self.ff
+        assert isinstance(ff, ForwardMapFeedforward)
+        plan = ff.plan
+        i = plan.index_at(t)
+        ahead = bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False
+        launch, stop = low_speed_sides(ff.table, float(plan.need_accel_kmhs[i]), ref, ahead)
+        launch = bool(launch) and speed < self._dob_launch_top()
+        return launch, bool(stop), self._dob_low_speed(speed, int(plan.flag[i]))
+
+    def _predictor_step(self, t: float, ref: float, speed: float, ff_effort: float) -> None:
+        """C13（段2u）: 車速のフィルタを 1 周期進め、L 秒先の予測と P の上乗せの偏差を決める。
+
+        どこを予測に変えたか: C10 の P の上乗せの偏差だけ（dev ＝ 基準の L 秒先 − 予測）。
+        低速の行（停車保持・停車速度以下・発進側／停止側の表の車速）は C11 の DOB を使わない行と同じ
+        なので、予測も使わず今の偏差（基準 − CAN 車速）のまま。ペダルの遅れが測れない行も同じ。
+        DOB の実加速度（`_dob_update`）にはここで出した推定車速を使う。惰行の補助・DOB の
+        上乗せの量・安全網・ガバナー・調停は CAN 車速のまま変えない。"""
+        # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
+        from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+        from tests.research.fwd_plan import FLAG_STOP  # noqa: PLC0415
+
+        pred, ff = self.pred, self.ff
+        assert pred is not None and isinstance(ff, ForwardMapFeedforward)
+        launch, stop, held = self._low_flags(t, ref, speed)
+        idle = (
+            self._first_hold and speed <= STOP_SPEED_KMH
+            and int(ff.plan.flag[ff.plan.index_at(t)]) == FLAG_STOP
+        )
+        if not idle:
+            self._first_hold = False
+        self._speed_est = pred.step(
+            t=t, can_kmh=speed, launch=launch, stop=stop, held=held, idle=idle
+        )
+        self._speed_pred = None
+        self._pred_dev = None
+        lag = pred.lag_for(ff_effort)
+        if not held and lag is not None and lag > 0.0:
+            v_hat = pred.predict_ahead(t=t, lag_s=lag, launch=launch, stop=stop, held=held)
+            if v_hat is not None:
+                self._speed_pred = v_hat
+                self._pred_dev = self.ref.at(t + lag) - v_hat
+                pred.stats.add_prediction(t=t, lag_s=lag, pred_kmh=v_hat, can_kmh=speed)
+        self._pred_row_dev = ref - speed if self._pred_dev is None else self._pred_dev
 
     def _c10_offset(self, t: float, ref: float, speed: float, ff_effort: float) -> float:
         """C10: 今の列の effort に偏差の分を上乗せしたときの差（上乗せ後 − 今の列）[%]。
@@ -1098,7 +1213,8 @@ class _ModeRun:
             "need_kmhs": float(plan.need_accel_kmhs[i]),
             "ref_kmh": ref,
             "row_kmh": ref if ff.deviation_row == "reference" else speed,
-            "dev_kmh": ref - speed,
+            # C13: 予測を使う周期は「基準の L 秒先 − 予測した L 秒先の車速」。それ以外は今の偏差
+            "dev_kmh": ref - speed if self._pred_dev is None else self._pred_dev,
             "tau_accel_s": ff.tau_accel_s,
             "tau_brake_s": ff.tau_brake_s,
             "accel_min_pct": v.min_accel_opening_pct,
@@ -1231,8 +1347,10 @@ class _ModeRun:
             u = -(brake - v.min_brake_opening_pct)
         else:
             u = 0.0
+        # C13: DOB の実加速度は、車速のフィルタの推定車速の差分から（C11・C12 は CAN 車速の差分）
         pedal = dob.update(
-            t=t, speed_kmh=speed, u_now=u, governed=governed,
+            t=t, speed_kmh=speed if self._speed_est is None else self._speed_est,
+            u_now=u, governed=governed,
             at_limit_now=(
                 accel >= v.max_accel_opening_pct or brake >= v.max_brake_opening_pct
             ),
@@ -1404,6 +1522,8 @@ async def run_mode_drive(
         dob=run.dob_stats,
         coast_settings=run.coast_settings,
         coast_stats=None if run.coast is None else run.coast.stats,
+        predictor_settings=None if run.pred is None else run.pred.settings_text(),
+        predictor=None if run.pred is None else run.pred.stats,
         samples=run.samples,
     )
     say(f"モード走行 {'完了' if result.completed else '中断'}: {run_s:.1f}s・{run.cycles} 周期"
@@ -1419,6 +1539,9 @@ async def run_mode_drive(
         say(f"  C11（DOB。{dob_settings_text(run.ff)}）: {run.dob_stats.summary()}")
     if run.coast is not None:
         say(f"  C12（惰行の補助。{run.coast_settings}）: {run.coast.stats.summary()}")
+    if run.pred is not None:
+        say(f"  C13（予測器・車速のフィルタ。{run.pred.settings_text()}）: "
+            f"{run.pred.stats.summary()}")
     if run.cycle_ms:
         say(f"  1 周期の処理時間: {cycle_time_text(run.cycle_ms, run.interval_s)}")
     if result.completed:

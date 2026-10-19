@@ -1594,3 +1594,108 @@ async def test_c12_assists_in_coast_rows_and_logs_coast_effort(
     with csv11.open(newline="", encoding="utf-8") as f:
         rows11 = list(csv.DictReader(f))
     assert all(r["coast_effort_pct"] == "" for r in rows11)
+
+
+# ─── C13（予測器・車速のフィルタ。2026-10-19 段2u） ──────────────────────
+
+
+async def _c13_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate: str, *, enabled: bool = True
+) -> tuple[mdmod.ModeDriveResult, list[dict[str, str]]]:
+    """40 → 26 km/h に下げる基準を、30 km/h に固定したスタブ車速で走る（C12 の試験と同じ）。"""
+    cfg = _c10_cfg(tmp_path, candidate=candidate)
+    cfg.forward_map.predictor_enabled = enabled
+    mode = _mode([(0.0, 0.0), (2.0, 0.0), (6.0, 40.0), (8.0, 40.0), (14.0, 26.0), (16.0, 26.0)])
+
+    async def fake_load_mode(_cfg: cfgmod.ResearchConfig, _name: str) -> object:
+        return mode
+
+    monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+    setup = await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+    hw = await _held_stub(cfg)
+    hw.can.speed_kmh = 30.0
+    log = dlmod.SessionLog(cfg, hw, has_ref=True)
+    log.start(dlmod.SECTION_MODE_DRIVE, "")
+    result = await mdmod.run_mode_drive(hw, cfg, setup, log=log)
+    await log.close()
+    with log.csv_path.open(newline="", encoding="utf-8") as f:
+        rows = [r for r in csv.DictReader(f) if r["section"] == dlmod.SECTION_MODE_DRIVE]
+    return result, rows
+
+
+async def test_c13_logs_filter_and_prediction_columns_and_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result, rows = await _c13_run(tmp_path, monkeypatch, "C13")
+    assert result.predictor is not None and result.predictor_settings is not None
+    assert "σ_a" in result.predictor_settings and "R:" in result.predictor_settings
+    assert result.predictor.est_n > 100 and result.predictor.pred_used_cycles > 0
+    assert "予測なし" in result.predictor.summary()
+    out = capsys.readouterr().out
+    assert "C13（予測器・車速のフィルタ" in out
+    assert all(r["speed_est_kmh"] != "" and r["pred_dev_kmh"] != "" for r in rows)
+    # 30 km/h は低速の行ではないので、予測が出る周期がある。停車保持の行（先頭）では空欄
+    assert any(r["speed_pred_kmh"] != "" for r in rows)
+    assert rows[0]["speed_pred_kmh"] == ""
+    # 低速の行などで予測を使わない周期の偏差は今の偏差（基準 − CAN 車速）
+    r0 = rows[0]
+    assert float(r0["pred_dev_kmh"]) == pytest.approx(
+        float(r0["ref_speed_kmh"]) - float(r0["actual_speed_kmh"]), abs=1e-3
+    )
+
+
+async def test_c13_with_predictor_disabled_gives_the_same_commands_as_c12(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r13, rows13 = await _c13_run(tmp_path, monkeypatch, "C13", enabled=False)
+    r12, rows12 = await _c13_run(tmp_path, monkeypatch, "C12")
+    assert r13.predictor is None and r13.predictor_settings is None
+    assert len(rows13) == len(rows12) > 100
+    # スタブは実時間で動くので、同じ C12 を 2 回走っても指令は最大 0.5% ほどずれる。
+    # 予測器が混ざれば（偏差が基準の L 秒先に変わる）これを超えて違う
+    for key in ("accel_cmd_pct", "brake_cmd_pct", "c10_effort_pct", "dob_effort_pct"):
+        diff = max(abs(float(a[key] or 0.0) - float(b[key] or 0.0))
+                   for a, b in zip(rows13, rows12, strict=True))
+        assert diff < 1.0, (key, diff)
+    assert all(r["dob_accel_kmhs"] != "" for r in rows13)
+    assert all(
+        r["speed_est_kmh"] == "" and r["speed_pred_kmh"] == "" and r["pred_dev_kmh"] == ""
+        for r in rows13 + rows12
+    )
+
+
+async def test_c13_prepare_shows_predictor_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _c10_cfg(tmp_path, candidate="C13")
+    cfg.forward_map.speed_filter_r = 2e-4
+    mode = _mode(_C10_MODE_POINTS)
+
+    async def fake_load_mode(_cfg: cfgmod.ResearchConfig, _name: str) -> object:
+        return mode
+
+    monkeypatch.setattr(mdmod, "load_mode", fake_load_mode)
+    setup = await mdmod.prepare_mode_drive(cfg, "dummy_mode")
+    assert isinstance(setup.ff, ff_candidate.PredictorFeedforward)
+    out = capsys.readouterr().out
+    assert "C13（予測器・車速のフィルタ）: 有効・Q pkl の meta から" in out
+    assert "R yaml の上書き 0.0002" in out
+
+
+async def test_c10_offset_uses_predicted_deviation_only_when_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C13: `_pred_dev` があれば P の上乗せはその偏差から。None なら今の偏差（基準 − CAN 車速）で、
+    C10・C11・C12（および predictor_enabled が false の C13）と同じ出力。"""
+    cfg = _c10_cfg(tmp_path)
+    run = await _c10_run_obj(cfg, monkeypatch)
+    plan = run.ff.plan
+    ia = int(np.flatnonzero(plan.effort_pct > 4.0 + 1.0)[0])
+    t, e = float(plan.t_s[ia]), float(plan.effort_pct[ia])
+    ref = 40.0
+    plain = run._c10_offset(t, ref, ref - 2.0, e)  # noqa: SLF001
+    run._pred_dev = 2.0  # noqa: SLF001  今の偏差と同じ値なら出力も同じ
+    assert run._c10_offset(t, ref, ref - 2.0, e) == pytest.approx(plain)  # noqa: SLF001
+    run._pred_dev = -1.0  # noqa: SLF001  予測では追いつく見込み → 減らす向き
+    assert run._c10_offset(t, ref, ref - 2.0, e) < plain  # noqa: SLF001
+    assert run._c10_offset(t, ref, ref - 2.0, e) < 0.0  # noqa: SLF001

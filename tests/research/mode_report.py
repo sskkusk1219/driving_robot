@@ -143,6 +143,10 @@ class RunInfo:
     # 2026-10-18 段2r: C12（惰行の補助）の設定と集計の表示。None は C12 でない（または不明）
     coast_settings: str | None = None
     coast_summary: str | None = None
+    # 2026-10-19 段2u: C13（予測器・車速のフィルタ）の設定（L・Q・R）と集計の表示。None は C13 で
+    # ない・予測器が無効（または不明）。研究系の設定はログに残らないので、ここで確かめる
+    predictor_settings: str | None = None
+    predictor_summary: str | None = None
     # 2026-10-19 段2s-2b: FEL の 1 行（mode_drive.fel_text）。None は不明（CSV からの作り直し）か
     # FF が表の候補でない
     fel_text: str | None = None
@@ -902,6 +906,10 @@ def write_mode_report(
                  "なし" if info.coast_settings is None else info.coast_settings),
                 ("C12 の惰行の補助（ペダル別の入った回数・秒数・入れなかった理由別・離した回数）",
                  "なし" if info.coast_summary is None else info.coast_summary),
+                ("C13（予測器・車速のフィルタ）の設定（遅れ L・Q・R）",
+                 "なし" if info.predictor_settings is None else info.predictor_settings),
+                ("C13 の集計（推定と CAN の差の RMS・予測の当たり具合＝L 秒後の実車速との差）",
+                 "なし" if info.predictor_summary is None else info.predictor_summary),
                 ("ブレーキ寄与ほぼ0（指令はあるが惰行カーブ相当しか効いていない）",
                  f"{pedal.brake_ineffective_s:.1f}s"),
                 (f"ばたつき（実車速 {CHATTER_BAND_HZ[0]:g}〜{CHATTER_BAND_HZ[1]:g}Hz の帯 RMS・"

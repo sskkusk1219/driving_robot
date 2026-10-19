@@ -125,6 +125,12 @@ CSV_COLUMNS: tuple[str, ...] = (
     # 2026-10-18 段2r: C12（惰行の補助）が惰行の行に出した開度 [%]（正＝アクセル・負＝ブレーキ。
     # 補助していない周期は 0。C12 の行だけ、他は空欄）。c10_effort_pct にも同じ値が入る
     "coast_effort_pct",
+    # 2026-10-19 段2u: C13 の車速のフィルタの推定車速 [km/h]、L 秒先の予測車速 [km/h]（低速の行など
+    # 予測を使わない周期は空欄）、C10 の P の上乗せに使った偏差 [km/h]（基準 − 車速の向き。予測を
+    # 使った周期は 基準の L 秒先 − 予測車速、使わない周期は 基準 − CAN 車速）。C13 の行だけ
+    "speed_est_kmh",
+    "speed_pred_kmh",
+    "pred_dev_kmh",
 )
 
 
@@ -161,6 +167,10 @@ class DriveSample:
     dob_brake_kmhs: float | None = None
     dob_effort_pct: float | None = None
     coast_effort_pct: float | None = None  # C12 の惰行の補助の開度（C12 の行だけ。他は None）
+    # C13 の車速のフィルタの推定・L 秒先の予測・P の上乗せに使った偏差（C13 の行だけ。他は None）
+    speed_est_kmh: float | None = None
+    speed_pred_kmh: float | None = None
+    pred_dev_kmh: float | None = None
 
 
 class SessionLog:
@@ -241,6 +251,9 @@ class SessionLog:
         dob_brake_kmhs: float | None = None,
         dob_effort_pct: float | None = None,
         coast_effort_pct: float | None = None,
+        speed_est_kmh: float | None = None,
+        speed_pred_kmh: float | None = None,
+        pred_dev_kmh: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -269,6 +282,9 @@ class SessionLog:
             dob_brake_kmhs=dob_brake_kmhs,
             dob_effort_pct=dob_effort_pct,
             coast_effort_pct=coast_effort_pct,
+            speed_est_kmh=speed_est_kmh,
+            speed_pred_kmh=speed_pred_kmh,
+            pred_dev_kmh=pred_dev_kmh,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -454,6 +470,9 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.dob_brake_kmhs),
                 _fmt(s.dob_effort_pct),
                 _fmt(s.coast_effort_pct),
+                _fmt(s.speed_est_kmh),
+                _fmt(s.speed_pred_kmh),
+                _fmt(s.pred_dev_kmh),
             ])
 
 

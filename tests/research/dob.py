@@ -88,6 +88,15 @@ class PedalDisturbanceObserver:
         m = min((u for ht, u, _, _ in self._hist if t0 - 1e-9 <= ht <= t1 + 1e-9), default=u_d)
         return max(u_d - m, 0.0)
 
+    def delayed_u(self, tau: float) -> tuple[float, bool, bool] | None:
+        """時刻 τ の加速度に効く (u, 最大開度か, ガバナーか)（`_delayed` の公開名。2026-10-19 段2u:
+        C13 の車速のフィルタ・予測器が同じ引き方で表を引く）。履歴が足りなければ None。"""
+        return self._delayed(tau)
+
+    def release_at(self, tau: float, u_d: float) -> float:
+        """時刻 τ のブレーキの戻し量（`_release` の公開名。段2u）。"""
+        return self._release(tau, u_d)
+
     def _at(self, t: float) -> tuple[float, bool, bool] | None:
         """時刻 t 以前で最新の履歴の (u, 最大開度か, ガバナーか)。t が履歴より前なら None。"""
         found = None

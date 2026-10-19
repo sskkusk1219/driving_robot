@@ -60,8 +60,9 @@ class VehicleSection:
 #: C10（C8 の開度の列 ＋ 走行中に偏差の分だけ上乗せ。pkl は C8 と同じ。2026-10-17 段2p）
 #: C11（C10 ＋ 外乱オブザーバ DOB。pkl は C8 と同じ。2026-10-18 段2q）
 #: C12（C11 ＋ 惰行の行の補助。pkl は C8 と同じ。2026-10-18 段2r）
+#: C13（C12 ＋ 遅れの予測器 ＋ 車速のフィルタ。pkl は C8 と同じ。2026-10-19 段2u）
 CANDIDATE_NAMES: tuple[str, ...] = (
-    "C1", "C2", "C3", "C4", "C5", "C7", "C8", "C10", "C11", "C12",
+    "C1", "C2", "C3", "C4", "C5", "C7", "C8", "C10", "C11", "C12", "C13",
 )
 
 # C10 が表を引く車速の行（forward_map.deviation_row）。reference＝案A・actual＝案B
@@ -596,6 +597,23 @@ class ForwardMapSection:
     # 段2r ③。true なら 1 つの惰行の区間で使うペダルは 1 つだけ。false なら、前の補助のペダルが
     # min に戻り保持時間がたてば反対のペダルにも入る
     coast_one_pedal_per_section: bool = True
+    # 2026-10-19 段2u（C13 のときだけ効く）: 遅れの予測器 ＋ 車速のフィルタ（speed_predictor.py）。
+    # predictor_enabled: false なら C13 でも C12 と同じ指令（フィルタも予測器も動かさない）。
+    predictor_enabled: bool = True
+    # speed_filter_q: フィルタの Q の元になる、表の予測加速度の外れの分散 σ_a² [(km/h/s)²]。
+    # null ＝ pkl の meta の seed_mae（学習の加速度の MAE）から自動（無ければ下の仮値 σ_a）。
+    # 数値なら上書き。効く先: 小さいほど予測（表）を信じ、観測（CAN）をならす
+    speed_filter_q: float | None = None
+    # speed_filter_r: 観測雑音の分散 R [(km/h)²]。null ＝ 走行の最初の停車保持の CAN 車速の乱れから
+    # 自動（測れなければ下の下限）。数値なら上書き。効く先: 大きいほど CAN をならす（遅れが増える）
+    speed_filter_r: float | None = None
+    # R の下限 [(km/h)²]。停車中の CAN 車速が一定値に張り付くと乱れが 0 に測れ、フィルタが CAN を
+    # 無視してしまうのを防ぐ。1e-4 ＝ (0.01 km/h)²。仮値（CAN の分解能 0.01 km/h の想定。094422 の
+    # 定速の 2 階差分から見た乱れの上限 σ≈0.008 km/h より少し大きい）。決める時期: 実機 1〜2 本の後
+    speed_filter_r_floor: float = 1.0e-4
+    # pkl に seed_mae が無いときの σ_a [km/h/s]。仮値 0.2（094422 の pkl の MAE 0.147 から換算した
+    # σ 0.185 より少し大きい）。決める時期: 実機 1〜2 本の後
+    speed_filter_accel_sigma: float = 0.2
 
 
 @dataclass
@@ -999,6 +1017,21 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         f"（coast_on_kmh={fm.coast_on_kmh}）",
     )
     need(fm.coast_hold_coef > 0.0, f"forward_map.coast_hold_coef は正値: {fm.coast_hold_coef}")
+    for label, val in (
+        ("speed_filter_q", fm.speed_filter_q), ("speed_filter_r", fm.speed_filter_r),
+    ):
+        need(
+            val is None or val > 0.0,
+            f"forward_map.{label} は null か正値: {val}",
+        )
+    need(
+        fm.speed_filter_r_floor > 0.0,
+        f"forward_map.speed_filter_r_floor は正値: {fm.speed_filter_r_floor}",
+    )
+    need(
+        fm.speed_filter_accel_sigma > 0.0,
+        f"forward_map.speed_filter_accel_sigma は正値: {fm.speed_filter_accel_sigma}",
+    )
     need(
         fm.deviation_row in DEVIATION_ROWS,
         f"forward_map.deviation_row が不正です: {fm.deviation_row!r}"

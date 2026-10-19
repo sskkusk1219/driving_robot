@@ -904,6 +904,37 @@ class CoastAssistFeedforward(DisturbanceObserverFeedforward):
         self.coast_hold_coef = hold_coef
 
 
+class PredictorFeedforward(CoastAssistFeedforward):
+    """C13: C12 に、遅れの予測器 ＋ 車速のフィルタを足す（2026-10-19 段2u）。
+
+    読む pkl・開度の列・DOB・惰行の補助は C12 と同じ。足すのは、C10 の P の上乗せの偏差を
+    「基準の L 秒先 − 予測した L 秒先の車速」で取ること（予測は `speed_predictor.
+    SpeedFilterPredictor`）と、DOB の実加速度に車速のフィルタの推定の差分を使うこと。
+    使うか（predictor_enabled）・Q と R の上書き・下限は、走行前に mode_drive が
+    `set_predictor` で持たせる。predictor_enabled が False なら C12 と同じ指令になる。
+    """
+
+    candidate = "C13"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.predictor_enabled: bool = True
+        self.filter_q: float | None = None  # σ_a² の上書き。None ＝ pkl の meta から
+        self.filter_r: float | None = None  # R の上書き。None ＝ 最初の停車保持で測る
+        self.filter_r_floor: float = 1.0e-4
+        self.filter_accel_sigma: float = 0.2  # meta に残差が無いときの σ_a
+
+    def set_predictor(
+        self, *, enabled: bool, q: float | None, r: float | None, r_floor: float,
+        accel_sigma: float,
+    ) -> None:
+        self.predictor_enabled = enabled
+        self.filter_q = q
+        self.filter_r = r
+        self.filter_r_floor = r_floor
+        self.filter_accel_sigma = accel_sigma
+
+
 #: V1 案スイッチ: config の feedforward.candidate 名 → クラス
 CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedforward]] = {
     "C1": CandidateFeedforward,
@@ -916,6 +947,7 @@ CANDIDATE_CLASSES: dict[str, type[CandidateFeedforward] | type[ForwardMapFeedfor
     "C10": DeviationForwardFeedforward,
     "C11": DisturbanceObserverFeedforward,
     "C12": CoastAssistFeedforward,
+    "C13": PredictorFeedforward,
 }
 
 
