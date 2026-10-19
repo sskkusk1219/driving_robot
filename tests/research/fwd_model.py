@@ -51,7 +51,8 @@ RANDOM_STATE = 0  # 固定（再現のため）
 
 def poly_features(x: np.ndarray) -> np.ndarray:
     """(車速, u) → 車速・u・車速²・u²・車速×u。
-    3 列（車速, u, 戻し量 r。ブレーキ側。2026-10-14 段2o-5）のときは r・r²・r×u・r×車速 を足す。"""
+    3 列（車速, u, 戻し量 r。ブレーキ側は 2026-10-14 段2o-5、アクセル側は 2026-10-20 段4-3 から）
+    のときは r・r²・r×u・r×車速 を足す。"""
     v, u = x[:, 0], x[:, 1]
     cols = [v, u, v * v, u * u, v * u]
     if x.shape[1] >= 3:
@@ -77,7 +78,8 @@ def _xy(
     rows_list: Sequence[FwdRows], side: str, *, coast_in_brake: bool = True
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """片側の行（accel: u >= 0、brake: u <= 0）の入力・加速度・ログ番号（グループ）。
-    入力は accel が (N, 2)（車速・u）、brake が (N, 3)（車速・u・戻し量。2026-10-14 段2o-5）。
+    入力は accel・brake とも (N, 3)（車速・u・戻し量。ブレーキ側は 2026-10-14 段2o-5、
+    アクセル側のアクセルの戻し量 accel_release_pct は 2026-10-20 段4-3）。
     coast_in_brake=False のときブレーキ側は u < 0 の行だけ（惰行の行を入れない）。"""
     xs, ys, gs = [], [], []
     for g, r in enumerate(rows_list):
@@ -86,8 +88,7 @@ def _xy(
         else:
             m = r.u_pct <= 0 if coast_in_brake else r.u_pct < 0
         cols = [r.speed_kmh[m], r.u_pct[m]]
-        if side != "accel":
-            cols.append(r.release_pct[m])
+        cols.append(r.accel_release_pct[m] if side == "accel" else r.release_pct[m])
         xs.append(np.column_stack(cols))
         ys.append(r.accel_kmhs[m])
         gs.append(np.full(int(m.sum()), g))
@@ -254,16 +255,19 @@ def raw_grid(
     *,
     coast_from: str = "mean",
     release_pct: float = 0.0,
+    accel_release_pct: float = 0.0,
 ) -> np.ndarray:
     """学習済みモデルを like（C7 の表）と同じ格子で評価した、単調化する前の配列。
     行 = 車速、列 = u。
     coast_from: u = 0 の取り方。"mean" は 2 式の平均、"accel" はアクセル側の式。
     release_pct: ブレーキ側に入れる戻し量 [%]（2026-10-14 段2o-5。既定 0 ＝ 本体の配列）。
-    アクセル側（u > 0）は戻し量に依らない。"""
+    accel_release_pct: アクセル側に入れる戻し量 [%]（2026-10-20 段4-3。既定 0 ＝ 本体の配列。
+    アクセル側の式の入力が 2 つの古いモデルは戻し量に依らない）。
+    ブレーキ側（u < 0）はアクセルの戻し量に依らない。"""
     if coast_from not in ("mean", "accel"):
         raise ValueError(f"coast_from が不明: {coast_from}")
     rep, ug = like.speed_rep, like.u_grid
-    acc = _predict_grid(fitted.accel_side, rep, ug)
+    acc = _predict_grid(fitted.accel_side, rep, ug, accel_release_pct)
     brk = _predict_grid(fitted.brake_side, rep, ug, release_pct)
     zero = acc if coast_from == "accel" else (acc + brk) / 2.0
     return np.where(ug[None, :] > 0, acc, np.where(ug[None, :] < 0, brk, zero))
@@ -284,6 +288,26 @@ def raw_release_slices(
     return np.stack(
         [
             raw_grid(fitted, like, coast_from=coast_from, release_pct=float(r))
+            for r in release_grid
+        ]
+    )
+
+
+def raw_accel_release_slices(
+    fitted: FittedModel,
+    like: ForwardTable,
+    release_grid: Sequence[float],
+    *,
+    coast_from: str = "mean",
+) -> np.ndarray:
+    """アクセルの戻し量ごとの、単調化する前の配列 (戻し量の数, 行, u)（2026-10-20 段4-3）。
+    u >= 0 の列はアクセル側の式にその戻し量を入れた値、u < 0 の列は本体（戻し量 0）と同じ
+    （ブレーキ側はアクセルの戻し量に依らない）。アクセル側の式の入力が 2 つの古いモデルは
+    全スライスが本体と同じ。
+    """
+    return np.stack(
+        [
+            raw_grid(fitted, like, coast_from=coast_from, accel_release_pct=float(r))
             for r in release_grid
         ]
     )

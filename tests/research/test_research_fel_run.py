@@ -219,3 +219,66 @@ def test_fel_text_of_reports_pkl_and_setting(tmp_path) -> None:
     cfg.fel.enabled = False
     assert "無効" in mainmod._fel_text_of(cfg, SimpleNamespace(ff=SimpleNamespace(table=t)))
     assert mainmod._fel_text_of(cfg, SimpleNamespace(ff=SimpleNamespace())) is None
+
+
+# ── 2026-10-20 段4-3: 手順2 の 2-3 を設定で走らない ─────────────────────
+
+
+def _run_step2_with_stubs(monkeypatch, cfg) -> dict:
+    """step2_pattern_drive を、走行・モデル作成を差し替えて最後まで通す。呼ばれた部品を返す。"""
+    calls = {"prepare": 0, "fel": 0, "build": 0}
+    mode = _mode([(0.0, 30.0), (60.0, 30.0)])
+
+    async def fake_load_mode(_cfg, _name):
+        return mode
+
+    async def fake_pedal(*_a, **_k):
+        return None
+
+    async def fake_drive(*_a, **_k):
+        return SimpleNamespace(csv_path=Path("x.csv"), ramp_results=[])
+
+    def fake_build(*_a, **_k):
+        calls["build"] += 1
+        return SimpleNamespace(model_path="m.pkl", checks=[])
+
+    def fake_prepare(*_a, **_k):
+        calls["prepare"] += 1
+        return SimpleNamespace()
+
+    async def fake_fel(*_a, **_k):
+        calls["fel"] += 1
+
+    plan = SimpleNamespace(levels=[1], execution_order=lambda: [])
+    monkeypatch.setattr(mainmod, "require_forward_candidate", lambda _c: None)
+    monkeypatch.setattr(mainmod, "load_mode", fake_load_mode)
+    monkeypatch.setattr(mainmod, "top_speed_cap_kmh", lambda *_a: 130.0)
+    monkeypatch.setattr(mainmod, "count_bands_for_modes", lambda *_a: [])
+    monkeypatch.setattr(mainmod, "cruise_kwargs", lambda _c: {"cruise_min_kmh": 10.0})
+    monkeypatch.setattr(mainmod, "plan_ramps", lambda *_a, **_k: plan)
+    monkeypatch.setattr(mainmod, "format_plan_table", lambda _p: "")
+    monkeypatch.setattr(mainmod, "run_pedal_search", fake_pedal)
+    monkeypatch.setattr(mainmod, "run_pattern_drive", fake_drive)
+    monkeypatch.setattr(mainmod, "build_ff_model", fake_build)
+    monkeypatch.setattr(mainmod, "_prepare_fel_run", fake_prepare)
+    monkeypatch.setattr(mainmod, "_run_fel_learning", fake_fel)
+    hw = SimpleNamespace(hw_mode="stub", is_real=False)
+    ctx = SimpleNamespace(
+        config=cfg, require_hardware=lambda: hw, session_log=None
+    )
+    asyncio.run(mainmod.step2_pattern_drive(ctx))
+    return calls
+
+
+def test_step2_runs_23_by_default_and_skips_it_when_disabled(monkeypatch, capsys) -> None:
+    cfg = _cfg(Path("."))
+    assert cfg.learning.fel_pattern_enabled is True  # 既定は今までと同じ（2-3 を走る）
+    on = _run_step2_with_stubs(monkeypatch, cfg)
+    assert on == {"prepare": 1, "fel": 1, "build": 1}
+    off_cfg = _cfg(Path("."))
+    off_cfg.learning.fel_pattern_enabled = False
+    capsys.readouterr()
+    off = _run_step2_with_stubs(monkeypatch, off_cfg)
+    assert off == {"prepare": 0, "fel": 0, "build": 1}  # 2-2（モデル作成）までは走る
+    out = capsys.readouterr().out
+    assert "2-3" in out and "走らない" in out and "手順 2 完了" in out

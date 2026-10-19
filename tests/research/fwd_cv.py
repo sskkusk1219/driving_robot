@@ -37,7 +37,13 @@ import numpy as np
 from tests.research import fwd_torch
 from tests.research.fwd_data import STOP_SPEED_KMH, FwdRows
 from tests.research.fwd_map import RELEASE_GRID_PCT, ForwardTable, load_forward_map, refine_u_grid
-from tests.research.fwd_model import FittedModel, grid_from_raw, raw_grid, raw_release_slices
+from tests.research.fwd_model import (
+    FittedModel,
+    grid_from_raw,
+    raw_accel_release_slices,
+    raw_grid,
+    raw_release_slices,
+)
 from tests.research.fwd_plan import lagged_input
 from tests.research.fwd_tool import (
     DEFAULT_C7_MAP,
@@ -157,7 +163,8 @@ def side_rows(
     """片側の行の x・加速度 y・ログ番号・時刻 t_s。選び方は fwd_model._xy と同じ
     （accel: u >= 0、brake: u <= 0。coast_in_brake=False なら brake は u < 0）。
     exclude_launch=True はブレーキ側から発進の区間の行（launch_row）を除く（アクセル側は除かない）。
-    x は accel が (N, 2)（車速・u）、brake が (N, 3)（車速・u・戻し量。2026-10-14 段2o-5）。"""
+    x は accel・brake とも (N, 3)（車速・u・戻し量。ブレーキ側は 2026-10-14 段2o-5、
+    アクセル側のアクセルの戻し量は 2026-10-20 段4-3）。"""
     xs, ys, gs, ts = [], [], [], []
     for g, r in enumerate(rows_list):
         if side == "accel":
@@ -167,8 +174,7 @@ def side_rows(
             if exclude_launch:
                 m = m & ~r.launch_row
         cols = [r.speed_kmh[m], r.u_pct[m]]
-        if side != "accel":
-            cols.append(r.release_pct[m])
+        cols.append(r.accel_release_pct[m] if side == "accel" else r.release_pct[m])
         xs.append(np.column_stack(cols))
         ys.append(r.accel_kmhs[m])
         gs.append(np.full(int(m.sum()), g))
@@ -408,9 +414,12 @@ def _agg(per_fold: dict[str, dict], how: str) -> dict[str, float]:
 # ─────────────────────────── 学習・集計 ───────────────────────────
 
 
-def _worker(args: tuple) -> tuple[int, int, np.ndarray, float, np.ndarray | None]:
+def _worker(
+    args: tuple,
+) -> tuple[int, int, np.ndarray, float, np.ndarray | None, np.ndarray | None]:
     """(分割番号, 乱数) 1 タスク。単調化前の配列・学習秒数・戻し量ごとの単調化前の配列
-    （cfg.release_slices でなければ None。2026-10-14 段2o-5）を返す。pickle できるようトップレベル。
+    （cfg.release_slices でなければ None。2026-10-14 段2o-5）・アクセルの戻し量ごとの単調化前の
+    配列（同じ条件で None。2026-10-20 段4-3）を返す。pickle できるようトップレベル。
     末尾の (学習ログごとの trace, DeadbandLag) は rollout_s > 0 のときだけ使う（省略可）。
     追加学習の info はここで表示する。"""
     cfg, fold_idx, seed, train_rows, like_path, max_iter, n_threads, *rest = args
@@ -439,7 +448,12 @@ def _worker(args: tuple) -> tuple[int, int, np.ndarray, float, np.ndarray | None
         if cfg.release_slices
         else None
     )
-    return fold_idx, seed, raw, time.perf_counter() - t0, rel
+    arel = (
+        raw_accel_release_slices(fm, like, RELEASE_GRID_PCT, coast_from=cfg.coast_from)
+        if cfg.release_slices
+        else None
+    )
+    return fold_idx, seed, raw, time.perf_counter() - t0, rel, arel
 
 
 @dataclass
@@ -495,7 +509,7 @@ def run_model_config(cfg: CvConfig, ctx: Context, workers: int, max_iter: int) -
             outs = list(ex.map(_worker, tasks))
     else:
         outs = [_worker(t) for t in tasks]
-    for fold_idx, seed, _, sec, _rel in outs:
+    for fold_idx, seed, _, sec, _rel, _arel in outs:
         print(f"    タスク 分割{fold_idx} 乱数{seed}: {sec:.1f} 秒", flush=True)
     per_fold: dict[str, dict] = {}
     for i, (_, held) in enumerate(ctx.fold_rows):

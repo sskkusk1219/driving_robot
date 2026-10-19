@@ -399,6 +399,11 @@ class LearningSection:
     stop_brake_floor_opening_tol_pct: float = 0.3  # 候補開度への一致とみなす許容誤差 [%]
     # コーストダウンの終了判定（段7c。pattern_loop の `_advance_coast`）に使う
     grid_settle_tol_kmh: float = 1.0  # 「落ち着いた」とみなす車速の許容幅 [km/h]
+    # 2026-10-20 段4-3: 手順2 の 2-3（学習用パターン＝FEL の補正表の学習走行）を走るか。
+    # true（既定）は今までと同じ（2-3 を走る）。false なら 2-3 を走らず、手順2 は 2-2 まで
+    # （約 43 → 32 分）。ユーザー決定 2026-10-20: 段4-3 で手順2 を走り直すときだけ false にする
+    # （補正表 fel.enabled は false で保留中。手順12 の学習用パターンは別に走れる）
+    fel_pattern_enabled: bool = True
 
 
 @dataclass

@@ -119,6 +119,13 @@ def test_c8_makes_model_pkl_and_stub_names_differ(tmp_path: Path) -> None:
     )
     table = load_forward_map(Path(result.model_path))
     assert table.kind == KIND_MODEL
+    # 2026-10-20 段4-3: 発進側・停止側の表は本体と同じ開度の元（指令）で読み、meta に残す。
+    # アクセルの戻し・停止側の戻しの層・ブレーキの戻しの 7.5〜20 km/h の秒数も meta にある
+    assert table.meta["side_table_opening_source"] == table.meta["opening_source"] == "cmd"
+    assert len(table.meta["stop_release_layer_s"]) == 5
+    assert table.meta["accel_release_rows_s"] >= 0.0 and "accel_release_max_pct" in table.meta
+    assert table.meta["brake_release_band_s"] >= 0.0
+    assert table.meta["brake_release_band_hi_kmh"] == 20.0
     assert "_stub" in Path(result.model_path).name
     assert cfg.source_path.read_text(encoding="utf-8") == before  # スタブは config を触らない
     # 先に作った C7 の表（格子と設定の元）も同じ場所に残る
@@ -135,7 +142,9 @@ def test_c8_stub_runs_every_check_and_shows_c8_seed_mae(
     result = pdmod.build_ff_model(
         cfg, _csv(tmp_path, cfg), hw_mode=hwmod.HW_STUB, pedal=PEDAL, **SMALL_C8
     )
-    assert [c.id for c in result.checks] == ["B1", "B3", "B4", "B5", "B6", "C1", "C2", "D1"]
+    assert [c.id for c in result.checks] == [
+        "B1", "B3", "B4", "B5", "B6", "C1", "C2", "D1", "I1",
+    ]
     by_id = {c.id: c for c in result.checks}
     assert by_id["C1"].status == "SKIP" and by_id["D1"].status == "SKIP"  # モード無し
     assert by_id["B1"].metrics["c8_mae"] > 0.0 and "ratio_mae" in by_id["B1"].metrics
@@ -273,3 +282,35 @@ def test_table_without_onset_keys_still_loads_and_inverts(tmp_path: Path) -> Non
     old = load_forward_map(path)
     assert "accel_onset_u_pct" not in old.meta and "brake_onset_u_pct" not in old.meta
     assert old.meta.get("accel_onset_u_pct") is None
+
+
+def test_side_tables_are_read_with_the_body_opening_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-20 段4-3: 発進側・停止側の行（keep_stopped=True で読む行）は、実開度ではなく
+    本体と同じ指令の開度で読む。動き出す開度も同じ元で測る。"""
+    cfg = _cfg_with(tmp_path, "C8")
+    seen: list[str] = []
+    orig = fwd_tool.read_logs
+
+    def spy(paths, st, **kw):
+        if kw.get("keep_stopped"):
+            seen.append(str(kw.get("opening_source")))
+        return orig(paths, st, **kw)
+
+    sources: list[str] = []
+    import tests.research.fwd_data as fdmod  # noqa: PLC0415
+
+    orig_bk = fdmod.launch_breakaway
+
+    def spy_bk(path, **kw):
+        sources.append(str(kw.get("opening_source")))
+        return orig_bk(path, **kw)
+
+    monkeypatch.setattr(fwd_tool, "read_logs", spy)
+    monkeypatch.setattr(fdmod, "launch_breakaway", spy_bk)
+    pdmod.build_ff_model(
+        cfg, _csv(tmp_path, cfg), hw_mode=hwmod.HW_STUB, pedal=PEDAL, **SMALL_C8
+    )
+    assert seen and set(seen) == {"cmd"}
+    assert sources == ["cmd"]

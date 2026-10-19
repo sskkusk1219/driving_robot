@@ -37,6 +37,10 @@ accel(v, u, release = u − m) = 要る加速度 を解く（u の格子点で�
 深いブレーキも m に入る（学習の戻し量が全時系列で計算されているのと同じ）。発進側の表を引いた
 時刻（基準が上がっているブレーキ）は戻しではないので解き直さない。release_grid が None の表は
 今までと完全に同じ（ベクトル化のまま）。
+2026-10-20 段4-3: 停止側の表を引いた時刻も、表が stop_release_accel（停止側の戻しの層）を持つとき
+は同じ手順で解き直す（その時刻は停止側の表と層で引く）。アクセルは、表が accel_release_grid を持つ
+とき、直近 RELEASE_WINDOW_S 秒の計画済みの u の最大 m からの戻り m − u を戻し量として、同じ
+やり方で時刻順に解き直す（`_resolve_accel_releases`）。
 """
 
 from __future__ import annotations
@@ -406,11 +410,25 @@ def build_plan(
 
     effort[stop] = -stop_brake_opening_pct
     flag[stop] = FLAG_STOP
-    if table.release_grid is not None and table.release_accel is not None:
-        redo = is_brake & ~stop
-        redo &= ~(launch_b | stop_b)  # 発進側・停止側の表で解いた時刻は戻しではない
+    body_release = table.release_grid is not None and table.release_accel is not None
+    # 2026-10-20 段4-3: 停止側の表で解いた時刻も、停止側の戻しの層があれば戻し量を見て解き直す
+    stop_release = table.stop_release_accel is not None and table.stop_release_grid is not None
+    if body_release or stop_release:
+        redo = np.zeros(n, dtype=bool)
+        if body_release:
+            redo |= is_brake & ~stop & ~(launch_b | stop_b)  # 発進側の表で解いた時刻は戻しではない
+        if stop_release:
+            redo |= is_brake & ~stop & stop_b & ~launch_b
         _resolve_releases(
-            effort, redo, u_b, v, need_b, table, brake_deadband_pct, accel_deadband_pct, period_s
+            effort, redo, u_b, v, need_b, table, brake_deadband_pct, accel_deadband_pct, period_s,
+            stop_side=stop_b,
+        )
+    if table.accel_release_grid is not None and table.accel_release_accel is not None:
+        # 2026-10-20 段4-3: アクセルの戻し量（直近の u の最大からの戻り）を見て解き直す。
+        # 発進側・停止側の表で解いた時刻は対象外（その表は戻し量を見ない）
+        redo_a = is_accel & ~stop & ~(launch_a | stop_a)
+        _resolve_accel_releases(
+            effort, redo_a, u_a, v, need_a, table, brake_deadband_pct, accel_deadband_pct, period_s
         )
     effort = np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)
     stats = None
@@ -740,9 +758,12 @@ def _resolve_releases(
     accel_deadband_pct: float,
     period_s: float,
     window_s: float = RELEASE_WINDOW_S,
+    stop_side: np.ndarray | None = None,
 ) -> None:
     """戻しの表があるとき、redo の時刻のブレーキを時刻順に解き直して effort を書き換える
-    （2026-10-14 段2o-5。手順はモジュールの docstring）。u_b0 は戻し量 0 で解いた u。"""
+    （2026-10-14 段2o-5。手順はモジュールの docstring）。u_b0 は戻し量 0 で解いた u。
+    stop_side（2026-10-20 段4-3）: True の時刻は停止側の表（と停止側の戻しの層）で引く。
+    None なら全部本体（今までと同じ）。"""
     w = max(int(round(window_s / period_s)), 1)
     # 計画済みの効く開度 u（アクセル＋・ブレーキ−。停車保持の深いブレーキも含む）
     u = np.where(
@@ -756,7 +777,11 @@ def _resolve_releases(
         if m >= 0.0 or float(u_b0[i]) <= m:
             continue  # 戻していない（直近の最小が 0 以上）か、戻し量 0 の解がすでに m より深い
         pts = np.concatenate([[m], grid[(grid > m) & (grid < 0.0)], [0.0]])
-        f = np.asarray(table.accel(float(v[i]), pts, release=pts - m), dtype=float) - need_b[i]
+        on_stop = stop_side is not None and bool(stop_side[i])
+        f = (
+            np.asarray(table.accel(float(v[i]), pts, release=pts - m, stop=on_stop), dtype=float)
+            - need_b[i]
+        )
         hit = np.flatnonzero(f >= 0.0)
         if len(hit) == 0:
             continue  # 完全に離しても要る加速度に届かない: 戻し量 0 の解のまま
@@ -770,6 +795,57 @@ def _resolve_releases(
         u_new = min(u_new, 0.0)
         u[i] = u_new
         effort[i] = -(brake_deadband_pct + abs(u_new))
+
+
+def _resolve_accel_releases(
+    effort: np.ndarray,
+    redo: np.ndarray,
+    u_a0: np.ndarray,
+    v: np.ndarray,
+    need_a: np.ndarray,
+    table: ForwardTable,
+    brake_deadband_pct: float,
+    accel_deadband_pct: float,
+    period_s: float,
+    window_s: float = RELEASE_WINDOW_S,
+) -> None:
+    """アクセルの戻しの表があるとき、redo の時刻のアクセルを時刻順に解き直して effort を書き換える
+    （2026-10-20 段4-3。`_resolve_releases` のアクセル版）。u_a0 は戻し量 0 で解いた u。
+
+    時刻 i の戻し量 ＝ 直近 window_s 秒（i の手前まで）の計画済みの u の最大 m − 新しい u。
+    m <= 0（直近にアクセルを踏んでいない）か、戻し量 0 の解がすでに m 以上（踏み増している）なら
+    そのまま。そうでなければ u を 0 から m まで動かし、accel(v, u, accel_release=m − u) ≧ need に
+    最初になる u（節の間は直線補間）を新しい u にする。戻していても要る加速度に届かないとき
+    （u = m でも届かない）は戻し量 0 の解のまま。
+    """
+    w = max(int(round(window_s / period_s)), 1)
+    u = np.where(
+        effort < -brake_deadband_pct,
+        effort + brake_deadband_pct,
+        np.where(effort > accel_deadband_pct, effort - accel_deadband_pct, 0.0),
+    )
+    grid = table.u_grid
+    for i in np.flatnonzero(redo):
+        m = float(u[max(i - w, 0) : i].max()) if i > 0 else 0.0
+        if m <= 0.0 or float(u_a0[i]) >= m:
+            continue  # 直近に踏んでいない、または踏み増している（戻していない）
+        pts = np.concatenate([[0.0], grid[(grid > 0.0) & (grid < m)], [m]])
+        f = (
+            np.asarray(table.accel(float(v[i]), pts, accel_release=m - pts), dtype=float)
+            - need_a[i]
+        )
+        hit = np.flatnonzero(f >= 0.0)
+        if len(hit) == 0:
+            continue  # 戻し量 0 の解のまま
+        j = int(hit[0])
+        if j == 0:
+            continue  # u = 0 でも届く: 戻し量 0 の解のまま（アクセルの行を 0 にしない）
+        f0, f1 = f[j - 1], f[j]
+        frac = 0.0 if f1 == f0 else float(np.clip(-f0 / (f1 - f0), 0.0, 1.0))
+        u_new = float(pts[j - 1] + frac * (pts[j] - pts[j - 1]))
+        u_new = max(u_new, 0.0)
+        u[i] = u_new
+        effort[i] = accel_deadband_pct + u_new
 
 
 def _lag(given: float | None, table: ForwardTable, key: str, default: float) -> float:

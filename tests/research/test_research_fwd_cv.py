@@ -235,14 +235,22 @@ def test_fit_one_info_without_rollout_returns_none_info():
     assert info is None and fm.accel_side is not None
 
 
-def test_side_rows_brake_has_release_column_accel_does_not():
-    """2026-10-14 段2o-5: ブレーキ側の入力は (車速, u, 戻し量) の 3 列、アクセル側は 2 列。"""
+def test_side_rows_both_sides_have_own_release_column():
+    """2026-10-14 段2o-5: ブレーキ側の入力は (車速, u, ブレーキの戻し量) の 3 列。
+    2026-10-20 段4-3: アクセル側も (車速, u, アクセルの戻し量) の 3 列。"""
     base = _rows()
-    r = FwdRows(**{**base.__dict__, "release_pct": np.array([0.0, 0.0, 0.0, 0.0, 1.5])})
+    r = FwdRows(
+        **{
+            **base.__dict__,
+            "release_pct": np.array([0.0, 0.0, 0.0, 0.0, 1.5]),
+            "accel_release_pct": np.array([0.0, 0.7, 0.0, 0.0, 0.0]),
+        }
+    )
     xb, _, _, _ = side_rows([r], "brake", coast_in_brake=True)
     xa, _, _, _ = side_rows([r], "accel", coast_in_brake=True)
-    assert xb.shape[1] == 3 and xa.shape[1] == 2
+    assert xb.shape[1] == 3 and xa.shape[1] == 3
     assert xb[:, 2].tolist() == [0.0, 0.0, 0.0, 1.5]  # u <= 0 の 4 行
+    assert xa[:, 2].tolist() == [0.7, 0.0, 0.0]  # u >= 0 の 3 行（添字 1・2・3）
 
 
 def test_side_rows_exclude_launch_only_on_brake_side():

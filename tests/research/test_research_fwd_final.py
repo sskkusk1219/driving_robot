@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 
 from tests.research.fwd_cv import CvConfig
-from tests.research.fwd_data import FwdRows, concat_rows, make_speed_edges, release_amount
+from tests.research.fwd_data import (
+    FwdRows,
+    accel_release_amount,
+    concat_rows,
+    make_speed_edges,
+    release_amount,
+)
 from tests.research.fwd_final import build_final_table, final_config
 from tests.research.fwd_map import KIND_MODEL, build_table, save_table
 from tests.research.test_research_fwd_model import make_rows
@@ -108,7 +114,13 @@ def test_final_table_with_finer_u_step(tmp_path):
     assert np.array_equal(tb0.u_grid, like.u_grid) and tb0.meta["u_step_pct"] == 2.0
 
 
-def make_release_rows(seed: int, source: str, n: int = 4000, release_gain: float = 0.0) -> FwdRows:
+def make_release_rows(
+    seed: int,
+    source: str,
+    n: int = 4000,
+    release_gain: float = 0.0,
+    accel_release_gain: float = 0.0,
+) -> FwdRows:
     """u がゆっくり揺れる時系列（0.05 秒刻み）。戻し量は release_amount で全系列から計算する。
     ブレーキが弱まる効き（release_gain × 戻し量 × |u|）を加速度に足す。"""
     rng = np.random.default_rng(seed)
@@ -116,7 +128,10 @@ def make_release_rows(seed: int, source: str, n: int = 4000, release_gain: float
     u = -3.0 + 8.0 * np.sin(t / 3.0 + seed) + rng.normal(0.0, 0.2, n)
     v = rng.uniform(10.0, 70.0, n)
     rel = release_amount(t, u, 3.0)
-    a = -2.0 - 0.01 * v + np.where(u >= 0, 0.3 * u, 0.6 * u + release_gain * rel * -u)
+    arel = accel_release_amount(t, u, 3.0)
+    a = -2.0 - 0.01 * v + np.where(
+        u >= 0, 0.3 * u - accel_release_gain * arel * u, 0.6 * u + release_gain * rel * -u
+    )
     return FwdRows(
         speed_kmh=v,
         u_pct=u,
@@ -126,6 +141,7 @@ def make_release_rows(seed: int, source: str, n: int = 4000, release_gain: float
         source=source,
         dt_row_s=np.full(n, 0.05),
         release_pct=rel,
+        accel_release_pct=arel,
     )
 
 
@@ -187,3 +203,37 @@ def test_final_config_brake_exclude_launch_default_on():
     assert final_config().brake_exclude_launch is True
     assert "brake_exclude_launch" not in final_config().key()
     assert not final_config(brake_exclude_launch=False).brake_exclude_launch
+
+
+def test_final_table_attaches_accel_release_slices(tmp_path):
+    """2026-10-20 段4-3: アクセルの戻し行が足りれば、アクセルの戻しの表が付く（行ごとに単調）。
+    u > 0 の列は戻し量で変わり（戻すと加速が弱い）、u < 0 の列は本体と同じ。"""
+    rows = [
+        make_release_rows(i, f"log{i}", release_gain=0.05, accel_release_gain=0.03)
+        for i in range(2)
+    ]
+    like = build_table(concat_rows(rows), speed_edges=make_speed_edges(80.0))
+    path = save_table(like, tmp_path / "like.pkl")
+    cfg = CvConfig("t", (6,), loss="absolute", seeds=(0, 1))
+    tb, _ = build_final_table(cfg, rows, path, workers=1, max_iter=30)
+    assert tb.accel_release_grid is not None
+    assert tb.accel_release_accel.shape == (len(tb.accel_release_grid), *tb.accel_grid.shape)
+    assert np.all(np.diff(tb.accel_release_accel, axis=2) >= -1e-9)
+    assert tb.meta["accel_release_rows_s"] >= 10.0 and tb.meta["accel_release_max_pct"] > 0.0
+    ug = tb.u_grid
+    pos = ug > 0
+    assert not np.allclose(tb.accel_release_accel[-1][:, pos], tb.accel_grid[:, pos])
+    assert np.allclose(tb.accel_release_accel[:, :, ug < 0], tb.accel_grid[None, :, ug < 0])
+    # release_slices=False ならアクセルの戻しの表も付かず、本体は変わらない
+    cfg_off = CvConfig("t", (6,), loss="absolute", seeds=(0, 1), release_slices=False)
+    tb_off, _ = build_final_table(cfg_off, rows, path, workers=1, max_iter=30)
+    assert tb_off.accel_release_grid is None and np.allclose(tb_off.accel_grid, tb.accel_grid)
+
+
+def test_final_table_without_accel_release_rows_has_no_accel_release_table(tmp_path):
+    rows = [make_rows(i, f"log{i}") for i in range(2)]  # アクセルの戻し量はすべて 0
+    like = build_table(concat_rows(rows), speed_edges=make_speed_edges(80.0))
+    path = save_table(like, tmp_path / "like.pkl")
+    cfg = CvConfig("t", (4,), loss="absolute", seeds=(0,))
+    tb, _ = build_final_table(cfg, rows, path, workers=1, max_iter=3)
+    assert tb.accel_release_grid is None and tb.meta["accel_release_rows_s"] == 0.0

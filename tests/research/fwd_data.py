@@ -100,11 +100,17 @@ class FwdRows:
     # （発進は戻しではなく attach_launch の別の表が受け持つ）。read_fwd_rows が mark_launch=True で
     # 作る。省略（長さ 0）なら全行 False
     launch_row: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    # 2026-10-20 段4-3: 各行の「アクセルの戻し量」[%]。直近 RELEASE_WINDOW_S 秒（その行を含む）の
+    # u の最大からの戻り量で、u > 0 の行だけ正（最大 − u）、それ以外は 0（accel_release_amount）。
+    # 省略（長さ 0）なら全行 0
+    accel_release_pct: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
     def __post_init__(self) -> None:
         n = len(self.speed_kmh)
         if len(self.release_pct) == 0 and n > 0:
             object.__setattr__(self, "release_pct", np.zeros(n))
+        if len(self.accel_release_pct) == 0 and n > 0:
+            object.__setattr__(self, "accel_release_pct", np.zeros(n))
         if len(self.launch_row) == 0 and n > 0:
             object.__setattr__(self, "launch_row", np.zeros(n, dtype=bool))
 
@@ -144,6 +150,27 @@ def release_amount(
             continue
         win = u[start : i + 1]
         out[i] = u[i] - float(np.nanmin(win))
+    return out
+
+
+def accel_release_amount(
+    t_s: np.ndarray, u_pct: np.ndarray, window_s: float = RELEASE_WINDOW_S
+) -> np.ndarray:
+    """アクセルの戻し量 [%]（2026-10-20 段4-3。release_amount のアクセル版）。1 本の連続した時系列
+    （時刻昇順）について、各点の「直近 window_s 秒（その点を含む）の u の最大からの戻り量」を、
+    u > 0 の点だけ 最大 − u として返す（u <= 0 の点は 0）。u が NaN の点は最大の計算から外す
+    （その点自身の戻し量は 0）。例: u = 6 から 4 へ戻した点は 2、6 のままなら 0。
+    """
+    t = np.asarray(t_s, dtype=float)
+    u = np.asarray(u_pct, dtype=float)
+    out = np.zeros(len(t))
+    start = 0
+    for i in range(len(t)):
+        while t[start] < t[i] - window_s - 1e-9:
+            start += 1
+        if not (u[i] > 0.0):  # NaN も含めて 0
+            continue
+        out[i] = float(np.nanmax(u[start : i + 1])) - u[i]
     return out
 
 
@@ -269,6 +296,7 @@ def read_fwd_rows(
     acc_o: list[float] = []
     t_o: list[float] = []
     rel_o: list[float] = []
+    arel_o: list[float] = []
     secs: set[str] = set()
     all_dt: list[float] = []
     for seg in segments:
@@ -287,6 +315,7 @@ def read_fwd_rows(
                 if uf is not None:
                     u_full[i] = uf
         rel_full = release_amount(ts, u_full)
+        arel_full = accel_release_amount(ts, u_full)
         for i, (_t, v, ap, bp, gov, _s, lagged) in enumerate(seg):
             if ap is None or bp is None:
                 dropped[DROP_NO_OPENING] += 1
@@ -324,6 +353,7 @@ def read_fwd_rows(
             acc_o.append(float(slope[j]))
             t_o.append(float(t_keep[j]))
             rel_o.append(float(rel_full[i]))
+            arel_o.append(float(arel_full[i]))
             secs.add(seg[i][5])
     dt = float(np.median(all_dt)) if all_dt else 0.0
     n = len(speed_o)
@@ -338,6 +368,7 @@ def read_fwd_rows(
         sections=tuple(sorted(secs)),
         dt_row_s=np.full(n, dt),
         release_pct=np.array(rel_o, dtype=float),
+        accel_release_pct=np.array(arel_o, dtype=float),
     )
     if mark_launch and not keep_stopped and n > 0:
         la = read_fwd_rows(
@@ -394,6 +425,7 @@ def take_rows(rows: FwdRows, mask: np.ndarray) -> FwdRows:
         dt_row_s=rows.dt_row_s[m],
         release_pct=rows.release_pct[m],
         launch_row=rows.launch_row[m],
+        accel_release_pct=rows.accel_release_pct[m],
     )
 
 
@@ -473,8 +505,13 @@ def launch_breakaway(
     brake_min_pct: float,
     brake_lag_s: float,
     min_speed_kmh: float = STOP_SPEED_KMH,
+    opening_source: str = OPENING_ACTUAL,
 ) -> Breakaway | None:
     """「動き出す開度」を CSV から求める（2026-10-18 段2o-10）。
+
+    opening_source（2026-10-20 段4-3）: ブレーキの開度を実開度（"actual"。既定）で読むか、最終指令
+    （"cmd"）で読むか。発進側・停止側の表を指令の開度で作るときは、動き出す開度も同じ指令の
+    開度で測る（表の u の軸と同じ量にそろえる）。
 
     - RAMP_LAUNCH_RELEASE 区間（PATTERN_DRIVE。途切れない連続した行）ごとに、区間の始まり以降で
       実車速が min_speed_kmh 以上になった最初の行の時刻 t_move を探し、(t_move − brake_lag_s)
@@ -494,7 +531,10 @@ def launch_breakaway(
     for r in rows:
         t = _num(r.get("elapsed_s"))
         v = _num(r.get("actual_speed_kmh"))
-        b = actual_opening(r, "brake")
+        if opening_source == OPENING_CMD:
+            b = _cmd_or_none(r, "brake")
+        else:
+            b = actual_opening(r, "brake")
         if t is None or v is None or b is None:
             continue
         t_all.append(t)
@@ -570,6 +610,7 @@ def concat_rows(parts: Sequence[FwdRows], source: str = "") -> FwdRows:
         dt_row_s=dt_row,
         release_pct=cat("release_pct"),
         launch_row=cat("launch_row").astype(bool),
+        accel_release_pct=cat("accel_release_pct"),
     )
 
 

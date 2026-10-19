@@ -79,11 +79,10 @@ def fitted(logs):
 def test_fit_recovers_quadratic_surface(fitted):
     v = np.array([10.0, 40.0, 70.0, 25.0])
     u = np.array([5.0, 15.0, 2.0, -12.0])
-    x = np.column_stack([v, u])
-    x3 = np.column_stack([v, u, np.zeros_like(v)])  # ブレーキ側は 3 列（戻し量 0）
+    x3 = np.column_stack([v, u, np.zeros_like(v)])  # 両側とも 3 列（戻し量 0）
     for name in (NAME_LINEAR, NAME_RIDGE):
         f = fitted[name]
-        side = np.where(u >= 0, f.accel_side.predict(x), f.brake_side.predict(x3))
+        side = np.where(u >= 0, f.accel_side.predict(x3), f.brake_side.predict(x3))
         assert np.allclose(side, true_accel(v, u), atol=0.05), name
     assert fitted[NAME_RIDGE].alpha in (0.01, 0.1, 1.0, 10.0, 100.0)
     assert fitted[NAME_MLP].hidden == (10,)
@@ -102,9 +101,8 @@ def test_grid_copies_like_and_zero_is_mean(fitted, like):
     assert np.array_equal(tb.u_grid, like.u_grid)
     j0 = int(np.argmin(np.abs(tb.u_grid)))
     rep = tb.speed_rep
-    x = np.column_stack([rep, np.zeros_like(rep)])
     x3 = np.column_stack([rep, np.zeros_like(rep), np.zeros_like(rep)])
-    mean0 = (f.accel_side.predict(x) + f.brake_side.predict(x3)) / 2.0
+    mean0 = (f.accel_side.predict(x3) + f.brake_side.predict(x3)) / 2.0
     assert np.allclose(tb.accel_before_mono[:, j0], mean0)
     assert tb.meta["model_name"] == NAME_LINEAR
 
@@ -143,8 +141,9 @@ def test_default_unchanged_and_coast_from_accel(fitted, like):
     assert np.array_equal(tb.accel_before_mono, raw_grid(f, like))
     tb2 = model_to_grid(f, like, coast_from="accel")
     j0 = int(np.argmin(np.abs(tb2.u_grid)))
-    x = np.column_stack([tb2.speed_rep, np.zeros_like(tb2.speed_rep)])
-    assert np.allclose(tb2.accel_before_mono[:, j0], f.accel_side.predict(x))
+    z = np.zeros_like(tb2.speed_rep)
+    x3 = np.column_stack([tb2.speed_rep, z, z])
+    assert np.allclose(tb2.accel_before_mono[:, j0], f.accel_side.predict(x3))
     with pytest.raises(ValueError):
         raw_grid(f, like, coast_from="x")
 
@@ -206,7 +205,7 @@ def test_brake_side_has_three_inputs_and_release_slices_follow_main(like):
     rows = [make_release_rows(i, f"r{i}", release_gain=0.05) for i in range(2)]
     fs = fit_models(rows, mlp_max_iter=30)
     for name in (NAME_LINEAR, NAME_RIDGE, NAME_MLP):
-        assert fs[name].accel_side.predict(np.zeros((1, 2))).shape == (1,)
+        assert fs[name].accel_side.predict(np.zeros((1, 3))).shape == (1,)  # 段4-3: 3 入力
         assert fs[name].brake_side.predict(np.zeros((1, 3))).shape == (1,)
     f = fs[NAME_RIDGE]
     grid = (0.5, 1.0, 4.0)

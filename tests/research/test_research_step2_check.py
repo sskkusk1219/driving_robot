@@ -347,3 +347,32 @@ def test_format_checks_lists_every_item() -> None:
     ]
     text = sc.format_checks(items)
     assert "X1" in text and "X2" in text and "SKIP" in text and "a=1.5000" in text
+
+
+def test_i1_table_extras_is_informational_and_reports_seconds() -> None:
+    """2026-10-20 段4-3: 表の作り方のお知らせ。開度の元・停止側の戻しの層の秒数・アクセルの戻しの
+    秒数と頭打ち・ブレーキの戻しの 7.5〜20 km/h の秒数。NG にしない。"""
+    t = _table(
+        side_table_opening_source="cmd",
+        stop_release_layer_s=[0.0, 3.5, 0.0, 1.0, 0.0],
+        stop_release_grid_pct=[0.5, 1.0, 2.0, 4.0, 8.0],
+        accel_release_rows_s=41.5,
+        accel_release_max_pct=2.25,
+        brake_release_band_s=4.0,
+        brake_release_band_lo_kmh=7.5,
+        brake_release_band_hi_kmh=20.0,
+    )
+    item = sc.check_table_extras(t, None)
+    assert item.id == "I1" and item.status == sc.STATUS_OK
+    assert "cmd" in item.value and "1%:3.5s" in item.value and "4%:1.0s" in item.value
+    assert "41.5s" in item.value and "2.25%" in item.value and "7.5〜20 km/h 4.0s" in item.value
+    assert item.metrics["stop_release_total_s"] == pytest.approx(4.5)
+    assert item.metrics["accel_release_rows_s"] == pytest.approx(41.5)
+    assert item.metrics["accel_release_max_pct"] == pytest.approx(2.25)
+    assert item.metrics["brake_release_band_s"] == pytest.approx(4.0)
+    # 古い pkl（meta にキーが無い）でも落ちず、NG にもならない
+    old = sc.check_table_extras(_table(), None)
+    assert old.status == sc.STATUS_OK and "なし" in old.value
+    assert sc.check_table_extras(None, None).status == sc.STATUS_SKIP
+    # 判定の対象に入っていない（しきい値なし）
+    assert sc._judge("I1", item.metrics) == sc.STATUS_OK

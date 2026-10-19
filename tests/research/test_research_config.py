@@ -1170,3 +1170,22 @@ def test_coast_settings_are_loaded_from_yaml_and_validated(tmp_path: Path) -> No
         cfg = cfgmod.load_config(path)
         setattr(cfg.forward_map, name, bad)
         assert any(f"forward_map.{name}" in p for p in cfgmod.validate_config(cfg)), (name, bad)
+
+
+def test_fel_pattern_enabled_is_loaded_from_yaml_and_defaults_to_true(tmp_path: Path) -> None:
+    """2026-10-20 段4-3: 手順2 の 2-3（学習用パターン）を走るか。既定 true ＝ 今までと同じ。"""
+    cfg = _load_default()
+    assert cfg.learning.fel_pattern_enabled is True
+    assert cfgmod.LearningSection().fel_pattern_enabled is True
+    text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    assert "  fel_pattern_enabled: true\n" in text
+    off = tmp_path / "off.yaml"
+    off.write_text(
+        text.replace("  fel_pattern_enabled: true\n", "  fel_pattern_enabled: false\n"),
+        encoding="utf-8",
+    )
+    assert cfgmod.load_config(off).learning.fel_pattern_enabled is False
+    # キーが無い yaml は既定の true
+    none = tmp_path / "none.yaml"
+    none.write_text(text.replace("  fel_pattern_enabled: true\n", ""), encoding="utf-8")
+    assert cfgmod.load_config(none).learning.fel_pattern_enabled is True

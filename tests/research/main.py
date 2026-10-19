@@ -425,6 +425,13 @@ async def step2_pattern_drive(ctx: RunContext) -> None:
     # ここには来ない（学習の走りは走らない）。スタブは yaml を書かないので、2-2 が作った pkl の
     # パスを直接渡す
     say()
+    if not ctx.config.learning.fel_pattern_enabled:
+        # 2026-10-20 段4-3: 設定で 2-3 を走らない（ユーザー決定。約 43 → 32 分。pkl は 2-2 のまま）
+        say("2-3. 学習用パターン（FEL）: 走らない（learning.fel_pattern_enabled: false）。"
+            "補正表は付けません（手順12 で後から走れます）")
+        say()
+        say("手順 2 完了。次は手順 3（FF のみで WLTP モード走行）です。")
+        return
     say(f"2-3. 学習用パターン（FEL。手順3 と同じ候補 {candidate} で走り、"
         f"補正表を {built.model_path} に付ける）")
     fel_run = _prepare_fel_run(ctx.config, built.model_path, cover_modes, top_cap)

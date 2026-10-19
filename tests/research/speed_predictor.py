@@ -235,7 +235,12 @@ class SpeedFilterPredictor:
         u_d = dl[0]
         low = launch or stop
         release = 0.0 if low else self.dob.release_at(tau, u_d)
-        if release > 0.0:
+        a_release = 0.0 if low else self.dob.accel_release_at(tau, u_d)
+        if a_release > 0.0:
+            a = float(
+                self.table.accel(v, u_d, launch=False, stop=False, accel_release=a_release)
+            )
+        elif release > 0.0:
             a = float(self.table.accel(v, u_d, launch=False, stop=False, release=release))
         else:
             a = float(self.table.accel(v, u_d, launch=launch, stop=stop))

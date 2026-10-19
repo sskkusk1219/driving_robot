@@ -117,6 +117,8 @@ class FelRows:
     kind: np.ndarray  # 予測に引いた表: KIND_*
     release: np.ndarray  # 戻し量 [%]（ブレーキの行だけ。ほかは 0）
     dt_s: float = DT_S
+    # アクセルの戻し量 [%]（アクセルの行だけ。ほかは 0。2026-10-20 段4-3）。None ＝ 使わない
+    accel_release: np.ndarray | None = None
 
     def __len__(self) -> int:
         return len(self.r)
@@ -171,13 +173,22 @@ def _trailing_min(x: np.ndarray, k: int) -> np.ndarray:
 
 
 def _predict(
-    table: ForwardTable, v: np.ndarray, u: np.ndarray, kind: np.ndarray, release: np.ndarray
+    table: ForwardTable,
+    v: np.ndarray,
+    u: np.ndarray,
+    kind: np.ndarray,
+    release: np.ndarray,
+    accel_release: np.ndarray | None = None,
 ) -> np.ndarray:
-    """行ごとの表の予測（kind で停止側・発進側・戻し・本体を引き分ける）。"""
+    """行ごとの表の予測（kind で停止側・発進側・戻し・本体を引き分ける）。
+    停止側は、表が停止側の戻しの層を持つときだけ戻し量を渡す（2026-10-20 段4-3。持たなければ
+    今までと同じ）。本体は accel_release（アクセルの戻し量）を渡す（表がアクセルの戻しの表を
+    持たなければ無視される）。"""
     pred = np.zeros(len(v))
     m = kind == KIND_STOP
     if m.any():
-        pred[m] = table.accel(v[m], u[m], stop=True)
+        stop_rel = release[m] if table.stop_release_accel is not None else None
+        pred[m] = table.accel(v[m], u[m], stop=True, release=stop_rel)
     m = kind == KIND_LAUNCH
     if m.any():
         pred[m] = table.accel(v[m], u[m], launch=True)
@@ -186,13 +197,14 @@ def _predict(
         pred[m] = table.accel(v[m], u[m], release=release[m])
     m = kind == KIND_MAIN
     if m.any():
-        pred[m] = table.accel(v[m], u[m])
+        arel = None if accel_release is None else accel_release[m]
+        pred[m] = table.accel(v[m], u[m], accel_release=arel)
     return pred
 
 
 def predict_rows(table: ForwardTable, rows: FelRows) -> np.ndarray:
     """rows の各行を table で予測し直した加速度（走行と同じ引き方）。"""
-    return _predict(table, rows.v, rows.u, rows.kind, rows.release)
+    return _predict(table, rows.v, rows.u, rows.kind, rows.release, rows.accel_release)
 
 
 def fel_rows(
@@ -232,6 +244,7 @@ def fel_rows(
     u = np.where(pedal > 0, ua, np.where(pedal < 0, -ub, 0.0))
     k = int(round(RELEASE_WINDOW_S / dt_s))
     release = np.where(pedal < 0, u - _trailing_min(u, k), 0.0)
+    accel_release = np.where(pedal > 0, -_trailing_min(-u, k) - u, 0.0)  # 段4-3
 
     refv = np.nan_to_num(ref, nan=0.0)
     stop_soon = np.zeros(n, bool)
@@ -251,7 +264,7 @@ def fel_rows(
     )
 
     vv = np.nan_to_num(v, nan=0.0)
-    pred = _predict(table, vv, u, kind, release)
+    pred = _predict(table, vv, u, kind, release, accel_release)
     r = acc - pred
 
     sw = np.concatenate([[False], pedal[1:] != pedal[:-1]])
@@ -268,6 +281,7 @@ def fel_rows(
     return FelRows(
         r=r[ok], pedal=pedal[ok].astype(int), v=v[ok], u=u[ok], rel=rel[ok], stop20=stop20[ok],
         acc=acc[ok], kind=kind[ok].astype(int), release=release[ok], dt_s=dt_s,
+        accel_release=accel_release[ok],
     )
 
 

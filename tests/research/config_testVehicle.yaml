@@ -581,6 +581,11 @@ learning:
   coast_curve_low_min_bin_samples: 5    # 低速ビンの最少サンプル数
   # コーストダウンの終了判定（段7c。pattern_loop の _advance_coast）に使う許容幅
   grid_settle_tol_kmh: 1.0              # 「落ち着いた」とみなす車速の許容幅 [km/h]
+  # 2026-10-20 段4-3: 手順2 の 2-3（学習用パターン＝FEL の補正表の学習走行）を走るか。
+  # true は今までと同じ（2-3 を走る）。false なら 2-3 を走らず手順2 は 2-2 まで（約 43 → 32 分）。
+  # ユーザー決定 2026-10-20: 段4-3 で手順2 を走り直すときだけ、yaml のコピーで false にする
+  # （補正表 fel.enabled は false で保留中。手順12 の学習用パターンは別に走れる）
+  fel_pattern_enabled: true
 
 # ── ペダル探索（手順 2-0。クリープ車速と停車保持開度を測る） ────────
 #   両ペダルを vehicle.min_*_opening_pct（待機位置）に置き、クリープ車速が落ち着くのを待つ。

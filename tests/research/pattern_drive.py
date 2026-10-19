@@ -1011,8 +1011,14 @@ def _attach_low_speed_tables(
       停止側 … PRE_DRIVE_CHECK/BRAKE_STEP・PEDAL_SEARCH/BRAKE_SEARCH・PATTERN_DRIVE の停車の手前の
                行（`stop_approach_rows`・停車まぎわの強いブレーキ `stop_approach_mask`）・
                CREEP_WAIT の u = 0 の行
-    読み方は実開度・ずれ許容なし・停車の行を残す・窓 LAUNCH_ACCEL_WINDOW_S（従来の発進側と同じ）。
-    「動き出す開度」は CSV の RAMP_LAUNCH_RELEASE（無ければ BRAKE_SEARCH）から求める。
+    読み方は本体と同じ開度の元（`st.opening_source` ＝ 指令。2026-10-20 段4-3 まで実開度）・
+    ずれ許容なし・停車の行を残す・窓 LAUNCH_ACCEL_WINDOW_S（従来の発進側と同じ）。表を引く制御は
+    指令の開度を出すので、表の u の軸も指令にそろえる（発進の直後は実開度が指令より遅れる）。
+    「動き出す開度」は CSV の RAMP_LAUNCH_RELEASE（無ければ BRAKE_SEARCH）から求める（開度の元は
+    同じ）。
+    停止側には戻し量ごとの層（stop_release_accel。`attach_stop_release`）も付ける。層に使う行は
+    停止側の行（上）に加えて、PATTERN_DRIVE の低速のブレーキの行（停車まぎわでなくても、戻し量を
+    持つ行。発進の区間でブレーキを離している行を含む）。
     クリープ車速が 0 以下の車は両方とも作らない（None）。
     """
     from tests.research import fwd_tool  # noqa: PLC0415
@@ -1029,12 +1035,16 @@ def _attach_low_speed_tables(
         stop_approach_rows,
         take_rows,
     )
-    from tests.research.fwd_map import attach_launch, attach_stop  # noqa: PLC0415
+    from tests.research.fwd_map import (  # noqa: PLC0415
+        attach_launch,
+        attach_stop,
+        attach_stop_release,
+    )
 
     def read(sections: Sequence[str], phases: Sequence[str] | None = None) -> Any:
         extra: dict[str, Any] = {} if phases is None else {"phases": tuple(phases)}
         (rows,) = fwd_tool.read_logs(
-            [csv_path], st, opening_source="actual", actuator_lag_tol_pct=None,
+            [csv_path], st, opening_source=st.opening_source, actuator_lag_tol_pct=None,
             keep_stopped=True, accel_window_s=LAUNCH_ACCEL_WINDOW_S, sections=tuple(sections),
             **extra,
         )
@@ -1063,7 +1073,7 @@ def _attach_low_speed_tables(
     min_speed = STOP_SPEED_KMH if creep_launch_min_speed_kmh is None else creep_launch_min_speed_kmh
     breakaway = launch_breakaway(
         csv_path, brake_min_pct=st.brake_deadband_pct, brake_lag_s=st.brake_lag_s,
-        min_speed_kmh=min_speed,
+        min_speed_kmh=min_speed, opening_source=st.opening_source,
     )
     table = attach_launch(
         table, launch_rows, creep_speed_kmh=creep_speed_kmh, breakaway=breakaway,
@@ -1072,6 +1082,15 @@ def _attach_low_speed_tables(
     table = attach_stop(
         table, stop_rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=LAUNCH_ACCEL_WINDOW_S
     )
+    # 2026-10-20 段4-3: 停止側の戻し量ごとの層。停止側の行に、PATTERN_DRIVE の低速のブレーキの行
+    # （動いている・u < 0。車速は attach_stop_release が stop_max_speed_kmh 未満に絞る。
+    # 発進の区間でブレーキを離している行を含む）を足す。停車の手前の行は 1 回だけ数える
+    near_or_brake = near_stop | ((pattern.u_pct < 0.0) & (pattern.speed_kmh >= STOP_SPEED_KMH))
+    stop_release_rows = concat_rows(
+        [brake_step, brake_search, take_rows(pattern, near_or_brake)], "stop_release"
+    )
+    table = attach_stop_release(table, stop_release_rows, creep_speed_kmh=creep_speed_kmh)
+    table.meta["side_table_opening_source"] = st.opening_source
     if creep_speed_kmh <= 0.0:
         say("  発進側・停止側: クリープ車速が 0 なので作らない")
     if table.launch_accel is None:
@@ -1090,6 +1109,18 @@ def _attach_low_speed_tables(
         say(f"  停止側: 動いている行 {table.meta['stop_rows_s']:.1f} 秒、置き換えた車速の行 "
             f"{[round(x, 2) for x in table.meta['stop_speed_rows']]} km/h"
             f"（引く車速の上限 {table.meta['stop_max_speed_kmh']:g} km/h）")
+        layer_s = table.meta.get("stop_release_layer_s", [])
+        built = table.meta.get("stop_release_layer_built", [])
+        grid = table.meta.get("stop_release_grid_pct", [])
+        if table.stop_release_accel is None:
+            say(f"  停止側の戻しの層: 作らない（層ごとの秒数 {[round(x, 1) for x in layer_s]}）")
+        else:
+            cells = ", ".join(
+                f"{g:g}%: {sec:.1f}秒{'' if ok else '(行不足で一つ下の層)'}"
+                for g, sec, ok in zip(grid, layer_s, built, strict=True)
+            )
+            say(f"  停止側の戻しの層: {cells}、頭打ち {table.meta['stop_release_max_pct']:.2f}%")
+    say(f"  発進側・停止側の表の開度の元: {st.opening_source}")
     return table
 
 
@@ -1112,7 +1143,12 @@ def _build_forward_model(
     測れたペダルだけ表に入れる（C7 の表を作るときと同じ）。
     """
     from tests.research import fwd_final, fwd_tool, fwd_torch  # noqa: PLC0415
-    from tests.research.fwd_map import load_forward_map, save_table  # noqa: PLC0415
+    from tests.research.fwd_map import (  # noqa: PLC0415
+        LOW_RELEASE_BAND_MAX_KMH,
+        load_forward_map,
+        release_seconds_in_band,
+        save_table,
+    )
 
     say("順モデル（C8）: まず C7 の表を作り（格子と設定の元）、続けてニューラルネットを学習 …")
     like = _build_table_model(
@@ -1153,6 +1189,22 @@ def _build_forward_model(
         say(f"  戻しの表: 戻し量 0.3% 以上のブレーキの行 {rel_s:.1f} 秒、"
             f"戻し量の格子 {[float(x) for x in table.release_grid]} %、"
             f"頭打ち {table.meta['release_max_pct']:.2f} %")
+    # 2026-10-20 段4-3: アクセルの戻しの表（build_final_table が付ける）と、7.5〜20 km/h の
+    # ブレーキの戻しの行の秒数（表示だけ。表の作り方には使わない）
+    a_rel_s = float(table.meta.get("accel_release_rows_s", 0.0))
+    if table.accel_release_grid is None:
+        say(f"  アクセルの戻しの表: 戻しの行が足りないので作らない（{a_rel_s:.1f} 秒）")
+    else:
+        say(f"  アクセルの戻しの表: 戻し量 0.3% 以上のアクセルの行 {a_rel_s:.1f} 秒、"
+            f"戻し量の格子 {[float(x) for x in table.accel_release_grid]} %、"
+            f"頭打ち {table.meta['accel_release_max_pct']:.2f} %")
+    band_lo = float(table.meta.get("stop_max_speed_kmh", 0.0)) or 7.5
+    band_s = sum(release_seconds_in_band(r, band_lo) for r in rows)
+    table.meta["brake_release_band_lo_kmh"] = band_lo
+    table.meta["brake_release_band_hi_kmh"] = LOW_RELEASE_BAND_MAX_KMH
+    table.meta["brake_release_band_s"] = band_s
+    say(f"  戻しの行 {band_lo:g}〜{LOW_RELEASE_BAND_MAX_KMH:g} km/h（ブレーキ・戻し量 0.3% 以上）: "
+        f"{band_s:.1f} 秒")
     _attach_onsets(table, profile, csv_path)
     _attach_returns(table, csv_path)
     path = save_table(table, _forward_pkl_path(models_dir, "fwd_model", hw_mode))

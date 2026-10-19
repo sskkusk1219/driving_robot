@@ -40,6 +40,7 @@ from tests.research.fwd_data import FwdRows
 from tests.research.fwd_map import (
     RELEASE_GRID_PCT,
     ForwardTable,
+    attach_accel_release,
     attach_release,
     load_forward_map,
     refine_u_grid,
@@ -204,6 +205,23 @@ def build_final_table(
             dt_row_s=np.concatenate(rel_dt) if rel_dt else np.zeros(0),
             release_grid=RELEASE_GRID_PCT,
         )
+    if cfg.release_slices and all(o[5] is not None for o in outs):
+        # 2026-10-20 段4-3: アクセルの戻しの表。ブレーキの戻しの表と同じ流れ。アクセルの行
+        # （u > 0。停車まぎわ除外は u <= 閾値の行だけを外すのでアクセルの行は変わらない）の
+        # アクセルの戻し量で accel_release_max_pct と秒数を決め、足りなければ付けない
+        arel_p, arel_dt = [], []
+        for r in train_rows:
+            m = r.u_pct > 0.0
+            arel_p.append(r.accel_release_pct[m])
+            arel_dt.append(r.dt_row_s[m])
+        aslices = monotone_rows(np.mean([o[5] for o in outs], axis=0), like.u_grid)
+        tb = attach_accel_release(
+            tb,
+            aslices,
+            release_pct=np.concatenate(arel_p) if arel_p else np.zeros(0),
+            dt_row_s=np.concatenate(arel_dt) if arel_dt else np.zeros(0),
+            release_grid=RELEASE_GRID_PCT,
+        )
     return tb, [(o[1], o[3]) for o in outs]
 
 
@@ -284,6 +302,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"- 戻しの表: {'あり' if tb.release_grid is not None else 'なし'}"
         f"（戻し量 0.3% 以上のブレーキの行 {tb.meta.get('release_rows_s', 0.0):.1f} 秒、"
         f"release_max_pct {tb.meta.get('release_max_pct', 0.0):.2f}%）"
+    )
+    print(
+        f"- アクセルの戻しの表: {'あり' if tb.accel_release_grid is not None else 'なし'}"
+        f"（戻し量 0.3% 以上のアクセルの行 {tb.meta.get('accel_release_rows_s', 0.0):.1f} 秒、"
+        f"accel_release_max_pct {tb.meta.get('accel_release_max_pct', 0.0):.2f}%）"
     )
     moved = float(np.abs(tb.accel_grid - tb.accel_before_mono).max())
     print(

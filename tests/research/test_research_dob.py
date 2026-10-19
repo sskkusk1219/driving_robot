@@ -172,3 +172,46 @@ def test_brake_prediction_uses_release_amount_like_the_plan() -> None:
     plain = _obs()
     _run(plain, 5, u=-10.0)  # release の引数を持たない表でも動く（窓 0）
     assert plain.n_brake > 0
+
+
+class _AccelReleaseTable(_Table):
+    """アクセルの戻しの表つき: アクセルの戻し量 r だけ加速が弱まる（a ＝ 本体 − 0.1r）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[float | None, float | None]] = []
+
+    def accel(self, v: float, u: float, *, launch: bool = False, stop: bool = False,
+              release: float | None = None, accel_release: float | None = None) -> float:
+        self.calls.append((release, accel_release))
+        return super().accel(v, u) - 0.1 * (accel_release or 0.0)
+
+
+def test_accel_prediction_uses_accel_release_amount() -> None:
+    """2026-10-20 段4-3: アクセルを戻している間は、アクセルの戻し量（窓の u の最大 − 遅れた u）
+    で表を引く。踏み増し・保持・窓 0（既定）では accel_release を渡さない（今までと同じ）。"""
+    tb = _AccelReleaseTable()
+    obs = PedalDisturbanceObserver(
+        tb, tq_accel_s=1.0, tq_brake_s=1.0, lag_accel_s=0.0, lag_brake_s=0.0,
+        release_window_s=1.0,
+    )
+    args = {"governed": False, "at_limit_now": False, "launch": False, "stop": False}
+    t, v = 0.0, 50.0
+    for _ in range(5):  # +10 で踏んでから
+        obs.update(t=t, speed_kmh=v, u_now=10.0, **args)  # type: ignore[arg-type]
+        t += DT
+    assert all(c[1] is None for c in tb.calls)  # 保持の間は渡さない
+    tb.calls.clear()
+    obs.update(t=t, speed_kmh=v, u_now=6.0, **args)  # type: ignore[arg-type]
+    assert tb.calls[-1][1] == pytest.approx(4.0)  # 10 − 6
+    assert tb.calls[-1][0] is None  # ブレーキの戻し量は渡さない
+    assert obs.accel_release_at(t, 6.0) == pytest.approx(4.0)
+    assert obs.accel_release_at(t, -3.0) == 0.0  # ブレーキの u には 0
+    # 窓 0（既定）は渡さない
+    tb2 = _AccelReleaseTable()
+    off = PedalDisturbanceObserver(
+        tb2, tq_accel_s=1.0, tq_brake_s=1.0, lag_accel_s=0.0, lag_brake_s=0.0
+    )
+    for u in (10.0, 10.0, 6.0):
+        off.update(t=t, speed_kmh=v, u_now=u, **args)  # type: ignore[arg-type]
+        t += DT
+    assert all(c[1] is None for c in tb2.calls)

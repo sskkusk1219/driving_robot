@@ -17,6 +17,7 @@ from tests.research.fwd_data import (
     DROP_REASONS,
     DROP_STOPPED,
     FwdRows,
+    accel_release_amount,
     cell_counts,
     concat_rows,
     effective_opening,
@@ -533,3 +534,60 @@ def test_stop_approach_rows_only_moving_rows_shortly_before_a_stop() -> None:
     t3[5:] += 10.0
     rows3 = synth_launch_rows(speed, [-3.0] * len(speed), [-1.0] * len(speed), t=t3)
     assert not stop_approach_rows(rows3, lookahead_s=3.0, gap_s=1.5).any()
+
+
+# ───────── 2026-10-20 段4-3: アクセルの戻し量 ─────────
+
+
+def test_accel_release_amount_is_distance_from_recent_max_for_positive_u() -> None:
+    t = np.arange(8) * 1.0
+    u = np.array([0.0, 2.0, 6.0, 6.0, 4.0, 3.0, 3.0, 3.0])
+    # 窓 3 秒（その点を含む）: 点 4 の窓は t=1..4 → 最大 6 → 戻し 2、点 5 は t=2..5 → 3、
+    # 点 7 は t=4..7 → 最大 4 → 戻し 1（山が窓から出ると戻し量が縮む）
+    rel = accel_release_amount(t, u, 3.0)
+    assert rel.tolist() == [0.0, 0.0, 0.0, 0.0, 2.0, 3.0, 3.0, 1.0]
+
+
+def test_accel_release_amount_zero_for_nonpositive_u_and_ignores_nan() -> None:
+    t = np.arange(5) * 1.0
+    u = np.array([5.0, 0.0, -3.0, np.nan, 1.0])
+    rel = accel_release_amount(t, u, 10.0)
+    # u <= 0 の点・NaN の点は 0。最後の点は窓の最大 5 から 4 戻している
+    assert rel.tolist() == [0.0, 0.0, 0.0, 0.0, 4.0]
+
+
+def test_read_fwd_rows_accel_release_follows_accel_pedal(tmp_path: Path) -> None:
+    rows = make_rows(40, lambda t: 10.0 + 2.0 * t, accel=AD + 6.0)  # u = +6
+    for r in rows:
+        if r["elapsed_s"] >= 2.0:
+            r["accel_actual_pct"] = AD + 3.0  # u = +3（戻した）
+    r = read(write_csv(tmp_path / "a.csv", rows))
+    assert len(r.accel_release_pct) == len(r) > 0
+    after = r.t_s >= 2.0
+    assert np.allclose(r.accel_release_pct[after & (r.t_s <= 3.0)], 3.0)
+    assert np.all(r.accel_release_pct[~after] == 0.0)
+    assert np.all(r.accel_release_pct[r.t_s > 4.5] == 0.0)  # 窓から山が出れば 0
+    assert np.all(r.release_pct == 0.0)  # ブレーキの戻し量は変わらない
+
+
+def test_take_and_concat_rows_carry_accel_release() -> None:
+    a = synth_launch_rows([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [0.0, 1.0, 2.0])
+    a = FwdRows(**{**a.__dict__, "accel_release_pct": np.array([0.0, 0.5, 1.5])})
+    b = FwdRows(**{**a.__dict__, "accel_release_pct": np.array([2.0, 0.0, 0.1])})
+    assert take_rows(a, np.array([False, True, True])).accel_release_pct.tolist() == [0.5, 1.5]
+    assert concat_rows([a, b]).accel_release_pct.tolist() == [0.0, 0.5, 1.5, 2.0, 0.0, 0.1]
+    plain = synth_launch_rows([1.0, 2.0], [1.0, 2.0], [0.0, 1.0])
+    assert plain.accel_release_pct.tolist() == [0.0, 0.0]  # 省略は全部 0
+
+
+def test_launch_breakaway_reads_cmd_opening_when_asked(tmp_path: Path) -> None:
+    rows = _breakaway_rows("PATTERN_DRIVE", "RAMP_LAUNCH_RELEASE", 8.0)
+    for r in rows:  # 指令は実開度より 1.0% 浅い（実開度が遅れている）
+        r["brake_cmd_pct"] = float(r["brake_actual_pct"]) - 1.0
+    path = write_csv(tmp_path / "c.csv", rows)
+    act = launch_breakaway(path, brake_min_pct=BD, brake_lag_s=0.2, min_speed_kmh=1.0)
+    cmd = launch_breakaway(
+        path, brake_min_pct=BD, brake_lag_s=0.2, min_speed_kmh=1.0, opening_source="cmd"
+    )
+    assert act is not None and cmd is not None
+    assert cmd.u_pct == pytest.approx(act.u_pct + 1.0, abs=1e-6)

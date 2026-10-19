@@ -14,7 +14,13 @@ import numpy as np
 
 from tests.research.config import DEFAULT_CONFIG_PATH, ResearchConfig, load_config
 from tests.research.fwd_data import DEFAULT_ACCEL_LAG_S, DEFAULT_BRAKE_LAG_S, FwdRows
-from tests.research.fwd_map import ForwardTable, load_forward_map
+from tests.research.fwd_map import (
+    LOW_RELEASE_BAND_MAX_KMH,
+    RELEASE_GRID_PCT,
+    ForwardTable,
+    load_forward_map,
+    release_seconds_in_band,
+)
 from tests.research.fwd_plan import FLAG_PREPOS, build_plan
 from tests.research.fwd_tool import DeadbandLag, err_stats, read_logs, residuals, settings_of_table
 from tests.research.pedal_lag import estimate_pedal_return
@@ -591,6 +597,58 @@ def check_plan(
 # ─────────────────────────────────────────────────────────────────────
 
 
+def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | None) -> CheckItem:
+    """表の作り方のお知らせ（2026-10-20 段4-3。NG にしない・しきい値なし）。
+
+    - 発進側・停止側の表の開度の元（meta の side_table_opening_source。cmd＝指令）
+    - 停止側の戻しの層ごとの秒数（meta の stop_release_layer_s。戻し量の格子の順）
+    - アクセルの戻し量 0.3% 以上の行の秒数と、頭打ち（戻し量の p95）
+    - ブレーキの戻しの行 7.5〜20 km/h の秒数（meta の brake_release_band_s。無い古い pkl は
+      手順2 の行から数える）
+    """
+    name = "表の作り方（段4-3のお知らせ）"
+    if table is None:
+        return _skip("I1", name, "C8 の表なし")
+    m = table.meta
+    src = m.get("side_table_opening_source")
+    layers = m.get("stop_release_layer_s")
+    grid = m.get("stop_release_grid_pct") or [float(x) for x in RELEASE_GRID_PCT]
+    band_s = m.get("brake_release_band_s")
+    lo = float(m.get("brake_release_band_lo_kmh") or m.get("stop_max_speed_kmh") or 7.5)
+    hi = float(m.get("brake_release_band_hi_kmh") or LOW_RELEASE_BAND_MAX_KMH)
+    if band_s is None and rows:
+        band_s = sum(release_seconds_in_band(r, lo, hi) for r in rows)
+    metrics: dict[str, float] = {}
+    if layers:
+        metrics["stop_release_total_s"] = float(sum(layers))
+    a_s = m.get("accel_release_rows_s")
+    a_cap = m.get("accel_release_max_pct")
+    if a_s is not None:
+        metrics["accel_release_rows_s"] = float(a_s)
+    if a_cap is not None:
+        metrics["accel_release_max_pct"] = float(a_cap)
+    if band_s is not None:
+        metrics["brake_release_band_s"] = float(band_s)
+    stop_part = (
+        "なし"
+        if not layers
+        else "／".join(f"{g:g}%:{_f(sec, 1)}s" for g, sec in zip(grid, layers, strict=False))
+        + ("" if table.stop_release_accel is not None else "（層は作らず）")
+    )
+    parts = [
+        f"開度の元 {src if src else '-（古い pkl は実開度）'}",
+        f"停止側の戻しの層 {stop_part}",
+        "アクセルの戻し "
+        + ("なし" if a_s is None else f"{_f(float(a_s), 1)}s・頭打ち {_f(float(a_cap or 0.0))}%"
+           + ("" if table.accel_release_grid is not None else "（表は作らず）")),
+        f"ブレーキの戻し {lo:g}〜{hi:g} km/h "
+        + ("-" if band_s is None else f"{_f(float(band_s), 1)}s"),
+    ]
+    return CheckItem(
+        "I1", name, STATUS_OK, "・".join(parts), "-", "お知らせ（NG にしない）", metrics
+    )
+
+
 def run_checks(
     *,
     cfg: ResearchConfig,
@@ -604,7 +662,7 @@ def run_checks(
     yaml_cfg: ResearchConfig | None = None,
 ) -> list[CheckItem]:
     """走行が無くても出せる項目を計算し、走行の材料（ramp_results・pedal_result 等）があれば
-    C1・B5① も出す。無い材料は SKIP。順に B1 B3 B4 B5 B6 C1 C2 D1。
+    C1・B5① も出す。無い材料は SKIP。順に B1 B3 B4 B5 B6 C1 C2 D1 I1（I1 は段4-3 のお知らせ）。
 
     cfg は「手順3 が使う値」の cfg（惰行・クリープ加速カーブは今回の値。yaml を書く前なら
     新しい値を入れた写しを渡す）。yaml_cfg は C1 用の「yaml を読み直した cfg」（省略時は cfg）。
@@ -657,6 +715,7 @@ def run_checks(
         check_measured_in_yaml(yaml_cfg if yaml_cfg is not None else cfg, pedal_result),
         check_model_path(cfg, saved_path),
         check_plan(cfg, table_c8, plan_mode),
+        check_table_extras(table_c8, rows),
     ]
 
 

@@ -232,3 +232,30 @@ def test_fel_rows_from_csv_builds_r_and_drops_stop_rows(tmp_path: Path) -> None:
     i = int(np.argmin(np.abs(rows.v - 15.0)))
     assert rows.acc[i] == pytest.approx(1.0, abs=0.05)
     assert rows.r[i] == pytest.approx(rows.acc[i] - float(tb.accel(rows.v[i], rows.u[i])), abs=1e-6)
+
+
+def test_predict_passes_release_to_stop_layers_and_accel_release_to_main() -> None:
+    """2026-10-20 段4-3: 停止側の行は停止側の戻しの層があるときだけ戻し量を渡し、本体の行は
+    アクセルの戻し量を渡す。層・表が無い表では今までと同じ値。"""
+    plain = _table()
+    plain.stop_accel = plain.accel_grid.copy()
+    v = np.array([3.0, 3.0, 30.0, 30.0])
+    u = np.array([-3.0, -3.0, 3.0, 3.0])
+    kind = np.array([felmod.KIND_STOP, felmod.KIND_STOP, felmod.KIND_MAIN, felmod.KIND_MAIN])
+    rel = np.array([0.0, 2.0, 0.0, 0.0])
+    arel = np.array([0.0, 0.0, 0.0, 2.0])
+    base = felmod._predict(plain, v, u, kind, rel, arel)
+    assert np.array_equal(base, felmod._predict(plain, v, u, kind, rel))  # 層なしは無視される
+    layered = _table()
+    layered.stop_accel = layered.accel_grid.copy()
+    layered.stop_release_grid = np.array([1.0, 2.0])
+    layered.stop_release_accel = np.stack([layered.stop_accel + 0.5, layered.stop_accel + 1.0])
+    layered.accel_release_grid = np.array([1.0, 2.0])
+    layered.accel_release_accel = np.stack([layered.accel_grid - 0.5, layered.accel_grid - 1.0])
+    layered.meta["stop_release_max_pct"] = 2.0
+    layered.meta["accel_release_max_pct"] = 2.0
+    got = felmod._predict(layered, v, u, kind, rel, arel)
+    assert got[0] == pytest.approx(base[0])  # 戻し量 0 は停止側のまま
+    assert got[1] == pytest.approx(base[1] + 1.0)  # 戻し量 2% → 節 2.0
+    assert got[2] == pytest.approx(base[2])
+    assert got[3] == pytest.approx(base[3] - 1.0)  # アクセルの戻し量 2%

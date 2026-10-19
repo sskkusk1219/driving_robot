@@ -383,7 +383,7 @@ def test_plan_with_weaker_braking_on_release_brakes_deeper_when_releasing() -> N
         # 解き直した u が表を満たす: accel(v, u, release = u − m) = 要る加速度
         w = int(round(3.0 / plan.period_s))
         u_all = np.where(plan.effort_pct < -BD, plan.effort_pct + BD, 0.0)
-        m = float(u_all[i - w : i].min())
+        m = float(u_all[max(i - w, 0) : i].min())
         u = float(u_all[i])
         assert u > m  # 戻している
         got = tb.accel(_release_ref(t), u, release=u - m)
@@ -823,3 +823,140 @@ def test_coast_assist_effort_uses_same_effort_u_relation_as_build_plan() -> None
     assert _coast(t, is_accel=False, dev=0.0, need=coast_a - 1.0) == pytest.approx(
         -(BD + abs(float(ub)))
     )
+
+
+# ───────── 2026-10-20 段4-3: 停止側の戻し・アクセルの戻しを使った解き直し ─────────
+
+
+def _stop_release_variant(strength: float = 0.05) -> ForwardTable:
+    """停止側の表（linear_table と同じ）に、u < 0 の列へ戻し量 × strength × |u| を足す層を付ける."""
+    from tests.research.fwd_map import RELEASE_GRID_PCT  # noqa: PLC0415
+
+    t = linear_table()
+    t.stop_accel = t.accel_grid.copy()
+    t.meta["stop_max_speed_kmh"] = 25.0
+    t.meta["stop_release_max_pct"] = 8.0
+    g = t.u_grid
+    t.stop_release_grid = np.array(RELEASE_GRID_PCT, dtype=float)
+    t.stop_release_accel = np.stack(
+        [t.stop_accel + np.where(g < 0, strength * r * -g, 0.0)[None, :] for r in RELEASE_GRID_PCT]
+    )
+    return t
+
+
+def _stop_release_ref(t: float) -> float:
+    """20 km/h から −5 km/h/s で 2 秒（強いブレーキ）→ −4 km/h/s（浅くして戻す）。"""
+    return 20.0 - 5.0 * t if t < 2.0 else max(10.0 - 4.0 * (t - 2.0), 0.0)
+
+
+def test_stop_release_none_gives_identical_plan() -> None:
+    base_t = _stop_release_variant()
+    base_t.stop_release_grid = None
+    base_t.stop_release_accel = None
+    only_stop = _stop_release_variant()
+    only_stop.stop_release_accel = None
+    only_stop.stop_release_grid = None
+    a = plan_for(_stop_release_ref, 12.0, base_t, stop_horizon_s=10.0)
+    b = plan_for(_stop_release_ref, 12.0, only_stop, stop_horizon_s=10.0)
+    assert np.array_equal(a.effort_pct, b.effort_pct) and np.array_equal(a.flag, b.flag)
+    # 頭打ちが 0 なら戻し量は常に 0 ＝ 解き直しても結果は変わらない
+    zero = _stop_release_variant()
+    zero.meta["stop_release_max_pct"] = 0.0
+    z = plan_for(_stop_release_ref, 12.0, zero, stop_horizon_s=10.0)
+    assert np.allclose(z.effort_pct, a.effort_pct, atol=1e-9)
+
+
+def test_stop_side_times_are_resolved_with_the_stop_release_layers() -> None:
+    plain = _stop_release_variant()
+    plain.stop_release_grid = None
+    plain.stop_release_accel = None
+    tb = _stop_release_variant()
+    base = plan_for(_stop_release_ref, 12.0, plain, stop_horizon_s=10.0)
+    plan = plan_for(_stop_release_ref, 12.0, tb, stop_horizon_s=10.0)
+    assert plan.stops_ahead is not None and plan.stops_ahead[idx(plan, 3.0)]
+    # 強いブレーキの間（戻す前）は同じ
+    for t in (0.5, 1.0, 1.4):
+        assert plan.effort_pct[idx(plan, t)] == pytest.approx(base.effort_pct[idx(base, t)])
+    # 戻している間は、戻しで効きが弱まる表なので踏みが深い（effort がより負）
+    u_all = np.where(plan.effort_pct < -BD, plan.effort_pct + BD, 0.0)
+    w = int(round(3.0 / plan.period_s))
+    checked = 0
+    for t in (2.5, 3.0, 3.5):
+        i = idx(plan, t)
+        assert plan.effort_pct[i] < base.effort_pct[i] - 0.3, t
+        m = float(u_all[max(i - w, 0) : i].min())
+        u = float(u_all[i])
+        assert u > m
+        got = tb.accel(_stop_release_ref(t), u, stop=True, release=u - m)
+        assert got == pytest.approx(plan.need_accel_kmhs[i], abs=0.02)
+        checked += 1
+    assert checked == 3
+    # 停止側の判定でない時刻（停車の先が遠い・範囲外の車速）は影響されない
+    far = plan_for(lambda t: 40.0 - 4.0 * t if t < 3.0 else 28.0 - (t - 3.0), 5.0, tb)
+    far0 = plan_for(lambda t: 40.0 - 4.0 * t if t < 3.0 else 28.0 - (t - 3.0), 5.0, plain)
+    assert np.array_equal(far.effort_pct, far0.effort_pct)
+
+
+def _accel_release_variant(strength: float = 0.04, with_layers: bool = True) -> ForwardTable:
+    """linear_table に、u > 0 の列から strength × 戻し量 × u を引くアクセルの戻しの層を付ける。"""
+    from tests.research.fwd_map import RELEASE_GRID_PCT, attach_accel_release  # noqa: PLC0415
+
+    t = linear_table()
+    if not with_layers:
+        return t
+    g = t.u_grid
+    layers = np.stack(
+        [t.accel_grid - np.where(g > 0, strength * r * g, 0.0)[None, :] for r in RELEASE_GRID_PCT]
+    )
+    t = attach_accel_release(
+        t, layers, release_pct=np.full(1000, 1.0), dt_row_s=np.full(1000, 0.05)
+    )
+    t.meta["accel_release_max_pct"] = 8.0
+    return t
+
+
+def _accel_release_ref(t: float) -> float:
+    """30 km/h から +8 km/h/s で 2 秒（強い加速）→ +2 km/h/s（弱くして戻す）。"""
+    return 30.0 + 8.0 * t if t < 2.0 else 46.0 + 2.0 * (t - 2.0)
+
+
+def test_accel_release_none_gives_identical_plan() -> None:
+    plain = _accel_release_variant(with_layers=False)
+    base = plan_for(_accel_release_ref, 8.0, plain)
+    tb = _accel_release_variant()
+    tb.accel_release_grid = None
+    tb.accel_release_accel = None
+    same = plan_for(_accel_release_ref, 8.0, tb)
+    assert np.array_equal(same.effort_pct, base.effort_pct)
+    assert np.array_equal(same.flag, base.flag)
+    zero = _accel_release_variant()
+    zero.meta["accel_release_max_pct"] = 0.0  # 戻し量は常に 0 ＝ 解き直しても変わらない
+    res = plan_for(_accel_release_ref, 8.0, zero)
+    assert np.allclose(res.effort_pct, base.effort_pct, atol=1e-9)
+
+
+def test_accel_times_are_resolved_in_time_order_with_the_planned_release() -> None:
+    base = plan_for(_accel_release_ref, 8.0, _accel_release_variant(with_layers=False))
+    tb = _accel_release_variant()
+    plan = plan_for(_accel_release_ref, 8.0, tb)
+    # 山（強い加速）の間は同じ
+    for t in (0.5, 1.0, 1.4):
+        assert plan.effort_pct[idx(plan, t)] == pytest.approx(base.effort_pct[idx(base, t)])
+    # 戻している間は、戻しで効きが弱まる表なので踏みが深い（effort がより正）
+    u_all = np.where(plan.effort_pct > AD, plan.effort_pct - AD, 0.0)
+    w = int(round(3.0 / plan.period_s))
+    for t in (3.0, 3.5, 4.0):
+        i = idx(plan, t)
+        assert plan.effort_pct[i] > base.effort_pct[i] + 0.1, t
+        m = float(u_all[max(i - w, 0) : i].max())  # 計画済みの列（時刻順に解き直した後）の山
+        u = float(u_all[i])
+        assert u < m  # 戻している
+        got = tb.accel(_accel_release_ref(t), u, accel_release=m - u)
+        assert got == pytest.approx(plan.need_accel_kmhs[i], abs=0.02)
+    # 戻しに入らない時刻（ブレーキ側・ずっと同じ傾きの加速）は影響されない
+    dn = plan_for(lambda t: 80.0 - 5.0 * t, 4.0, tb)
+    dn0 = plan_for(lambda t: 80.0 - 5.0 * t, 4.0, _accel_release_variant(with_layers=False))
+    assert np.array_equal(dn.effort_pct, dn0.effort_pct)
+    up = plan_for(lambda t: 30.0 + 2.0 * t, 6.0, tb)
+    up0 = plan_for(lambda t: 30.0 + 2.0 * t, 6.0, _accel_release_variant(with_layers=False))
+    assert np.array_equal(up.effort_pct, up0.effort_pct)
