@@ -589,6 +589,16 @@ learning:
   # ユーザー決定 2026-10-20: 段4-3 で手順2 を走り直すときだけ、yaml のコピーで false にする
   # （補正表 fel.enabled は false で保留中。手順12 の学習用パターンは別に走れる）
   fel_pattern_enabled: true
+  # 2026-10-20 段4-3: 発進・停止側の表（と動き出す開度の測定）の開度の元。cmd ＝ 最終指令（0ee7c1b の
+  # 作り方）、actual ＝ 実開度（0ee7c1b より前）。机上（既存 12 本のログの外れ r）で cmd は発進側が
+  # 少し悪化（−0.20 → −0.26 km/h/s）。効く先: 手順2 の発進・停止側の表。pkl meta
+  # side_table_opening_source に残る。決める時期: 戻しの層・アクセルの戻し量を切り分けた実機比較の後
+  side_table_opening_source: actual
+  # 2026-10-20 段4-3: 停止側の戻しの層を作るか。false は作らず pkl の stop_release_* が None
+  # （0ee7c1b より前と同じ引き方）。机上で層を入れると外れの向きが逆になっただけ
+  # （+0.6〜+1.0 → −0.5〜−1.3 km/h/s）。効く先: 手順2 の停止側の表。meta stop_release_layer_built は
+  # 作ったときだけ残る。決める時期: アクセルの戻し量だけで作り直した実機比較の後
+  stop_release_layer_enabled: false
 
 # ── ペダル探索（手順 2-0。クリープ車速と停車保持開度を測る） ────────
 #   両ペダルを vehicle.min_*_opening_pct（待機位置）に置き、クリープ車速が落ち着くのを待つ。

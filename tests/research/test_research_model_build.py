@@ -119,10 +119,14 @@ def test_c8_makes_model_pkl_and_stub_names_differ(tmp_path: Path) -> None:
     )
     table = load_forward_map(Path(result.model_path))
     assert table.kind == KIND_MODEL
-    # 2026-10-20 段4-3: 発進側・停止側の表は本体と同じ開度の元（指令）で読み、meta に残す。
-    # アクセルの戻し・停止側の戻しの層・ブレーキの戻しの 7.5〜20 km/h の秒数も meta にある
-    assert table.meta["side_table_opening_source"] == table.meta["opening_source"] == "cmd"
-    assert len(table.meta["stop_release_layer_s"]) == 5
+    # 2026-10-20 段4-3: 発進側・停止側の表の開度の元は設定（既定 actual ＝ 0ee7c1b より前と同じ）。
+    # 停止側の戻しの層は既定で作らない（stop_release_* は None）。アクセルの戻し・ブレーキの戻しの
+    # 7.5〜20 km/h の秒数は設定に関係なく meta にある
+    assert table.meta["side_table_opening_source"] == "actual"
+    assert table.meta["opening_source"] == "cmd"  # 本体（ニューラルネット）は指令のまま
+    assert table.meta["stop_release_layer_enabled"] is False
+    assert table.stop_release_grid is None and table.stop_release_accel is None
+    assert "stop_release_layer_s" not in table.meta
     assert table.meta["accel_release_rows_s"] >= 0.0 and "accel_release_max_pct" in table.meta
     assert table.meta["brake_release_band_s"] >= 0.0
     assert table.meta["brake_release_band_hi_kmh"] == 20.0
@@ -131,6 +135,29 @@ def test_c8_makes_model_pkl_and_stub_names_differ(tmp_path: Path) -> None:
     # 先に作った C7 の表（格子と設定の元）も同じ場所に残る
     tables = list(Path(result.model_path).parent.glob("fwd_table_*_stub.pkl"))
     assert tables and load_forward_map(tables[0]).kind == KIND_TABLE
+
+
+def test_c8_side_table_settings_switch_opening_source_and_stop_release_layer(
+    tmp_path: Path,
+) -> None:
+    """2026-10-20 段4-3: learning.side_table_opening_source=cmd・stop_release_layer_enabled=true で
+    指令の開度の表と停止側の戻しの層ができる。既定（actual・false）の発進・停止側の本体の表は、
+    層を除けば同じ作り方（開度の元 cmd と actual で表の値が変わりうるだけ）。"""
+    cfg = _cfg_with(tmp_path, "C8")
+    cfg.save({
+        "learning.side_table_opening_source": "cmd",
+        "learning.stop_release_layer_enabled": True,
+    })
+    cfg = cfgmod.load_config(cfg.source_path)
+    assert cfg.learning.side_table_opening_source == "cmd"
+    assert cfg.learning.stop_release_layer_enabled is True
+    result = pdmod.build_ff_model(
+        cfg, _csv(tmp_path, cfg), hw_mode=hwmod.HW_STUB, pedal=PEDAL, **SMALL_C8
+    )
+    table = load_forward_map(Path(result.model_path))
+    assert table.meta["side_table_opening_source"] == "cmd"
+    assert table.meta["stop_release_layer_enabled"] is True
+    assert len(table.meta["stop_release_layer_s"]) == 5
 
 
 def test_c8_stub_runs_every_check_and_shows_c8_seed_mae(
@@ -284,12 +311,16 @@ def test_table_without_onset_keys_still_loads_and_inverts(tmp_path: Path) -> Non
     assert old.meta.get("accel_onset_u_pct") is None
 
 
-def test_side_tables_are_read_with_the_body_opening_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("source", ["actual", "cmd"])
+def test_side_tables_are_read_with_the_configured_opening_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
-    """2026-10-20 段4-3: 発進側・停止側の行（keep_stopped=True で読む行）は、実開度ではなく
-    本体と同じ指令の開度で読む。動き出す開度も同じ元で測る。"""
+    """2026-10-20 段4-3: 発進側・停止側の行（keep_stopped=True で読む行）は、
+    learning.side_table_opening_source の開度（既定 actual。cmd なら指令）で読む。動き出す開度も
+    同じ元で測る。"""
     cfg = _cfg_with(tmp_path, "C8")
+    cfg.save({"learning.side_table_opening_source": source})
+    cfg = cfgmod.load_config(cfg.source_path)
     seen: list[str] = []
     orig = fwd_tool.read_logs
 
@@ -312,5 +343,5 @@ def test_side_tables_are_read_with_the_body_opening_source(
     pdmod.build_ff_model(
         cfg, _csv(tmp_path, cfg), hw_mode=hwmod.HW_STUB, pedal=PEDAL, **SMALL_C8
     )
-    assert seen and set(seen) == {"cmd"}
-    assert sources == ["cmd"]
+    assert seen and set(seen) == {source}
+    assert sources == [source]

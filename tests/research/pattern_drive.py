@@ -1002,6 +1002,8 @@ def _attach_low_speed_tables(
     *,
     creep_speed_kmh: float,
     creep_launch_min_speed_kmh: float | None = None,
+    side_table_opening_source: str = "actual",
+    stop_release_layer_enabled: bool = False,
 ) -> Any:
     """C8 の表に、発進側（launch_accel）と停止側（stop_accel）を付けて返す（2026-10-18 段2o-10）。
 
@@ -1011,14 +1013,17 @@ def _attach_low_speed_tables(
       停止側 … PRE_DRIVE_CHECK/BRAKE_STEP・PEDAL_SEARCH/BRAKE_SEARCH・PATTERN_DRIVE の停車の手前の
                行（`stop_approach_rows`・停車まぎわの強いブレーキ `stop_approach_mask`）・
                CREEP_WAIT の u = 0 の行
-    読み方は本体と同じ開度の元（`st.opening_source` ＝ 指令。2026-10-20 段4-3 まで実開度）・
+    読み方は開度の元 side_table_opening_source（learning.side_table_opening_source。2026-10-20
+    段4-3。既定 "actual" ＝ 実開度、"cmd" ＝ 最終指令の開度。本体の st.opening_source とは独立）・
     ずれ許容なし・停車の行を残す・窓 LAUNCH_ACCEL_WINDOW_S（従来の発進側と同じ）。表を引く制御は
-    指令の開度を出すので、表の u の軸も指令にそろえる（発進の直後は実開度が指令より遅れる）。
+    指令の開度を出すので、cmd なら表の u の軸も指令にそろえる（発進の直後は実開度が指令より
+    遅れる）。
     「動き出す開度」は CSV の RAMP_LAUNCH_RELEASE（無ければ BRAKE_SEARCH）から求める（開度の元は
     同じ）。
-    停止側には戻し量ごとの層（stop_release_accel。`attach_stop_release`）も付ける。層に使う行は
+    stop_release_layer_enabled（learning.stop_release_layer_enabled。既定 false）が true の
+    ときだけ、停止側に戻し量ごとの層（stop_release_accel。`attach_stop_release`）も付ける。層に使う行は
     停止側の行（上）に加えて、PATTERN_DRIVE の低速のブレーキの行（停車まぎわでなくても、戻し量を
-    持つ行。発進の区間でブレーキを離している行を含む）。
+    持つ行。発進の区間でブレーキを離している行を含む）。false なら層は作らない（None）。
     クリープ車速が 0 以下の車は両方とも作らない（None）。
     """
     from tests.research import fwd_tool  # noqa: PLC0415
@@ -1044,7 +1049,7 @@ def _attach_low_speed_tables(
     def read(sections: Sequence[str], phases: Sequence[str] | None = None) -> Any:
         extra: dict[str, Any] = {} if phases is None else {"phases": tuple(phases)}
         (rows,) = fwd_tool.read_logs(
-            [csv_path], st, opening_source=st.opening_source, actuator_lag_tol_pct=None,
+            [csv_path], st, opening_source=side_table_opening_source, actuator_lag_tol_pct=None,
             keep_stopped=True, accel_window_s=LAUNCH_ACCEL_WINDOW_S, sections=tuple(sections),
             **extra,
         )
@@ -1073,7 +1078,7 @@ def _attach_low_speed_tables(
     min_speed = STOP_SPEED_KMH if creep_launch_min_speed_kmh is None else creep_launch_min_speed_kmh
     breakaway = launch_breakaway(
         csv_path, brake_min_pct=st.brake_deadband_pct, brake_lag_s=st.brake_lag_s,
-        min_speed_kmh=min_speed, opening_source=st.opening_source,
+        min_speed_kmh=min_speed, opening_source=side_table_opening_source,
     )
     table = attach_launch(
         table, launch_rows, creep_speed_kmh=creep_speed_kmh, breakaway=breakaway,
@@ -1082,15 +1087,17 @@ def _attach_low_speed_tables(
     table = attach_stop(
         table, stop_rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=LAUNCH_ACCEL_WINDOW_S
     )
-    # 2026-10-20 段4-3: 停止側の戻し量ごとの層。停止側の行に、PATTERN_DRIVE の低速のブレーキの行
-    # （動いている・u < 0。車速は attach_stop_release が stop_max_speed_kmh 未満に絞る。
-    # 発進の区間でブレーキを離している行を含む）を足す。停車の手前の行は 1 回だけ数える
-    near_or_brake = near_stop | ((pattern.u_pct < 0.0) & (pattern.speed_kmh >= STOP_SPEED_KMH))
-    stop_release_rows = concat_rows(
-        [brake_step, brake_search, take_rows(pattern, near_or_brake)], "stop_release"
-    )
-    table = attach_stop_release(table, stop_release_rows, creep_speed_kmh=creep_speed_kmh)
-    table.meta["side_table_opening_source"] = st.opening_source
+    if stop_release_layer_enabled:
+        # 2026-10-20 段4-3: 停止側の戻し量ごとの層。停止側の行に、PATTERN_DRIVE の低速のブレーキの行
+        # （動いている・u < 0。車速は attach_stop_release が stop_max_speed_kmh 未満に絞る。
+        # 発進の区間でブレーキを離している行を含む）を足す。停車の手前の行は 1 回だけ数える
+        near_or_brake = near_stop | ((pattern.u_pct < 0.0) & (pattern.speed_kmh >= STOP_SPEED_KMH))
+        stop_release_rows = concat_rows(
+            [brake_step, brake_search, take_rows(pattern, near_or_brake)], "stop_release"
+        )
+        table = attach_stop_release(table, stop_release_rows, creep_speed_kmh=creep_speed_kmh)
+    table.meta["side_table_opening_source"] = side_table_opening_source
+    table.meta["stop_release_layer_enabled"] = bool(stop_release_layer_enabled)
     if creep_speed_kmh <= 0.0:
         say("  発進側・停止側: クリープ車速が 0 なので作らない")
     if table.launch_accel is None:
@@ -1112,7 +1119,9 @@ def _attach_low_speed_tables(
         layer_s = table.meta.get("stop_release_layer_s", [])
         built = table.meta.get("stop_release_layer_built", [])
         grid = table.meta.get("stop_release_grid_pct", [])
-        if table.stop_release_accel is None:
+        if not stop_release_layer_enabled:
+            say("  停止側の戻しの層: 作らない（learning.stop_release_layer_enabled: false）")
+        elif table.stop_release_accel is None:
             say(f"  停止側の戻しの層: 作らない（層ごとの秒数 {[round(x, 1) for x in layer_s]}）")
         else:
             cells = ", ".join(
@@ -1120,7 +1129,7 @@ def _attach_low_speed_tables(
                 for g, sec, ok in zip(grid, layer_s, built, strict=True)
             )
             say(f"  停止側の戻しの層: {cells}、頭打ち {table.meta['stop_release_max_pct']:.2f}%")
-    say(f"  発進側・停止側の表の開度の元: {st.opening_source}")
+    say(f"  発進側・停止側の表の開度の元: {side_table_opening_source}")
     return table
 
 
@@ -1135,6 +1144,8 @@ def _build_forward_model(
     max_iter: int | None,
     lags: MeasuredLags | None = None,
     creep_launch_min_speed_kmh: float | None = None,
+    side_table_opening_source: str = "actual",
+    stop_release_layer_enabled: bool = False,
 ) -> _BuiltModel:
     """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
 
@@ -1180,6 +1191,8 @@ def _build_forward_model(
     table = _attach_low_speed_tables(
         table, csv_path, st, creep_speed_kmh=profile.feedforward_params.creep_speed_kmh,
         creep_launch_min_speed_kmh=creep_launch_min_speed_kmh,
+        side_table_opening_source=side_table_opening_source,
+        stop_release_layer_enabled=stop_release_layer_enabled,
     )
     # 2026-10-14 段2o-5: 戻しの表は build_final_table が付ける（final_config の既定で作る）
     rel_s = float(table.meta.get("release_rows_s", 0.0))
@@ -1384,6 +1397,8 @@ def build_ff_model(
             profile, csv_path, models_dir, hw_mode,
             workers=forward_workers, seeds=forward_seeds, max_iter=forward_max_iter, lags=lags,
             creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
+            side_table_opening_source=cfg.learning.side_table_opening_source,
+            stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
         )
     else:
         built = _build_poly_model(
@@ -1451,6 +1466,8 @@ def build_ff_model(
             profile, csv_path, models_dir, hw_mode,
             workers=forward_workers, seeds=new_seeds, max_iter=forward_max_iter, lags=lags,
             creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
+            side_table_opening_source=cfg.learning.side_table_opening_source,
+            stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
         )
         checks = run_checks_now()
     say(step2_check.format_checks(checks))

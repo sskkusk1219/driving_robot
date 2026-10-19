@@ -404,6 +404,20 @@ class LearningSection:
     # （約 43 → 32 分）。ユーザー決定 2026-10-20: 段4-3 で手順2 を走り直すときだけ false にする
     # （補正表 fel.enabled は false で保留中。手順12 の学習用パターンは別に走れる）
     fel_pattern_enabled: bool = True
+    # 2026-10-20 段4-3: 手順2 の発進・停止側の表（と動き出す開度の測定）を、どの開度で作るか。
+    # "cmd" ＝ 最終指令の開度（0ee7c1b の作り方）、"actual" ＝ 実開度（0ee7c1b より前の作り方）。
+    # 根拠は机上（既存 12 本のログで外れ r を見た）: cmd にすると発進側が少し悪化（−0.20 → −0.26
+    # km/h/s）。効く先は pattern_drive._attach_low_speed_tables（発進・停止側の表の読み方と
+    # fwd_data.launch_breakaway）。pkl meta side_table_opening_source に実際の値が残る。
+    # 決める時期: 戻しの層・アクセルの戻し量を切り分けた実機比較の後
+    side_table_opening_source: str = "actual"
+    # 2026-10-20 段4-3: 停止側の戻しの層（ForwardTable.stop_release_*。attach_stop_release）を
+    # 作るか。
+    # false なら作らず、pkl の stop_release_* は None（0ee7c1b より前と同じ引き方）。根拠は机上:
+    # 層を入れると外れの向きが逆になっただけ（+0.6〜+1.0 → −0.5〜−1.3 km/h/s）。効く先は
+    # _attach_low_speed_tables（meta stop_release_layer_built・stop_release_layer_s は作った
+    # ときだけ残る）。決める時期: アクセルの戻し量だけで作り直した実機比較の後
+    stop_release_layer_enabled: bool = False
 
 
 @dataclass
@@ -1257,6 +1271,11 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     )
 
     need(cfg.learning.timeout_s > 0.0, "learning.timeout_s は正値")
+    need(
+        cfg.learning.side_table_opening_source in ("cmd", "actual"),
+        f"learning.side_table_opening_source は cmd か actual: "
+        f"{cfg.learning.side_table_opening_source!r}",
+    )
     need(cfg.learning.coast_timeout_s > 0.0, "learning.coast_timeout_s は正値")
     rg = cfg.learning.ramp_g_levels
     need(

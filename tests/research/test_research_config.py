@@ -1189,3 +1189,19 @@ def test_fel_pattern_enabled_is_loaded_from_yaml_and_defaults_to_true(tmp_path: 
     none = tmp_path / "none.yaml"
     none.write_text(text.replace("  fel_pattern_enabled: true\n", ""), encoding="utf-8")
     assert cfgmod.load_config(none).learning.fel_pattern_enabled is True
+
+
+def test_side_table_settings_default_and_validation(tmp_path: Path) -> None:
+    """2026-10-20 段4-3: 発進・停止側の表の開度の元（既定 actual）／戻しの層（既定 false）。"""
+    d = cfgmod.LearningSection()
+    assert d.side_table_opening_source == "actual" and d.stop_release_layer_enabled is False
+    text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    assert "  side_table_opening_source: actual\n" in text
+    assert "  stop_release_layer_enabled: false\n" in text
+    cfg = _load_default()
+    assert cfg.learning.side_table_opening_source == "actual"
+    assert cfg.learning.stop_release_layer_enabled is False
+    cfg.learning.side_table_opening_source = "cmd"
+    assert not any("side_table_opening_source" in p for p in cfgmod.validate_config(cfg))
+    cfg.learning.side_table_opening_source = "bogus"
+    assert any("side_table_opening_source" in p for p in cfgmod.validate_config(cfg))

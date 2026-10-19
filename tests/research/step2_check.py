@@ -601,6 +601,8 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
     """表の作り方のお知らせ（2026-10-20 段4-3。NG にしない・しきい値なし）。
 
     - 発進側・停止側の表の開度の元（meta の side_table_opening_source。cmd＝指令）
+    - 停止側の戻しの層を作る設定か（meta の stop_release_layer_enabled。learning.
+      stop_release_layer_enabled。無い古い pkl は層の有無から）
     - 停止側の戻しの層ごとの秒数（meta の stop_release_layer_s。戻し量の格子の順）
     - アクセルの戻し量 0.3% 以上の行の秒数と、頭打ち（戻し量の p95）
     - ブレーキの戻しの行 7.5〜20 km/h の秒数（meta の brake_release_band_s。無い古い pkl は
@@ -612,6 +614,9 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
     m = table.meta
     src = m.get("side_table_opening_source")
     layers = m.get("stop_release_layer_s")
+    layer_on = m.get("stop_release_layer_enabled")
+    if layer_on is None:  # 古い pkl（設定が meta に無い）は層の有無で見る
+        layer_on = table.stop_release_accel is not None
     grid = m.get("stop_release_grid_pct") or [float(x) for x in RELEASE_GRID_PCT]
     band_s = m.get("brake_release_band_s")
     lo = float(m.get("brake_release_band_lo_kmh") or m.get("stop_max_speed_kmh") or 7.5)
@@ -637,7 +642,7 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
     )
     parts = [
         f"開度の元 {src if src else '-（古い pkl は実開度）'}",
-        f"停止側の戻しの層 {stop_part}",
+        f"停止側の戻しの層 {'作る' if layer_on else '作らない'}設定（{stop_part}）",
         "アクセルの戻し "
         + ("なし" if a_s is None else f"{_f(float(a_s), 1)}s・頭打ち {_f(float(a_cap or 0.0))}%"
            + ("" if table.accel_release_grid is not None else "（表は作らず）")),

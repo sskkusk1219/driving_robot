@@ -364,6 +364,7 @@ def test_i1_table_extras_is_informational_and_reports_seconds() -> None:
     )
     item = sc.check_table_extras(t, None)
     assert item.id == "I1" and item.status == sc.STATUS_OK
+    assert "作らない設定" in item.value  # meta に設定が無い pkl は層の有無から（_table は層なし）
     assert "cmd" in item.value and "1%:3.5s" in item.value and "4%:1.0s" in item.value
     assert "41.5s" in item.value and "2.25%" in item.value and "7.5〜20 km/h 4.0s" in item.value
     assert item.metrics["stop_release_total_s"] == pytest.approx(4.5)
@@ -371,6 +372,10 @@ def test_i1_table_extras_is_informational_and_reports_seconds() -> None:
     assert item.metrics["accel_release_max_pct"] == pytest.approx(2.25)
     assert item.metrics["brake_release_band_s"] == pytest.approx(4.0)
     # 古い pkl（meta にキーが無い）でも落ちず、NG にもならない
+    on = sc.check_table_extras(_table(stop_release_layer_enabled=True), None)
+    assert "作る設定" in on.value
+    off = sc.check_table_extras(_table(stop_release_layer_enabled=False), None)
+    assert "作らない設定" in off.value
     old = sc.check_table_extras(_table(), None)
     assert old.status == sc.STATUS_OK and "なし" in old.value
     assert sc.check_table_extras(None, None).status == sc.STATUS_SKIP
