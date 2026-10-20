@@ -46,7 +46,8 @@ feedforward:
   # 2026-10-06 段2k: 手順2 はここに書かれた candidate の種類のモデルを作り、model_path を書き換える
   # （candidate は書き換えない。C8 のときは C7 の表 fwd_table_*.pkl も同じフォルダにできる）。
   # 組が合わない（C7/C8 に多項式モデル、C7 にモデルの pkl、C8 に表の pkl、C1〜C5 に表・モデルの pkl）と、走り出す前にエラーで止まります
-  candidate: C12
+  # 2026-10-20 段4-2 で C15 に変更（C15 `081609` |偏差|>1 3.7 秒 ↔ C12 組み合わせ `070645` 7.4・`084720` 5.9 秒）
+  candidate: C15
   # 2次多項式 Ridge 逆モデル（本番 src/domain/model_training.py と同型）の保存先
   # ファイル名の日時はローカル時刻（JST）。2026-09-20 以前の pkl は UTC 命名（JST−9h）
   model_path: tests/research/results/models/fwd_model_20261019_003112.pkl
