@@ -84,6 +84,7 @@ def final_config(
     table_u_step_pct: float | None = None,
     release_slices: bool = True,
     brake_exclude_launch: bool = True,
+    accel_release_input: bool = True,
 ) -> CvConfig:
     """既定は交差検証で良かった `1-1 絶対誤差`（乱数の本数だけ最終用に増やす）。
     層・活性化・停車まぎわ除外を変えたときは設定名を引数から作る。
@@ -108,6 +109,7 @@ def final_config(
         table_u_step_pct=table_u_step_pct,
         release_slices=release_slices,
         brake_exclude_launch=brake_exclude_launch,
+        accel_release_input=accel_release_input,
     )
 
 
@@ -181,6 +183,7 @@ def build_final_table(
             "val_split": cfg.val_split,
             "seeds": cfg.seeds,
             "rollout_s": cfg.rollout_s,
+            "accel_release_input_enabled": cfg.accel_release_input,
             "sources": "+".join(r.source for r in train_rows),
         },
     )
@@ -205,7 +208,7 @@ def build_final_table(
             dt_row_s=np.concatenate(rel_dt) if rel_dt else np.zeros(0),
             release_grid=RELEASE_GRID_PCT,
         )
-    if cfg.release_slices and all(o[5] is not None for o in outs):
+    if cfg.release_slices and cfg.accel_release_input and all(o[5] is not None for o in outs):
         # 2026-10-20 段4-3: アクセルの戻しの表。ブレーキの戻しの表と同じ流れ。アクセルの行
         # （u > 0。停車まぎわ除外は u <= 閾値の行だけを外すのでアクセルの行は変わらない）の
         # アクセルの戻し量で accel_release_max_pct と秒数を決め、足りなければ付けない
@@ -305,7 +308,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(
         f"- アクセルの戻しの表: {'あり' if tb.accel_release_grid is not None else 'なし'}"
-        f"（戻し量 0.3% 以上のアクセルの行 {tb.meta.get('accel_release_rows_s', 0.0):.1f} 秒、"
+        f"（アクセル側の入力 {'3（戻し量あり）' if cfg.accel_release_input else '2（車速・u）'}、"
+        f"戻し量 0.3% 以上のアクセルの行 {tb.meta.get('accel_release_rows_s', 0.0):.1f} 秒、"
         f"accel_release_max_pct {tb.meta.get('accel_release_max_pct', 0.0):.2f}%）"
     )
     moved = float(np.abs(tb.accel_grid - tb.accel_before_mono).max())

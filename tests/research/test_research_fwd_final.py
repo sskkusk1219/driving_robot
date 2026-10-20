@@ -237,3 +237,37 @@ def test_final_table_without_accel_release_rows_has_no_accel_release_table(tmp_p
     cfg = CvConfig("t", (4,), loss="absolute", seeds=(0,))
     tb, _ = build_final_table(cfg, rows, path, workers=1, max_iter=3)
     assert tb.accel_release_grid is None and tb.meta["accel_release_rows_s"] == 0.0
+
+
+def test_final_table_without_accel_release_input_is_two_inputs_and_no_table(tmp_path):
+    """2026-10-20 段4-3: accel_release_input=False（手順2 の既定）はアクセル側が (車速, u) の
+    2 入力で、アクセルの戻し行が十分あっても戻しの表を作らない（0ee7c1b より前と同じ）。"""
+    from tests.research.fwd_cv import fit_one_info, side_rows  # noqa: PLC0415
+
+    rows = [
+        make_release_rows(i, f"log{i}", release_gain=0.05, accel_release_gain=0.03)
+        for i in range(2)
+    ]
+    like = build_table(concat_rows(rows), speed_edges=make_speed_edges(80.0))
+    path = save_table(like, tmp_path / "like.pkl")
+    cfg = final_config((0,), accel_release_input=False)
+    assert cfg.accel_release_input is False and final_config().accel_release_input is True
+    assert "accel_release_input" not in final_config().key()
+    assert final_config(accel_release_input=False).key().endswith("|accel_release_input=False")
+    xa, _, _, _ = side_rows(rows, "accel", coast_in_brake=True, accel_release_input=False)
+    xb, _, _, _ = side_rows(rows, "brake", coast_in_brake=True, accel_release_input=False)
+    assert xa.shape[1] == 2 and xb.shape[1] == 3
+    fm, _ = fit_one_info(CvConfig("t", (4,), accel_release_input=False), rows, 0, max_iter=3)
+    assert fm.accel_side.n_inputs == 2 and fm.brake_side.n_inputs == 3
+    tb, _ = build_final_table(
+        CvConfig("t", (6,), loss="absolute", seeds=(0,), accel_release_input=False),
+        rows, path, workers=1, max_iter=5,
+    )
+    assert tb.accel_release_grid is None and tb.accel_release_accel is None
+    assert "accel_release_rows_s" not in tb.meta
+    assert tb.meta["accel_release_input_enabled"] is False
+    assert tb.release_grid is not None  # ブレーキの戻しの表は変わらない
+    on, _ = build_final_table(
+        CvConfig("t", (6,), loss="absolute", seeds=(0,)), rows, path, workers=1, max_iter=5
+    )
+    assert on.meta["accel_release_input_enabled"] is True and on.accel_release_grid is not None

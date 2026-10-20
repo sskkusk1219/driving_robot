@@ -1146,12 +1146,18 @@ def _build_forward_model(
     creep_launch_min_speed_kmh: float | None = None,
     side_table_opening_source: str = "actual",
     stop_release_layer_enabled: bool = False,
+    accel_release_input_enabled: bool = False,
 ) -> _BuiltModel:
     """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
 
     2026-10-13 段2o-2: 設定は relu（2 層 50 個・停車まぎわ除外あり・追加学習なし。ユーザー決定。
     `fwd_final` の CLI の既定（1-1）は変えず、ここで渡す引数だけ変える）。遅れ L は `lags` で
     測れたペダルだけ表に入れる（C7 の表を作るときと同じ）。
+
+    accel_release_input_enabled（learning.accel_release_input_enabled。既定 false。2026-10-20
+    段4-3）が true のときだけ、アクセル側のニューラルネットの入力に「アクセルの戻し量」を足し
+    （3 入力）、アクセルの戻しの表も作る。false は (車速, u) の 2 入力・戻しの表なし（0ee7c1b より
+    前と同じ）。値は pkl meta accel_release_input_enabled に残る。
     """
     from tests.research import fwd_final, fwd_tool, fwd_torch  # noqa: PLC0415
     from tests.research.fwd_map import (  # noqa: PLC0415
@@ -1174,6 +1180,7 @@ def _build_forward_model(
         use_seeds, hidden=FORWARD_HIDDEN, activation=FORWARD_ACTIVATION,
         drop_stop_approach=FORWARD_DROP_STOP_APPROACH,
         table_u_step_pct=FORWARD_TABLE_U_STEP_PCT,
+        accel_release_input=accel_release_input_enabled,
     )
     use_iter = fwd_torch.MAX_ITER if max_iter is None else max_iter
     say(f"  設定: {cfg8.name}（隠れ層 {cfg8.hidden}・{cfg8.activation}・損失 {cfg8.loss}）、"
@@ -1185,6 +1192,7 @@ def _build_forward_model(
         seed_mae=True,  # 乱数ごとの MAE を meta に残す（チェック B1 の乱数の外れ用）
     )
     wall = time.perf_counter() - started
+    table.meta["accel_release_input_enabled"] = bool(accel_release_input_enabled)
     for seed, sec in secs:
         say(f"    乱数{seed}: 学習 {sec:.1f} 秒")
     say(f"  学習の合計 {sum(s for _, s in secs):.1f} 秒・壁時計 {wall:.1f} 秒")
@@ -1206,7 +1214,11 @@ def _build_forward_model(
     # ブレーキの戻しの行の秒数（表示だけ。表の作り方には使わない）
     a_rel_s = float(table.meta.get("accel_release_rows_s", 0.0))
     if table.accel_release_grid is None:
-        say(f"  アクセルの戻しの表: 戻しの行が足りないので作らない（{a_rel_s:.1f} 秒）")
+        if accel_release_input_enabled:
+            say(f"  アクセルの戻しの表: 戻しの行が足りないので作らない（{a_rel_s:.1f} 秒）")
+        else:
+            say("  アクセルの戻し量: 入力にしない・表も作らない"
+                "（learning.accel_release_input_enabled: false）")
     else:
         say(f"  アクセルの戻しの表: 戻し量 0.3% 以上のアクセルの行 {a_rel_s:.1f} 秒、"
             f"戻し量の格子 {[float(x) for x in table.accel_release_grid]} %、"
@@ -1399,6 +1411,7 @@ def build_ff_model(
             creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
             side_table_opening_source=cfg.learning.side_table_opening_source,
             stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
+            accel_release_input_enabled=cfg.learning.accel_release_input_enabled,
         )
     else:
         built = _build_poly_model(
@@ -1468,6 +1481,7 @@ def build_ff_model(
             creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
             side_table_opening_source=cfg.learning.side_table_opening_source,
             stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
+            accel_release_input_enabled=cfg.learning.accel_release_input_enabled,
         )
         checks = run_checks_now()
     say(step2_check.format_checks(checks))

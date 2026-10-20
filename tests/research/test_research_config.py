@@ -1205,3 +1205,11 @@ def test_side_table_settings_default_and_validation(tmp_path: Path) -> None:
     assert not any("side_table_opening_source" in p for p in cfgmod.validate_config(cfg))
     cfg.learning.side_table_opening_source = "bogus"
     assert any("side_table_opening_source" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_accel_release_input_setting_default_off(tmp_path: Path) -> None:
+    """2026-10-20 段4-3: アクセルの戻し量を入力にする設定は既定 false（実機 091838 で悪化）。"""
+    assert cfgmod.LearningSection().accel_release_input_enabled is False
+    text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    assert "  accel_release_input_enabled: false\n" in text
+    assert _load_default().learning.accel_release_input_enabled is False

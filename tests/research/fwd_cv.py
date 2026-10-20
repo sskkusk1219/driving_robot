@@ -129,6 +129,11 @@ class CvConfig:
     # 停止保持のブレーキを離しながら動き出す行）を外す。発進は attach_launch の別の表が受け持ち、
     # ここに混ぜると「戻し ⇒ ブレーキが弱い」を過大に教えるため。アクセル側は変えない
     brake_exclude_launch: bool = True
+    # 2026-10-20 段4-3: True（既定。CV・fwd_final の CLI は 0ee7c1b のまま）ならアクセル側の
+    # ニューラルネットの入力に「アクセルの戻し量」を足して 3 つにし、アクセルの戻しの表
+    # （raw_accel_release_slices）も作る。False は (車速, u) の 2 つ・戻しの表なし（0ee7c1b より
+    # 前と同じ）。手順2 は learning.accel_release_input_enabled（既定 false）をここへ渡す
+    accel_release_input: bool = True
 
     def key(self) -> str:
         """全フィールドから作る文字列（結果ファイルで同じ設定を見分ける）。
@@ -139,6 +144,8 @@ class CvConfig:
         for k in ("time_weight", "drop_stop_approach", "rollout_s", "table_u_step_pct"):
             if not d[k]:
                 del d[k]
+        if d["accel_release_input"]:  # 既定（True）は含めない（足す前の結果を読み直せるように）
+            del d["accel_release_input"]
         if d["release_slices"]:  # 既定（True）は含めない（足す前の結果を読み直せるように）
             del d["release_slices"]
         if d["brake_exclude_launch"]:
@@ -158,13 +165,19 @@ def fold_name(held: Path) -> str:
 
 
 def side_rows(
-    rows_list: Sequence[FwdRows], side: str, *, coast_in_brake: bool, exclude_launch: bool = False
+    rows_list: Sequence[FwdRows],
+    side: str,
+    *,
+    coast_in_brake: bool,
+    exclude_launch: bool = False,
+    accel_release_input: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """片側の行の x・加速度 y・ログ番号・時刻 t_s。選び方は fwd_model._xy と同じ
     （accel: u >= 0、brake: u <= 0。coast_in_brake=False なら brake は u < 0）。
     exclude_launch=True はブレーキ側から発進の区間の行（launch_row）を除く（アクセル側は除かない）。
     x は accel・brake とも (N, 3)（車速・u・戻し量。ブレーキ側は 2026-10-14 段2o-5、
-    アクセル側のアクセルの戻し量は 2026-10-20 段4-3）。"""
+    アクセル側のアクセルの戻し量は 2026-10-20 段4-3）。accel_release_input=False のときアクセル側は
+    (N, 2)（車速・u。0ee7c1b より前と同じ）。"""
     xs, ys, gs, ts = [], [], [], []
     for g, r in enumerate(rows_list):
         if side == "accel":
@@ -174,7 +187,10 @@ def side_rows(
             if exclude_launch:
                 m = m & ~r.launch_row
         cols = [r.speed_kmh[m], r.u_pct[m]]
-        cols.append(r.accel_release_pct[m] if side == "accel" else r.release_pct[m])
+        if side != "accel":
+            cols.append(r.release_pct[m])
+        elif accel_release_input:
+            cols.append(r.accel_release_pct[m])
         xs.append(np.column_stack(cols))
         ys.append(r.accel_kmhs[m])
         gs.append(np.full(int(m.sum()), g))
@@ -288,6 +304,7 @@ def fit_one_info(
             side,
             coast_in_brake=cfg.coast_from != "accel",
             exclude_launch=cfg.brake_exclude_launch,
+            accel_release_input=cfg.accel_release_input,
         )
         if cfg.drop_stop_approach:  # 重み 0 ではなく行そのものを除く（検証の分け方も変わる）
             keep = ~stop_approach_mask(x[:, 0], x[:, 1])
@@ -418,8 +435,9 @@ def _worker(
     args: tuple,
 ) -> tuple[int, int, np.ndarray, float, np.ndarray | None, np.ndarray | None]:
     """(分割番号, 乱数) 1 タスク。単調化前の配列・学習秒数・戻し量ごとの単調化前の配列
-    （cfg.release_slices でなければ None。2026-10-14 段2o-5）・アクセルの戻し量ごとの単調化前の
-    配列（同じ条件で None。2026-10-20 段4-3）を返す。pickle できるようトップレベル。
+    （cfg.release_slices でなければ None。2026-10-14 段2o-5）・アクセルの戻し量ごとの単調化前
+    の配列（同じ条件か cfg.accel_release_input が False なら None。2026-10-20 段4-3）を返す。
+    pickle できるようトップレベル。
     末尾の (学習ログごとの trace, DeadbandLag) は rollout_s > 0 のときだけ使う（省略可）。
     追加学習の info はここで表示する。"""
     cfg, fold_idx, seed, train_rows, like_path, max_iter, n_threads, *rest = args
@@ -450,7 +468,7 @@ def _worker(
     )
     arel = (
         raw_accel_release_slices(fm, like, RELEASE_GRID_PCT, coast_from=cfg.coast_from)
-        if cfg.release_slices
+        if cfg.release_slices and cfg.accel_release_input
         else None
     )
     return fold_idx, seed, raw, time.perf_counter() - t0, rel, arel

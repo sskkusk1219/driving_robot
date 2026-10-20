@@ -376,6 +376,10 @@ def test_i1_table_extras_is_informational_and_reports_seconds() -> None:
     assert "作る設定" in on.value
     off = sc.check_table_extras(_table(stop_release_layer_enabled=False), None)
     assert "作らない設定" in off.value
+    a_on = sc.check_table_extras(_table(accel_release_input_enabled=True), None)
+    a_off = sc.check_table_extras(_table(accel_release_input_enabled=False), None)
+    assert "アクセルの戻し量の入力 あり設定" in a_on.value
+    assert "アクセルの戻し量の入力 なし設定" in a_off.value
     old = sc.check_table_extras(_table(), None)
     assert old.status == sc.STATUS_OK and "なし" in old.value
     assert sc.check_table_extras(None, None).status == sc.STATUS_SKIP

@@ -75,12 +75,18 @@ class FittedModel:
 
 
 def _xy(
-    rows_list: Sequence[FwdRows], side: str, *, coast_in_brake: bool = True
+    rows_list: Sequence[FwdRows],
+    side: str,
+    *,
+    coast_in_brake: bool = True,
+    accel_release_input: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """片側の行（accel: u >= 0、brake: u <= 0）の入力・加速度・ログ番号（グループ）。
     入力は accel・brake とも (N, 3)（車速・u・戻し量。ブレーキ側は 2026-10-14 段2o-5、
     アクセル側のアクセルの戻し量 accel_release_pct は 2026-10-20 段4-3）。
-    coast_in_brake=False のときブレーキ側は u < 0 の行だけ（惰行の行を入れない）。"""
+    coast_in_brake=False のときブレーキ側は u < 0 の行だけ（惰行の行を入れない）。
+    accel_release_input=False のときアクセル側は (N, 2)（車速・u。0ee7c1b より前と同じ。
+    learning.accel_release_input_enabled が false のとき）。"""
     xs, ys, gs = [], [], []
     for g, r in enumerate(rows_list):
         if side == "accel":
@@ -88,7 +94,10 @@ def _xy(
         else:
             m = r.u_pct <= 0 if coast_in_brake else r.u_pct < 0
         cols = [r.speed_kmh[m], r.u_pct[m]]
-        cols.append(r.accel_release_pct[m] if side == "accel" else r.release_pct[m])
+        if side != "accel":
+            cols.append(r.release_pct[m])
+        elif accel_release_input:
+            cols.append(r.accel_release_pct[m])
         xs.append(np.column_stack(cols))
         ys.append(r.accel_kmhs[m])
         gs.append(np.full(int(m.sum()), g))

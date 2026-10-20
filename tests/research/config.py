@@ -418,6 +418,15 @@ class LearningSection:
     # _attach_low_speed_tables（meta stop_release_layer_built・stop_release_layer_s は作った
     # ときだけ残る）。決める時期: アクセルの戻し量だけで作り直した実機比較の後
     stop_release_layer_enabled: bool = False
+    # 2026-10-20 段4-3: アクセルの戻し量（直近 RELEASE_WINDOW_S 秒の u の最大 − 今）を、手順2 の
+    # ニューラルネットのアクセル側の 3 つ目の入力にし、アクセルの戻しの表
+    # （accel_release_*。attach_accel_release）も作るか。false なら入力は (車速, u) の 2 つ・
+    # 表なし（pkl の accel_release_* は None。0ee7c1b より前と同じ）。根拠は実機 091838
+    # （2026-10-20）: true で作った pkl は |偏差|>1 が 3.7 → 45.1 秒に悪化した（DOB が戻しに
+    # よる弱さを外乱として打ち消していたのを、表が説明してしまい消えた）。効く先: fwd_cv／
+    # fwd_final／pattern_drive._build_forward_model（meta accel_release_input_enabled に残る）。
+    # 決める時期: 戻しの層（stop_release_layer_enabled）と切り分けた実機比較の後
+    accel_release_input_enabled: bool = False
 
 
 @dataclass

@@ -127,7 +127,12 @@ def test_c8_makes_model_pkl_and_stub_names_differ(tmp_path: Path) -> None:
     assert table.meta["stop_release_layer_enabled"] is False
     assert table.stop_release_grid is None and table.stop_release_accel is None
     assert "stop_release_layer_s" not in table.meta
-    assert table.meta["accel_release_rows_s"] >= 0.0 and "accel_release_max_pct" in table.meta
+    # アクセルの戻し量は既定で入力にしない（learning.accel_release_input_enabled: false。
+    # 0ee7c1b より前と同じ ＝ アクセル側 2 入力・戻しの表なし）
+    assert table.meta["accel_release_input_enabled"] is False
+    assert table.accel_release_grid is None and table.accel_release_accel is None
+    assert "accel_release_rows_s" not in table.meta
+    assert table.meta["n_models"] >= 1
     assert table.meta["brake_release_band_s"] >= 0.0
     assert table.meta["brake_release_band_hi_kmh"] == 20.0
     assert "_stub" in Path(result.model_path).name
