@@ -1127,6 +1127,20 @@ def test_pedal_rule_brake_during_launch_is_launch_side_unless_deeper_than_breaka
     assert np.all(plan2.side_brake[mid] == SIDE_LAUNCH)
 
 
+def test_launch_midway_covers_every_launch() -> None:
+    """発進の途中は、停車保持を抜けるたびに始まる（モードの最初の発進だけではない）。"""
+    from tests.research.fwd_plan import _launch_midway
+
+    stop = np.array([1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0], dtype=bool)
+    accel = np.array([0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0], dtype=bool)
+    got = _launch_midway(stop, accel)
+    assert got.tolist() == [0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0]
+    # 最初が停車保持でないなら、最初の区間は発進の途中ではない。アクセルが出なければ次の停車保持まで
+    stop2 = np.array([0, 0, 1, 0, 0, 1, 0], dtype=bool)
+    got2 = _launch_midway(stop2, np.zeros(7, dtype=bool))
+    assert got2.tolist() == [0, 0, 0, 1, 1, 0, 1]
+
+
 def test_pedal_rule_body_and_release_unchanged_at_or_above_top() -> None:
     tb, plain = _release_low_table()
     plan = plan_for(_decel_then_ease, 5.0, tb, low_speed_side_rule="pedal")

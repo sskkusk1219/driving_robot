@@ -542,19 +542,18 @@ def _solve_sides(
 
 
 def _launch_midway(stop: np.ndarray, accel_now: np.ndarray) -> np.ndarray:
-    """発進の途中の行（段5-2）: モードの最初の停車保持の最後の行の次から、初めてアクセルを使う
-    行の直前まで。モードの最初が停車保持でなければ全部 False。アクセルが出ないときは最後まで。"""
+    """発進の途中の行（段5-2）: 停車保持を抜けるたびに、抜けた最初の行から、初めてアクセルを使う
+    行（またはその前に停車保持に戻る行）の直前まで。アクセルが出ないときは最後まで。"""
     n = len(stop)
     out = np.zeros(n, dtype=bool)
-    if n == 0 or not stop[0]:
+    if n == 0:
         return out
-    free = np.flatnonzero(~stop)
-    if len(free) == 0:
-        return out
-    i0 = int(free[0])
-    hit = np.flatnonzero(accel_now[i0:])
-    j = n if len(hit) == 0 else i0 + int(hit[0])
-    out[i0:j] = True
+    starts = np.flatnonzero(stop[:-1] & ~stop[1:]) + 1
+    ends = np.flatnonzero(accel_now | stop)
+    for i0 in starts.tolist():
+        k = np.searchsorted(ends, i0)
+        j = n if k >= len(ends) else int(ends[k])
+        out[i0:j] = True
     return out
 
 
