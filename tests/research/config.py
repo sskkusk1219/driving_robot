@@ -425,6 +425,21 @@ class LearningSection:
     # （LAUNCH_ACCEL_WINDOW_S）。本体は 1.0 秒窓。仮値: 発進は約 1 秒で終わるので短くしてある。
     # 効く先: _attach_low_speed_tables・launch_breakaway の行の読み方。決める時期: 段5-3 の机上の後
     side_table_accel_window_s: float = 0.5
+    # 2026-10-22 段5-4 b: 発進側の表を、停止側と同じ車速の行（今は 7.5 km/h 未満の 3 行）まで
+    # 置き換えるか。false ＝ 今まで（発進側は 0〜5 km/h の 2 行だけ。5〜7.5 km/h の開度 0 が
+    # 発進側（本体）−0.44 ↔ 停止側 0.00 と食い違う）。true ＝ 停止側の u ≦ 0 の値を写し、
+    # アクセル側は
+    # launch_accel_side_source に従って作る。効く先: _attach_low_speed_tables（meta
+    # launch_rows_to_stop_max・launch_speed_rows）。既定は今と同じ。
+    # 決める時期: 段5-4 の机上の後の実機 1 組
+    launch_rows_to_stop_max: bool = False
+    # 2026-10-22 段5-4 e: 発進側・停止側の表の車速方向の補間に使う行の代表車速。"grid" ＝ 今まで
+    # （行の中心 1.25・3.75・6.25）、"data" ＝ 置き換えた行の学習データ（動いている行）の車速の
+    # 中央値（停止側の 5〜7.5 km/h の行はほとんどちょうど 5.00 km/h）。隣の行と 0.5 km/h（仮値）より
+    # 近くなる行は中心に戻す。効く先: ForwardTable.launch_speed_rep・stop_speed_rep（meta
+    # launch_speed_rep_map・stop_speed_rep_map）。既定は今と同じ。
+    # 決める時期: 段5-4 の机上の後の実機 1 組
+    side_row_speed_rep: str = "grid"
     # 2026-10-20 段4-3: 停止側の戻しの層（ForwardTable.stop_release_*。attach_stop_release）を
     # 作るか。
     # false なら作らず、pkl の stop_release_* は None（0ee7c1b より前と同じ引き方）。根拠は机上:
@@ -1329,6 +1344,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         cfg.learning.side_table_accel_window_s > 0.0,
         f"learning.side_table_accel_window_s は正値: {cfg.learning.side_table_accel_window_s}",
+    )
+    need(
+        cfg.learning.side_row_speed_rep in ("grid", "data"),
+        f"learning.side_row_speed_rep は grid か data: {cfg.learning.side_row_speed_rep!r}",
     )
     need(cfg.learning.coast_timeout_s > 0.0, "learning.coast_timeout_s は正値")
     rg = cfg.learning.ramp_g_levels

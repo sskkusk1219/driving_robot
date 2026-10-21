@@ -753,6 +753,7 @@ def _seed_outlier_setup(
         creep_launch_min_speed_kmh=None, side_table_opening_source="actual",
         stop_release_layer_enabled=False, accel_release_input_enabled=False,
         launch_accel_side_source="extrapolate", side_table_accel_window_s=0.5,
+        launch_rows_to_stop_max=False, side_row_speed_rep="grid",
     ):
         seeds_seen.append(tuple(seeds))
         path = tmp_path / "results" / "models" / f"fwd_model_fake_{len(seeds_seen)}.pkl"

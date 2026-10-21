@@ -24,12 +24,14 @@ from tests.research.fwd_map import (
     RELEASE_GRID_PCT,
     ForwardTable,
     apply_launch_accel_measured,
+    apply_side_row_speed_rep,
     attach_accel_release,
     attach_launch,
     attach_release,
     attach_stop,
     attach_stop_release,
     build_table,
+    extend_launch_rows_to_stop_max,
     load_forward_map,
     refine_u_grid,
     release_bin_edges,
@@ -911,3 +913,152 @@ def test_measured_launch_accel_without_launch_table_changes_nothing() -> None:
     table, _ = _launch_setup()
     t2 = apply_launch_accel_measured(table, _accel_rows(3.0, [1.0], lambda u: u))
     assert t2.launch_accel is None and t2.meta["launch_accel_side_source"] == "measured"
+
+
+# ───────── 2026-10-22 段5-4: 発進側を停止側の車速の行まで広げる（b）・行の代表車速（e） ─────────
+
+
+def _wide_stop_rows(v_lo: float = 0.6, v_hi: float = 7.4, seed: int = 3):
+    """停止側の行: v_lo〜v_hi（5〜7.5 km/h の行にも届く）、a = −0.2 + 0.15u、u = 0 は 0.8。"""
+    rng = np.random.default_rng(seed)
+    n = 800
+    v = rng.uniform(v_lo, v_hi, n)
+    u = -rng.choice(np.arange(1.0, 10.01, 0.5), n)
+    v = np.concatenate([v, rng.uniform(v_lo, v_hi, 150)])
+    u = np.concatenate([u, np.zeros(150)])
+    return make_rows(v, u, np.where(u == 0.0, 0.8, -0.2 + 0.15 * u), 0.1)
+
+
+def _both_sides():
+    table, lrows = _launch_setup()  # 発進側の行は v < 4.9 → [1.25, 3.75]
+    t = attach_launch(table, lrows, creep_speed_kmh=5.0)
+    t = attach_stop(t, _wide_stop_rows(), creep_speed_kmh=5.0)  # 停止側は [1.25, 3.75, 6.25]
+    return t
+
+
+def test_extend_launch_rows_copies_stop_brake_side_and_builds_accel_side() -> None:
+    t1 = _both_sides()
+    assert t1.meta["launch_speed_rows"] == [1.25, 3.75]
+    assert t1.meta["stop_speed_rows"] == [1.25, 3.75, 6.25]
+    t2 = extend_launch_rows_to_stop_max(t1)
+    assert t2.meta["launch_speed_rows"] == [1.25, 3.75, 6.25]
+    assert t2.meta["launch_rows_to_stop_max"] is True
+    assert t2.meta["launch_rows_to_stop_max_rows"] == [6.25]
+    g = t1.u_grid
+    neg, pos = g <= 0.0, g > 0.0
+    r = 2
+    assert np.array_equal(t2.launch_accel[r, neg], t1.stop_accel[r, neg])
+    u0 = float(np.interp(0.0, g, t1.stop_accel[r]))
+    # アクセル側 ＝ 停止側の開度 0 ＋ 本体の増え（本体は a = 0.3u なので傾きは 0.3）
+    assert float(np.interp(3.0, g, t2.launch_accel[r])) == pytest.approx(u0 + 0.9, abs=1e-6)
+    assert np.all(np.diff(t2.launch_accel[r]) >= -1e-9)
+    assert t2.launch_accel[r, pos].min() >= t2.launch_accel[r, neg].max() - 1e-9
+    # 5〜7.5 km/h の開度 0 が、停止側とそろう（広げる前は本体 0.0 ↔ 停止側 0.8 の食い違い）
+    assert float(t2.accel(6.25, 0.0, launch=True)) == pytest.approx(
+        float(t2.accel(6.25, 0.0, stop=True)))
+    assert float(t1.accel(6.25, 0.0, launch=True)) != pytest.approx(
+        float(t1.accel(6.25, 0.0, stop=True)))
+    # 他の行・本体・停止側は変えない。元の表も書き換えない
+    assert np.array_equal(t2.launch_accel[[0, 1, 3]], t1.launch_accel[[0, 1, 3]])
+    assert np.array_equal(t2.accel_grid, t1.accel_grid)
+    assert np.array_equal(t2.stop_accel, t1.stop_accel)
+    assert t1.meta["launch_speed_rows"] == [1.25, 3.75]
+
+
+def test_extend_launch_rows_then_measured_builds_accel_side_from_points() -> None:
+    t2 = extend_launch_rows_to_stop_max(_both_sides())
+    pat = _accel_rows(6.0, [1.5, 3.5], lambda u: 2.0 + 0.2 * u, n_each=10)
+    t3 = apply_launch_accel_measured(t2, pat, cell_pct=1.0)
+    assert [round(p[0], 3) for p in t3.meta["launch_accel_measured"]["6.25"]] == [1.5, 3.5]
+    assert float(np.interp(2.5, t3.u_grid, t3.launch_accel[2])) == pytest.approx(2.5, abs=1e-6)
+    neg = t3.u_grid <= 0.0
+    assert np.array_equal(t3.launch_accel[2, neg], t3.stop_accel[2, neg])
+
+
+def test_extend_launch_rows_is_noop_without_both_tables_or_extra_rows() -> None:
+    table, lrows = _launch_setup()
+    only_launch = attach_launch(table, lrows, creep_speed_kmh=5.0)
+    t = extend_launch_rows_to_stop_max(only_launch)
+    assert t.launch_accel is only_launch.launch_accel and t.meta["launch_rows_to_stop_max"] is True
+    assert t.meta["launch_rows_to_stop_max_rows"] == []
+    both = attach_stop(only_launch, _stop_rows(), creep_speed_kmh=5.0)  # 停止側も [1.25, 3.75]
+    t = extend_launch_rows_to_stop_max(both)
+    assert np.array_equal(t.launch_accel, both.launch_accel)
+    assert t.meta["launch_rows_to_stop_max_rows"] == []
+    assert extend_launch_rows_to_stop_max(table).launch_accel is None
+
+
+def _rep_rows(v_value: float, n: int = 100, spread: float = 0.0):
+    rng = np.random.default_rng(4)
+    v = v_value + spread * rng.uniform(-1.0, 1.0, n)
+    u = -rng.choice(np.arange(1.0, 10.01, 0.5), n)
+    return make_rows(v, u, -0.2 + 0.15 * u, 0.1)
+
+
+def test_side_row_speed_rep_uses_data_median_and_keeps_others() -> None:
+    t1 = extend_launch_rows_to_stop_max(_both_sides())
+    stop_rows = concat_rows([_rep_rows(2.0, spread=0.3), _rep_rows(4.0, spread=0.3),
+                             _rep_rows(5.8, spread=0.3)], "stop")
+    launch_rows = concat_rows([_rep_rows(2.2, spread=0.3), _rep_rows(4.2, spread=0.3)], "launch")
+    t2 = apply_side_row_speed_rep(t1, launch_rows, stop_rows)
+    assert t2.meta["side_row_speed_rep"] == "data"
+    assert t2.stop_speed_rep[:3] == pytest.approx([2.0, 4.0, 5.8], abs=0.1)
+    # 発進側: 元から置き換えた行は発進側のデータ、広げた行（6.25）は停止側の中央値
+    assert t2.launch_speed_rep[:3] == pytest.approx([2.2, 4.2, t2.stop_speed_rep[2]], abs=0.1)
+    # 置き換えていない行（7.5 km/h 以上）は本体と同じ
+    assert t2.stop_speed_rep[3] == t1.speed_rep[3] and t2.launch_speed_rep[3] == t1.speed_rep[3]
+    assert np.all(np.diff(t2.stop_speed_rep) > 0) and np.all(np.diff(t2.launch_speed_rep) > 0)
+    assert t2.meta["stop_speed_rep_map"]["6.25"] == pytest.approx(5.8, abs=0.1)
+    assert t1.stop_speed_rep is None  # 元は書き換えない
+
+
+def test_side_row_speed_rep_reverts_rows_too_close_to_neighbour() -> None:
+    t1 = _both_sides()
+    # 2.5〜5 の行が 4.97、5〜7.5 の行が 5.0 → 近すぎるので下の行を中心 (3.75) に戻す
+    stop_rows = concat_rows([_rep_rows(2.0), _rep_rows(4.97), _rep_rows(5.0)], "stop")
+    t2 = apply_side_row_speed_rep(t1, concat_rows([_rep_rows(2.0)], "launch"), stop_rows,
+                                  min_gap_kmh=0.5)
+    assert t2.stop_speed_rep[:3] == pytest.approx([2.0, 3.75, 5.0])
+    assert np.all(np.diff(t2.stop_speed_rep) > 0)
+
+
+def test_side_row_speed_rep_changes_only_the_side_table_interpolation() -> None:
+    t1 = _both_sides()
+    t2 = replace(t1, stop_speed_rep=np.array([1.25, 3.75, 5.0, 8.75]))
+    v = np.array([3.0, 4.5, 5.0, 5.6, 6.5])
+    u = np.full(5, -4.0)
+    # 本体・発進側は変わらない
+    assert np.array_equal(t2.accel(v, u), t1.accel(v, u))
+    assert np.array_equal(t2.accel(v, u, launch=True), t1.accel(v, u, launch=True))
+    # 停止側は専用の代表車速で補間する: 行の値そのもの（代表車速ちょうど）を引ける
+    assert float(t2.accel(5.0, -4.0, stop=True)) == pytest.approx(
+        float(np.interp(-4.0, t1.u_grid, t1.stop_accel[2])))
+    assert float(t2.coast_accel(5.0, stop=True)) == pytest.approx(
+        float(np.interp(0.0, t1.u_grid, t1.stop_accel[2])))
+    # invert も同じ代表車速で引く（accel の逆）
+    a = float(t2.accel(5.4, -4.0, stop=True))
+    u_back, _ = t2.invert(5.4, a, stop=True)
+    assert float(u_back) == pytest.approx(-4.0, abs=0.3)
+    # 既定（None）は今と完全に同じ
+    t3 = replace(t1, stop_speed_rep=None, launch_speed_rep=None)
+    assert np.array_equal(t3.accel(v, u, stop=True), t1.accel(v, u, stop=True))
+    assert t1._rep(False, True) is t1.speed_rep and t1._rep(True) is t1.speed_rep
+
+
+def test_side_row_speed_rep_roundtrips_through_pkl_and_old_pkl_is_none(tmp_path: Path) -> None:
+    t1 = _both_sides()
+    t2 = replace(t1, stop_speed_rep=np.array([1.5, 3.5, 5.0, 8.75]),
+                 launch_speed_rep=np.array([1.5, 3.5, 6.25, 8.75]))
+    back = load_forward_map(save_table(t2, tmp_path / "r.pkl"))
+    assert np.array_equal(back.stop_speed_rep, t2.stop_speed_rep)
+    assert np.array_equal(back.launch_speed_rep, t2.launch_speed_rep)
+    plain = load_forward_map(save_table(t1, tmp_path / "p.pkl"))
+    assert plain.stop_speed_rep is None and plain.launch_speed_rep is None
+    # キーの無い古い pkl
+    with (tmp_path / "p.pkl").open("rb") as f:
+        d = pickle.load(f)
+    d.pop("stop_speed_rep"), d.pop("launch_speed_rep")
+    with (tmp_path / "old.pkl").open("wb") as f:
+        pickle.dump(d, f)
+    old = load_forward_map(tmp_path / "old.pkl")
+    assert old.stop_speed_rep is None and old.launch_speed_rep is None

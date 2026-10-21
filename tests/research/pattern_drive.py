@@ -1006,6 +1006,8 @@ def _attach_low_speed_tables(
     stop_release_layer_enabled: bool = False,
     launch_accel_side_source: str = "extrapolate",
     side_table_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+    launch_rows_to_stop_max: bool = False,
+    side_row_speed_rep: str = "grid",
 ) -> Any:
     """C8 の表に、発進側（launch_accel）と停止側（stop_accel）を付けて返す（2026-10-18 段2o-10）。
 
@@ -1032,6 +1034,11 @@ def _attach_low_speed_tables(
     （learning.launch_accel_side_source）が "measured" のときだけ、発進側のアクセル側を
     PATTERN_DRIVE の行の実測の点で作り直す
     （`fwd_map.apply_launch_accel_measured`）。"extrapolate"（既定）は今まで。
+    2026-10-22 段5-4: launch_rows_to_stop_max（learning.launch_rows_to_stop_max。既定 false）が
+    true なら、発進側の表を停止側と同じ車速の行まで広げる
+    （`fwd_map.extend_launch_rows_to_stop_max`。アクセル側の測り直しの前に行う）。side_row_speed_rep（learning.side_row_speed_rep。既定
+    "grid"）が "data" なら、発進側・停止側の置き換えた行の代表車速を学習データの車速の中央値にする
+    （`fwd_map.apply_side_row_speed_rep`。最後に行う）。どちらも既定は今と同じ。
     """
     from tests.research import fwd_tool  # noqa: PLC0415
     from tests.research.fwd_cv import stop_approach_mask  # noqa: PLC0415
@@ -1049,9 +1056,11 @@ def _attach_low_speed_tables(
     )
     from tests.research.fwd_map import (  # noqa: PLC0415
         apply_launch_accel_measured,
+        apply_side_row_speed_rep,
         attach_launch,
         attach_stop,
         attach_stop_release,
+        extend_launch_rows_to_stop_max,
     )
 
     def read(sections: Sequence[str], phases: Sequence[str] | None = None) -> Any:
@@ -1095,6 +1104,10 @@ def _attach_low_speed_tables(
     table = attach_stop(
         table, stop_rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=side_table_accel_window_s
     )
+    if launch_rows_to_stop_max:
+        table = extend_launch_rows_to_stop_max(table)
+    else:
+        table.meta["launch_rows_to_stop_max"] = False
     if launch_accel_side_source == "measured":
         table = apply_launch_accel_measured(table, pattern)
     else:
@@ -1108,6 +1121,10 @@ def _attach_low_speed_tables(
             [brake_step, brake_search, take_rows(pattern, near_or_brake)], "stop_release"
         )
         table = attach_stop_release(table, stop_release_rows, creep_speed_kmh=creep_speed_kmh)
+    if side_row_speed_rep == "data":
+        table = apply_side_row_speed_rep(table, launch_rows, stop_rows)
+    else:
+        table.meta["side_row_speed_rep"] = "grid"
     table.meta["side_table_opening_source"] = side_table_opening_source
     table.meta["side_table_accel_window_s"] = side_table_accel_window_s
     table.meta["stop_release_layer_enabled"] = bool(stop_release_layer_enabled)
@@ -1149,6 +1166,10 @@ def _attach_low_speed_tables(
         npts = {k: len(v) for k, v in pts.items()}
         detail = f"（行ごとの点の数 {npts}）" if launch_accel_side_source == "measured" else ""
         say(f"  発進側のアクセル側: {launch_accel_side_source}{detail}")
+        say(f"  段5-4: 発進側を停止側の車速の行まで広げる {launch_rows_to_stop_max}"
+            f"（広げた行 {table.meta.get('launch_rows_to_stop_max_rows', [])}）、行の代表車速 "
+            f"{side_row_speed_rep}（発進側 {table.meta.get('launch_speed_rep_map', {})}、"
+            f"停止側 {table.meta.get('stop_speed_rep_map', {})}）")
     return table
 
 
@@ -1168,6 +1189,8 @@ def _build_forward_model(
     accel_release_input_enabled: bool = False,
     launch_accel_side_source: str = "extrapolate",
     side_table_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+    launch_rows_to_stop_max: bool = False,
+    side_row_speed_rep: str = "grid",
 ) -> _BuiltModel:
     """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
 
@@ -1224,6 +1247,8 @@ def _build_forward_model(
         stop_release_layer_enabled=stop_release_layer_enabled,
         launch_accel_side_source=launch_accel_side_source,
         side_table_accel_window_s=side_table_accel_window_s,
+        launch_rows_to_stop_max=launch_rows_to_stop_max,
+        side_row_speed_rep=side_row_speed_rep,
     )
     # 2026-10-14 段2o-5: 戻しの表は build_final_table が付ける（final_config の既定で作る）
     rel_s = float(table.meta.get("release_rows_s", 0.0))
@@ -1437,6 +1462,8 @@ def build_ff_model(
             accel_release_input_enabled=cfg.learning.accel_release_input_enabled,
             launch_accel_side_source=cfg.learning.launch_accel_side_source,
             side_table_accel_window_s=cfg.learning.side_table_accel_window_s,
+            launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,
+            side_row_speed_rep=cfg.learning.side_row_speed_rep,
         )
     else:
         built = _build_poly_model(
@@ -1509,6 +1536,8 @@ def build_ff_model(
             accel_release_input_enabled=cfg.learning.accel_release_input_enabled,
             launch_accel_side_source=cfg.learning.launch_accel_side_source,
             side_table_accel_window_s=cfg.learning.side_table_accel_window_s,
+            launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,
+            side_row_speed_rep=cfg.learning.side_row_speed_rep,
         )
         checks = run_checks_now()
     say(step2_check.format_checks(checks))

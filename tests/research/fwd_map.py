@@ -118,6 +118,11 @@ class ForwardTable:
     # 発進側・停止側の配列の点の種類（POINT_*。accel_grid と同じ形）。None ＝ 本体の point_kind
     launch_kind: np.ndarray | None = None
     stop_kind: np.ndarray | None = None
+    # 発進側・停止側の表を車速方向に補間するときの行の代表車速（2026-10-22 段5-4 e。
+    # apply_side_row_speed_rep）。speed_rep と同じ長さ。置き換えた行だけ学習データの車速の中央値、
+    # それ以外は speed_rep と同じ。None ＝ 本体と同じ speed_rep（今までと完全に同じ）
+    launch_speed_rep: np.ndarray | None = None
+    stop_speed_rep: np.ndarray | None = None
     # 戻しの表（2026-10-14 段2o-5。attach_release）。release_grid ＝ 戻し量 [%] の格子（昇順・正）、
     # release_accel ＝ (戻し量の数, 行, 格子点) 加速度。戻し量 0 は本体 accel_grid。
     # None ＝ 戻しの表なし（今までと完全に同じ）。戻し量は meta["release_max_pct"] で頭打ちにする
@@ -255,7 +260,13 @@ class ForwardTable:
         return [self.accel_grid, *self.accel_release_accel], vals, r
 
     def _blend(
-        self, arrs: list[np.ndarray], vals: np.ndarray, r: np.ndarray, v: np.ndarray, u: np.ndarray
+        self,
+        arrs: list[np.ndarray],
+        vals: np.ndarray,
+        r: np.ndarray,
+        v: np.ndarray,
+        u: np.ndarray,
+        speed_rep: np.ndarray | None = None,
     ) -> np.ndarray:
         """戻し量の節の間を直線補間して引いた加速度（accel の戻し量ありの計算）。"""
         k, w = _release_weights(vals, r)
@@ -263,8 +274,20 @@ class ForwardTable:
         for j, arr in enumerate(arrs):
             h = np.where(k == j, 1.0 - w, 0.0) + np.where(k + 1 == j, w, 0.0)
             if h.any():
-                out = out + h * np.asarray(grid_accel(self.speed_rep, self.u_grid, arr, v, u))
+                out = out + h * np.asarray(
+                    grid_accel(self.speed_rep if speed_rep is None else speed_rep,
+                               self.u_grid, arr, v, u)
+                )
         return out
+
+    def _rep(self, launch: bool, stop: bool = False) -> np.ndarray:
+        """車速方向の補間に使う行の代表車速（_grid と同じ選び方。発進側・停止側の専用の代表車速が
+        あり、その表を引くときだけそれを使う。2026-10-22 段5-4）。"""
+        if launch and self.launch_accel is not None and self.launch_speed_rep is not None:
+            return self.launch_speed_rep
+        if stop and self.stop_accel is not None and self.stop_speed_rep is not None:
+            return self.stop_speed_rep
+        return self.speed_rep
 
     def _grid(self, launch: bool, stop: bool = False) -> np.ndarray:
         if launch and stop:
@@ -309,19 +332,19 @@ class ForwardTable:
         anodes = self._accel_release_nodes(accel_release, launch, v.shape, stop)
         if nodes is None and anodes is None:
             return grid_accel(
-                self.speed_rep, self.u_grid, self._grid(launch, stop), v_kmh, u_pct
+                self._rep(launch, stop), self.u_grid, self._grid(launch, stop), v_kmh, u_pct
             )
         if nodes is None:
             out_b = np.asarray(
-                grid_accel(self.speed_rep, self.u_grid, self._grid(launch, stop), v, u)
+                grid_accel(self._rep(launch, stop), self.u_grid, self._grid(launch, stop), v, u)
             )
         else:
             arrs, vals, r, _ = nodes
-            out_b = self._blend(arrs, vals, r, v, u)
+            out_b = self._blend(arrs, vals, r, v, u, self._rep(launch, stop))
         if anodes is None:
             return _scalar_or_array(out_b)
         arrs_a, vals_a, r_a = anodes
-        out_a = self._blend(arrs_a, vals_a, r_a, v, u)
+        out_a = self._blend(arrs_a, vals_a, r_a, v, u, self._rep(launch, stop))
         return _scalar_or_array(np.where(u > 0.0, out_a, out_b))
 
     def invert(
@@ -343,8 +366,8 @@ class ForwardTable:
         anodes = self._accel_release_nodes(accel_release, launch, v.shape, stop)
         if nodes is None and anodes is None:
             return grid_invert(
-                self.speed_rep, self.u_grid, self._grid(launch, stop), self._kind(launch, stop),
-                v_kmh, a_kmhs,
+                self._rep(launch, stop), self.u_grid, self._grid(launch, stop),
+                self._kind(launch, stop), v_kmh, a_kmhs,
             )
         extra: dict[str, Any] = {}
         if anodes is not None:
@@ -355,12 +378,12 @@ class ForwardTable:
             }
         if nodes is None:
             return grid_invert(
-                self.speed_rep, self.u_grid, self._grid(launch, stop), self._kind(launch, stop),
-                v, a, **extra,
+                self._rep(launch, stop), self.u_grid, self._grid(launch, stop),
+                self._kind(launch, stop), v, a, **extra,
             )
         arrs, vals, r, kind = nodes
         return grid_invert(
-            self.speed_rep, self.u_grid, arrs[0], kind, v, a,
+            self._rep(launch, stop), self.u_grid, arrs[0], kind, v, a,
             release_nodes=arrs, release_node_pct=vals, release=r, **extra,
         )
 
@@ -368,7 +391,9 @@ class ForwardTable:
         self, v_kmh: np.ndarray | float, *, launch: bool = False, stop: bool = False
     ) -> Any:
         """u=0（惰行）の加速度 [km/h/s]。launch・stop は accel と同じ。"""
-        return grid_accel(self.speed_rep, self.u_grid, self._grid(launch, stop), v_kmh, 0.0)
+        return grid_accel(
+            self._rep(launch, stop), self.u_grid, self._grid(launch, stop), v_kmh, 0.0
+        )
 
     def save(self, path: Path | None = None) -> Path:
         return save_table(self, path)
@@ -912,6 +937,149 @@ def attach_stop(
     return replace(table, stop_accel=out, stop_kind=kind, meta=meta)
 
 
+# 2026-10-22 段5-4 b: 発進側の表を停止側と同じ車速の行まで置き換える
+# （extend_launch_rows_to_stop_max）。
+# 発進側 5 km/h・停止側 7.5 km/h で置き換える範囲が違い、5〜7.5 km/h の開度 0 が発進側（本体）
+# −0.44 ↔ 停止側 0.00 と食い違っていた。置き換えていない行は、停止側の u ≦ 0（開度 0 と
+# ブレーキ側）をそのまま写し、アクセル側（u > 0）は「停止側の開度 0 の値 ＋ 本体の開度による
+# 増え」で作る
+# （measured のときはこの後 apply_launch_accel_measured がアクセル側を実測の点で作り直す）。
+def extend_launch_rows_to_stop_max(table: ForwardTable) -> ForwardTable:
+    """発進側の表（launch_accel）を、停止側が置き換えていて発進側が置き換えていない車速の行まで
+    広げた新しい表を返す（2026-10-22 段5-4 b）。
+
+    - u ≦ 0（開度 0 とブレーキ側）: 停止側の表（stop_accel）のその行の値。
+    - u > 0（アクセル側）: 停止側の開度 0 の値 ＋ max(本体の同じ u の値 − 本体の開度 0 の値, 0)。
+      そのあと u について単調（非減少）にそろえ、ブレーキ側の最大値を下回らないようにする。
+    meta: launch_rows_to_stop_max（True）・launch_rows_to_stop_max_rows（広げた行の代表車速）。
+    launch_speed_rows に広げた行を足す（昇順）。発進側か停止側の表が無い、広げる行が無いときは
+    表はそのまま（meta のフラグだけ残す）。元の表は書き換えない。
+    """
+    meta = dict(table.meta)
+    meta["launch_rows_to_stop_max"] = True
+    meta["launch_rows_to_stop_max_rows"] = []
+    if table.launch_accel is None or table.stop_accel is None:
+        return replace(table, meta=meta)
+    have = [float(x) for x in meta.get("launch_speed_rows", [])]
+    want = [float(x) for x in meta.get("stop_speed_rows", [])]
+    targets = [x for x in want if not any(abs(x - h) < 1e-6 for h in have)]
+    if not targets:
+        return replace(table, meta=meta)
+    grid = table.u_grid
+    pos = grid > _EPS
+    neg_idx = np.flatnonzero(grid <= _EPS)
+    out = table.launch_accel.copy()
+    kind = (table.launch_kind if table.launch_kind is not None else table.point_kind).copy()
+    stop_kind = table.stop_kind if table.stop_kind is not None else table.point_kind
+    done: list[float] = []
+    for r in range(len(table.speed_rep)):
+        if not any(abs(float(table.speed_rep[r]) - x) < 1e-6 for x in targets):
+            continue
+        stop_row = table.stop_accel[r]
+        body = table.accel_grid[r]
+        row = out[r].copy()
+        row[neg_idx] = stop_row[neg_idx]
+        u0_stop = float(np.interp(0.0, grid, stop_row))
+        u0_body = float(np.interp(0.0, grid, body))
+        val = u0_stop + np.maximum(body - u0_body, 0.0)
+        acc_part = IsotonicRegression(increasing=True).fit_transform(grid[pos], val[pos])
+        floor = float(row[neg_idx].max()) if len(neg_idx) else -np.inf
+        row[pos] = np.maximum(acc_part, floor)
+        out[r] = row
+        k_row = kind[r].copy()
+        k_row[neg_idx] = stop_kind[r][neg_idx]
+        k_row[pos] = POINT_FILLED
+        kind[r] = k_row
+        done.append(float(table.speed_rep[r]))
+    meta["launch_rows_to_stop_max_rows"] = done
+    meta["launch_speed_rows"] = sorted(have + done)
+    return replace(table, launch_accel=out, launch_kind=kind, meta=meta)
+
+
+# 2026-10-22 段5-4 e: 発進側・停止側の置き換えた行の代表車速を、学習データの車速の中央値にする
+# （apply_side_row_speed_rep）。停止側の 5〜7.5 km/h の行のデータはほとんどちょうど 5.00 km/h、
+# 2.5〜5 の行も半分が 4.95〜5.0 km/h なのに、表は行の中心（1.25・3.75・6.25）に置いていた。
+#   SIDE_REP_MIN_GAP_KMH … 隣の行の代表車速との間隔の下限 [km/h]。これより近いと車速方向の
+#     補間が急になりすぎる（4.95 と 5.00 の間で 1 行ぶん入れ替わる）ので、その行は元の中心に戻す。
+#     仮値（データ由来ではない。置き換えた行の幅 2.5 km/h の 1/5）
+SIDE_REP_MIN_GAP_KMH = 0.5
+
+
+def apply_side_row_speed_rep(
+    table: ForwardTable,
+    launch_rows: FwdRows,
+    stop_rows: FwdRows,
+    *,
+    min_gap_kmh: float = SIDE_REP_MIN_GAP_KMH,
+) -> ForwardTable:
+    """発進側・停止側の表を補間するときの行の代表車速を、置き換えた行ごとに学習データ（動いている
+    行）の車速の中央値にした新しい表を返す（2026-10-22 段5-4 e）。
+
+    - 対象: meta launch_speed_rows（発進側）・stop_speed_rows（停止側）の行。置き換えていない行は
+      本体の speed_rep のまま。
+    - 中央値は、その車速の行の帯（speed_edges）に入る動いている行（車速 ≧ STOP_SPEED_KMH）の車速。
+      発進側で段5-4 b が広げた行（meta launch_rows_to_stop_max_rows）は、値の元が停止側の表なので
+      停止側の中央値を使う。動いている行が無い行は元の代表車速のまま。
+    - 代表車速は単調増加を保つ: 隣の行（置き換えた後）との間隔が min_gap_kmh 未満になる行は、元の
+      代表車速に戻す（下の行から順に確かめる）。
+    meta: launch_speed_rep_map / stop_speed_rep_map（行の元の代表車速 → 新しい代表車速）・
+    side_row_speed_rep（"data"）・side_row_speed_rep_min_gap_kmh。launch_speed_rep・stop_speed_rep
+    を付ける。launch_accel / stop_accel が無い側は付けない。
+    """
+    meta = dict(table.meta)
+    meta["side_row_speed_rep"] = "data"
+    meta["side_row_speed_rep_min_gap_kmh"] = min_gap_kmh
+    edges = table.speed_edges
+    grid_rep = np.asarray(table.speed_rep, dtype=float)
+
+    def medians(rows: FwdRows) -> dict[int, float]:
+        mv = rows.speed_kmh >= STOP_SPEED_KMH
+        sc = speed_cell_edges(rows.speed_kmh[mv], edges)
+        v = rows.speed_kmh[mv]
+        return {int(r): float(np.median(v[sc == r])) for r in np.unique(sc)}
+
+    def row_ids(key: str) -> list[int]:
+        xs = [float(x) for x in meta.get(key, [])]
+        return [r for r in range(len(grid_rep)) if any(abs(grid_rep[r] - x) < 1e-6 for x in xs)]
+
+    def build(ids: list[int], med: dict[int, float]) -> tuple[np.ndarray, dict[str, float]]:
+        rep = grid_rep.copy()
+        for r in ids:
+            if r in med:
+                rep[r] = med[r]
+        changed = [r for r in ids if r in med]
+        for r in changed:
+            for q in (r - 1, r + 1):
+                if 0 <= q < len(rep) and abs(rep[r] - rep[q]) < min_gap_kmh - _EPS:
+                    rep[r] = grid_rep[r]
+                    break
+        # 戻したあとの確認（単調増加と間隔）。崩れていたら全部元に戻す（安全側）
+        if np.any(np.diff(rep) <= 0.0):
+            rep = grid_rep.copy()
+        return rep, {f"{grid_rep[r]:g}": float(rep[r]) for r in ids}
+
+    stop_ids = row_ids("stop_speed_rows")
+    med_stop = medians(stop_rows) if len(stop_rows) else {}
+    launch_ids = row_ids("launch_speed_rows")
+    ext_ids = set(row_ids("launch_rows_to_stop_max_rows"))
+    med_launch = medians(launch_rows) if len(launch_rows) else {}
+    for r in ext_ids:
+        if r in med_stop:
+            med_launch[r] = med_stop[r]
+        else:
+            med_launch.pop(r, None)
+    out = table
+    if table.stop_accel is not None and stop_ids:
+        rep, mp = build(stop_ids, med_stop)
+        meta["stop_speed_rep_map"] = mp
+        out = replace(out, stop_speed_rep=rep)
+    if table.launch_accel is not None and launch_ids:
+        rep, mp = build(launch_ids, med_launch)
+        meta["launch_speed_rep_map"] = mp
+        out = replace(out, launch_speed_rep=rep)
+    return replace(out, meta=meta)
+
+
 def release_stats(
     release_pct: np.ndarray,
     dt_row_s: np.ndarray,
@@ -1254,6 +1422,8 @@ def save_table(table: ForwardTable, path: Path | None = None) -> Path:
         "stop_accel": table.stop_accel,
         "launch_kind": table.launch_kind,
         "stop_kind": table.stop_kind,
+        "launch_speed_rep": table.launch_speed_rep,  # 2026-10-22 段5-4 e
+        "stop_speed_rep": table.stop_speed_rep,
         "release_grid": table.release_grid,
         "release_accel": table.release_accel,
         "accel_release_grid": table.accel_release_grid,  # 2026-10-20 段4-3
@@ -1295,6 +1465,8 @@ def load_forward_map(path: Path) -> ForwardTable:
         stop_accel=d.get("stop_accel"),  # 2026-10-18 段2o-10: 古い pkl（キー無し）は None
         launch_kind=d.get("launch_kind"),
         stop_kind=d.get("stop_kind"),
+        launch_speed_rep=d.get("launch_speed_rep"),  # 2026-10-22 段5-4 e: 古い pkl は None
+        stop_speed_rep=d.get("stop_speed_rep"),
         release_grid=d.get("release_grid"),  # 2026-10-14 段2o-5: 古い pkl（キー無し）は None
         release_accel=d.get("release_accel"),
         accel_release_grid=d.get("accel_release_grid"),  # 2026-10-20 段4-3: 古い pkl は None

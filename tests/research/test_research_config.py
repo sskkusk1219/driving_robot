@@ -1244,3 +1244,16 @@ def test_stage53_settings_default_to_current_behaviour_and_are_validated() -> No
     probs = cfgmod.validate_config(cfg)
     for k in keys:
         assert any(k in p for p in probs), k
+
+
+def test_stage54_settings_default_to_current_behaviour_and_are_validated() -> None:
+    d = cfgmod.LearningSection()
+    assert d.launch_rows_to_stop_max is False and d.side_row_speed_rep == "grid"
+    cfg = _load_default()
+    assert cfg.learning.launch_rows_to_stop_max is False
+    assert cfg.learning.side_row_speed_rep == "grid"
+    assert not any("side_row_speed_rep" in p for p in cfgmod.validate_config(cfg))
+    cfg.learning.side_row_speed_rep = "data"
+    assert not any("side_row_speed_rep" in p for p in cfgmod.validate_config(cfg))
+    cfg.learning.side_row_speed_rep = "bogus"
+    assert any("side_row_speed_rep" in p for p in cfgmod.validate_config(cfg))
