@@ -1213,3 +1213,13 @@ def test_accel_release_input_setting_default_off(tmp_path: Path) -> None:
     text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
     assert "  accel_release_input_enabled: false\n" in text
     assert _load_default().learning.accel_release_input_enabled is False
+
+
+def test_low_speed_side_rule_defaults_to_legacy_and_is_validated() -> None:
+    cfg = _load_default()
+    assert cfg.forward_map.low_speed_side_rule == "legacy"
+    assert not any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.low_speed_side_rule = "pedal"
+    assert not any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.low_speed_side_rule = "bogus"
+    assert any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))

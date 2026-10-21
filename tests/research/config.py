@@ -668,6 +668,14 @@ class ForwardMapSection:
     # 効く先: 停車まぎわの |偏差|>1 の秒数。決める時期: C15 の実機 1〜2 本の後（C12 と比べる）
     stop_lead_enabled: bool = True
     stop_end_p_enabled: bool = True
+    # 2026-10-22 段5-2: 低速（meta の stop_max_speed_kmh 未満）で、発進側・停止側のどちらの表を
+    # 引くか。"legacy" ＝ 今まで（発進側 ＝ 要る加速度 ＞ 0、停止側 ＝ 減速かつ停車の 0.5 秒前から。
+    # 残りは本体・戻しの表）。"pedal" ＝ アクセルはいつでも発進側、ブレーキは発進の途中だけ発進側
+    # （動き出す開度より深くなる行は停止側）でそれ以外は停止側。本体・戻しは低速で使わない。
+    # 表が発進側・停止側の両方を持たないときは legacy と同じ。
+    # 効く先: 7.5 km/h 未満の指令（P・惰行の補助・DOB の予測が引く表も同じ）。
+    # 決める時期: 段5-2 の実機（C8 の WLTP・UDDS・US06）の後
+    low_speed_side_rule: str = "legacy"
 
 
 @dataclass
@@ -1070,6 +1078,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         f"forward_map.coast_band_kmhs は 0 以上: {fm.coast_band_kmhs}",
     )
     need(fm.need_window_s > 0.0, f"forward_map.need_window_s は正値: {fm.need_window_s}")
+    need(
+        fm.low_speed_side_rule in ("legacy", "pedal"),
+        f"forward_map.low_speed_side_rule は legacy か pedal: {fm.low_speed_side_rule!r}",
+    )
     for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")
     need(fm.deviation_c >= 0.0, f"forward_map.deviation_c は 0 以上: {fm.deviation_c}")

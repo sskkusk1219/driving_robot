@@ -142,6 +142,10 @@ CSV_COLUMNS: tuple[str, ...] = (
     # 他は空欄）と 停C の τ [s]（停C の区間の行だけ。それ以外は空欄）
     "stop_lead_active",
     "stop_end_tau_s",
+    # 2026-10-22 段5-2: 計画がその行で引いた表（0 本体・1 発進側・2 停止側・3 戻し）。アクセル側・
+    # ブレーキ側それぞれ。C7 以降の FF の行だけ、他は空欄
+    "ff_side_accel",
+    "ff_side_brake",
 )
 
 
@@ -186,6 +190,8 @@ class DriveSample:
     creep_floor_pct: float | None = None  # C14 の下限が上げた量（C14 の行だけ。他は None）
     stop_lead_active: bool | None = None  # C15 の停A の行なら True（C15 の行だけ。他は None）
     stop_end_tau_s: float | None = None  # C15 の停C の τ [s]（区間の行だけ。他は None）
+    ff_side_accel: int | None = None  # 計画がその行のアクセル側で引いた表（SIDE_*。FF の行だけ）
+    ff_side_brake: int | None = None  # 同、ブレーキ側
 
 
 class SessionLog:
@@ -273,6 +279,8 @@ class SessionLog:
         creep_floor_pct: float | None = None,
         stop_lead_active: bool | None = None,
         stop_end_tau_s: float | None = None,
+        ff_side_accel: int | None = None,
+        ff_side_brake: int | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -308,6 +316,8 @@ class SessionLog:
             creep_floor_pct=creep_floor_pct,
             stop_lead_active=stop_lead_active,
             stop_end_tau_s=stop_end_tau_s,
+            ff_side_accel=ff_side_accel,
+            ff_side_brake=ff_side_brake,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -500,6 +510,8 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.creep_floor_pct),
                 _fmt_bool(s.stop_lead_active),
                 _fmt(s.stop_end_tau_s),
+                "" if s.ff_side_accel is None else str(s.ff_side_accel),
+                "" if s.ff_side_brake is None else str(s.ff_side_brake),
             ])
 
 

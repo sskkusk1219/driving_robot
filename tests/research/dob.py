@@ -18,7 +18,8 @@ deviation_offset_detail(dob_kmhs=d)` で「要る加速度から d を引いて�
 - 更新しない（値を保つ）条件: 遅れた u が 0（惰行・停車保持）／ガバナー作動／遅れた u が最大開度／
   発進側・停止側の表の行／そのペダルの Tq が None
 - numpy 以外は import しない（fwd_plan を読むと mode_drive との循環になる。発進・停止の判定は
-  呼び出し側が `low_speed_sides` で出して渡す）
+  呼び出し側が出して渡す。出どころは、計画の規則が legacy なら `low_speed_sides`、pedal なら計画が
+  行ごとに決めた表（`ForwardPlan.side_accel` / `side_brake`。2026-10-22 段5-2））
 """
 
 from __future__ import annotations
@@ -139,7 +140,8 @@ class PedalDisturbanceObserver:
         更新しなければ None。
 
         u_now ＝ 今の周期で出した開度 − min（アクセル正・ブレーキ負・min 以下は 0）。
-        launch・stop ＝ 今の計画の行が発進側・停止側の表を引くか（`fwd_plan.low_speed_sides`）。
+        launch・stop ＝ 今の計画の行が発進側・停止側の表を引くか（`fwd_plan.low_speed_sides`、
+        規則が pedal の計画は `ForwardPlan.side_for`。段5-2）。
         """
         self._hist.append((t, u_now, at_limit_now, governed))
         prev_t, prev_v = self._prev_t, self._prev_speed

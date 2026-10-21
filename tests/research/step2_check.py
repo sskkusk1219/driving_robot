@@ -537,6 +537,7 @@ def check_plan(
         preposition_enabled=fm.preposition_enabled,
         preposition_margin_pct=fm.preposition_margin_pct,
         preposition_lead_s=fm.preposition_lead_s,
+        low_speed_side_rule=fm.low_speed_side_rule,
     )
     nan_count = int(np.count_nonzero(np.isnan(plan.effort_pct))) + int(
         np.count_nonzero(np.isnan(plan.need_accel_kmhs))

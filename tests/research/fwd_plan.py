@@ -86,6 +86,14 @@ FLAG_OUT = POINT_OUT
 FLAG_COAST = 3
 FLAG_STOP = 4
 FLAG_PREPOS = 5  # 2026-10-16 段2o-6: 次に踏むペダルを min から効き始めの手前へ先に置いている区間
+# 2026-10-22 段5-2: 行ごとに引いた表（ForwardPlan.side_accel / side_brake。int）。
+# 戻しの表（SIDE_RELEASE）は、ブレーキ側で戻し量を見て解き直した行だけに入る
+SIDE_MAIN = 0
+SIDE_LAUNCH = 1
+SIDE_STOP = 2
+SIDE_RELEASE = 3
+LOW_SPEED_SIDE_RULES = ("legacy", "pedal")
+
 FLAG_LABELS = {
     FLAG_MEASURED: "実測",
     FLAG_FILLED: "穴埋め",
@@ -253,6 +261,22 @@ class ForwardPlan:
     # 停A（C15。2026-10-20 段4-2）で停車保持へ早めに入れた時刻（停A が無ければ全部 False、
     # None ＝ 持たない）。flag は FLAG_STOP のまま、通常の入る時刻より前の行だけ True
     stop_lead: np.ndarray | None = None
+    # 2026-10-22 段5-2: 行ごとに引いた表（SIDE_*。アクセル側・ブレーキ側それぞれ）。
+    # deviation_offset_detail・coast_assist_effort の side に渡して、計画と同じ表で P・惰行の補助を
+    # 引く。None ＝ 持たない（その場合は low_speed_sides で決める）
+    side_accel: np.ndarray | None = None
+    side_brake: np.ndarray | None = None
+    # 表の引き方の規則（build_plan の low_speed_side_rule）。"legacy" のときは side_for が None を
+    # 返し、呼び出し側は今までどおり low_speed_sides で決める（計算が変わらないことを保証するため）
+    side_rule: str = "legacy"
+
+    def side_for(self, i: int, is_accel: bool) -> int | None:
+        """行 i のペダル（アクセル側かブレーキ側か）で計画が引いた表 SIDE_*。"pedal" の規則の
+        計画だけ値を返す（legacy・配列なしは None）。P・惰行の補助・DOB の予測が渡す。"""
+        arr = self.side_accel if is_accel else self.side_brake
+        if self.side_rule != "pedal" or arr is None:
+            return None
+        return int(arr[i])
 
     def index_at(self, t_s: float) -> int:
         """時刻 t に最も近い行の番号（`at` と同じ最近傍）。"""
@@ -328,8 +352,17 @@ def build_plan(
     return_gap_enabled: bool = True,
     stop_ref_at: Callable[[float], float] | None = None,
     stop_lead: bool = False,
+    low_speed_side_rule: str = "legacy",
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
+
+    2026-10-22 段5-2: `low_speed_side_rule`。"legacy" は今までと完全に同じ（`low_speed_sides`）。
+    "pedal"（表が launch_accel と stop_accel の両方を持つときだけ。片方でも無ければ legacy）は、
+    基準車速が meta stop_max_speed_kmh 未満の行を、ペダルごとに次の表で解く: アクセル＝いつでも
+    発進側。ブレーキ＝発進の途中（停車保持を抜けてから、初めてアクセルを使うまで）は発進側、
+    それ以外は停止側（need の符号・停車の先読みは問わない）。ただし発進の途中でも、基準が停車速度
+    より上で、発進側で解いた u_b の深さが meta launch_breakaway_u_pct（動き出す開度）より深い行は
+    停止側で解き直す。この車速では本体・戻しの表は使わない（上の車速は今までと同じ）。
 
     2026-10-20 段4-2 停A: `stop_lead` が True のとき、停車保持に入る時刻を「ブレーキの遅れ
     （brake_lag_s）先の基準が停車速度以下」に早める（遅れの分だけ早く停車保持の開度を指令する）。
@@ -379,24 +412,48 @@ def build_plan(
     u_a, kind_a = table.invert(v, need_a)
     u_b, kind_b = table.invert(v, need_b)
 
-    coast_a = coast_b = coast
     stops_ahead = ref_stop <= STOP_SPEED_KMH
-    launch_a, stop_a = low_speed_sides(table, need_a, v, stops_ahead)
-    launch_b, stop_b = low_speed_sides(table, need_b, v, stops_ahead)
-    # 発進側（基準が上がっている時刻）・停止側（停車へ向かう減速の時刻）だけ、その表で解く
-    for use_launch, side_a, side_b in ((True, launch_a, launch_b), (False, stop_a, stop_b)):
-        if not (side_a.any() or side_b.any()):
-            continue
-        kw = {"launch": True} if use_launch else {"stop": True}
-        coast_s = np.asarray(table.coast_accel(v, **kw), dtype=float)
-        u_a_s, kind_a_s = table.invert(v, need_a, **kw)
-        u_b_s, kind_b_s = table.invert(v, need_b, **kw)
-        coast_a = np.where(side_a, coast_s, coast_a)
-        coast_b = np.where(side_b, coast_s, coast_b)
-        u_a, kind_a = np.where(side_a, u_a_s, u_a), np.where(side_a, kind_a_s, kind_a)
-        u_b, kind_b = np.where(side_b, u_b_s, u_b), np.where(side_b, kind_b_s, kind_b)
+    pedal_rule = (
+        low_speed_side_rule == "pedal"
+        and table.launch_accel is not None
+        and table.stop_accel is not None
+    )
+    if not pedal_rule:
+        coast_a = coast_b = coast
+        launch_a, stop_a = low_speed_sides(table, need_a, v, stops_ahead)
+        launch_b, stop_b = low_speed_sides(table, need_b, v, stops_ahead)
+        # 発進側（基準が上がっている時刻）・停止側（停車へ向かう減速の時刻）だけ、その表で解く
+        coast_a, u_a, kind_a = _solve_sides(
+            table, v, need_a, launch_a, stop_a, coast_a, u_a, kind_a
+        )
+        coast_b, u_b, kind_b = _solve_sides(
+            table, v, need_b, launch_b, stop_b, coast_b, u_b, kind_b
+        )
+        want_accel = need_a - coast_a >= coast_band_kmhs - 1e-12
+    else:
+        top = float(table.meta.get("stop_max_speed_kmh", 0.0))
+        low = v < top
+        # アクセル側: 低速はいつでも発進側。判定（want_accel・is_accel）はアクセル側の値だけ
+        launch_a, stop_a = low, np.zeros(n, dtype=bool)
+        coast_a, u_a, kind_a = _solve_sides(table, v, need_a, launch_a, stop_a, coast, u_a, kind_a)
+        want_accel = need_a - coast_a >= coast_band_kmhs - 1e-12
+        accel_now = want_accel & (u_a > 0.0)
+        midway = _launch_midway(stop, accel_now)
+        # ブレーキ側: 発進の途中は発進側、それ以外は停止側。発進の途中でも、動き出す開度より深い
+        # 行（基準が停車速度より上）は停止側で解き直す
+        launch_b = low & midway
+        stop_b = low & ~midway
+        breakaway = table.meta.get("launch_breakaway_u_pct")
+        if launch_b.any() and breakaway is not None and np.isfinite(breakaway):
+            u_b_l, _ = table.invert(v, need_b, launch=True)
+            # 実機の pkl の meta は符号つき（ブレーキ側 ＝ 負）なので、大きさで比べる
+            deep = (
+                launch_b & (v > STOP_SPEED_KMH)
+                & (np.abs(np.asarray(u_b_l)) > abs(float(breakaway)))
+            )
+            launch_b, stop_b = launch_b & ~deep, stop_b | deep
+        coast_b, u_b, kind_b = _solve_sides(table, v, need_b, launch_b, stop_b, coast, u_b, kind_b)
 
-    want_accel = need_a - coast_a >= coast_band_kmhs - 1e-12
     want_brake = ~want_accel & (need_b - coast_b <= -coast_band_kmhs + 1e-12)
     is_accel = want_accel & (u_a > 0.0)
     is_brake = want_brake & (u_b < 0.0)
@@ -410,6 +467,7 @@ def build_plan(
 
     effort[stop] = -stop_brake_opening_pct
     flag[stop] = FLAG_STOP
+    released = np.zeros(n, dtype=bool)  # ブレーキで戻しの表（本体）に解き直した行
     body_release = table.release_grid is not None and table.release_accel is not None
     # 2026-10-20 段4-3: 停止側の表で解いた時刻も、停止側の戻しの層があれば戻し量を見て解き直す
     stop_release = table.stop_release_accel is not None and table.stop_release_grid is not None
@@ -419,7 +477,7 @@ def build_plan(
             redo |= is_brake & ~stop & ~(launch_b | stop_b)  # 発進側の表で解いた時刻は戻しではない
         if stop_release:
             redo |= is_brake & ~stop & stop_b & ~launch_b
-        _resolve_releases(
+        released = _resolve_releases(
             effort, redo, u_b, v, need_b, table, brake_deadband_pct, accel_deadband_pct, period_s,
             stop_side=stop_b,
         )
@@ -449,11 +507,55 @@ def build_plan(
     gap_stats = (
         ensure_return_gap(effort, flag, ret=ret, period_s=period_s) if return_gap_enabled else None
     )
+    side_accel = np.where(launch_a, SIDE_LAUNCH, np.where(stop_a, SIDE_STOP, SIDE_MAIN))
+    side_brake = np.where(launch_b, SIDE_LAUNCH, np.where(stop_b, SIDE_STOP, SIDE_MAIN))
+    side_brake = np.where(released & ~stop_b & ~launch_b, SIDE_RELEASE, side_brake)
     return ForwardPlan(
         t_s=t, effort_pct=effort, need_accel_kmhs=need, flag=flag, period_s=period_s,
         preposition=stats, return_gap=gap_stats, stops_ahead=stops_ahead,
-        stop_lead=lead_mask,
+        stop_lead=lead_mask, side_accel=side_accel.astype(int), side_brake=side_brake.astype(int),
+        side_rule="pedal" if pedal_rule else "legacy",
     )
+
+
+def _solve_sides(
+    table: ForwardTable,
+    v: np.ndarray,
+    need: np.ndarray,
+    launch: np.ndarray,
+    stop: np.ndarray,
+    coast: np.ndarray,
+    u: np.ndarray,
+    kind: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """発進側・停止側の行だけ、その表で惰行の加速度 c と逆引き u を置き換える（残りは本体のまま）。
+    戻り値は (coast, u, kind)。launch・stop が全部 False なら入力をそのまま返す。"""
+    for use_launch, side in ((True, launch), (False, stop)):
+        if not side.any():
+            continue
+        kw = {"launch": True} if use_launch else {"stop": True}
+        coast_s = np.asarray(table.coast_accel(v, **kw), dtype=float)
+        u_s, kind_s = table.invert(v, need, **kw)
+        coast = np.where(side, coast_s, coast)
+        u, kind = np.where(side, u_s, u), np.where(side, kind_s, kind)
+    return coast, u, kind
+
+
+def _launch_midway(stop: np.ndarray, accel_now: np.ndarray) -> np.ndarray:
+    """発進の途中の行（段5-2）: モードの最初の停車保持の最後の行の次から、初めてアクセルを使う
+    行の直前まで。モードの最初が停車保持でなければ全部 False。アクセルが出ないときは最後まで。"""
+    n = len(stop)
+    out = np.zeros(n, dtype=bool)
+    if n == 0 or not stop[0]:
+        return out
+    free = np.flatnonzero(~stop)
+    if len(free) == 0:
+        return out
+    i0 = int(free[0])
+    hit = np.flatnonzero(accel_now[i0:])
+    j = n if len(hit) == 0 else i0 + int(hit[0])
+    out[i0:j] = True
+    return out
 
 
 def low_speed_sides(
@@ -483,6 +585,21 @@ def low_speed_sides(
     return launch, stop
 
 
+def _side_flags(
+    table: ForwardTable,
+    side: int | None,
+    need_kmhs: float,
+    ref_kmh: float,
+    stops_ahead: bool,
+) -> tuple[bool, bool]:
+    """表の引き方 (launch, stop)。side があればそれ（SIDE_LAUNCH / SIDE_STOP / それ以外は本体）、
+    None なら `low_speed_sides`（今までと同じ）。"""
+    if side is None:
+        lv, sv = low_speed_sides(table, need_kmhs, ref_kmh, stops_ahead)
+        return bool(lv), bool(sv)
+    return side == SIDE_LAUNCH, side == SIDE_STOP
+
+
 def deviation_offset(table: ForwardTable, **kwargs: Any) -> float:
     """`deviation_offset_detail` の上乗せ後 effort [%] だけ返す（引数は同じ）。"""
     return deviation_offset_detail(table, **kwargs)[0]
@@ -503,6 +620,7 @@ def deviation_offset_detail(
     brake_min_pct: float,
     stops_ahead: bool = False,
     dob_kmhs: float = 0.0,
+    side: int | None = None,
 ) -> tuple[float, bool]:
     """C10: 開度の列の 1 行（effort）に、偏差の分だけ上乗せした effort [%] を返す（段2p）。
 
@@ -526,6 +644,10 @@ def deviation_offset_detail(
       need − d がより負になり、深く踏む。既定 0 は C10 と同じ出力。
       τ が None の行（遅れが測れない）は dob_kmhs ≠ 0 でも何もしない。
       τ ≦ 0（deviation_c ＝ 0）のときは偏差の項 Δa ＝ 0 で DOB だけ効く。
+    - side（2026-10-22 段5-2）: 計画がその行のペダルで引いた表（ForwardPlan.side_accel /
+      side_brake。SIDE_LAUNCH ＝ 発進側・SIDE_STOP ＝ 停止側・それ以外 ＝ 本体）。None なら上の
+      `low_speed_sides`
+      で決める（今までと同じ）。
     """
     if flag in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS) or effort == 0.0:
         return effort, False
@@ -533,8 +655,7 @@ def deviation_offset_detail(
     tau = tau_accel_s if is_accel else tau_brake_s
     if tau is None or (tau <= 0.0 and dob_kmhs == 0.0):
         return effort, False
-    lv, sv = low_speed_sides(table, need_kmhs, ref_kmh, stops_ahead)
-    launch, stop = bool(lv), bool(sv)
+    launch, stop = _side_flags(table, side, need_kmhs, ref_kmh, stops_ahead)
     d_a = dev_kmh / tau if tau > 0.0 else 0.0
     u0, _ = table.invert(ref_kmh, need_kmhs, launch=launch, stop=stop)
     u1, _ = table.invert(row_kmh, need_kmhs + d_a - dob_kmhs, launch=launch, stop=stop)
@@ -561,6 +682,7 @@ def coast_assist_effort(
     stops_ahead: bool = False,
     dob_kmhs: float = 0.0,
     onset_u_pct: float | None = None,
+    side: int | None = None,
 ) -> float:
     """C12: 惰行の行で補助に使うペダルの effort [%] を返す（段2r。正＝アクセル・負＝ブレーキ）。
 
@@ -575,12 +697,12 @@ def coast_assist_effort(
     onset_u_pct（そのペダルの効き始め。min からの量）を渡すと、u の大きさをそれ以上にする
     （段2r ②。遊びの中に入って効かないのを防ぐ。逆の符号で min に止めた場合も効き始めに置く）。
     None なら下限なし。
+    side（2026-10-22 段5-2）: 計画がその行のペダルで引いた表（SIDE_*）。None なら
+    `low_speed_sides`。
     """
-    lv, sv = low_speed_sides(table, need_kmhs, ref_kmh, stops_ahead)
+    launch, stop = _side_flags(table, side, need_kmhs, ref_kmh, stops_ahead)
     d_a = dev_kmh / tau_s if tau_s > 0.0 else 0.0
-    u1, _ = table.invert(
-        row_kmh, need_kmhs + d_a - dob_kmhs, launch=bool(lv), stop=bool(sv)
-    )
+    u1, _ = table.invert(row_kmh, need_kmhs + d_a - dob_kmhs, launch=launch, stop=stop)
     u = float(u1)
     floor = 0.0 if onset_u_pct is None or not np.isfinite(onset_u_pct) else float(onset_u_pct)
     if is_accel:
@@ -759,11 +881,13 @@ def _resolve_releases(
     period_s: float,
     window_s: float = RELEASE_WINDOW_S,
     stop_side: np.ndarray | None = None,
-) -> None:
+) -> np.ndarray:
     """戻しの表があるとき、redo の時刻のブレーキを時刻順に解き直して effort を書き換える
     （2026-10-14 段2o-5。手順はモジュールの docstring）。u_b0 は戻し量 0 で解いた u。
     stop_side（2026-10-20 段4-3）: True の時刻は停止側の表（と停止側の戻しの層）で引く。
-    None なら全部本体（今までと同じ）。"""
+    None なら全部本体（今までと同じ）。
+    戻り値（段5-2）: 解き直して effort を書いた行の bool 配列。"""
+    changed = np.zeros(len(effort), dtype=bool)
     w = max(int(round(window_s / period_s)), 1)
     # 計画済みの効く開度 u（アクセル＋・ブレーキ−。停車保持の深いブレーキも含む）
     u = np.where(
@@ -795,6 +919,8 @@ def _resolve_releases(
         u_new = min(u_new, 0.0)
         u[i] = u_new
         effort[i] = -(brake_deadband_pct + abs(u_new))
+        changed[i] = True
+    return changed
 
 
 def _resolve_accel_releases(

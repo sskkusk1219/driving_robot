@@ -784,11 +784,13 @@ class ForwardMapFeedforward:
         preposition_lead_s: float = 0.2,
         stop_ref_at: Callable[[float], float] | None = None,
         stop_lead: bool = False,
+        low_speed_side_rule: str = "legacy",
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
 
         stop_ref_at（2026-10-19 段3）: ref_at をぼかした基準にするとき、停車の判定に使う
-        元の基準。stop_lead（2026-10-20 段4-2 停A）: 停車保持へ入るのをブレーキの遅れ分早める。"""
+        元の基準。stop_lead（2026-10-20 段4-2 停A）: 停車保持へ入るのをブレーキの遅れ分早める。
+        low_speed_side_rule（2026-10-22 段5-2）: 低速の表の引き方（"legacy" か "pedal"）。"""
         from tests.research.fwd_plan import build_plan  # noqa: PLC0415
 
         self._plan = build_plan(
@@ -809,6 +811,7 @@ class ForwardMapFeedforward:
             preposition_lead_s=preposition_lead_s,
             stop_ref_at=stop_ref_at,
             stop_lead=stop_lead,
+            low_speed_side_rule=low_speed_side_rule,
         )
         return self._plan
 

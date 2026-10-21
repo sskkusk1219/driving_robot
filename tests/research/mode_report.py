@@ -154,6 +154,8 @@ class RunInfo:
     # C15 でなければ None
     stop_end_settings: str | None = None
     stop_lead_summary: str | None = None
+    # 2026-10-22 段5-2: forward_map.low_speed_side_rule（低速の表の引き方）。None は不明
+    low_speed_side_rule: str | None = None
     stop_end_summary: str | None = None
     # 2026-10-19 段3: 基準のぼかし σ [s]（feedforward.ref_smooth_sigma_s。0 ＝ なし）。None は不明
     # （CSV からの作り直し）。研究系の設定はログに残らないので、ここで確かめる
@@ -929,6 +931,8 @@ def write_mode_report(
                  "なし" if info.stop_lead_summary is None else info.stop_lead_summary),
                 ("C15 の停C の集計（働いた回数・秒数・ブレーキ開度の変化）",
                  "なし" if info.stop_end_summary is None else info.stop_end_summary),
+                ("低速の表の引き方（段5-2 forward_map.low_speed_side_rule。legacy ＝ 今まで）",
+                 "不明" if info.low_speed_side_rule is None else info.low_speed_side_rule),
                 ("基準のぼかし（段3。目標側だけ。KPI・偏差は元の基準）",
                  "不明（CSV からの作り直し）" if info.ref_smooth_sigma_s is None
                  else ref_smooth_text(info.ref_smooth_sigma_s)),

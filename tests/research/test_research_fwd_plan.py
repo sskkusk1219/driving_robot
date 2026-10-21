@@ -15,6 +15,10 @@ from tests.research.fwd_plan import (
     FLAG_OUT,
     FLAG_PREPOS,
     FLAG_STOP,
+    SIDE_LAUNCH,
+    SIDE_MAIN,
+    SIDE_RELEASE,
+    SIDE_STOP,
     ForwardPlan,
     build_plan,
     coast_assist_effort,
@@ -960,3 +964,208 @@ def test_accel_times_are_resolved_in_time_order_with_the_planned_release() -> No
     up = plan_for(lambda t: 30.0 + 2.0 * t, 6.0, tb)
     up0 = plan_for(lambda t: 30.0 + 2.0 * t, 6.0, _accel_release_variant(with_layers=False))
     assert np.array_equal(up.effort_pct, up0.effort_pct)
+
+
+# ───────── 2026-10-22 段5-2: 低速の表の引き方（low_speed_side_rule） ─────────
+
+
+def _pedal_table(dl: float = 2.0, ds: float = 2.4, breakaway: float | None = None) -> ForwardTable:
+    """発進側・停止側を持つ表。発進側は本体より dl、停止側は ds だけ全体に持ち上げる
+    （惰行の加速度が本体 −2.0 に対し、発進側 −2+dl・停止側 −2+ds）。低速は 7.5 km/h 未満。"""
+    t = linear_table()
+    t.launch_accel = t.accel_grid + dl
+    t.stop_accel = t.accel_grid + ds
+    t.meta["stop_max_speed_kmh"] = 7.5
+    if breakaway is not None:
+        t.meta["launch_breakaway_u_pct"] = breakaway
+    return t
+
+
+def _launch_then_constant(t: float) -> float:
+    """停車保持 → 2〜3 s で 1.6 km/h まで発進 → 8 s まで一定（need = 0）。"""
+    return 0.0 if t < 2.0 else min(1.6 * (t - 2.0), 1.6)
+
+
+def test_side_rule_legacy_is_the_default_and_matches_explicit_legacy() -> None:
+    for tb in (_pedal_table(), _launch_variant(), _stop_variant()):
+        base = plan_for(_launch_then_constant, 8.0, tb)
+        same = plan_for(_launch_then_constant, 8.0, tb, low_speed_side_rule="legacy")
+        assert np.array_equal(base.effort_pct, same.effort_pct)
+        assert np.array_equal(base.flag, same.flag)
+        assert base.side_rule == "legacy" and base.side_for(10, False) is None
+        assert base.side_accel is not None and base.side_brake is not None
+
+
+def test_side_arrays_in_legacy_come_from_low_speed_sides() -> None:
+    tb = _pedal_table()
+    plan = plan_for(_decel_to_stop, 6.0, tb)
+    near, far = idx(plan, 4.5), idx(plan, 2.0)
+    assert plan.side_brake[near] == SIDE_STOP and plan.side_brake[far] == SIDE_MAIN
+    rise = plan_for(lambda t: min(2.0 * t, 10.0), 6.0, tb)
+    assert rise.side_accel[idx(rise, 1.0)] == SIDE_LAUNCH  # need > 0 → 発進側
+
+
+def test_pedal_rule_without_launch_or_stop_table_is_legacy() -> None:
+    for tb in (_launch_variant(), _stop_variant()):  # 片方しか持たない
+        base = plan_for(_launch_then_constant, 8.0, tb)
+        same = plan_for(_launch_then_constant, 8.0, tb, low_speed_side_rule="pedal")
+        assert np.array_equal(base.effort_pct, same.effort_pct)
+        assert same.side_rule == "legacy"
+
+
+def test_pedal_rule_constant_after_launch_uses_the_stop_table() -> None:
+    tb = _pedal_table()
+    legacy = plan_for(_launch_then_constant, 8.0, tb)
+    plan = plan_for(_launch_then_constant, 8.0, tb, low_speed_side_rule="pedal")
+    assert plan.side_rule == "pedal"
+    for t in (4.0, 6.0, 7.5):
+        i = idx(plan, t)
+        assert plan.need_accel_kmhs[i] == pytest.approx(0.0, abs=1e-9)
+        assert plan.side_brake[i] == SIDE_STOP
+        assert plan.side_accel[i] == SIDE_LAUNCH
+        assert plan.effort_pct[i] < 0.0  # 停止側の惰行 +0.38 に対し need 0 → ブレーキ
+        # legacy は need = 0 だと本体（惰行 −2.08）になり、アクセルを踏む
+        assert legacy.side_brake[i] == SIDE_MAIN and legacy.effort_pct[i] > 0.0
+    # 発進のアクセル（need > 0）は発進側
+    assert plan.side_accel[idx(plan, 2.5)] == SIDE_LAUNCH
+    assert plan.effort_pct[idx(plan, 2.5)] > 0.0
+
+
+def _release_low_table() -> tuple[ForwardTable, ForwardTable]:
+    import copy  # noqa: PLC0415
+
+    from tests.research.test_research_fwd_map import release_table  # noqa: PLC0415
+
+    tb = release_table()
+    tb.meta["release_max_pct"] = 8.0
+    tb.launch_accel = tb.accel_grid.copy()
+    tb.stop_accel = tb.accel_grid.copy()
+    tb.meta["stop_max_speed_kmh"] = 7.5
+    plain = copy.deepcopy(tb)
+    plain.release_grid = None
+    plain.release_accel = None
+    return tb, plain
+
+
+def _decel_then_ease(t: float) -> float:
+    """14 から −4 km/h/s で 1.5 s（強いブレーキ、8 km/h）→ −2.5 km/h/s（浅くして戻す）。"""
+    return 14.0 - 4.0 * t if t < 1.5 else max(0.0, 8.0 - 2.5 * (t - 1.5))
+
+
+def test_pedal_rule_low_speed_decel_uses_stop_table_not_release_table() -> None:
+    tb, plain = _release_low_table()
+    plan = plan_for(_decel_then_ease, 5.0, tb, low_speed_side_rule="pedal")
+    base = plan_for(_decel_then_ease, 5.0, plain, low_speed_side_rule="pedal")
+    legacy = plan_for(_decel_then_ease, 5.0, tb)
+    v = np.array([_decel_then_ease(float(x)) for x in plan.t_s])
+    low = (v < 7.5) & (plan.flag != FLAG_STOP) & (plan.effort_pct < 0.0)
+    rows = np.flatnonzero(low & (plan.t_s > 2.0))
+    assert len(rows) > 10
+    # 停車の 0.5 s より前でも停止側。戻しの表は引かない（戻しの層を持たない表と同じ開度）
+    assert np.all(plan.side_brake[rows] == SIDE_STOP)
+    assert np.allclose(plan.effort_pct[rows], base.effort_pct[rows])
+    # legacy はこの行を本体＋戻しの表で解き、戻しの分だけ深くなる行がある
+    assert np.any(legacy.side_brake[rows] == SIDE_RELEASE)
+    assert np.any(legacy.effort_pct[rows] < plan.effort_pct[rows] - 0.1)
+    # 7.5 km/h 以上の戻しは今まで通り（戻しの表）
+    hi = np.flatnonzero((v >= 7.5) & (plan.flag != FLAG_STOP) & (plan.t_s > 1.5))
+    assert np.any(plan.side_brake[hi] == SIDE_RELEASE)
+    assert np.allclose(plan.effort_pct[hi], legacy.effort_pct[hi])
+
+
+def _slow_launch(t: float) -> float:
+    """停車保持 → 2〜6 s で 0.5 km/h/s で 2.0 まで → 6〜7 s で −1.0 km/h/s → 7.5 s まで 1.0 一定
+    → 7.5〜9.5 s で 10 km/h まで加速。"""
+    if t < 2.0:
+        return 0.0
+    if t < 6.0:
+        return 0.5 * (t - 2.0)
+    if t < 7.0:
+        return 2.0 - (t - 6.0)
+    if t < 7.5:
+        return 1.0
+    return min(1.0 + 4.5 * (t - 7.5), 10.0)
+
+
+def test_pedal_rule_brake_during_launch_is_launch_side_unless_deeper_than_breakaway() -> None:
+    bk = 3.0
+    tb = _pedal_table(dl=3.0, ds=2.4, breakaway=bk)
+    plan = plan_for(_slow_launch, 10.0, tb, low_speed_side_rule="pedal")
+    v = np.array([_slow_launch(float(x)) for x in plan.t_s])
+    stop = plan.flag == FLAG_STOP
+    first_accel = int(np.flatnonzero((plan.effort_pct > 0.0) & ~stop)[0])
+    low = v < 7.5
+    # 停車保持の直後（ref ≤ 0.5）と動き出して浅い間: 発進側
+    for t in (1.9, 3.0, 4.0):
+        i = idx(plan, t)
+        assert not stop[i] and i < first_accel
+        assert plan.effort_pct[i] < 0.0, t
+        assert plan.side_brake[i] == SIDE_LAUNCH, t
+    # 発進の途中で、発進側で解いた深さが動き出す開度より深い行は停止側。浅い行は発進側
+    mid = np.arange(len(v)) < first_accel
+    mid &= ~stop & low
+    n_stop = n_launch = 0
+    for i in np.flatnonzero(mid):
+        u_l = abs(float(tb.invert(v[i], plan.need_accel_kmhs[i], launch=True)[0]))
+        if v[i] > 0.5 and u_l > bk:
+            assert plan.side_brake[i] == SIDE_STOP, i
+            n_stop += 1
+        else:
+            assert plan.side_brake[i] == SIDE_LAUNCH, i
+            n_launch += 1
+    assert n_stop > 0 and n_launch > 0
+    # アクセルを使い始めた後の低速のブレーキ側は停止側
+    after = np.flatnonzero(low & ~stop & (np.arange(len(v)) > first_accel))
+    assert len(after) > 0 and np.all(plan.side_brake[after] == SIDE_STOP)
+    # 実機の pkl の meta は符号つき（ブレーキ側 ＝ 負）。大きさで比べるので同じ結果
+    neg = _pedal_table(dl=3.0, ds=2.4, breakaway=-bk)
+    plan_neg = plan_for(_slow_launch, 10.0, neg, low_speed_side_rule="pedal")
+    assert np.array_equal(plan_neg.side_brake, plan.side_brake)
+    # 動き出す開度が meta に無ければこの判定はしない（深い行も発進側のまま）
+    tb2 = _pedal_table(dl=3.0, ds=2.4, breakaway=None)
+    plan2 = plan_for(_slow_launch, 10.0, tb2, low_speed_side_rule="pedal")
+    assert np.all(plan2.side_brake[mid] == SIDE_LAUNCH)
+
+
+def test_pedal_rule_body_and_release_unchanged_at_or_above_top() -> None:
+    tb, plain = _release_low_table()
+    plan = plan_for(_decel_then_ease, 5.0, tb, low_speed_side_rule="pedal")
+    legacy = plan_for(_decel_then_ease, 5.0, tb)
+    v = np.array([_decel_then_ease(float(x)) for x in plan.t_s])
+    hi = v >= 7.5
+    assert np.array_equal(plan.effort_pct[hi], legacy.effort_pct[hi])
+    assert np.array_equal(plan.side_accel[hi], legacy.side_accel[hi])
+
+
+def test_side_argument_selects_the_table_in_deviation_and_coast_assist() -> None:
+    t = linear_table()
+    t.stop_accel = t.accel_grid.copy()
+    cols = t.u_grid < 0
+    base_col = (-2.0 - 0.01 * t.speed_rep)[:, None]
+    t.stop_accel[:, cols] = (t.accel_grid[:, cols] - base_col) * 2.0 + base_col  # 傾き 2 倍
+    t.launch_accel = t.accel_grid.copy()
+    t.launch_accel[:, cols] = (t.accel_grid[:, cols] - base_col) * 0.5 + base_col  # 傾き 半分
+    t.meta["stop_max_speed_kmh"] = 25.0
+    kw = dict(effort=-15.0, need=-3.0, ref=10.0, dev=1.0)
+    plain = _dev(linear_table(), **kw)
+    stop = _dev(t, stops_ahead=True, **kw)  # low_speed_sides で停止側
+    assert _dev(t, **kw) == pytest.approx(plain)  # stops_ahead なしは本体（side=None は今まで通り）
+    # side を渡すとその表（stops_ahead・need の符号は見ない）
+    assert _dev(t, side=SIDE_STOP, **kw) == pytest.approx(stop)
+    assert _dev(t, side=SIDE_STOP, stops_ahead=False, **kw) == pytest.approx(stop)
+    assert _dev(t, side=SIDE_MAIN, stops_ahead=True, **kw) == pytest.approx(plain)
+    assert _dev(t, side=SIDE_RELEASE, stops_ahead=True, **kw) == pytest.approx(plain)
+    launch = _dev(t, side=SIDE_LAUNCH, **kw)
+    assert launch - (-15.0) == pytest.approx(2.0 * (plain - (-15.0)))  # 傾き半分 → 上乗せ 2 倍
+    # 惰行の補助も同じ
+    ck = dict(is_accel=False, dev=1.0, need=-3.0, ref=10.0)
+    assert _coast(t, side=SIDE_STOP, **ck) == pytest.approx(_coast(t, stops_ahead=True, **ck))
+    assert _coast(t, side=SIDE_MAIN, stops_ahead=True, **ck) == pytest.approx(_coast(t, **ck))
+    assert _coast(t, side=SIDE_LAUNCH, **ck) != pytest.approx(_coast(t, **ck))
+
+
+def test_plan_side_for_returns_side_only_for_pedal_rule() -> None:
+    tb = _pedal_table()
+    plan = plan_for(_launch_then_constant, 8.0, tb, low_speed_side_rule="pedal")
+    i = idx(plan, 6.0)
+    assert plan.side_for(i, False) == SIDE_STOP and plan.side_for(i, True) == SIDE_LAUNCH

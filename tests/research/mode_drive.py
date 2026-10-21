@@ -309,6 +309,7 @@ def _prepare_forward_map_plan(
         stop_ref_at=None if target_ref is orig_ref else orig_ref.at,
         # 2026-10-20 段4-2 停A: C15 で stop_lead_enabled のとき、停車保持へ遅れ分早く入る
         stop_lead=isinstance(ff, StopEndFeedforward) and fm.stop_lead_enabled,
+        low_speed_side_rule=fm.low_speed_side_rule,  # 段5-2
     )
     meta = ff.table.meta
     # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）
@@ -319,6 +320,8 @@ def _prepare_forward_map_plan(
     say(fel_text(cfg, ff.table))
     say(f"  遅れ アクセル {lag_a}s / ブレーキ {lag_b}s・惰行の帯 ±{fm.coast_band_kmhs:g} km/h/s・"
         f"窓 {fm.need_window_s:g}s")
+    say(f"  低速の表の引き方（段5-2）: 設定 {fm.low_speed_side_rule}・計画に使った規則 "
+        f"{plan.side_rule}（pedal でも表が発進側・停止側の両方を持たなければ legacy）")
     if isinstance(ff, DeviationForwardFeedforward):
         # 2026-10-17 段2p: τ ＝ c × 上の遅れ（yaml の上書き、なければ pkl の meta）。
         # どちらにも無いペダルは None で、fwd_plan の既定値には落とさない（上乗せしない）
@@ -1379,6 +1382,8 @@ class _ModeRun:
                     creep_floor_pct=floor_raise,
                     stop_lead_active=self._stop_lead_now,
                     stop_end_tau_s=self._stop_end_tau_s,
+                    ff_side_accel=self._ff_side_now(t, True),
+                    ff_side_brake=self._ff_side_now(t, False),
                 )
             )
         if segment != self._segment:
@@ -1398,20 +1403,43 @@ class _ModeRun:
                        f"{100.0 * t / self.duration_s:4.1f}%{gov}"),
             ))
 
-    def _low_flags(self, t: float, ref: float, speed: float) -> tuple[bool, bool, bool]:
+    def _ff_side_now(self, t: float, is_accel: bool) -> int | None:
+        """CSV 用（段5-2）: 今の計画の行が、そのペダル側で引いた表 SIDE_*（計画なしは None）。"""
+        ff = self.ff
+        plan = ff._plan if isinstance(ff, ForwardMapFeedforward) else None  # noqa: SLF001
+        arr = None if plan is None else (plan.side_accel if is_accel else plan.side_brake)
+        return None if arr is None else int(arr[plan.index_at(t)])
+
+    def _row_sides(
+        self, plan: Any, i: int, ref: float, is_accel: bool
+    ) -> tuple[bool, bool]:
+        """今の計画の行 i で、そのペダルが引く表の (発進側か, 停止側か)。段5-2: 規則が "pedal" の
+        計画は、計画が行ごとに決めた表（plan.side_accel / side_brake）。"legacy" は今までどおり
+        `low_speed_sides`（need ＞ 0 → 発進側、停車へ向かう減速 → 停止側）。"""
+        # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
+        from tests.research.fwd_plan import SIDE_LAUNCH, SIDE_STOP, low_speed_sides  # noqa: PLC0415
+
+        side = plan.side_for(i, is_accel)
+        if side is not None:
+            return side == SIDE_LAUNCH, side == SIDE_STOP
+        ahead = bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False
+        launch, stop = low_speed_sides(
+            self.ff.table, float(plan.need_accel_kmhs[i]), ref, ahead  # type: ignore[attr-defined]
+        )
+        return bool(launch), bool(stop)
+
+    def _low_flags(
+        self, t: float, ref: float, speed: float, ff_effort: float = 0.0
+    ) -> tuple[bool, bool, bool]:
         """今の計画の行の (発進側か, 停止側か, 低速の行か)。`_dob_update` と同じ条件
         （発進側は発進側の表が置き換えた車速の行の中だけ。低速の行は `_dob_low_speed`）。"""
-        # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
-        from tests.research.fwd_plan import low_speed_sides  # noqa: PLC0415
-
         ff = self.ff
         assert isinstance(ff, ForwardMapFeedforward)
         plan = ff.plan
         i = plan.index_at(t)
-        ahead = bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False
-        launch, stop = low_speed_sides(ff.table, float(plan.need_accel_kmhs[i]), ref, ahead)
-        launch = bool(launch) and speed < self._dob_launch_top()
-        return launch, bool(stop), self._dob_low_speed(speed, int(plan.flag[i]))
+        launch, stop = self._row_sides(plan, i, ref, is_accel=ff_effort >= 0.0)
+        launch = launch and speed < self._dob_launch_top()
+        return launch, stop, self._dob_low_speed(speed, int(plan.flag[i]))
 
     def _predictor_step(self, t: float, ref: float, speed: float, ff_effort: float) -> None:
         """C13（段2u）: 車速のフィルタを 1 周期進め、L 秒先の予測と P の上乗せの偏差を決める。
@@ -1428,7 +1456,7 @@ class _ModeRun:
 
         pred, ff = self.pred, self.ff
         assert pred is not None and isinstance(ff, ForwardMapFeedforward)
-        launch, stop, held = self._low_flags(t, ref, speed)
+        launch, stop, held = self._low_flags(t, ref, speed, ff_effort)
         idle = (
             self._first_hold and speed <= STOP_SPEED_KMH
             and int(ff.plan.flag[ff.plan.index_at(t)]) == FLAG_STOP
@@ -1481,6 +1509,8 @@ class _ModeRun:
             "accel_min_pct": v.min_accel_opening_pct,
             "brake_min_pct": v.min_brake_opening_pct,
             "stops_ahead": bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False,
+            # 段5-2: 計画が行ごとに決めた表（規則が legacy なら None ＝ 今までと同じ）
+            "side": plan.side_for(i, ff_effort > 0.0),
         }
         dob = self.dob
         # C11: 押しているペダルの行にだけ、そのペダルの外乱の推定を引いて表を引く。
@@ -1558,6 +1588,7 @@ class _ModeRun:
             "accel_min_pct": v.min_accel_opening_pct,
             "brake_min_pct": v.min_brake_opening_pct,
             "stops_ahead": bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False,
+            "side": plan.side_for(i, is_accel),  # 段5-2（規則が legacy なら None）
         }
         if self.cfg.forward_map.coast_floor_onset:
             # 段2r ②: 補助中のそのペダルは手順2 の効き始め以上に置く（meta に無ければ下限なし）
@@ -1605,19 +1636,23 @@ class _ModeRun:
         判定するため。2026-10-19 段3）。停車の判定は計画の stops_ahead（元の基準）。
         u ＝ 開度 − min（アクセル正・ブレーキ負・min 以下は 0）。発進側・停止側の行では更新しない
         （今の計画の行で `low_speed_sides` を引く。C10 の上乗せと同じ条件）。"""
-        # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
-        from tests.research.fwd_plan import low_speed_sides  # noqa: PLC0415
-
         ff, dob, v = self.ff, self.dob, self.cfg.vehicle
         assert isinstance(ff, DisturbanceObserverFeedforward)
         assert dob is not None and self.dob_stats is not None
         plan = ff.plan
         i = plan.index_at(t)
-        ahead = bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False
-        launch, stop = low_speed_sides(ff.table, float(plan.need_accel_kmhs[i]), ref, ahead)
+        # 段5-2: 引く表は計画が行ごとに決めたもの（規則が legacy なら low_speed_sides）。ペダルは
+        # 実際に出したほう（どちらも min 以下なら計画の行の向き）
+        if accel > v.min_accel_opening_pct:
+            row_accel = True
+        elif brake > v.min_brake_opening_pct:
+            row_accel = False
+        else:
+            row_accel = float(plan.effort_pct[i]) >= 0.0
+        launch, stop = self._row_sides(plan, i, ref, is_accel=row_accel)
         # 発進側は need > 0 の行すべてで True になる（表を引く車速の範囲は表の中で決まる）ので、
         # 止めるのは発進側の表が置き換えた車速の行（meta の launch_speed_rows）の中だけにする
-        launch = bool(launch) and speed < self._dob_launch_top()
+        launch = launch and speed < self._dob_launch_top()
         # 2026-10-18 段2q ① `121218` の修正: 停車中（停車保持の深いブレーキ）は表が強い減速を
         # 予測し、実測は 0 なので、ブレーキの推定が +9 km/h/s まで積み上がって次の減速で踏み過ぎた。
         # 停車保持の行・停車速度以下・低速の表の車速の行では更新しない（`_dob_low_speed`）
