@@ -353,8 +353,12 @@ def build_plan(
     stop_ref_at: Callable[[float], float] | None = None,
     stop_lead: bool = False,
     low_speed_side_rule: str = "legacy",
+    release_table_min_kmh: float = 0.0,
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
+
+    2026-10-22 段5-3: `release_table_min_kmh`。基準がこの車速未満のブレーキの行は、戻しの表（本体の
+    戻し）で解き直さない（本体のまま）。0.0 は今までと完全に同じ。停止側の戻しの層には効かない。
 
     2026-10-22 段5-2: `low_speed_side_rule`。"legacy" は今までと完全に同じ（`low_speed_sides`）。
     "pedal"（表が launch_accel と stop_accel の両方を持つときだけ。片方でも無ければ legacy）は、
@@ -474,7 +478,11 @@ def build_plan(
     if body_release or stop_release:
         redo = np.zeros(n, dtype=bool)
         if body_release:
-            redo |= is_brake & ~stop & ~(launch_b | stop_b)  # 発進側の表で解いた時刻は戻しではない
+            # 発進側の表で解いた時刻は戻しではない
+            body_redo = is_brake & ~stop & ~(launch_b | stop_b)
+            if release_table_min_kmh > 0.0:  # 段5-3: 低い車速は戻しの表で解き直さない
+                body_redo &= v >= release_table_min_kmh
+            redo |= body_redo
         if stop_release:
             redo |= is_brake & ~stop & stop_b & ~launch_b
         released = _resolve_releases(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pickle
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ from tests.research.fwd_map import (
     POINT_OUT,
     RELEASE_GRID_PCT,
     ForwardTable,
+    apply_launch_accel_measured,
     attach_accel_release,
     attach_launch,
     attach_release,
@@ -834,3 +836,78 @@ def test_release_seconds_in_band_counts_braking_release_rows() -> None:
     r = FwdRows(**{**base.__dict__, "release_pct": np.array([1.0, 1.0, 1.0, 1.0, 1.0, 0.1])})
     # 7.5〜20 km/h・u < 0・戻し量 0.3% 以上: 添字 1・2 だけ
     assert release_seconds_in_band(r, 7.5) == pytest.approx(0.2)
+
+
+# ───────── 2026-10-22 段5-3: 発進側のアクセル側を実測の点で作る ─────────
+
+
+def _accel_rows(speed: float, us, accel_of, dt: float = 0.1, n_each: int = 10) -> FwdRows:
+    u = np.repeat(np.asarray(us, dtype=float), n_each)
+    return make_rows(np.full(len(u), speed), u, accel_of(u), dt=dt)
+
+
+def test_measured_launch_accel_uses_cell_medians_and_keeps_brake_side() -> None:
+    table, rows = _launch_setup()  # u の格子は −16〜+3.75（0.5 刻み）
+    t1 = attach_launch(table, rows, creep_speed_kmh=5.0)
+    pat = _accel_rows(3.0, [0.5, 1.5, 2.5], lambda u: 2.0 + 0.2 * u)  # 1% のマスに 1 秒ずつ
+    t2 = apply_launch_accel_measured(t1, pat, cell_pct=1.0)
+    assert t2.meta["launch_accel_side_source"] == "measured"
+    pts = t2.meta["launch_accel_measured"]["3.75"]
+    assert [round(p[0], 3) for p in pts] == [0.5, 1.5, 2.5]
+    assert pts[1][1] == pytest.approx(2.3) and pts[1][2] == pytest.approx(1.0)
+    la, g = t2.launch_accel, t2.u_grid
+    r = 1  # 2.5〜5 km/h の行
+    creep = float(np.interp(0.0, g, t1.launch_accel[r]))
+    assert float(np.interp(1.5, g, la[r])) == pytest.approx(2.3, abs=1e-6)  # 点の位置
+    # 浅い所は u = 0 のクリープから最初の点へ直線
+    assert float(np.interp(0.25, g, la[r])) == pytest.approx(creep + 0.5 * (2.1 - creep), abs=1e-6)
+    # いちばん深い点（u=2.5）より深い所は「点の値 ＋ 本体の差」
+    body = t1.accel_grid[r]
+    want = 2.5 + (float(np.interp(3.25, g, body)) - float(np.interp(2.5, g, body)))
+    assert float(np.interp(3.25, g, la[r])) == pytest.approx(want, abs=1e-6)
+    # ブレーキ側・他の行は変えない。アクセル側は単調
+    neg = g <= 0.0
+    assert np.array_equal(la[r, neg], t1.launch_accel[r, neg])
+    assert np.array_equal(la[0, neg], t1.launch_accel[0, neg])
+    assert np.array_equal(la[2:], t1.launch_accel[2:])
+    assert np.all(np.diff(la[r]) >= -1e-9)
+    assert t1.meta.get("launch_accel_side_source") is None  # 元は書き換えない
+
+
+def test_measured_launch_accel_low_row_is_max_of_creep_and_body() -> None:
+    table, rows = _launch_setup()
+    t1 = attach_launch(table, rows, creep_speed_kmh=5.0)
+    steep = t1.accel_grid.copy()
+    steep[0] = np.where(t1.u_grid > 0, 0.8 * t1.u_grid, steep[0])  # 本体が深い側でクリープを超える
+    t1 = replace(t1, accel_grid=steep)
+    t2 = apply_launch_accel_measured(t1, _accel_rows(3.0, [0.5, 1.5], lambda u: 2.0 + 0.2 * u))
+    g = t1.u_grid
+    pos = g > 0
+    creep = float(np.interp(0.0, g, t1.launch_accel[0]))
+    want = np.maximum(creep, steep[0][pos])
+    assert np.allclose(t2.launch_accel[0][pos], np.maximum.accumulate(want))
+    assert t2.launch_accel[0][pos][0] == pytest.approx(creep)  # 浅い所はクリープ
+    assert t2.launch_accel[0][pos].max() > creep + 1.0  # 深い所は本体の増え
+    neg = g <= 0.0
+    assert np.array_equal(t2.launch_accel[0][neg], t1.launch_accel[0][neg])
+
+
+def test_measured_launch_accel_row_without_points_stays_and_short_cells_dropped() -> None:
+    table, rows = _launch_setup()
+    t1 = attach_launch(table, rows, creep_speed_kmh=5.0)
+    # 0.3 秒しかないマスは捨てる。点が 1 つも無い行は今のまま
+    short = _accel_rows(3.0, [1.0, 3.0], lambda u: 2.0 + 0.2 * u, n_each=3)
+    t2 = apply_launch_accel_measured(t1, short)
+    assert t2.meta["launch_accel_measured"]["3.75"] == []
+    assert np.array_equal(t2.launch_accel[1], t1.launch_accel[1])
+    # 車速が帯の外・u <= 0 の行は点にならない
+    out = _accel_rows(8.0, [1.0, 3.0], lambda u: 2.0 + 0.2 * u)
+    assert apply_launch_accel_measured(t1, out).meta["launch_accel_measured"]["3.75"] == []
+    brake = _accel_rows(3.0, [-1.0, -3.0], lambda u: 2.0 + 0.2 * u)
+    assert apply_launch_accel_measured(t1, brake).meta["launch_accel_measured"]["3.75"] == []
+
+
+def test_measured_launch_accel_without_launch_table_changes_nothing() -> None:
+    table, _ = _launch_setup()
+    t2 = apply_launch_accel_measured(table, _accel_rows(3.0, [1.0], lambda u: u))
+    assert t2.launch_accel is None and t2.meta["launch_accel_side_source"] == "measured"

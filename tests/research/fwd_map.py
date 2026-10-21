@@ -769,6 +769,102 @@ def attach_launch(
     return replace(table, launch_accel=out, launch_kind=kind, meta=meta)
 
 
+# 2026-10-22 段5-3: 発進側のアクセル側（u > 0）を実測の点で作る（apply_launch_accel_measured）。
+#   LAUNCH_ACCEL_CELL_PCT … アクセルの開度のマス幅 [%]（ユーザー決定 2026-10-22 の 2%）
+#   LAUNCH_ACCEL_MIN_S … 1 マスの最小秒数（発進側の LAUNCH_MIN_S と同じ 0.5 秒。仮値）
+#   LAUNCH_ACCEL_SPLIT_KMH … 行の帯の下端がこの車速以上なら実測の点、上端がこの車速以下なら
+#     max(クリープ, 本体)（ユーザー決定 2026-10-22 の 2.5 km/h。0.5〜2.5 km/h は手順2 にアクセルの
+#     行が無い）
+LAUNCH_ACCEL_CELL_PCT = 2.0
+LAUNCH_ACCEL_MIN_S = 0.5
+LAUNCH_ACCEL_SPLIT_KMH = 2.5
+
+
+def apply_launch_accel_measured(
+    table: ForwardTable,
+    rows: FwdRows,
+    *,
+    cell_pct: float = LAUNCH_ACCEL_CELL_PCT,
+    min_s: float = LAUNCH_ACCEL_MIN_S,
+    split_kmh: float = LAUNCH_ACCEL_SPLIT_KMH,
+) -> ForwardTable:
+    """発進側の表のアクセル側（u > 0 の格子）を作り直した新しい表を返す（2026-10-22 段5-3）。
+
+    対象は attach_launch が置き換えた車速の行（meta launch_speed_rows）。launch_accel が無い、
+    対象の行が無いときは何も変えない（meta に launch_accel_side_source だけ残す）。
+    rows: 手順2 の PATTERN_DRIVE の行（車速・u・加速度・秒数を持つ。u は min からの量）。
+    - 帯の下端 ≧ split_kmh の行: 車速が帯の中・u > 0 の行を cell_pct 幅のマスに分け、秒数が min_s
+      以上のマスの (u の中央値, 加速度の中央値) を点にする。u = 0 の点はその行の今の値（クリープ）。
+      点の間は直線。いちばん深い点より深い所は「いちばん深い点の値 ＋ 本体の表のその行の
+      (u) − (u_last) の差」。点が 1 つも無い行は今のまま。
+    - 帯の上端 ≦ split_kmh の行: u > 0 の各格子で max(その行の u = 0 の値, 本体の同じ u の値)。
+    - 最後にアクセル側だけ u について単調（非減少）にそろえ、ブレーキ側（u ≦ 0）の最大値（u = 0 に
+      いちばん近い格子の値）を下回らないようにする。ブレーキ側は変えない。
+    meta: launch_accel_side_source（"measured"）・launch_accel_measured（行の代表車速 →
+    [[u, 加速度, 秒], …]）・launch_accel_cell_pct・launch_accel_min_s・launch_accel_split_kmh。
+    """
+    meta = dict(table.meta)
+    meta["launch_accel_side_source"] = "measured"
+    meta.update(
+        launch_accel_measured={},
+        launch_accel_cell_pct=cell_pct,
+        launch_accel_min_s=min_s,
+        launch_accel_split_kmh=split_kmh,
+    )
+    targets = [float(x) for x in meta.get("launch_speed_rows", [])]
+    if table.launch_accel is None or not targets:
+        return replace(table, meta=meta)
+    edges, grid = table.speed_edges, table.u_grid
+    out = table.launch_accel.copy()
+    kind = (table.launch_kind if table.launch_kind is not None else table.point_kind).copy()
+    pos = grid > _EPS
+    neg_idx = np.flatnonzero(grid <= _EPS)
+    measured: dict[str, list[list[float]]] = {}
+    for r in range(len(table.speed_rep)):
+        if not any(abs(float(table.speed_rep[r]) - x) < 1e-6 for x in targets):
+            continue
+        row = out[r]
+        creep = float(np.interp(0.0, grid, row))
+        body = table.accel_grid[r]
+        lo_edge, hi_edge = float(edges[r]), float(edges[r + 1])
+        if hi_edge <= split_kmh + _EPS:
+            new = np.maximum(creep, body)
+            val = np.where(pos, new, row)
+        elif lo_edge >= split_kmh - _EPS:
+            sel = (rows.speed_kmh >= lo_edge) & (rows.speed_kmh < hi_edge) & (rows.u_pct > 0.0)
+            pts: list[tuple[float, float, float]] = []
+            if sel.any():
+                u_s, a_s, dt_s = rows.u_pct[sel], rows.accel_kmhs[sel], rows.dt_row_s[sel]
+                cells = u_cell(u_s, cell_pct)
+                for k in np.unique(cells):
+                    m = cells == k
+                    sec = float(dt_s[m].sum())
+                    if sec >= min_s:
+                        pts.append((float(np.median(u_s[m])), float(np.median(a_s[m])), sec))
+            measured[f"{table.speed_rep[r]:g}"] = [[u, a, sec] for u, a, sec in pts]
+            if not pts:
+                continue
+            xu = np.array([0.0] + [p[0] for p in pts])
+            xa = np.array([creep] + [p[1] for p in pts])
+            u_last, a_last = xu[-1], xa[-1]
+            b_last = float(np.interp(u_last, grid, body))
+            inside = np.interp(grid, xu, xa)
+            beyond = a_last + (body - b_last)
+            val = np.where(pos, np.where(grid > u_last + _EPS, beyond, inside), row)
+        else:
+            continue  # 帯が split_kmh をまたぐ行は今のまま
+        acc_part = IsotonicRegression(increasing=True).fit_transform(grid[pos], val[pos])
+        floor = float(row[neg_idx].max()) if len(neg_idx) else -np.inf
+        res = row.copy()
+        res[pos] = np.maximum(acc_part, floor)
+        out[r] = res
+        k_row = kind[r].copy()
+        k_row[pos] = POINT_FILLED
+        kind[r] = k_row
+    meta["launch_accel_measured"] = measured
+    return replace(table, launch_accel=out, launch_kind=kind, meta=meta)
+
+
 def attach_stop(
     table: ForwardTable,
     stop_rows: FwdRows,

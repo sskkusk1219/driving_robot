@@ -310,6 +310,7 @@ def _prepare_forward_map_plan(
         # 2026-10-20 段4-2 停A: C15 で stop_lead_enabled のとき、停車保持へ遅れ分早く入る
         stop_lead=isinstance(ff, StopEndFeedforward) and fm.stop_lead_enabled,
         low_speed_side_rule=fm.low_speed_side_rule,  # 段5-2
+        release_table_min_kmh=fm.release_table_min_kmh,  # 段5-3
     )
     meta = ff.table.meta
     # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）
@@ -322,6 +323,8 @@ def _prepare_forward_map_plan(
         f"窓 {fm.need_window_s:g}s")
     say(f"  低速の表の引き方（段5-2）: 設定 {fm.low_speed_side_rule}・計画に使った規則 "
         f"{plan.side_rule}（pedal でも表が発進側・停止側の両方を持たなければ legacy）")
+    say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
+        "（0 ＝ 全部の車速で使う）")
     if isinstance(ff, DeviationForwardFeedforward):
         # 2026-10-17 段2p: τ ＝ c × 上の遅れ（yaml の上書き、なければ pkl の meta）。
         # どちらにも無いペダルは None で、fwd_plan の既定値には落とさない（上乗せしない）

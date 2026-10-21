@@ -1223,3 +1223,24 @@ def test_low_speed_side_rule_defaults_to_legacy_and_is_validated() -> None:
     assert not any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
     cfg.forward_map.low_speed_side_rule = "bogus"
     assert any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_stage53_settings_default_to_current_behaviour_and_are_validated() -> None:
+    d = cfgmod.LearningSection()
+    assert d.launch_accel_side_source == "extrapolate" and d.side_table_accel_window_s == 0.5
+    assert cfgmod.ForwardMapSection().release_table_min_kmh == 0.0
+    cfg = _load_default()
+    assert cfg.learning.launch_accel_side_source == "extrapolate"
+    assert cfg.learning.side_table_accel_window_s == 0.5
+    assert cfg.forward_map.release_table_min_kmh == 0.0
+    keys = ("launch_accel_side_source", "side_table_accel_window_s", "release_table_min_kmh")
+    assert not any(k in p for p in cfgmod.validate_config(cfg) for k in keys)
+    cfg.learning.launch_accel_side_source = "measured"
+    cfg.forward_map.release_table_min_kmh = 15.0
+    assert not any(k in p for p in cfgmod.validate_config(cfg) for k in keys)
+    cfg.learning.launch_accel_side_source = "bogus"
+    cfg.learning.side_table_accel_window_s = 0.0
+    cfg.forward_map.release_table_min_kmh = -1.0
+    probs = cfgmod.validate_config(cfg)
+    for k in keys:
+        assert any(k in p for p in probs), k

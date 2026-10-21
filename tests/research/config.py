@@ -411,6 +411,20 @@ class LearningSection:
     # fwd_data.launch_breakaway）。pkl meta side_table_opening_source に実際の値が残る。
     # 決める時期: 戻しの層・アクセルの戻し量を切り分けた実機比較の後
     side_table_opening_source: str = "actual"
+    # 2026-10-22 段5-3: 発進側の表のアクセル側（u > 0）の作り方。
+    # "extrapolate" ＝ 今まで（アクセル側に実測が無く、クリープ ＋ 本体の増えの外挿）。
+    # "measured" ＝ 手順2 の
+    # PATTERN_DRIVE の行（車速が行の帯の中・アクセルを踏んでいる）を 2% のマスで測った点（帯の下端が
+    # 2.5 km/h 以上の行）、帯の上端が 2.5 km/h 以下の行は max(クリープ, 本体)。根拠は段5 の照合
+    # （手順2 090007 で今の表は 8% より深い所で 0.3〜1.1 強すぎる）。マス幅 2%・0.5 秒・2.5 km/h は
+    # 仮値（ユーザー決定 2026-10-22 の 2%）。効く先: _attach_low_speed_tables（meta
+    # launch_accel_side_source・launch_accel_measured に残る）。既定は今と同じ。
+    # 決める時期: 段5-3 の机上（stage5_side_candidates.py）の後の実機 1 組
+    launch_accel_side_source: str = "extrapolate"
+    # 2026-10-22 段5-3: 発進側・停止側の表を作るときの加速度の窓 [s]。既定 0.5 ＝ 今まで
+    # （LAUNCH_ACCEL_WINDOW_S）。本体は 1.0 秒窓。仮値: 発進は約 1 秒で終わるので短くしてある。
+    # 効く先: _attach_low_speed_tables・launch_breakaway の行の読み方。決める時期: 段5-3 の机上の後
+    side_table_accel_window_s: float = 0.5
     # 2026-10-20 段4-3: 停止側の戻しの層（ForwardTable.stop_release_*。attach_stop_release）を
     # 作るか。
     # false なら作らず、pkl の stop_release_* は None（0ee7c1b より前と同じ引き方）。根拠は机上:
@@ -676,6 +690,12 @@ class ForwardMapSection:
     # 効く先: 7.5 km/h 未満の指令（P・惰行の補助・DOB の予測が引く表も同じ）。
     # 決める時期: 段5-2 の実機（C8 の WLTP・UDDS・US06）の後
     low_speed_side_rule: str = "legacy"
+    # 2026-10-22 段5-3: 基準がこの車速 [km/h] 未満のブレーキの行は、戻しの表（本体の戻し）で
+    # 解き直さない（本体のまま）。既定 0.0 ＝ 今と同じ（全部の車速で戻しの表を使う）。
+    # 15.0 なら 7.5〜15 km/h では使わない（段3b の「戻し 7.5〜20 が弱い」への対策。仮値。
+    # 机上で比べて決める）。
+    # 効く先: fwd_plan.build_plan の戻しの解き直し。決める時期: 段5-3 の机上の後の実機 1 組
+    release_table_min_kmh: float = 0.0
 
 
 @dataclass
@@ -1082,6 +1102,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         fm.low_speed_side_rule in ("legacy", "pedal"),
         f"forward_map.low_speed_side_rule は legacy か pedal: {fm.low_speed_side_rule!r}",
     )
+    need(
+        fm.release_table_min_kmh >= 0.0,
+        f"forward_map.release_table_min_kmh は 0 以上: {fm.release_table_min_kmh}",
+    )
     for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")
     need(fm.deviation_c >= 0.0, f"forward_map.deviation_c は 0 以上: {fm.deviation_c}")
@@ -1296,6 +1320,15 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         cfg.learning.side_table_opening_source in ("cmd", "actual"),
         f"learning.side_table_opening_source は cmd か actual: "
         f"{cfg.learning.side_table_opening_source!r}",
+    )
+    need(
+        cfg.learning.launch_accel_side_source in ("extrapolate", "measured"),
+        f"learning.launch_accel_side_source は extrapolate か measured: "
+        f"{cfg.learning.launch_accel_side_source!r}",
+    )
+    need(
+        cfg.learning.side_table_accel_window_s > 0.0,
+        f"learning.side_table_accel_window_s は正値: {cfg.learning.side_table_accel_window_s}",
     )
     need(cfg.learning.coast_timeout_s > 0.0, "learning.coast_timeout_s は正値")
     rg = cfg.learning.ramp_g_levels

@@ -1183,3 +1183,21 @@ def test_plan_side_for_returns_side_only_for_pedal_rule() -> None:
     plan = plan_for(_launch_then_constant, 8.0, tb, low_speed_side_rule="pedal")
     i = idx(plan, 6.0)
     assert plan.side_for(i, False) == SIDE_STOP and plan.side_for(i, True) == SIDE_LAUNCH
+
+
+def test_release_table_min_kmh_skips_release_below_the_speed() -> None:
+    tb, plain = _release_low_table()
+    default = plan_for(_decel_then_ease, 5.0, tb)
+    zero = plan_for(_decel_then_ease, 5.0, tb, release_table_min_kmh=0.0)
+    assert np.array_equal(default.effort_pct, zero.effort_pct)  # 既定は今まで
+    assert np.any(default.side_brake == SIDE_RELEASE)
+    # 100 km/h 未満は戻しの表で解かない ＝ 戻しの表なしの表と同じ開度
+    off = plan_for(_decel_then_ease, 5.0, tb, release_table_min_kmh=100.0)
+    base = plan_for(_decel_then_ease, 5.0, plain)
+    assert not np.any(off.side_brake == SIDE_RELEASE)
+    assert np.allclose(off.effort_pct, base.effort_pct)
+    # しきい値が 10 km/h のとき、10 km/h 未満の基準の行は戻しにならず、以上の行は戻しのまま
+    mid = plan_for(_decel_then_ease, 5.0, tb, release_table_min_kmh=10.0)
+    v = np.array([_decel_then_ease(float(x)) for x in mid.t_s])
+    assert not np.any(mid.side_brake[v < 10.0] == SIDE_RELEASE)
+    assert np.any(mid.side_brake[v >= 10.0] == SIDE_RELEASE)

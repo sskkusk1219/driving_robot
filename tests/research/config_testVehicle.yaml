@@ -221,6 +221,10 @@ forward_map:
   #           表が発進側・停止側の両方を持たないときは legacy と同じ。
   # 効く先: 7.5 km/h 未満の指令。既定 legacy ＝ 今と同じ。決める時期: 段5-2 の実機（C8 の WLTP・UDDS・US06）の後
   low_speed_side_rule: legacy
+  # 2026-10-22 段5-3: 基準がこの車速 [km/h] 未満のブレーキの行は戻しの表で解き直さない（本体のまま）。
+  # 既定 0.0 ＝ 今と同じ。15.0 なら 7.5〜15 km/h で使わない（段3b の「戻し 7.5〜20 が弱い」対策。仮値）。
+  # 効く先: 戻しの解き直し。決める時期: 段5-3 の机上（stage5_side_candidates.py）の後の実機 1 組
+  release_table_min_kmh: 0.0
   # 2026-10-17 段2o-9: 置くまでの待ち（preposition_clear_s: 0.1）は廃止。待ちは「戻す側のペダルが
   # min に戻るまでの時間」（pkl の meta の戻る時間。手順2 で測る）で決める
 
@@ -603,6 +607,14 @@ learning:
   # 少し悪化（−0.20 → −0.26 km/h/s）。効く先: 手順2 の発進・停止側の表。pkl meta
   # side_table_opening_source に残る。決める時期: 戻しの層・アクセルの戻し量を切り分けた実機比較の後
   side_table_opening_source: actual
+  # 2026-10-22 段5-3: 発進側の表のアクセル側の作り方。extrapolate ＝ 今まで（クリープ ＋ 本体の増えの
+  # 外挿）、measured ＝ 手順2 の行を 2% のマスで測った点（帯の下端 2.5 km/h 以上の行）／max(クリープ,
+  # 本体)（帯の上端 2.5 km/h 以下の行）。マス幅 2%・0.5 秒・2.5 km/h は仮値。既定は今と同じ。
+  # 効く先: 手順2 の発進側の表（meta launch_accel_side_source）。決める時期: 段5-3 の机上の後の実機 1 組
+  launch_accel_side_source: extrapolate
+  # 2026-10-22 段5-3: 発進側・停止側の表を作るときの加速度の窓 [s]（本体は 1.0）。既定 0.5 ＝ 今まで。
+  # 仮値。効く先: 手順2 の発進側・停止側の表と動き出す開度の行の読み方。決める時期: 段5-3 の机上の後
+  side_table_accel_window_s: 0.5
   # 2026-10-20 段4-3: 停止側の戻しの層を作るか。false は作らず pkl の stop_release_* が None
   # （0ee7c1b より前と同じ引き方）。机上で層を入れると外れの向きが逆になっただけ
   # （+0.6〜+1.0 → −0.5〜−1.3 km/h/s）。効く先: 手順2 の停止側の表。meta stop_release_layer_built は
