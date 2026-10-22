@@ -466,6 +466,37 @@ class LearningSection:
     # アクセルの解き直し・fel／speed_predictor／dob の予測（meta accel_push_input_enabled に残る）。
     # 決める時期: 5-7a の実機比較の後、C8・3 モード 1 組の実機比較
     accel_push_input_enabled: bool = False
+    # 2026-10-23 段5-8: 停止前の戻し B-1（手順2）。true なら各 G ランプの下りで、実車速が
+    # stop_release_start_kmh を切ったら、ブレーキを「山の開度（直近 3 秒の最深。min からの量）」の
+    # stop_release_fracs（段ごとに交互）だけ stop_release_rate_pct_s で直線に戻し、戻した開度の
+    # まま停車（実車速が停車速度未満）まで保つ。戻しても減速が止まった（実加速度 >= 0 が
+    # stop_release_escape_s 続いた）ら停車保持へ踏む（逃げ道）。目標減速度が stop_release_max_g
+    # を超える強い段には入れない。CSV の phase は RAMP_STOP_RELEASE（本体の戻し RAMP_RELEASE と
+    # 区別。学習の行に使える）。false なら今と完全に同じ走り。根拠: モードの B5（停車直前の戻し）は
+    # 3 モードで約 74 秒あるのに、手順2 の学習データは 5.3 秒しかない（段5-8）。
+    # 効く先: pattern_loop の RAMP_DOWN → RAMP_RELEASE（停止前版）→ 停車復帰。
+    # 手順2 の所要が約 +10 秒。
+    # 決める時期: 段5-8 の実機 1 回の後
+    stop_release_enabled: bool = False
+    # 戻し始める車速 [km/h]。データ由来（停止側の表の上限 7.5。モードの B5 は 7.4 km/h から）
+    stop_release_start_kmh: float = 7.5
+    # 戻す量の割合（山の min からの量 × この割合だけ戻す。0.25 なら山の 75% の開度に残る）。
+    # 段ごとに交互に使う。半分データ由来（モードの戻し量 2〜8% ÷ 山 約 8.5%）。決める時期: 同上
+    stop_release_fracs: list[float] = field(default_factory=lambda: [0.25, 0.5])
+    # 戻す速さ [%/s]。半分データ由来（モードの戻し量 ÷ 秒の中央値の概算 約 2%/秒）。決める時期: 同上
+    stop_release_rate_pct_s: float = 2.0
+    # 逃げ道: 実加速度 >= 0 がこの秒数続いたら停車保持へ踏む [s]。仮値（根拠なし）。決める時期: 同上
+    stop_release_escape_s: float = 0.5
+    # この目標減速度 [G] を超える段（0.25・0.35G。7.5 km/h から 1 秒ほどで止まる）には入れない。
+    # 仮値（0.2G は弱い段 0.175G と強い段 0.25G の間）。決める時期: 同上
+    stop_release_max_g: float = 0.2
+    # 2026-10-23 段5-8: 停車まぎわ除外（C8 系の学習から外す行）の外し方。"depth" ＝ 今まで
+    # （fwd_cv.STOP_APPROACH_*: 5 km/h 未満かつ u <= −8% の行）、"window" ＝ 加速度を作る窓
+    # （幅 accel_window_s）が停車の瞬間（実車速が停車速度未満になる時刻）にかかる行だけ。
+    # 根拠: 除外の理由は窓が停車にかかること（段2i）で、深さではない。090007 では depth が 2.9 秒を
+    # 外し、うち 2.0 秒が戻しの行だった。効く先: fwd_cv／fwd_final／pattern_drive（meta
+    # stop_approach_exclusion に残る）。決める時期: 段5-8 の机上（stop_exclusion.py）の後
+    stop_approach_exclusion: str = "depth"
 
 
 @dataclass
@@ -1430,6 +1461,20 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         f" 0 以上（空なら戻しを入れない）: {rel_f} / {rel_h}",
     )
     need(cfg.learning.ramp_release_move_s > 0.0, "learning.ramp_release_move_s は正値")
+    # 2026-10-23 段5-8: 停止前の戻し B-1・停車まぎわ除外
+    lr8 = cfg.learning
+    need(lr8.stop_release_start_kmh > 0.0, "learning.stop_release_start_kmh は正値")
+    need(
+        len(lr8.stop_release_fracs) > 0 and all(0.0 < f <= 1.0 for f in lr8.stop_release_fracs),
+        "learning.stop_release_fracs は空でなく、各値が 0 より大きく 1 以下",
+    )
+    need(lr8.stop_release_rate_pct_s > 0.0, "learning.stop_release_rate_pct_s は正値")
+    need(lr8.stop_release_escape_s > 0.0, "learning.stop_release_escape_s は正値")
+    need(lr8.stop_release_max_g > 0.0, "learning.stop_release_max_g は正値")
+    need(
+        lr8.stop_approach_exclusion in ("depth", "window"),
+        "learning.stop_approach_exclusion は depth か window",
+    )
     need(cfg.learning.ramp_min_at_g_s >= 0.0, "learning.ramp_min_at_g_s は 0 以上")
     need(
         cfg.learning.ramp_launch_g_rate_gps >= 0.0, "learning.ramp_launch_g_rate_gps は 0 以上"

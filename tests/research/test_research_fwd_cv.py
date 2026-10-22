@@ -16,6 +16,7 @@ from tests.research.fwd_cv import (
     folds,
     make_windows,
     side_rows,
+    side_stop_window,
     side_weights,
     stop_approach_mask,
 )
@@ -270,3 +271,53 @@ def test_cvconfig_brake_exclude_launch_default_on_and_key_compatible():
     assert CvConfig("t", (3,), brake_exclude_launch=False).key().endswith(
         "|brake_exclude_launch=False"
     )
+
+
+def test_stop_approach_exclusion_key_compat_and_side_selection():
+    """2026-10-23 段5-8: depth（既定）は key に含めない。window は含める。
+    side_stop_window は side_rows と同じ行の並びで stop_window_row を返す。"""
+    base = CvConfig("a", (10,), drop_stop_approach=True)
+    assert "stop_approach_exclusion" not in base.key()
+    win = dataclasses.replace(base, stop_approach_exclusion="window")
+    assert win.key() == base.key() + "|stop_approach_exclusion=window"
+    r = _rows()  # u = −2, 0, 0, 3, −1
+    r = FwdRows(**{**r.__dict__, "stop_window_row": np.array([True, False, True, False, True])})
+    flags = side_stop_window([r], "brake", coast_in_brake=True)
+    x, _, _, _ = side_rows([r], "brake", coast_in_brake=True)
+    assert len(flags) == len(x) == 4
+    assert flags.tolist() == [True, False, True, True]  # u <= 0 の行（0, 1, 2, 4 番目）
+    flags_a = side_stop_window([r], "accel", coast_in_brake=False)
+    assert flags_a.tolist() == [False, True, False]  # u >= 0 の行（1, 2, 3 番目）
+
+
+def test_fit_one_info_drops_rows_by_chosen_exclusion(monkeypatch):
+    """2026-10-23 段5-8: depth は (車速 < 5 かつ u <= −8%) の行、window は stop_window_row の行
+    だけを学習から外す。外す行の数を fit_side に渡る x の行数で見る。"""
+    n = 6
+    base = FwdRows(
+        speed_kmh=np.array([3.0, 3.0, 20.0, 20.0, 20.0, 20.0]),
+        u_pct=np.array([-10.0, -10.0, -2.0, -2.0, -10.0, -1.0]),
+        accel_kmhs=np.zeros(n),
+        t_s=np.arange(n) * 0.1,
+        dt_s=0.1,
+        source="x",
+        dt_row_s=np.full(n, 0.1),
+        stop_window_row=np.array([False, False, False, True, True, False]),
+    )
+    seen = {}
+
+    def fake_fit_side(x, y, **kw):
+        seen[len(seen)] = len(x)
+        return object()
+
+    monkeypatch.setattr("tests.research.fwd_cv.fwd_torch.fit_side", fake_fit_side)
+
+    def brake_rows(excl):
+        seen.clear()
+        cfg = CvConfig("t", (3,), drop_stop_approach=True, stop_approach_exclusion=excl)
+        fit_one_info(cfg, [base], 0, max_iter=2)
+        return seen[1]  # 2 回目がブレーキ側
+
+    all_brake = int((base.u_pct <= 0).sum())  # 6
+    assert brake_rows("depth") == all_brake - 2  # 0, 1 番目（車速 3・u −10）
+    assert brake_rows("window") == all_brake - 2  # 3, 4 番目（窓が停車にかかる行）

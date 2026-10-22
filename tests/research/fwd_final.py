@@ -87,6 +87,7 @@ def final_config(
     brake_exclude_launch: bool = True,
     accel_release_input: bool = True,
     accel_push_input: bool = False,
+    stop_approach_exclusion: str = "depth",
 ) -> CvConfig:
     """既定は交差検証で良かった `1-1 絶対誤差`（乱数の本数だけ最終用に増やす）。
     層・活性化・停車まぎわ除外を変えたときは設定名を引数から作る。
@@ -113,7 +114,15 @@ def final_config(
         brake_exclude_launch=brake_exclude_launch,
         accel_release_input=accel_release_input,
         accel_push_input=accel_push_input,
+        stop_approach_exclusion=stop_approach_exclusion,
     )
+
+
+def _dropped_rows(cfg: CvConfig, r: FwdRows) -> np.ndarray:
+    """停車まぎわ除外で学習から外す行（cfg.stop_approach_exclusion に従う。2026-10-23 段5-8）。"""
+    if cfg.stop_approach_exclusion == "window":
+        return r.stop_window_row
+    return stop_approach_mask(r.speed_kmh, r.u_pct)
 
 
 def build_final_table(
@@ -160,6 +169,7 @@ def build_final_table(
             "drop_stop_approach": True,
             "stop_approach_speed_kmh": STOP_APPROACH_SPEED_KMH,
             "stop_approach_u_pct": STOP_APPROACH_U_PCT,
+            "stop_approach_exclusion": cfg.stop_approach_exclusion,
         }
         if cfg.drop_stop_approach
         else {"drop_stop_approach": False}
@@ -201,7 +211,7 @@ def build_final_table(
             if cfg.brake_exclude_launch:
                 m &= ~r.launch_row  # 学習のブレーキ側と同じ行で数える
             if cfg.drop_stop_approach:
-                m &= ~stop_approach_mask(r.speed_kmh, r.u_pct)
+                m &= ~_dropped_rows(cfg, r)
             rel_p.append(r.release_pct[m])
             rel_dt.append(r.dt_row_s[m])
         slices = monotone_rows(np.mean([o[4] for o in outs], axis=0), like.u_grid)
@@ -219,6 +229,8 @@ def build_final_table(
         arel_p, arel_dt = [], []
         for r in train_rows:
             m = r.u_pct > 0.0
+            if cfg.drop_stop_approach:  # depth はアクセルの行を外さない・window は窓の行を外す
+                m &= ~_dropped_rows(cfg, r)
             arel_p.append(r.accel_release_pct[m])
             arel_dt.append(r.dt_row_s[m])
         aslices = monotone_rows(np.mean([o[5] for o in outs], axis=0), like.u_grid)
@@ -272,6 +284,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--drop-stop-approach", action="store_true", help="停車まぎわの強いブレーキの行を除く"
     )
     p.add_argument(
+        "--stop-approach-exclusion", choices=("depth", "window"), default="depth",
+        help="停車まぎわ除外の外し方（段5-8。depth＝今の深さ、window＝窓が停車にかかる行）",
+    )
+    p.add_argument(
         "--rollout-s",
         type=float,
         default=0.0,
@@ -295,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         activation=args.activation,
         drop_stop_approach=args.drop_stop_approach,
         rollout_s=args.rollout_s,
+        stop_approach_exclusion=args.stop_approach_exclusion,
     )
     max_iter = SMOKE_MAX_ITER if args.smoke else fwd_torch.MAX_ITER
     like = load_forward_map(Path(args.map))

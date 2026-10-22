@@ -753,7 +753,7 @@ def _seed_outlier_setup(
         creep_launch_min_speed_kmh=None, side_table_opening_source="actual",
         stop_release_layer_enabled=False, accel_release_input_enabled=False,
         launch_accel_side_source="extrapolate", side_table_accel_window_s=0.5,
-        launch_rows_to_stop_max=False, side_row_speed_rep="grid",
+        launch_rows_to_stop_max=False, side_row_speed_rep="grid", stop_approach_exclusion="depth",
     ):
         seeds_seen.append(tuple(seeds))
         path = tmp_path / "results" / "models" / f"fwd_model_fake_{len(seeds_seen)}.pkl"
@@ -1093,3 +1093,16 @@ def test_result_table_shows_cruise_and_lag_columns() -> None:
         turn_s=2.0,
     )
     assert "途中保持" in text and "18/20" in text and "30L" in text
+
+
+def test_loop_config_passes_stop_release_settings() -> None:
+    """2026-10-23 段5-8: loop_config は learning.stop_release_* をそのまま渡す（既定は off）。"""
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    lc = pdmod.loop_config_from_config(cfg)
+    assert lc.stop_release_enabled is False
+    assert lc.stop_release_fracs == tuple(cfg.learning.stop_release_fracs)
+    assert lc.stop_release_start_kmh == cfg.learning.stop_release_start_kmh
+    cfg.learning.stop_release_enabled = True
+    cfg.learning.stop_release_max_g = 0.15
+    lc = pdmod.loop_config_from_config(cfg)
+    assert lc.stop_release_enabled is True and lc.stop_release_max_g == 0.15

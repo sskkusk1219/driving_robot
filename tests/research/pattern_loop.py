@@ -390,6 +390,21 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
     - 戻しに使った時間は下りの時間切れから除く（`_rp_down_prior_s` に戻しの前までを足す。
       `_enter_phase` で経過が 0 に戻るので、戻しの間は数えない）。結果に戻しの秒・入った回数・
       飛ばした回数を持つ（`RampResult.release_s`・`release_n`・`release_skipped`）。
+
+2026-10-23 段5-8: 停止前の戻し B-1（`learning.stop_release_enabled`。既定 false ＝ 今と同じ走り）。
+    各 G ランプの下り（RAMP_DOWN のラッチ後・u ＜ 0）で、実車速が stop_release_start_kmh（7.5）を
+    切ったら、内部は RAMP_RELEASE のまま（CSV の phase は `RAMP_STOP_RELEASE`。本体の戻し
+    RAMP_RELEASE と区別する）、u を「山の開度」（直近 3 秒の u の最深。STOP_RELEASE_PEAK_WINDOW_S）
+    の
+    stop_release_fracs（段ごとに交互）だけ、stop_release_rate_pct_s で直線に戻し、戻した開度のまま
+    保つ。制御の項・ガバナーの踏み増しは使わない（RAMP_RELEASE と同じ）。アクセルは 0 のまま
+    （hi ＝ 0）なので両踏みにならない。
+    - 終わり方: 実車速 ≦ STOP_SPEED_KMH（停車）→ 結果を記録して `_finish_pattern`（今の RAMP_DOWN の
+      終わりと同じ。次のパターンが停車保持へ踏む）。逃げ道: 実加速度 ≧ 0 が stop_release_escape_s
+      続いたら、同じく結果を記録して `_finish_pattern`（走っていれば DRIVE_BRAKE ＝ 停車復帰）。
+      安全網: STOP_RELEASE_TIMEOUT_S 経っても終わらなければ同じ。
+    - 入らない段: 目標減速度が stop_release_max_g を超える段（強い段）、u ≧ 0 の段。
+      1 回の下りにつき 1 回だけ入る。
 """
 
 from __future__ import annotations
@@ -572,6 +587,14 @@ class _Phase(Enum):
 # 発進のゆっくり離し（段2o-10 A）の間の CSV の phase 名。内部のフェーズは RAMP_UP のまま
 # （`_rp_lr_active` が立っている間だけ名前を差し替える）
 RAMP_LAUNCH_RELEASE_PHASE = "RAMP_LAUNCH_RELEASE"
+# 停止前の戻し B-1（段5-8）の間の CSV の phase 名。内部のフェーズは RAMP_RELEASE のまま
+# （`_rp_stop_release_active` が立っている間だけ名前を差し替える）
+RAMP_STOP_RELEASE_PHASE = "RAMP_STOP_RELEASE"
+# 停止前の戻しの「山の開度」を見る窓 [s]。fwd_data.RELEASE_WINDOW_S（戻し量の山を見る窓）と同じ値
+# （tests/research 内で pattern_loop は fwd_data に依らないので持ち込み。変えるときは両方）
+STOP_RELEASE_PEAK_WINDOW_S = 3.0
+# 停止前の戻しの安全網 [s]。これだけ経っても停車せず逃げ道にも当たらなければ打ち切る
+STOP_RELEASE_TIMEOUT_S = 30.0
 
 # G ランプの区間（順に RAMP_UP → RAMP_HOLD → RAMP_DOWN。2026-10-10 段2l-10 で RAMP_HOLD を追加）
 _RAMP_PHASES = (
@@ -735,6 +758,13 @@ class PatternLoopConfig:
     ramp_release_min_kmh: float = field(default=0.0)
     # 2026-10-16 段2o-6: false なら戻しに入らない（learning.ramp_release_enabled から渡す）
     ramp_release_enabled: bool = field(default=True)
+    # 2026-10-23 段5-8: 停止前の戻し B-1（learning.stop_release_* から渡す。false なら今と同じ走り）
+    stop_release_enabled: bool = field(default=False)
+    stop_release_start_kmh: float = field(default=7.5)
+    stop_release_fracs: tuple[float, ...] = field(default=(0.25, 0.5))
+    stop_release_rate_pct_s: float = field(default=2.0)
+    stop_release_escape_s: float = field(default=0.5)
+    stop_release_max_g: float = field(default=0.2)
 
 
 class ActuatorDriverProtocol(Protocol):
@@ -947,6 +977,16 @@ class PatternLoop:
         self._rp_release_u_peak = 0.0  # 入った時点の u（山の開度。負）
         self._rp_release_n = 0
         self._rp_release_skipped = 0
+        # 停止前の戻し B-1（段5-8）。active は RAMP_RELEASE が停止前の戻しのとき True
+        self._rp_stop_release_active = False
+        self._rp_stop_release_done = False  # この下りで入った（または入れない）
+        self._rp_stop_release_n = 0  # 入った回数（割合を交互に使う。ループの間続く）
+        self._rp_stop_release_t0 = 0.0
+        self._rp_stop_release_u0 = 0.0  # 入った時点の u
+        self._rp_stop_release_target = 0.0  # 戻した先の u
+        self._rp_stop_release_nonneg_s = 0.0  # 実加速度 ≧ 0 が続いた秒数
+        self._rp_stop_release_last_t: float | None = None
+        self._rp_u_hist: deque[tuple[float, float]] = deque()  # 下りの u の履歴 (時刻, u)
         self._rp_seg_t = 0.0  # 今の区間の積算の起点
         self._rp_up_g: list[float] = []  # 加速側の実測 G（符号つき。窓が溜まってから）
         self._rp_down_g: list[float] = []  # 減速側の実測 G（符号つき）
@@ -1136,7 +1176,7 @@ class PatternLoop:
                 brake_current=brake_current,
             ),
             self._pattern_idx,
-            RAMP_LAUNCH_RELEASE_PHASE if self._rp_lr_active else self._phase.name,
+            self._csv_phase_name(),
             self._governor_limiting(),
             alarm_accel,
             alarm_brake,
@@ -1544,6 +1584,9 @@ class PatternLoop:
         self._rp_release_done = set()
         self._rp_release_n = 0
         self._rp_release_skipped = 0
+        self._rp_stop_release_active = False
+        self._rp_stop_release_done = False
+        self._rp_u_hist.clear()
         start = self._config.stop_confirm_pct
         if start is None or self._ramp_launch_release_enabled():
             # 段2o-10 A: ゆっくり離すときは停車保持開度から始め、止まる点は ① の終点に使う
@@ -1560,6 +1603,14 @@ class PatternLoop:
         self._rp_u = -(max(floor, min(start, self._profile.max_brake_opening)) - floor)
         self._rp_accel_reached = self._rp_u >= 0.0
         self._ramp_launch_release_begin(floor)
+
+    def _csv_phase_name(self) -> str:
+        """CSV の phase 列の名前。発進のゆっくり離し・停止前の戻しの間だけ別の名前。"""
+        if self._rp_lr_active:
+            return RAMP_LAUNCH_RELEASE_PHASE
+        if self._rp_stop_release_active and self._phase is _Phase.RAMP_RELEASE:
+            return RAMP_STOP_RELEASE_PHASE
+        return self._phase.name
 
     def _ramp_launch_release_enabled(self) -> bool:
         cfg = self._config
@@ -2210,8 +2261,15 @@ class PatternLoop:
             self._advance_hold_step(speed, now)
             return
         if self._phase is _Phase.RAMP_RELEASE:
-            self._advance_ramp_release(speed, now)
+            if self._rp_stop_release_active:
+                self._advance_stop_release(pattern, speed, now, measured_g)
+            else:
+                self._advance_ramp_release(speed, now)
             return
+        if self._phase is _Phase.RAMP_DOWN and self._config.stop_release_enabled:
+            self._rp_u_hist.append((now, self._rp_u))  # 山の開度（直近の u の最深）用
+            while self._rp_u_hist and now - self._rp_u_hist[0][0] > STOP_RELEASE_PEAK_WINDOW_S:
+                self._rp_u_hist.popleft()
         leg_s_elapsed = self._ramp_leg_elapsed(elapsed)  # 保持を除いた通算（段2o-2）
         if self._phase is not _Phase.RAMP_DOWN:
             accel_kmhs = 0.0 if measured_accel is None else measured_accel
@@ -2276,6 +2334,8 @@ class PatternLoop:
             self._finish_pattern(speed, now)
             return
         if self._ramp_release_try_enter(pattern, speed, now):
+            return
+        if self._stop_release_try_enter(pattern, speed, now):
             return
         self._ramp_cruise_try_enter(pattern, speed, now, measured_accel)
 
@@ -2504,6 +2564,73 @@ class PatternLoop:
         self._phase = _Phase.RAMP_RELEASE  # `_enter_phase` は通さない（`_rp_hist` を残す）
         self._skip_count = 0
         return True
+
+    # ── 停止前の戻し B-1（段5-8）──────────────────────────────────────────
+    def _stop_release_try_enter(self, pattern: GRampPattern, speed: float, now: float) -> bool:
+        """下り（RAMP_DOWN）で実車速が stop_release_start_kmh を切ったら停止前の戻しへ入る。
+        入ったら True。1 回の下りにつき 1 度だけ判定する（入れない場合も済みにする）。
+        入れない: 設定が off・強い段（目標減速度 ＞ stop_release_max_g）・ブレーキのラッチ前・
+        u ≧ 0・実車速が停車以下。"""
+        cfg = self._config
+        if not cfg.stop_release_enabled or self._rp_stop_release_done:
+            return False
+        if speed >= cfg.stop_release_start_kmh:
+            return False
+        self._rp_stop_release_done = True
+        if (
+            pattern.target_g > cfg.stop_release_max_g
+            or not self._rp_brake_latched
+            or self._rp_u >= 0.0
+            or speed <= STOP_SPEED_KMH
+            or not cfg.stop_release_fracs
+        ):
+            return False
+        peak = min([u for _, u in self._rp_u_hist] + [self._rp_u])
+        frac = cfg.stop_release_fracs[self._rp_stop_release_n % len(cfg.stop_release_fracs)]
+        self._rp_stop_release_n += 1
+        self._ramp_account(now)
+        self._rp_blend_left = self._rp_blend_time_left = 0.0  # 寄せ残りは捨てる
+        self._rp_down_brake_blend_pending = False
+        self._rp_blend_release = False
+        self._rp_stop_release_u0 = self._rp_u
+        # 戻した先。今がそれより浅ければ（山から離れた後）戻さずに保つ
+        self._rp_stop_release_target = max(self._rp_u, peak * (1.0 - frac))
+        self._rp_stop_release_t0 = now
+        self._rp_stop_release_nonneg_s = 0.0
+        self._rp_stop_release_last_t = now
+        self._rp_stop_release_active = True
+        self._phase = _Phase.RAMP_RELEASE  # `_enter_phase` は通さない（`_rp_hist` を残す）
+        self._skip_count = 0
+        return True
+
+    def _advance_stop_release(
+        self, pattern: GRampPattern, speed: float, now: float, measured_g: float | None
+    ) -> None:
+        """停止前の戻しの前進。u は入ってからの時間で直線に戻し、戻した先で保つ。
+        停車（実車速 ≦ STOP_SPEED_KMH）・逃げ道（実加速度 ≧ 0 が stop_release_escape_s 続いた）・
+        安全網（STOP_RELEASE_TIMEOUT_S）のどれかで結果を記録して `_finish_pattern`。"""
+        cfg = self._config
+        t = max(0.0, now - self._rp_stop_release_t0)
+        last = self._rp_stop_release_last_t
+        dt = 0.0 if last is None else min(max(0.0, now - last), 10.0 * self._interval_s)
+        self._rp_stop_release_last_t = now
+        if measured_g is not None and measured_g >= 0.0:
+            self._rp_stop_release_nonneg_s += dt
+        else:
+            self._rp_stop_release_nonneg_s = 0.0
+        if (
+            speed <= STOP_SPEED_KMH
+            or self._rp_stop_release_nonneg_s >= cfg.stop_release_escape_s
+            or t >= STOP_RELEASE_TIMEOUT_S
+        ):
+            self._rp_stop_release_active = False
+            self._ramp_record_result(pattern, now)
+            self._finish_pattern(speed, now)
+            return
+        self._rp_u = min(
+            self._rp_stop_release_target,
+            self._rp_stop_release_u0 + cfg.stop_release_rate_pct_s * t,
+        )
 
     def _ramp_release_total_s(self) -> float:
         """戻しの流れの全体の秒数 ＝ 移動 × 割合の数 ＋ 保持の合計。"""
@@ -3079,6 +3206,7 @@ class PatternLoop:
     ) -> None:
         self._phase = phase
         self._phase_started_at = now
+        self._rp_stop_release_active = False  # 停止前の戻し（段5-8）は RAMP_RELEASE の間だけ
         self._skip_count = 0
         self._stable_count = 0
         if phase is _Phase.COAST:

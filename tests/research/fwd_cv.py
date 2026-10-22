@@ -140,6 +140,10 @@ class CvConfig:
     # 踏み増しの表（raw_accel_push_slices）も作る。False（既定）は今までと完全に同じ。
     # 手順2 は learning.accel_push_input_enabled（既定 false）をここへ渡す
     accel_push_input: bool = False
+    # 2026-10-23 段5-8: 停車まぎわ除外（drop_stop_approach=True のとき）の外し方。"depth" ＝ 今の
+    # stop_approach_mask（5 km/h 未満かつ u <= −8%）、"window" ＝ 加速度を作る窓が停車の瞬間に
+    # かかる行（FwdRows.stop_window_row）だけ。key() には "depth"（既定）のとき含めない
+    stop_approach_exclusion: str = "depth"
 
     def key(self) -> str:
         """全フィールドから作る文字列（結果ファイルで同じ設定を見分ける）。
@@ -158,6 +162,8 @@ class CvConfig:
             del d["release_slices"]
         if d["brake_exclude_launch"]:
             del d["brake_exclude_launch"]
+        if d["stop_approach_exclusion"] == "depth":  # 既定は含めない（足す前の結果を読み直せる）
+            del d["stop_approach_exclusion"]
         return "|".join(f"{k}={v}" for k, v in d.items())
 
 
@@ -170,6 +176,25 @@ def folds() -> list[tuple[list[Path], Path]]:
 
 def fold_name(held: Path) -> str:
     return "_".join(held.stem.split("_")[-2:])
+
+
+def _side_mask(r: FwdRows, side: str, coast_in_brake: bool, exclude_launch: bool) -> np.ndarray:
+    """side_rows が片側に取る行の選び方（FwdRows 1 本分）。"""
+    if side == "accel":
+        return r.u_pct >= 0
+    m = r.u_pct <= 0 if coast_in_brake else r.u_pct < 0
+    if exclude_launch:
+        m = m & ~r.launch_row
+    return m
+
+
+def side_stop_window(
+    rows_list: Sequence[FwdRows], side: str, *, coast_in_brake: bool, exclude_launch: bool = False
+) -> np.ndarray:
+    """side_rows と同じ行の並びで、加速度の窓が停車の瞬間にかかる行（stop_window_row）の bool。"""
+    return np.concatenate(
+        [r.stop_window_row[_side_mask(r, side, coast_in_brake, exclude_launch)] for r in rows_list]
+    )
 
 
 def side_rows(
@@ -190,12 +215,7 @@ def side_rows(
     踏み増し量（2026-10-23 段5-7b）。"""
     xs, ys, gs, ts = [], [], [], []
     for g, r in enumerate(rows_list):
-        if side == "accel":
-            m = r.u_pct >= 0
-        else:
-            m = r.u_pct <= 0 if coast_in_brake else r.u_pct < 0
-            if exclude_launch:
-                m = m & ~r.launch_row
+        m = _side_mask(r, side, coast_in_brake, exclude_launch)
         cols = [r.speed_kmh[m], r.u_pct[m]]
         if side != "accel":
             cols.append(r.release_pct[m])
@@ -321,7 +341,13 @@ def fit_one_info(
             accel_push_input=cfg.accel_push_input,
         )
         if cfg.drop_stop_approach:  # 重み 0 ではなく行そのものを除く（検証の分け方も変わる）
-            keep = ~stop_approach_mask(x[:, 0], x[:, 1])
+            if cfg.stop_approach_exclusion == "window":
+                keep = ~side_stop_window(
+                    train_rows, side, coast_in_brake=cfg.coast_from != "accel",
+                    exclude_launch=cfg.brake_exclude_launch,
+                )
+            else:
+                keep = ~stop_approach_mask(x[:, 0], x[:, 1])
             x, y, g, t = x[keep], y[keep], g[keep], t[keep]
         blocks = fwd_torch.block_ids(t, g) if cfg.val_split == "block" else None
         w = side_weights(g, train_rows) if cfg.time_weight else None
@@ -343,6 +369,8 @@ def fit_one_info(
     if cfg.rollout_s > 0:
         if train_traces is None or st is None:
             raise ValueError("rollout_s > 0 には train_traces と st が要る")
+        if cfg.drop_stop_approach and cfg.stop_approach_exclusion == "window":
+            raise ValueError("stop_approach_exclusion='window' は rollout_s > 0 と併用できない")
         drop = stop_approach_mask if cfg.drop_stop_approach else None
         groups: list[fwd_torch.WindowGroup] = []
         used = dropped = 0.0

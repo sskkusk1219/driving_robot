@@ -611,3 +611,26 @@ def test_accel_push_amount_after_brake_equals_u() -> None:
     push = accel_push_amount(t, u, 10.0)
     # u <= 0・NaN の点は 0。アクセルの点は窓の最小が 0 なので踏み増し量 ＝ u
     assert push.tolist() == [0.0, 0.0, 0.0, 1.0, 1.0]
+def test_stop_window_row_marks_only_rows_whose_window_touches_the_stop_moment(
+    tmp_path: Path,
+) -> None:
+    """2026-10-23 段5-8: 実車速が停車速度（0.5）未満になる最初の点（t = 2.3）が、加速度の窓
+    （中心 t + 遅れ 0.05、幅 1.0 秒）に入る行だけ True。深さは関係しない。"""
+    rows = make_rows(60, lambda t: max(0.0, 5.0 - 2.0 * t), brake=BD + 4.0)
+    r = read(write_csv(tmp_path / "w.csv", rows))
+    assert len(r.stop_window_row) == len(r) > 0
+    near = (r.t_s >= 1.75 - 0.05 + 1e-6) & (r.t_s <= 2.75 - 0.05 + 1e-9)
+    assert near.any() and (~near).any()
+    assert np.all(r.stop_window_row[near]) and not np.any(r.stop_window_row[~near])
+    # 深さを変えても同じ行（深さではなく窓だけで決まる）
+    rows2 = make_rows(60, lambda t: max(0.0, 5.0 - 2.0 * t), brake=BD + 12.0)
+    r2 = read(write_csv(tmp_path / "w2.csv", rows2))
+    assert r2.stop_window_row.tolist() == r.stop_window_row.tolist()
+
+
+def test_stop_window_row_is_carried_by_take_and_concat() -> None:
+    a = synth_launch_rows([1.0, 2.0, 3.0], [-1.0, -2.0, -3.0], [0.0, 1.0, 2.0])
+    assert a.stop_window_row.tolist() == [False] * 3  # 省略は全行 False
+    a = FwdRows(**{**a.__dict__, "stop_window_row": np.array([False, True, True])})
+    assert take_rows(a, np.array([False, True, True])).stop_window_row.tolist() == [True, True]
+    assert concat_rows([a, a]).stop_window_row.tolist() == [False, True, True] * 2

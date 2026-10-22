@@ -1280,3 +1280,37 @@ def test_accel_push_input_setting_default_off() -> None:
     text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
     assert "  accel_push_input_enabled: false\n" in text
     assert _load_default().learning.accel_push_input_enabled is False
+def test_stop_release_and_stop_exclusion_settings_default_and_validation() -> None:
+    """2026-10-23 段5-8: 停止前の戻し B-1・停車まぎわ除外の設定。既定（yaml）と範囲外の検証。"""
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.stop_release_enabled is False
+    assert lr.stop_release_start_kmh == pytest.approx(7.5)
+    assert list(lr.stop_release_fracs) == [0.25, 0.5]
+    assert lr.stop_release_rate_pct_s == pytest.approx(2.0)
+    assert lr.stop_release_escape_s == pytest.approx(0.5)
+    assert lr.stop_release_max_g == pytest.approx(0.2)
+    assert lr.stop_approach_exclusion == "depth"
+    assert cfgmod.validate_config(cfg) == []
+    # dataclass の既定も同じ
+    fresh = cfgmod.LearningSection()
+    assert fresh.stop_release_enabled is False and fresh.stop_approach_exclusion == "depth"
+    assert list(fresh.stop_release_fracs) == [0.25, 0.5]
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    for key, bad, good in (
+        ("stop_release_start_kmh", 0.0, 7.5),
+        ("stop_release_rate_pct_s", 0.0, 2.0),
+        ("stop_release_escape_s", -1.0, 0.5),
+        ("stop_release_max_g", 0.0, 0.2),
+        ("stop_release_fracs", [], [0.25, 0.5]),
+        ("stop_release_fracs", [0.0], [0.25, 0.5]),
+        ("stop_release_fracs", [1.5], [0.25, 0.5]),
+        ("stop_approach_exclusion", "deep", "depth"),
+    ):
+        setattr(lr, key, bad)
+        assert problems_about(key), (key, bad)
+        setattr(lr, key, good)
+        assert not problems_about(key)

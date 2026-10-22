@@ -583,6 +583,13 @@ def loop_config_from_config(
         ramp_release_move_s=lr.ramp_release_move_s,
         ramp_release_hold_s=tuple(lr.ramp_release_hold_s),
         ramp_release_enabled=lr.ramp_release_enabled,
+        # 2026-10-23 段5-8: 停止前の戻し B-1
+        stop_release_enabled=lr.stop_release_enabled,
+        stop_release_start_kmh=lr.stop_release_start_kmh,
+        stop_release_fracs=tuple(lr.stop_release_fracs),
+        stop_release_rate_pct_s=lr.stop_release_rate_pct_s,
+        stop_release_escape_s=lr.stop_release_escape_s,
+        stop_release_max_g=lr.stop_release_max_g,
         ramp_release_min_kmh=cfg.feedforward.creep_speed_kmh + CRUISE_MIN_MARGIN_KMH,
         gov_soft_frac=lr.gov_soft_frac,
         # 待機位置 ＝ min（2026-10-08 段2l-6。待機しないなら掛けない）と、発進の開始位置
@@ -1192,6 +1199,7 @@ def _build_forward_model(
     launch_rows_to_stop_max: bool = False,
     side_row_speed_rep: str = "grid",
     accel_push_input_enabled: bool = False,
+    stop_approach_exclusion: str = "depth",
 ) -> _BuiltModel:
     """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
 
@@ -1207,6 +1215,10 @@ def _build_forward_model(
     true のときだけ、アクセル側の入力に「アクセルの踏み増し量」をさらに足し（戻し量が on なら 4、
     off なら 3 入力）、アクセルの踏み増しの表も作る。false は今までと完全に同じ。値は pkl meta
     accel_push_input_enabled に残る。
+
+    2026-10-23 段5-8: stop_approach_exclusion（learning.stop_approach_exclusion。既定 "depth"）。
+    停車まぎわ除外（FORWARD_DROP_STOP_APPROACH）の外し方。"window" は加速度の窓が停車の瞬間に
+    かかる行だけを外す。値は pkl meta stop_approach_exclusion に残る。
     """
     from tests.research import fwd_final, fwd_tool, fwd_torch  # noqa: PLC0415
     from tests.research.fwd_map import (  # noqa: PLC0415
@@ -1231,6 +1243,7 @@ def _build_forward_model(
         table_u_step_pct=FORWARD_TABLE_U_STEP_PCT,
         accel_release_input=accel_release_input_enabled,
         accel_push_input=accel_push_input_enabled,
+        stop_approach_exclusion=stop_approach_exclusion,
     )
     use_iter = fwd_torch.MAX_ITER if max_iter is None else max_iter
     say(f"  設定: {cfg8.name}（隠れ層 {cfg8.hidden}・{cfg8.activation}・損失 {cfg8.loss}）、"
@@ -1484,6 +1497,7 @@ def build_ff_model(
             side_table_accel_window_s=cfg.learning.side_table_accel_window_s,
             launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,
             side_row_speed_rep=cfg.learning.side_row_speed_rep,
+            stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
         )
     else:
         built = _build_poly_model(
@@ -1559,6 +1573,7 @@ def build_ff_model(
             side_table_accel_window_s=cfg.learning.side_table_accel_window_s,
             launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,
             side_row_speed_rep=cfg.learning.side_row_speed_rep,
+            stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
         )
         checks = run_checks_now()
     say(step2_check.format_checks(checks))

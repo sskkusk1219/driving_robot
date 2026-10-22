@@ -3480,3 +3480,148 @@ def test_launch_release_slow_phase_is_capped_by_time_limit() -> None:
 def test_launch_release_disabled_by_empty_rates_keeps_old_flow() -> None:
     loop = _lr_loop(slow=())
     assert not loop._rp_lr_active
+
+
+# ── 停止前の戻し B-1（2026-10-23 段5-8）──────────────────────────────────
+
+
+def _stop_config(**kw: object) -> PatternLoopConfig:
+    base = PatternLoopConfig(
+        stop_release_enabled=True, stop_release_start_kmh=7.5, stop_release_fracs=(0.25, 0.5),
+        stop_release_rate_pct_s=2.0, stop_release_escape_s=0.5, stop_release_max_g=0.2,
+    )
+    return dataclasses.replace(base, **kw)  # type: ignore[arg-type]
+
+
+class _StopKine(_Kine):
+    """停止前の戻しの間の車: decel_ratio × G で減速（0 なら一定）。他の区間は _Kine と同じ。"""
+
+    def __init__(self, loop: PatternLoop, g: float, decel_ratio: float = 0.4) -> None:
+        super().__init__(loop, g)
+        self.ratio = decel_ratio
+
+    def step(self, dt: float = 0.1) -> None:
+        if self.loop._phase is _Phase.RAMP_RELEASE:
+            self.v = max(0.0, self.v - self.ratio * self.g * G_TO_KMHS * dt)
+        else:
+            super().step(dt)
+
+
+def _run_stop(
+    loop: PatternLoop, p: plmod.GRampPattern, kine: _Kine, *, u_down: float = -6.0,
+    t_max: float = 150.0,
+) -> list[tuple[float, str, float, float, float, float]]:
+    """結果が記録されるまで回し、(t, CSV の phase 名, 車速, u, アクセル指令, ブレーキ指令) を返す。
+    記録された周期の次の 1 周期も入れる（終わった後の phase を見るため）。"""
+    rows = []
+    t = 0.0
+    done_at = None
+    while t < t_max:
+        if loop._phase is _Phase.RAMP_DOWN and kine.v > 0.0:
+            loop._rp_u = min(loop._rp_u, u_down)
+            loop._rp_brake_latched = True
+        a, b = _cycle(loop, p, kine.v, t)
+        rows.append((t, loop._csv_phase_name(), kine.v, loop._rp_u, a, b))
+        if loop.ramp_results and done_at is None:
+            done_at = t
+        if done_at is not None and t > done_at:
+            break
+        kine.step()
+        t += 0.1
+    return rows
+
+
+def test_stop_release_default_off_is_the_same_run() -> None:
+    """stop_release_enabled が false（既定）なら、他の stop_release_* を変えても今と同じ走り。"""
+    p = _release_ramp(stations=(), g=0.1)
+    a = _loop([p], config=_release_config())
+    b = _loop([p], config=_release_config(stop_release_fracs=(0.9,), stop_release_max_g=9.0))
+    ra = _run_stop(a, p, _StopKine(a, 0.1))
+    rb = _run_stop(b, p, _StopKine(b, 0.1))
+    assert ra == rb
+    assert not any(r[1] == "RAMP_STOP_RELEASE" for r in ra)
+    assert PatternLoopConfig().stop_release_enabled is False
+
+
+def test_stop_release_moves_u_linearly_holds_and_ends_at_stop() -> None:
+    """7.5 km/h を切ると RAMP_STOP_RELEASE（CSV の名前）。u は山 −6 から 2%/s で山 × 0.25 だけ
+    （−6 → −4.5）戻して保ち、停車（0.5 km/h 以下）で結果を記録して終わる。アクセルは常に 0。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_stop_config())
+    _, bdb = _deadbands(loop)
+    rows = _run_stop(loop, p, _StopKine(loop, 0.1))
+    seg = [r for r in rows if r[1] == "RAMP_STOP_RELEASE"]
+    assert seg
+    t0, v0, u0 = seg[0][0], seg[0][2], seg[0][3]
+    # 山 ＝ 入る前の直近 3 秒の u の最深（制御が踏み増すので −6 より深くなりうる）
+    peak = min([r[3] for r in rows if r[1] == "RAMP_DOWN" and t0 - 3.0 <= r[0] < t0] + [u0])
+    assert v0 < 7.5 and peak <= -6.0 and u0 >= peak - 1e-9
+    target = 0.75 * peak
+    for t, _name, _v, u, a, b in seg:
+        want = min(target, u0 + 2.0 * (t - t0))
+        assert u == pytest.approx(want, abs=0.25)
+        assert a == 0.0 and b > bdb  # 片足だけ（ブレーキは min より上。指令は u の更新の前の値）
+    assert seg[-1][3] == pytest.approx(target, abs=0.01)  # 戻した開度のまま保つ
+    assert len(loop.ramp_results) == 1
+    assert seg[-1][2] <= 0.5 + 1e-9 or seg[-1][2] < 1.0  # 停車まで保った
+    assert rows[-1][1] not in ("RAMP_STOP_RELEASE", "RAMP_RELEASE")
+    assert loop._csv_phase_name() == loop._phase.name  # 終わった後は普通の名前に戻る
+
+
+def test_stop_release_alternates_fractions_per_step() -> None:
+    """段ごとに割合を交互に使う（2 回目は 0.5 ＝ 山の半分）。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_stop_config())
+    loop._rp_stop_release_n = 1
+    rows = _run_stop(loop, p, _StopKine(loop, 0.1))
+    seg = [r for r in rows if r[1] == "RAMP_STOP_RELEASE"]
+    peak = min(r[3] for r in rows if r[1] == "RAMP_DOWN")
+    assert seg[-1][3] == pytest.approx(0.5 * peak, abs=0.01)
+    assert loop._rp_stop_release_n == 2
+
+
+def test_stop_release_escape_when_deceleration_stops() -> None:
+    """戻した開度で減速が止まった（実加速度 ≧ 0 が 0.5 秒続いた）ら停車保持へ踏む（結果を記録して
+    DRIVE_BRAKE ＝ 停車復帰）。車はまだ走っている。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_stop_config())
+    kine = _StopKine(loop, 0.1, decel_ratio=-0.1)  # 戻すと減速が止まり、わずかに加速する
+    rows = _run_stop(loop, p, kine)
+    seg = [r for r in rows if r[1] == "RAMP_STOP_RELEASE"]
+    assert seg
+    assert seg[-1][0] - seg[0][0] <= loop._config.coast_accel_slope_window_s + 1.5
+    assert seg[-1][2] > 1.0  # 停車していないのに終わった
+    assert len(loop.ramp_results) == 1
+    assert loop._phase is _Phase.DRIVE_BRAKE
+
+
+def test_stop_release_skips_strong_steps_and_non_brake() -> None:
+    """目標減速度が stop_release_max_g を超える段（0.25G）には入らない。0.2G ちょうどは入る。
+    u ＜ 0 でない（ブレーキを踏んでいない）下りも入らない。"""
+    strong = _release_ramp(stations=(), g=0.25)
+    loop = _loop([strong], config=_stop_config())
+    rows = _run_stop(loop, strong, _StopKine(loop, 0.25))
+    assert not any(r[1] == "RAMP_STOP_RELEASE" for r in rows)
+    edge = _release_ramp(stations=(), g=0.2)
+    loop = _loop([edge], config=_stop_config())
+    rows = _run_stop(loop, edge, _StopKine(loop, 0.2))
+    assert any(r[1] == "RAMP_STOP_RELEASE" for r in rows)
+    weak = _release_ramp(stations=(), g=0.1)
+    loop = _loop([weak], config=_stop_config())
+    t, v = 0.0, 40.0
+    loop._phase = _Phase.RAMP_DOWN
+    loop._rp_u, loop._rp_brake_latched = 0.0, False
+    assert not loop._stop_release_try_enter(weak, 5.0, t)
+    assert v > 0.0
+
+
+def test_stop_release_never_presses_both_pedals() -> None:
+    """停止前の戻しの全周期でアクセル指令は 0・ブレーキ指令は正（片足）。u は 0 以下。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_stop_config())
+    rows = _run_stop(loop, p, _StopKine(loop, 0.1))
+    seg = [r for r in rows if r[1] == "RAMP_STOP_RELEASE"]
+    assert seg and all(r[4] == 0.0 and r[5] > 0.0 for r in seg)
+    assert all(r[3] <= 0.0 for r in seg)
+    lo, hi = loop._ramp_u_limits() if loop._phase is _Phase.RAMP_RELEASE else (0.0, 0.0)
+    assert hi == 0.0 and lo <= 0.0

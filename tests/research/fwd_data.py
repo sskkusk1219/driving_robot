@@ -109,9 +109,15 @@ class FwdRows:
     # （accel_push_amount）。
     # 省略（長さ 0）なら全行 0
     accel_push_pct: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    # 2026-10-23 段5-8: 加速度を作る窓（中心 t + 遅れ L、幅 accel_window_s）が「停車の瞬間」
+    # （実車速が STOP_SPEED_KMH 未満になった最初の点の時刻）にかかる行が True。停車まぎわ除外の
+    # "window" 方式（fwd_cv.stop_approach_exclusion）が使う。省略（長さ 0）なら全行 False
+    stop_window_row: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
 
     def __post_init__(self) -> None:
         n = len(self.speed_kmh)
+        if len(self.stop_window_row) == 0 and n > 0:
+            object.__setattr__(self, "stop_window_row", np.zeros(n, dtype=bool))
         if len(self.release_pct) == 0 and n > 0:
             object.__setattr__(self, "release_pct", np.zeros(n))
         if len(self.accel_release_pct) == 0 and n > 0:
@@ -328,6 +334,7 @@ def read_fwd_rows(
     rel_o: list[float] = []
     arel_o: list[float] = []
     apush_o: list[float] = []
+    stopw_o: list[bool] = []
     secs: set[str] = set()
     all_dt: list[float] = []
     for seg in segments:
@@ -376,6 +383,9 @@ def read_fwd_rows(
         t_keep = ts[keep]
         lag = np.where(u_arr > 0.0, accel_lag_s, np.where(u_arr < 0.0, brake_lag_s, lag_coast))
         slope = window_slope(ts[ok], sp[ok], t_keep + lag, accel_window_s)
+        # 2026-10-23 段5-8: 停車の瞬間 ＝ 動いていた点（実車速 >= STOP_SPEED_KMH）の次に、実車速が
+        # STOP_SPEED_KMH 未満になった最初の点の時刻。窓の中心 ± 幅/2 にかかる行を印す
+        stop_ts = _stop_moments(ts[ok], sp[ok])
         for j, i in enumerate(keep):
             if not np.isfinite(slope[j]):
                 dropped[DROP_NO_WINDOW] += 1
@@ -387,6 +397,8 @@ def read_fwd_rows(
             rel_o.append(float(rel_full[i]))
             arel_o.append(float(arel_full[i]))
             apush_o.append(float(apush_full[i]))
+            c = float(t_keep[j] + lag[j])
+            stopw_o.append(any(abs(c - st_t) <= accel_window_s / 2.0 + 1e-9 for st_t in stop_ts))
             secs.add(seg[i][5])
     dt = float(np.median(all_dt)) if all_dt else 0.0
     n = len(speed_o)
@@ -403,6 +415,7 @@ def read_fwd_rows(
         release_pct=np.array(rel_o, dtype=float),
         accel_release_pct=np.array(arel_o, dtype=float),
         accel_push_pct=np.array(apush_o, dtype=float),
+        stop_window_row=np.array(stopw_o, dtype=bool),
     )
     if mark_launch and not keep_stopped and n > 0:
         la = read_fwd_rows(
@@ -430,6 +443,16 @@ def read_fwd_rows(
                 j = min(near, key=lambda q: abs(tl[q] - ti))
                 flag[i] = bool(lm[j]) and abs(tl[j] - ti) < max(dt, 1e-9) / 2.0
             out = replace(out, launch_row=flag)
+    return out
+
+
+def _stop_moments(t: np.ndarray, v: np.ndarray) -> list[float]:
+    """停車の瞬間の時刻の一覧（2026-10-23 段5-8）。時刻昇順の 1 セグメントで、前の点が
+    STOP_SPEED_KMH 以上・その点が STOP_SPEED_KMH 未満になった点の時刻。"""
+    out: list[float] = []
+    for i in range(1, len(t)):
+        if v[i - 1] >= STOP_SPEED_KMH and v[i] < STOP_SPEED_KMH:
+            out.append(float(t[i]))
     return out
 
 
@@ -461,6 +484,7 @@ def take_rows(rows: FwdRows, mask: np.ndarray) -> FwdRows:
         launch_row=rows.launch_row[m],
         accel_release_pct=rows.accel_release_pct[m],
         accel_push_pct=rows.accel_push_pct[m],
+        stop_window_row=rows.stop_window_row[m],
     )
 
 
@@ -647,6 +671,7 @@ def concat_rows(parts: Sequence[FwdRows], source: str = "") -> FwdRows:
         launch_row=cat("launch_row").astype(bool),
         accel_release_pct=cat("accel_release_pct"),
         accel_push_pct=cat("accel_push_pct"),
+        stop_window_row=cat("stop_window_row").astype(bool),
     )
 
 
