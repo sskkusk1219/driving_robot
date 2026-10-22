@@ -1257,3 +1257,9 @@ def test_stage54_settings_default_to_current_behaviour_and_are_validated() -> No
     assert not any("side_row_speed_rep" in p for p in cfgmod.validate_config(cfg))
     cfg.learning.side_row_speed_rep = "bogus"
     assert any("side_row_speed_rep" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_switch_lead_enabled_defaults_to_false() -> None:
+    cfg = _load_default()
+    assert cfg.forward_map.switch_lead_enabled is False
+    assert cfgmod.ForwardMapSection().switch_lead_enabled is False

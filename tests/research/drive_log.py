@@ -146,6 +146,9 @@ CSV_COLUMNS: tuple[str, ...] = (
     # ブレーキ側それぞれ。C7 以降の FF の行だけ、他は空欄
     "ff_side_accel",
     "ff_side_brake",
+    # 2026-10-22 段5-5c: 切り替えの先読みで要る加速度を見る時刻を早めた秒数。
+    # FF の行だけ（先読みなしは空欄）
+    "ff_switch_lead_s",
 )
 
 
@@ -192,6 +195,7 @@ class DriveSample:
     stop_end_tau_s: float | None = None  # C15 の停C の τ [s]（区間の行だけ。他は None）
     ff_side_accel: int | None = None  # 計画がその行のアクセル側で引いた表（SIDE_*。FF の行だけ）
     ff_side_brake: int | None = None  # 同、ブレーキ側
+    ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
 class SessionLog:
@@ -281,6 +285,7 @@ class SessionLog:
         stop_end_tau_s: float | None = None,
         ff_side_accel: int | None = None,
         ff_side_brake: int | None = None,
+        ff_switch_lead_s: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -318,6 +323,7 @@ class SessionLog:
             stop_end_tau_s=stop_end_tau_s,
             ff_side_accel=ff_side_accel,
             ff_side_brake=ff_side_brake,
+            ff_switch_lead_s=ff_switch_lead_s,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -512,6 +518,7 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.stop_end_tau_s),
                 "" if s.ff_side_accel is None else str(s.ff_side_accel),
                 "" if s.ff_side_brake is None else str(s.ff_side_brake),
+                _fmt(s.ff_switch_lead_s),
             ])
 
 

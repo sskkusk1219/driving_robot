@@ -118,11 +118,15 @@ def window_slope_vec(
     center_s: float,
     width_s: float,
     step_s: float = NEED_STEP_S,
+    shift_s: np.ndarray | None = None,
 ) -> np.ndarray:
-    """`pedal_select.window_slope_kmhs` のベクトル版（同じ窓・同じ最小二乗の傾き）。"""
+    """`pedal_select.window_slope_kmhs` のベクトル版（同じ窓・同じ最小二乗の傾き）。
+    shift_s（行ごと。段5-5c）は窓の中心を行ごとにその秒数ずらす。None ＝ ずらさない。"""
     n = max(1, round(width_s / step_s))
     ks = np.arange(n + 1) * step_s
     start = np.asarray(t_s, dtype=float) + center_s - width_s / 2.0
+    if shift_s is not None:
+        start = start + np.asarray(shift_s, dtype=float)
     vs = _eval_ref(ref_at, start[:, None] + ks[None, :])
     kc = ks - ks.mean()
     return ((vs - vs.mean(axis=1, keepdims=True)) @ kc) / float(np.dot(kc, kc))
@@ -269,6 +273,9 @@ class ForwardPlan:
     # 表の引き方の規則（build_plan の low_speed_side_rule）。"legacy" のときは side_for が None を
     # 返し、呼び出し側は今までどおり low_speed_sides で決める（計算が変わらないことを保証するため）
     side_rule: str = "legacy"
+    # 2026-10-22 段5-5c: 切り替えの先読み。行ごとに「要る加速度を見る時刻」を追加で早めた秒数
+    # （switch_lead=False なら None）
+    switch_lead_s: np.ndarray | None = None
 
     def side_for(self, i: int, is_accel: bool) -> int | None:
         """行 i のペダル（アクセル側かブレーキ側か）で計画が引いた表 SIDE_*。"pedal" の規則の
@@ -354,8 +361,17 @@ def build_plan(
     stop_lead: bool = False,
     low_speed_side_rule: str = "legacy",
     release_table_min_kmh: float = 0.0,
+    switch_lead: bool = False,
+    _lead_extra: np.ndarray | None = None,
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
+
+    2026-10-22 段5-5c: `switch_lead`。False は今までと完全に同じ。True は 2 回解く。1 回目は先置き・
+    すき間の確保の前の計画（要る加速度から素直に解いた effort。先置き・すき間の確保は切り替えの
+    時刻を動かすので、拾うのは動かす前の「要る加速度が決めた切り替え」）。そこから (a) アクセル ⇔
+    ブレーキの切り替え、(b) 深いブレーキ（効き始め meta brake_onset_u_pct より深い）を惰行へ戻す所、
+    を拾い、出来事の前の行で要る加速度を見る時刻を lead（今のペダルが min へ戻る時間 ＋ 次のペダルの
+    遅れ）だけ早める（`switch_lead_extra`）。2 回目はその要る加速度で、通常どおり最後まで解く。
 
     2026-10-22 段5-3: `release_table_min_kmh`。基準がこの車速未満のブレーキの行は、戻しの表（本体の
     戻し）で解き直さない（本体のまま）。0.0 は今までと完全に同じ。停止側の戻しの層には効かない。
@@ -388,6 +404,30 @@ def build_plan(
     lb = _lag(brake_lag_s, table, "brake_lag_s", DEFAULT_BRAKE_LAG_S)
     n = int(np.floor(duration_s / period_s + 1e-9)) + 1
     t = np.arange(n) * period_s
+    if switch_lead and _lead_extra is None:
+        common = {
+            "accel_deadband_pct": accel_deadband_pct, "brake_deadband_pct": brake_deadband_pct,
+            "stop_brake_opening_pct": stop_brake_opening_pct, "stop_horizon_s": stop_horizon_s,
+            "period_s": period_s, "accel_lag_s": accel_lag_s, "brake_lag_s": brake_lag_s,
+            "need_window_s": need_window_s, "coast_band_kmhs": coast_band_kmhs,
+            "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
+            "low_speed_side_rule": low_speed_side_rule,
+            "release_table_min_kmh": release_table_min_kmh,
+        }
+        first = build_plan(
+            ref_at, duration_s, table, **common,
+            preposition_enabled=False, return_gap_enabled=False,
+        )
+        extra = switch_lead_extra(
+            first, table, la=la, lb=lb, accel_min_pct=accel_deadband_pct,
+            brake_min_pct=brake_deadband_pct, need_window_s=need_window_s,
+        )
+        return build_plan(
+            ref_at, duration_s, table, **common,
+            preposition_enabled=preposition_enabled, preposition_margin_pct=preposition_margin_pct,
+            preposition_lead_s=preposition_lead_s, return_gap_enabled=return_gap_enabled,
+            _lead_extra=extra,
+        )
 
     # 1. 停車保持
     ref_now = _eval_ref(ref_at, t)
@@ -411,8 +451,8 @@ def build_plan(
     # 要る加速度は t + L を中心にした窓の傾き
     v = ref_now
     coast = np.asarray(table.coast_accel(v), dtype=float)
-    need_a = window_slope_vec(ref_at, t, la, need_window_s)
-    need_b = window_slope_vec(ref_at, t, lb, need_window_s)
+    need_a = window_slope_vec(ref_at, t, la, need_window_s, shift_s=_lead_extra)
+    need_b = window_slope_vec(ref_at, t, lb, need_window_s, shift_s=_lead_extra)
     u_a, kind_a = table.invert(v, need_a)
     u_b, kind_b = table.invert(v, need_b)
 
@@ -523,7 +563,81 @@ def build_plan(
         preposition=stats, return_gap=gap_stats, stops_ahead=stops_ahead,
         stop_lead=lead_mask, side_accel=side_accel.astype(int), side_brake=side_brake.astype(int),
         side_rule="pedal" if pedal_rule else "legacy",
+        switch_lead_s=_lead_extra,
     )
+
+
+def switch_lead_events(
+    plan: ForwardPlan,
+    table: ForwardTable,
+    *,
+    la: float,
+    lb: float,
+    accel_min_pct: float,
+    brake_min_pct: float,
+) -> list[tuple[int, float, str]]:
+    """切り替えの先読み（段5-5c）の出来事 [(行 k, lead [s], 種類 "switch"/"release")]。
+
+    switch: 停車保持・先置きを除いたアクセル ⇔ ブレーキの切り替え。k ＝ 切り替え先のペダルが最初に
+    出た行。lead ＝ 今のペダルが min へ戻る時間（meta の *_return_delay_s ＋ 戻す直前の深さ ÷
+    *_return_rate_pct_s）＋ 切り替え先のペダルの遅れ。
+    release: ブレーキが続いたあと惰行（停車保持でない 0）へ戻る行 k で、戻す直前の深さ
+    （min からの量）が meta brake_onset_u_pct（大きさ）より深いもの。
+    lead ＝ ブレーキの戻る時間（次のペダルは無いので
+    遅れは 0）。meta brake_onset_u_pct が無ければ release は拾わない。
+    """
+    ret = return_time_of(table, accel_min_pct, brake_min_pct)
+    onset = table.meta.get("brake_onset_u_pct")
+    onset_ok = onset is not None and np.isfinite(onset)
+    eff = plan.effort_pct
+    stop = (plan.flag == FLAG_STOP) | (plan.flag == FLAG_PREPOS)
+    out: list[tuple[int, float, str]] = []
+
+    def back_s(i: int) -> float:  # 行 i のペダルが min へ戻る時間（周期の余裕は入れない）
+        if eff[i] > 0.0:
+            depth = max(float(eff[i]) - accel_min_pct, 0.0)
+            return ret.accel_delay_s + depth / ret.accel_rate_pct_s
+        depth = max(-float(eff[i]) - brake_min_pct, 0.0)
+        return ret.brake_delay_s + depth / ret.brake_rate_pct_s
+
+    last_i: int | None = None  # 直前のペダルの最後の行
+    for k in range(len(eff)):
+        if stop[k]:
+            last_i = None  # 停車保持への出入りをまたぐ切り替えは対象外
+            continue
+        if eff[k] == 0.0:
+            continue
+        if last_i is not None and (eff[k] > 0.0) != (eff[last_i] > 0.0):
+            out.append((k, back_s(last_i) + (la if eff[k] > 0.0 else lb), "switch"))
+        last_i = k
+    for k in range(1, len(eff)):
+        if stop[k] or eff[k] != 0.0 or stop[k - 1] or eff[k - 1] >= 0.0 or not onset_ok:
+            continue
+        if -float(eff[k - 1]) - brake_min_pct > abs(float(onset)):
+            out.append((k, back_s(k - 1), "release"))
+    return out
+
+
+def switch_lead_extra(
+    plan: ForwardPlan,
+    table: ForwardTable,
+    *,
+    la: float,
+    lb: float,
+    accel_min_pct: float,
+    brake_min_pct: float,
+    need_window_s: float,
+) -> np.ndarray:
+    """行ごとの追加の先読み extra[i]。出来事 k ごとに行 [k − ceil(lead/周期) − round(窓/2/周期), k)
+    を lead にする（重なる所は大きい方）。それ以外は 0。"""
+    p = plan.period_s
+    extra = np.zeros(len(plan.t_s))
+    for k, lead, _kind in switch_lead_events(
+        plan, table, la=la, lb=lb, accel_min_pct=accel_min_pct, brake_min_pct=brake_min_pct
+    ):
+        lo = max(k - math.ceil(lead / p - 1e-9) - round(need_window_s / 2.0 / p), 0)
+        extra[lo:k] = np.maximum(extra[lo:k], lead)
+    return extra
 
 
 def _solve_sides(

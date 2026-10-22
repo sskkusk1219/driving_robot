@@ -156,6 +156,8 @@ class RunInfo:
     stop_lead_summary: str | None = None
     # 2026-10-22 段5-2: forward_map.low_speed_side_rule（低速の表の引き方）。None は不明
     low_speed_side_rule: str | None = None
+    # 2026-10-22 段5-5c: forward_map.switch_lead_enabled（切り替えの先読み）。None は不明
+    switch_lead_enabled: bool | None = None
     stop_end_summary: str | None = None
     # 2026-10-19 段3: 基準のぼかし σ [s]（feedforward.ref_smooth_sigma_s。0 ＝ なし）。None は不明
     # （CSV からの作り直し）。研究系の設定はログに残らないので、ここで確かめる
@@ -933,6 +935,9 @@ def write_mode_report(
                  "なし" if info.stop_end_summary is None else info.stop_end_summary),
                 ("低速の表の引き方（段5-2 forward_map.low_speed_side_rule。legacy ＝ 今まで）",
                  "不明" if info.low_speed_side_rule is None else info.low_speed_side_rule),
+                ("切り替えの先読み（段5-5c forward_map.switch_lead_enabled）",
+                 "不明" if info.switch_lead_enabled is None
+                 else ("あり" if info.switch_lead_enabled else "なし")),
                 ("基準のぼかし（段3。目標側だけ。KPI・偏差は元の基準）",
                  "不明（CSV からの作り直し）" if info.ref_smooth_sigma_s is None
                  else ref_smooth_text(info.ref_smooth_sigma_s)),

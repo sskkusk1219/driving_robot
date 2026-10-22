@@ -1201,3 +1201,118 @@ def test_release_table_min_kmh_skips_release_below_the_speed() -> None:
     v = np.array([_decel_then_ease(float(x)) for x in mid.t_s])
     assert not np.any(mid.side_brake[v < 10.0] == SIDE_RELEASE)
     assert np.any(mid.side_brake[v >= 10.0] == SIDE_RELEASE)
+
+
+# ───────── 2026-10-22 段5-5c: 切り替えの先読み（switch_lead） ─────────
+
+
+def _lead_table() -> ForwardTable:
+    tb = linear_table()
+    tb.meta.update(
+        accel_return_delay_s=0.2, accel_return_rate_pct_s=20.0,
+        brake_return_delay_s=0.3, brake_return_rate_pct_s=20.0,
+        brake_onset_u_pct=2.0,
+    )
+    return tb
+
+
+def _vee(t: float) -> float:
+    """ブレーキ（−4 km/h/s）→ 4 s で底 → アクセル（+4 km/h/s）。"""
+    return 50.0 + 4.0 * abs(t - 4.0)
+
+
+def _lead_kw() -> dict:
+    return dict(accel_lag_s=0.2, brake_lag_s=0.3, need_window_s=0.5)
+
+
+def _first_accel_row(plan: ForwardPlan) -> int:
+    return int(np.flatnonzero(plan.effort_pct > 0.0)[0])
+
+
+def test_switch_lead_default_false_is_identical() -> None:
+    tb = _lead_table()
+    base = plan_for(_vee, 8.0, tb, **_lead_kw())
+    same = plan_for(_vee, 8.0, tb, switch_lead=False, **_lead_kw())
+    assert base.switch_lead_s is None and same.switch_lead_s is None
+    assert np.array_equal(base.effort_pct, same.effort_pct)
+    assert np.array_equal(base.flag, same.flag)
+    assert np.array_equal(base.need_accel_kmhs, same.need_accel_kmhs)
+
+
+def test_switch_lead_brake_to_accel_switch_comes_earlier_by_about_lead() -> None:
+    tb = _lead_table()
+    base = plan_for(_vee, 8.0, tb, **_lead_kw())
+    lead = plan_for(_vee, 8.0, tb, switch_lead=True, **_lead_kw())
+    assert base.pedal_switches() == lead.pedal_switches() == 1
+    dt = (_first_accel_row(base) - _first_accel_row(lead)) * base.period_s
+    # lead = ブレーキの戻る時間 0.3 + 深さ/20 + アクセルの遅れ 0.2（0.5〜1.0 s 程度）
+    assert lead.switch_lead_s is not None and lead.switch_lead_s.max() > 0.0
+    expected = float(lead.switch_lead_s.max())
+    assert 0.5 <= expected <= 1.2
+    assert dt == pytest.approx(expected, abs=0.25)
+    # 先読みの行は切り替えの前だけ
+    assert lead.switch_lead_s[: idx(lead, 1.0)].max() == 0.0
+    assert lead.switch_lead_s[idx(lead, 6.5):].max() == 0.0
+
+
+def test_switch_lead_events_pick_up_switch_and_deep_release() -> None:
+    from tests.research.fwd_plan import switch_lead_events  # noqa: PLC0415
+
+    tb = _lead_table()
+    plan = plan_for(_vee, 8.0, tb, **_lead_kw())
+    ev = switch_lead_events(plan, tb, la=0.2, lb=0.3, accel_min_pct=AD, brake_min_pct=BD)
+    kinds = [e[2] for e in ev]
+    assert kinds.count("switch") == 1
+    k, lead, _ = next(e for e in ev if e[2] == "switch")
+    assert k == _first_accel_row(plan)
+    depth = -float(plan.effort_pct[k - 1]) - BD if plan.effort_pct[k - 1] < 0 else None
+    if depth is not None:
+        assert lead == pytest.approx(0.3 + depth / 20.0 + 0.2)
+
+
+def test_switch_lead_deep_brake_release_comes_earlier() -> None:
+    tb = _lead_table()
+
+    tb.meta["brake_onset_u_pct"] = 0.5  # 戻す直前の行の深さ（min からの量 0.71）より浅い効き始め
+
+    def decel_then_coast(t: float) -> float:
+        return 100.0 - 6.0 * t if t < 3.0 else 82.0 - 2.8 * (t - 3.0)
+
+    base = plan_for(decel_then_coast, 8.0, tb, **_lead_kw())
+    lead = plan_for(decel_then_coast, 8.0, tb, switch_lead=True, **_lead_kw())
+    from tests.research.fwd_plan import switch_lead_events  # noqa: PLC0415
+
+    ev = switch_lead_events(base, tb, la=0.2, lb=0.3, accel_min_pct=AD, brake_min_pct=BD)
+    assert [e[2] for e in ev] == ["release"]
+
+    def last_brake(p: ForwardPlan) -> int:
+        return int(np.flatnonzero(p.effort_pct < 0.0)[-1])
+
+    assert last_brake(lead) < last_brake(base)  # ブレーキの戻しが早まる
+    assert lead.switch_lead_s is not None and lead.switch_lead_s.max() == pytest.approx(
+        ev[0][1]
+    )
+
+
+def test_switch_lead_ignores_stop_hold_entry_and_exit() -> None:
+    tb = _lead_table()
+
+    def stop_and_go(t: float) -> float:  # 減速 → 停車 → 発進
+        if t < 3.0:
+            return max(20.0 - 7.0 * t, 0.0)
+        return 0.0 if t < 6.0 else min(5.0 * (t - 6.0), 20.0)
+
+    base = plan_for(stop_and_go, 12.0, tb, **_lead_kw())
+    lead = plan_for(stop_and_go, 12.0, tb, switch_lead=True, **_lead_kw())
+    stop = base.flag == FLAG_STOP
+    assert stop.any()
+    assert np.array_equal(base.flag == FLAG_STOP, lead.flag == FLAG_STOP)
+    assert np.array_equal(base.effort_pct[stop], lead.effort_pct[stop])
+    assert lead.switch_lead_s is not None
+    assert lead.switch_lead_s[stop].max() == 0.0
+    # 停車保持をまたぐブレーキ → アクセルは出来事に数えない
+    from tests.research.fwd_plan import switch_lead_events  # noqa: PLC0415
+
+    ev = switch_lead_events(base, tb, la=0.2, lb=0.3, accel_min_pct=AD, brake_min_pct=BD)
+    first, last = int(np.flatnonzero(stop)[0]), int(np.flatnonzero(stop)[-1])
+    assert all(k < first or k > last + 40 for k, _, _ in ev)  # 停車保持の中・抜けた直後は無し

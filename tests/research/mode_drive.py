@@ -311,6 +311,7 @@ def _prepare_forward_map_plan(
         stop_lead=isinstance(ff, StopEndFeedforward) and fm.stop_lead_enabled,
         low_speed_side_rule=fm.low_speed_side_rule,  # 段5-2
         release_table_min_kmh=fm.release_table_min_kmh,  # 段5-3
+        switch_lead=fm.switch_lead_enabled,  # 段5-5c
     )
     meta = ff.table.meta
     # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）
@@ -323,6 +324,7 @@ def _prepare_forward_map_plan(
         f"窓 {fm.need_window_s:g}s")
     say(f"  低速の表の引き方（段5-2）: 設定 {fm.low_speed_side_rule}・計画に使った規則 "
         f"{plan.side_rule}（pedal でも表が発進側・停止側の両方を持たなければ legacy）")
+    say(f"  切り替えの先読み（段5-5c）: {'あり' if fm.switch_lead_enabled else 'なし'}")
     say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
         "（0 ＝ 全部の車速で使う）")
     if isinstance(ff, DeviationForwardFeedforward):
@@ -1387,6 +1389,7 @@ class _ModeRun:
                     stop_end_tau_s=self._stop_end_tau_s,
                     ff_side_accel=self._ff_side_now(t, True),
                     ff_side_brake=self._ff_side_now(t, False),
+                    ff_switch_lead_s=self._ff_switch_lead_now(t),
                 )
             )
         if segment != self._segment:
@@ -1412,6 +1415,13 @@ class _ModeRun:
         plan = ff._plan if isinstance(ff, ForwardMapFeedforward) else None  # noqa: SLF001
         arr = None if plan is None else (plan.side_accel if is_accel else plan.side_brake)
         return None if arr is None else int(arr[plan.index_at(t)])
+
+    def _ff_switch_lead_now(self, t: float) -> float | None:
+        """CSV 用（段5-5c）: 今の計画の行で要る加速度を見る時刻を早めた秒数（なしは None）。"""
+        ff = self.ff
+        plan = ff._plan if isinstance(ff, ForwardMapFeedforward) else None  # noqa: SLF001
+        arr = None if plan is None else plan.switch_lead_s
+        return None if arr is None else float(arr[plan.index_at(t)])
 
     def _row_sides(
         self, plan: Any, i: int, ref: float, is_accel: bool

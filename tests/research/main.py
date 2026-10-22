@@ -661,6 +661,7 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
         ),
         ref_smooth_sigma_s=ctx.config.feedforward.ref_smooth_sigma_s,
         low_speed_side_rule=ctx.config.forward_map.low_speed_side_rule,
+        switch_lead_enabled=ctx.config.forward_map.switch_lead_enabled,
         fel_text=_fel_text_of(ctx.config, setup),
         notes=notes,
     )
