@@ -141,7 +141,8 @@ class CvConfig:
     # 手順2 は learning.accel_push_input_enabled（既定 false）をここへ渡す
     accel_push_input: bool = False
     # 2026-10-23 段5-8: 停車まぎわ除外（drop_stop_approach=True のとき）の外し方。"depth" ＝ 今の
-    # stop_approach_mask（5 km/h 未満かつ u <= −8%）、"window" ＝ 加速度を作る窓が停車の瞬間に
+    # stop_approach_mask（5 km/h 未満かつ u <= −8%）、
+    # "none" ＝ 外さない、"window" ＝ 加速度を作る窓が停車の瞬間に
     # かかる行（FwdRows.stop_window_row）だけ。key() には "depth"（既定）のとき含めない
     stop_approach_exclusion: str = "depth"
 
@@ -340,7 +341,8 @@ def fit_one_info(
             accel_release_input=cfg.accel_release_input,
             accel_push_input=cfg.accel_push_input,
         )
-        if cfg.drop_stop_approach:  # 重み 0 ではなく行そのものを除く（検証の分け方も変わる）
+        if cfg.drop_stop_approach and cfg.stop_approach_exclusion != "none":
+            # 重み 0 ではなく行そのものを除く（検証の分け方も変わる）。"none" は何も外さない
             if cfg.stop_approach_exclusion == "window":
                 keep = ~side_stop_window(
                     train_rows, side, coast_in_brake=cfg.coast_from != "accel",
@@ -371,7 +373,10 @@ def fit_one_info(
             raise ValueError("rollout_s > 0 には train_traces と st が要る")
         if cfg.drop_stop_approach and cfg.stop_approach_exclusion == "window":
             raise ValueError("stop_approach_exclusion='window' は rollout_s > 0 と併用できない")
-        drop = stop_approach_mask if cfg.drop_stop_approach else None
+        drop = (
+            stop_approach_mask
+            if cfg.drop_stop_approach and cfg.stop_approach_exclusion != "none" else None
+        )
         groups: list[fwd_torch.WindowGroup] = []
         used = dropped = 0.0
         for traces in train_traces:

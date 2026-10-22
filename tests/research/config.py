@@ -491,7 +491,8 @@ class LearningSection:
     # 仮値（0.2G は弱い段 0.175G と強い段 0.25G の間）。決める時期: 同上
     stop_release_max_g: float = 0.2
     # 2026-10-23 段5-8: 停車まぎわ除外（C8 系の学習から外す行）の外し方。"depth" ＝ 今まで
-    # （fwd_cv.STOP_APPROACH_*: 5 km/h 未満かつ u <= −8% の行）、"window" ＝ 加速度を作る窓
+    # （fwd_cv.STOP_APPROACH_*: 5 km/h 未満かつ u <= −8% の行）、
+    # "none" ＝ 外さない、"window" ＝ 加速度を作る窓
     # （幅 accel_window_s）が停車の瞬間（実車速が停車速度未満になる時刻）にかかる行だけ。
     # 根拠: 除外の理由は窓が停車にかかること（段2i）で、深さではない。090007 では depth が 2.9 秒を
     # 外し、うち 2.0 秒が戻しの行だった。効く先: fwd_cv／fwd_final／pattern_drive（meta
@@ -1472,8 +1473,8 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(lr8.stop_release_escape_s > 0.0, "learning.stop_release_escape_s は正値")
     need(lr8.stop_release_max_g > 0.0, "learning.stop_release_max_g は正値")
     need(
-        lr8.stop_approach_exclusion in ("depth", "window"),
-        "learning.stop_approach_exclusion は depth か window",
+        lr8.stop_approach_exclusion in ("depth", "window", "none"),
+        "learning.stop_approach_exclusion は depth か window か none",
     )
     need(cfg.learning.ramp_min_at_g_s >= 0.0, "learning.ramp_min_at_g_s は 0 以上")
     need(

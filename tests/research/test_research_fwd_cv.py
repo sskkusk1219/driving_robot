@@ -321,3 +321,4 @@ def test_fit_one_info_drops_rows_by_chosen_exclusion(monkeypatch):
     all_brake = int((base.u_pct <= 0).sum())  # 6
     assert brake_rows("depth") == all_brake - 2  # 0, 1 番目（車速 3・u −10）
     assert brake_rows("window") == all_brake - 2  # 3, 4 番目（窓が停車にかかる行）
+    assert brake_rows("none") == all_brake  # 何も外さない

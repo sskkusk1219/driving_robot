@@ -667,7 +667,7 @@ learning:
   stop_release_escape_s: 0.5
   stop_release_max_g: 0.2
   # 2026-10-23 段5-8: 停車まぎわ除外の外し方。depth ＝ 5 km/h 未満かつ u <= −8% の行（今まで）、
-  # window ＝ 加速度の窓が停車の瞬間にかかる行だけ。効く先: 手順2 の C8 系の表（meta
+  # none ＝ 外さない、window ＝ 加速度の窓が停車の瞬間にかかる行だけ。効く先: 手順2 の C8 系の表（meta
   # stop_approach_exclusion）。決める時期: 机上（stop_exclusion.py）の後
   stop_approach_exclusion: depth
 

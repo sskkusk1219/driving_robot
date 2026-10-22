@@ -120,6 +120,8 @@ def final_config(
 
 def _dropped_rows(cfg: CvConfig, r: FwdRows) -> np.ndarray:
     """停車まぎわ除外で学習から外す行（cfg.stop_approach_exclusion に従う。2026-10-23 段5-8）。"""
+    if cfg.stop_approach_exclusion == "none":
+        return np.zeros(len(r), dtype=bool)
     if cfg.stop_approach_exclusion == "window":
         return r.stop_window_row
     return stop_approach_mask(r.speed_kmh, r.u_pct)
@@ -284,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--drop-stop-approach", action="store_true", help="停車まぎわの強いブレーキの行を除く"
     )
     p.add_argument(
-        "--stop-approach-exclusion", choices=("depth", "window"), default="depth",
+        "--stop-approach-exclusion", choices=("depth", "window", "none"), default="depth",
         help="停車まぎわ除外の外し方（段5-8。depth＝今の深さ、window＝窓が停車にかかる行）",
     )
     p.add_argument(

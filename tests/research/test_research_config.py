@@ -1292,6 +1292,10 @@ def test_stop_release_and_stop_exclusion_settings_default_and_validation() -> No
     assert lr.stop_release_max_g == pytest.approx(0.2)
     assert lr.stop_approach_exclusion == "depth"
     assert cfgmod.validate_config(cfg) == []
+    for ok in ("window", "none"):
+        lr.stop_approach_exclusion = ok
+        assert cfgmod.validate_config(cfg) == []
+    lr.stop_approach_exclusion = "depth"
     # dataclass の既定も同じ
     fresh = cfgmod.LearningSection()
     assert fresh.stop_release_enabled is False and fresh.stop_approach_exclusion == "depth"
