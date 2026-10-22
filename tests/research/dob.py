@@ -141,7 +141,7 @@ class PedalDisturbanceObserver:
 
         u_now ＝ 今の周期で出した開度 − min（アクセル正・ブレーキ負・min 以下は 0）。
         launch・stop ＝ 今の計画の行が発進側・停止側の表を引くか（`fwd_plan.low_speed_sides`、
-        規則が pedal の計画は `ForwardPlan.side_for`。段5-2）。
+        規則が pedal・dir の計画は `ForwardPlan.side_for`。段5-2）。
         """
         self._hist.append((t, u_now, at_limit_now, governed))
         prev_t, prev_v = self._prev_t, self._prev_speed

@@ -792,7 +792,7 @@ class ForwardMapFeedforward:
 
         stop_ref_at（2026-10-19 段3）: ref_at をぼかした基準にするとき、停車の判定に使う
         元の基準。stop_lead（2026-10-20 段4-2 停A）: 停車保持へ入るのをブレーキの遅れ分早める。
-        low_speed_side_rule（2026-10-22 段5-2）: 低速の表の引き方（"legacy" か "pedal"）。
+        low_speed_side_rule（2026-10-22 段5-2）: 低速の表の引き方（"legacy"・"pedal"・"dir"）。
         release_table_min_kmh（段5-3）: 基準がこの車速未満のブレーキの行は戻しの表で解き直さない
         （0.0 ＝ 今まで）。switch_lead（段5-5c）: 切り替えの先読み（False ＝ 今まで）。"""
         from tests.research.fwd_plan import build_plan  # noqa: PLC0415

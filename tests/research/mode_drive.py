@@ -323,7 +323,7 @@ def _prepare_forward_map_plan(
     say(f"  遅れ アクセル {lag_a}s / ブレーキ {lag_b}s・惰行の帯 ±{fm.coast_band_kmhs:g} km/h/s・"
         f"窓 {fm.need_window_s:g}s")
     say(f"  低速の表の引き方（段5-2）: 設定 {fm.low_speed_side_rule}・計画に使った規則 "
-        f"{plan.side_rule}（pedal でも表が発進側・停止側の両方を持たなければ legacy）")
+        f"{plan.side_rule}（pedal・dir でも表が発進側・停止側の両方を持たなければ legacy）")
     say(f"  切り替えの先読み（段5-5c）: {'あり' if fm.switch_lead_enabled else 'なし'}")
     say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
         "（0 ＝ 全部の車速で使う）")
@@ -1426,8 +1426,9 @@ class _ModeRun:
     def _row_sides(
         self, plan: Any, i: int, ref: float, is_accel: bool
     ) -> tuple[bool, bool]:
-        """今の計画の行 i で、そのペダルが引く表の (発進側か, 停止側か)。段5-2: 規則が "pedal" の
-        計画は、計画が行ごとに決めた表（plan.side_accel / side_brake）。"legacy" は今までどおり
+        """今の計画の行 i で、そのペダルが引く表の (発進側か, 停止側か)。段5-2: 規則が
+        "pedal"・"dir" の計画は、計画が行ごとに決めた表（plan.side_accel / side_brake）。
+        "legacy" は今までどおり
         `low_speed_sides`（need ＞ 0 → 発進側、停車へ向かう減速 → 停止側）。"""
         # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
         from tests.research.fwd_plan import SIDE_LAUNCH, SIDE_STOP, low_speed_sides  # noqa: PLC0415

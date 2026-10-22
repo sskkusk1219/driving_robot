@@ -92,7 +92,7 @@ SIDE_MAIN = 0
 SIDE_LAUNCH = 1
 SIDE_STOP = 2
 SIDE_RELEASE = 3
-LOW_SPEED_SIDE_RULES = ("legacy", "pedal")
+LOW_SPEED_SIDE_RULES = ("legacy", "pedal", "dir")
 
 FLAG_LABELS = {
     FLAG_MEASURED: "実測",
@@ -278,10 +278,11 @@ class ForwardPlan:
     switch_lead_s: np.ndarray | None = None
 
     def side_for(self, i: int, is_accel: bool) -> int | None:
-        """行 i のペダル（アクセル側かブレーキ側か）で計画が引いた表 SIDE_*。"pedal" の規則の
-        計画だけ値を返す（legacy・配列なしは None）。P・惰行の補助・DOB の予測が渡す。"""
+        """行 i のペダル（アクセル側かブレーキ側か）で計画が引いた表 SIDE_*。
+        "pedal"・"dir"（段5-6）の規則の計画だけ値を返す
+        （legacy・配列なしは None）。P・惰行の補助・DOB の予測が渡す。"""
         arr = self.side_accel if is_accel else self.side_brake
-        if self.side_rule != "pedal" or arr is None:
+        if self.side_rule not in ("pedal", "dir") or arr is None:
             return None
         return int(arr[i])
 
@@ -373,6 +374,21 @@ def build_plan(
     を拾い、出来事の前の行で要る加速度を見る時刻を lead（今のペダルが min へ戻る時間 ＋ 次のペダルの
     遅れ）だけ早める（`switch_lead_extra`）。2 回目はその要る加速度で、通常どおり最後まで解く。
 
+    2026-10-23 段5-6: `low_speed_side_rule="dir"`（表が launch_accel と
+    stop_accel の両方を持つときだけ。片方でも無ければ legacy）。
+    "legacy"・"pedal" の計算は変えない。低速（基準 < meta
+    stop_max_speed_kmh）の引き方を、7.5 km/h 以上と同じ「踏み込み・保持／戻し」の判定にそろえる:
+      判定2: アクセル・惰行・ブレーキの判定に使う「ペダルを離した加速度」は、低速は停止側の表
+        （`coast_accel(v, stop=True)`）、それ以外は本体。停車 0.5 秒前だけ停止側、の条件は使わない。
+      判定3: ブレーキ。低速で発進の途中は発進側。低速で発進の途中でなければ、まず停止側で解き、直近
+        RELEASE_WINDOW_S の一番深いブレーキより浅い行は本体の戻しの効き（stop_side=None）で解き直す
+        （SIDE_RELEASE。段5-2 の「動き出す開度より深ければ停止側」は使わない）。
+        7.5 km/h 以上は今までと同じ。
+      判定4: アクセル。低速は発進側、7.5 km/h 以上は本体（pedal と同じ）。
+      (ロ) 発進の途中は踏み増さない: 発進の途中の連続区間ごとに、各行のブレーキを「その行から区間の
+        終わりまでの最深」にする（ブレーキは戻す向きにしか動かない）。惰行の行も後ろにブレーキがあれば
+        そのブレーキになる。値の出どころの行の flag・表（side_brake）を引き継ぐ。
+
     2026-10-22 段5-3: `release_table_min_kmh`。基準がこの車速未満のブレーキの行は、戻しの表（本体の
     戻し）で解き直さない（本体のまま）。0.0 は今までと完全に同じ。停止側の戻しの層には効かない。
 
@@ -462,7 +478,27 @@ def build_plan(
         and table.launch_accel is not None
         and table.stop_accel is not None
     )
-    if not pedal_rule:
+    dir_rule = (
+        low_speed_side_rule == "dir"
+        and table.launch_accel is not None
+        and table.stop_accel is not None
+    )
+    if dir_rule:
+        top = float(table.meta.get("stop_max_speed_kmh", 0.0))
+        low = v < top
+        # 判定2: ペダルを離した加速度。低速は停止側の表（クリープを知っている）、それ以外は本体
+        coast_low = np.where(low, np.asarray(table.coast_accel(v, stop=True), dtype=float), coast)
+        launch_a, stop_a = low, np.zeros(n, dtype=bool)  # 判定4: 低速のアクセルは発進側
+        _, u_a, kind_a = _solve_sides(table, v, need_a, launch_a, stop_a, coast, u_a, kind_a)
+        coast_a = coast_b = coast_low
+        want_accel = need_a - coast_a >= coast_band_kmhs - 1e-12
+        accel_now = want_accel & (u_a > 0.0)
+        midway = _launch_midway(stop, accel_now)
+        # 判定3: 低速で発進の途中は発進側、そうでなければ停止側（戻しは後で解き直す）
+        launch_b = low & midway
+        stop_b = low & ~midway
+        _, u_b, kind_b = _solve_sides(table, v, need_b, launch_b, stop_b, coast, u_b, kind_b)
+    elif not pedal_rule:
         coast_a = coast_b = coast
         launch_a, stop_a = low_speed_sides(table, need_a, v, stops_ahead)
         launch_b, stop_b = low_speed_sides(table, need_b, v, stops_ahead)
@@ -515,7 +551,18 @@ def build_plan(
     body_release = table.release_grid is not None and table.release_accel is not None
     # 2026-10-20 段4-3: 停止側の表で解いた時刻も、停止側の戻しの層があれば戻し量を見て解き直す
     stop_release = table.stop_release_accel is not None and table.stop_release_grid is not None
-    if body_release or stop_release:
+    if dir_rule:
+        # 段5-6: 低速で発進の途中でない行（停止側で解いた行）も、7.5 km/h 以上と同じく本体の戻しの
+        # （stop_side=None）で解き直す。停止側の戻しの層は使わない
+        if body_release:
+            body_redo = is_brake & ~stop & ~launch_b
+            if release_table_min_kmh > 0.0:  # 段5-3: 低速は dir が決める
+                body_redo &= (v >= release_table_min_kmh) | low
+            released = _resolve_releases(
+                effort, body_redo, u_b, v, need_b, table, brake_deadband_pct, accel_deadband_pct,
+                period_s, stop_side=None,
+            )
+    elif body_release or stop_release:
         redo = np.zeros(n, dtype=bool)
         if body_release:
             # 発進側の表で解いた時刻は戻しではない
@@ -536,6 +583,15 @@ def build_plan(
         _resolve_accel_releases(
             effort, redo_a, u_a, v, need_a, table, brake_deadband_pct, accel_deadband_pct, period_s
         )
+    side_brake_dir = None
+    if dir_rule:
+        # 戻しで解き直した行（低速の停止側だった行を含む）は SIDE_RELEASE、それ以外は上の表のまま
+        side_brake_dir = np.where(
+            launch_b, SIDE_LAUNCH,
+            np.where(released, SIDE_RELEASE, np.where(stop_b, SIDE_STOP, SIDE_MAIN)),
+        )
+        # (ロ) 発進の途中は踏み増さない（区間ごとに後ろからの最深に置き換える）
+        _no_deeper_brake_in_midway(effort, flag, side_brake_dir, midway)
     effort = np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)
     stats = None
     ret = return_time_of(table, accel_deadband_pct, brake_deadband_pct)
@@ -558,11 +614,13 @@ def build_plan(
     side_accel = np.where(launch_a, SIDE_LAUNCH, np.where(stop_a, SIDE_STOP, SIDE_MAIN))
     side_brake = np.where(launch_b, SIDE_LAUNCH, np.where(stop_b, SIDE_STOP, SIDE_MAIN))
     side_brake = np.where(released & ~stop_b & ~launch_b, SIDE_RELEASE, side_brake)
+    if side_brake_dir is not None:
+        side_brake = side_brake_dir
     return ForwardPlan(
         t_s=t, effort_pct=effort, need_accel_kmhs=need, flag=flag, period_s=period_s,
         preposition=stats, return_gap=gap_stats, stops_ahead=stops_ahead,
         stop_lead=lead_mask, side_accel=side_accel.astype(int), side_brake=side_brake.astype(int),
-        side_rule="pedal" if pedal_rule else "legacy",
+        side_rule="dir" if dir_rule else ("pedal" if pedal_rule else "legacy"),
         switch_lead_s=_lead_extra,
     )
 
@@ -683,6 +741,29 @@ def _launch_midway(stop: np.ndarray, accel_now: np.ndarray) -> np.ndarray:
         j = n if k >= len(ends) else int(ends[k])
         out[i0:j] = True
     return out
+
+
+def _no_deeper_brake_in_midway(
+    effort: np.ndarray, flag: np.ndarray, side_brake: np.ndarray, midway: np.ndarray
+) -> None:
+    """(ロ)（段5-6）発進の途中の連続区間ごとに、ブレーキを「その行から区間の終わりまでの最深」にする
+    （effort・flag・side_brake をその場で書き換える）。区間の中でブレーキは戻す向きにしか動かない。
+    惰行（0）の行も、後ろにブレーキがあればそのブレーキになる。flag・side_brake は値の出どころの行
+    のものを引き継ぐ。アクセルの行（effort > 0）と停車保持の行は触らない。"""
+    n = len(effort)
+    i = n - 1
+    while i >= 0:
+        if not midway[i]:
+            i -= 1
+            continue
+        best_e, best_j = 0.0, -1  # 後ろ（区間の終わりまで）の最深のブレーキ（負）とその行
+        while i >= 0 and midway[i]:
+            if flag[i] != FLAG_STOP and effort[i] <= 0.0:
+                if effort[i] < best_e:
+                    best_e, best_j = float(effort[i]), i
+                elif best_j >= 0:  # 自分より後ろに深いブレーキがある → それに置き換える
+                    effort[i], flag[i], side_brake[i] = best_e, flag[best_j], side_brake[best_j]
+            i -= 1
 
 
 def low_speed_sides(

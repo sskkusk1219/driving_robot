@@ -701,6 +701,8 @@ class ForwardMapSection:
     # 引くか。"legacy" ＝ 今まで（発進側 ＝ 要る加速度 ＞ 0、停止側 ＝ 減速かつ停車の 0.5 秒前から。
     # 残りは本体・戻しの表）。"pedal" ＝ アクセルはいつでも発進側、ブレーキは発進の途中だけ発進側
     # （動き出す開度より深くなる行は停止側）でそれ以外は停止側。本体・戻しは低速で使わない。
+    # "dir"（段5-6）＝ 低速も 7.5 km/h 以上と同じ「踏み込み・保持／戻し」で引く（停止側で解き、
+    # 浅くなったら本体の戻しの効き。発進の途中は発進側で踏み増さない）。
     # 表が発進側・停止側の両方を持たないときは legacy と同じ。
     # 効く先: 7.5 km/h 未満の指令（P・惰行の補助・DOB の予測が引く表も同じ）。
     # 決める時期: 段5-2 の実機（C8 の WLTP・UDDS・US06）の後
@@ -1120,8 +1122,8 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     )
     need(fm.need_window_s > 0.0, f"forward_map.need_window_s は正値: {fm.need_window_s}")
     need(
-        fm.low_speed_side_rule in ("legacy", "pedal"),
-        f"forward_map.low_speed_side_rule は legacy か pedal: {fm.low_speed_side_rule!r}",
+        fm.low_speed_side_rule in ("legacy", "pedal", "dir"),
+        f"forward_map.low_speed_side_rule は legacy・pedal・dir: {fm.low_speed_side_rule!r}",
     )
     need(
         fm.release_table_min_kmh >= 0.0,

@@ -1316,3 +1316,92 @@ def test_switch_lead_ignores_stop_hold_entry_and_exit() -> None:
     ev = switch_lead_events(base, tb, la=0.2, lb=0.3, accel_min_pct=AD, brake_min_pct=BD)
     first, last = int(np.flatnonzero(stop)[0]), int(np.flatnonzero(stop)[-1])
     assert all(k < first or k > last + 40 for k, _, _ in ev)  # 停車保持の中・抜けた直後は無し
+
+
+# ───────── 2026-10-23 段5-6: low_speed_side_rule="dir" ─────────
+
+
+def test_dir_rule_without_launch_or_stop_table_is_legacy() -> None:
+    for tb in (_launch_variant(), _stop_variant()):
+        base = plan_for(_launch_then_constant, 8.0, tb)
+        same = plan_for(_launch_then_constant, 8.0, tb, low_speed_side_rule="dir")
+        assert np.array_equal(base.effort_pct, same.effort_pct)
+        assert same.side_rule == "legacy"
+
+
+def test_dir_rule_leaves_legacy_and_pedal_untouched_and_reports_side_for() -> None:
+    tb = _pedal_table()
+    legacy = plan_for(_decel_to_stop, 6.0, tb)
+    again = plan_for(_decel_to_stop, 6.0, tb, low_speed_side_rule="legacy")
+    assert np.array_equal(legacy.effort_pct, again.effort_pct)
+    plan = plan_for(_launch_then_constant, 8.0, tb, low_speed_side_rule="dir")
+    assert plan.side_rule == "dir"
+    i = idx(plan, 2.5)
+    assert plan.side_for(i, True) == SIDE_LAUNCH  # 低速のアクセルは発進側
+    assert plan.side_for(idx(plan, 6.0), False) == SIDE_STOP  # 発進の途中を抜けた後
+    assert legacy.side_for(i, True) is None
+
+
+def test_dir_rule_coast_decision_uses_stop_side_coast_accel() -> None:
+    tb = _pedal_table()
+    plan = plan_for(_launch_then_constant, 8.0, tb, low_speed_side_rule="dir")
+    legacy = plan_for(_launch_then_constant, 8.0, tb)
+    for t in (4.0, 6.0, 7.5):
+        i = idx(plan, t)
+        # 停止側の惰行は +0.38、要る加速度 0 → 0 − 0.38 ≤ −帯 でブレーキ
+        assert plan.effort_pct[i] < 0.0
+        # 本体の惰行（−2.08）を使う legacy はアクセル
+        assert legacy.effort_pct[i] > 0.0
+    # 7.5 km/h 以上の惰行判定は本体のまま
+    hi = lambda t: 30.0 + 0.0 * t  # noqa: E731
+    a = plan_for(hi, 4.0, tb, low_speed_side_rule="dir")
+    b = plan_for(hi, 4.0, tb)
+    assert np.array_equal(a.effort_pct, b.effort_pct)
+
+
+def test_dir_rule_low_decel_then_ease_uses_stop_then_release_when_shallower() -> None:
+    tb, _ = _release_low_table()
+    plan = plan_for(_decel_then_ease, 5.0, tb, low_speed_side_rule="dir")
+    legacy = plan_for(_decel_then_ease, 5.0, tb)
+    v = np.array([_decel_then_ease(float(x)) for x in plan.t_s])
+    brake = (plan.flag != FLAG_STOP) & (plan.effort_pct < 0.0)
+    low_rows = np.flatnonzero(brake & (v < 7.5) & (plan.t_s > 1.5))
+    assert len(low_rows) > 10
+    sides = set(plan.side_brake[low_rows].tolist())
+    assert sides <= {SIDE_STOP, SIDE_RELEASE} and SIDE_RELEASE in sides
+    # 7.5 km/h 以上は legacy と同じ
+    hi = np.flatnonzero((v >= 7.5) & (plan.flag != FLAG_STOP))
+    assert np.array_equal(plan.effort_pct[hi], legacy.effort_pct[hi])
+    # 戻した行は、その行を本体の戻しの効きで解いた値（戻し量 m からの浅さ）になる
+    u = np.where(plan.effort_pct < -BD, plan.effort_pct + BD, 0.0)
+    w = int(round(3.0 / plan.period_s))
+    for i in low_rows:
+        if plan.side_brake[i] == SIDE_RELEASE:
+            assert u[i] > float(u[max(i - w, 0) : i].min()) - 1e-9
+
+
+def test_no_deeper_brake_in_midway_helper() -> None:
+    from tests.research.fwd_plan import FLAG_COAST, FLAG_MEASURED, _no_deeper_brake_in_midway
+
+    eff = np.array([0.0, -5.0, -2.0, 0.0, -8.0, -3.0, 4.0, -9.0, -1.0])
+    flag = np.array([FLAG_STOP, 0, 0, FLAG_COAST, 0, 0, 0, 0, 0])
+    side = np.array([0, 1, 1, 0, 3, 1, 0, 0, 0])
+    mid = np.array([0, 1, 1, 1, 1, 1, 0, 1, 1], dtype=bool)
+    _no_deeper_brake_in_midway(eff, flag, side, mid)
+    assert eff.tolist() == [0.0, -8.0, -8.0, -8.0, -8.0, -3.0, 4.0, -9.0, -1.0]
+    assert flag[3] == flag[4] == FLAG_MEASURED and side[1] == side[2] == side[3] == 3
+    # 区間をまたいで伝わらない（4.0 の行は区間の外）
+    assert eff[7] == -9.0
+
+
+def test_dir_rule_launch_midway_never_deepens_the_brake() -> None:
+    tb = _pedal_table(dl=3.0, ds=2.4, breakaway=3.0)
+    plan = plan_for(_slow_launch, 10.0, tb, low_speed_side_rule="dir")
+    stop = plan.flag == FLAG_STOP
+    first_accel = int(np.flatnonzero((plan.effort_pct > 0.0) & ~stop)[0])
+    first_move = int(np.flatnonzero(~stop)[0])
+    seg = plan.effort_pct[first_move:first_accel]
+    assert len(seg) > 10
+    depth = np.maximum(-seg, 0.0)
+    assert np.all(np.diff(depth) <= 1e-9)
+    # pedal の同じ区間は途中で深くなる行がある（(ロ) の効き）

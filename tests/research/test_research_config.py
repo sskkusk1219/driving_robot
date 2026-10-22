@@ -1263,3 +1263,12 @@ def test_switch_lead_enabled_defaults_to_false() -> None:
     cfg = _load_default()
     assert cfg.forward_map.switch_lead_enabled is False
     assert cfgmod.ForwardMapSection().switch_lead_enabled is False
+
+
+def test_low_speed_side_rule_accepts_dir_and_rejects_unknown() -> None:
+    cfg = _load_default()
+    for rule in ("legacy", "pedal", "dir"):
+        cfg.forward_map.low_speed_side_rule = rule
+        assert not any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.low_speed_side_rule = "nope"
+    assert any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
