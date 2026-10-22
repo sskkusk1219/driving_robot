@@ -966,6 +966,48 @@ def test_accel_times_are_resolved_in_time_order_with_the_planned_release() -> No
     assert np.array_equal(up.effort_pct, up0.effort_pct)
 
 
+def _legacy_launch_release_table(with_layers: bool = True) -> ForwardTable:
+    """アクセルの戻しの層つき（または無し）・発進側の表は本体と同じ値・低速の上の車速 7.5 km/h。"""
+    t = _accel_release_variant(with_layers=with_layers)
+    t.launch_accel = t.accel_grid.copy()
+    t.meta["stop_max_speed_kmh"] = 7.5
+    return t
+
+
+def test_legacy_accel_release_unchanged_without_release_layers() -> None:
+    # 戻しの表なし: 計画もラベルも、発進側の表なしの計画と変わらない（本体と同じ値の発進側の表）
+    with_l = plan_for(_accel_release_ref, 8.0, _legacy_launch_release_table(with_layers=False))
+    plain = plan_for(_accel_release_ref, 8.0, _accel_release_variant(with_layers=False))
+    assert np.array_equal(with_l.effort_pct, plain.effort_pct)
+    assert np.array_equal(with_l.flag, plain.flag)
+    again = plan_for(_accel_release_ref, 8.0, _legacy_launch_release_table(with_layers=False))
+    assert np.array_equal(with_l.side_accel, again.side_accel)
+    # need > 0 の行は従来どおり SIDE_LAUNCH のまま
+    assert (with_l.side_accel[with_l.need_accel_kmhs > 0.0] == SIDE_LAUNCH).all()
+
+
+def test_legacy_accel_release_resolves_above_top_but_not_below() -> None:
+    tb = _legacy_launch_release_table()
+    plan = plan_for(_accel_release_ref, 8.0, tb)
+    # 発進側の表を持たない同じ戻しの層の計画（7.5 km/h 以上は解き直される）が、7.5 km/h 以上の正解
+    ref_tb = _accel_release_variant()
+    ref_plan = plan_for(_accel_release_ref, 8.0, ref_tb)
+    for t in (3.0, 3.5, 4.0):
+        i = idx(plan, t)
+        assert plan.effort_pct[i] == pytest.approx(ref_plan.effort_pct[i])
+        zero = plan_for(_accel_release_ref, 8.0, _accel_release_variant(with_layers=False))
+        assert plan.effort_pct[i] > zero.effort_pct[i] + 0.1  # 戻し量 0 の解と変わる
+        assert plan.side_accel[i] == SIDE_MAIN
+    # 7.5 km/h 未満で発進側の行は解き直さない（戻し量 0 の解のまま・SIDE_LAUNCH）
+    def slow(t: float) -> float:
+        return 1.0 + 1.0 * t if t < 3.0 else 4.0 + 0.2 * (t - 3.0)
+
+    low = plan_for(slow, 6.0, tb)
+    low0 = plan_for(slow, 6.0, _legacy_launch_release_table(with_layers=False))
+    assert np.array_equal(low.effort_pct, low0.effort_pct)
+    assert (low.side_accel[low.need_accel_kmhs > 0.0] == SIDE_LAUNCH).all()
+
+
 # ───────── 2026-10-22 段5-2: 低速の表の引き方（low_speed_side_rule） ─────────
 
 

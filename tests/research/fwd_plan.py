@@ -576,13 +576,18 @@ def build_plan(
             effort, redo, u_b, v, need_b, table, brake_deadband_pct, accel_deadband_pct, period_s,
             stop_side=stop_b,
         )
+    relabel_a = np.zeros(n, dtype=bool)
     if table.accel_release_grid is not None and table.accel_release_accel is not None:
         # 2026-10-20 段4-3: アクセルの戻し量（直近の u の最大からの戻り）を見て解き直す。
-        # 発進側・停止側の表で解いた時刻は対象外（その表は戻し量を見ない）
-        redo_a = is_accel & ~stop & ~(launch_a | stop_a)
+        # 2026-10-23 段5-7a: 外すのは低速（stop_max_speed_kmh 未満）で発進側の表を引いた時刻と停止側
+        # の時刻だけ。それ以上の車速では発進側の表は本体と同じ値なので、legacy でも解き直す
+        low_a = v < float(table.meta.get("stop_max_speed_kmh", 0.0))
+        redo_a = is_accel & ~stop & ~((launch_a & low_a) | stop_a)
         _resolve_accel_releases(
             effort, redo_a, u_a, v, need_a, table, brake_deadband_pct, accel_deadband_pct, period_s
         )
+        # 解き直した行（7.5 km/h 以上の legacy の発進側）は本体の表なので、ラベルも本体にする
+        relabel_a = redo_a & launch_a
     side_brake_dir = None
     if dir_rule:
         # 戻しで解き直した行（低速の停止側だった行を含む）は SIDE_RELEASE、それ以外は上の表のまま
@@ -612,6 +617,7 @@ def build_plan(
         ensure_return_gap(effort, flag, ret=ret, period_s=period_s) if return_gap_enabled else None
     )
     side_accel = np.where(launch_a, SIDE_LAUNCH, np.where(stop_a, SIDE_STOP, SIDE_MAIN))
+    side_accel = np.where(relabel_a, SIDE_MAIN, side_accel)
     side_brake = np.where(launch_b, SIDE_LAUNCH, np.where(stop_b, SIDE_STOP, SIDE_MAIN))
     side_brake = np.where(released & ~stop_b & ~launch_b, SIDE_RELEASE, side_brake)
     if side_brake_dir is not None:
