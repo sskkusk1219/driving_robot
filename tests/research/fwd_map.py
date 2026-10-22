@@ -135,6 +135,15 @@ class ForwardTable:
     # None ＝ アクセルの戻しの表なし（今までと完全に同じ）
     accel_release_grid: np.ndarray | None = None
     accel_release_accel: np.ndarray | None = None
+    # アクセルの踏み増しの表（2026-10-23 段5-7b。attach_accel_push）。戻しの表の踏み増し版。
+    # accel_push_grid ＝ 踏み増し量 [%]（直近 RELEASE_WINDOW_S の u の最小からの増え）の格子
+    # （昇順・正）、
+    # accel_push_accel ＝ (踏み増し量の数, 行, 格子点) 加速度（u > 0 の列だけ意味がある）。
+    # 踏み増し量 0 は本体 accel_grid。踏み増し量は meta["accel_push_max_pct"] で頭打ちにする。
+    # 戻し量と同時に引くときは、それぞれの本体からの差を足す。
+    # None ＝ 踏み増しの表なし（今までと完全に同じ）
+    accel_push_grid: np.ndarray | None = None
+    accel_push_accel: np.ndarray | None = None
     # 停止側の戻しの表（2026-10-20 段4-3。attach_stop_release）。
     # stop_release_grid ＝ ブレーキの戻し量 [%] の格子、stop_release_accel ＝
     # (戻し量の数, 行, 格子点) 加速度。戻し量 0 は stop_accel。
@@ -259,6 +268,27 @@ class ForwardTable:
         r = np.clip(np.broadcast_to(np.asarray(accel_release, dtype=float), shape), 0.0, top)
         return [self.accel_grid, *self.accel_release_accel], vals, r
 
+    def _accel_push_nodes(
+        self, accel_push: Any, launch: bool, shape: tuple[int, ...], stop: bool = False
+    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray] | None:
+        """アクセルの踏み増し量を使うときの (節の配列のリスト, 節の踏み増し量,
+        頭打ちした踏み増し量)。
+        使わないなら None（2026-10-23 段5-7b。_accel_release_nodes の踏み増し版。頭打ちは meta の
+        accel_push_max_pct）。"""
+        if launch and stop:
+            raise ValueError("launch と stop は同時に True にできません")
+        if accel_push is None or self.accel_push_grid is None or self.accel_push_accel is None:
+            return None
+        if (launch and self.launch_accel is not None) or (stop and self.stop_accel is not None):
+            return None
+        vals = np.concatenate([[0.0], np.asarray(self.accel_push_grid, dtype=float)])
+        top = float(vals[-1])
+        cap = self.meta.get("accel_push_max_pct")
+        if cap is not None and np.isfinite(cap):
+            top = min(top, float(cap))
+        p = np.clip(np.broadcast_to(np.asarray(accel_push, dtype=float), shape), 0.0, top)
+        return [self.accel_grid, *self.accel_push_accel], vals, p
+
     def _blend(
         self,
         arrs: list[np.ndarray],
@@ -314,6 +344,7 @@ class ForwardTable:
         release: np.ndarray | float | None = None,
         stop: bool = False,
         accel_release: np.ndarray | float | None = None,
+        accel_push: np.ndarray | float | None = None,
     ) -> Any:
         """車速 v・効く開度 u での加速度 [km/h/s]（ベクトル入力可）。
 
@@ -326,11 +357,15 @@ class ForwardTable:
         accel_release（アクセルの戻し量 [%]。2026-10-20 段4-3）は、アクセルの戻しの表が
         あるとき u > 0 の点を同じ方法で引く（accel_release_max_pct で頭打ち）。None・0、表なし、
         発進側・停止側の表を引くときは今までと同じ。
+        accel_push（アクセルの踏み増し量 [%]。2026-10-23 段5-7b）は、アクセルの踏み増しの表が
+        あるとき u > 0 の点を同じ方法で引く（accel_push_max_pct で頭打ち）。accel_release も同時に
+        渡したときは、それぞれの本体からの差を足す。None・0、表なしのときは今までと同じ。
         """
         v, u = np.broadcast_arrays(np.asarray(v_kmh, dtype=float), np.asarray(u_pct, dtype=float))
         nodes = self._release_nodes(release, launch, v.shape, stop)
         anodes = self._accel_release_nodes(accel_release, launch, v.shape, stop)
-        if nodes is None and anodes is None:
+        pnodes = self._accel_push_nodes(accel_push, launch, v.shape, stop)
+        if nodes is None and anodes is None and pnodes is None:
             return grid_accel(
                 self._rep(launch, stop), self.u_grid, self._grid(launch, stop), v_kmh, u_pct
             )
@@ -341,10 +376,21 @@ class ForwardTable:
         else:
             arrs, vals, r, _ = nodes
             out_b = self._blend(arrs, vals, r, v, u, self._rep(launch, stop))
-        if anodes is None:
+        if anodes is None and pnodes is None:
             return _scalar_or_array(out_b)
-        arrs_a, vals_a, r_a = anodes
-        out_a = self._blend(arrs_a, vals_a, r_a, v, u, self._rep(launch, stop))
+        rep = self._rep(launch, stop)
+        if anodes is not None:
+            arrs_a, vals_a, r_a = anodes
+            out_a = self._blend(arrs_a, vals_a, r_a, v, u, rep)
+        if pnodes is not None:
+            arrs_p, vals_p, p_a = pnodes
+            out_p = self._blend(arrs_p, vals_p, p_a, v, u, rep)
+            if anodes is None:
+                out_a = out_p
+            else:  # 戻し量・踏み増し量の同時: 本体からの差を足す
+                out_a = out_a + out_p - np.asarray(
+                    grid_accel(rep, self.u_grid, self.accel_grid, v, u)
+                )
         return _scalar_or_array(np.where(u > 0.0, out_a, out_b))
 
     def invert(
@@ -356,15 +402,18 @@ class ForwardTable:
         release: np.ndarray | float | None = None,
         stop: bool = False,
         accel_release: np.ndarray | float | None = None,
+        accel_push: np.ndarray | float | None = None,
     ) -> tuple[Any, Any]:
         """車速 v で加速度 a になる u と点の種類 POINT_*（ベクトル入力可）。launch・release は
         accel と同じ（release は 1 サンプルごとに違う値を渡せる。サンプルごとに補間した列で解く）。
         accel_release（2026-10-20 段4-3）は u > 0 の列だけ、アクセルの戻しの表で補間した列を使う。
+        accel_push（2026-10-23 段5-7b）も同じ（戻し量と同時なら本体からの差を足した列）。
         """
         v, a = np.broadcast_arrays(np.asarray(v_kmh, dtype=float), np.asarray(a_kmhs, dtype=float))
         nodes = self._release_nodes(release, launch, v.shape, stop)
         anodes = self._accel_release_nodes(accel_release, launch, v.shape, stop)
-        if nodes is None and anodes is None:
+        pnodes = self._accel_push_nodes(accel_push, launch, v.shape, stop)
+        if nodes is None and anodes is None and pnodes is None:
             return grid_invert(
                 self._rep(launch, stop), self.u_grid, self._grid(launch, stop),
                 self._kind(launch, stop), v_kmh, a_kmhs,
@@ -376,6 +425,12 @@ class ForwardTable:
                 "accel_release_node_pct": anodes[1],
                 "accel_release": anodes[2],
             }
+        if pnodes is not None:
+            extra.update(
+                accel_push_nodes=pnodes[0],
+                accel_push_node_pct=pnodes[1],
+                accel_push=pnodes[2],
+            )
         if nodes is None:
             return grid_invert(
                 self._rep(launch, stop), self.u_grid, self._grid(launch, stop),
@@ -493,6 +548,9 @@ def grid_invert(
     accel_release_nodes: Sequence[np.ndarray] | None = None,
     accel_release_node_pct: np.ndarray | None = None,
     accel_release: np.ndarray | None = None,
+    accel_push_nodes: Sequence[np.ndarray] | None = None,
+    accel_push_node_pct: np.ndarray | None = None,
+    accel_push: np.ndarray | None = None,
 ) -> tuple[Any, Any]:
     """車速 v で加速度 a になる u と点の種類を返す（ベクトル入力可）。
 
@@ -502,6 +560,8 @@ def grid_invert(
     accel_release_nodes・accel_release_node_pct・accel_release は、アクセルの戻し量について同じ
     （2026-10-20 段4-3）。u > 0 の列だけをその補間した列にし、u <= 0 の列はブレーキ側の列
     （release を渡していれば戻し量で補間した列、なければ accel）のまま。渡さなければ今までと同じ。
+    accel_push_nodes・accel_push_node_pct・accel_push は、アクセルの踏み増し量について同じ
+    （2026-10-23 段5-7b）。戻し量と同時なら、それぞれの本体からの差を足した列にする。
 
     車速 v の列は、上下 2 行を車速で直線補間した加速度の列（単調）。
     - 平らな区間（同じ加速度が続く）では |u| が小さい側を返す。
@@ -520,6 +580,10 @@ def grid_invert(
     if accel_release_nodes is not None:
         assert accel_release_node_pct is not None and accel_release is not None  # noqa: S101
         arf = np.broadcast_to(np.asarray(accel_release, dtype=float), shape).reshape(-1)
+    pf = None
+    if accel_push_nodes is not None:
+        assert accel_push_node_pct is not None and accel_push is not None  # noqa: S101
+        pf = np.broadcast_to(np.asarray(accel_push, dtype=float), shape).reshape(-1)
     u_out = np.empty(len(vf))
     kind_out = np.empty(len(vf), dtype=int)
     kg = len(u_grid)
@@ -532,10 +596,19 @@ def grid_invert(
             c = (1.0 - w)[:, None] * accel[i0] + w[:, None] * accel[i1]
         else:
             c = _blend_columns(release_nodes, release_node_pct, rf[sl], i0, i1, w, kg)
-        if arf is not None:
-            c_a = _blend_columns(
-                accel_release_nodes, accel_release_node_pct, arf[sl], i0, i1, w, kg
-            )
+        if arf is not None or pf is not None:
+            if arf is not None:
+                c_a = _blend_columns(
+                    accel_release_nodes, accel_release_node_pct, arf[sl], i0, i1, w, kg
+                )
+            if pf is not None:
+                c_p = _blend_columns(
+                    accel_push_nodes, accel_push_node_pct, pf[sl], i0, i1, w, kg
+                )
+                if arf is None:
+                    c_a = c_p
+                else:  # 戻し量・踏み増し量の同時: 本体からの差を足す
+                    c_a = c_a + c_p - ((1.0 - w)[:, None] * accel[i0] + w[:, None] * accel[i1])
             c = np.where(u_grid[None, :] > 0.0, c_a, c)
         c = np.maximum.accumulate(c, axis=1)
         kd = np.maximum(
@@ -1209,6 +1282,45 @@ def attach_accel_release(
     return replace(table, accel_release_grid=grid, accel_release_accel=acc, meta=meta)
 
 
+def attach_accel_push(
+    table: ForwardTable,
+    accel_push_accel: np.ndarray,
+    *,
+    push_pct: np.ndarray,
+    dt_row_s: np.ndarray,
+    push_grid: Sequence[float] = RELEASE_GRID_PCT,
+    min_total_s: float = RELEASE_MIN_TOTAL_S,
+) -> ForwardTable:
+    """アクセルの踏み増しの表（accel_push_grid・accel_push_accel）を付けた新しい表を返す
+    （2026-10-23 段5-7b。attach_accel_release の踏み増し版）。
+
+    accel_push_accel: (踏み増し量の数, 行, 格子点)。単調化済みで、table と同じ格子。
+    push_pct・dt_row_s: 学習に使ったアクセルの行（u > 0）の踏み増し量と行ごとの秒数。
+    踏み増し量 RELEASE_COUNT_MIN_PCT 以上の行の合計秒数が min_total_s 未満なら付けない
+    （accel_push_grid は None ＝ 今までと完全に同じ。meta に秒数だけ残す）。付けるときは
+    meta の accel_push_max_pct ＝ 踏み増し量の p95 を残す（accel・invert はこれで頭打ちにする）。
+    """
+    total_s, p95 = release_stats(push_pct, dt_row_s)
+    meta = dict(table.meta)
+    meta.update(
+        accel_push_rows_s=total_s,
+        accel_push_max_pct=p95,
+        accel_push_min_total_s=min_total_s,
+        accel_push_count_min_pct=RELEASE_COUNT_MIN_PCT,
+    )
+    grid = np.asarray(push_grid, dtype=float)
+    acc = np.asarray(accel_push_accel, dtype=float)
+    if acc.shape != (len(grid), *table.accel_grid.shape):
+        raise ValueError(
+            f"accel_push_accel の形 {acc.shape} が"
+            f" (踏み増し量 {len(grid)}, {table.accel_grid.shape}) と違う"
+        )
+    if total_s < min_total_s:
+        return replace(table, accel_push_grid=None, accel_push_accel=None, meta=meta)
+    meta["accel_push_grid_pct"] = [float(x) for x in grid]
+    return replace(table, accel_push_grid=grid, accel_push_accel=acc, meta=meta)
+
+
 def attach_stop_release(
     table: ForwardTable,
     brake_rows: FwdRows,
@@ -1428,6 +1540,8 @@ def save_table(table: ForwardTable, path: Path | None = None) -> Path:
         "release_accel": table.release_accel,
         "accel_release_grid": table.accel_release_grid,  # 2026-10-20 段4-3
         "accel_release_accel": table.accel_release_accel,
+        "accel_push_grid": table.accel_push_grid,  # 2026-10-23 段5-7b
+        "accel_push_accel": table.accel_push_accel,
         "stop_release_grid": table.stop_release_grid,
         "stop_release_accel": table.stop_release_accel,
         "fel_cell_main": table.fel_cell_main,  # 2026-10-19 段2s-2
@@ -1471,6 +1585,8 @@ def load_forward_map(path: Path) -> ForwardTable:
         release_accel=d.get("release_accel"),
         accel_release_grid=d.get("accel_release_grid"),  # 2026-10-20 段4-3: 古い pkl は None
         accel_release_accel=d.get("accel_release_accel"),
+        accel_push_grid=d.get("accel_push_grid"),  # 2026-10-23 段5-7b: 古い pkl は None
+        accel_push_accel=d.get("accel_push_accel"),
         stop_release_grid=d.get("stop_release_grid"),
         stop_release_accel=d.get("stop_release_accel"),
         fel_cell_main=d.get("fel_cell_main"),  # 2026-10-19 段2s-2: 古い pkl（キー無し）は None

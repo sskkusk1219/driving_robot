@@ -215,3 +215,45 @@ def test_accel_prediction_uses_accel_release_amount() -> None:
         off.update(t=t, speed_kmh=v, u_now=u, **args)  # type: ignore[arg-type]
         t += DT
     assert all(c[1] is None for c in tb2.calls)
+
+
+class _AccelPushTable(_Table):
+    """踏み増しの表つき: 踏み増し量 p だけ加速が強まる（a ＝ 本体 ＋ 0.1p）。"""
+
+    accel_push_grid = (1.0,)
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[float | None, float | None]] = []
+
+    def accel(self, v: float, u: float, *, launch: bool = False, stop: bool = False,
+              release: float | None = None, accel_release: float | None = None,
+              accel_push: float | None = None) -> float:
+        self.calls.append((accel_release, accel_push))
+        return super().accel(v, u) + 0.1 * (accel_push or 0.0)
+
+
+def test_accel_prediction_uses_accel_push_amount() -> None:
+    """2026-10-23 段5-7b: アクセルを踏み増した直後は、踏み増し量（遅れた u − 窓の u の最小）を
+    表に渡す。踏み増しの表が無い表（_AccelReleaseTable）には渡さない。"""
+    tb = _AccelPushTable()
+    obs = PedalDisturbanceObserver(
+        tb, tq_accel_s=1.0, tq_brake_s=1.0, lag_accel_s=0.0, lag_brake_s=0.0,
+        release_window_s=1.0,
+    )
+    args = {"governed": False, "at_limit_now": False, "launch": False, "stop": False}
+    t, v = 0.0, 50.0
+    for _ in range(5):
+        obs.update(t=t, speed_kmh=v, u_now=6.0, **args)  # type: ignore[arg-type]
+        t += DT
+    tb.calls.clear()
+    obs.update(t=t, speed_kmh=v, u_now=10.0, **args)  # type: ignore[arg-type]
+    assert tb.calls[-1][1] == pytest.approx(4.0)  # 10 − 6
+    assert obs.accel_push_at(t, 10.0) == pytest.approx(4.0)
+    assert obs.accel_push_at(t, -3.0) == 0.0
+    plain = _AccelReleaseTable()  # 踏み増しの表を持たない表には accel_push を渡さない
+    off = PedalDisturbanceObserver(
+        plain, tq_accel_s=1.0, tq_brake_s=1.0, lag_accel_s=0.0, lag_brake_s=0.0,
+        release_window_s=1.0,
+    )
+    for u in (6.0, 6.0, 6.0, 10.0):
+        off.update(t=t, speed_kmh=v, u_now=u, **args)  # type: ignore[arg-type]

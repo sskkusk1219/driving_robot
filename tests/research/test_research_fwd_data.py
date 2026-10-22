@@ -17,6 +17,7 @@ from tests.research.fwd_data import (
     DROP_REASONS,
     DROP_STOPPED,
     FwdRows,
+    accel_push_amount,
     accel_release_amount,
     cell_counts,
     concat_rows,
@@ -591,3 +592,22 @@ def test_launch_breakaway_reads_cmd_opening_when_asked(tmp_path: Path) -> None:
     )
     assert act is not None and cmd is not None
     assert cmd.u_pct == pytest.approx(act.u_pct + 1.0, abs=1e-6)
+
+
+def test_accel_push_amount_is_rise_from_recent_min_for_positive_u() -> None:
+    """2026-10-23 段5-7b: 踏み増し量 ＝ u − 直近窓の u の最小（u > 0 の点だけ）。"""
+    t = np.arange(8) * 1.0
+    u = np.array([0.0, 2.0, 6.0, 6.0, 4.0, 3.0, 3.0, 3.0])
+    # 窓 3 秒（その点を含む）: 点 2 は t=0..2 → 最小 0 → 6、点 5 は t=2..5 → 最小 3 → 0、
+    # 点 4 は t=1..4 → 最小 2 → 2（谷が窓から出ると踏み増し量が縮む）
+    push = accel_push_amount(t, u, 3.0)
+    assert push.tolist() == [0.0, 2.0, 6.0, 6.0, 2.0, 0.0, 0.0, 0.0]
+
+
+def test_accel_push_amount_after_brake_equals_u() -> None:
+    """ブレーキ直後のアクセルの踏み増し量 ＝ 今の u（窓の最小は max(u, 0) で数える）。"""
+    t = np.arange(5) * 1.0
+    u = np.array([-3.0, 0.0, np.nan, 1.0, 1.0])
+    push = accel_push_amount(t, u, 10.0)
+    # u <= 0・NaN の点は 0。アクセルの点は窓の最小が 0 なので踏み増し量 ＝ u
+    assert push.tolist() == [0.0, 0.0, 0.0, 1.0, 1.0]

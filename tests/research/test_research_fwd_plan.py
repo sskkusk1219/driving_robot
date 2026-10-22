@@ -1447,3 +1447,84 @@ def test_dir_rule_launch_midway_never_deepens_the_brake() -> None:
     depth = np.maximum(-seg, 0.0)
     assert np.all(np.diff(depth) <= 1e-9)
     # pedal の同じ区間は途中で深くなる行がある（(ロ) の効き）
+
+
+def _accel_push_variant(strength: float = 0.05, with_release: bool = False) -> ForwardTable:
+    """linear_table に、u > 0 の列へ strength × 踏み増し量 × u を足すアクセルの踏み増しの層を付ける
+    （with_release なら戻しの層も付ける）。"""
+    from tests.research.fwd_map import RELEASE_GRID_PCT, attach_accel_push  # noqa: PLC0415
+
+    t = _accel_release_variant() if with_release else linear_table()
+    g = t.u_grid
+    layers = np.stack(
+        [t.accel_grid + np.where(g > 0, strength * p * g, 0.0)[None, :] for p in RELEASE_GRID_PCT]
+    )
+    t = attach_accel_push(t, layers, push_pct=np.full(1000, 1.0), dt_row_s=np.full(1000, 0.05))
+    t.meta["accel_push_max_pct"] = 8.0
+    return t
+
+
+def _push_ref(t: float) -> float:
+    """30 km/h から +2 km/h/s で 2 秒 → +8 km/h/s（踏み増す）。"""
+    return 30.0 + 2.0 * t if t < 2.0 else 34.0 + 8.0 * (t - 2.0)
+
+
+def test_accel_push_none_gives_identical_plan() -> None:
+    base = plan_for(_push_ref, 6.0, linear_table())
+    tb = _accel_push_variant()
+    tb.accel_push_grid = None
+    tb.accel_push_accel = None
+    same = plan_for(_push_ref, 6.0, tb)
+    assert np.array_equal(same.effort_pct, base.effort_pct)
+    assert np.array_equal(same.flag, base.flag)
+    # 戻しの表だけの表（踏み増しの軸なし）は、踏み増しの軸を外した表と同じ計画
+    both = _accel_push_variant(with_release=True)
+    both.accel_push_grid = None
+    both.accel_push_accel = None
+    assert np.array_equal(
+        plan_for(_accel_release_ref, 8.0, both).effort_pct,
+        plan_for(_accel_release_ref, 8.0, _accel_release_variant()).effort_pct,
+    )
+
+
+def test_accel_push_changes_plan_only_where_pushing() -> None:
+    base = plan_for(_push_ref, 6.0, linear_table())
+    tb = _accel_push_variant()
+    plan = plan_for(_push_ref, 6.0, tb)
+    # 踏み増さない（一定の速度を保つ）計画は同じ
+    flat = plan_for(lambda t: 50.0, 6.0, tb)
+    flat0 = plan_for(lambda t: 50.0, 6.0, linear_table())
+    assert np.allclose(flat.effort_pct, flat0.effort_pct, atol=1e-9)
+    u_all = np.where(plan.effort_pct > AD, plan.effort_pct - AD, 0.0)
+    w = int(round(3.0 / plan.period_s))
+    seen = 0
+    for t in (2.5, 3.0, 3.5, 4.0):
+        i = idx(plan, t)
+        mn = float(np.maximum(u_all[max(i - w, 0) : i], 0.0).min())
+        u = float(u_all[i])
+        assert u > mn
+        # 踏み増し量 0 の解と違い、踏み増しで効きが強まる表なので浅い（effort が小さい）
+        assert plan.effort_pct[i] < base.effort_pct[i] - 0.05, t
+        got = tb.accel(_push_ref(t), u, accel_push=u - mn)
+        assert got == pytest.approx(plan.need_accel_kmhs[i], abs=0.02)
+        seen += 1
+    assert seen == 4
+
+
+def test_accel_push_with_release_axis_solves_both_and_release_times_unchanged() -> None:
+    tb = _accel_push_variant(with_release=True)
+    plan = plan_for(_accel_release_ref, 8.0, tb)
+    u_all = np.where(plan.effort_pct > AD, plan.effort_pct - AD, 0.0)
+    w = int(round(3.0 / plan.period_s))
+    for t in (3.0, 3.5, 4.0):
+        i = idx(plan, t)
+        win = u_all[max(i - w, 0) : i]
+        mx, mn, u = float(win.max()), float(np.maximum(win, 0.0).min()), float(u_all[i])
+        got = tb.accel(
+            _accel_release_ref(t), u, accel_release=max(mx - u, 0.0), accel_push=max(u - mn, 0.0)
+        )
+        assert got == pytest.approx(plan.need_accel_kmhs[i], abs=0.02)
+    # ブレーキ側の減速は軸に影響されない
+    dn = plan_for(lambda t: 80.0 - 5.0 * t, 4.0, tb)
+    dn0 = plan_for(lambda t: 80.0 - 5.0 * t, 4.0, _accel_release_variant(with_layers=False))
+    assert np.array_equal(dn.effort_pct, dn0.effort_pct)

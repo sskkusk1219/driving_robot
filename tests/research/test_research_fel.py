@@ -259,3 +259,22 @@ def test_predict_passes_release_to_stop_layers_and_accel_release_to_main() -> No
     assert got[1] == pytest.approx(base[1] + 1.0)  # 戻し量 2% → 節 2.0
     assert got[2] == pytest.approx(base[2])
     assert got[3] == pytest.approx(base[3] - 1.0)  # アクセルの戻し量 2%
+
+
+def test_predict_passes_accel_push_to_main_rows_only_when_table_has_axis() -> None:
+    """2026-10-23 段5-7b: 本体の行に踏み増し量を渡す。踏み増しの表が無い表では無視される。"""
+    plain = _table()
+    v = np.array([30.0, 30.0])
+    u = np.array([3.0, 3.0])
+    kind = np.array([felmod.KIND_MAIN, felmod.KIND_MAIN])
+    rel = np.zeros(2)
+    push = np.array([0.0, 2.0])
+    base = felmod._predict(plain, v, u, kind, rel)
+    assert np.array_equal(base, felmod._predict(plain, v, u, kind, rel, None, push))
+    layered = _table()
+    layered.accel_push_grid = np.array([1.0, 2.0])
+    layered.accel_push_accel = np.stack([layered.accel_grid + 0.5, layered.accel_grid + 1.0])
+    layered.meta["accel_push_max_pct"] = 2.0
+    got = felmod._predict(layered, v, u, kind, rel, None, push)
+    assert got[0] == pytest.approx(base[0])
+    assert got[1] == pytest.approx(base[1] + 1.0)

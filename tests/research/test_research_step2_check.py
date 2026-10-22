@@ -380,6 +380,15 @@ def test_i1_table_extras_is_informational_and_reports_seconds() -> None:
     a_off = sc.check_table_extras(_table(accel_release_input_enabled=False), None)
     assert "アクセルの戻し量の入力 あり設定" in a_on.value
     assert "アクセルの戻し量の入力 なし設定" in a_off.value
+    p_on = sc.check_table_extras(
+        _table(accel_push_input_enabled=True, accel_push_rows_s=12.5, accel_push_max_pct=3.5), None
+    )
+    assert "アクセルの踏み増し量の入力 あり設定" in p_on.value and "12.5s" in p_on.value
+    assert p_on.metrics["accel_push_rows_s"] == pytest.approx(12.5)
+    assert p_on.metrics["accel_push_max_pct"] == pytest.approx(3.5)
+    assert p_on.status == sc.STATUS_OK
+    p_off = sc.check_table_extras(_table(accel_push_input_enabled=False), None)
+    assert "アクセルの踏み増し量の入力 なし設定" in p_off.value
     old = sc.check_table_extras(_table(), None)
     assert old.status == sc.STATUS_OK and "なし" in old.value
     assert sc.check_table_extras(None, None).status == sc.STATUS_SKIP

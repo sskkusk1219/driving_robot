@@ -40,6 +40,7 @@ from tests.research.fwd_map import RELEASE_GRID_PCT, ForwardTable, load_forward_
 from tests.research.fwd_model import (
     FittedModel,
     grid_from_raw,
+    raw_accel_push_slices,
     raw_accel_release_slices,
     raw_grid,
     raw_release_slices,
@@ -134,6 +135,11 @@ class CvConfig:
     # （raw_accel_release_slices）も作る。False は (車速, u) の 2 つ・戻しの表なし（0ee7c1b より
     # 前と同じ）。手順2 は learning.accel_release_input_enabled（既定 false）をここへ渡す
     accel_release_input: bool = True
+    # 2026-10-23 段5-7b: True ならアクセル側のニューラルネットの入力にさらに「アクセルの踏み増し量」
+    # （直近 RELEASE_WINDOW_S の u の最小からの増え）を足し（戻し量が on なら 4、off なら 3 入力）、
+    # 踏み増しの表（raw_accel_push_slices）も作る。False（既定）は今までと完全に同じ。
+    # 手順2 は learning.accel_push_input_enabled（既定 false）をここへ渡す
+    accel_push_input: bool = False
 
     def key(self) -> str:
         """全フィールドから作る文字列（結果ファイルで同じ設定を見分ける）。
@@ -146,6 +152,8 @@ class CvConfig:
                 del d[k]
         if d["accel_release_input"]:  # 既定（True）は含めない（足す前の結果を読み直せるように）
             del d["accel_release_input"]
+        if not d["accel_push_input"]:  # 既定（False）は含めない（足す前の結果を読み直せるように）
+            del d["accel_push_input"]
         if d["release_slices"]:  # 既定（True）は含めない（足す前の結果を読み直せるように）
             del d["release_slices"]
         if d["brake_exclude_launch"]:
@@ -171,13 +179,15 @@ def side_rows(
     coast_in_brake: bool,
     exclude_launch: bool = False,
     accel_release_input: bool = True,
+    accel_push_input: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """片側の行の x・加速度 y・ログ番号・時刻 t_s。選び方は fwd_model._xy と同じ
     （accel: u >= 0、brake: u <= 0。coast_in_brake=False なら brake は u < 0）。
     exclude_launch=True はブレーキ側から発進の区間の行（launch_row）を除く（アクセル側は除かない）。
     x は accel・brake とも (N, 3)（車速・u・戻し量。ブレーキ側は 2026-10-14 段2o-5、
     アクセル側のアクセルの戻し量は 2026-10-20 段4-3）。accel_release_input=False のときアクセル側は
-    (N, 2)（車速・u。0ee7c1b より前と同じ）。"""
+    (N, 2)（車速・u。0ee7c1b より前と同じ）。accel_push_input=True のときアクセル側の最後の列に
+    踏み増し量（2026-10-23 段5-7b）。"""
     xs, ys, gs, ts = [], [], [], []
     for g, r in enumerate(rows_list):
         if side == "accel":
@@ -189,8 +199,11 @@ def side_rows(
         cols = [r.speed_kmh[m], r.u_pct[m]]
         if side != "accel":
             cols.append(r.release_pct[m])
-        elif accel_release_input:
-            cols.append(r.accel_release_pct[m])
+        else:
+            if accel_release_input:
+                cols.append(r.accel_release_pct[m])
+            if accel_push_input:
+                cols.append(r.accel_push_pct[m])
         xs.append(np.column_stack(cols))
         ys.append(r.accel_kmhs[m])
         gs.append(np.full(int(m.sum()), g))
@@ -305,6 +318,7 @@ def fit_one_info(
             coast_in_brake=cfg.coast_from != "accel",
             exclude_launch=cfg.brake_exclude_launch,
             accel_release_input=cfg.accel_release_input,
+            accel_push_input=cfg.accel_push_input,
         )
         if cfg.drop_stop_approach:  # 重み 0 ではなく行そのものを除く（検証の分け方も変わる）
             keep = ~stop_approach_mask(x[:, 0], x[:, 1])
@@ -348,6 +362,8 @@ def fit_one_info(
             max_epochs=rollout_epochs,
         )
         info["used_s"], info["dropped_s"] = used, dropped
+    # 入力の並び（raw_grid が戻し量・踏み増し量を入れる列を見分ける。追加学習のコピーにも付ける）
+    sides["accel"].accel_inputs = (cfg.accel_release_input, cfg.accel_push_input)
     fm = FittedModel(
         "torch",
         sides["accel"],
@@ -433,10 +449,14 @@ def _agg(per_fold: dict[str, dict], how: str) -> dict[str, float]:
 
 def _worker(
     args: tuple,
-) -> tuple[int, int, np.ndarray, float, np.ndarray | None, np.ndarray | None]:
+) -> tuple[
+    int, int, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray | None
+]:
     """(分割番号, 乱数) 1 タスク。単調化前の配列・学習秒数・戻し量ごとの単調化前の配列
     （cfg.release_slices でなければ None。2026-10-14 段2o-5）・アクセルの戻し量ごとの単調化前
-    の配列（同じ条件か cfg.accel_release_input が False なら None。2026-10-20 段4-3）を返す。
+    の配列（同じ条件か cfg.accel_release_input が False なら None。2026-10-20 段4-3）・アクセルの
+    踏み増し量ごとの単調化前の配列（同じ条件か cfg.accel_push_input が False なら None。
+    2026-10-23 段5-7b）を返す。
     pickle できるようトップレベル。
     末尾の (学習ログごとの trace, DeadbandLag) は rollout_s > 0 のときだけ使う（省略可）。
     追加学習の info はここで表示する。"""
@@ -471,7 +491,12 @@ def _worker(
         if cfg.release_slices and cfg.accel_release_input
         else None
     )
-    return fold_idx, seed, raw, time.perf_counter() - t0, rel, arel
+    apush = (
+        raw_accel_push_slices(fm, like, RELEASE_GRID_PCT, coast_from=cfg.coast_from)
+        if cfg.release_slices and cfg.accel_push_input
+        else None
+    )
+    return fold_idx, seed, raw, time.perf_counter() - t0, rel, arel, apush
 
 
 @dataclass
@@ -527,7 +552,7 @@ def run_model_config(cfg: CvConfig, ctx: Context, workers: int, max_iter: int) -
             outs = list(ex.map(_worker, tasks))
     else:
         outs = [_worker(t) for t in tasks]
-    for fold_idx, seed, _, sec, _rel, _arel in outs:
+    for fold_idx, seed, _, sec, _rel, _arel, _apush in outs:
         print(f"    タスク 分割{fold_idx} 乱数{seed}: {sec:.1f} 秒", flush=True)
     per_fold: dict[str, dict] = {}
     for i, (_, held) in enumerate(ctx.fold_rows):

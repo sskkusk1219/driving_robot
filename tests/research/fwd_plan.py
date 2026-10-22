@@ -41,6 +41,9 @@ accel(v, u, release = u − m) = 要る加速度 を解く（u の格子点で�
 は同じ手順で解き直す（その時刻は停止側の表と層で引く）。アクセルは、表が accel_release_grid を持つ
 とき、直近 RELEASE_WINDOW_S 秒の計画済みの u の最大 m からの戻り m − u を戻し量として、同じ
 やり方で時刻順に解き直す（`_resolve_accel_releases`）。
+2026-10-23 段5-7b: 表が accel_push_grid（アクセルの踏み増しの表）も持つとき、同じ解き直しで、直近の
+計画済みの u の最小 n からの増え u − n を踏み増し量として引く（戻し量と踏み増し量を同時に入れて
+accel ≧ 要る加速度になる最初の u を探す。戻しの軸だけ・踏み増しの軸だけ・両方のどれでも動く）。
 """
 
 from __future__ import annotations
@@ -577,7 +580,10 @@ def build_plan(
             stop_side=stop_b,
         )
     relabel_a = np.zeros(n, dtype=bool)
-    if table.accel_release_grid is not None and table.accel_release_accel is not None:
+    accel_rel_on = table.accel_release_grid is not None and table.accel_release_accel is not None
+    accel_push_on = table.accel_push_grid is not None and table.accel_push_accel is not None
+    if accel_rel_on or accel_push_on:
+        # 2026-10-23 段5-7b: アクセルの踏み増しの表だけでも同じ解き直しに入る
         # 2026-10-20 段4-3: アクセルの戻し量（直近の u の最大からの戻り）を見て解き直す。
         # 2026-10-23 段5-7a: 外すのは低速（stop_max_speed_kmh 未満）で発進側の表を引いた時刻と停止側
         # の時刻だけ。それ以上の車速では発進側の表は本体と同じ値なので、legacy でも解き直す
@@ -1149,15 +1155,21 @@ def _resolve_accel_releases(
     period_s: float,
     window_s: float = RELEASE_WINDOW_S,
 ) -> None:
-    """アクセルの戻しの表があるとき、redo の時刻のアクセルを時刻順に解き直して effort を書き換える
-    （2026-10-20 段4-3。`_resolve_releases` のアクセル版）。u_a0 は戻し量 0 で解いた u。
+    """アクセルの戻しの表・踏み増しの表があるとき、redo の時刻のアクセルを時刻順に解き直して
+    effort を書き換える（2026-10-20 段4-3。`_resolve_releases` のアクセル版。2026-10-23 段5-7b で
+    踏み増しの軸を追加）。u_a0 は戻し量・踏み増し量 0 で解いた u。
 
-    時刻 i の戻し量 ＝ 直近 window_s 秒（i の手前まで）の計画済みの u の最大 m − 新しい u。
-    m <= 0（直近にアクセルを踏んでいない）か、戻し量 0 の解がすでに m 以上（踏み増している）なら
-    そのまま。そうでなければ u を 0 から m まで動かし、accel(v, u, accel_release=m − u) ≧ need に
-    最初になる u（節の間は直線補間）を新しい u にする。戻していても要る加速度に届かないとき
-    （u = m でも届かない）は戻し量 0 の解のまま。
+    時刻 i の戻し量 ＝ 直近 window_s 秒（i の手前まで）の計画済み u の最大 mx − 新しい u（0 以上）、
+    踏み増し量 ＝ 新しい u − 直近の u の最小 mn（0 以上）。
+    解き直す条件: 戻しの表があり mx > 0 かつ u_a0 < mx（戻している）、または踏み増しの表があり
+    u_a0 > mn（踏み増している。i = 0 は除く）。どちらでもなければそのまま。
+    解き直すときは u を 0 から上限まで動かし（上限 ＝ 戻しの軸があれば mx、踏み増しの軸があれば
+    u_a0 のうち大きい方）、accel(v, u, accel_release=…, accel_push=…) ≧ need に最初になる u
+    （節の間は直線補間）を新しい u にする。届かないとき（上限でも届かない）は戻し量・踏み増し量 0 の
+    解のまま。u = 0 で届くときもそのまま（アクセルの行を 0 にしない）。
     """
+    rel_on = table.accel_release_grid is not None and table.accel_release_accel is not None
+    push_on = table.accel_push_grid is not None and table.accel_push_accel is not None
     w = max(int(round(window_s / period_s)), 1)
     u = np.where(
         effort < -brake_deadband_pct,
@@ -1166,17 +1178,38 @@ def _resolve_accel_releases(
     )
     grid = table.u_grid
     for i in np.flatnonzero(redo):
-        m = float(u[max(i - w, 0) : i].max()) if i > 0 else 0.0
-        if m <= 0.0 or float(u_a0[i]) >= m:
-            continue  # 直近に踏んでいない、または踏み増している（戻していない）
-        pts = np.concatenate([[0.0], grid[(grid > 0.0) & (grid < m)], [m]])
+        win = u[max(i - w, 0) : i]
+        mx = float(win.max()) if i > 0 else 0.0
+        mn = float(np.maximum(win, 0.0).min()) if i > 0 else 0.0
+        u0 = float(u_a0[i])
+        do_rel = rel_on and mx > 0.0 and u0 < mx
+        do_push = push_on and i > 0 and u0 > mn + 1e-9
+        if not (do_rel or do_push):
+            continue  # 戻していない・踏み増していない
+        top = max(mx if do_rel else 0.0, u0 if do_push else 0.0)
+        if top <= 0.0:
+            continue
+        kinks = [0.0, top]
+        if rel_on and 0.0 < mx < top:
+            kinks.append(mx)  # 戻し量 max(mx − u, 0) の折れ点
+        if push_on and 0.0 < mn < top:
+            kinks.append(mn)  # 踏み増し量 max(u − mn, 0) の折れ点
+        pts = np.unique(np.concatenate([kinks, grid[(grid > 0.0) & (grid < top)]]))
         f = (
-            np.asarray(table.accel(float(v[i]), pts, accel_release=m - pts), dtype=float)
+            np.asarray(
+                table.accel(
+                    float(v[i]),
+                    pts,
+                    accel_release=np.maximum(mx - pts, 0.0) if rel_on else None,
+                    accel_push=np.maximum(pts - mn, 0.0) if push_on else None,
+                ),
+                dtype=float,
+            )
             - need_a[i]
         )
         hit = np.flatnonzero(f >= 0.0)
         if len(hit) == 0:
-            continue  # 戻し量 0 の解のまま
+            continue  # 戻し量・踏み増し量 0 の解のまま
         j = int(hit[0])
         if j == 0:
             continue  # u = 0 でも届く: 戻し量 0 の解のまま（アクセルの行を 0 にしない）

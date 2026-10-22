@@ -1272,3 +1272,11 @@ def test_low_speed_side_rule_accepts_dir_and_rejects_unknown() -> None:
         assert not any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
     cfg.forward_map.low_speed_side_rule = "nope"
     assert any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_accel_push_input_setting_default_off() -> None:
+    """2026-10-23 段5-7b: アクセルの踏み増し量を入力にする設定は既定 false。"""
+    assert cfgmod.LearningSection().accel_push_input_enabled is False
+    text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    assert "  accel_push_input_enabled: false\n" in text
+    assert _load_default().learning.accel_push_input_enabled is False

@@ -8,6 +8,7 @@ import pytest
 from tests.research.fwd_cv import CvConfig
 from tests.research.fwd_data import (
     FwdRows,
+    accel_push_amount,
     accel_release_amount,
     concat_rows,
     make_speed_edges,
@@ -120,6 +121,7 @@ def make_release_rows(
     n: int = 4000,
     release_gain: float = 0.0,
     accel_release_gain: float = 0.0,
+    accel_push_gain: float = 0.0,
 ) -> FwdRows:
     """u がゆっくり揺れる時系列（0.05 秒刻み）。戻し量は release_amount で全系列から計算する。
     ブレーキが弱まる効き（release_gain × 戻し量 × |u|）を加速度に足す。"""
@@ -129,8 +131,11 @@ def make_release_rows(
     v = rng.uniform(10.0, 70.0, n)
     rel = release_amount(t, u, 3.0)
     arel = accel_release_amount(t, u, 3.0)
+    apush = accel_push_amount(t, u, 3.0)
     a = -2.0 - 0.01 * v + np.where(
-        u >= 0, 0.3 * u - accel_release_gain * arel * u, 0.6 * u + release_gain * rel * -u
+        u >= 0,
+        0.3 * u - accel_release_gain * arel * u + accel_push_gain * apush * u,
+        0.6 * u + release_gain * rel * -u,
     )
     return FwdRows(
         speed_kmh=v,
@@ -142,6 +147,7 @@ def make_release_rows(
         dt_row_s=np.full(n, 0.05),
         release_pct=rel,
         accel_release_pct=arel,
+        accel_push_pct=apush,
     )
 
 
@@ -271,3 +277,51 @@ def test_final_table_without_accel_release_input_is_two_inputs_and_no_table(tmp_
         CvConfig("t", (6,), loss="absolute", seeds=(0,)), rows, path, workers=1, max_iter=5
     )
     assert on.meta["accel_release_input_enabled"] is True and on.accel_release_grid is not None
+
+
+def test_final_table_accel_push_input_builds_table_and_meta(tmp_path):
+    """2026-10-23 段5-7b: accel_push_input=True で踏み増しの表ができ meta が true、
+    False（既定）では None・meta false。戻し量の入力の on／off どちらの組み合わせでも動く。"""
+    from tests.research.fwd_cv import fit_one_info, side_rows  # noqa: PLC0415
+    from tests.research.fwd_model import accel_side_inputs, raw_grid  # noqa: PLC0415
+
+    rows = [
+        make_release_rows(i, f"log{i}", accel_release_gain=0.03, accel_push_gain=0.03)
+        for i in range(2)
+    ]
+    like = build_table(concat_rows(rows), speed_edges=make_speed_edges(80.0))
+    path = save_table(like, tmp_path / "like.pkl")
+    assert final_config().accel_push_input is False
+    assert "accel_push_input" not in final_config().key()
+    assert final_config(accel_push_input=True).key().endswith("|accel_push_input=True")
+    for arel_in, n_in in ((True, 4), (False, 3)):
+        xa, _, _, _ = side_rows(
+            rows, "accel", coast_in_brake=True, accel_release_input=arel_in, accel_push_input=True
+        )
+        assert xa.shape[1] == n_in
+        cfg = CvConfig(
+            "t", (6,), loss="absolute", seeds=(0, 1), accel_release_input=arel_in,
+            accel_push_input=True,
+        )
+        fm, _ = fit_one_info(cfg, rows, 0, max_iter=30)
+        assert fm.accel_side.n_inputs == n_in
+        assert accel_side_inputs(fm.accel_side) == (arel_in, True)
+        tb, _ = build_final_table(cfg, rows, path, workers=1, max_iter=30)
+        assert tb.meta["accel_push_input_enabled"] is True
+        assert tb.accel_push_grid is not None
+        assert tb.accel_push_accel.shape == (len(tb.accel_push_grid), *tb.accel_grid.shape)
+        assert np.all(np.diff(tb.accel_push_accel, axis=2) >= -1e-9)
+        assert tb.meta["accel_push_rows_s"] >= 10.0 and tb.meta["accel_push_max_pct"] > 0.0
+        ug = tb.u_grid
+        assert not np.allclose(tb.accel_push_accel[-1][:, ug > 0], tb.accel_grid[:, ug > 0])
+        assert np.allclose(tb.accel_push_accel[:, :, ug < 0], tb.accel_grid[None, :, ug < 0])
+        assert (tb.accel_release_grid is not None) == arel_in
+        assert not np.allclose(
+            raw_grid(fm, like, accel_push_pct=4.0)[:, like.u_grid > 0],
+            raw_grid(fm, like)[:, like.u_grid > 0],
+        )
+    off, _ = build_final_table(
+        CvConfig("t", (6,), loss="absolute", seeds=(0,)), rows, path, workers=1, max_iter=5
+    )
+    assert off.meta["accel_push_input_enabled"] is False
+    assert off.accel_push_grid is None and off.accel_push_accel is None

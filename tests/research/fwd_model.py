@@ -80,6 +80,7 @@ def _xy(
     *,
     coast_in_brake: bool = True,
     accel_release_input: bool = True,
+    accel_push_input: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """片側の行（accel: u >= 0、brake: u <= 0）の入力・加速度・ログ番号（グループ）。
     入力は accel・brake とも (N, 3)（車速・u・戻し量。ブレーキ側は 2026-10-14 段2o-5、
@@ -96,8 +97,11 @@ def _xy(
         cols = [r.speed_kmh[m], r.u_pct[m]]
         if side != "accel":
             cols.append(r.release_pct[m])
-        elif accel_release_input:
-            cols.append(r.accel_release_pct[m])
+        else:
+            if accel_release_input:
+                cols.append(r.accel_release_pct[m])
+            if accel_push_input:
+                cols.append(r.accel_push_pct[m])
         xs.append(np.column_stack(cols))
         ys.append(r.accel_kmhs[m])
         gs.append(np.full(int(m.sum()), g))
@@ -244,6 +248,30 @@ def _n_inputs(side: Any) -> int:
     return 3 if n == 3 else 2
 
 
+def accel_side_inputs(side: Any) -> tuple[bool, bool]:
+    """アクセル側の式の入力に (アクセルの戻し量, 踏み増し量) が入っているか（2026-10-23 段5-7b）。
+    学習時に side.accel_inputs へ残した値を読む。無い式（5-7b より前のモデル・テスト用のスタブ）は
+    入力が 3 つなら戻し量あり・踏み増しなし、それ以外は (False, False)。"""
+    flags = getattr(side, "accel_inputs", None)
+    if flags is not None:
+        return bool(flags[0]), bool(flags[1])
+    return (_n_inputs(side) == 3, False)
+
+
+def _predict_accel_grid(
+    side: Any, rep: np.ndarray, ug: np.ndarray, release_pct: float = 0.0, push_pct: float = 0.0
+) -> np.ndarray:
+    """アクセル側の式を格子で評価する（入力の並びは車速・u・（戻し量）・（踏み増し量））。"""
+    has_rel, has_push = accel_side_inputs(side)
+    vv = np.repeat(rep, len(ug))
+    cols = [vv, np.tile(ug, len(rep))]
+    if has_rel:
+        cols.append(np.full(len(vv), float(release_pct)))
+    if has_push:
+        cols.append(np.full(len(vv), float(push_pct)))
+    return np.asarray(side.predict(np.column_stack(cols))).reshape(len(rep), len(ug))
+
+
 def _predict_grid(
     side: Any, rep: np.ndarray, ug: np.ndarray, release_pct: float = 0.0
 ) -> np.ndarray:
@@ -265,6 +293,7 @@ def raw_grid(
     coast_from: str = "mean",
     release_pct: float = 0.0,
     accel_release_pct: float = 0.0,
+    accel_push_pct: float = 0.0,
 ) -> np.ndarray:
     """学習済みモデルを like（C7 の表）と同じ格子で評価した、単調化する前の配列。
     行 = 車速、列 = u。
@@ -272,11 +301,13 @@ def raw_grid(
     release_pct: ブレーキ側に入れる戻し量 [%]（2026-10-14 段2o-5。既定 0 ＝ 本体の配列）。
     accel_release_pct: アクセル側に入れる戻し量 [%]（2026-10-20 段4-3。既定 0 ＝ 本体の配列。
     アクセル側の式の入力が 2 つの古いモデルは戻し量に依らない）。
-    ブレーキ側（u < 0）はアクセルの戻し量に依らない。"""
+    accel_push_pct: アクセル側に入れる踏み増し量 [%]（2026-10-23 段5-7b。既定 0。入力に踏み増し量が
+    無いモデルは依らない）。
+    ブレーキ側（u < 0）はアクセルの戻し量・踏み増し量に依らない。"""
     if coast_from not in ("mean", "accel"):
         raise ValueError(f"coast_from が不明: {coast_from}")
     rep, ug = like.speed_rep, like.u_grid
-    acc = _predict_grid(fitted.accel_side, rep, ug, accel_release_pct)
+    acc = _predict_accel_grid(fitted.accel_side, rep, ug, accel_release_pct, accel_push_pct)
     brk = _predict_grid(fitted.brake_side, rep, ug, release_pct)
     zero = acc if coast_from == "accel" else (acc + brk) / 2.0
     return np.where(ug[None, :] > 0, acc, np.where(ug[None, :] < 0, brk, zero))
@@ -318,6 +349,25 @@ def raw_accel_release_slices(
         [
             raw_grid(fitted, like, coast_from=coast_from, accel_release_pct=float(r))
             for r in release_grid
+        ]
+    )
+
+
+def raw_accel_push_slices(
+    fitted: FittedModel,
+    like: ForwardTable,
+    push_grid: Sequence[float],
+    *,
+    coast_from: str = "mean",
+) -> np.ndarray:
+    """アクセルの踏み増し量ごとの、単調化する前の配列 (踏み増し量の数, 行, u)（2026-10-23 段5-7b）。
+    u >= 0 の列はアクセル側の式にその踏み増し量を入れた値（戻し量は 0）、u < 0 の列は本体と同じ。
+    アクセル側の式の入力に踏み増し量が無いモデルは全スライスが本体と同じ。
+    """
+    return np.stack(
+        [
+            raw_grid(fitted, like, coast_from=coast_from, accel_push_pct=float(p))
+            for p in push_grid
         ]
     )
 

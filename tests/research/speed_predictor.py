@@ -236,9 +236,15 @@ class SpeedFilterPredictor:
         low = launch or stop
         release = 0.0 if low else self.dob.release_at(tau, u_d)
         a_release = 0.0 if low else self.dob.accel_release_at(tau, u_d)
-        if a_release > 0.0:
+        # 段5-7b: 表が踏み増しの表を持つときだけ踏み増し量を数える（持たなければ今までと同じ）
+        has_push = getattr(self.table, "accel_push_grid", None) is not None
+        a_push = 0.0 if low or not has_push else self.dob.accel_push_at(tau, u_d)
+        if a_release > 0.0 or a_push > 0.0:
+            extra = {"accel_push": a_push} if a_push > 0.0 else {}
             a = float(
-                self.table.accel(v, u_d, launch=False, stop=False, accel_release=a_release)
+                self.table.accel(
+                    v, u_d, launch=False, stop=False, accel_release=a_release, **extra
+                )
             )
         elif release > 0.0:
             a = float(self.table.accel(v, u_d, launch=False, stop=False, release=release))

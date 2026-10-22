@@ -104,6 +104,11 @@ class FwdRows:
     # u の最大からの戻り量で、u > 0 の行だけ正（最大 − u）、それ以外は 0（accel_release_amount）。
     # 省略（長さ 0）なら全行 0
     accel_release_pct: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    # 2026-10-23 段5-7b: 各行の「アクセルの踏み増し量」[%]。直近 RELEASE_WINDOW_S 秒（その行を
+    # 含む）の u の最小からの増え量で、u > 0 の行だけ正（u − 最小）、それ以外は 0
+    # （accel_push_amount）。
+    # 省略（長さ 0）なら全行 0
+    accel_push_pct: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
     def __post_init__(self) -> None:
         n = len(self.speed_kmh)
@@ -111,6 +116,8 @@ class FwdRows:
             object.__setattr__(self, "release_pct", np.zeros(n))
         if len(self.accel_release_pct) == 0 and n > 0:
             object.__setattr__(self, "accel_release_pct", np.zeros(n))
+        if len(self.accel_push_pct) == 0 and n > 0:
+            object.__setattr__(self, "accel_push_pct", np.zeros(n))
         if len(self.launch_row) == 0 and n > 0:
             object.__setattr__(self, "launch_row", np.zeros(n, dtype=bool))
 
@@ -171,6 +178,29 @@ def accel_release_amount(
         if not (u[i] > 0.0):  # NaN も含めて 0
             continue
         out[i] = float(np.nanmax(u[start : i + 1])) - u[i]
+    return out
+
+
+def accel_push_amount(
+    t_s: np.ndarray, u_pct: np.ndarray, window_s: float = RELEASE_WINDOW_S
+) -> np.ndarray:
+    """アクセルの踏み増し量 [%]（2026-10-23 段5-7b。accel_release_amount の踏み増し版）。1 本の
+    連続した時系列（時刻昇順）について、各点の「直近 window_s 秒（その点を含む）の u の最小
+    からの増え量」を、u > 0 の点だけ u − 最小として返す（u <= 0 の点は 0）。u が NaN の点は
+    最小の計算から外す（その点自身の踏み増し量は 0）。窓の u は max(u, 0) に切る
+    （ブレーキ直後のアクセルの踏み増し量 ＝ 今の u）。例: u = 4 から 6 へ踏み増した点は 2、
+    4 のままなら 0。
+    """
+    t = np.asarray(t_s, dtype=float)
+    u = np.asarray(u_pct, dtype=float)
+    out = np.zeros(len(t))
+    start = 0
+    for i in range(len(t)):
+        while t[start] < t[i] - window_s - 1e-9:
+            start += 1
+        if not (u[i] > 0.0):  # NaN も含めて 0
+            continue
+        out[i] = u[i] - float(np.nanmin(np.maximum(u[start : i + 1], 0.0)))
     return out
 
 
@@ -297,6 +327,7 @@ def read_fwd_rows(
     t_o: list[float] = []
     rel_o: list[float] = []
     arel_o: list[float] = []
+    apush_o: list[float] = []
     secs: set[str] = set()
     all_dt: list[float] = []
     for seg in segments:
@@ -316,6 +347,7 @@ def read_fwd_rows(
                     u_full[i] = uf
         rel_full = release_amount(ts, u_full)
         arel_full = accel_release_amount(ts, u_full)
+        apush_full = accel_push_amount(ts, u_full)
         for i, (_t, v, ap, bp, gov, _s, lagged) in enumerate(seg):
             if ap is None or bp is None:
                 dropped[DROP_NO_OPENING] += 1
@@ -354,6 +386,7 @@ def read_fwd_rows(
             t_o.append(float(t_keep[j]))
             rel_o.append(float(rel_full[i]))
             arel_o.append(float(arel_full[i]))
+            apush_o.append(float(apush_full[i]))
             secs.add(seg[i][5])
     dt = float(np.median(all_dt)) if all_dt else 0.0
     n = len(speed_o)
@@ -369,6 +402,7 @@ def read_fwd_rows(
         dt_row_s=np.full(n, dt),
         release_pct=np.array(rel_o, dtype=float),
         accel_release_pct=np.array(arel_o, dtype=float),
+        accel_push_pct=np.array(apush_o, dtype=float),
     )
     if mark_launch and not keep_stopped and n > 0:
         la = read_fwd_rows(
@@ -426,6 +460,7 @@ def take_rows(rows: FwdRows, mask: np.ndarray) -> FwdRows:
         release_pct=rows.release_pct[m],
         launch_row=rows.launch_row[m],
         accel_release_pct=rows.accel_release_pct[m],
+        accel_push_pct=rows.accel_push_pct[m],
     )
 
 
@@ -611,6 +646,7 @@ def concat_rows(parts: Sequence[FwdRows], source: str = "") -> FwdRows:
         release_pct=cat("release_pct"),
         launch_row=cat("launch_row").astype(bool),
         accel_release_pct=cat("accel_release_pct"),
+        accel_push_pct=cat("accel_push_pct"),
     )
 
 

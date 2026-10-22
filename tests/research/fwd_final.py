@@ -40,6 +40,7 @@ from tests.research.fwd_data import FwdRows
 from tests.research.fwd_map import (
     RELEASE_GRID_PCT,
     ForwardTable,
+    attach_accel_push,
     attach_accel_release,
     attach_release,
     load_forward_map,
@@ -85,6 +86,7 @@ def final_config(
     release_slices: bool = True,
     brake_exclude_launch: bool = True,
     accel_release_input: bool = True,
+    accel_push_input: bool = False,
 ) -> CvConfig:
     """既定は交差検証で良かった `1-1 絶対誤差`（乱数の本数だけ最終用に増やす）。
     層・活性化・停車まぎわ除外を変えたときは設定名を引数から作る。
@@ -110,6 +112,7 @@ def final_config(
         release_slices=release_slices,
         brake_exclude_launch=brake_exclude_launch,
         accel_release_input=accel_release_input,
+        accel_push_input=accel_push_input,
     )
 
 
@@ -184,6 +187,7 @@ def build_final_table(
             "seeds": cfg.seeds,
             "rollout_s": cfg.rollout_s,
             "accel_release_input_enabled": cfg.accel_release_input,
+            "accel_push_input_enabled": cfg.accel_push_input,
             "sources": "+".join(r.source for r in train_rows),
         },
     )
@@ -224,6 +228,22 @@ def build_final_table(
             release_pct=np.concatenate(arel_p) if arel_p else np.zeros(0),
             dt_row_s=np.concatenate(arel_dt) if arel_dt else np.zeros(0),
             release_grid=RELEASE_GRID_PCT,
+        )
+    if cfg.release_slices and cfg.accel_push_input and all(o[6] is not None for o in outs):
+        # 2026-10-23 段5-7b: アクセルの踏み増しの表。アクセルの戻しの表と同じ流れ。アクセルの行
+        # （u > 0）の踏み増し量で accel_push_max_pct と秒数を決め、足りなければ付けない
+        push_p, push_dt = [], []
+        for r in train_rows:
+            m = r.u_pct > 0.0
+            push_p.append(r.accel_push_pct[m])
+            push_dt.append(r.dt_row_s[m])
+        pslices = monotone_rows(np.mean([o[6] for o in outs], axis=0), like.u_grid)
+        tb = attach_accel_push(
+            tb,
+            pslices,
+            push_pct=np.concatenate(push_p) if push_p else np.zeros(0),
+            dt_row_s=np.concatenate(push_dt) if push_dt else np.zeros(0),
+            push_grid=RELEASE_GRID_PCT,
         )
     return tb, [(o[1], o[3]) for o in outs]
 
@@ -311,6 +331,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"（アクセル側の入力 {'3（戻し量あり）' if cfg.accel_release_input else '2（車速・u）'}、"
         f"戻し量 0.3% 以上のアクセルの行 {tb.meta.get('accel_release_rows_s', 0.0):.1f} 秒、"
         f"accel_release_max_pct {tb.meta.get('accel_release_max_pct', 0.0):.2f}%）"
+    )
+    print(
+        f"- アクセルの踏み増しの表: {'あり' if tb.accel_push_grid is not None else 'なし'}"
+        f"（踏み増し量 0.3% 以上のアクセルの行 {tb.meta.get('accel_push_rows_s', 0.0):.1f} 秒、"
+        f"accel_push_max_pct {tb.meta.get('accel_push_max_pct', 0.0):.2f}%）"
     )
     moved = float(np.abs(tb.accel_grid - tb.accel_before_mono).max())
     print(

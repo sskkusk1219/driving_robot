@@ -1062,3 +1062,86 @@ def test_side_row_speed_rep_roundtrips_through_pkl_and_old_pkl_is_none(tmp_path:
         pickle.dump(d, f)
     old = load_forward_map(tmp_path / "old.pkl")
     assert old.stop_speed_rep is None and old.launch_speed_rep is None
+
+
+# ───────── 2026-10-23 段5-7b: アクセルの踏み増しの表 ─────────
+
+APUSH_SLOPE = 0.05  # 踏み増し量 1% ごとに、u > 0 の側の加速度が u に比例して増える量
+
+
+def accel_push_table(with_release: bool = False) -> ForwardTable:
+    """（アクセルの戻しの表つきの）表に、アクセルの踏み増しの表を足す。層: u > 0 の列に
+    APUSH_SLOPE × 踏み増し量 × u を足す（u = 0 では本体と同じ。単調のまま）。"""
+    from tests.research.fwd_map import attach_accel_push  # noqa: PLC0415
+
+    tb = accel_release_table() if with_release else release_table()
+    grid = tb.u_grid
+    slices = np.stack(
+        [
+            tb.accel_grid + np.where(grid > 0, APUSH_SLOPE * p * grid, 0.0)[None, :]
+            for p in RELEASE_GRID_PCT
+        ]
+    )
+    return attach_accel_push(tb, slices, push_pct=np.full(1000, 1.0), dt_row_s=np.full(1000, 0.05))
+
+
+def test_accel_push_none_zero_or_no_table_is_identical_to_main() -> None:
+    tb = accel_push_table()
+    v = np.array([10.0, 40.0, 70.0])
+    u = np.array([-8.0, 3.0, 5.0])
+    base = tb.accel(v, u)
+    assert np.array_equal(tb.accel(v, u, accel_push=None), base)
+    assert np.array_equal(tb.accel(v, u, accel_push=0.0), base)
+    a = np.array([-4.0, 1.0, 0.5])
+    assert np.array_equal(tb.invert(v, a, accel_push=0.0)[0], tb.invert(v, a)[0])
+    plain = release_table()
+    assert plain.accel_push_grid is None
+    assert np.array_equal(plain.accel(v, u, accel_push=3.0), plain.accel(v, u))
+    assert np.array_equal(plain.invert(v, a, accel_push=3.0)[0], plain.invert(v, a)[0])
+
+
+def test_accel_push_interpolates_clamps_and_only_for_positive_u() -> None:
+    tb = accel_push_table()
+    assert tb.meta["accel_push_max_pct"] == pytest.approx(1.0)
+    tb.meta["accel_push_max_pct"] = 8.0
+    for p in (0.25, 1.0, 3.0):
+        got = tb.accel(30.0, 6.0, accel_push=p)
+        assert got == pytest.approx(tb.accel(30.0, 6.0) + APUSH_SLOPE * p * 6.0, abs=1e-9)
+    assert tb.accel(30.0, -5.0, accel_push=2.0) == pytest.approx(tb.accel(30.0, -5.0))
+    tb.meta["accel_push_max_pct"] = 2.0
+    assert tb.accel(30.0, 6.0, accel_push=5.0) == pytest.approx(tb.accel(30.0, 6.0, accel_push=2.0))
+    tb.launch_accel = tb.accel_grid + 1.0
+    assert tb.accel(30.0, 6.0, launch=True, accel_push=1.0) == pytest.approx(
+        tb.accel(30.0, 6.0, launch=True)
+    )
+
+
+def test_accel_push_and_release_add_their_deltas_and_invert_is_inverse() -> None:
+    tb = accel_push_table(with_release=True)
+    tb.meta["accel_push_max_pct"] = 8.0
+    tb.meta["accel_release_max_pct"] = 8.0
+    base = tb.accel(30.0, 6.0)
+    both = tb.accel(30.0, 6.0, accel_release=2.0, accel_push=3.0)
+    d_rel = tb.accel(30.0, 6.0, accel_release=2.0) - base
+    d_push = tb.accel(30.0, 6.0, accel_push=3.0) - base
+    assert both == pytest.approx(base + d_rel + d_push)
+    v = np.array([20.0, 30.0, 60.0, 90.0])
+    u = np.array([12.0, 6.0, 2.5, 9.0])
+    r = np.array([0.0, 1.0, 2.5, 6.0])
+    p = np.array([2.0, 0.0, 1.5, 4.0])
+    for kw in ({"accel_push": p}, {"accel_release": r, "accel_push": p}):
+        a = tb.accel(v, u, **kw)
+        back, flag = tb.invert(v, a, **kw)
+        assert np.allclose(back, u, atol=1e-6)
+        assert np.all(flag == POINT_MEASURED)
+
+
+def test_accel_push_table_survives_save_and_old_pkl_has_none(tmp_path) -> None:
+    from tests.research.fwd_map import load_forward_map, save_table  # noqa: PLC0415
+
+    tb = accel_push_table()
+    got = load_forward_map(save_table(tb, tmp_path / "p.pkl"))
+    assert np.array_equal(got.accel_push_grid, tb.accel_push_grid)
+    assert np.array_equal(got.accel_push_accel, tb.accel_push_accel)
+    plain = load_forward_map(save_table(release_table(), tmp_path / "q.pkl"))
+    assert plain.accel_push_grid is None and plain.accel_push_accel is None

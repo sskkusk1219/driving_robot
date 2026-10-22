@@ -456,6 +456,16 @@ class LearningSection:
     # fwd_final／pattern_drive._build_forward_model（meta accel_release_input_enabled に残る）。
     # 決める時期: 戻しの層（stop_release_layer_enabled）と切り分けた実機比較の後
     accel_release_input_enabled: bool = False
+    # 2026-10-23 段5-7b: アクセルの踏み増し量（今の u − 直近 RELEASE_WINDOW_S 秒の u の最小）を、
+    # 手順2 のニューラルネットのアクセル側の最後の入力にし（戻し量が on なら 4、off なら 3 入力）、
+    # アクセルの踏み増しの表（accel_push_*。attach_accel_push）も作るか。false なら入力・表とも
+    # 今までと完全に同じ（pkl の accel_push_* は None）。根拠は机上（5-7a の pkl）: 7.5 km/h 以上で
+    # 戻していないアクセルの行は、直近 3 秒の踏み増し量が大きいほど実測が表より強い
+    # （踏み増し量 0〜0.3%: −0.10、8% 超: +0.08 km/h/s）。今の表は保持と踏み増しの平均。
+    # 効く先: fwd_cv／fwd_final／pattern_drive._build_forward_model・fwd_plan.build_plan の
+    # アクセルの解き直し・fel／speed_predictor／dob の予測（meta accel_push_input_enabled に残る）。
+    # 決める時期: 5-7a の実機比較の後、C8・3 モード 1 組の実機比較
+    accel_push_input_enabled: bool = False
 
 
 @dataclass

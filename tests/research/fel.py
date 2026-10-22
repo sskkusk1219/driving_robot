@@ -119,6 +119,8 @@ class FelRows:
     dt_s: float = DT_S
     # アクセルの戻し量 [%]（アクセルの行だけ。ほかは 0。2026-10-20 段4-3）。None ＝ 使わない
     accel_release: np.ndarray | None = None
+    # アクセルの踏み増し量 [%]（アクセルの行だけ。ほかは 0。2026-10-23 段5-7b）。None ＝ 使わない
+    accel_push: np.ndarray | None = None
 
     def __len__(self) -> int:
         return len(self.r)
@@ -179,11 +181,13 @@ def _predict(
     kind: np.ndarray,
     release: np.ndarray,
     accel_release: np.ndarray | None = None,
+    accel_push: np.ndarray | None = None,
 ) -> np.ndarray:
     """行ごとの表の予測（kind で停止側・発進側・戻し・本体を引き分ける）。
     停止側は、表が停止側の戻しの層を持つときだけ戻し量を渡す（2026-10-20 段4-3。持たなければ
     今までと同じ）。本体は accel_release（アクセルの戻し量）を渡す（表がアクセルの戻しの表を
-    持たなければ無視される）。"""
+    持たなければ無視される）。accel_push（アクセルの踏み増し量。2026-10-23 段5-7b）も同じ
+    （表が踏み増しの表を持たなければ無視される）。"""
     pred = np.zeros(len(v))
     m = kind == KIND_STOP
     if m.any():
@@ -198,13 +202,16 @@ def _predict(
     m = kind == KIND_MAIN
     if m.any():
         arel = None if accel_release is None else accel_release[m]
-        pred[m] = table.accel(v[m], u[m], accel_release=arel)
+        apush = None if accel_push is None else accel_push[m]
+        pred[m] = table.accel(v[m], u[m], accel_release=arel, accel_push=apush)
     return pred
 
 
 def predict_rows(table: ForwardTable, rows: FelRows) -> np.ndarray:
     """rows の各行を table で予測し直した加速度（走行と同じ引き方）。"""
-    return _predict(table, rows.v, rows.u, rows.kind, rows.release, rows.accel_release)
+    return _predict(
+        table, rows.v, rows.u, rows.kind, rows.release, rows.accel_release, rows.accel_push
+    )
 
 
 def fel_rows(
@@ -245,6 +252,7 @@ def fel_rows(
     k = int(round(RELEASE_WINDOW_S / dt_s))
     release = np.where(pedal < 0, u - _trailing_min(u, k), 0.0)
     accel_release = np.where(pedal > 0, -_trailing_min(-u, k) - u, 0.0)  # 段4-3
+    accel_push = np.where(pedal > 0, u - _trailing_min(np.maximum(u, 0.0), k), 0.0)  # 段5-7b
 
     refv = np.nan_to_num(ref, nan=0.0)
     stop_soon = np.zeros(n, bool)
@@ -264,7 +272,7 @@ def fel_rows(
     )
 
     vv = np.nan_to_num(v, nan=0.0)
-    pred = _predict(table, vv, u, kind, release, accel_release)
+    pred = _predict(table, vv, u, kind, release, accel_release, accel_push)
     r = acc - pred
 
     sw = np.concatenate([[False], pedal[1:] != pedal[:-1]])
@@ -281,7 +289,7 @@ def fel_rows(
     return FelRows(
         r=r[ok], pedal=pedal[ok].astype(int), v=v[ok], u=u[ok], rel=rel[ok], stop20=stop20[ok],
         acc=acc[ok], kind=kind[ok].astype(int), release=release[ok], dt_s=dt_s,
-        accel_release=accel_release[ok],
+        accel_release=accel_release[ok], accel_push=accel_push[ok],
     )
 
 

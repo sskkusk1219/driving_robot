@@ -1191,6 +1191,7 @@ def _build_forward_model(
     side_table_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
     launch_rows_to_stop_max: bool = False,
     side_row_speed_rep: str = "grid",
+    accel_push_input_enabled: bool = False,
 ) -> _BuiltModel:
     """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
 
@@ -1202,6 +1203,10 @@ def _build_forward_model(
     段4-3）が true のときだけ、アクセル側のニューラルネットの入力に「アクセルの戻し量」を足し
     （3 入力）、アクセルの戻しの表も作る。false は (車速, u) の 2 入力・戻しの表なし（0ee7c1b より
     前と同じ）。値は pkl meta accel_release_input_enabled に残る。
+    accel_push_input_enabled（learning.accel_push_input_enabled。既定 false。2026-10-23 段5-7b）が
+    true のときだけ、アクセル側の入力に「アクセルの踏み増し量」をさらに足し（戻し量が on なら 4、
+    off なら 3 入力）、アクセルの踏み増しの表も作る。false は今までと完全に同じ。値は pkl meta
+    accel_push_input_enabled に残る。
     """
     from tests.research import fwd_final, fwd_tool, fwd_torch  # noqa: PLC0415
     from tests.research.fwd_map import (  # noqa: PLC0415
@@ -1225,6 +1230,7 @@ def _build_forward_model(
         drop_stop_approach=FORWARD_DROP_STOP_APPROACH,
         table_u_step_pct=FORWARD_TABLE_U_STEP_PCT,
         accel_release_input=accel_release_input_enabled,
+        accel_push_input=accel_push_input_enabled,
     )
     use_iter = fwd_torch.MAX_ITER if max_iter is None else max_iter
     say(f"  設定: {cfg8.name}（隠れ層 {cfg8.hidden}・{cfg8.activation}・損失 {cfg8.loss}）、"
@@ -1237,6 +1243,7 @@ def _build_forward_model(
     )
     wall = time.perf_counter() - started
     table.meta["accel_release_input_enabled"] = bool(accel_release_input_enabled)
+    table.meta["accel_push_input_enabled"] = bool(accel_push_input_enabled)
     for seed, sec in secs:
         say(f"    乱数{seed}: 学習 {sec:.1f} 秒")
     say(f"  学習の合計 {sum(s for _, s in secs):.1f} 秒・壁時計 {wall:.1f} 秒")
@@ -1271,6 +1278,18 @@ def _build_forward_model(
         say(f"  アクセルの戻しの表: 戻し量 0.3% 以上のアクセルの行 {a_rel_s:.1f} 秒、"
             f"戻し量の格子 {[float(x) for x in table.accel_release_grid]} %、"
             f"頭打ち {table.meta['accel_release_max_pct']:.2f} %")
+    # 2026-10-23 段5-7b: アクセルの踏み増しの表（build_final_table が付ける）
+    a_push_s = float(table.meta.get("accel_push_rows_s", 0.0))
+    if table.accel_push_grid is None:
+        if accel_push_input_enabled:
+            say(f"  アクセルの踏み増しの表: 行が足りないので作らない（{a_push_s:.1f} 秒）")
+        else:
+            say("  アクセルの踏み増し量: 入力にしない・表も作らない"
+                "（learning.accel_push_input_enabled: false）")
+    else:
+        say(f"  アクセルの踏み増しの表: 踏み増し量 0.3% 以上のアクセルの行 {a_push_s:.1f} 秒、"
+            f"踏み増し量の格子 {[float(x) for x in table.accel_push_grid]} %、"
+            f"頭打ち {table.meta['accel_push_max_pct']:.2f} %")
     band_lo = float(table.meta.get("stop_max_speed_kmh", 0.0)) or 7.5
     band_s = sum(release_seconds_in_band(r, band_lo) for r in rows)
     table.meta["brake_release_band_lo_kmh"] = band_lo
@@ -1460,6 +1479,7 @@ def build_ff_model(
             side_table_opening_source=cfg.learning.side_table_opening_source,
             stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
             accel_release_input_enabled=cfg.learning.accel_release_input_enabled,
+            accel_push_input_enabled=cfg.learning.accel_push_input_enabled,
             launch_accel_side_source=cfg.learning.launch_accel_side_source,
             side_table_accel_window_s=cfg.learning.side_table_accel_window_s,
             launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,
@@ -1534,6 +1554,7 @@ def build_ff_model(
             side_table_opening_source=cfg.learning.side_table_opening_source,
             stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
             accel_release_input_enabled=cfg.learning.accel_release_input_enabled,
+            accel_push_input_enabled=cfg.learning.accel_push_input_enabled,
             launch_accel_side_source=cfg.learning.launch_accel_side_source,
             side_table_accel_window_s=cfg.learning.side_table_accel_window_s,
             launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,

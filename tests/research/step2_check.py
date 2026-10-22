@@ -608,6 +608,9 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
       stop_release_layer_enabled。無い古い pkl は層の有無から）
     - アクセルの戻し量をニューラルネットの入力にした設定か（meta の accel_release_input_enabled。
       learning.accel_release_input_enabled。無い古い pkl は戻しの表の有無から）
+    - アクセルの踏み増し量をニューラルネットの入力にした設定か（meta の accel_push_input_enabled。
+      learning.accel_push_input_enabled。2026-10-23 段5-7b。無い古い pkl は表の有無から）と、
+      踏み増し量 0.3% 以上の行の秒数・頭打ち
     - 停止側の戻しの層ごとの秒数（meta の stop_release_layer_s。戻し量の格子の順）
     - アクセルの戻し量 0.3% 以上の行の秒数と、頭打ち（戻し量の p95）
     - ブレーキの戻しの行 7.5〜20 km/h の秒数（meta の brake_release_band_s。無い古い pkl は
@@ -625,6 +628,11 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
     a_in = m.get("accel_release_input_enabled")
     if a_in is None:  # 古い pkl（設定が meta に無い）は戻しの表の有無で見る
         a_in = table.accel_release_grid is not None
+    p_in = m.get("accel_push_input_enabled")
+    if p_in is None:  # 古い pkl（設定が meta に無い）は踏み増しの表の有無で見る
+        p_in = table.accel_push_grid is not None
+    p_s = m.get("accel_push_rows_s")
+    p_cap = m.get("accel_push_max_pct")
     grid = m.get("stop_release_grid_pct") or [float(x) for x in RELEASE_GRID_PCT]
     band_s = m.get("brake_release_band_s")
     lo = float(m.get("brake_release_band_lo_kmh") or m.get("stop_max_speed_kmh") or 7.5)
@@ -640,6 +648,10 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
         metrics["accel_release_rows_s"] = float(a_s)
     if a_cap is not None:
         metrics["accel_release_max_pct"] = float(a_cap)
+    if p_s is not None:
+        metrics["accel_push_rows_s"] = float(p_s)
+    if p_cap is not None:
+        metrics["accel_push_max_pct"] = float(p_cap)
     if band_s is not None:
         metrics["brake_release_band_s"] = float(band_s)
     stop_part = (
@@ -655,6 +667,10 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
         + "・アクセルの戻し "
         + ("なし" if a_s is None else f"{_f(float(a_s), 1)}s・頭打ち {_f(float(a_cap or 0.0))}%"
            + ("" if table.accel_release_grid is not None else "（表は作らず）")),
+        f"アクセルの踏み増し量の入力 {'あり' if p_in else 'なし'}設定"
+        + "・アクセルの踏み増し "
+        + ("なし" if p_s is None else f"{_f(float(p_s), 1)}s・頭打ち {_f(float(p_cap or 0.0))}%"
+           + ("" if table.accel_push_grid is not None else "（表は作らず）")),
         f"ブレーキの戻し {lo:g}〜{hi:g} km/h "
         + ("-" if band_s is None else f"{_f(float(band_s), 1)}s"),
     ]

@@ -275,8 +275,8 @@ class WindowGroup:
 
 def _side_accel(side: TorchSide, v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     """片側のネットを物理単位（km/h/s）で評価する。入力が 3 つの側（ブレーキ側）は
-    戻し量 0 で評価する（積み上げの追加学習は戻し量を使わない。2026-10-14 段2o-5）。"""
-    cols = [v, u] if side.n_inputs == 2 else [v, u, torch.zeros_like(v)]
+    戻し量・踏み増し量 0 で評価する（積み上げの追加学習は戻し量を使わない。2026-10-14 段2o-5）。"""
+    cols = [v, u] + [torch.zeros_like(v) for _ in range(side.n_inputs - 2)]
     x = torch.stack(cols, dim=1)
     xm = torch.as_tensor(side.x_mean, dtype=x.dtype)
     xs = torch.as_tensor(side.x_std, dtype=x.dtype)

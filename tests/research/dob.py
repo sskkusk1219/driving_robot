@@ -102,6 +102,24 @@ class PedalDisturbanceObserver:
         m = max((u for ht, u, _, _ in self._hist if t0 - 1e-9 <= ht <= t1 + 1e-9), default=u_d)
         return max(m - u_d, 0.0)
 
+    def _accel_push(self, tau: float, u_d: float) -> float:
+        """アクセルの遅れた u（> 0）の踏み増し量 ＝ u_d − 時刻 τ − la までの直近
+        release_window_s 秒の u の最小（その時刻を含む）（2026-10-23 段5-7b）。
+        ブレーキ・窓 0 は 0。"""
+        if u_d <= 0.0 or self.release_window_s <= 0.0 or self.lag_accel_s is None:
+            return 0.0
+        t1 = tau - self.lag_accel_s
+        t0 = t1 - self.release_window_s
+        m = min(
+            (max(u, 0.0) for ht, u, _, _ in self._hist if t0 - 1e-9 <= ht <= t1 + 1e-9),
+            default=u_d,
+        )
+        return max(u_d - m, 0.0)
+
+    def accel_push_at(self, tau: float, u_d: float) -> float:
+        """時刻 τ のアクセルの踏み増し量（`_accel_push` の公開名。段5-7b）。"""
+        return self._accel_push(tau, u_d)
+
     def accel_release_at(self, tau: float, u_d: float) -> float:
         """時刻 τ のアクセルの戻し量（`_accel_release` の公開名。段4-3）。"""
         return self._accel_release(tau, u_d)
@@ -174,10 +192,14 @@ class PedalDisturbanceObserver:
         meas = (speed_kmh - prev_v) / dt
         release = self._release(t, u_d)
         a_release = self._accel_release(t, u_d)
-        if a_release > 0.0:
+        # 段5-7b: 表が踏み増しの表を持つときだけ踏み増し量を数える（持たなければ今までと同じ）
+        has_push = getattr(self.table, "accel_push_grid", None) is not None
+        a_push = self._accel_push(t, u_d) if has_push else 0.0
+        if a_release > 0.0 or a_push > 0.0:
+            extra = {"accel_push": a_push} if a_push > 0.0 else {}
             pred = float(
                 self.table.accel(
-                    speed_kmh, u_d, launch=False, stop=False, accel_release=a_release
+                    speed_kmh, u_d, launch=False, stop=False, accel_release=a_release, **extra
                 )
             )
         elif release > 0.0:
