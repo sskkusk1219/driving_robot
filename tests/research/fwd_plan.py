@@ -484,7 +484,7 @@ def build_plan(
         accel_now = want_accel & (u_a > 0.0)
         midway = _launch_midway(stop, accel_now)
         # ブレーキ側: 発進の途中は発進側、それ以外は停止側。発進の途中でも、動き出す開度より深い
-        # 行（基準が停車速度より上）は停止側で解き直す
+        # 行（基準が LAUNCH_MOVING_KMH より上）は停止側で解き直す
         launch_b = low & midway
         stop_b = low & ~midway
         breakaway = table.meta.get("launch_breakaway_u_pct")
@@ -492,7 +492,7 @@ def build_plan(
             u_b_l, _ = table.invert(v, need_b, launch=True)
             # 実機の pkl の meta は符号つき（ブレーキ側 ＝ 負）なので、大きさで比べる
             deep = (
-                launch_b & (v > STOP_SPEED_KMH)
+                launch_b & (v > LAUNCH_MOVING_KMH)
                 & (np.abs(np.asarray(u_b_l)) > abs(float(breakaway)))
             )
             launch_b, stop_b = launch_b & ~deep, stop_b | deep
@@ -661,6 +661,12 @@ def _solve_sides(
         coast = np.where(side, coast_s, coast)
         u, kind = np.where(side, u_s, u), np.where(side, kind_s, kind)
     return coast, u, kind
+
+
+# 段5-2: 発進の途中で「動き出した」とみなす基準車速 [km/h]（ProblemReport 段5 の表を引く条件の ①②
+# の境目 0.5 km/h。手順2 の fwd_data.STOP_SPEED_KMH と同じ値）。停車保持の判定の STOP_SPEED_KMH
+# （0.02）とは別。これ以下（① まだ止まっている所）は動き出す開度より深くても発進側のまま
+LAUNCH_MOVING_KMH = 0.5
 
 
 def _launch_midway(stop: np.ndarray, accel_now: np.ndarray) -> np.ndarray:
