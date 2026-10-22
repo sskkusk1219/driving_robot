@@ -50,7 +50,7 @@ feedforward:
   candidate: C15
   # 2次多項式 Ridge 逆モデル（本番 src/domain/model_training.py と同型）の保存先
   # ファイル名の日時はローカル時刻（JST）。2026-09-20 以前の pkl は UTC 命名（JST−9h）
-  model_path: tests/research/results/models/fwd_model_20261019_003112.pkl
+  model_path: tests/research/results/models/fwd_model_20261022_020945.pkl
   # 停車〜クリープ域（滑らかなモデルで表現できないため定数で補う）
   creep_speed_kmh: 5.0  # クリープで到達する車速 [km/h]
   creep_rate_kmhs: 1.42  # クリープ加速率 [km/h/s]
@@ -616,10 +616,10 @@ learning:
   # 外挿）、measured ＝ 手順2 の行を 2% のマスで測った点（帯の下端 2.5 km/h 以上の行）／max(クリープ,
   # 本体)（帯の上端 2.5 km/h 以下の行）。マス幅 2%・0.5 秒・2.5 km/h は仮値。既定は今と同じ。
   # 効く先: 手順2 の発進側の表（meta launch_accel_side_source）。決める時期: 段5-3 の机上の後の実機 1 組
-  launch_accel_side_source: extrapolate
+  launch_accel_side_source: measured
   # 2026-10-22 段5-3: 発進側・停止側の表を作るときの加速度の窓 [s]（本体は 1.0）。既定 0.5 ＝ 今まで。
   # 仮値。効く先: 手順2 の発進側・停止側の表と動き出す開度の行の読み方。決める時期: 段5-3 の机上の後
-  side_table_accel_window_s: 0.5
+  side_table_accel_window_s: 1.0
   # 2026-10-22 段5-4 b: 発進側の表を停止側と同じ車速の行（7.5 km/h 未満）まで置き換えるか。false は
   # 今まで（発進側は 0〜5 km/h だけ。5〜7.5 km/h の開度 0 が 発進側 −0.44 ↔ 停止側 0.00）。true は
   # 停止側の u ≦ 0 の値を写し、アクセル側は launch_accel_side_source で作る。効く先: 手順2 の発進側の表
