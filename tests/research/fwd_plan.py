@@ -60,7 +60,13 @@ from tests.research.ff_model import STOP_SPEED_KMH
 from tests.research.fwd_data import DEFAULT_ACCEL_LAG_S as _DATA_ACCEL_LAG_S
 from tests.research.fwd_data import DEFAULT_BRAKE_LAG_S as _DATA_BRAKE_LAG_S
 from tests.research.fwd_data import RELEASE_WINDOW_S
-from tests.research.fwd_map import POINT_FILLED, POINT_MEASURED, POINT_OUT, ForwardTable
+from tests.research.fwd_map import (
+    LAUNCH_MOVING_KMH,
+    POINT_FILLED,
+    POINT_MEASURED,
+    POINT_OUT,
+    ForwardTable,
+)
 
 DEFAULT_CONTROL_PERIOD_S = 0.05
 # 遅れ L の既定は fwd_data と同じ（データ由来。fwd_data の定数のコメント参照）。
@@ -366,6 +372,7 @@ def build_plan(
     low_speed_side_rule: str = "legacy",
     release_table_min_kmh: float = 0.0,
     switch_lead: bool = False,
+    launch_midway_brake_cap: bool = False,
     _lead_extra: np.ndarray | None = None,
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
@@ -432,6 +439,7 @@ def build_plan(
             "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
+            "launch_midway_brake_cap": launch_midway_brake_cap,
         }
         first = build_plan(
             ref_at, duration_s, table, **common,
@@ -603,6 +611,8 @@ def build_plan(
         )
         # (ロ) 発進の途中は踏み増さない（区間ごとに後ろからの最深に置き換える）
         _no_deeper_brake_in_midway(effort, flag, side_brake_dir, midway)
+        if launch_midway_brake_cap:  # 段5-6 追加 A1: (ロ) の後。浅くする向きだけ
+            _cap_midway_brake(effort, flag, midway, brake_deadband_pct, table.meta)
     effort = np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)
     stats = None
     ret = return_time_of(table, accel_deadband_pct, brake_deadband_pct)
@@ -733,10 +743,9 @@ def _solve_sides(
     return coast, u, kind
 
 
-# 段5-2: 発進の途中で「動き出した」とみなす基準車速 [km/h]（ProblemReport 段5 の表を引く条件の ①②
-# の境目 0.5 km/h。手順2 の fwd_data.STOP_SPEED_KMH と同じ値）。停車保持の判定の STOP_SPEED_KMH
-# （0.02）とは別。これ以下（① まだ止まっている所）は動き出す開度より深くても発進側のまま
-LAUNCH_MOVING_KMH = 0.5
+# 段5-2: LAUNCH_MOVING_KMH（0.5 km/h）は fwd_map で定義（ProblemReport 段5 の表を引く条件の ①② の
+# 境目）。停車保持の判定の STOP_SPEED_KMH（0.02）とは別。これ以下（① まだ止まっている所）は
+# 動き出す開度より深くても発進側のまま
 
 
 def _launch_midway(stop: np.ndarray, accel_now: np.ndarray) -> np.ndarray:
@@ -776,6 +785,22 @@ def _no_deeper_brake_in_midway(
                 elif best_j >= 0:  # 自分より後ろに深いブレーキがある → それに置き換える
                     effort[i], flag[i], side_brake[i] = best_e, flag[best_j], side_brake[best_j]
             i -= 1
+
+
+def _cap_midway_brake(
+    effort: np.ndarray, flag: np.ndarray, midway: np.ndarray, brake_deadband_pct: float,
+    meta: dict[str, Any],
+) -> None:
+    """段5-6 追加 A1: 発進の途中の行のブレーキを、動き出す開度（meta launch_breakaway_u_pct の
+    大きさ。min からの量）に min を足した深さで頭打ちにする（effort をその場で書き換える。
+    浅くする向きだけ。停車保持・アクセル・惰行の行は触らない）。meta が無い／非有限なら何もしない。
+    余裕は足さない。"""
+    bk = meta.get("launch_breakaway_u_pct")
+    if bk is None or not np.isfinite(bk):
+        return
+    cap = -(brake_deadband_pct + abs(float(bk)))
+    hit = midway & (flag != FLAG_STOP) & (effort < cap)
+    effort[hit] = cap
 
 
 def low_speed_sides(

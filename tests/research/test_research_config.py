@@ -1321,3 +1321,11 @@ def test_stop_release_and_stop_exclusion_settings_default_and_validation() -> No
         setattr(lr, key, good)
         assert not problems_about(key)
 
+
+def test_launch_breakaway_settings_defaults_and_yaml() -> None:
+    """段5-6 追加 A1・A2: config.py の既定は false、既定の yaml は true。"""
+    assert cfgmod.ForwardMapSection().launch_midway_brake_cap is False
+    assert cfgmod.ForwardMapSection().launch_table_breakaway_floor is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.forward_map.launch_midway_brake_cap is True
+    assert cfg.forward_map.launch_table_breakaway_floor is True

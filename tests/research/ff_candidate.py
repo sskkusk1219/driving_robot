@@ -765,6 +765,13 @@ class ForwardMapFeedforward:
         self._plan = None
         return True
 
+    def apply_launch_breakaway_floor(self, enabled: bool) -> None:
+        """段5-6 追加 A2: 表に launch_breakaway_floor を立てる（load_model の後）"""
+        if enabled == self.table.launch_breakaway_floor:
+            return
+        self._table = self.table.with_launch_breakaway_floor(enabled)
+        self._plan = None
+
     def build_plan(
         self,
         ref_at: Callable[[float], float],
@@ -787,6 +794,7 @@ class ForwardMapFeedforward:
         low_speed_side_rule: str = "legacy",
         release_table_min_kmh: float = 0.0,
         switch_lead: bool = False,
+        launch_midway_brake_cap: bool = False,
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
 
@@ -818,6 +826,7 @@ class ForwardMapFeedforward:
             low_speed_side_rule=low_speed_side_rule,
             release_table_min_kmh=release_table_min_kmh,
             switch_lead=switch_lead,
+            launch_midway_brake_cap=launch_midway_brake_cap,
         )
         return self._plan
 

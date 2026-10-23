@@ -1528,3 +1528,84 @@ def test_accel_push_with_release_axis_solves_both_and_release_times_unchanged() 
     dn = plan_for(lambda t: 80.0 - 5.0 * t, 4.0, tb)
     dn0 = plan_for(lambda t: 80.0 - 5.0 * t, 4.0, _accel_release_variant(with_layers=False))
     assert np.array_equal(dn.effort_pct, dn0.effort_pct)
+
+
+# ───────── 2026-10-23 段5-6 追加 A1・A2: 動き出す開度の頭打ち・床 ─────────
+
+
+def test_cap_midway_brake_helper_only_midway_and_only_shallower() -> None:
+    from tests.research.fwd_plan import FLAG_COAST, FLAG_MEASURED, _cap_midway_brake
+
+    eff = np.array([-9.0, -9.0, -6.0, 0.0, 3.0, -9.0, -9.0])
+    flag = np.array([FLAG_STOP, FLAG_MEASURED, FLAG_MEASURED, FLAG_COAST, FLAG_MEASURED,
+                     FLAG_MEASURED, FLAG_MEASURED])
+    mid = np.array([1, 1, 1, 1, 0, 0, 1], dtype=bool)
+    _cap_midway_brake(eff, flag, mid, 4.2, {"launch_breakaway_u_pct": -4.3})
+    cap = -(4.2 + 4.3)
+    # 停車保持の行・発進の途中でない行・浅い行・アクセルは変えない。深い行は cap まで
+    assert eff.tolist() == [-9.0, cap, -6.0, 0.0, 3.0, -9.0, cap]
+    for meta in ({}, {"launch_breakaway_u_pct": float("nan")}, {"launch_breakaway_u_pct": None}):
+        e2 = np.array([-9.0, -9.0])
+        _cap_midway_brake(e2, np.array([FLAG_MEASURED] * 2), np.ones(2, dtype=bool), 4.2, meta)
+        assert e2.tolist() == [-9.0, -9.0]
+
+
+def test_launch_midway_brake_cap_in_plan() -> None:
+    tb = _pedal_table(dl=3.0, ds=2.4, breakaway=-1.0)  # cap ＝ −(BD + 1.0) ＝ −8
+    off = plan_for(_slow_launch, 10.0, tb, low_speed_side_rule="dir")
+    on = plan_for(_slow_launch, 10.0, tb, low_speed_side_rule="dir", launch_midway_brake_cap=True)
+    stop = off.flag == FLAG_STOP
+    first_accel = int(np.flatnonzero((off.effort_pct > 0.0) & ~stop)[0])
+    first_move = int(np.flatnonzero(~stop)[0])
+    cap = -(BD + 1.0)
+    assert off.effort_pct[first_move:first_accel].min() < cap - 1e-9  # 前提: 頭打ちが要る計画
+    assert on.effort_pct[first_move:first_accel].min() >= cap - 1e-9
+    # 発進の途中より後・手前は同じ。途中も浅くなる向きだけ
+    assert np.array_equal(on.effort_pct[first_accel:], off.effort_pct[first_accel:])
+    assert np.array_equal(on.effort_pct[:first_move], off.effort_pct[:first_move])
+    assert np.all(on.effort_pct[first_move:first_accel] >= off.effort_pct[first_move:first_accel])
+    # 既定（False）は今と同じ、meta が無い表では on でも同じ
+    dflt = plan_for(
+        _slow_launch, 10.0, tb, low_speed_side_rule="dir", launch_midway_brake_cap=False
+    )
+    assert np.array_equal(dflt.effort_pct, off.effort_pct)
+    nob = _pedal_table(dl=3.0, ds=2.4)
+    a = plan_for(_slow_launch, 10.0, nob, low_speed_side_rule="dir")
+    b = plan_for(_slow_launch, 10.0, nob, low_speed_side_rule="dir", launch_midway_brake_cap=True)
+    assert np.array_equal(a.effort_pct, b.effort_pct)
+
+
+def test_launch_breakaway_floor_in_table_lookup() -> None:
+    base = _pedal_table(dl=12.0, ds=2.4, breakaway=-4.0)
+    fl = base.with_launch_breakaway_floor(True)
+    assert base.launch_breakaway_floor is False and fl.launch_breakaway_floor is True
+    v = np.array([0.0, 0.3, 0.6, 0.0, 0.0])
+    u = np.array([-9.0, -9.0, -9.0, -3.0, 5.0])
+    raw = np.asarray(base.accel(v, u, launch=True))
+    out = np.asarray(fl.accel(v, u, launch=True))
+    assert raw[0] > 0.0 and raw[1] > 0.0  # 前提: 発進側の表は深いブレーキで加速と言う
+    # 止まっている範囲（0.5 以下）で深い（|u| > 4）行だけ min(表, 0)
+    assert out[0] == 0.0 and out[1] == 0.0
+    assert out[2] == raw[2] and out[3] == raw[3] and out[4] == raw[4]
+    # launch=False（本体・停止側）は触らない
+    assert np.array_equal(fl.accel(v, u), base.accel(v, u))
+    assert np.array_equal(fl.accel(v, u, stop=True), base.accel(v, u, stop=True))
+    # スカラー入力
+    assert fl.accel(0.0, -9.0, launch=True) == 0.0
+    # invert: 止まっている範囲で動き出す開度より深い解は -4 に頭打ち。動いていれば触らない
+    ui, _ = fl.invert(np.array([0.0, 2.0]), np.array([-5.0, -5.0]), launch=True)
+    ur, _ = base.invert(np.array([0.0, 2.0]), np.array([-5.0, -5.0]), launch=True)
+    assert ur[0] < -4.0 and ui[0] == -4.0 and ui[1] == ur[1]
+    # meta が無い・非有限なら何もしない
+    nob = _pedal_table(dl=12.0, ds=2.4).with_launch_breakaway_floor(True)
+    assert np.array_equal(
+        nob.accel(v, u, launch=True), _pedal_table(dl=12.0, ds=2.4).accel(v, u, launch=True)
+    )
+
+
+def test_launch_breakaway_floor_off_is_identical_plan() -> None:
+    tb = _pedal_table(dl=3.0, ds=2.4, breakaway=-1.0)
+    a = plan_for(_slow_launch, 10.0, tb, low_speed_side_rule="dir")
+    tb_off = tb.with_launch_breakaway_floor(False)
+    b = plan_for(_slow_launch, 10.0, tb_off, low_speed_side_rule="dir")
+    assert np.array_equal(a.effort_pct, b.effort_pct)

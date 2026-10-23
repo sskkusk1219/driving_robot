@@ -251,6 +251,8 @@ def load_feedforward(cfg: ResearchConfig) -> CandidateFeedforward | ForwardMapFe
         # 2026-10-19 段2s-2: FEL（補正表 c）。有効で pkl に補正表があるときだけ f + c の表にする
         if cfg.fel.enabled:
             ff.apply_fel(cfg.fel.method)
+        # 段5-6 追加 A2: 発進側の表の動き出す開度の床（既定 false ＝ 今と同じ）
+        ff.apply_launch_breakaway_floor(cfg.forward_map.launch_table_breakaway_floor)
         return ff
     ff.set_params(feedforward_params(cfg))
     ff.set_research_params(research_ff_params(cfg))
@@ -312,6 +314,7 @@ def _prepare_forward_map_plan(
         low_speed_side_rule=fm.low_speed_side_rule,  # 段5-2
         release_table_min_kmh=fm.release_table_min_kmh,  # 段5-3
         switch_lead=fm.switch_lead_enabled,  # 段5-5c
+        launch_midway_brake_cap=fm.launch_midway_brake_cap,  # 段5-6 追加 A1
     )
     meta = ff.table.meta
     # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）

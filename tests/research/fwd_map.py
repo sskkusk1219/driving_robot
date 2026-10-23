@@ -66,6 +66,10 @@ DEFAULT_U_STEP_PCT = 2.0  # 仮値（段2f の集計で決めた刻み）
 DEFAULT_MIN_S = 1.0  # 仮値: 穴とみなす秒数（少ない行の中央値を信じない）
 # 仮値: 単調化での穴埋め点の重み [秒相当]。実測点（重み＝秒数、≥ min_s）より十分小さくする
 FILLED_WEIGHT_S = 0.1
+# 段5-2: 発進の途中で「動き出した」とみなす基準車速 [km/h]（fwd_plan も使う）。A2
+# （ForwardTable.launch_breakaway_floor）では、これ以下を「まだ止まっている」とみなす
+LAUNCH_MOVING_KMH = 0.5
+
 # 仮値（発進側の表 attach_launch）: 1 マスの最小秒数と、発進側を作るのに要る「動いている行」の
 # 合計秒数。手順2 `193155` の発進側は min＋3〜5% に約 12 秒（0.5% のマスで 1〜4 秒）。
 # 段2o-4 の確認でマスごとの秒数を見て決める
@@ -123,6 +127,12 @@ class ForwardTable:
     # それ以外は speed_rep と同じ。None ＝ 本体と同じ speed_rep（今までと完全に同じ）
     launch_speed_rep: np.ndarray | None = None
     stop_speed_rep: np.ndarray | None = None
+    # 2026-10-23 段5-6 追加 A2（forward_map.launch_table_breakaway_floor）: true なら、発進側の表を
+    # 引くとき（accel・invert の launch=True）、車速が LAUNCH_MOVING_KMH 以下で、ブレーキが meta の
+    # launch_breakaway_u_pct（動き出す開度）より深いとき、加速度を min(表の値, 0) にする（accel）／
+    # 開度を動き出す開度で頭打ちにする（invert）。pkl は変えず引くときに掛ける。meta が無い／非有限
+    # なら何もしない。False ＝ 今と完全に同じ。mode_drive が設定からロード後に立てる
+    launch_breakaway_floor: bool = False
     # 戻しの表（2026-10-14 段2o-5。attach_release）。release_grid ＝ 戻し量 [%] の格子（昇順・正）、
     # release_accel ＝ (戻し量の数, 行, 格子点) 加速度。戻し量 0 は本体 accel_grid。
     # None ＝ 戻しの表なし（今までと完全に同じ）。戻し量は meta["release_max_pct"] で頭打ちにする
@@ -335,7 +345,42 @@ class ForwardTable:
             return self.stop_kind
         return self.point_kind
 
+    def _breakaway_floor_u(self, launch: bool) -> float | None:
+        """A2 が効くとき、動き出す開度の大きさ（正）。効かないとき None。"""
+        if not (launch and self.launch_breakaway_floor and self.launch_accel is not None):
+            return None
+        bk = self.meta.get("launch_breakaway_u_pct")
+        if bk is None or not np.isfinite(bk):
+            return None
+        return abs(float(bk))
+
+    def with_launch_breakaway_floor(self, enabled: bool) -> ForwardTable:
+        """A2 のフラグを立てた（下ろした）新しい表を返す。"""
+        return replace(self, launch_breakaway_floor=bool(enabled))
+
     def accel(
+        self,
+        v_kmh: np.ndarray | float,
+        u_pct: np.ndarray | float,
+        *,
+        launch: bool = False,
+        release: np.ndarray | float | None = None,
+        stop: bool = False,
+        accel_release: np.ndarray | float | None = None,
+        accel_push: np.ndarray | float | None = None,
+    ) -> Any:
+        out = self._accel(
+            v_kmh, u_pct, launch=launch, release=release, stop=stop,
+            accel_release=accel_release, accel_push=accel_push,
+        )
+        bk = self._breakaway_floor_u(launch)
+        if bk is None:
+            return out
+        v, u = np.broadcast_arrays(np.asarray(v_kmh, dtype=float), np.asarray(u_pct, dtype=float))
+        deep = (v <= LAUNCH_MOVING_KMH) & (u < 0.0) & (np.abs(u) > bk)
+        return _scalar_or_array(np.where(deep, np.minimum(np.asarray(out), 0.0), np.asarray(out)))
+
+    def _accel(
         self,
         v_kmh: np.ndarray | float,
         u_pct: np.ndarray | float,
@@ -394,6 +439,30 @@ class ForwardTable:
         return _scalar_or_array(np.where(u > 0.0, out_a, out_b))
 
     def invert(
+        self,
+        v_kmh: np.ndarray | float,
+        a_kmhs: np.ndarray | float,
+        *,
+        launch: bool = False,
+        release: np.ndarray | float | None = None,
+        stop: bool = False,
+        accel_release: np.ndarray | float | None = None,
+        accel_push: np.ndarray | float | None = None,
+    ) -> tuple[Any, Any]:
+        u_out, kind = self._invert(
+            v_kmh, a_kmhs, launch=launch, release=release, stop=stop,
+            accel_release=accel_release, accel_push=accel_push,
+        )
+        bk = self._breakaway_floor_u(launch)
+        if bk is None:
+            return u_out, kind
+        v = np.asarray(v_kmh, dtype=float)
+        u_arr = np.asarray(u_out, dtype=float)
+        v, u_b = np.broadcast_arrays(v, u_arr)
+        deep = (v <= LAUNCH_MOVING_KMH) & (u_b < -bk)
+        return _scalar_or_array(np.where(deep, -bk, u_b)), kind
+
+    def _invert(
         self,
         v_kmh: np.ndarray | float,
         a_kmhs: np.ndarray | float,

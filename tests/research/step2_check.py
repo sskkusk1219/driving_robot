@@ -540,6 +540,7 @@ def check_plan(
         low_speed_side_rule=fm.low_speed_side_rule,
         release_table_min_kmh=fm.release_table_min_kmh,
         switch_lead=fm.switch_lead_enabled,
+        launch_midway_brake_cap=fm.launch_midway_brake_cap,
     )
     nan_count = int(np.count_nonzero(np.isnan(plan.effort_pct))) + int(
         np.count_nonzero(np.isnan(plan.need_accel_kmhs))

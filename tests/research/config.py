@@ -785,6 +785,21 @@ class ForwardMapSection:
     # 机上で比べて決める）。
     # 効く先: fwd_plan.build_plan の戻しの解き直し。決める時期: 段5-3 の机上の後の実機 1 組
     release_table_min_kmh: float = 0.0
+    # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
+    # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
+    # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・
+    # 余裕は足さない）。根拠: UDDS 1252 s（`074912`）で計画が 9.01% で保ったが動き出す開度は 8.53%
+    # で、止まっている車が動き出さなかった。既定 false ＝ 今と完全に同じ。
+    # 効く先: fwd_plan.build_plan の発進の途中のブレーキ。
+    # 決める時期: 実機の組（A1・A2 あり／なし）の後
+    launch_midway_brake_cap: bool = False
+    # 2026-10-23 段5-6 追加 A2: true なら、発進側の表を引くとき（accel・invert の launch=True。
+    # P・DOB の予測を含む）、車速が 0.5 km/h 以下で、ブレーキが動き出す開度より深いとき、
+    # 加速度を min(表の値, 0)（invert は開度を動き出す開度で頭打ち）にする。pkl は作り直さず、
+    # 引くときに掛ける。根拠: 発進側の表の 0〜1 km/h の行が 9.01% でも +0.16 km/h/s と言い、
+    # 動き出す開度と食い違う（UDDS 1252 s `074912`）。既定 false ＝ 今と完全に同じ。
+    # 効く先: ForwardTable.accel・invert（launch=True）。決める時期: 同上
+    launch_table_breakaway_floor: bool = False
 
 
 @dataclass
