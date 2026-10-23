@@ -249,6 +249,8 @@ def build_final_table(
         push_p, push_dt = [], []
         for r in train_rows:
             m = r.u_pct > 0.0
+            if cfg.drop_stop_approach:  # アクセルの戻しの表と同じ（window は窓の行を外す）
+                m &= ~_dropped_rows(cfg, r)
             push_p.append(r.accel_push_pct[m])
             push_dt.append(r.dt_row_s[m])
         pslices = monotone_rows(np.mean([o[6] for o in outs], axis=0), like.u_grid)

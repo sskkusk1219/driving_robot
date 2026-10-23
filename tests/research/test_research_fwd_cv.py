@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import types
 
 import numpy as np
 import torch
@@ -308,7 +309,7 @@ def test_fit_one_info_drops_rows_by_chosen_exclusion(monkeypatch):
 
     def fake_fit_side(x, y, **kw):
         seen[len(seen)] = len(x)
-        return object()
+        return types.SimpleNamespace()
 
     monkeypatch.setattr("tests.research.fwd_cv.fwd_torch.fit_side", fake_fit_side)
 
