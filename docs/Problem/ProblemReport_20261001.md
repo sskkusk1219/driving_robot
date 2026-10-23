@@ -148,7 +148,55 @@ C1 の FF のみの走行（`report20261001_RunFF.md`）は、最大逸脱 6.53 
 
 段3 の後は、手順4 の探索範囲（`kp_search_range`）の見直し → 手順4 へ進む予定（本レポートの外。必要ならここに段を足す）。
 
-**引き継ぎ（段6）**（2026-10-23 夜。段5 は完了。段6 は別のセッションで行う。ユーザー指示）
+**引き継ぎ（段7・段8）**（2026-10-24。段6 は完了。段7・段8 の実装は別のセッションで行う。ユーザー指示）
+
+今の状態:
+
+- 段6 の採否: c 6（6-1b）・6-2a の 3 キーを採る。Tq 係数 10（6-1c）・段6 C（6-2b）は採らない。6-6 の 5 モード `025036`・`032111`・`034440`・`035759`・`040840` で \|偏差\|>1 24.65 → 5.65 秒・p95 平均 0.346。残りは発進 1.25 秒・折れ目 4.25 秒（「6-6 結果」）
+- 発進・折れ目の議論は終わり、**計画は承認済み**: `/home/raspi5_16gb/.claude/plans/cozy-splashing-swan.md`（仕様・ユーザー決定 1〜13・各段・調整値・確認方法。このレポートの「### 段7・段8（発進）」「### 段7・段8（折れ目）」と同じ中身）。**コードは未着手**（実装用のサブエージェントを一度起こしたが、ファイルを変える前に止めた。`git status` に差分なし）
+- **実装は、ユーザーが新しいセッションで始めてよいと言ってから始める**（2026-10-24 指示。計画の承認だけでは始めない）。始めた後は 7-a → 7-b → 7-c' → 7-c → 8-a → 8-b → 5 モードを止めずに進める（止めるのはユーザー判断が必須のとき・「止めて」・計画の D）
+- 本体 yaml（`tests/research/config_testVehicle.yaml`）は段6 で採ったもの全部: `candidate: C15`・`model_path: tests/research/results/models/fwd_model_20261023_072511.pkl`・`deviation_c: 6.0`・`dob_tq_coef: 20.0`・`dob_low_speed_fade`・`dob_low_speed_align`・`stop_end_tau_cap_normal` が true・`launch_midway_fb_no_deeper: false`・`launch_midway_brake_cap: true`（A1）・`launch_table_breakaway_floor: true`（A2）・`low_speed_side_rule: dir`・`need_window_s: 1.0`・停車保持 18.09%・min はどちらも 4.2%
+
+進める順（計画の「進め方」。採らなかった段は外して次へ）:
+
+| 順 | 段 | 走り | 比べる相手 |
+|---|---|---|---|
+| 1 | 7-a 動き出す開度を 0.05 km/h で測る（`learning.launch_breakaway_move_kmh`）→ `--retrain 151009` で新しい pkl → 机上（meta が 8.4〜8.6% あたりか） | C15・3 モード | 6-6 の `025036`・`032111`・`035759` |
+| 2 | 7-b 基準の動き出しに合わせて離す（`launch_release_ramp` ほか 3 キー）→ 机上（5 モードの計画の発進の形） | 同上 | 一つ前の採った組 |
+| 3 | 7-c' 窓 `need_window_s` 0.5（yaml だけ） | 同上 | 同上 |
+| 4 | 7-c すき間の補償（`switch_gap_compensate`）→ 机上（折れ目の計画のずれ） | 同上 | 同上 |
+| 5 | 8-a 基準 0 で動いたら止めて待つ（積分）・8-b A2 を FB に掛けない・8-c 持ち越し（机上） | 同上 | 同上 |
+| 6 | 8-d（切り替えの所の FB）は折れ目が残ったときだけ、**ユーザーと議論してから** | — | — |
+| 7 | 5 モードで KPI 判定（6-6 と同じまとめ方） | C15・5 モード | 6-6 の 5 本 |
+
+走らせ方・比べ方（1 組約 70 分。実装は sonnet、実機は haiku のサブエージェント、解析・採否は opus）:
+
+```bash
+# 本体 yaml からモードごとのコピー（変えるキーだけ。表示される diff で確かめる）→ 実機
+MODES="wltp udds us06" tests/research/results/analysis/mk_yaml.sh y7b launch_release_ramp=true
+MODES="wltp udds us06" tests/research/results/analysis/run_set.sh y7b   # ログ・コピーは tests/research/results/analysis/runs/
+# 比べる（モードごとに A と B。--ev で出来事を時刻で突き合わせ）
+PYTHONPATH=. .venv/bin/python tests/research/results/analysis/stage6_cmp.py 025036,032111,035759 <B1>,<B2>,<B3> --ev
+# 発進ごと（0〜3 秒の最大・ブレーキを離した時刻と開度・車が動いた時刻）。launch_cmp.py はこれを元に作る
+PYTHONPATH=. .venv/bin/python tests/research/results/analysis/launch_tab.py <CSV の日時> ...
+# 折れ目の計画を作り直して並べる（要る加速度・計画・すき間なし・窓 0.3）／出来事の前後の生データ
+PYTHONPATH=. .venv/bin/python tests/research/results/analysis/kink_plan.py 040840 42.9,301.9 ev
+PYTHONPATH=. .venv/bin/python tests/research/results/analysis/kink_ev.py 040840:42.9 035759:300.0
+# スタブで確かめる（1 ステップだけは不可。--steps 1,3）
+.venv/bin/python -m tests.research.main --steps 1,3 --hw stub --config <コピー>
+```
+
+注意:
+
+- `tests/research/results/` は git に入らない。上の道具（`mk_yaml.sh`・`run_set.sh`・`stage6_cmp.py`・`launch_tab.py`・`kink_plan.py`・`kink_ev.py`）はそこに置いてある（前のセッションの scratchpad から移した）
+- 手順2 の CSV `151009` は `mode_time_s` が空なので、`ana.load` ではなく `pd.read_csv` で読む。`find_csv("151009")` は別の日の CSV に当たるので、日付込み（`20261023_151009`）で指定する
+- 発進で「8.21% で FB が抑えられない」のは A2（A1 ではない）。P は表を基準車速で引き直すので、基準 0.5 km/h 以下では動き出す開度より深くできない
+- 窓を縮めると往復が増える見込み（記録だけ。KPI ④ は緩めてよい）
+- 6-6 で使った 5 モードのコピーは `tests/research/results/analysis/runs/y66_*.yaml`（参考。新しく走るときは必ず本体から作り直す）
+
+---
+
+**引き継ぎ（段6。済み）**（2026-10-23 夜。段5 は完了。段6 は別のセッションで行う。ユーザー指示）
 
 今の状態:
 
@@ -7227,3 +7275,4 @@ cd /home/raspi5_16gb/projects/driving_robot
 | 2026-10-24 | ユーザー決定: 残りを FF で直す所＝段7、FB で直す所＝段8 とする。「発進」を先に議論して計画を立て、「折れ目」はその後。議論中 |
 | 2026-10-24 | 議論（発進）: 8.21% は「0.5 km/h に届いた開度」で、実際は 8.4〜8.6% で動き出す（`151009`）・FB を止めていたのは A2（訂正）・型A/B/C。ユーザー決定 8 件（0.05 km/h・表から引く・型C は折れ目へ・手前 ＋2%・2 秒前・5 秒以下の停車は動き出す開度で待つ・8-a は積分）→ 段7・段8（発進）の計画を承認。実装は「折れ目」の議論が終わってから（ユーザー指示。Claude が先に始めかけて止められた） |
 | 2026-10-24 | 議論（折れ目）: 原因は窓 1.0 秒の丸め（計画どおりでも谷 +0.8〜+1.1・山 −0.3〜−0.8、向きが全出来事で一致）とすき間を折れ目の前で全部取ること（AMA の谷 10 件で 0.20〜0.25 秒）。ユーザー決定 9〜13 → 7-c'（窓 0.5）・7-c（すき間の補償）を段7 に、8-d は段7 の後に要否。計画を承認。実装はユーザーの合図待ち |
+| 2026-10-24 | 段7・段8 の実装は別のセッションで行う（ユーザー指示）。全体計画の下に「引き継ぎ（段7・段8）」を書き、走らせ方・比べ方の道具を `tests/research/results/analysis/` に移した |
