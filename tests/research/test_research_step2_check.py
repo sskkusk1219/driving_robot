@@ -6,6 +6,7 @@ import math
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -394,3 +395,27 @@ def test_i1_table_extras_is_informational_and_reports_seconds() -> None:
     assert sc.check_table_extras(None, None).status == sc.STATUS_SKIP
     # 判定の対象に入っていない（しきい値なし）
     assert sc._judge("I1", item.metrics) == sc.STATUS_OK
+
+
+def test_d1_plan_is_built_like_step3(monkeypatch) -> None:
+    """2026-10-23: D1 は手順3（mode_drive）と同じ表・引数で計画を作る。
+    A2 の床は表に掛かり、stop_lead は候補が C15 のときだけ効く。"""
+    mode = _mode([(0.0, 0.0), (5.0, 0.0), (15.0, 40.0), (25.0, 40.0), (35.0, 0.0), (40.0, 0.0)])
+    seen: dict[str, Any] = {}
+    real = sc.build_plan
+
+    def spy(ref_at, duration_s, table, **kwargs):
+        seen["table"], seen["kwargs"] = table, kwargs
+        return real(ref_at, duration_s, table, **kwargs)
+
+    monkeypatch.setattr(sc, "build_plan", spy)
+    cfg = ResearchConfig()
+    cfg.forward_map.launch_table_breakaway_floor = True
+    cfg.forward_map.stop_lead_enabled = True
+    cfg.feedforward.candidate = "C15"
+    sc.check_plan(cfg, _table(accel_onset_u_pct=1.0, brake_onset_u_pct=1.0), mode)
+    assert seen["table"].launch_breakaway_floor is True
+    assert seen["kwargs"]["stop_lead"] is True
+    cfg.feedforward.candidate = "C8"
+    sc.check_plan(cfg, _table(accel_onset_u_pct=1.0, brake_onset_u_pct=1.0), mode)
+    assert seen["kwargs"]["stop_lead"] is False

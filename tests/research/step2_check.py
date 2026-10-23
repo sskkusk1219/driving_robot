@@ -504,12 +504,6 @@ def check_model_path(cfg: ResearchConfig, saved_path: str | Path | None) -> Chec
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _reference_at(mode: DrivingMode) -> Any:
-    from tests.research.mode_drive import ReferenceSpeed  # noqa: PLC0415
-
-    return ReferenceSpeed(mode).at
-
-
 def check_plan(
     cfg: ResearchConfig, table: ForwardTable | None, mode: DrivingMode | None
 ) -> CheckItem:
@@ -525,23 +519,18 @@ def check_plan(
     if mode is None:
         return _skip("D1", name, "走行モードが無い（DB から読めていない）")
     fm = cfg.forward_map
-    plan = build_plan(
-        _reference_at(mode), mode.total_duration, table,
-        accel_deadband_pct=cfg.vehicle.min_accel_opening_pct,
-        brake_deadband_pct=cfg.vehicle.min_brake_opening_pct,
-        stop_brake_opening_pct=cfg.stop_brake_opening_pct,
-        stop_horizon_s=cfg.features.h0_s,
-        period_s=cfg.control.loop_interval_s,
-        accel_lag_s=fm.accel_lag_s, brake_lag_s=fm.brake_lag_s,
-        need_window_s=fm.need_window_s, coast_band_kmhs=fm.coast_band_kmhs,
-        preposition_enabled=fm.preposition_enabled,
-        preposition_margin_pct=fm.preposition_margin_pct,
-        preposition_lead_s=fm.preposition_lead_s,
-        low_speed_side_rule=fm.low_speed_side_rule,
-        release_table_min_kmh=fm.release_table_min_kmh,
-        switch_lead=fm.switch_lead_enabled,
-        launch_midway_brake_cap=fm.launch_midway_brake_cap,
+    # 2026-10-23: 手順3（mode_drive）と同じ表・引数で作る
+    # （A2 の床・FEL・ぼかした基準・C15 の stop_lead 等）
+    from tests.research.mode_drive import (  # noqa: PLC0415
+        apply_table_options,
+        candidate_is_stop_end,
+        forward_map_plan_args,
     )
+
+    ref_at, duration_s, plan_kwargs = forward_map_plan_args(
+        cfg, mode, stop_end=candidate_is_stop_end(cfg.feedforward.candidate)
+    )
+    plan = build_plan(ref_at, duration_s, apply_table_options(cfg, table), **plan_kwargs)
     nan_count = int(np.count_nonzero(np.isnan(plan.effort_pct))) + int(
         np.count_nonzero(np.isnan(plan.need_accel_kmhs))
     )

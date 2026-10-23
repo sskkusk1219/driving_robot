@@ -284,18 +284,20 @@ def fel_text(cfg: ResearchConfig, table: Any) -> str:
     return f"  FEL: 有効・方法 {cfg.fel.method}・補正のあるマス {cells}・学習 CSV {src}"
 
 
-def _prepare_forward_map_plan(
-    cfg: ResearchConfig, mode: DrivingMode, ff: ForwardMapFeedforward
-) -> Any:
-    """C7・C8: 基準車速から開度の列を作り、中身を表示する（走行前チェックより前。HW 不使用）。"""
+def forward_map_plan_args(
+    cfg: ResearchConfig, mode: DrivingMode, *, stop_end: bool
+) -> tuple[Any, float, dict[str, Any]]:
+    """手順3 の開度の列（fwd_plan.build_plan）に渡す引数: (基準 ref_at, 長さ [s], キーワード引数)。
+
+    2026-10-23: 手順2 のチェック D1（step2_check.check_plan）と同じ作り方にするため切り出した。
+    stop_end は FF 候補が C15（StopEndFeedforward）か（True のときだけ stop_lead_enabled を掛ける）
+    """
     ff_cfg, fm = cfg.feedforward, cfg.forward_map
     # 2026-10-19 段3: 開度の列は「ぼかした基準」で作る（σ=0 なら元の基準そのもの）。停車の判定
     # （停車保持・停止側の表）だけは元の基準のまま（stop_ref_at）
     orig_ref = ReferenceSpeed(mode)
     target_ref = make_target_reference(mode, ff_cfg.ref_smooth_sigma_s)
-    plan = ff.build_plan(
-        target_ref.at,
-        mode.total_duration,
+    kwargs: dict[str, Any] = dict(
         accel_deadband_pct=cfg.vehicle.min_accel_opening_pct,
         brake_deadband_pct=cfg.vehicle.min_brake_opening_pct,
         stop_brake_opening_pct=cfg.stop_brake_opening_pct,
@@ -310,12 +312,40 @@ def _prepare_forward_map_plan(
         preposition_lead_s=fm.preposition_lead_s,
         stop_ref_at=None if target_ref is orig_ref else orig_ref.at,
         # 2026-10-20 段4-2 停A: C15 で stop_lead_enabled のとき、停車保持へ遅れ分早く入る
-        stop_lead=isinstance(ff, StopEndFeedforward) and fm.stop_lead_enabled,
+        stop_lead=stop_end and fm.stop_lead_enabled,
         low_speed_side_rule=fm.low_speed_side_rule,  # 段5-2
         release_table_min_kmh=fm.release_table_min_kmh,  # 段5-3
         switch_lead=fm.switch_lead_enabled,  # 段5-5c
         launch_midway_brake_cap=fm.launch_midway_brake_cap,  # 段5-6 追加 A1
     )
+    return target_ref.at, mode.total_duration, kwargs
+
+
+def candidate_is_stop_end(candidate: str) -> bool:
+    """FF 候補の名前が StopEndFeedforward（C15）か"""
+    return isinstance(make_candidate(candidate), StopEndFeedforward)
+
+
+def apply_table_options(cfg: ResearchConfig, table: Any) -> Any:
+    """load_model の後に mode_drive が表へ掛ける設定（FEL の補正・A2 の床）を、素の表にも掛ける。
+    D1 が手順3 と同じ表で計画を作るために使う。"""
+    if cfg.fel.enabled and table.has_fel(cfg.fel.method):
+        table = table.with_fel(cfg.fel.method)
+    if cfg.forward_map.launch_table_breakaway_floor != table.launch_breakaway_floor:
+        table = table.with_launch_breakaway_floor(cfg.forward_map.launch_table_breakaway_floor)
+    return table
+
+
+def _prepare_forward_map_plan(
+    cfg: ResearchConfig, mode: DrivingMode, ff: ForwardMapFeedforward
+) -> Any:
+    """C7・C8: 基準車速から開度の列を作り、中身を表示する（走行前チェックより前。HW 不使用）。"""
+    ff_cfg, fm = cfg.feedforward, cfg.forward_map
+    ref_at, duration_s, plan_kwargs = forward_map_plan_args(
+        cfg, mode, stop_end=isinstance(ff, StopEndFeedforward)
+    )
+    plan = ff.build_plan(ref_at, duration_s, **plan_kwargs)
+    target_ref = make_target_reference(mode, ff_cfg.ref_smooth_sigma_s)
     meta = ff.table.meta
     # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）
     lag_a = fm.accel_lag_s if fm.accel_lag_s is not None else meta.get("accel_lag_s")
