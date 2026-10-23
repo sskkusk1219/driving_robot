@@ -42,8 +42,8 @@ def _onset(pct: float | None) -> OnsetResult:
 
 
 def test_judge_thresholds_and_limits(monkeypatch) -> None:
-    assert sc._judge("B5", {"accel_in_run_diff_pct": 0.5}) == sc.STATUS_OK  # 境目ちょうどは OK
-    assert sc._judge("B5", {"accel_in_run_diff_pct": 0.51}) == sc.STATUS_NG
+    assert sc._judge("B5", {"accel_in_run_diff_pct": 2.0}) == sc.STATUS_OK  # 境目ちょうどは OK
+    assert sc._judge("B5", {"accel_in_run_diff_pct": 2.01}) == sc.STATUS_NG
     assert sc._judge("B5", {"accel_in_run_diff_pct": math.nan}) == sc.STATUS_NG
     assert sc._judge("B5", {"accel_in_run_diff_pct": math.inf}) == sc.STATUS_NG
     # None のしきい値は判定しない。limits は THRESHOLDS より優先する
@@ -211,10 +211,10 @@ def test_b5_meta_540_vs_recomputed_1015_is_ng() -> None:
 
 def test_b5_boundary_and_ok() -> None:
     t = _table(accel_onset_u_pct=1.5, brake_onset_u_pct=3.0)  # min 4.0 → 絶対 5.5・7.0
-    edge = sc.check_onsets(t, 4.0, 4.0, in_run=(5.0, 7.0))  # アクセルの差ちょうど 0.5
-    assert edge.metrics["accel_in_run_diff_pct"] == pytest.approx(0.5)
+    edge = sc.check_onsets(t, 4.0, 4.0, in_run=(3.5, 7.0))  # アクセルの差ちょうど 2.0（B5_TOL_PCT）
+    assert edge.metrics["accel_in_run_diff_pct"] == pytest.approx(2.0)
     assert edge.status == sc.STATUS_OK
-    over = sc.check_onsets(t, 4.0, 4.0, in_run=(4.9, 7.0))
+    over = sc.check_onsets(t, 4.0, 4.0, in_run=(3.4, 7.0))
     assert over.status == sc.STATUS_NG
     ok = sc.check_onsets(t, 4.0, 4.0, in_run=(5.5, 7.0), recomputed=(_onset(5.6), _onset(6.8)))
     assert ok.status == sc.STATUS_OK

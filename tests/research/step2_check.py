@@ -24,7 +24,7 @@ from tests.research.fwd_map import (
 from tests.research.fwd_plan import FLAG_PREPOS, build_plan
 from tests.research.fwd_tool import DeadbandLag, err_stats, read_logs, residuals, settings_of_table
 from tests.research.pedal_lag import estimate_pedal_return
-from tests.research.play_onset import BIN_PCT, OnsetResult, coast_fn_from_curve, onsets_from_csv
+from tests.research.play_onset import OnsetResult, coast_fn_from_curve, onsets_from_csv
 from tests.research.research_types import DrivingMode
 
 STATUS_OK = "OK"
@@ -39,6 +39,10 @@ SEED_OUTLIER_RATIO = 1.2
 # 値が nan のときも NG = 測れていない）。None は判定しない（記録だけ）。
 # 手順3 で C8 を使うときに影響する範囲だけを見る。車の特性の数値は使わず、「別の道筋で求めた値との
 # 差」か「手順3 の中で使う量」で決める（他の車でも同じ基準が使える）
+# 2026-10-23 ユーザー決定: 実車では効き始めの求め方で 2% ほど違いが出るため
+# （手順2 `151009`: meta 9.95%・走行中 9.90%・計算し直し 9.35%）
+B5_TOL_PCT = 2.0
+
 THRESHOLDS: dict[str, float | None] = {
     # NN の MAE ÷ 表（C7。データから直接作った表）の MAE。1.0 を超えたら NN の方が悪い = 学習失敗
     "B1.ratio_mae": 1.0,
@@ -56,12 +60,12 @@ THRESHOLDS: dict[str, float | None] = {
     # 遅れ [s]。0.005 は制御周期（50 ms）の 1/10 で、これより細かい差は手順3 の開度の列を変えない
     "B4.accel_lag_diff_s": 0.005,
     "B4.brake_lag_diff_s": 0.005,
-    # 効き始め [%]。BIN_PCT（0.5。効き始めを求めるときの開度のまとまりの幅）より細かい差は
-    # 計算の分解能より小さい。段のように立ち上がる効きでの誤り（meta 5.40% ↔ 10.15%）を検出する
-    "B5.accel_in_run_diff_pct": BIN_PCT,
-    "B5.brake_in_run_diff_pct": BIN_PCT,
-    "B5.accel_recomputed_diff_pct": BIN_PCT,
-    "B5.brake_recomputed_diff_pct": BIN_PCT,
+    # 効き始め [%]。B5_TOL_PCT を超える差で NG
+    # （段のように立ち上がる効きでの誤り、meta 5.40% ↔ 10.15% を検出する）
+    "B5.accel_in_run_diff_pct": B5_TOL_PCT,
+    "B5.brake_in_run_diff_pct": B5_TOL_PCT,
+    "B5.accel_recomputed_diff_pct": B5_TOL_PCT,
+    "B5.brake_recomputed_diff_pct": B5_TOL_PCT,
     # 戻る時間（遅れ [s]・戻る速さ [%/s]）。meta は同じ CSV から測った値なので、計算し直した値と
     # 浮動小数の誤差の範囲で一致する
     "B6.accel_delay_diff_s": 1e-6,
@@ -381,7 +385,7 @@ def check_onsets(
     ① 走行中の最後の値（RampResult の最後の accel_onset_pct・brake_onset_pct。絶対開度）
     ② yaml の惰行カーブで計算し直した値（`play_onset.onsets_from_csv` の結果）
 
-    差 > BIN_PCT（効き始めを求めるときの開度のまとまりの幅）で NG。meta にキーが無いのに①か②が
+    差 > B5_TOL_PCT で NG。meta にキーが無いのに①か②が
     求まっているときは差を無限大として記録する（= NG）。①も②も無いペダルは比べず、理由を残す。
     全ペダルで比べる値が無ければ SKIP。
     """
