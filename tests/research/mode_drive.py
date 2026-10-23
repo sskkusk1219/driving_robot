@@ -317,6 +317,10 @@ def forward_map_plan_args(
         release_table_min_kmh=fm.release_table_min_kmh,  # 段5-3
         switch_lead=fm.switch_lead_enabled,  # 段5-5c
         launch_midway_brake_cap=fm.launch_midway_brake_cap,  # 段5-6 追加 A1
+        launch_release_ramp=fm.launch_release_ramp,  # 段7-b
+        launch_release_lead_s=fm.launch_release_lead_s,
+        launch_release_pre_pct=fm.launch_release_pre_pct,
+        launch_short_stop_s=fm.launch_short_stop_s,
     )
     return target_ref.at, mode.total_duration, kwargs
 
@@ -360,6 +364,8 @@ def _prepare_forward_map_plan(
     say("  発進の途中は FB もブレーキを深くしない（段6 C）: "
         f"{'あり' if fm.launch_midway_fb_no_deeper else 'なし'}")
     say(f"  切り替えの先読み（段5-5c）: {'あり' if fm.switch_lead_enabled else 'なし'}")
+    say(f"  発進のブレーキを基準の動き出しに合わせて離す（段7-b）: "
+        f"{'あり' if fm.launch_release_ramp else 'なし'}")
     say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
         "（0 ＝ 全部の車速で使う）")
     if isinstance(ff, DeviationForwardFeedforward):

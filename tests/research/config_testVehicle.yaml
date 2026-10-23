@@ -246,6 +246,15 @@ forward_map:
   # 9.01% で保ち、動き出す開度 8.53% より深く車が動き出さなかった。効く先: 発進の途中のブレーキ。
   # 決める時期: 実機の組（あり／なし）の後
   launch_midway_brake_cap: true
+  # 2026-10-24 段7-b: true なら発進のブレーキを基準が動き出す時刻（t_go ＝ 基準が動き出す時刻 − ブレーキの
+  # 遅れ）に合わせて離す。長い停車（launch_short_stop_s 秒より長い）は停車保持で待ち、t_go の
+  # launch_release_lead_s 秒前に「動き出す開度（min ＋ |meta launch_breakaway_u_pct|）＋
+  # launch_release_pre_pct %」へ、t_go まで直線で動き出す開度へ離す。短い停車は動き出す開度で待つ。
+  # 3 つの値はすべてユーザー決定（2026-10-24）。効く先: 発進前のブレーキの列。決める時期: 段7-b の実機の組
+  launch_release_ramp: false
+  launch_release_lead_s: 2.0
+  launch_release_pre_pct: 2.0
+  launch_short_stop_s: 5.0
   # 2026-10-23 段6 C: true なら dir の発進の途中の行で、FB の上乗せ（P・DOB・惰行の補助の合計）が
   # ブレーキを FF より深くする向きのとき 0 にする（浅くする向きは通す）。根拠: 段5-6 の (ロ) を FB にも
   # 適用（ユーザー決定）。FB がブレーキを足すと動き出した車を再び止める恐れ。

@@ -1622,3 +1622,116 @@ def test_launch_breakaway_floor_off_is_identical_plan() -> None:
     tb_off = tb.with_launch_breakaway_floor(False)
     b = plan_for(_slow_launch, 10.0, tb_off, low_speed_side_rule="dir")
     assert np.array_equal(a.effort_pct, b.effort_pct)
+
+
+# ---- 段7-b: 基準の動き出しに合わせてブレーキを離す ----
+
+BK_U = -1.0  # meta launch_breakaway_u_pct（符号つき）。bk ＝ BD + 1.0 ＝ 8.0
+BK = BD + abs(BK_U)
+PRE = BK + 2.0
+LAG = {"brake_lag_s": 1.0, "accel_lag_s": 0.1}
+LB = LAG["brake_lag_s"]  # アクセルの窓（約 0.4 s 前から立ち上がりを拾う）より前に t_go が来る値
+
+
+def _bk_table() -> ForwardTable:
+    tb = linear_table()
+    tb.meta["launch_breakaway_u_pct"] = BK_U
+    return tb
+
+
+def _stop_then_go(stop_s: float):
+    def ref(t: float) -> float:
+        return 0.0 if t <= stop_s else min(2.0 * (t - stop_s), 20.0)
+
+    return ref
+
+
+def _t0_row(plan: ForwardPlan, ref) -> int:
+    v = np.array([ref(float(x)) for x in plan.t_s])
+    return int(np.flatnonzero(v > 0.1)[0]) if (v > 0.1).any() else -1
+
+
+def test_release_ramp_long_stop_ramps_from_pre_to_bk() -> None:
+    ref = _stop_then_go(12.0)
+    on = plan_for(ref, 16.0, _bk_table(), **LAG, launch_release_ramp=True)
+    t0 = _t0_row(on, ref)
+    i_go = t0 - int(round(LB / on.period_s))
+    i_r = i_go - int(round(2.0 / on.period_s))
+    assert on.effort_pct[i_r - 1] == pytest.approx(-STOP_PCT)  # 窓の手前は停車保持のまま
+    assert on.effort_pct[i_r] == pytest.approx(-PRE)  # t_go − 2 秒: 手前の開度
+    assert on.effort_pct[i_go] == pytest.approx(-BK)  # t_go: bk
+    mid = (i_r + i_go) // 2
+    frac = (mid - i_r) / (i_go - i_r)
+    assert on.effort_pct[mid] == pytest.approx(-(PRE + (BK - PRE) * frac))  # 間は直線
+    assert on.launch_prep is not None
+    assert on.launch_prep[i_r : i_go + 1].all() and not on.launch_prep[: i_r - 1].any()
+    assert np.all(on.effort_pct[i_r : i_go + 1] <= -BK + 1e-9)
+    assert np.all(on.flag[i_r : i_go + 1] == FLAG_STOP)
+
+
+def test_release_ramp_pre_never_deeper_than_stop_hold() -> None:
+    ref = _stop_then_go(12.0)
+    on = plan_for(
+        ref, 16.0, _bk_table(), **LAG, launch_release_ramp=True,
+        stop_brake_opening_pct=9.0,  # 停車保持 9% ＜ 手前の開度 10%
+    )
+    i_go = _t0_row(on, ref) - int(round(LB / on.period_s))
+    i_r = i_go - int(round(2.0 / on.period_s))
+    assert on.effort_pct[i_r] == pytest.approx(-9.0)  # 停車保持より深くしない
+
+
+def test_release_ramp_short_stop_waits_at_bk() -> None:
+    ref = _stop_then_go(3.0)
+    on = plan_for(ref, 8.0, _bk_table(), **LAG, launch_release_ramp=True)
+    off = plan_for(ref, 8.0, _bk_table(), **LAG)
+    t0 = _t0_row(on, ref)
+    i_go = t0 - int(round(LB / on.period_s))
+    assert np.all(off.effort_pct[: i_go - 5] == -STOP_PCT)
+    assert np.all(on.effort_pct[: i_go + 1] == pytest.approx(-BK))  # 停車保持の行も bk
+    assert np.all(on.flag[on.flag == FLAG_STOP] == FLAG_STOP)
+    assert on.launch_prep is not None and on.launch_prep[: i_go + 1].all()
+
+
+def test_release_ramp_brake_never_shallower_before_t_go() -> None:
+    """型B: 基準が 1 秒目から急に立ち上がる。off では t_go の前に戻しが入るが、on では入らない。"""
+    def ref(t: float) -> float:
+        return 0.0 if t <= 8.0 else min(8.0 * (t - 8.0), 30.0)
+
+    on = plan_for(
+        ref, 14.0, _bk_table(), **LAG, launch_release_ramp=True
+    )
+    i_go = _t0_row(on, ref) - int(round(LB / on.period_s))
+    assert np.all(on.effort_pct[: i_go + 1] <= -BK + 1e-9)
+
+
+def test_release_ramp_off_is_identical_and_no_meta_is_noop() -> None:
+    ref = _stop_then_go(12.0)
+    base = plan_for(ref, 16.0, _bk_table(), **LAG)
+    off = plan_for(ref, 16.0, _bk_table(), **LAG, launch_release_ramp=False)
+    assert base.launch_prep is None and off.launch_prep is None
+    assert np.array_equal(base.effort_pct, off.effort_pct)
+    assert np.array_equal(base.flag, off.flag)
+    nometa = plan_for(ref, 16.0, linear_table(), **LAG)
+    nm_on = plan_for(ref, 16.0, linear_table(), **LAG, launch_release_ramp=True)
+    assert np.array_equal(nometa.effort_pct, nm_on.effort_pct)
+    assert nm_on.launch_prep is not None and not nm_on.launch_prep.any()
+
+
+def test_release_ramp_tiny_stops_do_not_crash() -> None:
+    for stop_s in (0.0, 0.05, 0.1, 0.2):
+        ref = _stop_then_go(stop_s)
+        p = plan_for(ref, 6.0, _bk_table(), **LAG, launch_release_ramp=True)
+        assert len(p.effort_pct) == len(p.t_s) and np.all(np.isfinite(p.effort_pct))
+    # 停車のまま終わる・停車の途中で始まる（基準が最初から動いている）場合も壊れない
+    p = plan_for(lambda t: 0.0, 3.0, _bk_table(), launch_release_ramp=True)
+    assert not p.launch_prep.any()
+    p = plan_for(lambda t: 20.0, 3.0, _bk_table(), launch_release_ramp=True)
+    assert not p.launch_prep.any()
+
+
+def test_release_ramp_also_in_switch_lead_two_pass() -> None:
+    ref = _stop_then_go(12.0)
+    on = plan_for(
+        ref, 16.0, _bk_table(), **LAG, launch_release_ramp=True, switch_lead=True
+    )
+    assert on.launch_prep is not None and on.launch_prep.any()

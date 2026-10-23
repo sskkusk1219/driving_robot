@@ -288,6 +288,10 @@ class ForwardPlan:
     # 2026-10-23 段6 C: 行ごとの「発進の途中」か（dir の規則だけ持つ。それ以外は None）。
     # mode_drive が forward_map.launch_midway_fb_no_deeper で FB のブレーキ踏み増しを抑える行を引く
     launch_midway: np.ndarray | None = None
+    # 2026-10-24 段7-b: 発進前のブレーキを基準の動き出しに合わせて離す行（離しの行と、短い停車の
+    # bk の行）。stop_lead と同じ持ち方（launch_release_ramp=False なら None）。
+    # flag は FLAG_STOP のまま
+    launch_prep: np.ndarray | None = None
 
     def side_for(self, i: int, is_accel: bool) -> int | None:
         """行 i のペダル（アクセル側かブレーキ側か）で計画が引いた表 SIDE_*。
@@ -381,9 +385,22 @@ def build_plan(
     release_table_min_kmh: float = 0.0,
     switch_lead: bool = False,
     launch_midway_brake_cap: bool = False,
+    launch_release_ramp: bool = False,
+    launch_release_lead_s: float = 2.0,
+    launch_release_pre_pct: float = 2.0,
+    launch_short_stop_s: float = 5.0,
     _lead_extra: np.ndarray | None = None,
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
+
+    2026-10-24 段7-b: `launch_release_ramp`。False は今までと完全に同じ。True は停車からの発進の
+    ブレーキを基準の動き出しに合わせて離す（`_launch_release_ramp`）。t0 ＝ 停車の後に基準（停車の
+    判定と同じ基準）が停車速度を超える最初の行、t_go ＝ t0 − ブレーキの遅れ、bk ＝ min ＋
+    |meta launch_breakaway_u_pct|。停車が launch_short_stop_s 秒より長いなら、t_go −
+    launch_release_lead_s に「bk ＋ launch_release_pre_pct（停車保持の開度が浅ければそれまで）」へ、
+    t_go まで直線で bk へ。以下なら停車の区間を bk で待つ。どちらも t_go までのブレーキ・惰行の行は
+    浅くしない。meta が無ければ何もしない。A1 の後・np.clip の前（先置き・すき間の確保はその後に
+    今までどおり掛かる）。
 
     2026-10-22 段5-5c: `switch_lead`。False は今までと完全に同じ。True は 2 回解く。1 回目は先置き・
     すき間の確保の前の計画（要る加速度から素直に解いた effort。先置き・すき間の確保は切り替えの
@@ -448,6 +465,10 @@ def build_plan(
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
             "launch_midway_brake_cap": launch_midway_brake_cap,
+            "launch_release_ramp": launch_release_ramp,
+            "launch_release_lead_s": launch_release_lead_s,
+            "launch_release_pre_pct": launch_release_pre_pct,
+            "launch_short_stop_s": launch_short_stop_s,
         }
         first = build_plan(
             ref_at, duration_s, table, **common,
@@ -621,6 +642,17 @@ def build_plan(
         _no_deeper_brake_in_midway(effort, flag, side_brake_dir, midway)
         if launch_midway_brake_cap:  # 段5-6 追加 A1: (ロ) の後。浅くする向きだけ
             _cap_midway_brake(effort, flag, midway, brake_deadband_pct, table.meta)
+    launch_prep = None
+    if launch_release_ramp:  # 段7-b: A1 の後・clip の前
+        launch_prep = np.zeros(n, dtype=bool)
+        bkm = table.meta.get("launch_breakaway_u_pct")
+        if bkm is not None and np.isfinite(bkm):
+            launch_prep = _launch_release_ramp(
+                effort, flag, stop_now, period_s=period_s, brake_lag_s=lb,
+                bk_pct=brake_deadband_pct + abs(float(bkm)),
+                pre_pct=launch_release_pre_pct, lead_s=launch_release_lead_s,
+                short_stop_s=launch_short_stop_s, hold_pct=stop_brake_opening_pct,
+            )
     effort = np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)
     stats = None
     ret = return_time_of(table, accel_deadband_pct, brake_deadband_pct)
@@ -653,7 +685,99 @@ def build_plan(
         side_rule="dir" if dir_rule else ("pedal" if pedal_rule else "legacy"),
         switch_lead_s=_lead_extra,
         launch_midway=np.asarray(midway, dtype=bool).copy() if dir_rule else None,
+        launch_prep=launch_prep,
     )
+
+
+def _launch_release_ramp(
+    effort: np.ndarray,
+    flag: np.ndarray,
+    stop_ref: np.ndarray,
+    *,
+    period_s: float,
+    brake_lag_s: float,
+    bk_pct: float,
+    pre_pct: float,
+    lead_s: float,
+    short_stop_s: float,
+    hold_pct: float,
+) -> np.ndarray:
+    """段7-b: 停車からの発進のブレーキを基準の動き出しに合わせて離す（effort・flag をその場で
+    書き換え、書き換えた離しの行・短い停車の bk の行の bool 配列を返す）。
+
+    停車 ＝ stop_ref が停車速度以下の連なり（系列の先頭からの停車も含む）。t0 ＝ その直後の最初の
+    行、t_go ＝ t0 − brake_lag_s。bk_pct は動き出す開度（絶対値。min ＋ |meta|）。ブレーキの effort
+    は負。
+    - 停車が short_stop_s 秒より長い: 停車保持の開度（hold）で待ち、t_go − lead_s の行で
+      min(hold, bk ＋ pre_pct) → t_go の行で bk まで直線。停車保持の行がこの窓の中なら、この直線に
+      置き換える。窓の中のブレーキ・惰行の行はこの値より浅くしない（アクセルの行は触らない）。
+      停車保持の後ろから窓の始めまでのブレーキ・惰行の行は hold で保つ（型B の早い戻しを止める）
+    - 短い: 停車保持の行（停A の早めた行を含む）と、t_go までのブレーキ・惰行の行を bk より
+      浅くしない
+      （停車保持の行は bk にする。直線は作らない）
+    惰行の行を深くしたときは FLAG_STOP にする（FB が効かない行）。ブレーキの行の flag はそのまま。
+    """
+    n = len(effort)
+    prep = np.zeros(n, dtype=bool)
+    low = stop_ref <= STOP_SPEED_KMH
+    lead_n = max(int(round(lead_s / period_s)), 1)
+    prev_end = 0
+    i = 0
+
+    def deepen(r: int, depth: float, *, exact: bool) -> None:
+        """行 r を深さ depth のブレーキにする（exact なら浅くなっても置き換える）。"""
+        if effort[r] > 0.0:
+            return  # アクセルの行は触らない
+        if exact or -effort[r] < depth:
+            effort[r] = -depth
+        if flag[r] == FLAG_COAST:
+            flag[r] = FLAG_STOP
+        prep[r] = True
+
+    while i < n:
+        if not low[i]:
+            i += 1
+            continue
+        s = i
+        while i < n and low[i]:
+            i += 1
+        t0 = i
+        if t0 >= n:
+            break
+        length_s = (t0 - s) * period_s
+        i_go = int(np.clip(round(t0 - brake_lag_s / period_s), 0, t0))
+        # 停車保持の連なり（停A の早めた行を含む）。t0 の手前で最後の FLAG_STOP の行から前へ
+        j_end = t0 - 1
+        while j_end >= prev_end and flag[j_end] != FLAG_STOP:
+            j_end -= 1
+        b0 = j_end
+        if j_end >= prev_end:
+            while b0 - 1 >= prev_end and flag[b0 - 1] == FLAG_STOP:
+                b0 -= 1
+        has_hold = j_end >= prev_end
+        # アクセルが t_go より前に始まる計画（窓が基準の立ち上がりを先に拾う）では、その手前までで
+        # 止める（ブレーキと同時踏みにしない）
+        acc = np.flatnonzero((effort[s:] > 0.0) & (flag[s:] != FLAG_STOP))
+        i_end = min(i_go, s + int(acc[0]) - 1) if len(acc) else i_go
+        if length_s > short_stop_s + 1e-9:
+            hold = -float(effort[j_end]) if has_hold else hold_pct
+            pre = min(hold, bk_pct + pre_pct)
+            i_r = max(i_go - lead_n, 0)
+            span = max(i_go - i_r, 1)
+            if has_hold:  # 停車保持の後ろから窓の始めまで hold で保つ
+                for r in range(j_end + 1, min(i_r, i_end + 1)):
+                    deepen(r, hold, exact=False)
+            for r in range(i_r, min(i_end, n - 1) + 1):
+                val = pre + (bk_pct - pre) * (r - i_r) / span
+                stop_row = flag[r] == FLAG_STOP
+                deepen(r, val, exact=bool(stop_row))
+        else:
+            lo = b0 if has_hold else s
+            for r in range(lo, min(i_end, n - 1) + 1):
+                deepen(r, bk_pct, exact=bool(flag[r] == FLAG_STOP))
+        prev_end = t0
+    return prep
+
 
 
 def switch_lead_events(

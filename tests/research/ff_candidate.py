@@ -795,6 +795,10 @@ class ForwardMapFeedforward:
         release_table_min_kmh: float = 0.0,
         switch_lead: bool = False,
         launch_midway_brake_cap: bool = False,
+        launch_release_ramp: bool = False,
+        launch_release_lead_s: float = 2.0,
+        launch_release_pre_pct: float = 2.0,
+        launch_short_stop_s: float = 5.0,
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
 
@@ -827,6 +831,10 @@ class ForwardMapFeedforward:
             release_table_min_kmh=release_table_min_kmh,
             switch_lead=switch_lead,
             launch_midway_brake_cap=launch_midway_brake_cap,
+            launch_release_ramp=launch_release_ramp,
+            launch_release_lead_s=launch_release_lead_s,
+            launch_release_pre_pct=launch_release_pre_pct,
+            launch_short_stop_s=launch_short_stop_s,
         )
         return self._plan
 

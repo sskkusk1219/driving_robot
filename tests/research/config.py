@@ -800,6 +800,22 @@ class ForwardMapSection:
     # 効く先: fwd_plan.build_plan の発進の途中のブレーキ。
     # 決める時期: 実機の組（A1・A2 あり／なし）の後
     launch_midway_brake_cap: bool = False
+    # 2026-10-24 段7-b: true なら、停車からの発進のブレーキを基準が動き出す時刻に合わせて離す。
+    # t0 ＝ 基準が停車速度を超える最初の行、t_go ＝ t0 − ブレーキの遅れ、bk ＝ min ＋ |meta
+    # launch_breakaway_u_pct|（動き出す開度）。停車が launch_short_stop_s より長いときは停車保持の
+    # 開度で待ち、t_go − launch_release_lead_s に「bk ＋ launch_release_pre_pct」へ、t_go まで
+    # 直線で bk へ離す（t_go までのブレーキ・惰行の行はこの値より浅くしない）。短いときは停車の
+    # 区間を bk で待つ。meta が無ければ何もしない。既定 false ＝ 今と完全に同じ。
+    # 効く先: fwd_plan.build_plan の発進前のブレーキの列（plan.launch_prep が離しの行）。
+    # 決める時期: 段7-b の実機の組
+    launch_release_ramp: bool = False
+    # 離し始めを t_go の何秒前にするか（人の運転に合わせたユーザー決定 2026-10-24。正値）
+    launch_release_lead_s: float = 2.0
+    # 離し始めの開度を bk の何 % 上にするか（ユーザー決定。0 以上。停車保持が浅ければそれが上限）
+    launch_release_pre_pct: float = 2.0
+    # この秒数以下の停車は離しの途中を作らず bk で待つ（停車保持から戻すと間に合わない。
+    # ユーザー決定。0 以上）
+    launch_short_stop_s: float = 5.0
     # 2026-10-23 段6 C: true なら、dir の発進の途中の行（停車保持は除く）で、FB の上乗せ（C10 の P・
     # DOB・惰行の補助の合計）がブレーキを FF の開度より深くする向きのとき 0 にする（浅くする向き・
     # アクセル側は触らない。最終のブレーキ開度 ≤ FF のブレーキ開度）。
@@ -1246,6 +1262,18 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         fm.release_table_min_kmh >= 0.0,
         f"forward_map.release_table_min_kmh は 0 以上: {fm.release_table_min_kmh}",
+    )
+    need(
+        fm.launch_release_lead_s > 0.0,
+        f"forward_map.launch_release_lead_s は正値: {fm.launch_release_lead_s}",
+    )
+    need(
+        fm.launch_release_pre_pct >= 0.0,
+        f"forward_map.launch_release_pre_pct は 0 以上: {fm.launch_release_pre_pct}",
+    )
+    need(
+        fm.launch_short_stop_s >= 0.0,
+        f"forward_map.launch_short_stop_s は 0 以上: {fm.launch_short_stop_s}",
     )
     for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")
