@@ -1,6 +1,6 @@
 # 20261001 C1 の FF を改善する（減速側の偏り・基準の平滑化ほか）
 
-**状態: 段5 完了・ユーザー確認待ち（5-6（dir）＋A1・A2・5-7a・5-8（none）を採る、5-7b・5-7c は採らない。段6 に進むかはユーザーが判断（2026-10-23））**
+**状態: 進行中（段5 完了。段6 は別のセッションで 6-0 から始める。ユーザー決定 2026-10-23。引き継ぎは「全体計画」の下の「引き継ぎ（段6）」）**
 
 C1 の FF のみの走行（`report20261001_RunFF.md`）は、最大逸脱 6.53 km/h・p95 3.87 km/h・ペダル往復 0.84 回/s で、KPI をどれも満たしていない。
 ユーザー決定（2026-10-01）で、最大逸脱・p95 を先に改善し、往復・符号反転はその後に扱う。
@@ -145,7 +145,45 @@ C1 の FF のみの走行（`report20261001_RunFF.md`）は、最大逸脱 6.53 
 
 段3 の後は、手順4 の探索範囲（`kp_search_range`）の見直し → 手順4 へ進む予定（本レポートの外。必要ならここに段を足す）。
 
-**引き継ぎ**（2026-10-23。段5-6 → 段6 の実装・実機確認は別のセッションで行う。ユーザー指示）
+**引き継ぎ（段6）**（2026-10-23 夜。段5 は完了。段6 は別のセッションで行う。ユーザー指示）
+
+今の状態:
+
+- 段5 の採否: 5-3・5-6（dir）＋A1・A2・5-7a・5-8（除外 none）を採る。5-2・5-4・5-5a〜c・5-7b・5-7c は採らない。理由と数値は全体計画の表と各段の節。最後のコミット `f1daf7c`
+- **ユーザー決定（2026-10-23）: 段6 に進む**（段5 の内容を確認したうえで）
+- 本体 yaml（`tests/research/config_testVehicle.yaml`）は段5 で採ったもの全部を含む C15: `candidate: C15`・`model_path: tests/research/results/models/fwd_model_20261023_072511.pkl`・`low_speed_side_rule: dir`・`launch_midway_brake_cap: true`・`launch_table_breakaway_floor: true`・`accel_release_input_enabled: true`・`accel_push_input_enabled: false`・`need_window_s: 1.0`・`switch_lead_enabled: false`・`learning.ramp_release_enabled: true`・`learning.stop_release_enabled: true`・`learning.stop_approach_exclusion: none`・`learning.fel_pattern_enabled: false`・停車保持 `stop_brake_offset_pct: 13.89`（絶対 18.09%）。FB は段4 のまま（`deviation_c: 12.5`・`dob_tq_coef: 20.0`・惰行の補助・停A・停C）
+- 段6 用のコードは main に入っていて既定 off（yaml も false）: 6-2 の `dob_low_speed_fade`・`dob_low_speed_align`・`stop_end_tau_cap_normal`（`c18f189`）、段6 C の `launch_midway_fb_no_deeper`（発進の途中は FB もブレーキを深くしない。`f699285`）。6-1 は yaml の値（`deviation_c`・`dob_tq_coef`）だけで走れる。6-3〜6-5 は未実装
+- FF の中身の説明（段5 終了時点）: `docs/Problem/FFControl_20261023.md`
+
+進める順（「### 段6」の「各段」の表どおり）:
+
+1. **6-0**: 本体 yaml の C15 で WLTP → UDDS → US06（値は変えず、モードだけ変えたコピーで走る）。相手は段4-4 の C15 `081609`・`095014`・`102658`（pkl `003112`・10-20 の走り。日が違うので差は場面・イベント単位で読む）。段5 の FF の変更が FB と組んで悪くならないか（段4-3 の教訓: 表を変えると DOB の踏み足しが消えて悪化しうる）。**悪くなったらユーザーに相談**（計画にない判断）
+2. 6-机上 → 6-1（c 12.5 → 8 → 6、その上に Tq 係数 20 → 10）→ 6-2 → 条件つき 6-3〜6-5 → 6-6（5 モードで KPI 判定）
+3. 採否: 同時踏み 0 秒・ガバナー作動なしは必須。「良くなれば採る。しきい値は使わない」。比べ方は ① \|偏差\|>1 を場面・イベント単位 → ② p95。往復・符号反転は記録だけ。段6 の途中は止めずに進める（止めるのは計画にない判断が要るときと「止めて」のときだけ）
+
+走らせ方（1 組約 70 分。実機は haiku のサブエージェント、解析は opus）:
+
+```bash
+# モードは modes.wltp_mode_name で選ぶ（"01_WLTP_Low,Mid,Hi,ExHi"・"07_UDDS"・"09_US06"）。本体 yaml から
+# モードごとのコピーを作り、変えるのは wltp_mode_name と段6 で試すキーだけ
+.venv/bin/python -m tests.research.main --steps 1,3 --hw real --config <コピー_wltp.yaml>   # udds・us06 も同じ
+# 比べる: 場面別の Σ|作ったずれ|（FF のみ用。C15 では FB の分も入る）・停車ごと
+PYTHONPATH=. .venv/bin/python tests/research/results/analysis/scene_created.py --vs A1,A2,A3 B1,B2,B3
+PYTHONPATH=. .venv/bin/python tests/research/results/analysis/stop_cmp.py   # 中の組を書き換えて使う
+PYTHONPATH=. .venv/bin/python tests/research/results/analysis/kpi_review.py <CSV の日時>
+```
+
+注意（段5 で分かったこと）:
+
+- yaml のコピーは**毎回いまの本体 yaml から作る**（古いコピーを流用しない。決定と設定がずれると分析がぶれる）。変えるキーだけ書き換え、走る前に本体との diff で確かめる
+- `scene_created.py` の「停車へ」は、止まっていて遅い側の行を数えないので、早く止まるずれが消え、遅れて止まるときの戻りが数えられる。停車前の比較は `stop_cmp.py`（入口 7.5 km/h → 停車で作ったずれ・早く/遅れて止まった秒）で確かめる
+- 同じ設定でも全場面で 241 ↔ 255 程度・低速の場面は 1 モード ±4 ばらつく。UDDS 1252 s（基準 1.6 km/h 一定）は発進の保持の目安（5-8 で 1.5〜1.9 km/h）
+- 走行中に Modbus のアラーム（0x05E）で止まったことがある → そのモードだけ走り直す
+- 古い worktree（`.claude/worktrees/agent-*`・`s53`〜`s55`）は全部 main に取り込み済みか不採用。消してよい（ユーザーに確かめてから）
+
+---
+
+**引き継ぎ（段5-6 → 段6。済み）**（2026-10-23。段5-6 → 段6 の実装・実機確認は別のセッションで行う。ユーザー指示）
 
 今の状態:
 
@@ -6906,3 +6944,4 @@ cd /home/raspi5_16gb/projects/driving_robot
 | 2026-10-23 | 決定と設定の食い違いを点検（opus のサブエージェント・読むだけ）: 走りに効く値（本体 yaml・コピー・pkl meta）は決定どおり。ずれは config.py の既定（2-3 の既定 true ほか）・分析の道具 `plan_replay.py`（既定 legacy・A1/A2 なし・古い pkl）・yaml のコメント・記録（5-6 の旧判断）・D1 のチェックの計画。ユーザー決定: 2-3 の既定 false・道具は yaml に従う・コメントと記録を直す・既定値は残して yaml に無いキーを警告・D1 を手順3 と同じに。5-8 手順2 `151009`（28.5 分）は B5（効き始め 9.95↔9.35%）で exit 8 → **B5 の幅を 2% に（ユーザー決定）**・効き始めは 9.95% のまま |
 | 2026-10-23 | 段5-8: `--retrain 151009` で除外 depth・window・none の 3 本（exit 0）。机上で none を選ぶ（低速の戻しの外れ 0.555 → 0.420）。手順3（C8・3 モード）を実機中 |
 | 2026-10-23 | **段5-8 手順3 実機 `163534`・`170609`・`172936`（exit 0・同時踏み 0）: 停車前の早止まり 1〜2 秒 → 0.2 秒・折れ目 100.8 → 70.1・全場面 213.7 → 193.0 → 採る（none）。本体 yaml を `fwd_model_20261023_072511.pkl` ほかに。段5 完了 → 段6 に進むかはユーザー判断待ち** |
+| 2026-10-23 | 段5 完了を報告（採否・FF の中身 `docs/Problem/FFControl_20261023.md`）。**ユーザー決定: 段6 に進む（別のセッション）**。引き継ぎを全体計画の下に記録 |
