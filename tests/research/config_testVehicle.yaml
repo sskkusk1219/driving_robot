@@ -50,7 +50,7 @@ feedforward:
   candidate: C15
   # 2次多項式 Ridge 逆モデル（本番 src/domain/model_training.py と同型）の保存先
   # ファイル名の日時はローカル時刻（JST）。2026-09-20 以前の pkl は UTC 命名（JST−9h）
-  model_path: tests/research/results/models/fwd_model_20261023_072511.pkl
+  model_path: tests/research/results/models/fwd_model_20261023_220059.pkl
   # 停車〜クリープ域（滑らかなモデルで表現できないため定数で補う）
   creep_speed_kmh: 5.0  # クリープで到達する車速 [km/h]
   creep_rate_kmhs: 1.56  # クリープ加速率 [km/h/s]

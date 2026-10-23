@@ -1441,8 +1441,8 @@ async def test_c10_run_logs_offset_column_and_c8_leaves_it_blank(
 
 def test_forward_map_deviation_settings_are_validated(tmp_path: Path) -> None:
     cfg = _tmp_cfg(tmp_path)
-    # 今の yaml の値（段4-1 で deviation_c 12.5）
-    assert cfg.forward_map.deviation_c == 12.5 and cfg.forward_map.deviation_row == "reference"
+    # 今の yaml の値（段6-1b で deviation_c 6.0）
+    assert cfg.forward_map.deviation_c == 6.0 and cfg.forward_map.deviation_row == "reference"
     assert not any("deviation" in p for p in cfgmod.validate_config(cfg))
     cfg.forward_map.deviation_row = "bogus"
     assert any("deviation_row" in p for p in cfgmod.validate_config(cfg))
