@@ -50,7 +50,7 @@ feedforward:
   candidate: C15
   # 2次多項式 Ridge 逆モデル（本番 src/domain/model_training.py と同型）の保存先
   # ファイル名の日時はローカル時刻（JST）。2026-09-20 以前の pkl は UTC 命名（JST−9h）
-  model_path: tests/research/results/models/fwd_model_20261022_020945.pkl
+  model_path: tests/research/results/models/fwd_model_20261022_232500.pkl
   # 停車〜クリープ域（滑らかなモデルで表現できないため定数で補う）
   creep_speed_kmh: 5.0  # クリープで到達する車速 [km/h]
   creep_rate_kmhs: 1.42  # クリープ加速率 [km/h/s]
@@ -644,7 +644,7 @@ learning:
   # |偏差|>1 が 3.7 → 45.1 秒に悪化（DOB が戻しによる弱さを外乱として打ち消していたのを、表が説明
   # してしまい消えた）。効く先: 手順2 の C8 系の表。meta accel_release_input_enabled に残る。
   # 決める時期: 戻しの層と切り分けた実機比較の後
-  accel_release_input_enabled: false
+  accel_release_input_enabled: true
   # 2026-10-23 段5-7b: アクセルの踏み増し量（今の u − 直近 3 秒の u の最小）を手順2 のニューラルネットの
   # アクセル側の最後の入力にし（戻し量が on なら 4、off なら 3 入力）、アクセルの踏み増しの表も作るか。
   # false は入力・表とも今までと完全に同じ（pkl の accel_push_* が None）。根拠は机上（5-7a の pkl）:
