@@ -410,6 +410,10 @@ class LearningSection:
     # fwd_data.launch_breakaway）。pkl meta side_table_opening_source に実際の値が残る。
     # 決める時期: 戻しの層・アクセルの戻し量を切り分けた実機比較の後
     side_table_opening_source: str = "actual"
+    # 段7-a（2026-10-24 ユーザー決定）: 動き出す開度（fwd_data.launch_breakaway）を測る
+    # 車速のしきい値 [km/h]。車速がこれ以上になった最初の行で測る。
+    # None なら creep_launch_min_speed_kmh（無ければ 0.5）
+    launch_breakaway_move_kmh: float | None = None
     # 2026-10-22 段5-3: 発進側の表のアクセル側（u > 0）の作り方。
     # "extrapolate" ＝ 今まで（アクセル側に実測が無く、クリープ ＋ 本体の増えの外挿）。
     # "measured" ＝ 手順2 の
@@ -1457,6 +1461,12 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         cfg.learning.side_table_opening_source in ("cmd", "actual"),
         f"learning.side_table_opening_source は cmd か actual: "
         f"{cfg.learning.side_table_opening_source!r}",
+    )
+    move_kmh = cfg.learning.launch_breakaway_move_kmh
+    need(
+        move_kmh is None or move_kmh > 0.0,
+        f"learning.launch_breakaway_move_kmh は null か正値: "
+        f"{cfg.learning.launch_breakaway_move_kmh!r}",
     )
     need(
         cfg.learning.launch_accel_side_source in ("extrapolate", "measured"),

@@ -1010,6 +1010,7 @@ def _attach_low_speed_tables(
     *,
     creep_speed_kmh: float,
     creep_launch_min_speed_kmh: float | None = None,
+    launch_breakaway_move_kmh: float | None = None,
     side_table_opening_source: str = "actual",
     stop_release_layer_enabled: bool = False,
     launch_accel_side_source: str = "extrapolate",
@@ -1101,6 +1102,9 @@ def _attach_low_speed_tables(
     )
 
     min_speed = STOP_SPEED_KMH if creep_launch_min_speed_kmh is None else creep_launch_min_speed_kmh
+    # 段7-a: 動き出す開度だけ別のしきい値で測れる（None なら上の min_speed。比較は >=）
+    if launch_breakaway_move_kmh is not None:
+        min_speed = launch_breakaway_move_kmh
     breakaway = launch_breakaway(
         csv_path, brake_min_pct=st.brake_deadband_pct, brake_lag_s=st.brake_lag_s,
         min_speed_kmh=min_speed, opening_source=side_table_opening_source,
@@ -1109,6 +1113,7 @@ def _attach_low_speed_tables(
         table, launch_rows, creep_speed_kmh=creep_speed_kmh, breakaway=breakaway,
         accel_window_s=side_table_accel_window_s,
     )
+    table.meta["launch_breakaway_move_kmh"] = float(min_speed)
     table = attach_stop(
         table, stop_rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=side_table_accel_window_s
     )
@@ -1192,6 +1197,7 @@ def _build_forward_model(
     max_iter: int | None,
     lags: MeasuredLags | None = None,
     creep_launch_min_speed_kmh: float | None = None,
+    launch_breakaway_move_kmh: float | None = None,
     side_table_opening_source: str = "actual",
     stop_release_layer_enabled: bool = False,
     accel_release_input_enabled: bool = False,
@@ -1264,6 +1270,7 @@ def _build_forward_model(
     table = _attach_low_speed_tables(
         table, csv_path, st, creep_speed_kmh=profile.feedforward_params.creep_speed_kmh,
         creep_launch_min_speed_kmh=creep_launch_min_speed_kmh,
+        launch_breakaway_move_kmh=launch_breakaway_move_kmh,
         side_table_opening_source=side_table_opening_source,
         stop_release_layer_enabled=stop_release_layer_enabled,
         launch_accel_side_source=launch_accel_side_source,
@@ -1490,6 +1497,7 @@ def build_ff_model(
             profile, csv_path, models_dir, hw_mode,
             workers=forward_workers, seeds=forward_seeds, max_iter=forward_max_iter, lags=lags,
             creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
+            launch_breakaway_move_kmh=cfg.learning.launch_breakaway_move_kmh,
             side_table_opening_source=cfg.learning.side_table_opening_source,
             stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
             accel_release_input_enabled=cfg.learning.accel_release_input_enabled,
@@ -1566,6 +1574,7 @@ def build_ff_model(
             profile, csv_path, models_dir, hw_mode,
             workers=forward_workers, seeds=new_seeds, max_iter=forward_max_iter, lags=lags,
             creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
+            launch_breakaway_move_kmh=cfg.learning.launch_breakaway_move_kmh,
             side_table_opening_source=cfg.learning.side_table_opening_source,
             stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
             accel_release_input_enabled=cfg.learning.accel_release_input_enabled,

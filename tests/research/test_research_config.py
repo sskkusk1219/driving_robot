@@ -1216,6 +1216,19 @@ def test_side_table_settings_default_and_validation(tmp_path: Path) -> None:
     assert any("side_table_opening_source" in p for p in cfgmod.validate_config(cfg))
 
 
+def test_launch_breakaway_move_kmh_default_and_validation() -> None:
+    """段7-a: 動き出す開度のしきい値。config.py の既定は None、null か正値だけ通る。"""
+    assert cfgmod.LearningSection().launch_breakaway_move_kmh is None
+    cfg = _load_default()
+    assert cfg.learning.launch_breakaway_move_kmh == pytest.approx(0.05)
+    for ok in (None, 0.05, 1.0):
+        cfg.learning.launch_breakaway_move_kmh = ok
+        assert not any("launch_breakaway_move_kmh" in p for p in cfgmod.validate_config(cfg))
+    for bad in (0.0, -0.1):
+        cfg.learning.launch_breakaway_move_kmh = bad
+        assert any("launch_breakaway_move_kmh" in p for p in cfgmod.validate_config(cfg))
+
+
 def test_accel_release_input_setting_default_off(tmp_path: Path) -> None:
     """アクセルの戻し量を入力にする設定。config.py の既定は false、今の yaml は true（段5-7）。"""
     assert cfgmod.LearningSection().accel_release_input_enabled is False  # config.py の既定

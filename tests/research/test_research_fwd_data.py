@@ -594,6 +594,18 @@ def test_launch_breakaway_reads_cmd_opening_when_asked(tmp_path: Path) -> None:
     assert cmd.u_pct == pytest.approx(act.u_pct + 1.0, abs=1e-6)
 
 
+def test_launch_breakaway_smaller_threshold_measures_earlier(tmp_path: Path) -> None:
+    """段7-a: しきい値を下げると、車速がそこに届く時刻が早まり、まだ深いブレーキ開度で測る。"""
+    rows = _breakaway_rows("PATTERN_DRIVE", "RAMP_LAUNCH_RELEASE", 8.0)
+    for r in rows:  # 動き出し（k=1 s）の後も、ブレーキを 1 %/s で離し続ける
+        r["brake_actual_pct"] = 10.0 - float(r["elapsed_s"])
+    path = write_csv(tmp_path / "t.csv", rows)
+    hi = launch_breakaway(path, brake_min_pct=BD, brake_lag_s=0.0, min_speed_kmh=1.0)
+    lo = launch_breakaway(path, brake_min_pct=BD, brake_lag_s=0.0, min_speed_kmh=0.05)
+    assert hi is not None and lo is not None
+    assert lo.u_pct < hi.u_pct  # 早い時刻ほどブレーキを離しきっておらず、u（負）が深い
+
+
 def test_accel_push_amount_is_rise_from_recent_min_for_positive_u() -> None:
     """2026-10-23 段5-7b: 踏み増し量 ＝ u − 直近窓の u の最小（u > 0 の点だけ）。"""
     t = np.arange(8) * 1.0

@@ -648,6 +648,9 @@ learning:
   # 少し悪化（−0.20 → −0.26 km/h/s）。効く先: 手順2 の発進・停止側の表。pkl meta
   # side_table_opening_source に残る。決める時期: 戻しの層・アクセルの戻し量を切り分けた実機比較の後
   side_table_opening_source: actual
+  # 段7-a（2026-10-24 ユーザー決定）: 動き出す開度は車速が 0.05 km/h を超えた所で測る。
+  # null なら creep_launch_min_speed_kmh（無ければ 0.5）
+  launch_breakaway_move_kmh: 0.05
   # 2026-10-22 段5-3: 発進側の表のアクセル側の作り方。extrapolate ＝ 今まで（クリープ ＋ 本体の増えの
   # 外挿）、measured ＝ 手順2 の行を 2% のマスで測った点（帯の下端 2.5 km/h 以上の行）／max(クリープ,
   # 本体)（帯の上端 2.5 km/h 以下の行）。マス幅 2%・0.5 秒・2.5 km/h は仮値。既定は今と同じ。
