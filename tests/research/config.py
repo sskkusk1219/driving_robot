@@ -487,6 +487,11 @@ class LearningSection:
     stop_release_rate_pct_s: float = 2.0
     # 逃げ道: 実加速度 >= 0 がこの秒数続いたら停車保持へ踏む [s]。仮値（根拠なし）。決める時期: 同上
     stop_release_escape_s: float = 0.5
+    # 逃げ道の判定は「実加速度 >= −この値 [km/h/s]」（速度が一定＝減速が止まった、も拾う）。
+    # 実加速度は窓の傾きなので、一定でも 0 をわずかに下回って「>= 0」を満たさない
+    # （段5-8 のスタブで 4.58 km/h が 20 秒以上居座った）。仮値（根拠なし）。
+    # 決める時期: 段5-8 の実機の後
+    stop_release_escape_decel_kmhs: float = 0.1
     # この目標減速度 [G] を超える段（0.25・0.35G。7.5 km/h から 1 秒ほどで止まる）には入れない。
     # 仮値（0.2G は弱い段 0.175G と強い段 0.25G の間）。決める時期: 同上
     stop_release_max_g: float = 0.2
@@ -1490,6 +1495,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     )
     need(lr8.stop_release_rate_pct_s > 0.0, "learning.stop_release_rate_pct_s は正値")
     need(lr8.stop_release_escape_s > 0.0, "learning.stop_release_escape_s は正値")
+    need(
+        lr8.stop_release_escape_decel_kmhs >= 0.0,
+        "learning.stop_release_escape_decel_kmhs は 0 以上",
+    )
     need(lr8.stop_release_max_g > 0.0, "learning.stop_release_max_g は正値")
     need(
         lr8.stop_approach_exclusion in ("depth", "window", "none"),

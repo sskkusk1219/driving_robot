@@ -764,6 +764,7 @@ class PatternLoopConfig:
     stop_release_fracs: tuple[float, ...] = field(default=(0.25, 0.5))
     stop_release_rate_pct_s: float = field(default=2.0)
     stop_release_escape_s: float = field(default=0.5)
+    stop_release_escape_decel_kmhs: float = field(default=0.1)
     stop_release_max_g: float = field(default=0.2)
 
 
@@ -2607,14 +2608,16 @@ class PatternLoop:
         self, pattern: GRampPattern, speed: float, now: float, measured_g: float | None
     ) -> None:
         """停止前の戻しの前進。u は入ってからの時間で直線に戻し、戻した先で保つ。
-        停車（実車速 ≦ STOP_SPEED_KMH）・逃げ道（実加速度 ≧ 0 が stop_release_escape_s 続いた）・
+        停車（実車速 ≦ STOP_SPEED_KMH）・逃げ道（実加速度 ≧ −stop_release_escape_decel_kmhs が
+        stop_release_escape_s 続いた）・
         安全網（STOP_RELEASE_TIMEOUT_S）のどれかで結果を記録して `_finish_pattern`。"""
         cfg = self._config
         t = max(0.0, now - self._rp_stop_release_t0)
         last = self._rp_stop_release_last_t
         dt = 0.0 if last is None else min(max(0.0, now - last), 10.0 * self._interval_s)
         self._rp_stop_release_last_t = now
-        if measured_g is not None and measured_g >= 0.0:
+        floor_g = -cfg.stop_release_escape_decel_kmhs / G_TO_KMHS
+        if measured_g is not None and measured_g >= floor_g:
             self._rp_stop_release_nonneg_s += dt
         else:
             self._rp_stop_release_nonneg_s = 0.0

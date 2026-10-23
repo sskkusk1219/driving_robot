@@ -676,6 +676,8 @@ learning:
   stop_release_fracs: [0.25, 0.5]
   stop_release_rate_pct_s: 2.0
   stop_release_escape_s: 0.5
+  # 逃げ道の判定は加速度 >= −この値 [km/h/s]（速度一定を拾う。仮値・根拠なし。実機の後に決める）
+  stop_release_escape_decel_kmhs: 0.1
   stop_release_max_g: 0.2
   # 2026-10-23 段5-8: 停車まぎわ除外の外し方。depth ＝ 5 km/h 未満かつ u <= −8% の行（今まで）、
   # none ＝ 外さない、window ＝ 加速度の窓が停車の瞬間にかかる行だけ。効く先: 手順2 の C8 系の表（meta

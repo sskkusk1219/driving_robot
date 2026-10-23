@@ -3595,6 +3595,36 @@ def test_stop_release_escape_when_deceleration_stops() -> None:
     assert loop._phase is _Phase.DRIVE_BRAKE
 
 
+def test_stop_release_escape_when_speed_is_constant_slightly_negative() -> None:
+    """速度が一定（実加速度が 0 付近でわずかに負）でも escape_s 後に停車保持へ踏む。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_stop_config())
+    kine = _StopKine(loop, 0.1, decel_ratio=0.0)  # 戻すと速度が一定
+    orig = loop._advance_stop_release
+
+    def noisy(pattern, speed, now, measured_g):  # type: ignore[no-untyped-def]
+        # 傾きの丸め・ノイズで 0 をわずかに下回る（-0.02 km/h/s）
+        return orig(pattern, speed, now, None if measured_g is None else -0.02 / G_TO_KMHS)
+
+    loop._advance_stop_release = noisy  # type: ignore[method-assign]
+    rows = _run_stop(loop, p, kine)
+    seg = [r for r in rows if r[1] == "RAMP_STOP_RELEASE"]
+    assert seg
+    assert seg[-1][0] - seg[0][0] <= loop._config.coast_accel_slope_window_s + 1.5
+    assert seg[-1][2] > 1.0
+    assert len(loop.ramp_results) == 1
+    assert loop._phase is _Phase.DRIVE_BRAKE
+    # 閾値 0（旧動作）なら居座る
+    loop2 = _loop([p], config=_stop_config(stop_release_escape_decel_kmhs=0.0))
+    orig2 = loop2._advance_stop_release
+    loop2._advance_stop_release = lambda pt, sp, n, g: orig2(  # type: ignore[method-assign]
+        pt, sp, n, None if g is None else -0.02 / G_TO_KMHS
+    )
+    rows2 = _run_stop(loop2, p, _StopKine(loop2, 0.1, decel_ratio=0.0), t_max=60.0)
+    seg2 = [r for r in rows2 if r[1] == "RAMP_STOP_RELEASE"]
+    assert seg2[-1][0] - seg2[0][0] >= 25.0  # 安全網（30 秒）まで居座る
+
+
 def test_stop_release_skips_strong_steps_and_non_brake() -> None:
     """目標減速度が stop_release_max_g を超える段（0.25G）には入らない。0.2G ちょうどは入る。
     u ＜ 0 でない（ブレーキを踏んでいない）下りも入らない。"""

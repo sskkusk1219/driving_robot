@@ -589,6 +589,7 @@ def loop_config_from_config(
         stop_release_fracs=tuple(lr.stop_release_fracs),
         stop_release_rate_pct_s=lr.stop_release_rate_pct_s,
         stop_release_escape_s=lr.stop_release_escape_s,
+        stop_release_escape_decel_kmhs=lr.stop_release_escape_decel_kmhs,
         stop_release_max_g=lr.stop_release_max_g,
         ramp_release_min_kmh=cfg.feedforward.creep_speed_kmh + CRUISE_MIN_MARGIN_KMH,
         gov_soft_frac=lr.gov_soft_frac,
