@@ -220,6 +220,10 @@ def test_reach_horizons_settings_are_validated() -> None:
     cfg.feedforward.reach_horizons_s = [0.5, -1.0]  # 負値
     assert any("reach_horizons_s" in p for p in cfgmod.validate_config(cfg))
 
+    # reach_horizons_s は pedal_select_mode: window と併用できない（yaml は window）。
+    # この検証は reach_horizons_s 自体のものなので point にして確かめる
+    cfg.feedforward.pedal_select_mode = "point"
+    cfg.feedforward.pedal_select_brake_center_s = None  # window 専用キー（yaml に値があれば外す）
     cfg.feedforward.reach_horizons_s = [0.5, 1.0, 2.0]
     assert cfgmod.validate_config(cfg) == []
 
@@ -329,10 +333,10 @@ def test_pedal_search_creep_keys_validate() -> None:
     creep_settle_min_s）が validate_config を通り、範囲外は弾かれること。"""
     cfg = _load_default()
     ps = cfg.pedal_search
-    # 2026-09-21 実機確認で 3.0 → 5.0 に調整（ProblemReport_20260919 13.2）
-    assert ps.creep_window_s == 5.0
+    # 今の yaml の値（2026-10-19 段2s-2 で 5.0 → 7.0 に短縮。creep_settle_min_s も 7.0）
+    assert ps.creep_window_s == 7.0
     assert ps.creep_settle_kmhs == pytest.approx(0.020)  # 同上調整で 0.033 → 0.020
-    assert ps.creep_settle_min_s == 10.0
+    assert ps.creep_settle_min_s == 7.0
     assert cfgmod.validate_config(cfg) == []
 
     def problems_about(key: str) -> bool:
@@ -479,7 +483,7 @@ def test_min_opening_is_validated_against_max() -> None:
     """段2l-6: 0 ≤ min ＜ 対応する max（アクセル・ブレーキそれぞれ）。"""
     cfg = _load_default()
     v = cfg.vehicle
-    assert v.min_accel_opening_pct == 6.5 and v.min_brake_opening_pct == 2.9
+    assert v.min_accel_opening_pct == 4.2 and v.min_brake_opening_pct == 4.2  # 今の yaml の値
     assert cfgmod.validate_config(cfg) == []
 
     def problems_about(key: str) -> bool:
@@ -800,7 +804,7 @@ def test_ramp_settings_are_validated() -> None:
     lr = cfg.learning
     assert lr.ramp_g_levels == [0.02, 0.045, 0.08, 0.125, 0.175, 0.25, 0.35]
     assert lr.ramp_mode_min_s == pytest.approx(2.0)
-    assert lr.ramp_time_budget_s == pytest.approx(2060.0)  # 段2o-5: 1910 → 2060
+    assert lr.ramp_time_budget_s == pytest.approx(1600.0)  # 段2o-8: 2060 → 1600（今の yaml）
     assert cfgmod.validate_config(cfg) == []
 
     def problems_about(key: str) -> bool:
@@ -821,7 +825,7 @@ def test_ramp_settings_are_validated() -> None:
     lr.ramp_time_budget_s = 0.0
     assert problems_about("ramp_time_budget_s")
     lr.ramp_time_budget_s = 1200.0
-    assert lr.ramp_max_passes == 2  # 2026-10-17 段2o-8
+    assert lr.ramp_max_passes == 1  # 今の yaml（2026-10-17 段2o-8 で 2 → 1。config.py の既定は別）
     lr.ramp_max_passes = 0
     assert problems_about("ramp_max_passes")
     lr.ramp_max_passes = 1
@@ -1037,7 +1041,8 @@ def test_ramp_release_settings_are_loaded_and_validated() -> None:
     assert list(lr.ramp_release_fracs) == [0.5, 0.0]
     assert lr.ramp_release_move_s == pytest.approx(1.0)
     assert list(lr.ramp_release_hold_s) == [1.5, 2.0]
-    assert lr.ramp_release_enabled is True  # 2026-10-16 段2o-6（既定 true）
+    assert lr.ramp_release_enabled is False  # 今の yaml の値（結果に差がなく false 運用）
+    assert cfgmod.LearningSection().ramp_release_enabled is True  # config.py の既定
     assert cfgmod.validate_config(cfg) == []
 
     def problems_about(key: str) -> bool:
@@ -1064,13 +1069,13 @@ def test_ramp_release_enabled_is_loaded_and_passed_to_the_loop(tmp_path: Path) -
     from tests.research.pattern_drive import loop_config_from_config
 
     path = tmp_path / "cfg.yaml"
-    cfg = cfgmod.load_config(path)  # 無ければ既定 yaml から作られる
-    assert cfg.learning.ramp_release_enabled is True
-    assert loop_config_from_config(cfg).ramp_release_enabled is True
-    cfg.save({"learning.ramp_release_enabled": False})
+    cfg = cfgmod.load_config(path)  # 無ければ既定 yaml から作られる（今の yaml は false 運用）
+    assert cfg.learning.ramp_release_enabled is False
+    assert loop_config_from_config(cfg).ramp_release_enabled is False
+    cfg.save({"learning.ramp_release_enabled": True})
     cfg2 = cfgmod.load_config(path)
-    assert cfg2.learning.ramp_release_enabled is False
-    assert loop_config_from_config(cfg2).ramp_release_enabled is False
+    assert cfg2.learning.ramp_release_enabled is True
+    assert loop_config_from_config(cfg2).ramp_release_enabled is True
 
 
 def test_ramp_launch_release_settings_are_validated() -> None:
@@ -1098,6 +1103,7 @@ def test_ramp_launch_release_settings_are_validated() -> None:
 
 
 def test_candidate_c11_is_accepted_and_dob_tq_coef_default_is_40() -> None:
+    """config.py の既定は 40（yaml は 20: 段4-1）。yaml は読まず ForwardMapSection() で見る。"""
     cfg = _load_default()
     cfg.feedforward.candidate = "C11"
     assert not any("candidate" in p for p in cfgmod.validate_config(cfg))
@@ -1109,10 +1115,12 @@ def test_dob_tq_coef_is_loaded_from_yaml_and_validated(tmp_path: Path) -> None:
     text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
     assert "forward_map:\n" in text
     path = tmp_path / "dob.yaml"
-    path.write_text(text.replace("forward_map:\n", "forward_map:\n  dob_tq_coef: 25.0\n", 1),
+    assert "\n  dob_tq_coef: 20.0\n" in text  # 今の yaml の値
+    assert cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH).forward_map.dob_tq_coef == 20.0
+    path.write_text(text.replace("\n  dob_tq_coef: 20.0\n", "\n  dob_tq_coef: 25.0\n", 1),
                     encoding="utf-8")
     cfg = cfgmod.load_config(path)
-    assert cfg.forward_map.dob_tq_coef == 25.0
+    assert cfg.forward_map.dob_tq_coef == 25.0  # yaml の値が読まれる
     assert not any("dob_tq_coef" in p for p in cfgmod.validate_config(cfg))
     for bad in (0.0, -1.0):
         cfg.forward_map.dob_tq_coef = bad
@@ -1208,16 +1216,17 @@ def test_side_table_settings_default_and_validation(tmp_path: Path) -> None:
 
 
 def test_accel_release_input_setting_default_off(tmp_path: Path) -> None:
-    """2026-10-20 段4-3: アクセルの戻し量を入力にする設定は既定 false（実機 091838 で悪化）。"""
-    assert cfgmod.LearningSection().accel_release_input_enabled is False
+    """アクセルの戻し量を入力にする設定。config.py の既定は false、今の yaml は true（段5-7）。"""
+    assert cfgmod.LearningSection().accel_release_input_enabled is False  # config.py の既定
     text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
-    assert "  accel_release_input_enabled: false\n" in text
-    assert _load_default().learning.accel_release_input_enabled is False
+    assert "  accel_release_input_enabled: true\n" in text  # 今の yaml
+    assert _load_default().learning.accel_release_input_enabled is True
 
 
 def test_low_speed_side_rule_defaults_to_legacy_and_is_validated() -> None:
+    assert cfgmod.ForwardMapSection().low_speed_side_rule == "legacy"  # config.py の既定
     cfg = _load_default()
-    assert cfg.forward_map.low_speed_side_rule == "legacy"
+    assert cfg.forward_map.low_speed_side_rule == "dir"  # 今の yaml（段5-6 でユーザー決定）
     assert not any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
     cfg.forward_map.low_speed_side_rule = "pedal"
     assert not any("low_speed_side_rule" in p for p in cfgmod.validate_config(cfg))
@@ -1229,9 +1238,9 @@ def test_stage53_settings_default_to_current_behaviour_and_are_validated() -> No
     d = cfgmod.LearningSection()
     assert d.launch_accel_side_source == "extrapolate" and d.side_table_accel_window_s == 0.5
     assert cfgmod.ForwardMapSection().release_table_min_kmh == 0.0
-    cfg = _load_default()
-    assert cfg.learning.launch_accel_side_source == "extrapolate"
-    assert cfg.learning.side_table_accel_window_s == 0.5
+    cfg = _load_default()  # 今の yaml の値（measured・1.0）
+    assert cfg.learning.launch_accel_side_source == "measured"
+    assert cfg.learning.side_table_accel_window_s == 1.0
     assert cfg.forward_map.release_table_min_kmh == 0.0
     keys = ("launch_accel_side_source", "side_table_accel_window_s", "release_table_min_kmh")
     assert not any(k in p for p in cfgmod.validate_config(cfg) for k in keys)

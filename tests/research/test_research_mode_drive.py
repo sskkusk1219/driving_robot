@@ -40,12 +40,13 @@ HOLD_PCT = 22.0
 def _tmp_cfg(tmp_path: Path) -> cfgmod.ResearchConfig:
     path = tmp_path / "cfg.yaml"
     cfg = cfgmod.load_config(path)
+    min_brake = cfg.vehicle.min_brake_opening_pct  # 今の yaml の値（変わっても追従する）
     cfg.save(
         {
             "output.results_dir": str(tmp_path / "results"),
             "output.plot": False,
-            # 絶対 22.0%（min 2.9 ＋ 量）。段2l-7
-            "feedforward.stop_brake_offset_pct": HOLD_PCT - 2.9,
+            # 絶対 22.0%（min ＋ 量）。段2l-7
+            "feedforward.stop_brake_offset_pct": HOLD_PCT - min_brake,
             # 走行後の緩減速を短くする（判定ロジックは既定と同じ）
             "decel_stop.step_mm": 1.0,
             "decel_stop.dwell_s": 0.2,
@@ -256,6 +257,7 @@ async def test_prepare_mode_drive_shows_pedal_specific_horizons(
     """ペダル別ホライズンの pkl を読んだとき、アクセル/ブレーキ別に先読みを表示すること。"""
     cfg = _tmp_cfg(tmp_path)
     cfg.feedforward.model_path = str(tmp_path / "separated.pkl")
+    cfg.feedforward.candidate = "C1"  # 多項式 pkl を読む候補（yaml の C15 は不可）
     _write_pedal_separated_pkl(Path(cfg.feedforward.model_path))
     mode = _mode([(0.0, 0.0), (10.0, 20.0)])
 
@@ -280,6 +282,7 @@ async def test_prepare_mode_drive_warns_on_h0_h1_mismatch(
     """pkl の h0/h1 が現在の設定と食い違うと警告を出す（走行は pkl のまま続ける）。"""
     cfg = _tmp_cfg(tmp_path)
     cfg.feedforward.model_path = str(tmp_path / "separated.pkl")
+    cfg.feedforward.candidate = "C1"  # 多項式 pkl を読む候補（yaml の C15 は不可）
     _write_pedal_separated_pkl(Path(cfg.feedforward.model_path))
     cfg.features.h1_s = 2.0  # pkl の regime_horizon_s（1.0）と食い違わせる
     mode = _mode([(0.0, 0.0), (10.0, 20.0)])
@@ -1134,6 +1137,7 @@ def test_select_kwargs_point_is_empty_and_window_uses_L_and_H() -> None:
     cfg.feedforward.reach_horizons_s = []
 
     cfg.feedforward.pedal_select_mode = "window"
+    cfg.feedforward.pedal_select_brake_center_s = None  # yaml に L_b があっても外す
     cfg.feedforward.pedal_select_center_s = 0.5
     cfg.feedforward.pedal_select_width_s = 3.0
     kwargs = run._select_kwargs(4.0, 40.0)  # noqa: SLF001
@@ -1282,6 +1286,7 @@ def _c10_cfg(
     cfg.feedforward.candidate = candidate
     cfg.forward_map.deviation_c = c
     cfg.forward_map.deviation_row = row
+    cfg.forward_map.dob_tq_coef = 40.0  # テストの入力として固定（yaml の値 20 に依存しない）
     cfg.mode_drive.pedal_standby = False
     _write_forward_table_pkl(Path(cfg.feedforward.model_path), kind="model")
     return cfg
@@ -1436,7 +1441,8 @@ async def test_c10_run_logs_offset_column_and_c8_leaves_it_blank(
 
 def test_forward_map_deviation_settings_are_validated(tmp_path: Path) -> None:
     cfg = _tmp_cfg(tmp_path)
-    assert cfg.forward_map.deviation_c == 100.0 and cfg.forward_map.deviation_row == "reference"
+    # 今の yaml の値（段4-1 で deviation_c 12.5）
+    assert cfg.forward_map.deviation_c == 12.5 and cfg.forward_map.deviation_row == "reference"
     assert not any("deviation" in p for p in cfgmod.validate_config(cfg))
     cfg.forward_map.deviation_row = "bogus"
     assert any("deviation_row" in p for p in cfgmod.validate_config(cfg))

@@ -64,7 +64,13 @@ FAST_LOOP = PatternLoopConfig(
     creep_settle_stable_duration_s=0.2,
     creep_settle_timeout_s=1.0,
     accel_full_range_timeout_s=1.5,
-    brake_stop_timeout_s=4.0,
+    # 停車復帰: コーストダウンの惰行は 1 秒で打ち切るので、DRIVE_BRAKE に入る車速は壁時計次第で
+    # 10 km/h 前後まで残る（クリープ + 許容幅より高いと G 比例ブレーキで減速する）。G 比例の刻みを
+    # 本番（0.5mm/1s）のままにすると 4 秒では止まらず非常停止して不安定になるので、刻みを速く・
+    # 待ちを長くして、どの車速から入っても止まるようにする
+    brake_stop_timeout_s=20.0,
+    calib_step_mm=1.0,
+    calib_dwell_s=0.2,
     coast_timeout_s=1.0,
     coast_accel_rate_gain=1000.0,  # 短い試験でも開度が上がるように踏む速さを上げる
 )

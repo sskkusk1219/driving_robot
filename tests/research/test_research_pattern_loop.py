@@ -156,7 +156,9 @@ async def _run_until_done(loop: PatternLoop, rec: Recorder, timeout_s: float = 5
 def test_governor_reduces_holds_raises_and_releases() -> None:
     loop, *_ = _loop([_pattern(PatternKind.COAST_DOWN, accel=40.0)])
     limit = loop._g_limit_kmhs
-    assert limit == pytest.approx(0.4 * G_TO_KMHS * 0.98)
+    # 上限 G は yaml の車両の max_decel_g（今は 0.45）に追従する（古い 0.4 の決め打ちをやめた）
+    max_decel_g = cfgmod.load_config(CFG_PATH).vehicle.max_decel_g
+    assert limit == pytest.approx(max_decel_g * G_TO_KMHS * 0.98)
     cfg = loop._config
 
     # 上限以上: 最初は現在開度で頭打ち → 以降 2%/0.1 秒（この周期 0.02 秒なら 0.4%/周期）で下げる
@@ -171,11 +173,13 @@ def test_governor_reduces_holds_raises_and_releases() -> None:
     raised = loop._next_gov_cap(cap, limit * 0.5, 0.0, current=28.0, request=30.0)
     assert raised == pytest.approx(cap + cfg.gov_raise_step_pct * 0.02 / 0.1)
     # 指令に届いたら解除
-    assert loop._next_gov_cap(29.8, limit * 0.5, 0.0, current=29.8, request=30.0) is None
+    # （戻しは 1 周期 0.1%。次の一歩で指令 30.0 に届く 29.95 から始める）
+    assert loop._next_gov_cap(29.95, limit * 0.5, 0.0, current=29.95, request=30.0) is None
     # 頭打ちが無く上限未満なら何もしない
     assert loop._next_gov_cap(None, limit * 0.5, 0.0, current=30.0, request=30.0) is None
     # 下限は 0%
-    assert loop._next_gov_cap(1.0, limit + 1.0, 0.0, current=1.0, request=30.0) == 0.0
+    # （下げは 1 周期 0.4%。一歩で 0 を割る 0.3 から始める）
+    assert loop._next_gov_cap(0.3, limit + 1.0, 0.0, current=0.3, request=30.0) == 0.0
 
 
 def test_governor_steps_are_per_second_regardless_of_the_cycle() -> None:
