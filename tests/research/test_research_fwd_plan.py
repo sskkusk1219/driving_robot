@@ -1735,3 +1735,102 @@ def test_release_ramp_also_in_switch_lead_two_pass() -> None:
         ref, 16.0, _bk_table(), **LAG, launch_release_ramp=True, switch_lead=True
     )
     assert on.launch_prep is not None and on.launch_prep.any()
+
+
+# ---- 段7-c: すき間で失う分の補償 ----
+
+def _gap_table() -> ForwardTable:
+    tb = linear_table()
+    for p in ("accel", "brake"):
+        tb.meta[f"{p}_return_delay_s"] = 0.3
+        tb.meta[f"{p}_return_rate_pct_s"] = 20.0
+    return tb
+
+
+def _valley(t: float) -> float:
+    """50 km/h から 3 秒間 −4 km/h/s で減速して、そのまま +4 km/h/s で加速（谷）。"""
+    return 50.0 - 4.0 * t if t < 3.0 else 38.0 + 4.0 * (t - 3.0)
+
+
+def _hill(t: float) -> float:
+    """+4 km/h/s で 3 秒加速して、そのまま −4 km/h/s で減速（山）。"""
+    return 50.0 + 4.0 * t if t < 3.0 else 62.0 - 4.0 * (t - 3.0)
+
+
+def _gap_plan(ref, comp: bool, **kw):
+    return plan_for(
+        ref, 6.0, _gap_table(), return_gap_enabled=True, switch_gap_compensate=comp,
+        brake_lag_s=0.1, accel_lag_s=0.1, **kw,
+    )
+
+
+def test_gap_compensation_valley_deepens_brake_before_gap() -> None:
+    off, on = _gap_plan(_valley, False), _gap_plan(_valley, True)
+    assert off.return_gap.n_cut >= 1  # 前提: 谷で戻す側が削られている
+    assert on.return_gap.comp_events >= 1 and on.return_gap.comp_dv_kmh > 0.0
+    brake = (off.effort_pct < 0.0) & (on.effort_pct < 0.0)
+    assert np.any(on.effort_pct[brake] < off.effort_pct[brake] - 1e-9)  # 深くなった
+    assert np.all(on.effort_pct[brake] <= off.effort_pct[brake] + 1e-9)
+    assert on.return_gap.n_violations == 0
+    # 計画が持つ要る加速度は上乗せ前のまま
+    assert np.allclose(on.need_accel_kmhs, off.need_accel_kmhs, atol=1e-9)
+
+
+def test_gap_compensation_adds_dv_to_need_of_rows_before_gap() -> None:
+    from tests.research.fwd_plan import _gap_compensation, return_time_of
+
+    tb = _gap_table()
+    aux: dict = {}
+    base = plan_for(
+        _valley, 6.0, tb, return_gap_enabled=False, brake_lag_s=0.1, accel_lag_s=0.1,
+        _aux_out=aux,
+    )
+    ret = return_time_of(tb, AD, BD)
+    add, dv, n_ev, trimmed = _gap_compensation(base, aux, ret, base.period_s)
+    assert n_ev >= 1 and dv > 0.0 and trimmed.any()
+    rows = np.flatnonzero(add != 0.0)
+    assert np.all(add[rows] < 0.0)  # 谷: 減速が足りない → 要る加速度を下げる（ブレーキを深く）
+    assert np.all(base.effort_pct[rows] < 0.0) and not np.any(trimmed & (add != 0.0))
+    # 上乗せの合計 × 周期 ＝ −Σ|Δv|（削った行の（要る加速度 − 惰行の加速度）× 周期の合計）
+    assert float(add.sum()) * base.period_s == pytest.approx(
+        -sum(
+            abs(float(np.sum(base.need_accel_kmhs[trimmed] - aux["coast_b"][trimmed])))
+            * base.period_s
+            for _ in [0]
+        ),
+        rel=1e-6,
+    )
+
+
+def test_gap_compensation_hill_deepens_accel() -> None:
+    off, on = _gap_plan(_hill, False), _gap_plan(_hill, True)
+    assert off.return_gap.n_cut >= 1
+    assert on.return_gap.comp_events >= 1
+    accel = (off.effort_pct > 0.0) & (on.effort_pct > 0.0)
+    assert np.any(on.effort_pct[accel] > off.effort_pct[accel] + 1e-9)
+    assert np.all(on.effort_pct[accel] >= off.effort_pct[accel] - 1e-9)
+    assert on.return_gap.n_violations == 0
+
+
+def test_gap_compensation_off_is_identical_and_no_double_pedal() -> None:
+    off = _gap_plan(_valley, False)
+    dflt = plan_for(
+        _valley, 6.0, _gap_table(), return_gap_enabled=True, brake_lag_s=0.1, accel_lag_s=0.1
+    )
+    assert np.array_equal(off.effort_pct, dflt.effort_pct)
+    assert off.return_gap.comp_events == 0 and "補償" not in off.return_gap.summary()
+    on = _gap_plan(_valley, True)
+    assert "すき間の補償" in on.return_gap.summary()
+    # 一定速度の基準では切り替えが無いので何も変わらない
+    c_off = plan_for(lambda t: 50.0, 3.0, _gap_table(), return_gap_enabled=True)
+    c_on = plan_for(
+        lambda t: 50.0, 3.0, _gap_table(), return_gap_enabled=True, switch_gap_compensate=True
+    )
+    assert np.array_equal(c_off.effort_pct, c_on.effort_pct)
+
+
+def test_gap_compensation_with_preposition_and_switch_lead() -> None:
+    for kw in ({"preposition_enabled": True}, {"switch_lead": True}):
+        on = _gap_plan(_valley, True, **kw)
+        assert on.return_gap.n_violations == 0
+        assert len(on.effort_pct) == len(on.t_s) and np.all(np.isfinite(on.effort_pct))

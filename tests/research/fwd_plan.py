@@ -245,6 +245,10 @@ class ReturnGapStats:
     delayed_s: float = 0.0  # 遅らせた合計秒数
     n_violations: int = 0  # 処理の後に残ったすき間不足の数（0 のはず）
     defaults_used: tuple[str, ...] = ()  # 測定値が無く仮値を使ったペダル
+    # 2026-10-24 段7-c: すき間で失う分の補償（switch_gap_compensate）。補償しなければ全部 0
+    comp_events: int = 0  # 補償した切り替えの数
+    comp_dv_kmh: float = 0.0  # 上乗せした Δv の絶対値の合計 [km/h]
+    comp_new_trim_rows: int = 0  # 上乗せ後の 2 回目の確保で新しく惰行に削られた行数
 
     def summary(self) -> str:
         text = (
@@ -254,6 +258,11 @@ class ReturnGapStats:
         )
         if self.defaults_used:
             text += f"・戻る時間は仮値（{'・'.join(self.defaults_used)}。pkl に測定値なし）"
+        if self.comp_events:
+            text += (
+                f"・すき間の補償 {self.comp_events} 回（Δv 計 {self.comp_dv_kmh:.2f} km/h・"
+                f"2 回目で新しく削られた {self.comp_new_trim_rows} 行）"
+            )
         return text
 
 
@@ -389,7 +398,10 @@ def build_plan(
     launch_release_lead_s: float = 2.0,
     launch_release_pre_pct: float = 2.0,
     launch_short_stop_s: float = 5.0,
+    switch_gap_compensate: bool = False,
     _lead_extra: np.ndarray | None = None,
+    _need_add: np.ndarray | None = None,
+    _aux_out: dict[str, np.ndarray] | None = None,
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
 
@@ -401,6 +413,14 @@ def build_plan(
     t_go まで直線で bk へ。以下なら停車の区間を bk で待つ。どちらも t_go までのブレーキ・惰行の行は
     浅くしない。meta が無ければ何もしない。A1 の後・np.clip の前（先置き・すき間の確保はその後に
     今までどおり掛かる）。
+
+    2026-10-24 段7-c: `switch_gap_compensate`。False は今までと完全に同じ。True は、アクセル ⇔
+    ブレーキの切り替え（停車保持・先置きをまたぐものは除く。`switch_lead_events` と同じ対象）で
+    `ensure_return_gap` が戻す側の最後の行を惰行に削って失う速度
+    Δv ＝ Σ（その行の要る加速度 − 惰行の加速度）× 周期 を、削られた行の直前の同じペダルの同じ行数に
+    均等に上乗せして（要る加速度 ＋ Δv ÷ その秒数）、同じ表・同じ側で解き直す（`_need_add`）。
+    解き直した後のすき間の確保で新しく削られた行数は ReturnGapStats.comp_new_trim_rows に残す
+    （追わない）。新しい調整値は無い。
 
     2026-10-22 段5-5c: `switch_lead`。False は今までと完全に同じ。True は 2 回解く。1 回目は先置き・
     すき間の確保の前の計画（要る加速度から素直に解いた effort。先置き・すき間の確保は切り替えの
@@ -469,6 +489,7 @@ def build_plan(
             "launch_release_lead_s": launch_release_lead_s,
             "launch_release_pre_pct": launch_release_pre_pct,
             "launch_short_stop_s": launch_short_stop_s,
+            "switch_gap_compensate": switch_gap_compensate,
         }
         first = build_plan(
             ref_at, duration_s, table, **common,
@@ -484,6 +505,50 @@ def build_plan(
             preposition_lead_s=preposition_lead_s, return_gap_enabled=return_gap_enabled,
             _lead_extra=extra,
         )
+
+    if switch_gap_compensate and _need_add is None and return_gap_enabled:
+        # 段7-c: 1 回目（先置き・すき間の確保なし）で削られる行と Δv を調べ、上乗せして解き直す
+        common_c = {
+            "accel_deadband_pct": accel_deadband_pct, "brake_deadband_pct": brake_deadband_pct,
+            "stop_brake_opening_pct": stop_brake_opening_pct, "stop_horizon_s": stop_horizon_s,
+            "period_s": period_s, "accel_lag_s": accel_lag_s, "brake_lag_s": brake_lag_s,
+            "need_window_s": need_window_s, "coast_band_kmhs": coast_band_kmhs,
+            "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
+            "low_speed_side_rule": low_speed_side_rule,
+            "release_table_min_kmh": release_table_min_kmh,
+            "launch_midway_brake_cap": launch_midway_brake_cap,
+            "launch_release_ramp": launch_release_ramp,
+            "launch_release_lead_s": launch_release_lead_s,
+            "launch_release_pre_pct": launch_release_pre_pct,
+            "launch_short_stop_s": launch_short_stop_s,
+            "switch_lead": switch_lead, "_lead_extra": _lead_extra,
+            "preposition_enabled": False, "return_gap_enabled": False,
+        }
+        aux: dict[str, np.ndarray] = {}
+        base = build_plan(ref_at, duration_s, table, **common_c, _aux_out=aux)
+        ret_c = return_time_of(table, accel_deadband_pct, brake_deadband_pct)
+        add, dv_total, n_ev, trimmed0 = _gap_compensation(base, aux, ret_c, period_s)
+        if n_ev > 0:
+            comped = build_plan(
+                ref_at, duration_s, table, **common_c, _need_add=add, _aux_out={}
+            )
+            e1 = comped.effort_pct.copy()
+            ensure_return_gap(e1, comped.flag.copy(), ret=ret_c, period_s=period_s)
+            trimmed1 = (comped.effort_pct != 0.0) & (e1 == 0.0)
+            new_rows = int(np.count_nonzero(trimmed1 & ~trimmed0))
+            plan2 = build_plan(
+                ref_at, duration_s, table, **{
+                    **common_c, "preposition_enabled": preposition_enabled,
+                    "return_gap_enabled": return_gap_enabled,
+                },
+                preposition_margin_pct=preposition_margin_pct,
+                preposition_lead_s=preposition_lead_s, _need_add=add,
+            )
+            if plan2.return_gap is not None:
+                plan2.return_gap.comp_events = n_ev
+                plan2.return_gap.comp_dv_kmh = dv_total
+                plan2.return_gap.comp_new_trim_rows = new_rows
+            return plan2
 
     # 1. 停車保持
     ref_now = _eval_ref(ref_at, t)
@@ -509,6 +574,9 @@ def build_plan(
     coast = np.asarray(table.coast_accel(v), dtype=float)
     need_a = window_slope_vec(ref_at, t, la, need_window_s, shift_s=_lead_extra)
     need_b = window_slope_vec(ref_at, t, lb, need_window_s, shift_s=_lead_extra)
+    if _need_add is not None:  # 段7-c: すき間で失う分の上乗せ（要る加速度に足して解き直す）
+        need_a = need_a + _need_add
+        need_b = need_b + _need_add
     u_a, kind_a = table.invert(v, need_a)
     u_b, kind_b = table.invert(v, need_b)
 
@@ -584,6 +652,12 @@ def build_plan(
     flag[is_accel] = kind_a[is_accel]
     flag[is_brake] = kind_b[is_brake]
     need = np.where(want_brake, need_b, need_a)
+    if _need_add is not None:
+        # 計画が持つ「要る加速度」は上乗せ前（P・DOB の予測は元の基準で見る）
+        need = need - _need_add
+    if _aux_out is not None:  # 段7-c: 惰行の加速度（惰行の判定に使った表の値）を渡す
+        _aux_out["coast_a"] = np.broadcast_to(np.asarray(coast_a, dtype=float), (n,)).copy()
+        _aux_out["coast_b"] = np.broadcast_to(np.asarray(coast_b, dtype=float), (n,)).copy()
 
     effort[stop] = -stop_brake_opening_pct
     flag[stop] = FLAG_STOP
@@ -778,6 +852,64 @@ def _launch_release_ramp(
         prev_end = t0
     return prep
 
+
+def _gap_compensation(
+    base: ForwardPlan, aux: dict[str, np.ndarray], ret: ReturnTime, period_s: float
+) -> tuple[np.ndarray, float, int, np.ndarray]:
+    """段7-c: ensure_return_gap が戻す側の最後を惰行に削る切り替えを拾い、上乗せする分を返す。
+
+    base ＝ 先置き・すき間の確保なしの計画。その effort を `ensure_return_gap` に掛けて、削られた行
+    （戻す側の連なりの末尾。先頭の 1 行は残る）を調べる。対象外: 停車保持・先置きの行が絡むもの
+    （戻す側の行・切り替え先の最初の行が FLAG_STOP・FLAG_PREPOS）。
+    削られた行ごとの失う分 Δv ＝ Σ（要る加速度 − 惰行の加速度）× 周期。
+    上乗せ ＝ Δv ÷（行数 × 周期）を、
+    削られた行の直前の同じペダルの行（連なりの中・停車保持でない行だけ。足りなければある分）へ。
+    戻り値: (行ごとの上乗せ [km/h/s], Σ|Δv|, 補償した切り替えの数, 削られた行の bool 配列)
+    """
+    n = len(base.effort_pct)
+    before = base.effort_pct
+    after = before.copy()
+    ensure_return_gap(after, base.flag.copy(), ret=ret, period_s=period_s)
+    trimmed = (before != 0.0) & (after == 0.0)
+    add = np.zeros(n)
+    dv_total = 0.0
+    n_ev = 0
+    skip = (base.flag == FLAG_STOP) | (base.flag == FLAG_PREPOS)
+    i = 0
+    while i < n:
+        if not trimmed[i]:
+            i += 1
+            continue
+        s = i
+        while i < n and trimmed[i] and (before[i] > 0.0) == (before[s] > 0.0):
+            i += 1
+        e = i  # 削られた行 [s, e)
+        i = max(e, s + 1)
+        # 戻す側の連なりの末尾の削り（直前に同じペダルの行が残る）だけ。次のペダルを遅らせた行は除く
+        if s == 0 or after[s - 1] == 0.0 or (after[s - 1] > 0.0) != (before[s] > 0.0):
+            continue
+        nxt = e
+        while nxt < n and after[nxt] == 0.0:
+            nxt += 1
+        if nxt >= n or (after[nxt] > 0.0) == (before[s] > 0.0) or skip[nxt] or skip[s : e].any():
+            continue
+        m_rows = e - s
+        # 直前の同じペダルの行（削った行と同じ行数まで。
+        # 停車保持・先置きの行・符号が変わる所で止める）
+        k = s
+        while (
+            k > 0 and s - k < m_rows and after[k - 1] != 0.0
+            and (after[k - 1] > 0.0) == (before[s] > 0.0) and not skip[k - 1]
+        ):
+            k -= 1
+        if k == s:
+            continue
+        coast = aux["coast_a"][s:e] if before[s] > 0.0 else aux["coast_b"][s:e]
+        dv = float(np.sum(base.need_accel_kmhs[s:e] - coast)) * period_s
+        add[k:s] += dv / ((s - k) * period_s)
+        dv_total += abs(dv)
+        n_ev += 1
+    return add, dv_total, n_ev, trimmed
 
 
 def switch_lead_events(

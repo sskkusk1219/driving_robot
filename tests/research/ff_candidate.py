@@ -799,6 +799,7 @@ class ForwardMapFeedforward:
         launch_release_lead_s: float = 2.0,
         launch_release_pre_pct: float = 2.0,
         launch_short_stop_s: float = 5.0,
+        switch_gap_compensate: bool = False,
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
 
@@ -835,6 +836,7 @@ class ForwardMapFeedforward:
             launch_release_lead_s=launch_release_lead_s,
             launch_release_pre_pct=launch_release_pre_pct,
             launch_short_stop_s=launch_short_stop_s,
+            switch_gap_compensate=switch_gap_compensate,
         )
         return self._plan
 

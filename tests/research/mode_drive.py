@@ -321,6 +321,7 @@ def forward_map_plan_args(
         launch_release_lead_s=fm.launch_release_lead_s,
         launch_release_pre_pct=fm.launch_release_pre_pct,
         launch_short_stop_s=fm.launch_short_stop_s,
+        switch_gap_compensate=fm.switch_gap_compensate,  # 段7-c
     )
     return target_ref.at, mode.total_duration, kwargs
 
@@ -366,6 +367,7 @@ def _prepare_forward_map_plan(
     say(f"  切り替えの先読み（段5-5c）: {'あり' if fm.switch_lead_enabled else 'なし'}")
     say(f"  発進のブレーキを基準の動き出しに合わせて離す（段7-b）: "
         f"{'あり' if fm.launch_release_ramp else 'なし'}")
+    say(f"  すき間で失う分の補償（段7-c）: {'あり' if fm.switch_gap_compensate else 'なし'}")
     say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
         "（0 ＝ 全部の車速で使う）")
     if isinstance(ff, DeviationForwardFeedforward):

@@ -1378,15 +1378,15 @@ def test_keys_missing_in_yaml_lists_dataclass_keys_not_written(tmp_path: Path) -
 
 
 def test_launch_release_and_gap_compensate_settings() -> None:
-    """段7-b: 既定は off（値は 2.0・2.0・5.0）。yaml も off で、検証が値の範囲を見る。"""
+    """段7-b・段7-c: 既定は off（値は 2.0・2.0・5.0）。yaml も off で、検証が値の範囲を見る。"""
     fm0 = cfgmod.ForwardMapSection()
-    assert fm0.launch_release_ramp is False
+    assert fm0.launch_release_ramp is False and fm0.switch_gap_compensate is False
     assert (fm0.launch_release_lead_s, fm0.launch_release_pre_pct, fm0.launch_short_stop_s) == (
         2.0, 2.0, 5.0,
     )
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     fm = cfg.forward_map
-    assert fm.launch_release_ramp is False
+    assert fm.launch_release_ramp is False and fm.switch_gap_compensate is False
     assert (fm.launch_release_lead_s, fm.launch_release_pre_pct, fm.launch_short_stop_s) == (
         2.0, 2.0, 5.0,
     )
