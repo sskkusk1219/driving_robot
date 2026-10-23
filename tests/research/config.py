@@ -978,6 +978,27 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> ResearchConfig:
     return ResearchConfig(**kwargs)
 
 
+def keys_missing_in_yaml(path: Path) -> list[str]:
+    """データクラスにあって yaml に書かれていないキー（"セクション.キー"）。既定値が効いているもの。
+
+    2026-10-23: yaml に書き忘れた設定が黙って既定値で走るのを、走行前に知らせるため。
+    エラーにはしない（読めない・不正な yaml は load_config が扱うので、ここでは空を返す）。
+    """
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    missing: list[str] = []
+    for name, section_type in _SECTION_TYPES.items():
+        section = raw.get(name) or {}
+        if not isinstance(section, dict):
+            continue
+        missing.extend(f"{name}.{f.name}" for f in fields(section_type) if f.name not in section)
+    return missing
+
+
 #: 廃止したキー → 新しいキー（セクション別）。読み込み時に書き換えを促すエラーにする
 _RENAMED_KEYS: dict[str, dict[str, str]] = {
     "feedforward": {"stop_brake_opening_pct": "stop_brake_offset_pct"},

@@ -49,6 +49,7 @@ from pathlib import Path
 from tests.research.config import (
     ConfigError,
     ResearchConfig,
+    keys_missing_in_yaml,
     load_config,
     validate_config,
 )
@@ -189,6 +190,9 @@ def validate_config_once(ctx: RunContext) -> None:
             say(f"  ✗ {problem}")
         raise ConfigError("設定ファイルを修正してから再実行してください")
     say("設定の検証: OK（値域・相互整合）")
+    missing = keys_missing_in_yaml(cfg.source_path)
+    if missing:
+        say(f"yaml に無く既定値が効いている設定: {', '.join(missing)}")
     ctx.config_validated = True
 
 

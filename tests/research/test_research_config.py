@@ -1346,3 +1346,19 @@ def test_launch_midway_fb_no_deeper_default_false() -> None:
     assert cfgmod.ForwardMapSection().launch_midway_fb_no_deeper is False
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     assert cfg.forward_map.launch_midway_fb_no_deeper is False
+
+
+def test_keys_missing_in_yaml_lists_dataclass_keys_not_written(tmp_path: Path) -> None:
+    """2026-10-23: yaml に書かれていないキー（既定値が効くもの）を列挙する。今の yaml は
+    stop_brake_floor_* の 3 つだけ。キーを 1 つ消すと、そのキーが増える。"""
+    text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    base = cfgmod.keys_missing_in_yaml(cfgmod.DEFAULT_CONFIG_PATH)
+    assert base == [
+        "learning.stop_brake_floor_start_tol_kmh",
+        "learning.stop_brake_floor_min_float_s",
+        "learning.stop_brake_floor_opening_tol_pct",
+    ]
+    cut = tmp_path / "cut.yaml"
+    cut.write_text(text.replace("  fel_pattern_enabled: false\n", ""), encoding="utf-8")
+    assert set(cfgmod.keys_missing_in_yaml(cut)) == {*base, "learning.fel_pattern_enabled"}
+    assert cfgmod.keys_missing_in_yaml(tmp_path / "none.yaml") == []
