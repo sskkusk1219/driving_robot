@@ -1041,7 +1041,7 @@ def test_ramp_release_settings_are_loaded_and_validated() -> None:
     assert list(lr.ramp_release_fracs) == [0.5, 0.0]
     assert lr.ramp_release_move_s == pytest.approx(1.0)
     assert list(lr.ramp_release_hold_s) == [1.5, 2.0]
-    assert lr.ramp_release_enabled is False  # 今の yaml の値（結果に差がなく false 運用）
+    assert lr.ramp_release_enabled is True  # 今の yaml の値（2026-10-23 段5-8 で true を採用）
     assert cfgmod.LearningSection().ramp_release_enabled is True  # config.py の既定
     assert cfgmod.validate_config(cfg) == []
 
@@ -1069,13 +1069,13 @@ def test_ramp_release_enabled_is_loaded_and_passed_to_the_loop(tmp_path: Path) -
     from tests.research.pattern_drive import loop_config_from_config
 
     path = tmp_path / "cfg.yaml"
-    cfg = cfgmod.load_config(path)  # 無ければ既定 yaml から作られる（今の yaml は false 運用）
-    assert cfg.learning.ramp_release_enabled is False
-    assert loop_config_from_config(cfg).ramp_release_enabled is False
-    cfg.save({"learning.ramp_release_enabled": True})
+    cfg = cfgmod.load_config(path)  # 無ければ既定 yaml から作られる（今の yaml は true）
+    assert cfg.learning.ramp_release_enabled is True
+    assert loop_config_from_config(cfg).ramp_release_enabled is True
+    cfg.save({"learning.ramp_release_enabled": False})
     cfg2 = cfgmod.load_config(path)
-    assert cfg2.learning.ramp_release_enabled is True
-    assert loop_config_from_config(cfg2).ramp_release_enabled is True
+    assert cfg2.learning.ramp_release_enabled is False
+    assert loop_config_from_config(cfg2).ramp_release_enabled is False
 
 
 def test_ramp_launch_release_settings_are_validated() -> None:
@@ -1294,22 +1294,22 @@ def test_stop_release_and_stop_exclusion_settings_default_and_validation() -> No
     """2026-10-23 段5-8: 停止前の戻し B-1・停車まぎわ除外の設定。既定（yaml）と範囲外の検証。"""
     cfg = _load_default()
     lr = cfg.learning
-    assert lr.stop_release_enabled is False
+    assert lr.stop_release_enabled is True
     assert lr.stop_release_start_kmh == pytest.approx(7.5)
     assert list(lr.stop_release_fracs) == [0.25, 0.5]
     assert lr.stop_release_rate_pct_s == pytest.approx(2.0)
     assert lr.stop_release_escape_s == pytest.approx(0.5)
     assert lr.stop_release_escape_decel_kmhs == pytest.approx(0.1)
     assert lr.stop_release_max_g == pytest.approx(0.2)
-    assert lr.stop_approach_exclusion == "depth"
+    assert lr.stop_approach_exclusion == "none"
     assert cfgmod.validate_config(cfg) == []
-    for ok in ("window", "none"):
+    for ok in ("window", "depth"):
         lr.stop_approach_exclusion = ok
         assert cfgmod.validate_config(cfg) == []
-    lr.stop_approach_exclusion = "depth"
+    lr.stop_approach_exclusion = "none"
     # dataclass の既定も同じ
     fresh = cfgmod.LearningSection()
-    assert fresh.stop_release_enabled is False and fresh.stop_approach_exclusion == "depth"
+    assert fresh.stop_release_enabled is True and fresh.stop_approach_exclusion == "none"
     assert list(fresh.stop_release_fracs) == [0.25, 0.5]
 
     def problems_about(key: str) -> bool:
@@ -1324,7 +1324,7 @@ def test_stop_release_and_stop_exclusion_settings_default_and_validation() -> No
         ("stop_release_fracs", [], [0.25, 0.5]),
         ("stop_release_fracs", [0.0], [0.25, 0.5]),
         ("stop_release_fracs", [1.5], [0.25, 0.5]),
-        ("stop_approach_exclusion", "deep", "depth"),
+        ("stop_approach_exclusion", "deep", "none"),
     ):
         setattr(lr, key, bad)
         assert problems_about(key), (key, bad)

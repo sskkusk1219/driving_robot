@@ -317,6 +317,7 @@ class LearningSection:
     ramp_release_move_s: float = 1.0
     ramp_release_hold_s: list[float] = field(default_factory=list)
     # 2026-10-16 段2o-6: false なら戻し（RAMP_RELEASE）に入らない（下りはブレーキで続ける）。
+    # 2026-10-23 段5-8 で true を採用（yaml も true）。
     # 戻す車速・周回数・見込み秒数は planner のままなので、戻しの有無だけを比べられる
     ramp_release_enabled: bool = True
     # 2026-10-13 段2o-2: ペダルの遅れの測定。G ランプの後ろに、ramp_lag_speeds_kmh の各車速を
@@ -478,8 +479,8 @@ class LearningSection:
     # 3 モードで約 74 秒あるのに、手順2 の学習データは 5.3 秒しかない（段5-8）。
     # 効く先: pattern_loop の RAMP_DOWN → RAMP_RELEASE（停止前版）→ 停車復帰。
     # 手順2 の所要が約 +10 秒。
-    # 決める時期: 段5-8 の実機 1 回の後
-    stop_release_enabled: bool = False
+    # 2026-10-23 段5-8 で採る（true）。
+    stop_release_enabled: bool = True
     # 戻し始める車速 [km/h]。データ由来（停止側の表の上限 7.5。モードの B5 は 7.4 km/h から）
     stop_release_start_kmh: float = 7.5
     # 戻す量の割合（山の min からの量 × この割合だけ戻す。0.25 なら山の 75% の開度に残る）。
@@ -503,8 +504,8 @@ class LearningSection:
     # （幅 accel_window_s）が停車の瞬間（実車速が停車速度未満になる時刻）にかかる行だけ。
     # 根拠: 除外の理由は窓が停車にかかること（段2i）で、深さではない。090007 では depth が 2.9 秒を
     # 外し、うち 2.0 秒が戻しの行だった。効く先: fwd_cv／fwd_final／pattern_drive（meta
-    # stop_approach_exclusion に残る）。決める時期: 段5-8 の机上（stop_exclusion.py）の後
-    stop_approach_exclusion: str = "depth"
+    # stop_approach_exclusion に残る）。2026-10-23 段5-8 で none を採る。
+    stop_approach_exclusion: str = "none"
 
 
 @dataclass

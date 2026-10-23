@@ -1103,13 +1103,13 @@ def test_result_table_shows_cruise_and_lag_columns() -> None:
 
 
 def test_loop_config_passes_stop_release_settings() -> None:
-    """2026-10-23 段5-8: loop_config は learning.stop_release_* をそのまま渡す（既定は off）。"""
+    """2026-10-23 段5-8: loop_config は learning.stop_release_* をそのまま渡す（既定は on）。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     lc = pdmod.loop_config_from_config(cfg)
-    assert lc.stop_release_enabled is False
+    assert lc.stop_release_enabled is True
     assert lc.stop_release_fracs == tuple(cfg.learning.stop_release_fracs)
     assert lc.stop_release_start_kmh == cfg.learning.stop_release_start_kmh
-    cfg.learning.stop_release_enabled = True
+    cfg.learning.stop_release_enabled = False
     cfg.learning.stop_release_max_g = 0.15
     lc = pdmod.loop_config_from_config(cfg)
-    assert lc.stop_release_enabled is True and lc.stop_release_max_g == 0.15
+    assert lc.stop_release_enabled is False and lc.stop_release_max_g == 0.15
