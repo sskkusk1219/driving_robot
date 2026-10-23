@@ -272,7 +272,8 @@ def _run_step2_with_stubs(monkeypatch, cfg) -> dict:
 
 def test_step2_runs_23_by_default_and_skips_it_when_disabled(monkeypatch, capsys) -> None:
     cfg = _cfg(Path("."))
-    assert cfg.learning.fel_pattern_enabled is True  # 既定は今までと同じ（2-3 を走る）
+    assert cfg.learning.fel_pattern_enabled is False  # 既定は false（2026-10-23 ユーザー決定）
+    cfg.learning.fel_pattern_enabled = True
     on = _run_step2_with_stubs(monkeypatch, cfg)
     assert on == {"prepare": 1, "fel": 1, "build": 1}
     off_cfg = _cfg(Path("."))

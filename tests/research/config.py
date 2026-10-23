@@ -399,11 +399,9 @@ class LearningSection:
     stop_brake_floor_opening_tol_pct: float = 0.3  # 候補開度への一致とみなす許容誤差 [%]
     # コーストダウンの終了判定（段7c。pattern_loop の `_advance_coast`）に使う
     grid_settle_tol_kmh: float = 1.0  # 「落ち着いた」とみなす車速の許容幅 [km/h]
-    # 2026-10-20 段4-3: 手順2 の 2-3（学習用パターン＝FEL の補正表の学習走行）を走るか。
-    # true（既定）は今までと同じ（2-3 を走る）。false なら 2-3 を走らず、手順2 は 2-2 まで
-    # （約 43 → 32 分）。ユーザー決定 2026-10-20: 段4-3 で手順2 を走り直すときだけ false にする
-    # （補正表 fel.enabled は false で保留中。手順12 の学習用パターンは別に走れる）
-    fel_pattern_enabled: bool = True
+    # 2026-10-23 ユーザー決定: 学習用パターン（2-3）は今後使わない。既定 false
+    # （false なら 2-3 を走らず、手順2 は 2-2 まで。true にすれば従来どおり 2-3 を走る）
+    fel_pattern_enabled: bool = False
     # 2026-10-20 段4-3: 手順2 の発進・停止側の表（と動き出す開度の測定）を、どの開度で作るか。
     # "cmd" ＝ 最終指令の開度（0ee7c1b の作り方）、"actual" ＝ 実開度（0ee7c1b より前の作り方）。
     # 根拠は机上（既存 12 本のログで外れ r を見た）: cmd にすると発進側が少し悪化（−0.20 → −0.26

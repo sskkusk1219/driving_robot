@@ -918,7 +918,7 @@ def test_ramp_hold_deadband_and_lag_tolerance_are_loaded_and_validated() -> None
     assert cfgmod.validate_config(cfg) == []
 
 
-def test_ramp_one_sided_is_loaded_from_yaml_and_defaults_to_true(tmp_path: Path) -> None:
+def test_ramp_one_sided_is_loaded_from_yaml_and_defaults_to_false(tmp_path: Path) -> None:
     """2026-10-12 段2l-12: G ランプの片側調整。yaml は true、キーが無ければ既定の True。"""
     cfg = _load_default()
     assert cfg.learning.ramp_one_sided is True
@@ -1180,12 +1180,12 @@ def test_coast_settings_are_loaded_from_yaml_and_validated(tmp_path: Path) -> No
         assert any(f"forward_map.{name}" in p for p in cfgmod.validate_config(cfg)), (name, bad)
 
 
-def test_fel_pattern_enabled_is_loaded_from_yaml_and_defaults_to_true(tmp_path: Path) -> None:
-    """2026-10-20 段4-3: 手順2 の 2-3（学習用パターン）を走るか。config.py の既定 true。
-    yaml は 2026-10-23 ユーザー決定で false（2-3 は今後使わない）。"""
+def test_fel_pattern_enabled_is_loaded_from_yaml_and_defaults_to_false(tmp_path: Path) -> None:
+    """手順2 の 2-3（学習用パターン）を走るか。2026-10-23 ユーザー決定: 今後使わない。
+    config.py の既定も yaml も false。"""
     cfg = _load_default()
     assert cfg.learning.fel_pattern_enabled is False
-    assert cfgmod.LearningSection().fel_pattern_enabled is True
+    assert cfgmod.LearningSection().fel_pattern_enabled is False
     text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
     assert "  fel_pattern_enabled: false\n" in text
     on = tmp_path / "on.yaml"
@@ -1194,10 +1194,10 @@ def test_fel_pattern_enabled_is_loaded_from_yaml_and_defaults_to_true(tmp_path: 
         encoding="utf-8",
     )
     assert cfgmod.load_config(on).learning.fel_pattern_enabled is True
-    # キーが無い yaml は既定の true
+    # キーが無い yaml は既定の false
     none = tmp_path / "none.yaml"
     none.write_text(text.replace("  fel_pattern_enabled: false\n", ""), encoding="utf-8")
-    assert cfgmod.load_config(none).learning.fel_pattern_enabled is True
+    assert cfgmod.load_config(none).learning.fel_pattern_enabled is False
 
 
 def test_side_table_settings_default_and_validation(tmp_path: Path) -> None:
