@@ -153,6 +153,7 @@ class PedalDisturbanceObserver:
         at_limit_now: bool,
         launch: bool,
         stop: bool,
+        side_tables: bool = False,
     ) -> str | None:
         """1 周期ぶん進める。推定を更新したペダル（PEDAL_ACCEL / PEDAL_BRAKE）を返す。
         更新しなければ None。
@@ -160,6 +161,9 @@ class PedalDisturbanceObserver:
         u_now ＝ 今の周期で出した開度 − min（アクセル正・ブレーキ負・min 以下は 0）。
         launch・stop ＝ 今の計画の行が発進側・停止側の表を引くか（`fwd_plan.low_speed_sides`、
         規則が pedal・dir の計画は `ForwardPlan.side_for`。段5-2）。
+        side_tables（2026-10-23 段6-2 の f。既定 False ＝ 今までと同じ）: True なら launch・stop の
+        周期も更新を止めず、その周期に計画が引いた発進側・停止側の表で予測する（戻し・踏み増しの
+        補正は付けない）。
         """
         self._hist.append((t, u_now, at_limit_now, governed))
         prev_t, prev_v = self._prev_t, self._prev_speed
@@ -183,7 +187,7 @@ class PedalDisturbanceObserver:
         if delayed is None:
             return None
         u_d, limited, gov_d = delayed
-        if u_d == 0.0 or governed or gov_d or limited or launch or stop:
+        if u_d == 0.0 or governed or gov_d or limited or ((launch or stop) and not side_tables):
             return None
         is_accel = u_d > 0.0
         tq = self.tq_accel_s if is_accel else self.tq_brake_s
@@ -195,7 +199,9 @@ class PedalDisturbanceObserver:
         # 段5-7b: 表が踏み増しの表を持つときだけ踏み増し量を数える（持たなければ今までと同じ）
         has_push = getattr(self.table, "accel_push_grid", None) is not None
         a_push = self._accel_push(t, u_d) if has_push else 0.0
-        if a_release > 0.0 or a_push > 0.0:
+        if side_tables and (launch or stop):
+            pred = float(self.table.accel(speed_kmh, u_d, launch=bool(launch), stop=bool(stop)))
+        elif a_release > 0.0 or a_push > 0.0:
             extra = {"accel_push": a_push} if a_push > 0.0 else {}
             pred = float(
                 self.table.accel(

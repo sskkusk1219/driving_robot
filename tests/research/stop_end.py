@@ -136,3 +136,13 @@ class StopEndP:
             f"{self.brake_lag_s:.3f}s)・開度の範囲 ブレーキ {self.brake_min_pct:.2f}% 〜 "
             f"停車保持 {self.hold_pct:.2f}%"
         )
+
+
+def cap_stop_end_tau(
+    tau_end_s: float | None, normal_tau_s: float | None, enabled: bool
+) -> float | None:
+    """停C の τ の上限（2026-10-23 段6-2 (c)）。enabled なら min(普段の τ, 停C の τ)。
+    区間外（None）・普段の τ なし・enabled=False は、そのまま返す（今までと同じ）。"""
+    if not enabled or tau_end_s is None or normal_tau_s is None:
+        return tau_end_s
+    return min(tau_end_s, float(normal_tau_s))

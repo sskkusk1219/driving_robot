@@ -88,7 +88,7 @@ from tests.research.speed_predictor import (
     accel_error_var_from_meta,
 )
 from tests.research.stop_decel import PHASE_APPROACH, PHASE_STOP_HOLD, decelerate_to_stop
-from tests.research.stop_end import StopEndP, StopEndStats, StopLeadStats
+from tests.research.stop_end import StopEndP, StopEndStats, StopLeadStats, cap_stop_end_tau
 from tests.research.term import drive_status_line, say
 from tests.research.vehicle import (
     build_vehicle_profile,
@@ -345,6 +345,7 @@ def _prepare_forward_map_plan(
             lag_brake_s=None if lag_b is None else float(lag_b),
         )
         say(f"  C11（DOB）: {dob_settings_text(ff)}")
+        say(f"  低速の DOB・停C の τ（段6-2）: {dob_low_speed_text(fm)}")
     if isinstance(ff, CoastAssistFeedforward):
         # 2026-10-18 段2r: 惰行の補助。保持時間 ＝ 係数 × (遅れ ＋ 効き始めまでの戻り時間)
         ff.set_coast(
@@ -858,6 +859,26 @@ class DobStats:
 
     def summary(self) -> str:
         return f"{self._text('アクセル', True)}／{self._text('ブレーキ', False)}"
+
+
+DOB_FADE_START_KMH = 0.5  # 段6-2 (a): 薄める重みが 0 になる車速 [km/h]（fwd_data の停車速度と同値）
+
+
+def dob_fade_weight(v_kmh: float, stop_kmh: float, top_kmh: float) -> float:
+    """DOB の上乗せの重み（2026-10-23 段6-2 (a)）: clip((v − 0.5) / (境目 − 0.5), 0, 1)。
+    境目が停車速度以下なら、停車速度を超えれば 1。"""
+    if top_kmh <= stop_kmh:
+        return 1.0 if v_kmh > stop_kmh else 0.0
+    return min(1.0, max(0.0, (v_kmh - stop_kmh) / (top_kmh - stop_kmh)))
+
+
+def dob_low_speed_text(fm: Any) -> str:
+    """段6-2 の設定の表示（走行前）。"""
+    return (
+        f"薄める {'あり' if fm.dob_low_speed_fade else 'なし'}・"
+        f"境目と表を基準車速でそろえる {'あり' if fm.dob_low_speed_align else 'なし'}・"
+        f"停C の τ を普段より弱くしない {'あり' if fm.stop_end_tau_cap_normal else 'なし'}"
+    )
 
 
 def dob_settings_text(ff: object) -> str:
@@ -1533,8 +1554,10 @@ class _ModeRun:
         # 2026-10-18 段2q ③ `135125` の修正: 推定を更新しない低速の行（発進の前のブレーキを離す所
         # など）では使わない。そこで持ち越したブレーキの推定（−0.05〜−0.35）がブレーキを浅くし、
         # 発進で早く動き出した（アクセルを踏み始めた瞬間の偏差 +0.04〜+0.37 → +0.32〜+0.90）
-        if dob is not None and self._dob_low_speed(speed, int(plan.flag[i])):
-            d_row = 0.0
+        # 2026-10-23 段6-2: 設定が両方 false なら今までと同じ（低速の行は 0）。
+        # dob_low_speed_fade なら 1 → 0 へ連続に薄める（`_dob_weight`）
+        if dob is not None:
+            d_row *= self._dob_weight(speed, int(plan.flag[i]), ref)
         new, clamped = deviation_offset_detail(ff.table, dob_kmhs=d_row, **kwargs)
         if self.stop_end is not None:
             # C15 停C: 停車まぎわのブレーキの行は、P の τ を「基準が 0 になるまでの残り時間
@@ -1543,6 +1566,10 @@ class _ModeRun:
                 self.stop_end.tau_s(t, self.ref.at(t), int(plan.flag[i]) == FLAG_STOP)
                 if ff_effort < 0.0 and int(plan.flag[i]) not in (FLAG_COAST, FLAG_PREPOS)
                 else None
+            )
+            # 2026-10-23 段6-2 (c): 普段の τ より弱くしない（残り時間が長いときは普段のまま）
+            tau_end = cap_stop_end_tau(
+                tau_end, ff.tau_brake_s, self.cfg.forward_map.stop_end_tau_cap_normal
             )
             if tau_end is None:
                 self.stop_end.stats.add(False)
@@ -1608,8 +1635,7 @@ class _ModeRun:
             # 段2r ②: 補助中のそのペダルは手順2 の効き始め以上に置く（meta に無ければ下限なし）
             on = ff.table.meta.get("accel_onset_u_pct" if is_accel else "brake_onset_u_pct")
             kwargs["onset_u_pct"] = None if on is None else float(on)
-        low = self._dob_low_speed(speed, int(plan.flag[i]))
-        d = 0.0 if low else dob.estimate(is_accel=is_accel)
+        d = dob.estimate(is_accel=is_accel) * self._dob_weight(speed, int(plan.flag[i]), ref)
         with_dob = coast_assist_effort(ff.table, dob_kmhs=d, **kwargs)
         without = coast_assist_effort(ff.table, **kwargs) if d != 0.0 else with_dob
         self._dob_effort = with_dob - without
@@ -1625,15 +1651,48 @@ class _ModeRun:
             return 0.0
         return min((float(x) for x in table.speed_edges if x > max(rows)), default=0.0)
 
-    def _dob_low_speed(self, speed: float, flag: int) -> bool:
+    def _dob_low_top(self) -> float:
+        """DOB を止める／薄める境目の車速 [km/h]（launch_top と stop_max_speed_kmh の大きい方）"""
+        meta = self.ff.table.meta  # type: ignore[attr-defined]
+        return max(self._dob_launch_top(), float(meta.get("stop_max_speed_kmh", 0.0) or 0.0))
+
+    def _dob_boundary_speed(self, speed: float, ref: float | None) -> float:
+        """境目と比べる車速。dob_low_speed_align なら基準車速（表の切り替えが見るもの）、
+        そうでなければ実車速（今までと同じ。ref が None のときも実車速）"""
+        if ref is not None and self.cfg.forward_map.dob_low_speed_align:
+            return ref
+        return speed
+
+    def _dob_low_speed(self, speed: float, flag: int, ref: float | None = None) -> bool:
         """C11 の推定を更新せず、使いもしない行か（停車保持の行・停車速度以下・発進側／停止側の表が
-        置き換えた車速（launch_top と meta の stop_max_speed_kmh の大きいほう）未満）。"""
+        置き換えた車速（launch_top と meta の stop_max_speed_kmh の大きいほう）未満）。
+        2026-10-23 段6-2 (f): dob_low_speed_align で、境目は基準車速（`ref`）を見る
+        （停車保持・停車速度以下の判定は実車速のまま）。"""
         from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
         from tests.research.fwd_plan import FLAG_STOP  # noqa: PLC0415
 
-        meta = self.ff.table.meta  # type: ignore[attr-defined]
-        low_top = max(self._dob_launch_top(), float(meta.get("stop_max_speed_kmh", 0.0) or 0.0))
-        return flag == FLAG_STOP or speed <= STOP_SPEED_KMH or speed < low_top
+        v_b = self._dob_boundary_speed(speed, ref)
+        return flag == FLAG_STOP or speed <= STOP_SPEED_KMH or v_b < self._dob_low_top()
+
+    def _dob_weight(self, speed: float, flag: int, ref: float | None = None) -> float:
+        """DOB の上乗せに掛ける重み w（2026-10-23 段6-2 (a)）。dob_low_speed_fade が false なら
+        今までと同じ（低速の行 0・それ以外 1）。true なら、停車保持の行・停車速度以下は 0、
+        それ以外は w ＝ clip((v − 0.5) / (境目 − 0.5), 0, 1)（v は `_dob_boundary_speed`）。"""
+        if not self.cfg.forward_map.dob_low_speed_fade:
+            return 0.0 if self._dob_low_speed(speed, flag, ref) else 1.0
+        from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+        from tests.research.fwd_plan import FLAG_STOP  # noqa: PLC0415
+
+        if flag == FLAG_STOP or speed <= STOP_SPEED_KMH:
+            return 0.0
+        return dob_fade_weight(
+            self._dob_boundary_speed(speed, ref), DOB_FADE_START_KMH, self._dob_low_top()
+        )
+
+    def _dob_follow_plan_tables(self) -> bool:
+        """低速でも推定を更新し、計画が引いた表で予測するか（(a) と (f) を両方 true にしたとき）"""
+        fm = self.cfg.forward_map
+        return bool(fm.dob_low_speed_fade and fm.dob_low_speed_align)
 
     def _dob_update(
         self,
@@ -1666,11 +1725,21 @@ class _ModeRun:
         launch, stop = self._row_sides(plan, i, ref, is_accel=row_accel)
         # 発進側は need > 0 の行すべてで True になる（表を引く車速の範囲は表の中で決まる）ので、
         # 止めるのは発進側の表が置き換えた車速の行（meta の launch_speed_rows）の中だけにする
-        launch = launch and speed < self._dob_launch_top()
+        follow = self._dob_follow_plan_tables()
+        launch = launch and self._dob_boundary_speed(speed, ref) < self._dob_launch_top()
         # 2026-10-18 段2q ① `121218` の修正: 停車中（停車保持の深いブレーキ）は表が強い減速を
         # 予測し、実測は 0 なので、ブレーキの推定が +9 km/h/s まで積み上がって次の減速で踏み過ぎた。
         # 停車保持の行・停車速度以下・低速の表の車速の行では更新しない（`_dob_low_speed`）
-        held = self._dob_low_speed(speed, int(plan.flag[i]))
+        # 2026-10-23 段6-2: (a)(f) が両方 true のときは、停車保持の行・停車速度以下だけ止め、
+        # 低速の行は計画が引いた発進側・停止側の表で予測して更新を続ける（薄めた上乗せの推定を
+        # 使う表と同じ表の残差にそろえる）
+        if follow:
+            from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+            from tests.research.fwd_plan import FLAG_STOP  # noqa: PLC0415
+
+            held = int(plan.flag[i]) == FLAG_STOP or speed <= STOP_SPEED_KMH
+        else:
+            held = self._dob_low_speed(speed, int(plan.flag[i]))
         # 2026-10-18 段2r: 惰行の補助をしている周期も更新しない。浅い踏み込みは表がいちばん不確かな
         # 所なので、推定を FF の行から作ったままにする
         held = held or coast_active
@@ -1688,6 +1757,7 @@ class _ModeRun:
                 accel >= v.max_accel_opening_pct or brake >= v.max_brake_opening_pct
             ),
             launch=bool(launch), stop=bool(stop) or held,
+            side_tables=follow and not held,
         )
         if pedal is not None:
             is_accel = pedal == PEDAL_ACCEL
