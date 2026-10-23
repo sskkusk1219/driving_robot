@@ -421,7 +421,10 @@ class LearningSection:
     launch_accel_side_source: str = "extrapolate"
     # 2026-10-22 段5-3: 発進側・停止側の表を作るときの加速度の窓 [s]。既定 0.5 ＝ 今まで
     # （LAUNCH_ACCEL_WINDOW_S）。本体は 1.0 秒窓。仮値: 発進は約 1 秒で終わるので短くしてある。
-    # 効く先: _attach_low_speed_tables・launch_breakaway の行の読み方。決める時期: 段5-3 の机上の後
+    # 効く先: _attach_low_speed_tables の発進側・停止側の表の行の読み方だけ。
+    # 動き出す開度（fwd_data.launch_breakaway）の行は定数
+    # fwd_data.LAUNCH_ACCEL_WINDOW_S = 0.5 のままで、この値は効かない。
+    # 決める時期: 段5-3 の机上の後
     side_table_accel_window_s: float = 0.5
     # 2026-10-22 段5-4 b: 発進側の表を、停止側と同じ車速の行（今は 7.5 km/h 未満の 3 行）まで
     # 置き換えるか。false ＝ 今まで（発進側は 0〜5 km/h の 2 行だけ。5〜7.5 km/h の開度 0 が
@@ -445,14 +448,15 @@ class LearningSection:
     # _attach_low_speed_tables（meta stop_release_layer_built・stop_release_layer_s は作った
     # ときだけ残る）。決める時期: アクセルの戻し量だけで作り直した実機比較の後
     stop_release_layer_enabled: bool = False
-    # 2026-10-20 段4-3: アクセルの戻し量（直近 RELEASE_WINDOW_S 秒の u の最大 − 今）を、手順2 の
+    # アクセルの戻し量（直近 RELEASE_WINDOW_S 秒の u の最大 − 今）を、手順2 の
     # ニューラルネットのアクセル側の 3 つ目の入力にし、アクセルの戻しの表
-    # （accel_release_*。attach_accel_release）も作るか。false なら入力は (車速, u) の 2 つ・
-    # 表なし（pkl の accel_release_* は None。0ee7c1b より前と同じ）。根拠は実機 091838
-    # （2026-10-20）: true で作った pkl は |偏差|>1 が 3.7 → 45.1 秒に悪化した（DOB が戻しに
-    # よる弱さを外乱として打ち消していたのを、表が説明してしまい消えた）。効く先: fwd_cv／
-    # fwd_final／pattern_drive._build_forward_model（meta accel_release_input_enabled に残る）。
-    # 決める時期: 戻しの層（stop_release_layer_enabled）と切り分けた実機比較の後
+    # （accel_release_*。attach_accel_release）も作るか。
+    # 2026-10-23 段5-7a で採る（`3b6135e`。C8 の全場面 254.8 → 199.7）。段4-3（実機 091838、
+    # 2026-10-20）の悪化（|偏差|>1 が 3.7 → 45.1 秒）は、FF が変わらず DOB の踏み足しが消えた結果
+    # （C15 での確認は段6-0）。効く先: fwd_cv／fwd_final／
+    # pattern_drive._build_forward_model（meta accel_release_input_enabled に残る）。
+    # false なら入力は (車速, u) の 2 つ・表なし
+    # （pkl の accel_release_* は None。0ee7c1b より前と同じ）。
     accel_release_input_enabled: bool = False
     # 2026-10-23 段5-7b: アクセルの踏み増し量（今の u − 直近 RELEASE_WINDOW_S 秒の u の最小）を、
     # 手順2 のニューラルネットのアクセル側の最後の入力にし（戻し量が on なら 4、off なら 3 入力）、
@@ -798,7 +802,7 @@ class ForwardMapSection:
     # 根拠: 段5-6 の (ロ)「発進の途中はブレーキを踏み増さない」を FB にも適用（ユーザー決定）。
     # FF の (ロ)・A1 で止まっている車を動かしても、FB がブレーキを足すと再び止める恐れ。
     # 既定 false ＝ 今と完全に同じ。効く先: mode_drive の最終指令の組み立て（発進の途中の行）。
-    # 決める時期: 段6 の実機（C15）
+    # 段6 で試して採否を決める（既定 off）。
     launch_midway_fb_no_deeper: bool = False
     # 2026-10-23 段5-6 追加 A2: true なら、発進側の表を引くとき（accel・invert の launch=True。
     # P・DOB の予測を含む）、車速が 0.5 km/h 以下で、ブレーキが動き出す開度より深いとき、
