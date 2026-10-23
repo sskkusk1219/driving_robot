@@ -1181,21 +1181,22 @@ def test_coast_settings_are_loaded_from_yaml_and_validated(tmp_path: Path) -> No
 
 
 def test_fel_pattern_enabled_is_loaded_from_yaml_and_defaults_to_true(tmp_path: Path) -> None:
-    """2026-10-20 段4-3: 手順2 の 2-3（学習用パターン）を走るか。既定 true ＝ 今までと同じ。"""
+    """2026-10-20 段4-3: 手順2 の 2-3（学習用パターン）を走るか。config.py の既定 true。
+    yaml は 2026-10-23 ユーザー決定で false（2-3 は今後使わない）。"""
     cfg = _load_default()
-    assert cfg.learning.fel_pattern_enabled is True
+    assert cfg.learning.fel_pattern_enabled is False
     assert cfgmod.LearningSection().fel_pattern_enabled is True
     text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
-    assert "  fel_pattern_enabled: true\n" in text
-    off = tmp_path / "off.yaml"
-    off.write_text(
-        text.replace("  fel_pattern_enabled: true\n", "  fel_pattern_enabled: false\n"),
+    assert "  fel_pattern_enabled: false\n" in text
+    on = tmp_path / "on.yaml"
+    on.write_text(
+        text.replace("  fel_pattern_enabled: false\n", "  fel_pattern_enabled: true\n"),
         encoding="utf-8",
     )
-    assert cfgmod.load_config(off).learning.fel_pattern_enabled is False
+    assert cfgmod.load_config(on).learning.fel_pattern_enabled is True
     # キーが無い yaml は既定の true
     none = tmp_path / "none.yaml"
-    none.write_text(text.replace("  fel_pattern_enabled: true\n", ""), encoding="utf-8")
+    none.write_text(text.replace("  fel_pattern_enabled: false\n", ""), encoding="utf-8")
     assert cfgmod.load_config(none).learning.fel_pattern_enabled is True
 
 
