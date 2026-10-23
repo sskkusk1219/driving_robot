@@ -285,6 +285,9 @@ class ForwardPlan:
     # 2026-10-22 段5-5c: 切り替えの先読み。行ごとに「要る加速度を見る時刻」を追加で早めた秒数
     # （switch_lead=False なら None）
     switch_lead_s: np.ndarray | None = None
+    # 2026-10-23 段6 C: 行ごとの「発進の途中」か（dir の規則だけ持つ。それ以外は None）。
+    # mode_drive が forward_map.launch_midway_fb_no_deeper で FB のブレーキ踏み増しを抑える行を引く
+    launch_midway: np.ndarray | None = None
 
     def side_for(self, i: int, is_accel: bool) -> int | None:
         """行 i のペダル（アクセル側かブレーキ側か）で計画が引いた表 SIDE_*。
@@ -294,6 +297,11 @@ class ForwardPlan:
         if self.side_rule not in ("pedal", "dir") or arr is None:
             return None
         return int(arr[i])
+
+    def is_launch_midway(self, i: int) -> bool:
+        """行 i が発進の途中（停車保持の行は除く）か。持たない計画は False。"""
+        m = self.launch_midway
+        return bool(m is not None and m[i] and self.flag[i] != FLAG_STOP)
 
     def index_at(self, t_s: float) -> int:
         """時刻 t に最も近い行の番号（`at` と同じ最近傍）。"""
@@ -644,6 +652,7 @@ def build_plan(
         stop_lead=lead_mask, side_accel=side_accel.astype(int), side_brake=side_brake.astype(int),
         side_rule="dir" if dir_rule else ("pedal" if pedal_rule else "legacy"),
         switch_lead_s=_lead_extra,
+        launch_midway=np.asarray(midway, dtype=bool).copy() if dir_rule else None,
     )
 
 

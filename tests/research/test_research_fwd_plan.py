@@ -1575,6 +1575,19 @@ def test_launch_midway_brake_cap_in_plan() -> None:
     assert np.array_equal(a.effort_pct, b.effort_pct)
 
 
+def test_launch_midway_flag_in_plan() -> None:
+    """段6 C: dir の計画だけ行ごとの「発進の途中」を持つ。停車保持の行は対象外。"""
+    tb = _pedal_table(dl=3.0, ds=2.4)
+    plan = plan_for(_slow_launch, 10.0, tb, low_speed_side_rule="dir")
+    assert plan.launch_midway is not None and plan.launch_midway.any()
+    idx = np.flatnonzero(plan.launch_midway & (plan.flag != FLAG_STOP))
+    assert len(idx) > 0 and all(plan.is_launch_midway(int(i)) for i in idx)
+    stop_idx = np.flatnonzero(plan.flag == FLAG_STOP)
+    assert not any(plan.is_launch_midway(int(i)) for i in stop_idx)
+    legacy = plan_for(_slow_launch, 10.0, tb, low_speed_side_rule="legacy")
+    assert legacy.launch_midway is None and not legacy.is_launch_midway(0)
+
+
 def test_launch_breakaway_floor_in_table_lookup() -> None:
     base = _pedal_table(dl=12.0, ds=2.4, breakaway=-4.0)
     fl = base.with_launch_breakaway_floor(True)

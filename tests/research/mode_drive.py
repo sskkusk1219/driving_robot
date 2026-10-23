@@ -327,6 +327,8 @@ def _prepare_forward_map_plan(
         f"窓 {fm.need_window_s:g}s")
     say(f"  低速の表の引き方（段5-2）: 設定 {fm.low_speed_side_rule}・計画に使った規則 "
         f"{plan.side_rule}（pedal・dir でも表が発進側・停止側の両方を持たなければ legacy）")
+    say("  発進の途中は FB もブレーキを深くしない（段6 C）: "
+        f"{'あり' if fm.launch_midway_fb_no_deeper else 'なし'}")
     say(f"  切り替えの先読み（段5-5c）: {'あり' if fm.switch_lead_enabled else 'なし'}")
     say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
         "（0 ＝ 全部の車速で使う）")
@@ -1042,6 +1044,12 @@ class ModeDriveResult:
     samples: list[DriveSample] = field(default_factory=list)  # MODE_DRIVE の行（0.1s 刻み）
 
 
+def cut_deeper_brake_fb(ff_effort: float, fb_effort: float) -> float:
+    """段6 C: FB の上乗せがブレーキを FF の開度より深くする向き（FF ≤ 0 で FB < 0）なら 0。
+    浅くする向き（FB > 0）・アクセル側（FF > 0）はそのまま返す。"""
+    return 0.0 if ff_effort <= 0.0 and fb_effort < 0.0 else fb_effort
+
+
 class _ModeRun:
     """1 本のモード走行の状態。run() が 50ms 周期でモード終わりまで回す。"""
 
@@ -1173,6 +1181,10 @@ class _ModeRun:
         if isinstance(self.ff, StopEndFeedforward):
             self.stop_end = make_stop_end(self.ff, cfg, setup.mode)
             self.stop_lead_stats = StopLeadStats(period_s=self.interval_s)
+        # 段6 C: 発進の途中は FB もブレーキを深くしない（設定が true のときだけ働く）
+        self.midway_fb_no_deeper = bool(cfg.forward_map.launch_midway_fb_no_deeper)
+        self.midway_fb_cut_cycles = 0  # 抑えた周期数
+        self.midway_fb_cut_pct_sum = 0.0  # 抑えた量（ブレーキの深さ [%]）の合計
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
         self._accel_blocked = False
@@ -1302,6 +1314,14 @@ class _ModeRun:
             coast_effort = self._coast_assist(t, ref, ref_t, speed, ff_effort)
             if coast_effort != 0.0:
                 c10_effort, coast_active = coast_effort, True
+        if self.midway_fb_no_deeper and c10_effort and isinstance(self.ff, ForwardMapFeedforward):
+            plan = self.ff.plan
+            if plan.is_launch_midway(plan.index_at(t)):
+                cut = cut_deeper_brake_fb(ff_effort, c10_effort)
+                if cut != c10_effort:
+                    self.midway_fb_cut_cycles += 1
+                    self.midway_fb_cut_pct_sum += -c10_effort
+                    c10_effort = cut
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
         # C10 の上乗せは FF の列（accel_ff・brake_ff・plan_effort）には入れない（作ったずれが
         # 今までと同じ意味で比べられるように）。実際に出す effort にだけ足す
@@ -1944,6 +1964,10 @@ async def run_mode_drive(
         say(f"  実開度の安全網（両踏みを防ぐために次のペダルを止めた）: {run.interlock.summary()}")
     else:
         say("  実開度の安全網: 無効（mode_drive.pedal_interlock_enabled: false）")
+    if run.midway_fb_no_deeper:
+        say("  発進の途中の FB のブレーキ踏み増しの抑え（段6 C）: "
+            f"{run.midway_fb_cut_cycles} 周期（{run.midway_fb_cut_cycles * run.interval_s:.1f}s）・"
+            f"抑えた量の合計 {run.midway_fb_cut_pct_sum:.1f}%")
     if run.c10 is not None:
         say(f"  C10（偏差の上乗せ。{c10_settings_text(run.ff)}）: {run.c10.summary()}")
     if run.dob_stats is not None:

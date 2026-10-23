@@ -1338,3 +1338,10 @@ def test_launch_breakaway_settings_defaults_and_yaml() -> None:
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     assert cfg.forward_map.launch_midway_brake_cap is True
     assert cfg.forward_map.launch_table_breakaway_floor is True
+
+
+def test_launch_midway_fb_no_deeper_default_false() -> None:
+    """段6 C: config.py の既定も yaml も false。"""
+    assert cfgmod.ForwardMapSection().launch_midway_fb_no_deeper is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.forward_map.launch_midway_fb_no_deeper is False

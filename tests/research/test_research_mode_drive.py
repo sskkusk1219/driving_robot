@@ -1705,3 +1705,14 @@ async def test_c10_offset_uses_predicted_deviation_only_when_given(
     run._pred_dev = -1.0  # noqa: SLF001  予測では追いつく見込み → 減らす向き
     assert run._c10_offset(t, ref, ref - 2.0, e) < plain  # noqa: SLF001
     assert run._c10_offset(t, ref, ref - 2.0, e) < 0.0  # noqa: SLF001
+
+
+def test_cut_deeper_brake_fb() -> None:
+    """段6 C: ブレーキを FF より深くする向きの FB だけ 0。浅くする向き・アクセル側は通す。"""
+    from tests.research.mode_drive import cut_deeper_brake_fb
+
+    assert cut_deeper_brake_fb(-8.0, -2.0) == 0.0  # 深くする
+    assert cut_deeper_brake_fb(0.0, -1.5) == 0.0  # FF が惰行でもブレーキを足さない
+    assert cut_deeper_brake_fb(-8.0, 2.0) == 2.0  # 浅くする向きは通る
+    assert cut_deeper_brake_fb(5.0, -2.0) == -2.0  # アクセル側は触らない
+    assert cut_deeper_brake_fb(5.0, 3.0) == 3.0
