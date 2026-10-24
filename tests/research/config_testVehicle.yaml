@@ -260,7 +260,9 @@ forward_map:
   # （Ki ＝ 1 ÷ (τ² × k)。τ ＝ deviation_c × brake_lag_s、k ＝ 発進側の表の最低車速行の bk 前後の傾き。
   # 走行前に表示）。基準が動き出した後は「止めた開度 ＋ I − bk」を発進の途中のブレーキに足し、
   # min に戻ったらやめる。launch_release_ramp が必要。効く先: 最終指令。決める時期: 段8 の実機の組
-  launch_move_hold: false
+  # → 2026-10-24 採る（113942/121038/123416: |偏差|>1 3.70→3.20・p95 同じ。足した量は最大 0.08% で
+  # この車ではほぼ働かなかった。基準 0 で動いたときだけ効くので害は無い）
+  launch_move_hold: true
   # 2026-10-24 段8-b: true なら P・惰行の補助の表の引き直しだけ A2（launch_table_breakaway_floor）を外す。
   # FF の計画は A2 のまま。効く先: FB の表。決める時期: 段8 の実機の組
   fb_no_breakaway_floor: false
