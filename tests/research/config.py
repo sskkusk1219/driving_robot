@@ -839,6 +839,16 @@ class ForwardMapSection:
     # 動き出す開度と食い違う（UDDS 1252 s `074912`）。既定 false ＝ 今と完全に同じ。
     # 効く先: ForwardTable.accel・invert（launch=True）。決める時期: 同上
     launch_table_breakaway_floor: bool = False
+    # 2026-10-24 段8-a: true なら、発進前のブレーキを離す行・短い停車の bk の行（plan.launch_prep。
+    # launch_release_ramp が必要）で、実車速が 0.05 km/h を超えて動いたら、その周期の FF で離しを
+    # 止め、深くする向きだけの積分 I（I += Ki × 車速 × dt。0.05 km/h 以下なら足さず待つ）を足す。
+    # Ki ＝ 1 ÷ (τ² × k)。τ ＝ deviation_c × brake_lag_s（P と同じ）、k ＝ A2 なしの発進側の表の
+    # 最も低い車速の行で bk 前後のクリープの傾き [km/h/s ÷ %]（走行前に表から計算して表示）。
+    # 基準が動き出した後は「止めた開度 ＋ I − bk」を、発進の途中のブレーキの行に足し、計画の
+    # ブレーキが min に戻ったらやめる。発進ごとに 0 に戻す。k ≦ 0 なら働かない。
+    # 根拠: 基準 0 のまま車が動き出した所で、離しが進んで待つ値が浅くなり続ける。
+    # 既定 false ＝ 今と完全に同じ。ログ: launch_hold_pct。効く先: mode_drive の最終指令
+    launch_move_hold: bool = False
 
 
 @dataclass
@@ -1281,6 +1291,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         fm.launch_short_stop_s >= 0.0,
         f"forward_map.launch_short_stop_s は 0 以上: {fm.launch_short_stop_s}",
+    )
+    need(
+        not fm.launch_move_hold or fm.launch_release_ramp,
+        "forward_map.launch_move_hold は launch_release_ramp が true のときだけ使える",
     )
     for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")

@@ -25,6 +25,7 @@ from tests.research import mode_drive as mdmod
 from tests.research import mode_report as mrmod
 from tests.research.axis_safety import ALARM_CHECK_INTERVAL_S
 from tests.research.dob import PedalDisturbanceObserver
+from tests.research.launch_hold import LaunchMoveHold, launch_hold_gain
 from tests.research.research_types import (
     G_TO_KMHS,
     DriveLogData,
@@ -1716,3 +1717,150 @@ def test_cut_deeper_brake_fb() -> None:
     assert cut_deeper_brake_fb(-8.0, 2.0) == 2.0  # 浅くする向きは通る
     assert cut_deeper_brake_fb(5.0, -2.0) == -2.0  # アクセル側は触らない
     assert cut_deeper_brake_fb(5.0, 3.0) == 3.0
+
+
+# ─── 段8-a（基準 0 で動いたら止めて待つ）・段8-b（FB から A2 を外す。2026-10-24） ──────
+
+
+def _hold(ki: float = 2.0, bk: float = 8.0, bmin: float = 4.0) -> LaunchMoveHold:
+    return LaunchMoveHold(ki=ki, bk_pct=bk, brake_min_pct=bmin, dt_s=0.05)
+
+
+def _go(h: LaunchMoveHold, prep: bool, v: float, ff: float, midway: bool = False) -> float:
+    return h.step(prep=prep, speed_kmh=v, ff_effort=ff, midway=midway)
+
+
+def test_launch_hold_freezes_ff_and_integrates_only_while_moving_deeper_only() -> None:
+    h = _hold()
+    assert _go(h, True, 0.0, -10.0) == 0.0 and h.frozen is None  # 動いていない: 何もしない
+    assert _go(h, True, 0.05, -10.0) == 0.0  # 0.05 ちょうどは動いたと見ない
+    # 動いた周期: その周期の FF（-9）で止め、I を足す（Ki × v × dt ＝ 2 × 1 × 0.05 ＝ 0.1）
+    assert _go(h, True, 1.0, -9.0) == pytest.approx(0.1)
+    assert h.frozen == -9.0 and h.integral == pytest.approx(0.1)
+    # 計画がさらに離れても（-8）止めた値 ＋ I で出す（指令 ＝ -9.2 → 足す深さ ＝ 1.2）
+    assert _go(h, True, 1.0, -8.0) == pytest.approx(1.2)
+    # 止まっている間は I を足さずその値で待つ
+    assert _go(h, True, 0.0, -8.0) == pytest.approx(1.2)
+    assert h.integral == pytest.approx(0.2)
+    # 計画が止めた値より深いなら計画に I を足す。足す量は常に 0 以上（浅くしない）
+    assert _go(h, True, 0.0, -12.0) == pytest.approx(0.2)
+    assert all(_go(h, True, v, -8.0) >= 0.0 for v in (0.0, 0.5, 3.0))
+
+
+def test_launch_hold_resets_at_next_launch_and_ignores_accel_rows() -> None:
+    h = _hold()
+    _go(h, True, 1.0, -9.0)
+    _go(h, False, 1.0, -9.0)  # 発進の連なりが終わる
+    assert h.integral > 0.0
+    assert _go(h, True, 0.0, -9.0) == 0.0  # 次の発進: 戻る
+    assert h.frozen is None and h.integral == 0.0
+    # アクセルの行・惰行の行には何もしない
+    assert _go(h, True, 1.0, 5.0) == 0.0 and _go(h, True, 1.0, 0.0) == 0.0 and h.frozen is None
+
+
+def test_launch_hold_hand_over_offset_applies_then_drops_at_min() -> None:
+    h = _hold(ki=2.0, bk=8.0, bmin=4.0)
+    _go(h, True, 1.0, -9.5)  # 止めた 9.5・I ＝ 0.1
+    for _ in range(9):
+        _go(h, True, 1.0, -9.0)  # I ＝ 1.0
+    assert h.integral == pytest.approx(1.0)
+    # 終わった周期: ずれ ＝ 9.5 ＋ 1.0 − 8.0 ＝ 2.5。発進の途中のブレーキの行に足す
+    assert _go(h, False, 1.0, -8.0, midway=True) == pytest.approx(2.5)
+    assert _go(h, False, 1.0, -6.0, midway=True) == pytest.approx(2.5)
+    # 計画が min に戻ったらやめ、その後は足さない
+    assert _go(h, False, 1.0, -4.0, midway=True) == 0.0
+    assert _go(h, False, 1.0, -8.0, midway=True) == 0.0
+    # 発進の途中でない行でも足さない／止めた値が bk 以下ならずれなし
+    h2 = _hold()
+    _go(h2, True, 1.0, -7.0)
+    assert _go(h2, False, 1.0, -8.0, midway=True) == 0.0
+    h3 = _hold()
+    _go(h3, True, 1.0, -9.5)
+    assert _go(h3, False, 1.0, -8.0, midway=False) == 0.0
+
+
+class _GainTable:
+    """launch_hold_gain 用の最小の表（発進側の加速度は u の直線: 傾き 0.8 km/h/s/%）。"""
+
+    def __init__(self, slope: float, bk: float | None = -4.0) -> None:
+        self.slope = slope
+        self.meta: dict[str, float] = {} if bk is None else {"launch_breakaway_u_pct": bk}
+        self.floor = True
+
+    def with_launch_breakaway_floor(self, enabled: bool) -> _GainTable:
+        self.floor = enabled
+        return self
+
+    def accel(self, v: float, u: float, *, launch: bool = False) -> float:
+        assert launch and not self.floor  # A2 なしの発進側の表を引く
+        return self.slope * u + 1.0
+
+
+def test_launch_hold_gain_is_one_over_tau_squared_times_k() -> None:
+    ki, k, note = launch_hold_gain(_GainTable(0.8), tau_brake_s=1.5)
+    assert k == pytest.approx(0.8) and ki == pytest.approx(1.0 / (1.5**2 * 0.8))
+    assert "Ki" in note
+    # k ≦ 0・τ なし・meta なしは働かない（Ki は None）
+    assert launch_hold_gain(_GainTable(-0.1), tau_brake_s=1.5)[0] is None
+    assert launch_hold_gain(_GainTable(0.8), tau_brake_s=None)[0] is None
+    assert launch_hold_gain(_GainTable(0.8), tau_brake_s=0.0)[0] is None
+    assert launch_hold_gain(_GainTable(0.8, bk=None), tau_brake_s=1.5)[0] is None
+
+
+def _plan_stub(prep: list[bool], midway: list[bool] | None = None) -> object:
+    from types import SimpleNamespace
+
+    n = len(prep)
+    mid = None if midway is None else np.array(midway)
+    return SimpleNamespace(
+        launch_prep=np.array(prep), launch_midway=mid, t_s=np.arange(n) * 0.05,
+        index_at=lambda t: int(np.clip(round(t / 0.05), 0, n - 1)),
+        is_launch_midway=lambda i: bool(mid[i]),
+    )
+
+
+def _hold_run(cfg: cfgmod.ResearchConfig, hold: LaunchMoveHold | None, plan: object):
+    from types import SimpleNamespace
+
+    run = mdmod._ModeRun.__new__(mdmod._ModeRun)  # noqa: SLF001
+    run.cfg = cfg
+    run.ff = SimpleNamespace(plan=plan)
+    run.launch_hold = hold
+    run._launch_hold_pct = None if hold is None else 0.0  # noqa: SLF001
+    return run
+
+
+def test_launch_hold_step_off_is_identical_and_on_logs_added_depth(tmp_path: Path) -> None:
+    cfg = _c7_cfg(tmp_path)
+    plan = _plan_stub([True, True, True, False, False], [False, False, False, True, True])
+    off = _hold_run(cfg, None, plan)
+    assert off._launch_hold_step(0.1, 1.0, -9.0) == 0.0  # noqa: SLF001
+    assert off._launch_hold_pct is None  # noqa: SLF001  CSV は空欄
+    on = _hold_run(cfg, _hold(), plan)
+    assert on._launch_hold_step(0.0, 1.0, -9.0) < 0.0  # noqa: SLF001  深くする向き（負の effort）
+    assert on._launch_hold_pct == pytest.approx(0.1)  # noqa: SLF001
+    # ブレーキの上限（max_brake）を超えない
+    on2 = _hold_run(cfg, _hold(ki=1e6), plan)
+    d = on2._launch_hold_step(0.0, 1.0, -9.0)  # noqa: SLF001
+    assert -9.0 + d == pytest.approx(-cfg.vehicle.max_brake_opening_pct)
+
+
+def test_make_launch_hold_needs_ramp_and_flag(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    cfg = _c7_cfg(tmp_path)
+    ff = SimpleNamespace(table=_GainTable(0.8))
+    assert mdmod.make_launch_hold(cfg, ff, _plan_stub([True]))[0] is None  # off
+    cfg.forward_map.launch_move_hold = True
+    plan = _plan_stub([True])
+    plan.launch_prep = None
+    hold, text = mdmod.make_launch_hold(cfg, ff, plan)
+    assert hold is None and "働かない" in text
+    cfg.forward_map.brake_lag_s = 0.2
+    cfg.forward_map.deviation_c = 5.0
+    hold, text = mdmod.make_launch_hold(cfg, ff, _plan_stub([True]))
+    assert hold is not None and hold.ki == pytest.approx(1.0 / (1.0**2 * 0.8))
+    assert hold.bk_pct == pytest.approx(cfg.vehicle.min_brake_opening_pct + 4.0)
+    assert "Ki" in text
+    ff_bad = SimpleNamespace(table=_GainTable(-1.0))
+    assert "働かない" in mdmod.make_launch_hold(cfg, ff_bad, _plan_stub([True]))[1]

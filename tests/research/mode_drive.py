@@ -68,6 +68,7 @@ from tests.research.ff_candidate import (
 )
 from tests.research.ff_params import research_ff_params
 from tests.research.hardware import ActuatorProtocol, DriveError, ResearchHardware
+from tests.research.launch_hold import LaunchMoveHold, launch_hold_gain
 from tests.research.pattern_drive import _overcurrent_limit_ma, _release_pedals
 from tests.research.pedal_arbiter import (
     PedalArbiter,
@@ -341,6 +342,31 @@ def apply_table_options(cfg: ResearchConfig, table: Any) -> Any:
     return table
 
 
+def make_launch_hold(
+    cfg: ResearchConfig, ff: ForwardMapFeedforward, plan: Any
+) -> tuple[LaunchMoveHold | None, str]:
+    """段8-a: 発進で動き出したら離しを止めて待つ仕組み（forward_map.launch_move_hold）と、設定の
+    表示文。働かないとき（off・launch_prep なし・k ≦ 0 など）は (None, 理由)。
+    τ ＝ deviation_c × brake_lag_s（P と同じ。yaml の brake_lag_s、なければ pkl の meta）。"""
+    fm = cfg.forward_map
+    if not fm.launch_move_hold:
+        return None, "なし"
+    if plan.launch_prep is None:
+        return None, "あり（設定）だが働かない: 計画に launch_prep が無い（ramp が off）"
+    meta = ff.table.meta
+    lag_b = fm.brake_lag_s if fm.brake_lag_s is not None else meta.get("brake_lag_s")
+    tau = None if lag_b is None else fm.deviation_c * float(lag_b)
+    ki, _k, note = launch_hold_gain(ff.table, tau_brake_s=tau)
+    if ki is None:
+        return None, f"あり（設定）だが働かない: {note}"
+    bk = cfg.vehicle.min_brake_opening_pct + abs(float(meta["launch_breakaway_u_pct"]))
+    hold = LaunchMoveHold(
+        ki=ki, bk_pct=bk, brake_min_pct=cfg.vehicle.min_brake_opening_pct,
+        dt_s=cfg.control.loop_interval_s,
+    )
+    return hold, f"あり・{note}・bk ＝ {bk:.2f}%"
+
+
 def _prepare_forward_map_plan(
     cfg: ResearchConfig, mode: DrivingMode, ff: ForwardMapFeedforward
 ) -> Any:
@@ -367,6 +393,8 @@ def _prepare_forward_map_plan(
     say(f"  切り替えの先読み（段5-5c）: {'あり' if fm.switch_lead_enabled else 'なし'}")
     say(f"  発進のブレーキを基準の動き出しに合わせて離す（段7-b）: "
         f"{'あり' if fm.launch_release_ramp else 'なし'}")
+    if isinstance(ff, ForwardMapFeedforward):
+        say(f"  動き出したら離しを止めて待つ（段8-a）: {make_launch_hold(cfg, ff, plan)[1]}")
     say(f"  すき間で失う分の補償（段7-c）: {'あり' if fm.switch_gap_compensate else 'なし'}")
     say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
         "（0 ＝ 全部の車速で使う）")
@@ -1099,6 +1127,9 @@ class _ModeRun:
     stop_lead_stats: StopLeadStats | None = None
     _stop_lead_now: bool | None = None
     _stop_end_tau_s: float | None = None
+    # 段8-a の既定（__init__ を通らない最小の _ModeRun でも読めるように）
+    launch_hold: LaunchMoveHold | None = None
+    _launch_hold_pct: float | None = None
 
     def __init__(
         self,
@@ -1223,6 +1254,13 @@ class _ModeRun:
         self.midway_fb_no_deeper = bool(cfg.forward_map.launch_midway_fb_no_deeper)
         self.midway_fb_cut_cycles = 0  # 抑えた周期数
         self.midway_fb_cut_pct_sum = 0.0  # 抑えた量（ブレーキの深さ [%]）の合計
+        # 段8-a: 基準 0 で動き出したら離しを止めて待つ（forward_map.launch_move_hold）
+        self.launch_hold = None
+        self._launch_hold_pct = None
+        if isinstance(self.ff, ForwardMapFeedforward):
+            self.launch_hold, _text = make_launch_hold(cfg, self.ff, self.ff.plan)
+            if self.launch_hold is not None:
+                self._launch_hold_pct = 0.0
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
         self._accel_blocked = False
@@ -1361,9 +1399,10 @@ class _ModeRun:
                     self.midway_fb_cut_pct_sum += -c10_effort
                     c10_effort = cut
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
+        hold_delta = self._launch_hold_step(t, speed, ff_effort)  # 段8-a（off なら 0）
         # C10 の上乗せは FF の列（accel_ff・brake_ff・plan_effort）には入れない（作ったずれが
         # 今までと同じ意味で比べられるように）。実際に出す effort にだけ足す
-        effort = ff_effort + (c10_effort or 0.0) + pid_effort
+        effort = ff_effort + (c10_effort or 0.0) + pid_effort + hold_delta
         ff_shown = ff_effort  # ログの FF 列に出す値（C14 の下限を掛けたもの）
         floor_raise: float | None = None
         if self.cfloor is not None:
@@ -1462,6 +1501,7 @@ class _ModeRun:
                     dob_brake_kmhs=None if self.dob is None else self.dob.d_brake,
                     dob_effort_pct=self._dob_effort,
                     coast_effort_pct=None if self.coast is None else self._coast_effort,
+                    launch_hold_pct=self._launch_hold_pct,
                     speed_est_kmh=self._speed_est,
                     speed_pred_kmh=self._speed_pred,
                     pred_dev_kmh=self._pred_row_dev,
@@ -1490,6 +1530,24 @@ class _ModeRun:
                        f"max|偏差|={self.max_abs_dev:.2f} "
                        f"{100.0 * t / self.duration_s:4.1f}%{gov}"),
             ))
+
+    def _launch_hold_step(self, t: float, speed: float, ff_effort: float) -> float:
+        """段8-a: 発進のブレーキに足す effort [%]（≦ 0。ブレーキを深くする向き）。off は 0。
+        `launch_hold_pct`（CSV）にはその深さを入れる。FB の P・DOB はこの行では有効にしない
+        （launch_prep の行は FLAG_STOP で P は何もしない）。ブレーキの上限を超えない。"""
+        hold = self.launch_hold
+        if hold is None:
+            return 0.0
+        plan = self.ff.plan  # type: ignore[attr-defined]
+        i = plan.index_at(t)
+        midway = plan.is_launch_midway(i) if plan.launch_midway is not None else True
+        added = hold.step(
+            prep=bool(plan.launch_prep[i]), speed_kmh=speed, ff_effort=ff_effort, midway=midway
+        )
+        room = max(self.cfg.vehicle.max_brake_opening_pct + ff_effort, 0.0)
+        added = min(added, room)  # ff_effort は負: 深さ上限 − |ff|
+        self._launch_hold_pct = added
+        return -added
 
     def _ff_side_now(self, t: float, is_accel: bool) -> int | None:
         """CSV 用（段5-2）: 今の計画の行が、そのペダル側で引いた表 SIDE_*（計画なしは None）。"""

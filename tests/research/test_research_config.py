@@ -1378,7 +1378,7 @@ def test_keys_missing_in_yaml_lists_dataclass_keys_not_written(tmp_path: Path) -
 
 
 def test_launch_release_and_gap_compensate_settings() -> None:
-    """段7-b・段7-c: 既定は off（値は 2.0・2.0・5.0）。yaml も off で、検証が値の範囲を見る。"""
+    """段7-b・段7-c: 既定 off（2.0・2.0・5.0）。yaml は 7-b が true・7-c が off。"""
     fm0 = cfgmod.ForwardMapSection()
     assert fm0.launch_release_ramp is False and fm0.switch_gap_compensate is False
     assert (fm0.launch_release_lead_s, fm0.launch_release_pre_pct, fm0.launch_short_stop_s) == (
@@ -1386,7 +1386,7 @@ def test_launch_release_and_gap_compensate_settings() -> None:
     )
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     fm = cfg.forward_map
-    assert fm.launch_release_ramp is False and fm.switch_gap_compensate is False
+    assert fm.launch_release_ramp is True and fm.switch_gap_compensate is False
     assert (fm.launch_release_lead_s, fm.launch_release_pre_pct, fm.launch_short_stop_s) == (
         2.0, 2.0, 5.0,
     )
@@ -1405,3 +1405,17 @@ def test_launch_release_and_gap_compensate_settings() -> None:
         assert problems_about(key), (key, bad)
         setattr(fm, key, good)
         assert not problems_about(key)
+
+
+def test_launch_move_hold_settings() -> None:
+    """段8-a: 既定も yaml も off。launch_move_hold は launch_release_ramp が必要。"""
+    fm0 = cfgmod.ForwardMapSection()
+    assert fm0.launch_move_hold is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.forward_map.launch_move_hold is False
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.launch_move_hold = True
+    cfg.forward_map.launch_release_ramp = False
+    assert any("launch_move_hold" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.launch_release_ramp = True
+    assert cfgmod.validate_config(cfg) == []

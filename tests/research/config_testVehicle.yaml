@@ -255,6 +255,12 @@ forward_map:
   launch_release_lead_s: 2.0
   launch_release_pre_pct: 2.0
   launch_short_stop_s: 5.0
+  # 2026-10-24 段8-a: true なら launch_prep の行（発進前の離し・短い停車の bk の行）で実車速が
+  # 0.05 km/h を超えたとき、その周期の FF で離しを止め、深くする向きだけの積分 I を足して待つ
+  # （Ki ＝ 1 ÷ (τ² × k)。τ ＝ deviation_c × brake_lag_s、k ＝ 発進側の表の最低車速行の bk 前後の傾き。
+  # 走行前に表示）。基準が動き出した後は「止めた開度 ＋ I − bk」を発進の途中のブレーキに足し、
+  # min に戻ったらやめる。launch_release_ramp が必要。効く先: 最終指令。決める時期: 段8 の実機の組
+  launch_move_hold: false
   # 2026-10-24 段7-c: true ならアクセル ⇔ ブレーキの切り替えで、すき間の確保が削った最後の行で失う速度を
   # 削った行の直前の同じペダルに上乗せして解き直す。新しい調整値は無い。効く先: 折れ目の前の行。
   # 決める時期: 段7-c の実機の組
