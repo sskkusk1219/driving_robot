@@ -823,6 +823,21 @@ class ForwardMapSection:
     # 新しい調整値は無い。停車保持・先置きをまたぐ切り替えは対象外。既定 false ＝ 今と完全に同じ。
     # 効く先: fwd_plan.build_plan の折れ目の前の行。決める時期: 段7-c の実機の組
     switch_gap_compensate: bool = False
+    # 2026-10-25 段9-b: true なら、アクセル ⇔ ブレーキの切り替えのすき間の確保
+    # （ensure_return_gap）を、前（戻す側）で c 行削る・後ろ（次のペダル）で d 行遅らせる組み合わせ
+    # のうち、すき間の条件を満たし損の合計（惰行にした行の |要る加速度 − 惰行の加速度|×周期の和）
+    # が最小のものにする。同点は前で削る（今まで）。後ろで遅らせた分は補償しない
+    # （switch_gap_compensate は前で削った分だけ）。
+    # 停車保持・先置きが絡む切り替えは今までどおり。新しい調整値は無い。
+    # 既定 false ＝ 今と完全に同じ。効く先: fwd_plan.ensure_return_gap。決める時期: 段9-b の実機の組
+    switch_gap_min_loss: bool = False
+    # 2026-10-25 段9-c: true なら、アクセルの戻しの層を学習データの範囲の中だけで使う。戻し量が
+    # 表の meta accel_release_max_pct を超える点は本体の表（戻し量 0）で引き、直近 3 秒の最大 u が
+    # meta accel_release_peak_max_pct（学習の戻しのあるアクセルの行の直近の最大 u の p95）を超える
+    # 時刻は層を使わない。meta が無い pkl ではエラー（fwd_final add-release-peak で付ける）。
+    # 新しい調整値は無い。既定 false ＝ 今と完全に同じ。効く先: fwd_plan._resolve_accel_releases。
+    # 決める時期: 段9-c の実機の組
+    accel_release_in_range_only: bool = False
     # 2026-10-23 段6 C: true なら、dir の発進の途中の行（停車保持は除く）で、FB の上乗せ（C10 の P・
     # DOB・惰行の補助の合計）がブレーキを FF の開度より深くする向きのとき 0 にする（浅くする向き・
     # アクセル側は触らない。最終のブレーキ開度 ≤ FF のブレーキ開度）。

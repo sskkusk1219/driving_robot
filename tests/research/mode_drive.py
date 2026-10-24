@@ -323,6 +323,8 @@ def forward_map_plan_args(
         launch_release_pre_pct=fm.launch_release_pre_pct,
         launch_short_stop_s=fm.launch_short_stop_s,
         switch_gap_compensate=fm.switch_gap_compensate,  # 段7-c
+        switch_gap_min_loss=fm.switch_gap_min_loss,  # 段9-b
+        accel_release_in_range_only=fm.accel_release_in_range_only,  # 段9-c
     )
     return target_ref.at, mode.total_duration, kwargs
 
@@ -398,6 +400,12 @@ def _prepare_forward_map_plan(
     say("  P・惰行の補助の表から A2 を外す（段8-b）: "
         f"{'あり' if fm.fb_no_breakaway_floor else 'なし'}")
     say(f"  すき間で失う分の補償（段7-c）: {'あり' if fm.switch_gap_compensate else 'なし'}")
+    say("  すき間を前後の損の合計が最小で取る（段9-b）: "
+        f"{'あり' if fm.switch_gap_min_loss else 'なし'}")
+    say(
+        "  アクセルの戻しの層を学習の範囲の中だけで使う（段9-c）: "
+        f"{'あり' if fm.accel_release_in_range_only else 'なし'}"
+    )
     say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
         "（0 ＝ 全部の車速で使う）")
     if isinstance(ff, DeviationForwardFeedforward):

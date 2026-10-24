@@ -1145,3 +1145,20 @@ def test_accel_push_table_survives_save_and_old_pkl_has_none(tmp_path) -> None:
     assert np.array_equal(got.accel_push_accel, tb.accel_push_accel)
     plain = load_forward_map(save_table(release_table(), tmp_path / "q.pkl"))
     assert plain.accel_push_grid is None and plain.accel_push_accel is None
+
+
+def test_attach_accel_release_peak_meta_is_p95_of_rows_with_release() -> None:
+    tb = release_table(with_release=False)
+    slices = np.stack([tb.accel_grid] * len(RELEASE_GRID_PCT))
+    rel = np.concatenate([np.full(400, 1.0), np.zeros(100), np.full(100, 0.1)])
+    peak = np.concatenate([np.linspace(10.0, 30.0, 400), np.full(200, 99.0)])
+    ok = attach_accel_release(
+        tb, slices, release_pct=rel, dt_row_s=np.full(len(rel), 0.05), peak_pct=peak
+    )
+    # 戻し量 0.3% 以上の行（先頭 400 行）の直近の最大 u の p95
+    assert ok.meta["accel_release_peak_max_pct"] == pytest.approx(
+        float(np.quantile(peak[:400], 0.95))
+    )
+    # peak_pct を渡さなければ meta に残さない（今までと同じ）
+    none = attach_accel_release(tb, slices, release_pct=rel, dt_row_s=np.full(len(rel), 0.05))
+    assert "accel_release_peak_max_pct" not in none.meta

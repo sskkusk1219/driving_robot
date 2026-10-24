@@ -12,6 +12,8 @@
         [--train CSV...] [--map PKL] [--check CSV...] [--ref-check CSV...] [--out PKL]
         [--save] [--smoke]
     （--smoke は max_iter 3 の動作確認。名前で区別できないので smoke 時は保存しない）
+    .venv/bin/python -m tests.research.fwd_final add-release-peak PKL 学習ログCSV... --out 新PKL
+    （2026-10-25 段9-c: 再学習せず meta に accel_release_peak_max_pct を足した pkl を作る）
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import multiprocessing
 import time
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +48,8 @@ from tests.research.fwd_map import (
     attach_release,
     load_forward_map,
     refine_u_grid,
+    release_peak_stat,
+    release_stats,
     save_table,
 )
 from tests.research.fwd_model import grid_from_raw, monotone_rows
@@ -228,13 +233,14 @@ def build_final_table(
         # 2026-10-20 段4-3: アクセルの戻しの表。ブレーキの戻しの表と同じ流れ。アクセルの行
         # （u > 0。停車まぎわ除外は u <= 閾値の行だけを外すのでアクセルの行は変わらない）の
         # アクセルの戻し量で accel_release_max_pct と秒数を決め、足りなければ付けない
-        arel_p, arel_dt = [], []
+        arel_p, arel_dt, arel_pk = [], [], []
         for r in train_rows:
             m = r.u_pct > 0.0
             if cfg.drop_stop_approach:  # depth はアクセルの行を外さない・window は窓の行を外す
                 m &= ~_dropped_rows(cfg, r)
             arel_p.append(r.accel_release_pct[m])
             arel_dt.append(r.dt_row_s[m])
+            arel_pk.append((r.u_pct + r.accel_release_pct)[m])  # 直近の最大 u（段9-c）
         aslices = monotone_rows(np.mean([o[5] for o in outs], axis=0), like.u_grid)
         tb = attach_accel_release(
             tb,
@@ -242,6 +248,7 @@ def build_final_table(
             release_pct=np.concatenate(arel_p) if arel_p else np.zeros(0),
             dt_row_s=np.concatenate(arel_dt) if arel_dt else np.zeros(0),
             release_grid=RELEASE_GRID_PCT,
+            peak_pct=np.concatenate(arel_pk) if arel_pk else np.zeros(0),
         )
     if cfg.release_slices and cfg.accel_push_input and all(o[6] is not None for o in outs):
         # 2026-10-23 段5-7b: アクセルの踏み増しの表。アクセルの戻しの表と同じ流れ。アクセルの行
@@ -307,8 +314,76 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def add_release_peak(pkl: Path, train_csv: Sequence[str | Path], out: Path) -> dict[str, float]:
+    """再学習せずに、pkl の meta へ accel_release_peak_max_pct を足した新しい pkl を out に書く
+    （2026-10-25 段9-c）。元の pkl は書き換えない。
+
+    値は build_final_table と同じ行の作り方（read_logs・アクセルの行 u > 0・meta の停車まぎわ除外
+    drop_stop_approach / stop_approach_exclusion と同じ外し方）で学習ログから計算する。戻しの表の
+    meta（accel_release_max_pct・accel_release_rows_s）も同じ行で再計算して元の値と照合し、
+    ずれていたら止める（学習ログ・除外の取り違え防止）。"""
+    tb = load_forward_map(pkl)
+    meta = tb.meta
+    if "accel_release_max_pct" not in meta:
+        raise ValueError(f"{pkl} にアクセルの戻しの meta（accel_release_max_pct）がありません")
+    st = settings_of_table(tb, _settings())
+    rows = read_logs([str(p) for p in train_csv], st)
+    drop = bool(meta.get("drop_stop_approach", False))
+    excl = str(meta.get("stop_approach_exclusion", "depth"))
+    cfg = final_config(drop_stop_approach=drop, stop_approach_exclusion=excl)
+    rel, dt, pk = [], [], []
+    for r in rows:
+        m = r.u_pct > 0.0
+        if drop:
+            m &= ~_dropped_rows(cfg, r)
+        rel.append(r.accel_release_pct[m])
+        dt.append(r.dt_row_s[m])
+        pk.append((r.u_pct + r.accel_release_pct)[m])
+    rel_a, dt_a, pk_a = np.concatenate(rel), np.concatenate(dt), np.concatenate(pk)
+    total_s, p95 = release_stats(rel_a, dt_a)
+    old_p95 = float(meta["accel_release_max_pct"])
+    old_s = float(meta.get("accel_release_rows_s", total_s))
+    if abs(p95 - old_p95) > 1e-6 or abs(total_s - old_s) > 1e-3:
+        raise ValueError(
+            f"学習ログから計算した戻しの meta（max {p95:.4f}・{total_s:.2f} 秒）が pkl の値"
+            f"（max {old_p95:.4f}・{meta.get('accel_release_rows_s')} 秒）と合いません。"
+            "学習ログか除外の設定が違います"
+        )
+    peak = release_peak_stat(rel_a, pk_a)
+    new_meta = dict(meta)
+    new_meta["accel_release_peak_max_pct"] = peak
+    out = Path(out)
+    if out.resolve() == Path(pkl).resolve():
+        raise ValueError("--out は元の pkl と別のパスにしてください")
+    save_table(replace(tb, meta=new_meta), out)
+    return {"accel_release_peak_max_pct": peak, "accel_release_max_pct": old_p95}
+
+
+def main_add_release_peak(argv: Sequence[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="fwd_final add-release-peak",
+        description="pkl の meta に accel_release_peak_max_pct を足した新しい pkl を作る",
+    )
+    p.add_argument("pkl")
+    p.add_argument("train_csv", nargs="+", help="学習ログ（pkl の meta sources のもの）")
+    p.add_argument("--out", required=True, help="保存先 pkl（元の pkl とは別のパス）")
+    args = p.parse_args(argv)
+    res = add_release_peak(Path(args.pkl), args.train_csv, Path(args.out))
+    print(f"- 保存: `{args.out}`")
+    print(
+        f"- accel_release_peak_max_pct {res['accel_release_peak_max_pct']:.4f}%"
+        f"（参考 accel_release_max_pct {res['accel_release_max_pct']:.4f}%）"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    import sys  # noqa: PLC0415
+
+    arg_list = list(sys.argv[1:] if argv is None else argv)
+    if arg_list and arg_list[0] == "add-release-peak":
+        return main_add_release_peak(arg_list[1:])
+    args = build_parser().parse_args(arg_list)
     cfg = final_config(
         args.seeds,
         hidden=args.hidden,

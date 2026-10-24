@@ -399,6 +399,8 @@ def build_plan(
     launch_release_pre_pct: float = 2.0,
     launch_short_stop_s: float = 5.0,
     switch_gap_compensate: bool = False,
+    switch_gap_min_loss: bool = False,
+    accel_release_in_range_only: bool = False,
     _lead_extra: np.ndarray | None = None,
     _need_add: np.ndarray | None = None,
     _aux_out: dict[str, np.ndarray] | None = None,
@@ -421,6 +423,17 @@ def build_plan(
     均等に上乗せして（要る加速度 ＋ Δv ÷ その秒数）、同じ表・同じ側で解き直す（`_need_add`）。
     解き直した後のすき間の確保で新しく削られた行数は ReturnGapStats.comp_new_trim_rows に残す
     （追わない）。新しい調整値は無い。
+
+    2026-10-25 段9-b: `switch_gap_min_loss`。False は今までと完全に同じ。True は、アクセル ⇔
+    ブレーキの切り替え（停車保持・先置きが絡むものは今までどおり）のすき間の確保で、前（戻す側）で
+    c 行削る・後ろ（次のペダル）で d 行遅らせる組み合わせのうち、すき間の条件を満たし、損の合計
+    Σ|要る加速度 − 惰行の加速度|×周期（惰行にした行）が最小のものを選ぶ（`ensure_return_gap`）。
+    後ろで遅らせた分は補償しない（段7-c の補償は前で削った分だけ）。新しい調整値は無い。
+
+    2026-10-25 段9-c: `accel_release_in_range_only`。False は今までと完全に同じ。True は、アクセルの
+    戻しの層を学習データの範囲の中だけで使う（`_resolve_accel_releases`。戻し量が meta
+    accel_release_max_pct を超える点は本体・直近の最大 u が meta accel_release_peak_max_pct を超える
+    時刻は層なし）。meta が無い表ではエラー。
 
     2026-10-22 段5-5c: `switch_lead`。False は今までと完全に同じ。True は 2 回解く。1 回目は先置き・
     すき間の確保の前の計画（要る加速度から素直に解いた effort。先置き・すき間の確保は切り替えの
@@ -490,6 +503,8 @@ def build_plan(
             "launch_release_pre_pct": launch_release_pre_pct,
             "launch_short_stop_s": launch_short_stop_s,
             "switch_gap_compensate": switch_gap_compensate,
+            "switch_gap_min_loss": switch_gap_min_loss,
+            "accel_release_in_range_only": accel_release_in_range_only,
         }
         first = build_plan(
             ref_at, duration_s, table, **common,
@@ -522,18 +537,28 @@ def build_plan(
             "launch_release_pre_pct": launch_release_pre_pct,
             "launch_short_stop_s": launch_short_stop_s,
             "switch_lead": switch_lead, "_lead_extra": _lead_extra,
+            "switch_gap_min_loss": switch_gap_min_loss,
+            "accel_release_in_range_only": accel_release_in_range_only,
             "preposition_enabled": False, "return_gap_enabled": False,
         }
         aux: dict[str, np.ndarray] = {}
         base = build_plan(ref_at, duration_s, table, **common_c, _aux_out=aux)
         ret_c = return_time_of(table, accel_deadband_pct, brake_deadband_pct)
-        add, dv_total, n_ev, trimmed0 = _gap_compensation(base, aux, ret_c, period_s)
+        add, dv_total, n_ev, trimmed0 = _gap_compensation(
+            base, aux, ret_c, period_s, min_loss=switch_gap_min_loss
+        )
         if n_ev > 0:
             comped = build_plan(
                 ref_at, duration_s, table, **common_c, _need_add=add, _aux_out={}
             )
             e1 = comped.effort_pct.copy()
-            ensure_return_gap(e1, comped.flag.copy(), ret=ret_c, period_s=period_s)
+            if switch_gap_min_loss:
+                ensure_return_gap(
+                    e1, comped.flag.copy(), ret=ret_c, period_s=period_s,
+                    need_accel=base.need_accel_kmhs, coast_a=aux["coast_a"], coast_b=aux["coast_b"],
+                )
+            else:
+                ensure_return_gap(e1, comped.flag.copy(), ret=ret_c, period_s=period_s)
             trimmed1 = (comped.effort_pct != 0.0) & (e1 == 0.0)
             new_rows = int(np.count_nonzero(trimmed1 & ~trimmed0))
             plan2 = build_plan(
@@ -701,7 +726,8 @@ def build_plan(
         low_a = v < float(table.meta.get("stop_max_speed_kmh", 0.0))
         redo_a = is_accel & ~stop & ~((launch_a & low_a) | stop_a)
         _resolve_accel_releases(
-            effort, redo_a, u_a, v, need_a, table, brake_deadband_pct, accel_deadband_pct, period_s
+            effort, redo_a, u_a, v, need_a, table, brake_deadband_pct, accel_deadband_pct, period_s,
+            in_range_only=accel_release_in_range_only,
         )
         # 解き直した行（7.5 km/h 以上の legacy の発進側）は本体の表なので、ラベルも本体にする
         relabel_a = redo_a & launch_a
@@ -743,9 +769,16 @@ def build_plan(
             ret=ret,
             period_s=period_s,
         )
-    gap_stats = (
-        ensure_return_gap(effort, flag, ret=ret, period_s=period_s) if return_gap_enabled else None
-    )
+    gap_stats = None
+    if return_gap_enabled:
+        if switch_gap_min_loss:  # 段9-b: 損の合計が最小の組（要る加速度・惰行の加速度を渡す）
+            gap_stats = ensure_return_gap(
+                effort, flag, ret=ret, period_s=period_s, need_accel=need,
+                coast_a=np.broadcast_to(np.asarray(coast_a, dtype=float), (n,)),
+                coast_b=np.broadcast_to(np.asarray(coast_b, dtype=float), (n,)),
+            )
+        else:
+            gap_stats = ensure_return_gap(effort, flag, ret=ret, period_s=period_s)
     side_accel = np.where(launch_a, SIDE_LAUNCH, np.where(stop_a, SIDE_STOP, SIDE_MAIN))
     side_accel = np.where(relabel_a, SIDE_MAIN, side_accel)
     side_brake = np.where(launch_b, SIDE_LAUNCH, np.where(stop_b, SIDE_STOP, SIDE_MAIN))
@@ -854,7 +887,12 @@ def _launch_release_ramp(
 
 
 def _gap_compensation(
-    base: ForwardPlan, aux: dict[str, np.ndarray], ret: ReturnTime, period_s: float
+    base: ForwardPlan,
+    aux: dict[str, np.ndarray],
+    ret: ReturnTime,
+    period_s: float,
+    *,
+    min_loss: bool = False,
 ) -> tuple[np.ndarray, float, int, np.ndarray]:
     """段7-c: ensure_return_gap が戻す側の最後を惰行に削る切り替えを拾い、上乗せする分を返す。
 
@@ -869,7 +907,13 @@ def _gap_compensation(
     n = len(base.effort_pct)
     before = base.effort_pct
     after = before.copy()
-    ensure_return_gap(after, base.flag.copy(), ret=ret, period_s=period_s)
+    if min_loss:  # 段9-b: 同じ取り方で削る。後ろで遅らせた行は下の判定で補償の対象から外れる
+        ensure_return_gap(
+            after, base.flag.copy(), ret=ret, period_s=period_s,
+            need_accel=base.need_accel_kmhs, coast_a=aux["coast_a"], coast_b=aux["coast_b"],
+        )
+    else:
+        ensure_return_gap(after, base.flag.copy(), ret=ret, period_s=period_s)
     trimmed = (before != 0.0) & (after == 0.0)
     add = np.zeros(n)
     dv_total = 0.0
@@ -1305,6 +1349,9 @@ def ensure_return_gap(
     *,
     ret: ReturnTime,
     period_s: float,
+    need_accel: np.ndarray | None = None,
+    coast_a: np.ndarray | None = None,
+    coast_b: np.ndarray | None = None,
 ) -> ReturnGapStats:
     """アクセル⇔ブレーキの全部の切り替えで、すき間（戻す側の指令が 0 の行数）を戻る時間 T 以上にする
     （effort・flag を書き換える。2026-10-17 段2o-9）。
@@ -1315,8 +1362,16 @@ def ensure_return_gap(
       次のペダルの最初の行から 0 に書き換えて遅らせる（停車保持を早く離すとクリープで動き出す）
     - それ以外: 戻す側の最後の行を 1 行ずつ 0（惰行）にして前倒しする（削るたびに深さを測り直す。
       最後の部分はたいてい遊びの中）
+
+    2026-10-25 段9-b: need_accel・coast_a・coast_b（行ごとの要る加速度・アクセル側／ブレーキ側の
+    惰行の加速度）を渡すと、停車保持・先置きが絡まないアクセル ⇔ ブレーキの切り替えは、前で c 行
+    削り（先頭の 1 行は残す）・後ろで d 行遅らせる（次のペダルの連なりの中で、1 行は残す）組み合わせ
+    のうち gap + c + d ≥ gap_rows(前の残った最後の行) を満たし、損 Σ|要る加速度 − 惰行の加速度|
+    ×周期（惰行にした行）が最小のものを選ぶ（同点は d の小さい方・c の小さい方＝今までの前で削る）。
+    条件を満たす組が無ければ今までの手順。None は今までと完全に同じ。
     """
     n = len(effort)
+    min_loss = need_accel is not None and coast_a is not None and coast_b is not None
     stats = ReturnGapStats(defaults_used=ret.defaults_used())
     last = -1  # 直前の 0 でない行
     i = 0
@@ -1333,6 +1388,31 @@ def ensure_return_gap(
                 leaving_accel = effort[last] > 0.0
                 while a > 0 and effort[a - 1] != 0.0 and (effort[a - 1] > 0.0) == leaving_accel:
                     a -= 1
+                pick = (
+                    _min_loss_split(
+                        effort, flag, a, last, i, gap, ret, period_s,
+                        need_accel, coast_a, coast_b,
+                    )
+                    if min_loss
+                    else None
+                )
+                if pick is not None:  # 段9-b: 前で c 行削り、後ろで d 行遅らせる
+                    c, d = pick
+                    if c > 0:
+                        effort[last - c + 1 : last + 1] = 0.0
+                        flag[last - c + 1 : last + 1] = FLAG_COAST
+                        stats.n_cut += 1
+                        stats.cut_s += c * period_s
+                        last -= c
+                    if d > 0:
+                        effort[i : i + d] = 0.0
+                        flag[i : i + d] = FLAG_COAST
+                        stats.n_delayed += 1
+                        stats.delayed_s += d * period_s
+                        i += d
+                    last = i
+                    i += 1
+                    continue
                 cut = None
                 if flag[last] != FLAG_STOP:
                     for c in range(1, last - a + 1):  # 先頭の 1 行は残す
@@ -1365,6 +1445,58 @@ def ensure_return_gap(
         i += 1
     stats.n_violations = count_gap_violations(effort, ret=ret, period_s=period_s)
     return stats
+
+
+def _min_loss_split(
+    effort: np.ndarray,
+    flag: np.ndarray,
+    a: int,
+    last: int,
+    i: int,
+    gap: int,
+    ret: ReturnTime,
+    period_s: float,
+    need_accel: np.ndarray,
+    coast_a: np.ndarray,
+    coast_b: np.ndarray,
+) -> tuple[int, int] | None:
+    """段9-b: すき間不足の切り替えで、前を c 行削り・後ろを d 行遅らせる組 (c, d) のうち、
+    gap + c + d ≥ gap_rows(effort[last − c]) を満たし損が最小のものを返す。
+
+    前の連なりは [a, last]（先頭の 1 行は残すので c ≤ last − a）、後ろの連なりは i からの同じ向きの
+    0 でない行（停車保持・先置きの行の手前まで。1 行は残すので d ≤ 連なりの長さ − 1）。
+    損 ＝ Σ|要る加速度 − 惰行の加速度| × 周期（前はそのペダル側、後ろは次のペダル側の惰行）。
+    同点は d の小さい方・c の小さい方。停車保持・先置きが絡むとき・組が無いときは None
+    （今までの手順に任せる）。
+    """
+    skip = (FLAG_STOP, FLAG_PREPOS)
+    if flag[last] in skip or flag[i] in skip:
+        return None
+    n = len(effort)
+    sign = effort[i] > 0.0
+    j = i
+    while j < n and effort[j] != 0.0 and (effort[j] > 0.0) == sign and flag[j] not in skip:
+        j += 1
+    d_max = j - i - 1
+    front_coast = coast_a if effort[last] > 0.0 else coast_b
+    back_coast = coast_b if effort[last] > 0.0 else coast_a
+    front_loss = np.concatenate(
+        [[0.0], np.cumsum(np.abs(need_accel[last:a:-1] - front_coast[last:a:-1]))]
+    ) * period_s  # front_loss[c] ＝ 後ろから c 行削った損（先頭 a は残す）
+    back_loss = np.concatenate(
+        [[0.0], np.cumsum(np.abs(need_accel[i : i + d_max] - back_coast[i : i + d_max]))]
+    ) * period_s
+    best: tuple[float, int, int] | None = None
+    for c in range(0, last - a + 1):
+        for d in range(0, d_max + 1):
+            if gap + c + d < ret.gap_rows(float(effort[last - c]), period_s):
+                continue
+            key = (float(front_loss[c] + back_loss[d]), d, c)
+            if best is None or key[0] < best[0] - 1e-12 or (
+                abs(key[0] - best[0]) <= 1e-12 and key[1:] < best[1:]
+            ):
+                best = key
+    return None if best is None else (best[2], best[1])
 
 
 def count_gap_violations(effort: np.ndarray, *, ret: ReturnTime, period_s: float) -> int:
@@ -1444,6 +1576,7 @@ def _resolve_accel_releases(
     accel_deadband_pct: float,
     period_s: float,
     window_s: float = RELEASE_WINDOW_S,
+    in_range_only: bool = False,
 ) -> None:
     """アクセルの戻しの表・踏み増しの表があるとき、redo の時刻のアクセルを時刻順に解き直して
     effort を書き換える（2026-10-20 段4-3。`_resolve_releases` のアクセル版。2026-10-23 段5-7b で
@@ -1457,9 +1590,27 @@ def _resolve_accel_releases(
     u_a0 のうち大きい方）、accel(v, u, accel_release=…, accel_push=…) ≧ need に最初になる u
     （節の間は直線補間）を新しい u にする。届かないとき（上限でも届かない）は戻し量・踏み増し量 0 の
     解のまま。u = 0 で届くときもそのまま（アクセルの行を 0 にしない）。
+
+    2026-10-25 段9-c: in_range_only=True のとき、戻しの層を学習データの範囲の中だけで使う。
+    戻し量 mx − u が meta accel_release_max_pct を超える点は戻し量 0（本体の表）で引き、
+    直近の最大 u（mx）が meta accel_release_peak_max_pct を超える時刻は戻しの層を使わない
+    （戻し量 0 ＝ 本体のまま。踏み増しの層は別）。戻しの表があるのに meta が無ければエラー。
     """
     rel_on = table.accel_release_grid is not None and table.accel_release_accel is not None
     push_on = table.accel_push_grid is not None and table.accel_push_accel is not None
+    rel_cap = peak_cap = None
+    if in_range_only and rel_on:
+        rel_cap = table.meta.get("accel_release_max_pct")
+        peak_cap = table.meta.get("accel_release_peak_max_pct")
+        if rel_cap is None or peak_cap is None or not (
+            np.isfinite(rel_cap) and np.isfinite(peak_cap)
+        ):
+            raise ValueError(
+                "accel_release_in_range_only が true ですが、表の meta に"
+                " accel_release_max_pct / accel_release_peak_max_pct がありません"
+                "（`python -m tests.research.fwd_final add-release-peak` で付けてください）"
+            )
+        rel_cap, peak_cap = float(rel_cap), float(peak_cap)
     w = max(int(round(window_s / period_s)), 1)
     u = np.where(
         effort < -brake_deadband_pct,
@@ -1473,6 +1624,8 @@ def _resolve_accel_releases(
         mn = float(np.maximum(win, 0.0).min()) if i > 0 else 0.0
         u0 = float(u_a0[i])
         do_rel = rel_on and mx > 0.0 and u0 < mx
+        if do_rel and peak_cap is not None and mx > peak_cap:
+            do_rel = False  # 段9-c: 直近の最大 u が学習の範囲の外は戻しの層なし
         do_push = push_on and i > 0 and u0 > mn + 1e-9
         if not (do_rel or do_push):
             continue  # 戻していない・踏み増していない
@@ -1480,7 +1633,8 @@ def _resolve_accel_releases(
         if top <= 0.0:
             continue
         kinks = [0.0, top]
-        if rel_on and 0.0 < mx < top:
+        use_rel = rel_on and not (peak_cap is not None and mx > peak_cap)
+        if use_rel and 0.0 < mx < top:
             kinks.append(mx)  # 戻し量 max(mx − u, 0) の折れ点
         if push_on and 0.0 < mn < top:
             kinks.append(mn)  # 踏み増し量 max(u − mn, 0) の折れ点
@@ -1490,7 +1644,9 @@ def _resolve_accel_releases(
                 table.accel(
                     float(v[i]),
                     pts,
-                    accel_release=np.maximum(mx - pts, 0.0) if rel_on else None,
+                    accel_release=(
+                        _release_amount_in_range(mx - pts, rel_cap) if use_rel else None
+                    ),
                     accel_push=np.maximum(pts - mn, 0.0) if push_on else None,
                 ),
                 dtype=float,
@@ -1509,6 +1665,12 @@ def _resolve_accel_releases(
         u_new = max(u_new, 0.0)
         u[i] = u_new
         effort[i] = accel_deadband_pct + u_new
+
+
+def _release_amount_in_range(amount: np.ndarray, cap: float | None) -> np.ndarray:
+    """戻し量（負は 0 に）。cap があるとき、cap を超える点は 0（本体）にする（段9-c）。"""
+    r = np.maximum(amount, 0.0)
+    return r if cap is None else np.where(r > cap, 0.0, r)
 
 
 def _lag(given: float | None, table: ForwardTable, key: str, default: float) -> float:

@@ -1239,6 +1239,24 @@ def release_stats(
     return total, float(np.quantile(rel, quantile))
 
 
+def release_peak_stat(
+    release_pct: np.ndarray,
+    peak_pct: np.ndarray,
+    *,
+    count_min_pct: float = RELEASE_COUNT_MIN_PCT,
+    quantile: float = RELEASE_CLAMP_QUANTILE,
+) -> float:
+    """学習のアクセルの行（u > 0。呼ぶ側で絞って渡す）のうち、戻し量 count_min_pct 以上の行の
+    「直近の最大 u」（＝ u + 戻し量）の quantile 分位（2026-10-25 段9-c。release_stats の流儀）。
+    該当する行が無ければ 0。"""
+    rel = np.asarray(release_pct, dtype=float)
+    pk = np.asarray(peak_pct, dtype=float)
+    m = rel >= count_min_pct - 1e-12
+    if not np.any(m):
+        return 0.0
+    return float(np.quantile(pk[m], quantile))
+
+
 # 戻しの表の 7.5〜20 km/h の帯（2026-10-20 段4-3）。下端は停止側の表の車速の上限
 # （meta の stop_max_speed_kmh）、上端はこの値。この帯のブレーキの戻しの行が手順2 に少ない
 # （段3b）ことを step2 のチェックで秒数として出すだけ。表の作り方には使わない。
@@ -1320,6 +1338,7 @@ def attach_accel_release(
     dt_row_s: np.ndarray,
     release_grid: Sequence[float] = RELEASE_GRID_PCT,
     min_total_s: float = RELEASE_MIN_TOTAL_S,
+    peak_pct: np.ndarray | None = None,
 ) -> ForwardTable:
     """アクセルの戻しの表（accel_release_grid・accel_release_accel）を付けた新しい表を返す
     （2026-10-20 段4-3。attach_release のアクセル版）。
@@ -1329,6 +1348,9 @@ def attach_accel_release(
     戻し量 RELEASE_COUNT_MIN_PCT 以上の行の合計秒数が min_total_s 未満なら付けない
     （accel_release_grid は None ＝ 今までと完全に同じ。meta に秒数だけ残す）。付けるときは
     meta の accel_release_max_pct ＝ 戻し量の p95 を残す（accel・invert はこれで頭打ちにする）。
+    peak_pct（2026-10-25 段9-c。release_pct と同じ行の「直近の最大 u」＝ u + 戻し量）を渡すと、
+    戻し量 RELEASE_COUNT_MIN_PCT 以上の行のその p95 を meta の accel_release_peak_max_pct に残す
+    （accel_release_in_range_only が使う。None なら残さない＝今までと同じ）。
     """
     total_s, p95 = release_stats(release_pct, dt_row_s)
     meta = dict(table.meta)
@@ -1338,6 +1360,8 @@ def attach_accel_release(
         accel_release_min_total_s=min_total_s,
         accel_release_count_min_pct=RELEASE_COUNT_MIN_PCT,
     )
+    if peak_pct is not None:
+        meta["accel_release_peak_max_pct"] = release_peak_stat(release_pct, peak_pct)
     grid = np.asarray(release_grid, dtype=float)
     acc = np.asarray(accel_release_accel, dtype=float)
     if acc.shape != (len(grid), *table.accel_grid.shape):

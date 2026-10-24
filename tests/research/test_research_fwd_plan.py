@@ -1834,3 +1834,139 @@ def test_gap_compensation_with_preposition_and_switch_lead() -> None:
         on = _gap_plan(_valley, True, **kw)
         assert on.return_gap.n_violations == 0
         assert len(on.effort_pct) == len(on.t_s) and np.all(np.isfinite(on.effort_pct))
+
+
+# ---- 段9-b: すき間を前と後ろの損の合計が最小で取る ----
+
+def _gap_ml(effort_list, need, coast_a=0.0, coast_b=0.0, flag=None):
+    from tests.research.fwd_plan import ensure_return_gap  # noqa: PLC0415
+
+    effort = np.array(effort_list, dtype=float)
+    n = len(effort)
+    fl = np.full(n, FLAG_COAST, dtype=int) if flag is None else np.array(flag)
+    st = ensure_return_gap(
+        effort, fl, ret=_ret(), period_s=DT, need_accel=np.asarray(need, dtype=float),
+        coast_a=np.full(n, coast_a), coast_b=np.full(n, coast_b),
+    )
+    return effort, fl, st
+
+
+def test_gap_min_loss_none_is_identical_to_before() -> None:
+    eff = [24.0] * 20 + [-24.0] * 10
+    e0, f0, s0 = _gap(eff)
+    e1, f1, s1 = _gap_ml(eff, np.zeros(30))  # 損が全部 0 ＝ 同点 ＝ 前で削る
+    assert np.array_equal(e0, e1) and np.array_equal(f0, f1)
+    assert (s1.n_cut, s1.n_delayed, s1.n_violations) == (s0.n_cut, s0.n_delayed, 0)
+    assert s1.cut_s == pytest.approx(s0.cut_s)
+
+
+def test_gap_min_loss_delays_back_when_front_loss_is_large() -> None:
+    # 前（アクセル）の行は要る加速度が大きい（削ると損が大きい）、後ろ（ブレーキ）は惰行と同じ
+    need = [5.0] * 20 + [0.0] * 10
+    e, fl, st = _gap_ml([24.0] * 20 + [-24.0] * 10, need)
+    assert st.n_cut == 0 and st.n_delayed == 1 and st.delayed_s == pytest.approx(7 * DT)
+    assert np.all(e[:20] == 24.0) and np.all(e[20:27] == 0.0) and np.all(e[27:] == -24.0)
+    assert np.all(fl[20:27] == FLAG_COAST) and st.n_violations == 0
+
+
+def test_gap_min_loss_splits_front_and_back() -> None:
+    # 前は 1 行 0.05 の損・後ろは先頭 3 行だけ損が無く、その先は大きい → 後ろ 3 行 ＋ 前 4 行
+    need = [1.0] * 20 + [0.0] * 3 + [-5.0] * 7
+    e, _, st = _gap_ml([24.0] * 20 + [-24.0] * 10, need)
+    assert st.n_cut == 1 and st.cut_s == pytest.approx(4 * DT)
+    assert st.n_delayed == 1 and st.delayed_s == pytest.approx(3 * DT)
+    assert np.all(e[16:23] == 0.0) and e[15] == 24.0 and e[23] == -24.0
+
+
+def test_gap_min_loss_stop_hold_and_prepos_keep_old_behaviour() -> None:
+    need = [5.0] * 20 + [0.0] * 10
+    fl = [FLAG_COAST] * 20 + [FLAG_PREPOS] * 10
+    e0, f0, _ = _gap([24.0] * 20 + [-24.0] * 10, flag=fl)
+    e1, f1, _ = _gap_ml([24.0] * 20 + [-24.0] * 10, need, flag=fl)
+    assert np.array_equal(e0, e1) and np.array_equal(f0, f1)
+    fl2 = [FLAG_STOP] * 20 + [FLAG_COAST] * 10
+    e2, _, _ = _gap([-24.0] * 20 + [24.0] * 10, flag=fl2)
+    e3, _, _ = _gap_ml([-24.0] * 20 + [24.0] * 10, [-5.0] * 20 + [0.0] * 10, flag=fl2)
+    assert np.array_equal(e2, e3)
+
+
+def test_gap_min_loss_off_plan_is_identical_and_compensates_front_only() -> None:
+    off = _gap_plan(_valley, True)
+    dflt = _gap_plan(_valley, True, switch_gap_min_loss=False)
+    assert np.array_equal(off.effort_pct, dflt.effort_pct)
+    on = _gap_plan(_valley, True, switch_gap_min_loss=True)
+    assert on.return_gap.n_violations == 0
+    assert on.return_gap.n_cut == 1 and on.return_gap.n_delayed == 1  # 谷: 前と後ろに分ける
+    assert on.return_gap.comp_events == 1
+    # 補償の Δv は前で削った行の分だけ（後ろで遅らせた行は含まない）
+    from tests.research.fwd_plan import _gap_compensation, return_time_of  # noqa: PLC0415
+
+    tb = _gap_table()
+    aux: dict = {}
+    base = plan_for(
+        _valley, 6.0, tb, return_gap_enabled=False, brake_lag_s=0.1, accel_lag_s=0.1,
+        _aux_out=aux,
+    )
+    ret = return_time_of(tb, AD, BD)
+    add, dv, n_ev, trimmed = _gap_compensation(base, aux, ret, base.period_s, min_loss=True)
+    cut_rows = trimmed & (base.effort_pct < 0.0)  # 谷: 前はブレーキ
+    front_dv = abs(float(np.sum(base.need_accel_kmhs[cut_rows] - aux["coast_b"][cut_rows])))
+    assert n_ev == 1 and dv == pytest.approx(front_dv * base.period_s)
+    assert trimmed.sum() > cut_rows.sum()  # 後ろで遅らせた行もある
+    # 山は全部後ろで遅らせる → 補償するものが無い
+    hill = _gap_plan(_hill, True, switch_gap_min_loss=True)
+    assert hill.return_gap.n_cut == 0 and hill.return_gap.comp_events == 0
+
+
+# ---- 段9-c: アクセルの戻しの層を学習の範囲の中だけで使う ----
+
+def _in_range_table(max_pct: float = 8.0, peak: float | None = 100.0) -> ForwardTable:
+    t = _accel_release_variant()
+    t.meta["accel_release_max_pct"] = max_pct
+    if peak is not None:
+        t.meta["accel_release_peak_max_pct"] = peak
+    return t
+
+
+def test_accel_release_in_range_only_off_or_wide_range_is_identical() -> None:
+    t = _in_range_table(max_pct=1000.0)
+    base = plan_for(_accel_release_ref, 8.0, t)
+    wide = plan_for(_accel_release_ref, 8.0, t, accel_release_in_range_only=True)
+    assert np.array_equal(base.effort_pct, wide.effort_pct)  # 範囲が十分広ければ同じ
+
+
+def test_accel_release_in_range_only_peak_beyond_range_uses_body() -> None:
+    body = plan_for(_accel_release_ref, 8.0, _accel_release_variant(with_layers=False))
+    layered = plan_for(_accel_release_ref, 8.0, _in_range_table())
+    # 山（直近の最大 u）が範囲の外 → 層を使わない ＝ 本体のまま
+    narrow = plan_for(
+        _accel_release_ref, 8.0, _in_range_table(peak=0.5), accel_release_in_range_only=True
+    )
+    assert np.allclose(narrow.effort_pct, body.effort_pct, atol=1e-9)
+    assert not np.allclose(layered.effort_pct, body.effort_pct, atol=1e-6)  # 前提: 層は効く
+
+
+def test_accel_release_in_range_only_amount_beyond_cap_uses_body_at_that_point() -> None:
+    body = plan_for(_accel_release_ref, 8.0, _accel_release_variant(with_layers=False))
+    # 戻し量の頭打ち 0.1% より戻し量が大きい点は本体の表（戻し量 0）で引く
+    capped = plan_for(
+        _accel_release_ref, 8.0, _in_range_table(max_pct=0.1), accel_release_in_range_only=True
+    )
+    off = plan_for(_accel_release_ref, 8.0, _in_range_table(max_pct=0.1))
+    # off は頭打ち 0.1 の層で解く ＝ 本体からずれる行がある。on は戻し量 > 0.1 の行で本体
+    assert not np.allclose(off.effort_pct, body.effort_pct, atol=1e-6)
+    d_on = np.abs(capped.effort_pct - body.effort_pct)
+    d_off = np.abs(off.effort_pct - body.effort_pct)
+    assert d_on.max() <= d_off.max() + 1e-9
+
+
+def test_accel_release_in_range_only_without_meta_raises() -> None:
+    with pytest.raises(ValueError, match="accel_release_peak_max_pct"):
+        plan_for(
+            _accel_release_ref, 8.0, _in_range_table(peak=None), accel_release_in_range_only=True
+        )
+    # 戻しの層が無い表はメタが無くてもエラーにしない
+    plan_for(
+        _accel_release_ref, 8.0, _accel_release_variant(with_layers=False),
+        accel_release_in_range_only=True,
+    )
