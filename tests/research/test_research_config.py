@@ -1424,18 +1424,19 @@ def test_launch_move_hold_and_fb_no_breakaway_floor_settings() -> None:
 
 
 def test_switch_gap_min_loss_and_accel_release_in_range_only_settings() -> None:
-    """段9-b・段9-c: 既定 off。本体 yaml も false。"""
+    """段9-b・段9-c: 既定 off（本体 yaml の値は段の採否で変わるので見ない）。"""
     fm0 = cfgmod.ForwardMapSection()
     assert fm0.switch_gap_min_loss is False and fm0.accel_release_in_range_only is False
-    fm = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH).forward_map
-    assert fm.switch_gap_min_loss is False and fm.accel_release_in_range_only is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfgmod.validate_config(cfg) == []
 
 
 def test_dob_fast_defaults_and_validation() -> None:
+    fm0 = cfgmod.ForwardMapSection()  # 既定（本体 yaml の on/off は段の採否で変わるので見ない）
+    assert fm0.dob_fast_enabled is False
+    assert fm0.dob_fast_tq_coef == 10.0 and fm0.dob_fast_need_kmhs == 5.0
     cfg = _load_default()
     fm = cfg.forward_map
-    assert fm.dob_fast_enabled is False
-    assert fm.dob_fast_tq_coef == 10.0 and fm.dob_fast_need_kmhs == 5.0
     assert cfgmod.validate_config(cfg) == []
     for name, value in (
         ("dob_fast_tq_coef", 0.0),
