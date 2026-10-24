@@ -1407,12 +1407,13 @@ def test_launch_release_and_gap_compensate_settings() -> None:
         assert not problems_about(key)
 
 
-def test_launch_move_hold_settings() -> None:
-    """段8-a: 既定も yaml も off。launch_move_hold は launch_release_ramp が必要。"""
+def test_launch_move_hold_and_fb_no_breakaway_floor_settings() -> None:
+    """段8-a・段8-b: 既定も yaml も off。launch_move_hold は launch_release_ramp が必要。"""
     fm0 = cfgmod.ForwardMapSection()
-    assert fm0.launch_move_hold is False
+    assert fm0.launch_move_hold is False and fm0.fb_no_breakaway_floor is False
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     assert cfg.forward_map.launch_move_hold is False
+    assert cfg.forward_map.fb_no_breakaway_floor is False
     assert cfgmod.validate_config(cfg) == []
     cfg.forward_map.launch_move_hold = True
     cfg.forward_map.launch_release_ramp = False

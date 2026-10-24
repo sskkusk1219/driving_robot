@@ -849,6 +849,10 @@ class ForwardMapSection:
     # 根拠: 基準 0 のまま車が動き出した所で、離しが進んで待つ値が浅くなり続ける。
     # 既定 false ＝ 今と完全に同じ。ログ: launch_hold_pct。効く先: mode_drive の最終指令
     launch_move_hold: bool = False
+    # 2026-10-24 段8-b: true なら P（deviation_offset_detail）と惰行の補助の表の引き直しだけ、
+    # A2（動き出す開度の頭打ち）を外した表を使う（動き出した後に A2 が FB の予測を 0 に潰さない）。
+    # FF の計画は今のまま A2 あり。既定 false ＝ 今と完全に同じ。効く先: mode_drive の FB の表
+    fb_no_breakaway_floor: bool = False
 
 
 @dataclass

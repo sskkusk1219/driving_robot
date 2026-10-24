@@ -395,6 +395,8 @@ def _prepare_forward_map_plan(
         f"{'あり' if fm.launch_release_ramp else 'なし'}")
     if isinstance(ff, ForwardMapFeedforward):
         say(f"  動き出したら離しを止めて待つ（段8-a）: {make_launch_hold(cfg, ff, plan)[1]}")
+    say("  P・惰行の補助の表から A2 を外す（段8-b）: "
+        f"{'あり' if fm.fb_no_breakaway_floor else 'なし'}")
     say(f"  すき間で失う分の補償（段7-c）: {'あり' if fm.switch_gap_compensate else 'なし'}")
     say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
         "（0 ＝ 全部の車速で使う）")
@@ -1127,9 +1129,10 @@ class _ModeRun:
     stop_lead_stats: StopLeadStats | None = None
     _stop_lead_now: bool | None = None
     _stop_end_tau_s: float | None = None
-    # 段8-a の既定（__init__ を通らない最小の _ModeRun でも読めるように）
+    # 段8-a・段8-b の既定（__init__ を通らない最小の _ModeRun でも読めるように）
     launch_hold: LaunchMoveHold | None = None
     _launch_hold_pct: float | None = None
+    fb_no_floor: bool = False
 
     def __init__(
         self,
@@ -1261,6 +1264,8 @@ class _ModeRun:
             self.launch_hold, _text = make_launch_hold(cfg, self.ff, self.ff.plan)
             if self.launch_hold is not None:
                 self._launch_hold_pct = 0.0
+        # 段8-b: P・惰行の補助の表の引き直しだけ A2 を外す（forward_map.fb_no_breakaway_floor）
+        self.fb_no_floor = bool(cfg.forward_map.fb_no_breakaway_floor)
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
         self._accel_blocked = False
@@ -1549,6 +1554,11 @@ class _ModeRun:
         self._launch_hold_pct = added
         return -added
 
+    def _fb_table(self) -> Any:
+        """段8-b: P・惰行の補助が表を引き直すときの表（A2 を外した表）。"""
+        table = self.ff.table  # type: ignore[attr-defined]
+        return table.with_launch_breakaway_floor(False) if self.fb_no_floor else table
+
     def _ff_side_now(self, t: float, is_accel: bool) -> int | None:
         """CSV 用（段5-2）: 今の計画の行が、そのペダル側で引いた表 SIDE_*（計画なしは None）。"""
         ff = self.ff
@@ -1666,6 +1676,7 @@ class _ModeRun:
             # 段5-2: 計画が行ごとに決めた表（規則が legacy なら None ＝ 今までと同じ）
             "side": plan.side_for(i, ff_effort > 0.0),
         }
+        fb_table = self._fb_table()  # 段8-b
         dob = self.dob
         # C11: 押しているペダルの行にだけ、そのペダルの外乱の推定を引いて表を引く。
         # DOB の分は「P ＋ DOB の上乗せ − P だけの上乗せ」で別に出す（ログ・集計用）
@@ -1677,7 +1688,7 @@ class _ModeRun:
         # dob_low_speed_fade なら 1 → 0 へ連続に薄める（`_dob_weight`）
         if dob is not None:
             d_row *= self._dob_weight(speed, int(plan.flag[i]), ref)
-        new, clamped = deviation_offset_detail(ff.table, dob_kmhs=d_row, **kwargs)
+        new, clamped = deviation_offset_detail(fb_table, dob_kmhs=d_row, **kwargs)
         if self.stop_end is not None:
             # C15 停C: 停車まぎわのブレーキの行は、P の τ を「基準が 0 になるまでの残り時間
             # （ブレーキの遅れより短くしない）」にして引き直し、開度の範囲に収める
@@ -1695,13 +1706,13 @@ class _ModeRun:
             else:
                 normal = new
                 kwargs["tau_brake_s"] = tau_end  # p_only（DOB の分けるとき）も同じ τ で出す
-                new, clamped = deviation_offset_detail(ff.table, dob_kmhs=d_row, **kwargs)
+                new, clamped = deviation_offset_detail(fb_table, dob_kmhs=d_row, **kwargs)
                 new = self.stop_end.clamp(new, ff_effort)
                 self._stop_end_tau_s = tau_end
                 self.stop_end.stats.add(True, normal - new)  # 深い向きが正
         delta = new - ff_effort
         if dob is not None:
-            p_only, _ = deviation_offset_detail(ff.table, **kwargs)
+            p_only, _ = deviation_offset_detail(fb_table, **kwargs)
             self._dob_effort = (new - p_only) if ff_effort != 0.0 else 0.0
             if self.dob_stats is not None and ff_effort != 0.0:
                 self.dob_stats.add_effort(is_accel=ff_effort > 0.0, effort_pct=self._dob_effort)
@@ -1755,8 +1766,9 @@ class _ModeRun:
             on = ff.table.meta.get("accel_onset_u_pct" if is_accel else "brake_onset_u_pct")
             kwargs["onset_u_pct"] = None if on is None else float(on)
         d = dob.estimate(is_accel=is_accel) * self._dob_weight(speed, int(plan.flag[i]), ref)
-        with_dob = coast_assist_effort(ff.table, dob_kmhs=d, **kwargs)
-        without = coast_assist_effort(ff.table, **kwargs) if d != 0.0 else with_dob
+        fb_table = self._fb_table()  # 段8-b
+        with_dob = coast_assist_effort(fb_table, dob_kmhs=d, **kwargs)
+        without = coast_assist_effort(fb_table, **kwargs) if d != 0.0 else with_dob
         self._dob_effort = with_dob - without
         self._coast_effort = with_dob
         coast.note_effort(with_dob)

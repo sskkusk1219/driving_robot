@@ -1864,3 +1864,34 @@ def test_make_launch_hold_needs_ramp_and_flag(tmp_path: Path) -> None:
     assert "Ki" in text
     ff_bad = SimpleNamespace(table=_GainTable(-1.0))
     assert "働かない" in mdmod.make_launch_hold(cfg, ff_bad, _plan_stub([True]))[1]
+
+
+async def test_fb_no_breakaway_floor_lets_p_go_deeper_than_bk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dataclasses
+
+    from tests.research.fwd_plan import FLAG_MEASURED, deviation_offset_detail
+
+    cfg = _c10_cfg(tmp_path)
+    run = await _c10_run_obj(cfg, monkeypatch)
+    tb = run.ff.table
+    from types import SimpleNamespace
+
+    run.ff = SimpleNamespace(table=dataclasses.replace(
+        tb, launch_accel=tb.accel_grid + 12.0, launch_breakaway_floor=True,
+        meta={**tb.meta, "launch_breakaway_u_pct": -4.0},
+    ))
+    run.fb_no_floor = False
+    assert run._fb_table() is run.ff.table  # noqa: SLF001  off ＝ 同じ表
+    kw = dict(
+        effort=-15.0, flag=FLAG_MEASURED, need_kmhs=1.0, ref_kmh=0.3, row_kmh=0.3, dev_kmh=-1.0,
+        tau_accel_s=0.3, tau_brake_s=0.3, accel_min_pct=4.0, brake_min_pct=7.0, side=1,
+    )
+    off, _ = deviation_offset_detail(run._fb_table(), **kw)  # noqa: SLF001
+    run.fb_no_floor = True
+    fb = run._fb_table()  # noqa: SLF001
+    assert fb.launch_breakaway_floor is False and run.ff.table.launch_breakaway_floor is True
+    on, _ = deviation_offset_detail(fb, **kw)
+    assert off == pytest.approx(-15.0)  # A2 あり: bk（4.0）より深い解は頭打ち → P は何も足さない
+    assert on < -15.0 - 1.0  # A2 なし: ref ≦ 0.5 km/h でも bk より深く踏み増せる
