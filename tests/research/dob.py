@@ -43,6 +43,9 @@ class PedalDisturbanceObserver:
         lag_accel_s: float | None,
         lag_brake_s: float | None,
         release_window_s: float = 0.0,
+        tq_fast_accel_s: float | None = None,
+        tq_fast_brake_s: float | None = None,
+        fast_need_kmhs: float = 0.0,
     ) -> None:
         self.table = table
         self.tq_accel_s = tq_accel_s
@@ -51,6 +54,14 @@ class PedalDisturbanceObserver:
         self.lag_accel_s = lag_accel_s
         self.lag_brake_s = lag_brake_s
         self.release_window_s = release_window_s  # 0 ＝ 戻しの表を引かない
+        # 段9-d: 強い加速・減速が続く間だけ使う速い Tq（None ＝ 速くしない）。強さは update に渡す
+        # 要る加速度 need_kmhs を、アクセルの更新なら ≥ +fast_need_kmhs、ブレーキの更新なら
+        # ≤ −fast_need_kmhs で判定する
+        self.tq_fast_accel_s = tq_fast_accel_s
+        self.tq_fast_brake_s = tq_fast_brake_s
+        self.fast_need_kmhs = fast_need_kmhs
+        self.n_fast_accel = 0  # 速い Tq で更新した周期数
+        self.n_fast_brake = 0
         self.d_accel = 0.0
         self.d_brake = 0.0
         self.n_accel = 0  # 推定を更新した周期数
@@ -154,6 +165,7 @@ class PedalDisturbanceObserver:
         launch: bool,
         stop: bool,
         side_tables: bool = False,
+        need_kmhs: float | None = None,
     ) -> str | None:
         """1 周期ぶん進める。推定を更新したペダル（PEDAL_ACCEL / PEDAL_BRAKE）を返す。
         更新しなければ None。
@@ -164,6 +176,10 @@ class PedalDisturbanceObserver:
         side_tables（2026-10-23 段6-2 の f。既定 False ＝ 今までと同じ）: True なら launch・stop の
         周期も更新を止めず、その周期に計画が引いた発進側・停止側の表で予測する（戻し・踏み増しの
         補正は付けない）。
+        need_kmhs（段9-d。既定 None ＝ 速くしない）: 今の計画の行の要る加速度 [km/h/s]。速い Tq が
+        あり、更新するペダルの向きで強いとき（アクセル ≥ +fast_need_kmhs・
+        ブレーキ ≤ −fast_need_kmhs）だけ、その周期の更新を速い Tq で行う。外れたら元の Tq に戻る
+        （推定値はそのまま引き継ぐ）。
         """
         self._hist.append((t, u_now, at_limit_now, governed))
         prev_t, prev_v = self._prev_t, self._prev_speed
@@ -215,11 +231,26 @@ class PedalDisturbanceObserver:
         else:
             pred = float(self.table.accel(speed_kmh, u_d, launch=False, stop=False))
         e = meas - pred
+        tq_fast = self.tq_fast_accel_s if is_accel else self.tq_fast_brake_s
+        fast = (
+            need_kmhs is not None
+            and tq_fast is not None
+            and tq_fast > 0.0
+            and self.fast_need_kmhs > 0.0
+            and (
+                need_kmhs >= self.fast_need_kmhs
+                if is_accel else need_kmhs <= -self.fast_need_kmhs
+            )
+        )
+        if fast:
+            tq = min(tq, tq_fast)  # type: ignore[type-var]
         alpha = min(1.0, dt / tq)
         if is_accel:
             self.d_accel += alpha * (e - self.d_accel)
             self.n_accel += 1
+            self.n_fast_accel += int(fast)
             return PEDAL_ACCEL
         self.d_brake += alpha * (e - self.d_brake)
         self.n_brake += 1
+        self.n_fast_brake += int(fast)
         return PEDAL_BRAKE

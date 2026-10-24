@@ -257,3 +257,43 @@ def test_accel_prediction_uses_accel_push_amount() -> None:
     )
     for u in (6.0, 6.0, 6.0, 10.0):
         off.update(t=t, speed_kmh=v, u_now=u, **args)  # type: ignore[arg-type]
+
+
+def _fast_obs(**kw: object) -> PedalDisturbanceObserver:
+    return PedalDisturbanceObserver(
+        _Table(), tq_accel_s=1.0, tq_brake_s=1.0, lag_accel_s=0.0, lag_brake_s=0.0,
+        tq_fast_accel_s=0.2, tq_fast_brake_s=0.2, fast_need_kmhs=5.0, **kw,  # type: ignore[arg-type]
+    )
+
+
+def test_fast_tq_off_matches_baseline() -> None:
+    base, off = _obs(), _obs()
+    for t_obs, need in ((base, None), (off, 9.0)):
+        _run(t_obs, 20, u=10.0, extra=-0.4, need_kmhs=need)
+    assert off.d_accel == base.d_accel and off.n_fast_accel == 0
+    # tq_fast が None なら need が強くても速くしない
+    assert _obs().tq_fast_accel_s is None
+
+
+def test_fast_tq_used_only_while_strong() -> None:
+    fast = _fast_obs()
+    # 最初の周期は前回の車速がなく更新しない → 次の 3 周期が更新
+    t, v = _run(fast, 4, u=10.0, extra=-0.4, need_kmhs=6.0)
+    assert fast.n_fast_accel == 3
+    # 速い Tq 0.2 s: alpha = 0.5 の更新 3 回 → 1 − 0.5^3 ＝ 0.875 に近づく
+    assert fast.d_accel == pytest.approx(-0.4 * (1 - 0.5**3), abs=0.01)
+    d_before = fast.d_accel
+    # 条件が外れたら元の Tq（alpha 0.1）に戻り、推定値は引き継ぐ
+    _run(fast, 1, u=10.0, extra=-0.4, t0=t, v0=v, need_kmhs=4.9)
+    assert fast.n_fast_accel == 3
+    assert fast.d_accel == pytest.approx(d_before + 0.1 * (-0.4 - d_before), abs=0.01)
+
+
+def test_fast_tq_ignores_wrong_direction() -> None:
+    obs = _fast_obs()
+    # アクセルの更新なのに need ≤ −5、ブレーキの更新なのに need ≥ +5 は速くしない
+    t, v = _run(obs, 10, u=10.0, extra=-0.4, need_kmhs=-8.0)
+    _run(obs, 10, u=-10.0, extra=0.2, t0=t, v0=v, need_kmhs=8.0)
+    assert obs.n_fast_accel == 0 and obs.n_fast_brake == 0
+    _run(obs, 10, u=-10.0, extra=0.2, t0=t + 1.0, v0=v, need_kmhs=-8.0)
+    assert obs.n_fast_brake > 0 and obs.n_fast_accel == 0

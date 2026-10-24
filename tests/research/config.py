@@ -706,6 +706,14 @@ class ForwardMapSection:
     # 仮の全車共通係数（段2s で決め直す）。40 は遅れ約 0.25 s で Tq ≈ 10 s
     # （加速度の乱れ ±0.4〜0.5 km/h/s をならして、推定の幅 ±0.2 程度）
     dob_tq_coef: float = 40.0
+    # 2026-10-25 段9-d: 強い加速・減速が続く間だけ DOB の Tq を速くする（既定 off ＝ 今まで）。
+    # dob_fast_need_kmhs 5: 8-最終 5 モード（135306・142403・144748・150116・151218）で基準の傾き
+    # +5 km/h/s 以上の帯は |偏差| p95 0.70・0.5 超え 10.4%（+4〜5 以下は 0.44・3.6%）と跳ねる
+    # （データ由来）。dob_fast_tq_coef 10: 段6-1c で c 6 と組んで実機で走った値（発振なし）。
+    # 段2t の余裕の下限は 5。決める時期: 段9-d の実機の組
+    dob_fast_enabled: bool = False
+    dob_fast_tq_coef: float = 10.0
+    dob_fast_need_kmhs: float = 5.0
     # 2026-10-18 段2r（C12 のときだけ効く）: 惰行の行の補助（coast assist）
     # on／off ＝ 入る／離す偏差の大きさ [km/h]。仮の全車共通の値（KPI の |偏差|>1 km/h の帯の
     # 半分と 2 割）。入る・離すのばたつきに効く（2r の実機で 1〜2 通り試して決める）
@@ -1344,6 +1352,15 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         f"fel.high_speed_quantile は 0 より大きく 1 以下: {fe.high_speed_quantile}",
     )
     need(fm.dob_tq_coef > 0.0, f"forward_map.dob_tq_coef は正値: {fm.dob_tq_coef}")
+    need(
+        0.0 < fm.dob_fast_tq_coef < fm.dob_tq_coef,
+        "forward_map.dob_fast_tq_coef は正値で dob_tq_coef 未満: "
+        f"{fm.dob_fast_tq_coef}（dob_tq_coef {fm.dob_tq_coef}）",
+    )
+    need(
+        fm.dob_fast_need_kmhs > 0.0,
+        f"forward_map.dob_fast_need_kmhs は正値: {fm.dob_fast_need_kmhs}",
+    )
     need(fm.coast_on_kmh > 0.0, f"forward_map.coast_on_kmh は正値: {fm.coast_on_kmh}")
     need(
         0.0 <= fm.coast_off_kmh < fm.coast_on_kmh,

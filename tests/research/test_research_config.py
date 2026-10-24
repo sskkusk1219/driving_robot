@@ -1429,3 +1429,19 @@ def test_switch_gap_min_loss_and_accel_release_in_range_only_settings() -> None:
     assert fm0.switch_gap_min_loss is False and fm0.accel_release_in_range_only is False
     fm = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH).forward_map
     assert fm.switch_gap_min_loss is False and fm.accel_release_in_range_only is False
+
+
+def test_dob_fast_defaults_and_validation() -> None:
+    cfg = _load_default()
+    fm = cfg.forward_map
+    assert fm.dob_fast_enabled is False
+    assert fm.dob_fast_tq_coef == 10.0 and fm.dob_fast_need_kmhs == 5.0
+    assert cfgmod.validate_config(cfg) == []
+    for name, value in (
+        ("dob_fast_tq_coef", 0.0),
+        ("dob_fast_tq_coef", fm.dob_tq_coef),
+        ("dob_fast_need_kmhs", 0.0),
+    ):
+        bad = _load_default()
+        setattr(bad.forward_map, name, value)
+        assert any(f"forward_map.{name}" in p for p in cfgmod.validate_config(bad))

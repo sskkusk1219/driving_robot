@@ -424,6 +424,8 @@ def _prepare_forward_map_plan(
             tq_coef=fm.dob_tq_coef,
             lag_accel_s=None if lag_a is None else float(lag_a),
             lag_brake_s=None if lag_b is None else float(lag_b),
+            fast_enabled=fm.dob_fast_enabled, fast_tq_coef=fm.dob_fast_tq_coef,
+            fast_need_kmhs=fm.dob_fast_need_kmhs,
         )
         say(f"  C11（DOB）: {dob_settings_text(ff)}")
         say(f"  低速の DOB・停C の τ（段6-2）: {dob_low_speed_text(fm)}")
@@ -972,7 +974,13 @@ def dob_settings_text(ff: object) -> str:
 
     return (
         f"Tq 係数 {ff.dob_tq_coef:g}・"
-        f"Tq アクセル {tq(ff.tq_accel_s)} / ブレーキ {tq(ff.tq_brake_s)}"
+        f"Tq アクセル {tq(ff.tq_accel_s)} / ブレーキ {tq(ff.tq_brake_s)}・"
+        f"強い加速・減速の間だけ速くする（段9-d）: "
+        + (
+            f"あり（Tq 係数 {ff.dob_fast_tq_coef:g}・要る加速度 {ff.dob_fast_need_kmhs:g} "
+            "km/h/s 以上）"
+            if ff.dob_fast_enabled else "なし"
+        )
     )
 
 
@@ -1211,6 +1219,8 @@ class _ModeRun:
                 tq_accel_s=self.ff.tq_accel_s, tq_brake_s=self.ff.tq_brake_s,
                 lag_accel_s=self.ff.dob_lag_accel_s, lag_brake_s=self.ff.dob_lag_brake_s,
                 release_window_s=RELEASE_WINDOW_S,
+                tq_fast_accel_s=self.ff.tq_fast_accel_s, tq_fast_brake_s=self.ff.tq_fast_brake_s,
+                fast_need_kmhs=self.ff.dob_fast_need_kmhs,
             )
             self.dob_stats = DobStats(period_s=self.interval_s)
         # C12（惰行の補助）: C12 のときだけ状態機械と集計を持つ
@@ -1897,6 +1907,7 @@ class _ModeRun:
             ),
             launch=bool(launch), stop=bool(stop) or held,
             side_tables=follow and not held,
+            need_kmhs=float(plan.need_accel_kmhs[i]),
         )
         if pedal is not None:
             is_accel = pedal == PEDAL_ACCEL
@@ -2088,6 +2099,13 @@ async def run_mode_drive(
         say(f"  C10（偏差の上乗せ。{c10_settings_text(run.ff)}）: {run.c10.summary()}")
     if run.dob_stats is not None:
         say(f"  C11（DOB。{dob_settings_text(run.ff)}）: {run.dob_stats.summary()}")
+        if run.dob is not None and run.dob.fast_need_kmhs > 0.0 and (
+            run.dob.tq_fast_accel_s is not None or run.dob.tq_fast_brake_s is not None
+        ):
+            p = run.interval_s
+            say("  C11（DOB）速い Tq で更新した周期（段9-d）: "
+                f"アクセル {run.dob.n_fast_accel} 周期（{run.dob.n_fast_accel * p:.1f}s）・"
+                f"ブレーキ {run.dob.n_fast_brake} 周期（{run.dob.n_fast_brake * p:.1f}s）")
     if run.coast is not None:
         say(f"  C12（惰行の補助。{run.coast_settings}）: {run.coast.stats.summary()}")
     if run.pred is not None:

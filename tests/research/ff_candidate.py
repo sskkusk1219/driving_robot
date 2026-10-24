@@ -908,9 +908,16 @@ class DisturbanceObserverFeedforward(DeviationForwardFeedforward):
         self.tq_brake_s: float | None = None
         self.dob_lag_accel_s: float | None = None  # 推定が u を遅らせるときの遅れ（Tq の元と同じ）
         self.dob_lag_brake_s: float | None = None
+        # 段9-d: 強い加速・減速の間だけ速くする Tq（既定 off）
+        self.dob_fast_enabled: bool = False
+        self.dob_fast_tq_coef: float = 0.0
+        self.dob_fast_need_kmhs: float = 0.0
+        self.tq_fast_accel_s: float | None = None
+        self.tq_fast_brake_s: float | None = None
 
     def set_dob(
-        self, *, tq_coef: float, lag_accel_s: float | None, lag_brake_s: float | None
+        self, *, tq_coef: float, lag_accel_s: float | None, lag_brake_s: float | None,
+        fast_enabled: bool = False, fast_tq_coef: float = 0.0, fast_need_kmhs: float = 0.0,
     ) -> None:
         """係数とペダル別の遅れから Tq を決める。遅れが None のペダルの Tq は None。"""
         self.dob_tq_coef = tq_coef
@@ -918,6 +925,16 @@ class DisturbanceObserverFeedforward(DeviationForwardFeedforward):
         self.tq_brake_s = None if lag_brake_s is None else tq_coef * lag_brake_s
         self.dob_lag_accel_s = lag_accel_s
         self.dob_lag_brake_s = lag_brake_s
+        self.dob_fast_enabled = fast_enabled
+        self.dob_fast_tq_coef = fast_tq_coef
+        self.dob_fast_need_kmhs = fast_need_kmhs
+        use = fast_enabled and fast_tq_coef > 0.0
+        self.tq_fast_accel_s = (
+            fast_tq_coef * lag_accel_s if use and lag_accel_s is not None else None
+        )
+        self.tq_fast_brake_s = (
+            fast_tq_coef * lag_brake_s if use and lag_brake_s is not None else None
+        )
 
 
 class CoastAssistFeedforward(DisturbanceObserverFeedforward):
