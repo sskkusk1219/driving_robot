@@ -140,7 +140,7 @@ def test_forward_map_section_defaults_without_yaml_section(tmp_path: Path) -> No
 
 def test_forward_map_yaml_values_are_loaded() -> None:
     fm = _load_default().forward_map
-    assert fm.coast_band_kmhs == 0.25 and fm.need_window_s == 0.5  # 段7-c'（2026-10-24）
+    assert fm.coast_band_kmhs == 0.25 and fm.need_window_s == 0.25  # 段9-a'（2026-10-25）
     assert fm.accel_lag_s is None and fm.brake_lag_s is None
 
 
