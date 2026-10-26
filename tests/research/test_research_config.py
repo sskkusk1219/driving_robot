@@ -1446,3 +1446,34 @@ def test_dob_fast_defaults_and_validation() -> None:
         bad = _load_default()
         setattr(bad.forward_map, name, value)
         assert any(f"forward_map.{name}" in p for p in cfgmod.validate_config(bad))
+
+
+def test_switch_gap_rule_and_pedal_track_defaults_and_validation() -> None:
+    """段10-1・段10-2: R は既定 off。ペダルの動き方の既定はデータ由来の値。"""
+    fm0 = cfgmod.ForwardMapSection()
+    assert fm0.switch_gap_rule is False
+    assert (fm0.pedal_track_accel_delay_s, fm0.pedal_track_accel_max_rate_pct_s) == (0.02, 100.0)
+    assert fm0.pedal_track_accel_max_accel_pct_s2 == 2000.0
+    assert (fm0.pedal_track_brake_delay_s, fm0.pedal_track_brake_max_rate_pct_s) == (0.02, 90.0)
+    assert fm0.pedal_track_brake_max_accel_pct_s2 == 1400.0
+    assert fm0.pedal_track_accel_effect_lag_s == 0.10 == fm0.pedal_track_brake_effect_lag_s
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.pedal_track_brake_max_accel_pct_s2 = 0.0
+    assert any("pedal_track_brake_max_accel_pct_s2" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_switch_gap_min_peak_defaults_and_validation() -> None:
+    """段10-3: 案 C は既定 off・窓 2.0 秒。R と同時に true はエラー、窓は正値。"""
+    fm0 = cfgmod.ForwardMapSection()
+    assert fm0.switch_gap_min_peak is False and fm0.switch_gap_peak_window_s == 2.0
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.forward_map.switch_gap_min_peak is False and cfgmod.validate_config(cfg) == []
+    cfg.forward_map.switch_gap_rule = False  # 本体 yaml は R on（段10-6）。C 単独は off にして見る
+    cfg.forward_map.switch_gap_min_peak = True
+    assert cfgmod.validate_config(cfg) == []  # R が false なら C だけ on は通る
+    cfg.forward_map.switch_gap_rule = True
+    assert any("switch_gap_min_peak" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.switch_gap_rule = False
+    cfg.forward_map.switch_gap_peak_window_s = 0.0
+    assert any("switch_gap_peak_window_s" in p for p in cfgmod.validate_config(cfg))

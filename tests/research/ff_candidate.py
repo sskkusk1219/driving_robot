@@ -80,7 +80,7 @@ if TYPE_CHECKING:
     # 実行時は使うメソッドの中で import する（fwd_map・fwd_plan は ff_bias 経由でこのモジュールを
     # import するため、先頭で import すると循環する）
     from tests.research.fwd_map import ForwardTable
-    from tests.research.fwd_plan import ForwardPlan
+    from tests.research.fwd_plan import ForwardPlan, PedalTrack
 
 __all__ = [
     "CandidateC2",
@@ -801,6 +801,10 @@ class ForwardMapFeedforward:
         launch_short_stop_s: float = 5.0,
         switch_gap_compensate: bool = False,
         switch_gap_min_loss: bool = False,
+        switch_gap_rule: bool = False,
+        switch_gap_min_peak: bool = False,
+        switch_gap_peak_window_s: float = 2.0,
+        pedal_track: PedalTrack | None = None,
         accel_release_in_range_only: bool = False,
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
@@ -840,6 +844,10 @@ class ForwardMapFeedforward:
             launch_short_stop_s=launch_short_stop_s,
             switch_gap_compensate=switch_gap_compensate,
             switch_gap_min_loss=switch_gap_min_loss,
+            switch_gap_rule=switch_gap_rule,
+            switch_gap_min_peak=switch_gap_min_peak,
+            switch_gap_peak_window_s=switch_gap_peak_window_s,
+            pedal_track=pedal_track,
             accel_release_in_range_only=accel_release_in_range_only,
         )
         return self._plan

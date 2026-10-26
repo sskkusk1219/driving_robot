@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import types
 
 import numpy as np
 import pytest
@@ -1970,3 +1971,655 @@ def test_accel_release_in_range_only_without_meta_raises() -> None:
         _accel_release_ref, 8.0, _accel_release_variant(with_layers=False),
         accel_release_in_range_only=True,
     )
+
+
+# ---- 段10-1: ペダルの実際の位置を追う部品 ----
+
+def _pt(**kw):
+    from tests.research.fwd_plan import PedalTrack  # noqa: PLC0415
+
+    return PedalTrack(**kw)
+
+
+def _track(effort, track=None, **kw):
+    from tests.research.fwd_plan import track_pedal_position  # noqa: PLC0415
+
+    return track_pedal_position(
+        np.asarray(effort, dtype=float), period_s=DT, track=track or _pt(), accel_min_pct=AD,
+        brake_min_pct=BD, **kw,
+    )
+
+
+def test_pedal_track_defaults_are_the_measured_values() -> None:
+    t = _pt()
+    accel = (t.accel_delay_s, t.accel_max_rate_pct_s, t.accel_max_accel_pct_s2)
+    brake = (t.brake_delay_s, t.brake_max_rate_pct_s, t.brake_max_accel_pct_s2)
+    assert accel == (0.02, 100.0, 2000.0) and brake == (0.02, 90.0, 1400.0)
+    assert (t.accel_effect_lag_s, t.brake_effect_lag_s) == (0.10, 0.10)
+
+
+def _ref_follow(cmd, p0, delay_s, vmax, amax, mn):
+    """独立に書いた参照実装（式をそのまま）。"""
+    n = len(cmd)
+    idx = np.arange(n, dtype=float)
+    c = np.maximum(np.interp(idx - delay_s / DT, idx, cmd), mn)
+    x, v, h = p0, 0.0, DT / 10
+    pos = [x]
+    for k in range(1, n):
+        for _ in range(10):
+            e = c[k - 1] - x
+            vd = np.sign(e) * min(vmax, np.sqrt(2 * amax * abs(e)))
+            v += np.clip(vd - v, -amax * h, amax * h)
+            x += v * h
+            if abs(c[k - 1] - x) < 0.05 and abs(v) < 2 * amax * h:
+                x, v = c[k - 1], 0.0
+        pos.append(x)
+    return np.array(pos)
+
+
+def test_track_pedal_position_matches_reference_formula() -> None:
+    t = _pt()
+    eff = [0.0] * 4 + [60.0] * 12 + [20.0] * 6 + [0.0] * 14
+    pa, pb = _track(eff)
+    cmd = np.maximum(np.where(np.asarray(eff) > 0.0, eff, AD), AD)
+    ref = _ref_follow(
+        cmd, AD, t.accel_delay_s, t.accel_max_rate_pct_s, t.accel_max_accel_pct_s2, AD
+    )
+    assert np.allclose(pa, ref, atol=1e-9) and np.all(pb == BD)
+
+
+def test_track_pedal_position_short_move_is_slow_long_move_caps_at_vmax() -> None:
+    t = _pt(accel_delay_s=0.0)
+    # 短い移動（+3 %）: 1 周期で 3 % には着かない（加速度の上限で平均が遅い。100 %/s 一定なら着く）
+    pa, _ = _track([0.0] * 3 + [AD + 3.0] * 10, t)
+    assert AD + 1.0 < pa[4] < AD + 3.0 - 0.1  # 行 3 の指令へ 1 周期後（5 % ＝ 100 %/s なら着く）
+    assert pa[5] == AD + 3.0  # 着いたら止まる
+    # 長い移動（+60 %）: 速さは vmax（100 %/s ＝ 1 周期 5 %）を超えない
+    pa, _ = _track([0.0] * 3 + [64.0] * 30, t)
+    assert np.all(np.diff(pa) <= 100.0 * DT + 1e-9)
+    assert pa[4] - pa[3] < 100.0 * DT * 0.7  # 動き出しは加速度の上限で遅い
+    assert np.max(np.diff(pa)) == pytest.approx(100.0 * DT, rel=0.05)  # 頭打ちになる
+    # 十分な時間があれば着いて止まる（min のわずか上には残らない）
+    assert pa[-1] == 64.0
+    pa, _ = _track([0.0] * 3 + [64.0] * 12 + [0.0] * 30, t)
+    assert pa[-1] == AD and np.all(pa >= AD - 0.5)  # 戻って min で止まる（行き過ぎは 0.5 % 未満）
+
+
+def test_follow_resume_equals_full_tracking() -> None:
+    from tests.research.fwd_plan import _follow_pedal, _follow_resume  # noqa: PLC0415
+
+    rng = np.random.default_rng(3)
+    cmd_base = np.maximum(rng.uniform(0.0, 50.0, 60), AD)
+    cmd_new = cmd_base.copy()
+    cmd_new[25:40] = AD  # 途中から違う
+    vlog = np.zeros(60)
+    pos_base = _follow_pedal(cmd_base, None, 0.02, 100.0, 2000.0, AD, DT, vlog=vlog)
+    got = _follow_resume(cmd_new, cmd_base, pos_base, vlog, 0.02, 100.0, 2000.0, AD, DT)
+    want = _follow_pedal(cmd_new, None, 0.02, 100.0, 2000.0, AD, DT)
+    assert np.array_equal(got, want)
+    assert np.array_equal(_follow_resume(cmd_base, cmd_base, pos_base, vlog, 0.02, 100.0,
+                                         2000.0, AD, DT), pos_base)
+
+
+def test_track_pedal_position_delay_and_brake_side() -> None:
+    eff = [0.0] * 4 + [-30.0] * 30
+    t0 = _pt(brake_delay_s=0.0)
+    t1 = _pt(brake_delay_s=0.10)
+    _, p0 = _track(eff, t0)
+    _, p1 = _track(eff, t1)
+    r0 = int(np.flatnonzero(p0 > BD + 1e-9)[0])
+    r1 = int(np.flatnonzero(p1 > BD + 1e-9)[0])
+    assert r1 - r0 == 2  # 遅れ 0.10 s ＝ 2 周期
+    assert np.all(np.diff(p0) <= 90.0 * DT + 1e-9)  # ブレーキの速さの上限は 90 %/s
+    pa, _ = _track(eff, t0)
+    assert np.all(pa == AD)
+
+
+def test_track_pedal_position_fractional_delay_interpolates_and_p0() -> None:
+    t = _pt(accel_delay_s=0.025)
+    t0 = _pt(accel_delay_s=0.0)
+    pa, _ = _track([0.0, 0.0, 6.0, 6.0, 6.0, 6.0], t)
+    pa0, _ = _track([0.0, 0.0, 6.0, 6.0, 6.0, 6.0], t0)
+    # 半周期の遅れ（直線補間）: 行 2 の指令は (4 + 6) / 2 ＝ 5 になる。遅れなしより遅い
+    assert pa[3] < pa0[3] and pa[3] <= 5.0 + 0.3 and pa[3] > AD
+    pa, _ = _track([0.0, 0.0], t, accel_p0=30.0)
+    assert pa[0] == 30.0 and pa[1] < 30.0  # 開始位置は指定できる
+
+
+def _pos_table():
+    return linear_table(coast_at_zero=-1.0, v_coef=0.0)
+
+
+def _pred(table, v, pa, pb, **kw):
+    from tests.research.fwd_plan import predicted_accel  # noqa: PLC0415
+
+    kw.setdefault("track", _pt())
+    return predicted_accel(
+        table, np.asarray(v, dtype=float), np.asarray(pa, dtype=float),
+        np.asarray(pb, dtype=float), accel_min_pct=AD, brake_min_pct=BD, period_s=DT, **kw,
+    )
+
+
+def test_predicted_accel_coast_when_both_at_min_and_sides() -> None:
+    tb = _pos_table()
+    n = 6
+    v = np.full(n, 50.0)
+    a = _pred(tb, v, np.full(n, AD), np.full(n, BD))
+    assert np.allclose(a, tb.coast_accel(50.0))  # 両方 min は惰行
+    a = _pred(tb, v, np.full(n, AD + 10.0), np.full(n, BD))
+    assert np.allclose(a, tb.accel(50.0, 10.0))  # アクセルは u ＝ 位置 − min
+    a = _pred(tb, v, np.full(n, AD), np.full(n, BD + 10.0))
+    assert np.allclose(a, tb.accel(50.0, -10.0))  # ブレーキは u を負に
+
+
+def test_predicted_accel_effect_lag_shifts_position() -> None:
+    tb = _pos_table()
+    n = 10
+    v = np.full(n, 50.0)
+    pa = np.full(n, AD)
+    pa[4:] = AD + 10.0
+    a0 = _pred(tb, v, pa, np.full(n, BD), track=_pt(accel_effect_lag_s=0.0))
+    a1 = _pred(tb, v, pa, np.full(n, BD), track=_pt(accel_effect_lag_s=0.10))
+    up = tb.accel(50.0, 10.0)
+    assert a0[4] == pytest.approx(up) and a1[4] == pytest.approx(tb.coast_accel(50.0))
+    assert a1[6] == pytest.approx(up)  # λ 0.10 s ＝ 2 周期あとに効く
+    a2 = _pred(tb, v, pa, np.full(n, BD), track=_pt(accel_effect_lag_s=0.025))
+    assert tb.coast_accel(50.0) < a2[4] < up  # 周期の端数は補間
+
+
+def test_position_return_row() -> None:
+    from tests.research.fwd_plan import position_return_row  # noqa: PLC0415
+
+    pos = np.array([30.0, 20.0, 9.0, 4.04, 4.0, 4.0])
+    assert position_return_row(pos, 0, 4.0) == 3  # min + 0.05 以下になる最初の行
+    assert position_return_row(pos, 4, 4.0) == 4
+    assert position_return_row(np.array([30.0, 20.0]), 0, 4.0) is None
+    assert position_return_row(np.array([4.0, 20.0, 4.0]), 1, 4.0) == 2  # start より前は見ない
+    assert position_return_row(np.array([4.06, 4.2]), 0, 4.0) is None  # tol を超える
+
+
+# ---- 段10-2: 案 R（switch_gap_rule） ----
+
+def _rule_ctx(n, ref_acc, coast=-2.5, v=50.0, table=None):
+    from tests.research.fwd_plan import GapContext, PedalTrack  # noqa: PLC0415
+
+    return GapContext(
+        table=table or linear_table(), v=np.full(n, v), ref_acc=np.asarray(ref_acc, dtype=float),
+        coast_a=np.full(n, coast), coast_b=np.full(n, coast), track=PedalTrack(),
+        accel_min_pct=AD, brake_min_pct=BD, brake_lag_s=0.1,
+    )
+
+
+def _rule_gap(effort_list, ctx, flag=None):
+    from tests.research.fwd_plan import ensure_return_gap  # noqa: PLC0415
+
+    effort = np.array(effort_list, dtype=float)
+    fl = np.full(len(effort), FLAG_COAST, dtype=int) if flag is None else np.array(flag)
+    st = ensure_return_gap(effort, fl, ret=_ret(amin=AD, bmin=BD), period_s=DT, rule_ctx=ctx)
+    return effort, fl, st
+
+
+def test_rule_peak_stops_accel_before_apex_and_brake_starts_at_position_min() -> None:
+    from tests.research.fwd_plan import position_return_row  # noqa: PLC0415
+
+    n = 100
+    eff = np.zeros(n)
+    eff[20:56] = 24.0  # アクセル（last ＝ 55）
+    eff[58:80] = -24.0  # ブレーキ（i ＝ 58。すき間 2 行）
+    ref_acc = np.where(np.arange(n) < 60, 1.0, -5.0)  # 頂点 k_v ＝ 60（惰行 −2.5 を初めて下回る）
+    e, fl, st = _rule_gap(eff, _rule_ctx(n, ref_acc))
+    s = int(np.flatnonzero(e[20:56] > 0.0)[-1]) + 21  # アクセルの残った最後の行の次 ＝ 戻し始め
+    assert 21 <= s < 60 and np.all(e[s:56] == 0.0) and np.all(fl[s:56] == FLAG_COAST)
+    assert st.n_rule_peak == 1 and st.n_rule_valley == 0 and st.rule_peak_spans == [(s, 56)]
+    # ブレーキはアクセルの位置が min に着いた行 r の次の行（r + 1）から（前へは動かさない）。
+    # 安全網は前の周期の実開度で見るので 1 周期の余裕を取る（旧 ReturnTime の ＋1 周期と同じ）
+    pa, _ = _track(e)
+    r = position_return_row(pa, s, AD)
+    b = r + 1
+    first_brake = int(np.flatnonzero(e[56:] < 0.0)[0]) + 56
+    assert b > 58 and first_brake == b and np.all(e[58:b] == 0.0)
+    # 変わり目の真ん中は面積で決める（段10-2'）: 独立に書いた採点（|cum| 最小・同点は遅い方）
+    tb = _rule_ctx(n, ref_acc).table
+    cands = []
+    for ss in range(21, 57):
+        ee = eff.copy()
+        ee[ss:56] = 0.0
+        p, _ = _track(ee)
+        bb = position_return_row(p, ss, AD)
+        if bb is not None:
+            cands.append((ss, bb + 1))
+    r0 = min(c[0] for c in cands) - 10
+    r1 = min(max(c[1] for c in cands) + round(0.5 / DT), n - 1)
+    cums = {}
+    for ss, bb in cands:
+        ee = eff.copy()
+        ee[ss:56] = 0.0
+        ee[58 : max(bb, 58)] = 0.0
+        pa_, pb_ = _track(ee)
+        pr = _pred(tb, np.full(n, 50.0), pa_, pb_)
+        cums[ss] = abs(float(np.sum((pr[r0 : r1 + 1] - ref_acc[r0 : r1 + 1]) * DT)))
+    best = min(cums.values())
+    assert s == max(ss for ss, c in cums.items() if c <= best + 1e-9)
+
+
+def test_rule_peak_searches_only_near_the_end_of_a_long_accel_run() -> None:
+    """長いアクセルの連なりでも、戻し始める行は連なりの最後から RULE_PEAK_RANGE_S 以内。"""
+    from tests.research import fwd_plan  # noqa: PLC0415
+
+    n = 400
+    eff = np.zeros(n)
+    eff[20:300] = 24.0  # 14 秒の連なり（last ＝ 299）
+    eff[302:340] = -24.0
+    ref_acc = np.where(np.arange(n) < 305, 1.0, -5.0)
+    _, _, st = _rule_gap(eff, _rule_ctx(n, ref_acc))
+    s = st.rule_peak_spans[0][0]
+    assert s >= 300 - round(fwd_plan.RULE_PEAK_RANGE_S / DT)
+
+
+def test_rule_peak_brake_already_late_is_not_moved_forward() -> None:
+    n = 100
+    eff = np.zeros(n)
+    eff[20:56] = 24.0
+    eff[75:90] = -24.0  # ブレーキはずっと後ろ
+    ref_acc = np.where(np.arange(n) < 60, 1.0, -5.0)
+    e, _, _ = _rule_gap(eff, _rule_ctx(n, ref_acc))
+    assert np.all(e[75:90] == -24.0)  # b ≤ i ならブレーキはそのまま
+
+
+def test_rule_valley_cuts_brake_tail_and_keeps_accel() -> None:
+    from tests.research.fwd_plan import position_return_row  # noqa: PLC0415
+
+    n = 100
+    eff = np.zeros(n)
+    eff[20:60] = -24.0
+    eff[62:80] = 24.0
+    e, fl, st = _rule_gap(eff, _rule_ctx(n, np.zeros(n)))
+    assert np.all(e[62:80] == 24.0)  # アクセルは遅らせない
+    c = int(np.count_nonzero((eff < 0.0) & (e == 0.0)))
+    assert c >= 1 and e[20] == -24.0 and st.n_rule_valley == 1 and st.n_delayed == 0
+    assert st.rule_valley_spans == [(60 - c, 60)] and np.all(fl[60 - c : 60] == FLAG_COAST)
+    _, pb = _track(e)
+    # 着く行の次の行が i 以下（安全網は前の周期の実開度で見る。1 周期の余裕）
+    assert position_return_row(pb, 60 - c + 1, BD) + 1 <= 62
+    # 最小の c: 1 行少なければ間に合わない
+    e1 = eff.copy()
+    e1[60 - (c - 1) : 60] = 0.0
+    _, pb1 = _track(e1)
+    r1 = position_return_row(pb1, 60 - (c - 1) + 1, BD)
+    assert r1 is None or r1 + 1 > 62
+
+
+def test_rule_valley_already_in_time_does_nothing() -> None:
+    n = 100
+    eff = np.zeros(n)
+    eff[20:60] = -24.0
+    eff[75:80] = 24.0  # 十分遠い
+    e, _, st = _rule_gap(eff, _rule_ctx(n, np.zeros(n)))
+    assert np.array_equal(e, eff) and st.n_rule_valley == 0 and st.n_cut == 0
+
+
+def test_rule_ignores_nonnegative_coast_and_stop_prepos() -> None:
+    n = 100
+    ref_acc = np.where(np.arange(n) < 60, 1.0, -5.0)
+    for eff in (
+        np.r_[np.zeros(20), np.full(36, 24.0), np.zeros(2), np.full(22, -24.0), np.zeros(20)],
+        np.r_[np.zeros(20), np.full(40, -24.0), np.zeros(2), np.full(18, 24.0), np.zeros(20)],
+    ):
+        e0, f0, _ = _gap(eff.tolist())
+        e1, f1, st = _rule_gap(eff, _rule_ctx(n, ref_acc, coast=0.5))  # 惰行 ≥ 0 は対象外
+        assert np.array_equal(e0, e1) and np.array_equal(f0, f1)
+        assert st.n_rule_peak == 0 and st.n_rule_valley == 0
+        nz = np.flatnonzero(eff != 0.0)
+        last_row = int(nz[np.flatnonzero(np.diff(nz) > 1)[0]])  # 戻す側の最後の行
+        flags = []
+        for kind, row in (
+            (FLAG_PREPOS, last_row + 3), (FLAG_STOP, last_row + 3), (FLAG_STOP, last_row)
+        ):
+            fl = [FLAG_COAST] * n
+            fl[row] = kind
+            flags.append(fl)
+        for fl in flags:
+            e2, f2, _ = _gap(eff.tolist(), flag=fl)
+            e3, f3, st3 = _rule_gap(eff, _rule_ctx(n, ref_acc), flag=fl)
+            assert np.array_equal(e2, e3) and np.array_equal(f2, f3)
+            assert st3.n_rule_peak == 0 and st3.n_rule_valley == 0
+
+
+def test_rule_peak_without_apex_falls_back() -> None:
+    n = 100
+    eff = np.zeros(n)
+    eff[20:56] = 24.0
+    eff[56:80] = -24.0
+    e0, _, _ = _gap(eff.tolist())
+    e1, _, st = _rule_gap(eff, _rule_ctx(n, np.full(n, 1.0)))  # 基準の加速度が惰行を下回らない
+    assert np.array_equal(e0, e1) and st.n_rule_peak == 0
+
+
+def test_rule_off_plan_is_identical_and_summary_has_counts() -> None:
+    off = _gap_plan(_valley, True)
+    dflt = _gap_plan(_valley, True, switch_gap_rule=False)
+    assert np.array_equal(off.effort_pct, dflt.effort_pct)
+    assert "案 R" not in off.return_gap.summary()
+    on = _gap_plan(_hill, True, switch_gap_rule=True)
+    assert on.return_gap.n_rule_peak + on.return_gap.n_rule_valley >= 1
+    assert "案 R で置き直し" in on.return_gap.summary()
+    assert np.all(np.isfinite(on.effort_pct))
+
+
+def test_rule_compensation_valley_dv_is_smaller_than_coast_version() -> None:
+    from tests.research.fwd_plan import (  # noqa: PLC0415
+        GapContext,
+        PedalTrack,
+        _gap_compensation,
+        return_time_of,
+    )
+
+    tb = _gap_table()
+    aux: dict = {}
+    base = plan_for(
+        _valley, 6.0, tb, return_gap_enabled=False, brake_lag_s=0.1, accel_lag_s=0.1,
+        switch_gap_rule=True, _aux_out=aux,
+    )
+    ret = return_time_of(tb, AD, BD)
+    ctx = GapContext(
+        table=tb, v=aux["v"], ref_acc=aux["ref_acc"], coast_a=aux["coast_a"],
+        coast_b=aux["coast_b"], track=PedalTrack(), accel_min_pct=AD, brake_min_pct=BD,
+        brake_lag_s=0.1,
+    )
+    add_r, dv_r, n_r, trimmed_r = _gap_compensation(base, aux, ret, base.period_s, rule_ctx=ctx)
+    # 同じ削り（R の削り）を惰行の加速度で数えた Δv ＝ 今の式
+    assert n_r >= 1 and trimmed_r.any()
+    cut = trimmed_r & (base.effort_pct < 0.0)
+    coast_dv = abs(float(np.sum(base.need_accel_kmhs[cut] - aux["coast_b"][cut]))) * base.period_s
+    assert dv_r < coast_dv  # 戻る途中のブレーキが効く分、失う Δv は小さい
+
+
+def test_rule_peak_ignores_decelerating_head_of_accel_run() -> None:
+    n = 100
+    eff = np.zeros(n)
+    eff[20:56] = 24.0
+    eff[58:80] = -24.0
+    k = np.arange(n)
+    # 連なりの頭（谷の立ち上がり）は基準がまだ減速中。頂点はその後の 60 行目
+    ref_acc = np.where(k < 25, -5.0, np.where(k < 60, 1.0, -5.0))
+    e, _, st = _rule_gap(eff, _rule_ctx(n, ref_acc))
+    s = st.rule_peak_spans[0][0]
+    assert s > 30 and np.all(e[20:s] == 24.0)  # 連なりの頭（25 行目まで）を削ったりしない
+
+
+def _valley_boost_setup(ref_shift=0.0):
+    from tests.research.fwd_plan import GapContext, PedalTrack, predicted_accel  # noqa: PLC0415
+
+    n = 100
+    eff, need = _peak_valley(n)
+    tb = linear_table()
+    v = np.full(n, 50.0)
+    pa, pb = _track(eff)
+    ref = predicted_accel(
+        tb, v, pa, pb, track=PedalTrack(), accel_min_pct=AD, brake_min_pct=BD, period_s=DT
+    ) + ref_shift
+    after = eff.copy()
+    after[58:60] = 0.0  # c = 2 行削った
+    ctx = GapContext(
+        table=tb, v=v, ref_acc=ref, coast_a=np.full(n, -2.5), coast_b=np.full(n, -2.5),
+        track=PedalTrack(), accel_min_pct=AD, brake_min_pct=BD, brake_lag_s=0.1, need=need,
+    )
+    base = types.SimpleNamespace(need_accel_kmhs=need)
+    return n, eff, need, after, ctx, base, ref
+
+
+def _boost_cum(f, add0, n, need, after, ctx, ref, k, s, r0, r1):
+    """独立に書いた採点: M 行を表で解き直した列で両ペダルの位置を追い、r0〜r1 の面積。"""
+    e = after.copy()
+    u, _ = ctx.table.invert(ctx.v[k:s], need[k:s] + f * add0)
+    u = np.asarray(u, dtype=float)
+    e[k:s] = np.where(u < 0.0, -(BD - u), e[k:s])
+    pa, pb = _track(e)
+    pr = _pred(ctx.table, ctx.v, pa, pb)
+    return float(np.sum((pr[r0 : r1 + 1] - ref[r0 : r1 + 1]) * DT))
+
+
+def test_valley_boost_gain_balances_area_to_zero() -> None:
+    from tests.research.fwd_plan import _valley_boost_gain  # noqa: PLC0415
+
+    n, _eff, need, after, ctx, base, ref = _valley_boost_setup()
+    k, s, nxt, m = 52, 58, 62, 6
+    r0, r1 = s - m - 10, nxt + round(0.5 / DT)
+    add0 = -2.0
+    # 削ると減速が足りない
+    assert _boost_cum(0.0, add0, n, need, after, ctx, ref, k, s, r0, r1) > 0.0
+    f = _valley_boost_gain(base, after, ctx, k, s, nxt, m, add0, DT)
+    assert 0.0 < f < 4.0
+    assert abs(_boost_cum(f, add0, n, need, after, ctx, ref, k, s, r0, r1)) < 1e-3
+    # 量を半分にすると倍率は倍（f × add0 が同じ）
+    f2 = _valley_boost_gain(base, after, ctx, k, s, nxt, m, add0 / 2.0, DT)
+    assert f2 * add0 / 2.0 == pytest.approx(f * add0, rel=0.02)
+
+
+def test_valley_boost_gain_clamps_to_0_and_max() -> None:
+    from tests.research.fwd_plan import VALLEY_BOOST_F_MAX, _valley_boost_gain  # noqa: PLC0415
+
+    n, _eff, need, after, ctx, base, _ref = _valley_boost_setup()
+    k, s, nxt, m = 52, 58, 62, 6
+    assert _valley_boost_gain(base, after, ctx, k, s, nxt, m, -0.02, DT) == VALLEY_BOOST_F_MAX
+    # 基準が強い加速 → 削っても足りている
+    _, _, _, _, ctx0, base0, _ = _valley_boost_setup(ref_shift=5.0)
+    assert _valley_boost_gain(base0, after, ctx0, k, s, nxt, m, -2.0, DT) == 0.0
+
+
+def test_rule_valley_compensation_spreads_over_max_c_or_0_3_s_and_logs_f() -> None:
+    from tests.research.fwd_plan import (  # noqa: PLC0415
+        GapContext,
+        PedalTrack,
+        _gap_compensation,
+        return_time_of,
+    )
+
+    tb = _gap_table()
+    aux: dict = {}
+    base = plan_for(
+        _valley, 6.0, tb, return_gap_enabled=False, brake_lag_s=0.1, accel_lag_s=0.1,
+        switch_gap_rule=True, _aux_out=aux,
+    )
+    ret = return_time_of(tb, AD, BD)
+    ctx = GapContext(
+        table=tb, v=aux["v"], ref_acc=aux["ref_acc"], coast_a=aux["coast_a"],
+        coast_b=aux["coast_b"], track=PedalTrack(), accel_min_pct=AD, brake_min_pct=BD,
+        brake_lag_s=0.1, need=base.need_accel_kmhs,
+    )
+    add, _dv, n_ev, trimmed = _gap_compensation(base, aux, ret, base.period_s, rule_ctx=ctx)
+    assert n_ev >= 1 and len(ctx.comp_f_log) >= 1
+    assert all(0.0 <= f <= 4.0 for f in ctx.comp_f_log)
+    c = int(np.count_nonzero(trimmed & (base.effort_pct < 0.0)))
+    rows = int(np.count_nonzero(add != 0.0))
+    assert rows <= max(c, round(0.3 / base.period_s))
+    assert np.all(add <= 1e-12)  # ブレーキ側なので減速を増やす向き（負）か 0
+
+
+# ---- 段10-3: 案 C（switch_gap_min_peak） ----
+
+def _peak_ctx(n, need, ref_acc, *, comp=False, window_s=2.0, coast=-2.5, v=50.0):
+    from tests.research.fwd_plan import GapContext, PedalTrack  # noqa: PLC0415
+
+    return GapContext(
+        table=linear_table(), v=np.full(n, v), ref_acc=np.asarray(ref_acc, dtype=float),
+        coast_a=np.full(n, coast), coast_b=np.full(n, coast), track=PedalTrack(),
+        accel_min_pct=AD, brake_min_pct=BD, brake_lag_s=0.1, use_rule=False, min_peak=True,
+        need=np.asarray(need, dtype=float), accel_lag_s=0.1, comp=comp, peak_window_s=window_s,
+    )
+
+
+def _peak_valley(n=100):
+    """ブレーキ [20, 60)・アクセル [62, 80)。要る加速度はそれぞれ表どおり（−4.0・+3.0）。"""
+    eff = np.zeros(n)
+    eff[20:60] = -9.5
+    eff[62:80] = 22.3
+    need = np.where(eff < 0.0, -4.0, np.where(eff > 0.0, 3.0, -2.5))
+    return eff, need
+
+
+def _peak_err(e, ctx, i, window_s=2.0):
+    """独立に書いた採点: 位置を追い、予測 − 基準の傾きを T − 窓から 0 で積み上げた最大の大きさ。"""
+    from tests.research.fwd_plan import predicted_accel  # noqa: PLC0415
+
+    pa, pb = _track(e)
+    pred = predicted_accel(
+        ctx.table, ctx.v, pa, pb, track=ctx.track, accel_min_pct=AD, brake_min_pct=BD, period_s=DT,
+    )
+    w = round(window_s / DT)
+    sl = slice(i - w, i + w + 1)
+    return float(np.max(np.abs(np.r_[0.0, np.cumsum((pred[sl] - ctx.ref_acc[sl]) * DT)])))
+
+
+def test_min_peak_defaults_off_plan_is_identical() -> None:
+    off = _gap_plan(_valley, True)
+    dflt = _gap_plan(_valley, True, switch_gap_min_peak=False, switch_gap_peak_window_s=3.0)
+    assert np.array_equal(off.effort_pct, dflt.effort_pct)
+    assert off.return_gap.n_min_peak == 0 and "案 C" not in off.return_gap.summary()
+
+
+def test_min_peak_choice_is_minimum_among_position_feasible_pairs() -> None:
+    from tests.research.fwd_plan import position_return_row  # noqa: PLC0415
+
+    n = 100
+    eff, need = _peak_valley(n)
+    ref = np.where(np.arange(n) < 60, -4.0, 2.0)
+    ctx = _peak_ctx(n, need, ref)
+    e = eff.copy()
+    st = _gap_with(e, ctx)
+    c = int(np.count_nonzero((eff < 0.0) & (e == 0.0)))
+    d = int(np.count_nonzero((eff > 0.0) & (e == 0.0)))
+    assert st.n_min_peak == 1 and e[20] == -9.5  # 先頭の 1 行は残る
+    # すき間の条件は位置で決まる: 戻す側が min に着く行 ≤ 次のペダルの最初の行
+    _, pb = _track(e)
+    assert position_return_row(pb, 60 - c + 1, BD) + 1 <= 62 + d
+    # 独立に数えた全部の組（条件を満たすもの）の中で、最大の大きさが最小
+    best = None
+    for cc in range(0, 40):
+        for dd in range(0, 18):
+            ee = eff.copy()
+            if cc:
+                ee[60 - cc : 60] = 0.0
+            ee[62 : 62 + dd] = 0.0
+            _, pbb = _track(ee)
+            r = position_return_row(pbb, 60 - cc, BD)
+            if r is None or r + 1 > 62 + dd:
+                continue
+            err = _peak_err(ee, ctx, 62)
+            if best is None or err < best - 1e-9:
+                best = err
+    assert _peak_err(e, ctx, 62) == pytest.approx(best, abs=1e-6)
+
+
+def _gap_with(effort, ctx, ret=None):
+    from tests.research.fwd_plan import ensure_return_gap  # noqa: PLC0415
+
+    fl = np.full(len(effort), FLAG_COAST, dtype=int)
+    return ensure_return_gap(
+        effort, fl, ret=ret or _ret(amin=AD, bmin=BD), period_s=DT, rule_ctx=ctx,
+    )
+
+
+def test_min_peak_skips_switch_when_coast_is_not_negative() -> None:
+    """切り替え先の惰行の加速度が 0 以上（停車前後の低速など）の切り替えは C の対象外。"""
+    n = 100
+    eff, need = _peak_valley(n)
+    ref = np.where(np.arange(n) < 60, -4.0, 2.0)
+    e_neg = eff.copy()
+    st_neg = _gap_with(e_neg, _peak_ctx(n, need, ref))  # 惰行 −2.5: C が掛かる
+    assert st_neg.n_min_peak == 1
+    e = eff.copy()
+    st = _gap_with(e, _peak_ctx(n, need, ref, coast=0.5))  # 惰行 ≥ 0: 今までの手順
+    e0 = eff.copy()
+    st0 = _gap_with(e0, None)
+    assert st.n_min_peak == 0 and np.array_equal(e, e0) and st.n_cut == st0.n_cut
+
+
+def test_min_peak_valley_picks_a_different_pair_from_min_loss() -> None:
+    from tests.research.fwd_plan import ensure_return_gap  # noqa: PLC0415
+
+    n = 100
+    eff, need = _peak_valley(n)
+    ref = np.where(np.arange(n) < 60, -4.0, 2.0)
+    coast = np.full(n, -2.5)
+    e9 = eff.copy()
+    ensure_return_gap(
+        e9, np.full(n, FLAG_COAST, dtype=int), ret=_ret(amin=AD, bmin=BD), period_s=DT,
+        need_accel=need, coast_a=coast, coast_b=coast,
+    )
+    ec = eff.copy()
+    _gap_with(ec, _peak_ctx(n, need, ref))
+    assert not np.array_equal(e9, ec)  # 損の最小と予測した偏差の最小は別の組
+
+
+def test_min_peak_gap_ok_by_old_rule_but_position_late_is_redone() -> None:
+    n = 100
+    eff = np.zeros(n)
+    eff[20:60] = -24.0  # 深いブレーキ（戻るのに数行）
+    eff[62:80] = 24.0
+    need = np.where(eff < 0.0, -12.7, np.where(eff > 0.0, 4.0, -2.5))
+    fast = _ret(delay=0.0, rate=1e9, amin=AD, bmin=BD)  # 従来の見方ではすき間 2 行で足りる
+    e0 = eff.copy()
+    from tests.research.fwd_plan import ensure_return_gap  # noqa: PLC0415
+
+    ensure_return_gap(e0, np.full(n, FLAG_COAST, dtype=int), ret=fast, period_s=DT)
+    assert np.array_equal(e0, eff)
+    e1 = eff.copy()
+    st = _gap_with(e1, _peak_ctx(n, need, need.copy()), ret=fast)
+    assert not np.array_equal(e1, eff) and st.n_min_peak == 1
+
+
+def test_min_peak_position_already_in_time_changes_nothing() -> None:
+    n = 100
+    eff, need = _peak_valley(n)
+    eff[62:80] = 0.0
+    eff[75:80] = 22.3  # 十分遠い
+    e = eff.copy()
+    st = _gap_with(e, _peak_ctx(n, need, need.copy()))
+    assert np.array_equal(e, eff) and st.n_min_peak == 0 and st.n_cut == 0
+
+
+def test_min_peak_ignores_stop_and_prepos_rows() -> None:
+    n = 100
+    eff, need = _peak_valley(n)
+    for row, kind in ((59, FLAG_STOP), (62, FLAG_PREPOS)):
+        fl = np.full(n, FLAG_COAST, dtype=int)
+        fl[row] = kind
+        e0, e1 = eff.copy(), eff.copy()
+        from tests.research.fwd_plan import ensure_return_gap  # noqa: PLC0415
+
+        ensure_return_gap(e0, fl.copy(), ret=_ret(amin=AD, bmin=BD), period_s=DT)
+        st = ensure_return_gap(
+            e1, fl.copy(), ret=_ret(amin=AD, bmin=BD), period_s=DT,
+            rule_ctx=_peak_ctx(n, need, need.copy()),
+        )
+        assert np.array_equal(e0, e1) and st.n_min_peak == 0
+
+
+def test_min_peak_on_plan_runs_and_counts() -> None:
+    on = _gap_plan(_valley, True, switch_gap_min_peak=True)
+    assert np.all(np.isfinite(on.effort_pct))
+    assert on.return_gap.n_min_peak >= 1
+    assert "案 C" in on.return_gap.summary()
+    assert abs(on.effort_pct).max() <= 100.0
+
+
+def test_gap_violations_by_position_matches_rule_and_old_count_unchanged() -> None:
+    """段10-6: rule_ctx があるとき n_violations は位置の物差し（R の置いた切り替えは 0）。
+    rule_ctx が無ければ今までの数え方のまま。"""
+    from tests.research.fwd_plan import count_gap_violations  # noqa: PLC0415
+
+    n = 100
+    eff = np.zeros(n)
+    eff[20:56] = 24.0
+    eff[58:80] = -24.0
+    ref_acc = np.where(np.arange(n) < 60, 1.0, -5.0)
+    e, _, st = _rule_gap(eff, _rule_ctx(n, ref_acc))
+    assert st.n_rule_peak == 1 and st.by_position and st.n_violations == 0
+    assert "位置で数えた" in st.summary()
+    # 旧い数え方（指令の最後の値の戻る時間）では、R が置いた切り替えは不足と数える
+    assert count_gap_violations(e, ret=_ret(amin=AD, bmin=BD), period_s=DT) > 0
+    # rule_ctx なし（off）は今のまま
+    e2, _, st2 = _gap([24.0] * 6 + [-20.0] * 6)
+    assert not st2.by_position and st2.n_violations == 0
+    assert "位置で数えた" not in st2.summary()

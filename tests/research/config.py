@@ -839,6 +839,44 @@ class ForwardMapSection:
     # 停車保持・先置きが絡む切り替えは今までどおり。新しい調整値は無い。
     # 既定 false ＝ 今と完全に同じ。効く先: fwd_plan.ensure_return_gap。決める時期: 段9-b の実機の組
     switch_gap_min_loss: bool = False
+    # 2026-10-26 段10-2: true なら、アクセル ⇔ ブレーキの切り替え（9-b と同じ対象＝停車保持・
+    # 先置きが絡まないもの）のうち、切り替え先の最初の行の惰行の加速度が負のものを、ペダルの
+    # 実際の位置（下の pedal_track_*）で置き直す（案 R）。山（アクセル → ブレーキ）は、車の加速度が
+    # 下がる区間の真ん中が基準の頂点に来るようにアクセルを戻し始め、ブレーキはアクセルの位置が
+    # min に着いた行から。谷（ブレーキ → アクセル）は、すき間を前で取る（アクセルは遅らせない）。
+    # 7-c の補償は谷の前の削りだけで、Δv は戻る途中のブレーキの効きを入れて数える。
+    # switch_gap_min_loss も true なら、R の対象の切り替えは R、それ以外は 9-b。
+    # 新しい調整値は下の pedal_track_*（データ由来）だけ。既定 false ＝ 今と完全に同じ。
+    # 効く先: fwd_plan.ensure_return_gap。決める時期: 段10 の実機の組
+    switch_gap_rule: bool = False
+    # 2026-10-26 段10-1: ペダルの実際の位置の動き方（案 R・案 C のときだけ効く）。データ由来:
+    # 24 件の折れ目（AMA 谷 6 か所 × 2 本・US06 山 2 か所 × 6 本）の当てはめ
+    # （stage10_pedal_track.py。ProblemReport_20261026 の段1）。位置は「速さの上限 ＋ 加速度の
+    # 上限」で動く（短い移動は平均が遅く、長い移動は上限の速さで頭打ち）。
+    # delay は指令 → 位置の遅れ。
+    # 位置は 1 周期遅れて指令へ動くので、実効の遅れは 0.02 s ＋ 1 周期（約 0.07 s）。
+    # effect_lag は位置 → 車の加速度に効くまでの遅れ
+    pedal_track_accel_delay_s: float = 0.02  # アクセルの指令 → 位置の遅れ [s]
+    pedal_track_accel_max_rate_pct_s: float = 100.0  # アクセルの速さの上限 [%/s]
+    pedal_track_accel_max_accel_pct_s2: float = 2000.0  # アクセルの加速度の上限 [%/s^2]
+    pedal_track_brake_delay_s: float = 0.02  # ブレーキの指令 → 位置の遅れ [s]
+    pedal_track_brake_max_rate_pct_s: float = 90.0  # ブレーキの速さの上限 [%/s]
+    pedal_track_brake_max_accel_pct_s2: float = 1400.0  # ブレーキの加速度の上限 [%/s^2]
+    pedal_track_accel_effect_lag_s: float = 0.10  # アクセルの位置 → 車の加速度に効くまでの遅れ [s]
+    pedal_track_brake_effect_lag_s: float = 0.10  # ブレーキの位置 → 車の加速度に効くまでの遅れ [s]
+    # 2026-10-26 段10-3: true なら、9-b（switch_gap_min_loss）と同じ切り替え（停車保持・先置きが
+    # 絡まないもの）のすき間の取り方を、「損 Σ|要る加速度 − 惰行|」の最小から「予測した最大偏差」の
+    # 最小に直す（案 C）。前（戻す側）を c 行削る・後ろ（次のペダル）を d 行遅らせる組のうち、
+    # 戻す側の実際の位置（pedal_track_*）が min に着く行 ≤ 次のペダルの最初の行、を満たすものを、
+    # 切り替えの前後 switch_gap_peak_window_s 秒の「予測した加速度 − 基準の傾き」を積み上げた
+    # 最大の大きさで比べて選ぶ（7-c の補償を入れた列で比べる）。on のときは
+    # switch_gap_min_loss の値に関係なく C の比べ方を使う。
+    # switch_gap_rule（案 R）と同時に true にはできない。
+    # 調整値 switch_gap_peak_window_s は仮の値（kink_cmp.predicted_err の T−2〜T+2 を流用。
+    # 段3 で 1.5・3.0 と選ぶ組が変わらないか確かめる）。
+    # 既定 false ＝ 今と完全に同じ。効く先: fwd_plan.ensure_return_gap。決める時期: 段10 の実機の組
+    switch_gap_min_peak: bool = False
+    switch_gap_peak_window_s: float = 2.0
     # 2026-10-25 段9-c: true なら、アクセルの戻しの層を学習データの範囲の中だけで使う。戻し量が
     # 表の meta accel_release_max_pct を超える点は本体の表（戻し量 0）で引き、直近 3 秒の最大 u が
     # meta accel_release_peak_max_pct（学習の戻しのあるアクセルの行の直近の最大 u の p95）を超える
@@ -1315,6 +1353,27 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         fm.launch_release_pre_pct >= 0.0,
         f"forward_map.launch_release_pre_pct は 0 以上: {fm.launch_release_pre_pct}",
     )
+    need(
+        not (fm.switch_gap_rule and fm.switch_gap_min_peak),
+        "forward_map.switch_gap_rule と switch_gap_min_peak は同時に true にできない",
+    )
+    need(
+        fm.switch_gap_peak_window_s > 0.0,
+        f"forward_map.switch_gap_peak_window_s は正値: {fm.switch_gap_peak_window_s}",
+    )
+    for key in (
+        "accel_max_rate_pct_s", "accel_max_accel_pct_s2", "brake_max_rate_pct_s",
+        "brake_max_accel_pct_s2",
+    ):
+        need(
+            getattr(fm, f"pedal_track_{key}") > 0.0,
+            f"forward_map.pedal_track_{key} は正値: {getattr(fm, f'pedal_track_{key}')}",
+        )
+    for key in ("accel_delay_s", "brake_delay_s", "accel_effect_lag_s", "brake_effect_lag_s"):
+        need(
+            getattr(fm, f"pedal_track_{key}") >= 0.0,
+            f"forward_map.pedal_track_{key} は 0 以上: {getattr(fm, f'pedal_track_{key}')}",
+        )
     need(
         fm.launch_short_stop_s >= 0.0,
         f"forward_map.launch_short_stop_s は 0 以上: {fm.launch_short_stop_s}",

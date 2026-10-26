@@ -285,6 +285,23 @@ def fel_text(cfg: ResearchConfig, table: Any) -> str:
     return f"  FEL: 有効・方法 {cfg.fel.method}・補正のあるマス {cells}・学習 CSV {src}"
 
 
+def _pedal_track_of(fm: Any) -> Any:
+    """forward_map の pedal_track_* から PedalTrack を作る（2026-10-26 段10-1）。"""
+    # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
+    from tests.research.fwd_plan import PedalTrack  # noqa: PLC0415
+
+    return PedalTrack(
+        accel_delay_s=fm.pedal_track_accel_delay_s,
+        accel_max_rate_pct_s=fm.pedal_track_accel_max_rate_pct_s,
+        accel_max_accel_pct_s2=fm.pedal_track_accel_max_accel_pct_s2,
+        brake_delay_s=fm.pedal_track_brake_delay_s,
+        brake_max_rate_pct_s=fm.pedal_track_brake_max_rate_pct_s,
+        brake_max_accel_pct_s2=fm.pedal_track_brake_max_accel_pct_s2,
+        accel_effect_lag_s=fm.pedal_track_accel_effect_lag_s,
+        brake_effect_lag_s=fm.pedal_track_brake_effect_lag_s,
+    )
+
+
 def forward_map_plan_args(
     cfg: ResearchConfig, mode: DrivingMode, *, stop_end: bool
 ) -> tuple[Any, float, dict[str, Any]]:
@@ -324,6 +341,10 @@ def forward_map_plan_args(
         launch_short_stop_s=fm.launch_short_stop_s,
         switch_gap_compensate=fm.switch_gap_compensate,  # 段7-c
         switch_gap_min_loss=fm.switch_gap_min_loss,  # 段9-b
+        switch_gap_rule=fm.switch_gap_rule,  # 段10-2
+        switch_gap_min_peak=fm.switch_gap_min_peak,  # 段10-3
+        switch_gap_peak_window_s=fm.switch_gap_peak_window_s,  # 段10-3
+        pedal_track=_pedal_track_of(fm),  # 段10-1
         accel_release_in_range_only=fm.accel_release_in_range_only,  # 段9-c
     )
     return target_ref.at, mode.total_duration, kwargs
@@ -402,6 +423,10 @@ def _prepare_forward_map_plan(
     say(f"  すき間で失う分の補償（段7-c）: {'あり' if fm.switch_gap_compensate else 'なし'}")
     say("  すき間を前後の損の合計が最小で取る（段9-b）: "
         f"{'あり' if fm.switch_gap_min_loss else 'なし'}")
+    say("  すき間をペダルの実際の位置で置く（案 R。段10-2）: "
+        f"{'あり' if fm.switch_gap_rule else 'なし'}")
+    say("  すき間を予測した最大偏差の最小で取る（案 C。段10-3）: "
+        f"{f'あり（窓 {fm.switch_gap_peak_window_s} 秒）' if fm.switch_gap_min_peak else 'なし'}")
     say(
         "  アクセルの戻しの層を学習の範囲の中だけで使う（段9-c）: "
         f"{'あり' if fm.accel_release_in_range_only else 'なし'}"

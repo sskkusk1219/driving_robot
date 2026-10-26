@@ -282,7 +282,32 @@ forward_map:
   switch_gap_compensate: true
   # 2026-10-25 段9-b: true ならすき間の確保を、前で削る行と後ろで遅らせる行の損の合計が最小の組にする
   # （後ろで遅らせた分は補償しない）。新しい調整値は無い。効く先: 折れ目のすき間。決める時期: 段9-b の実機の組
-  switch_gap_min_loss: true  # 段9-b で採った（2026-10-25 `071554`・`074657`・`081034`）
+  switch_gap_min_loss: false  # 段9-b は採った（2026-10-25 `071554`・`074657`・`081034`）が、段10 で R に置き換えて off（2026-10-26）
+  # 2026-10-26 段10-2: true ならアクセル ⇔ ブレーキの切り替えのうち切り替え先の惰行の加速度が負のものを、
+  # ペダルの実際の位置で置き直す（案 R: 山は変わり目の真ん中を頂点に・谷はすき間を前で取る）。
+  # 新しい調整値は下の pedal_track_*（データ由来）だけ。効く先: 折れ目のすき間。決める時期: 段10 の実機の組
+  # → 2026-10-26 採る（実機 4 モード: WLTP `124629`・UDDS `131734`・US06 `113553`・AMA `114705`。相手 9-最終。
+  # AMA |偏差|>1 3.25 → 0.20 s、#1〜8 の折れ目が全部 1 未満）
+  switch_gap_rule: true
+  # 2026-10-26 段10-3: true なら 9-b と同じ切り替えのすき間の取り方を、予測した最大偏差の最小にする（案 C）。
+  # switch_gap_min_loss の値に関係なく C の比べ方を使う。switch_gap_rule と同時には true にできない。
+  # switch_gap_peak_window_s は仮の値（kink_cmp.predicted_err の T−2〜T+2 を流用。段3 で 1.5・3.0 と比べる）。
+  # 効く先: 折れ目のすき間。決める時期: 段10 の実機の組
+  # 案 C は不採用（2026-10-26: US06 `121051` 2.90 s・AMA `122224` 0.75 s で R より悪い）
+  switch_gap_min_peak: false
+  switch_gap_peak_window_s: 2.0
+  # 2026-10-26 段10-1: ペダルの実際の位置の動き方（案 R・C のときだけ効く）。データ由来: 24 件の折れ目の
+  # 当てはめ（stage10_pedal_track.py）。速さの上限 ＋ 加速度の上限で動く（短い移動は遅く、長い移動は
+  # 上限の速さで頭打ち）。delay は指令 → 位置（1 周期遅れて動くので実効は 0.02 s ＋ 1 周期）、
+  # effect_lag は位置 → 車の加速度に効くまで
+  pedal_track_accel_delay_s: 0.02
+  pedal_track_accel_max_rate_pct_s: 100.0
+  pedal_track_accel_max_accel_pct_s2: 2000.0
+  pedal_track_brake_delay_s: 0.02
+  pedal_track_brake_max_rate_pct_s: 90.0
+  pedal_track_brake_max_accel_pct_s2: 1400.0
+  pedal_track_accel_effect_lag_s: 0.10
+  pedal_track_brake_effect_lag_s: 0.10
   # 2026-10-25 段9-c: true ならアクセルの戻しの層を学習データの範囲の中だけで使う（戻し量・直近の最大 u が
   # 学習の p95 を超えるときは本体の表）。pkl の meta に accel_release_peak_max_pct が要る。
   # 効く先: 加速中の戻しの解き直し。決める時期: 段9-c の実機の組
