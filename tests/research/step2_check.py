@@ -532,7 +532,7 @@ def check_plan(
     )
 
     ref_at, duration_s, plan_kwargs = forward_map_plan_args(
-        cfg, mode, stop_end=candidate_is_stop_end(cfg.feedforward.candidate)
+        cfg, mode, stop_end=candidate_is_stop_end(cfg.feedforward.candidate), table=table
     )
     plan = build_plan(ref_at, duration_s, apply_table_options(cfg, table), **plan_kwargs)
     nan_count = int(np.count_nonzero(np.isnan(plan.effort_pct))) + int(

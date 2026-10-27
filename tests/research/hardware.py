@@ -376,6 +376,9 @@ def build_hardware(cfg: ResearchConfig, hw_mode: str) -> ResearchHardware:
     say(f"ハードウェア: 実機（設定 {settings_path}）")
     say(f"  アクセル軸 : {settings.serial.accel_port} @ {settings.serial.baud_rate}bps")
     say(f"  ブレーキ軸 : {settings.serial.brake_port} @ {settings.serial.baud_rate}bps")
+    say(f"  速度/加減速: アクセル {settings.actuator.accel.speed_mm_s:g}mm/s "
+        f"{settings.actuator.accel.max_accel_g:g}G / ブレーキ "
+        f"{settings.actuator.brake.speed_mm_s:g}mm/s {settings.actuator.brake.max_accel_g:g}G")
     say(f"  CAN        : {settings.can.interface} ch{settings.can.channel} "
         f"{settings.can.bitrate}bps  DBC={settings.can.dbc_path}")
     if cfg.checks.init_ups:
@@ -393,6 +396,8 @@ def build_hardware(cfg: ResearchConfig, hw_mode: str) -> ResearchHardware:
         retries=settings.serial.retries,
         axis_name="accel",
         lead_mm=settings.actuator.accel.lead_mm,
+        speed_mm_s=settings.actuator.accel.speed_mm_s,
+        max_accel=round(settings.actuator.accel.max_accel_g * 100),
     )
     brake = ResearchActuatorDriver(
         port=settings.serial.brake_port,
@@ -402,6 +407,8 @@ def build_hardware(cfg: ResearchConfig, hw_mode: str) -> ResearchHardware:
         retries=settings.serial.retries,
         axis_name="brake",
         lead_mm=settings.actuator.brake.lead_mm,
+        speed_mm_s=settings.actuator.brake.speed_mm_s,
+        max_accel=round(settings.actuator.brake.max_accel_g * 100),
     )
     can = CANReader(
         interface=settings.can.interface,

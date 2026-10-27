@@ -1470,6 +1470,8 @@ def test_switch_gap_min_peak_defaults_and_validation() -> None:
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
     assert cfg.forward_map.switch_gap_min_peak is False and cfgmod.validate_config(cfg) == []
     cfg.forward_map.switch_gap_rule = False  # 本体 yaml は R on（段10-6）。C 単独は off にして見る
+    cfg.forward_map.switch_gap_peak_robust = False  # 頑健化は R なしでは使えない
+    cfg.forward_map.switch_gap_valley_robust = False
     cfg.forward_map.switch_gap_min_peak = True
     assert cfgmod.validate_config(cfg) == []  # R が false なら C だけ on は通る
     cfg.forward_map.switch_gap_rule = True
@@ -1477,3 +1479,76 @@ def test_switch_gap_min_peak_defaults_and_validation() -> None:
     cfg.forward_map.switch_gap_rule = False
     cfg.forward_map.switch_gap_peak_window_s = 0.0
     assert any("switch_gap_peak_window_s" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_switch_gap_peak_from_corner_default_false_in_class_and_yaml() -> None:
+    """段11-4: R の山の下限を基準の頂点から取る設定は既定 false（クラス既定も本体 yaml も）。"""
+    assert cfgmod.ForwardMapSection().switch_gap_peak_from_corner is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.forward_map.switch_gap_peak_from_corner is False
+
+
+def test_switch_gap_choose_default_false_and_requires_rule() -> None:
+    """段11-5: 選び直し（R のまま／後ろで取る）は既定 false。R なしで true はエラー。"""
+    assert cfgmod.ForwardMapSection().switch_gap_choose is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.forward_map.switch_gap_choose is False and cfgmod.validate_config(cfg) == []
+    cfg.forward_map.switch_gap_choose = True
+    cfg.forward_map.switch_gap_rule = True
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.switch_gap_rule = False
+    assert any("switch_gap_choose" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_switch_gap_peak_robust_default_false_and_requires_rule() -> None:
+    """段12: R の山の採点の頑健化はクラスの既定は false。R なしで true はエラー。"""
+    assert cfgmod.ForwardMapSection().switch_gap_peak_robust is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.forward_map.switch_gap_peak_robust = True
+    cfg.forward_map.switch_gap_rule = True
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.switch_gap_rule = False
+    assert any("switch_gap_peak_robust" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_switch_gap_valley_robust_default_false_and_requires_rule() -> None:
+    """段12 谷: R の谷の上乗せの頑健化はクラスの既定は false。R なしで true はエラー。"""
+    assert cfgmod.ForwardMapSection().switch_gap_valley_robust is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.forward_map.switch_gap_valley_robust = True
+    cfg.forward_map.switch_gap_rule = True
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.switch_gap_rule = False
+    assert any("switch_gap_valley_robust" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_step13_launch_keys_default_false_in_section_and_yaml() -> None:
+    # 2026-10-27 段13: 発進のずらし・低速の予測の表の側は既定 off。
+    # 本体 yaml は 2026-10-28 段5 の実機で on
+    fm0 = cfgmod.ForwardMapSection()
+    assert fm0.predict_low_speed_sides is False and fm0.launch_shift_choose is False
+    cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
+    assert cfg.forward_map.predict_low_speed_sides is True
+    assert cfg.forward_map.launch_shift_choose is True
+    assert cfgmod.validate_config(cfg) == []
+
+
+def test_step14_keys_default_false_and_validated() -> None:
+    # 2026-10-28 段14: クリープ曲線の予測・符号で離す惰行の補助は既定 off（本体 yaml も false）
+    fm0 = cfgmod.ForwardMapSection()
+    assert fm0.predict_creep_curve is False and fm0.coast_release_on_cross is False
+    cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
+    # 本体 yaml は 2026-10-28 段6・7 の実機で on
+    assert cfg.forward_map.predict_creep_curve is True
+    assert cfg.forward_map.coast_release_on_cross is True
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.coast_release_on_cross = True
+    cfg.forward_map.predict_creep_curve = True
+    cfg.forward_map.predict_low_speed_sides = True
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.predict_low_speed_sides = False
+    assert any("predict_creep_curve" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.predict_low_speed_sides = True
+    cfg.feedforward.creep_accel_speeds_kmh = []
+    cfg.feedforward.creep_accel_kmhs = []
+    assert any("predict_creep_curve" in p for p in cfgmod.validate_config(cfg))

@@ -308,3 +308,84 @@ def test_estimate_pedal_return_missing_file_or_columns(tmp_path: Path) -> None:
     bad = tmp_path / "bad.csv"
     bad.write_text("elapsed_s,speed\n0,1\n", encoding="utf-8")
     assert not pedal_lag.estimate_pedal_return(bad).accel.measured
+
+
+# --- 2026-10-26 段11-2: estimate_pedal_track（手順2 からペダルの動き方を測る） ---------
+
+
+class _StubTable:
+    """加速度 = 0.1 × u（アクセル側。ブレーキは u が負）、惰行 = −0.2 の表（車速に依らない）。"""
+
+    def accel(self, v, u):
+        return 0.1 * np.asarray(u, dtype=float)
+
+    def coast_accel(self, v):
+        return np.full_like(np.asarray(v, dtype=float), -0.2)
+
+
+def _write_track_csv(path: Path, *, delay: float, vmax: float, amax: float, lag: float) -> None:
+    """アクセル指令（min 4.2 ↔ 30 を不規則な長さで切り替え）→ 既知の動きで実位置 →
+    既知の遅れで加速度 → 車速。ブレーキは動かさない（min のまま）。"""
+    from tests.research.fwd_plan import PedalTrack, _follow_pedal, predicted_accel
+
+    rng = np.random.default_rng(0)
+    mn = 4.2
+    cmd = []
+    level = mn
+    while len(cmd) < 1600:
+        level = 30.0 if level == mn else mn
+        cmd += [level] * int(rng.integers(10, 40))
+    cmd_a = np.array(cmd[:1600])
+    act = _follow_pedal(cmd_a, mn, delay, vmax, amax, mn, DT)
+    brk = np.full(len(cmd_a), mn)
+    trk = PedalTrack(accel_effect_lag_s=lag, brake_effect_lag_s=lag)
+    a = predicted_accel(
+        _StubTable(), np.full(len(cmd_a), 50.0), act, brk, track=trk,
+        accel_min_pct=mn, brake_min_pct=mn, period_s=DT,
+    )
+    speed = 50.0 + np.cumsum(a) * DT
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["actual_speed_kmh", "accel_cmd_pct", "accel_actual_pct", "brake_actual_pct"])
+        for row in zip(speed, cmd_a, act, brk, strict=True):
+            w.writerow([f"{x:.6f}" for x in row])
+
+
+def test_estimate_pedal_track_recovers_motion_and_lag(tmp_path: Path) -> None:
+    p = tmp_path / "s2.csv"
+    _write_track_csv(p, delay=0.02, vmax=90.0, amax=1700.0, lag=0.15)
+    fit = pedal_lag.estimate_pedal_track(
+        p, _StubTable(), accel_min_pct=4.2, brake_min_pct=4.2, period_s=DT
+    )
+    assert fit.measured
+    # delay は 1 周期未満だと指令が階段のとき位置が同じになり分けられない（同点は小さい方）
+    assert (fit.accel_max_rate_pct_s, fit.accel_max_accel_pct_s2) == (90.0, 1700.0)
+    assert fit.accel_delay_s < DT
+    # ブレーキの動きはアクセルの値を流用（ユーザー決定）
+    assert (fit.brake_delay_s, fit.brake_max_rate_pct_s, fit.brake_max_accel_pct_s2) == (
+        fit.accel_delay_s, fit.accel_max_rate_pct_s, fit.accel_max_accel_pct_s2)
+    assert fit.rmse_pct < 1e-6
+    assert abs(fit.accel_effect_lag_s - 0.15) <= 0.025
+    assert fit.n_moved_accel > 100 and fit.n_moved_brake == 0
+    # ブレーキは動かないので遅れはアクセルの値を流用
+    assert fit.brake_effect_lag_s == fit.accel_effect_lag_s
+
+
+def test_estimate_pedal_track_not_measured_when_pedal_does_not_move(tmp_path: Path) -> None:
+    p = tmp_path / "flat.csv"
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["actual_speed_kmh", "accel_cmd_pct", "accel_actual_pct", "brake_actual_pct"])
+        for _ in range(200):
+            w.writerow([50.0, 4.2, 4.2, 4.2])
+    fit = pedal_lag.estimate_pedal_track(
+        p, _StubTable(), accel_min_pct=4.2, brake_min_pct=4.2, period_s=DT
+    )
+    assert not fit.measured and "動いた行" in fit.reason
+
+
+def test_estimate_pedal_track_unreadable_csv(tmp_path: Path) -> None:
+    fit = pedal_lag.estimate_pedal_track(
+        tmp_path / "none.csv", _StubTable(), accel_min_pct=4.2, brake_min_pct=4.2
+    )
+    assert not fit.measured and "読めない" in fit.reason

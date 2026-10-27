@@ -971,6 +971,35 @@ def _attach_returns(table: Any, csv_path: Path) -> None:
             f"（場面 {fit.n} 件、当てはめの外れ最大 {fit.max_err_s:.3f}s）")
 
 
+def _attach_pedal_track(table: Any, csv_path: Path) -> None:
+    """表の meta に、ペダルの位置の動き方と位置 → 加速度の遅れ（PedalTrack の 8 値）を入れる
+    （2026-10-26 段11-2。ProblemReport_20261026_2 段2・段3）。
+
+    手順2 の CSV と表から `pedal_lag.estimate_pedal_track` で測る。本番ではモードを走れないので、
+    yaml の pedal_track_* （モード走行の当てはめ）に頼らず手順2 から決める。ブレーキの動き（delay・
+    速さ・加速度の上限）は手順2 に速い動きが無く測れないため、アクセルの値を流用する
+    （ユーザー決定）。
+    測れなければキーを入れない（読む側は yaml の値を使い、表示で知らせる）。
+    """
+    amin = float(table.meta.get("accel_deadband_pct", math.nan))
+    bmin = float(table.meta.get("brake_deadband_pct", math.nan))
+    if not (math.isfinite(amin) and math.isfinite(bmin)):
+        say("  ペダルの動き方: 表の meta に min が無く測れず。meta に入れない")
+        return
+    fit = pedal_lag.estimate_pedal_track(csv_path, table, accel_min_pct=amin, brake_min_pct=bmin)
+    if not fit.measured:
+        say(f"  ペダルの動き方: 測れず（{fit.reason}）。meta に入れない")
+        return
+    for key in pedal_lag.PEDAL_TRACK_META_KEYS:
+        table.meta[f"pedal_track_{key}"] = float(getattr(fit, key))
+    say(f"  ペダルの動き方: delay {fit.accel_delay_s:g}s・速さ {fit.accel_max_rate_pct_s:g}%/s・"
+        f"加速度 {fit.accel_max_accel_pct_s2:g}%/s^2（アクセルで測り、ブレーキも同じ値）")
+    say(f"  　位置の RMSE {fit.rmse_pct:.3f}%・動いた行 アクセル {fit.n_moved_accel}・"
+        f"ブレーキ {fit.n_moved_brake}")
+    say(f"  位置 → 加速度の遅れ: アクセル {fit.accel_effect_lag_s:g}s・"
+        f"ブレーキ {fit.brake_effect_lag_s:g}s")
+
+
 def _build_table_model(
     profile: VehicleProfile,
     csv_path: Path,
@@ -995,6 +1024,7 @@ def _build_table_model(
     table = fwd_tool.table_from(rows, st)
     _attach_onsets(table, profile, csv_path)
     _attach_returns(table, csv_path)
+    _attach_pedal_track(table, csv_path)
     path = save_table(table, _forward_pkl_path(models_dir, "fwd_table", hw_mode))
     say(f"  u の原点（min）: アクセル {st.accel_deadband_pct:g}・"
         f"ブレーキ {st.brake_deadband_pct:g} %（vehicle.min_*_opening_pct）、"
@@ -1320,6 +1350,7 @@ def _build_forward_model(
         f"{band_s:.1f} 秒")
     _attach_onsets(table, profile, csv_path)
     _attach_returns(table, csv_path)
+    _attach_pedal_track(table, csv_path)
     path = save_table(table, _forward_pkl_path(models_dir, "fwd_model", hw_mode))
     say(f"モデル保存: {path}")
     return _BuiltModel(model_path=str(path), metrics={}, c7_path=like.model_path)

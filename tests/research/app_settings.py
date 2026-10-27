@@ -52,6 +52,9 @@ class ActuatorAxisSettings:
     # PCON-CB パラメーター No.152「高出力化設定」が無効の場合の値を入れておくと、
     # 設定に関わらず安全側になる。
     max_speed_mm_s: float = 100.0
+    # 運用の速度指令 VCMD [mm/s]。max_speed_mm_s を超えてはならない（load_settings で検査）。
+    # 2026-10-27 ユーザー決定: アクセル 225・ブレーキ 190（仕様の無効時上限 250/210 の 90%）。
+    speed_mm_s: float = 100.0
     # 運用上の最大加減速度 [G]。仕様の「加減速度別可搬質量」表で運用速度域の可搬質量が
     # ペダル反力を上回る範囲に収めること（MJ3751-2Q 1.2.2 の注意:「加減速度は、許容値
     # 以上の設定は行わないでください」）。
@@ -263,7 +266,13 @@ def _parse_actuator_settings(raw: dict[str, object]) -> ActuatorSettings:
     def _axis(section: object) -> ActuatorAxisSettings:
         if not isinstance(section, dict):
             return ActuatorAxisSettings()
-        return ActuatorAxisSettings(**{k: v for k, v in section.items() if k in known})
+        axis = ActuatorAxisSettings(**{k: v for k, v in section.items() if k in known})
+        if axis.speed_mm_s > axis.max_speed_mm_s:
+            raise ValueError(
+                f"[actuator] speed_mm_s={axis.speed_mm_s} が "
+                f"max_speed_mm_s={axis.max_speed_mm_s} を超えています"
+            )
+        return axis
 
     return ActuatorSettings(accel=_axis(raw.get("accel")), brake=_axis(raw.get("brake")))
 

@@ -44,6 +44,8 @@ class CoastStats:
     blocked_prev_return: int = 0  # 前の反対のペダルが min に戻っていない
     blocked_next_return: int = 0  # 次の反対のペダルまでに保持して戻る時間がない
     released_next: int = 0  # (a) 次の反対のペダルに間に合うよう、保持の途中で離した回数
+    # 2026-10-28 段14 K: 偏差の符号が補助の向きと逆になり、保持の途中で離した回数
+    released_cross: int = 0
 
     def add_active(self, pedal: str) -> None:
         if pedal == PEDAL_ACCEL:
@@ -61,13 +63,15 @@ class CoastStats:
             f"入り直しの間隔 {self.blocked_reentry * p:.1f}s・"
             f"前の戻り待ち {self.blocked_prev_return * p:.1f}s・"
             f"次の戻り待ち {self.blocked_next_return * p:.1f}s・"
-            f"次のペダルのため保持の途中で離した {self.released_next} 回"
+            f"次のペダルのため保持の途中で離した {self.released_next} 回・"
+            f"符号が逆になり保持の途中で離した {self.released_cross} 回"
         )
 
 
 def coast_settings_text(
     on_kmh: float, off_kmh: float, hold_coef: float, hold_accel_s: float, hold_brake_s: float,
     floor_onset: bool = False, one_pedal_per_section: bool = True,
+    release_on_cross: bool = False,
 ) -> str:
     """C12 の設定の表示（走行前とレポートで同じ文）。"""
     return (
@@ -75,6 +79,7 @@ def coast_settings_text(
         f"（保持 アクセル {hold_accel_s:.2f}s / ブレーキ {hold_brake_s:.2f}s）"
         f"・効き始めの下限 {'あり' if floor_onset else 'なし'}"
         f"・区間で片方のペダルだけ {'あり' if one_pedal_per_section else 'なし'}"
+        f"・符号が逆になったら保持の途中でも離す {'あり' if release_on_cross else 'なし'}"
     )
 
 
@@ -101,8 +106,11 @@ class CoastAssist:
         accel_onset_effort: float,
         brake_onset_effort: float,
         one_pedal_per_section: bool = True,
+        release_on_cross: bool = False,
     ) -> None:
         self.one_pedal_per_section = one_pedal_per_section
+        # 2026-10-28 段14 K: True なら偏差の符号が補助の向きと逆になった時点で保持の途中でも離す
+        self.release_on_cross = release_on_cross
         self.flag = np.asarray(plan_flag)
         self.on_kmh = on_kmh
         self.off_kmh = off_kmh
@@ -182,6 +190,11 @@ class CoastAssist:
                     return None
             # (c) 保持が済み、偏差が off 以下に戻った（または符号が逆になった）
             wrong_sign = (dev_kmh < 0.0) if pedal == PEDAL_ACCEL else (dev_kmh > 0.0)
+            # 段14 K: 符号が逆になったら保持の途中でも離す（行き過ぎ防止）
+            if self.release_on_cross and wrong_sign and t - self.t_on < hold - 1e-9:
+                self.stats.released_cross += 1
+                self._release(t)
+                return None
             if t - self.t_on >= hold - 1e-9 and (abs(dev_kmh) <= self.off_kmh or wrong_sign):
                 self._release(t)
                 return None

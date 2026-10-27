@@ -728,6 +728,14 @@ class ForwardMapSection:
     # 段2r ③。true なら 1 つの惰行の区間で使うペダルは 1 つだけ。false なら、前の補助のペダルが
     # min に戻り保持時間がたてば反対のペダルにも入る
     coast_one_pedal_per_section: bool = True
+    # 2026-10-28 ProblemReport_20261027 段14 K: true なら、惰行の補助中に偏差の符号が補助の向きと
+    # 逆になった（アクセルの補助で dev < 0・ブレーキで dev > 0。dev ＝ 基準 − 実車速）時点で、
+    # 保持時間の途中でも離す（既定は保持が済んでから離す）。入り直しの間隔などの規則は今のまま。
+    # 根拠: しきい値 0.2 km/h の補助が、偏差が 0 を越えても保持（アクセル 1.81 s）が済むまで
+    # 踏み続け、逆側へ +0.6 まで行き過ぎた（WLTP 335 s、drive_log_real_20261028_001556.csv）。
+    # 新しい調整値は無い。
+    # 既定 false ＝ 今と完全に同じ。効く先: C12 の離す判断。決める時期: 段14 の実機
+    coast_release_on_cross: bool = False
     # 2026-10-19 段2u（C13 のときだけ効く）: 遅れの予測器 ＋ 車速のフィルタ（speed_predictor.py）。
     # predictor_enabled: false なら C13 でも C12 と同じ指令（フィルタも予測器も動かさない）。
     predictor_enabled: bool = True
@@ -877,6 +885,32 @@ class ForwardMapSection:
     # 既定 false ＝ 今と完全に同じ。効く先: fwd_plan.ensure_return_gap。決める時期: 段10 の実機の組
     switch_gap_min_peak: bool = False
     switch_gap_peak_window_s: float = 2.0
+    # 2026-10-26 段11-4: true なら R の山の戻し始めを探す範囲を、固定 2 秒
+    # （fwd_plan.RULE_PEAK_RANGE_S、仮の値）でなく、基準の加速度が頂点へ下がり始める行
+    # （頂点の手前の最後の極大）− (戻る行数＋効くまでの遅れ) からにする。データ由来。
+    # 既定 false ＝ 今と完全に同じ。効く先: R の山。決める時期: 段11-7 の実機
+    switch_gap_peak_from_corner: bool = False
+    # 2026-10-27 段12: true なら R の山の採点だけを変える（候補の s の選び方は同じ）。
+    # 戻す前の加速中に
+    # たまった予測の片寄り（実機に無い水準のずれ）を数えないよう積み上げの数え始めを遅らせ（案 Y）、
+    # ペダルが効くまでの遅れを fwd_plan.PEAK_ROBUST_LAG_ROWS 行ずらした 3 通りの積み上がりの最大で
+    # 選ぶ（案 X）。switch_gap_rule が true のときだけ使える。既定 false ＝ 今と完全に同じ。
+    # 効く先: R の山。決める時期: 段12 の US06 実機
+    switch_gap_peak_robust: bool = False
+    # 2026-10-27 段12 谷: true なら R の谷の上乗せの倍率 f の決め方だけを変える。数え始めを上乗せを
+    # 配る最初の行の 1 行前へ遅らせ（案 Y）、遅れを fwd_plan.PEAK_ROBUST_LAG_ROWS 行
+    # ずらした 3 通りの積み上がりの最大が最小の f を、0.1 刻みで粗く見てから黄金分割で詰めて選ぶ
+    # （案 X）。
+    # switch_gap_rule が true のときだけ使える。既定 false ＝ 今と完全に同じ。
+    # 効く先: R の谷の上乗せ。決める時期: 段12 谷の US06 実機
+    switch_gap_valley_robust: bool = False
+    # 2026-10-26 段11-5: true なら R が扱う踏み替え（山・谷）ごとに「R のまま」と
+    # 「後ろで取る（9-最終の形: 戻す側は要る間踏み、次のペダルを戻す側の位置が min に着く行＋1 まで
+    # 遅らせる）」を作り、
+    # 切り替えの前後 switch_gap_peak_window_s の予測した積み上げの偏差の最大の大きさが小さい方を選ぶ
+    # （同点は R）。switch_gap_rule が true のときだけ使える。既定 false ＝ 今と完全に同じ。
+    # 効く先: 折れ目のすき間。決める時期: 段11-7 の実機
+    switch_gap_choose: bool = False
     # 2026-10-25 段9-c: true なら、アクセルの戻しの層を学習データの範囲の中だけで使う。戻し量が
     # 表の meta accel_release_max_pct を超える点は本体の表（戻し量 0）で引き、直近 3 秒の最大 u が
     # meta accel_release_peak_max_pct（学習の戻しのあるアクセルの行の直近の最大 u の p95）を超える
@@ -884,6 +918,38 @@ class ForwardMapSection:
     # 新しい調整値は無い。既定 false ＝ 今と完全に同じ。効く先: fwd_plan._resolve_accel_releases。
     # 決める時期: 段9-c の実機の組
     accel_release_in_range_only: bool = False
+    # 2026-10-27 段13: true なら、すき間の処理の予測（fwd_plan.predicted_accel）で、車速が
+    # pkl meta stop_max_speed_kmh（無ければ 7.5）未満の行を、計画がその行で選んだ表
+    # （side_accel / side_brake。発進側・停止側・それ以外は本体）で引く。
+    # 根拠: 本体の表だけだと 0 km/h でブレーキ min でも惰行 −0.32 km/h/s と見て
+    # クリープを知らない（予測 −0.30・実測 +0.64。発進側の表なら +0.33 で向きが合う。
+    # ProblemReport_20261027 段2 の机上）。low_speed_side_rule が pedal・dir のときだけ効く
+    # （legacy は側が決まらないので今まで通り）。新しい調整値は無い。
+    # 既定 false ＝ 今と完全に同じ。効く先: すき間の処理（案 R・C）の予測。決める時期: 段13 の実機
+    predict_low_speed_sides: bool = False
+    # 2026-10-27 段13: true なら、停車からの各発進で、発進の並び（ブレーキを離す〜アクセルの
+    # 立ち上がり）を 0〜fwd_plan.LAUNCH_SHIFT_MAX_ROWS 行（仮の値 8 行＝0.4 秒。0.05 秒刻み）
+    # 後ろへずらした計画を作り、予測した偏差（車速を基準の動き出しの 2.0 秒前から v=0 で積む）の
+    # 動き出しの 1.0 秒前〜1.5 秒後の |偏差| の最大を、効くまでの遅れ ±1 行の最悪で採点して、
+    # 最小の δ を選ぶ。
+    # 根拠: 強い発進 20 回すべてで車が基準より 0.25〜0.36 秒早く動き出し +0.53〜+0.78 km/h になる
+    # （窓が基準の立ち上がりを先に拾い、アクセルを約 0.25 秒前に踏み、すき間でブレーキを
+    # 約 0.45 秒前に min へ戻すため、クリープで先に動く。ProblemReport_20261027 段2）。
+    # 予測の最大は後ろへずらすと小さくなる（1〜2 行が最良）。predict_low_speed_sides と組で使う
+    # 想定（採点が低速の表で予測する）。
+    # 既定 false ＝ 今と完全に同じ。効く先: 発進の計画。決める時期: 段13 の実機
+    launch_shift_choose: bool = False
+    # 2026-10-28 ProblemReport_20261027 段14 L1: true なら、すき間の処理・発進のずらしの予測
+    # （fwd_plan.predicted_accel）で、両ペダルが min（位置 − min ≦ 0）かつ車速が
+    # feedforward.creep_accel_speeds_kmh の最後（5.0 km/h）未満の行の加速度を、手順2 が測った
+    # クリープの曲線 np.interp(v, creep_accel_speeds_kmh, creep_accel_kmhs) にする
+    # （0.5 km/h 未満は先頭の値）。
+    # 根拠: 発進側の表は 0 km/h・両ペダル min で +1.51 km/h/s と言うが、実測のクリープは
+    # 約 2.2 km/h/s。表のままだと「早く動き出しすぎ」を小さく見て δ が小さく選ばれる
+    # （US06 500 s で δ=0、実測 +0.84）。
+    # predict_low_speed_sides が true のときだけ使える。新しい調整値は無い（曲線は手順2 の測定値）。
+    # 既定 false ＝ 今と完全に同じ。効く先: 予測（案 R・C・発進のずらし）。決める時期: 段14 の実機
+    predict_creep_curve: bool = False
     # 2026-10-23 段6 C: true なら、dir の発進の途中の行（停車保持は除く）で、FB の上乗せ（C10 の P・
     # DOB・惰行の補助の合計）がブレーキを FF の開度より深くする向きのとき 0 にする（浅くする向き・
     # アクセル側は触らない。最終のブレーキ開度 ≤ FF のブレーキ開度）。
@@ -914,6 +980,34 @@ class ForwardMapSection:
     # A2（動き出す開度の頭打ち）を外した表を使う（動き出した後に A2 が FB の予測を 0 に潰さない）。
     # FF の計画は今のまま A2 あり。既定 false ＝ 今と完全に同じ。効く先: mode_drive の FB の表
     fb_no_breakaway_floor: bool = False
+    # 2026-10-27 段3 P3: true なら、元の基準（ぼかす前）が停車速度（ff_model.STOP_SPEED_KMH）
+    # 以下の行で、FB の上乗せ（P・DOB・惰行の補助の合計）がブレーキを FF より深くする向き
+    # のとき 0 にする（浅くする向きは通す）。launch_hold（段8-a）の I と、P が働かない
+    # 停車保持の行は変わらない。
+    # 根拠: UDDS 1250.95 s（`165424`）で、基準がまだ 0 なのに車が +0.17 km/h 動き、
+    # launch_prep が切れた次の行（flag 穴埋め）で P が −9.6%（ブレーキ 8.8→18.8%）を出して
+    # 車を止め、離した。既定 false ＝ 今と完全に同じ。
+    # 効く先: 基準 0 の行の最終指令。決める時期: 段3 の実機
+    fb_no_deeper_at_ref_zero: bool = False
+    # 2026-10-27 段6 P1: true なら、車速が meta の stop_max_speed_kmh（無ければ 7.5）未満で、
+    # FF がブレーキの行（ff_effort < 0）かつ FF のブレーキ開度が min 以上・停車保持未満の行で、
+    # C10 の P（停C の τ 短縮後を含む）の上乗せの大きさ |delta| を cap ＝ meta の
+    # launch_u_step_pct に抑える（meta に無ければ働かない）。
+    # cap の根拠: 手順2 が動き出す開度を探した刻み。この幅より細かい所では車の応答が
+    # 「止まる／動く」に切り替わる（半分データ由来）。
+    # 背景: 動き出す開度（≈8.57%）の付近では 0.5% で「止まる／クリープ」が入れ替わり、
+    # P が ±0.4〜1% を 0.7 s 周期で往復（UDDS 1251 s）、停止直前に停C の τ が 0.2 s まで縮んで
+    # P がブレーキを 5.4% まで離しクリープで再加速（AMA 75 s・WLTP 386 s・986 s）。
+    # 既定 false ＝ 今と完全に同じ。効く先: 低速のブレーキの行の P。決める時期: 段6 の実機
+    fb_breakaway_band_cap: bool = False
+    # 2026-10-27 段7 P2（停止側）: true なら、停C の区間の行（stop_end.tau_s が None でない行）で、
+    # 最終のブレーキ指令（FF＋FB 後・片足ルール・安全網の前）を前の周期のブレーキ指令より
+    # 浅くしない（踏み増すだけ）。区間を抜けたら（τ が None・停車保持・アクセルの行）解除。
+    # 発進側は launch_midway_fb_no_deeper を使う。
+    # 根拠: 停止の最後でブレーキを離す・踏むを繰り返し、止まりかけてまた進む（停止 40 回中 13 回）。
+    # 人は止まる前は踏み増すだけ。既定 false ＝ 今と完全に同じ。
+    # 効く先: C15 の停止まぎわ。決める時期: 段7 の実機
+    stop_end_brake_monotone: bool = False
 
 
 @dataclass
@@ -1356,6 +1450,28 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         not (fm.switch_gap_rule and fm.switch_gap_min_peak),
         "forward_map.switch_gap_rule と switch_gap_min_peak は同時に true にできない",
+    )
+    need(
+        not (fm.switch_gap_peak_robust and not fm.switch_gap_rule),
+        "forward_map.switch_gap_peak_robust は switch_gap_rule が true のときだけ true にできる",
+    )
+    need(
+        not (fm.predict_creep_curve and not fm.predict_low_speed_sides),
+        "forward_map.predict_creep_curve は predict_low_speed_sides が true のときだけ"
+        " true にできる",
+    )
+    need(
+        not (fm.predict_creep_curve and not ff.creep_accel_speeds_kmh),
+        "forward_map.predict_creep_curve は feedforward.creep_accel_speeds_kmh が"
+        " 空でないときだけ true にできる",
+    )
+    need(
+        not (fm.switch_gap_valley_robust and not fm.switch_gap_rule),
+        "forward_map.switch_gap_valley_robust は switch_gap_rule が true のときだけ true にできる",
+    )
+    need(
+        not (fm.switch_gap_choose and not fm.switch_gap_rule),
+        "forward_map.switch_gap_choose は switch_gap_rule が true のときだけ true にできる",
     )
     need(
         fm.switch_gap_peak_window_s > 0.0,

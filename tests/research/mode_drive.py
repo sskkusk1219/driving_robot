@@ -285,11 +285,42 @@ def fel_text(cfg: ResearchConfig, table: Any) -> str:
     return f"  FEL: 有効・方法 {cfg.fel.method}・補正のあるマス {cells}・学習 CSV {src}"
 
 
-def _pedal_track_of(fm: Any) -> Any:
-    """forward_map の pedal_track_* から PedalTrack を作る（2026-10-26 段10-1）。"""
+def _pedal_track_meta(meta: Any) -> dict[str, float] | None:
+    """表の meta の pedal_track_* 8 値（手順2 で測った値。2026-10-26 段11-3）。全部あって有限で、
+    速さ・加速度の上限が正・delay と遅れが 0 以上のときだけ返す。そうでなければ None。"""
+    from tests.research.pedal_lag import PEDAL_TRACK_META_KEYS  # noqa: PLC0415
+
+    if not meta:
+        return None
+    vals: dict[str, float] = {}
+    for key in PEDAL_TRACK_META_KEYS:
+        raw = meta.get(f"pedal_track_{key}")
+        if raw is None:
+            return None
+        try:
+            x = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(x) or (x <= 0.0 if ("rate" in key or "accel_pct" in key) else x < 0.0):
+            return None
+        vals[key] = x
+    return vals
+
+
+def pedal_track_source(meta: Any) -> str:
+    """PedalTrack の値の出どころの表示（meta＝手順2 で測った値／yaml＝古い pkl の代わり）。"""
+    return "pkl の meta（手順2 で測定）" if _pedal_track_meta(meta) else "yaml（pkl に値なし）"
+
+
+def _pedal_track_of(fm: Any, meta: Any = None) -> Any:
+    """PedalTrack を作る。pkl の meta に pedal_track_* の 8 値が揃っていればそれ（手順2 で測った値。
+    2026-10-26 段11-3）、なければ forward_map の pedal_track_* （yaml。段10-1。古い pkl 用）。"""
     # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
     from tests.research.fwd_plan import PedalTrack  # noqa: PLC0415
 
+    m = _pedal_track_meta(meta)
+    if m is not None:
+        return PedalTrack(**m)
     return PedalTrack(
         accel_delay_s=fm.pedal_track_accel_delay_s,
         accel_max_rate_pct_s=fm.pedal_track_accel_max_rate_pct_s,
@@ -303,12 +334,14 @@ def _pedal_track_of(fm: Any) -> Any:
 
 
 def forward_map_plan_args(
-    cfg: ResearchConfig, mode: DrivingMode, *, stop_end: bool
+    cfg: ResearchConfig, mode: DrivingMode, *, stop_end: bool, table: Any = None
 ) -> tuple[Any, float, dict[str, Any]]:
     """手順3 の開度の列（fwd_plan.build_plan）に渡す引数: (基準 ref_at, 長さ [s], キーワード引数)。
 
     2026-10-23: 手順2 のチェック D1（step2_check.check_plan）と同じ作り方にするため切り出した。
     stop_end は FF 候補が C15（StopEndFeedforward）か（True のときだけ stop_lead_enabled を掛ける）
+    table（2026-10-26 段11-3）: 使う表。meta に pedal_track_* が揃っていればペダルの動き方はそれ
+    （手順2 で測った値）、None・揃っていなければ yaml の値。
     """
     ff_cfg, fm = cfg.feedforward, cfg.forward_map
     # 2026-10-19 段3: 開度の列は「ぼかした基準」で作る（σ=0 なら元の基準そのもの）。停車の判定
@@ -344,8 +377,17 @@ def forward_map_plan_args(
         switch_gap_rule=fm.switch_gap_rule,  # 段10-2
         switch_gap_min_peak=fm.switch_gap_min_peak,  # 段10-3
         switch_gap_peak_window_s=fm.switch_gap_peak_window_s,  # 段10-3
-        pedal_track=_pedal_track_of(fm),  # 段10-1
+        switch_gap_peak_from_corner=fm.switch_gap_peak_from_corner,  # 段11-4
+        switch_gap_peak_robust=fm.switch_gap_peak_robust,  # 段12
+        switch_gap_valley_robust=fm.switch_gap_valley_robust,  # 段12 谷
+        switch_gap_choose=fm.switch_gap_choose,  # 段11-5
+        pedal_track=_pedal_track_of(fm, None if table is None else table.meta),  # 段10-1・11-3
         accel_release_in_range_only=fm.accel_release_in_range_only,  # 段9-c
+        predict_low_speed_sides=fm.predict_low_speed_sides,  # 段13
+        launch_shift_choose=fm.launch_shift_choose,  # 段13
+        predict_creep_curve=fm.predict_creep_curve,  # 段14 L1
+        creep_accel_speeds_kmh=tuple(ff_cfg.creep_accel_speeds_kmh),
+        creep_accel_kmhs=tuple(ff_cfg.creep_accel_kmhs),
     )
     return target_ref.at, mode.total_duration, kwargs
 
@@ -390,13 +432,26 @@ def make_launch_hold(
     return hold, f"あり・{note}・bk ＝ {bk:.2f}%"
 
 
+def band_cap_of(cfg: ResearchConfig, ff: Any) -> tuple[float | None, float, str]:
+    """段6 P1: (cap [%]・帯の車速の上限 [km/h]・設定の表示文)。cap は pkl meta の launch_u_step_pct
+    （手順2 が動き出す開度を探した刻み）。off・meta に刻みが無いときの cap は None（働かない）。"""
+    meta = getattr(getattr(ff, "table", None), "meta", None) or {}
+    top = float(meta.get("stop_max_speed_kmh") or 7.5)
+    if not cfg.forward_map.fb_breakaway_band_cap:
+        return None, top, "なし"
+    step = meta.get("launch_u_step_pct")
+    if step is None or float(step) <= 0.0:
+        return None, top, "あり（設定）だが働かない: pkl の meta に launch_u_step_pct が無い"
+    return float(step), top, f"あり・|P| ≦ {float(step):g}%（車速 {top:g} km/h 未満）"
+
+
 def _prepare_forward_map_plan(
     cfg: ResearchConfig, mode: DrivingMode, ff: ForwardMapFeedforward
 ) -> Any:
     """C7・C8: 基準車速から開度の列を作り、中身を表示する（走行前チェックより前。HW 不使用）。"""
     ff_cfg, fm = cfg.feedforward, cfg.forward_map
     ref_at, duration_s, plan_kwargs = forward_map_plan_args(
-        cfg, mode, stop_end=isinstance(ff, StopEndFeedforward)
+        cfg, mode, stop_end=isinstance(ff, StopEndFeedforward), table=ff.table
     )
     plan = ff.build_plan(ref_at, duration_s, **plan_kwargs)
     target_ref = make_target_reference(mode, ff_cfg.ref_smooth_sigma_s)
@@ -413,6 +468,8 @@ def _prepare_forward_map_plan(
         f"{plan.side_rule}（pedal・dir でも表が発進側・停止側の両方を持たなければ legacy）")
     say("  発進の途中は FB もブレーキを深くしない（段6 C）: "
         f"{'あり' if fm.launch_midway_fb_no_deeper else 'なし'}")
+    say(f"  ペダルの動き方（段10-1・11-3）: {pedal_track_source(meta)}・"
+        f"{plan_kwargs['pedal_track']}")
     say(f"  切り替えの先読み（段5-5c）: {'あり' if fm.switch_lead_enabled else 'なし'}")
     say(f"  発進のブレーキを基準の動き出しに合わせて離す（段7-b）: "
         f"{'あり' if fm.launch_release_ramp else 'なし'}")
@@ -420,6 +477,11 @@ def _prepare_forward_map_plan(
         say(f"  動き出したら離しを止めて待つ（段8-a）: {make_launch_hold(cfg, ff, plan)[1]}")
     say("  P・惰行の補助の表から A2 を外す（段8-b）: "
         f"{'あり' if fm.fb_no_breakaway_floor else 'なし'}")
+    say("  基準 0 の行は FB もブレーキを深くしない（段3 P3）: "
+        f"{'あり' if fm.fb_no_deeper_at_ref_zero else 'なし'}")
+    say(f"  動き出す開度の帯の P を刻みに抑える（段6 P1）: {band_cap_of(cfg, ff)[2]}")
+    say("  停C の区間のブレーキ指令を浅くしない（段7 P2）: "
+        f"{'あり' if fm.stop_end_brake_monotone else 'なし'}")
     say(f"  すき間で失う分の補償（段7-c）: {'あり' if fm.switch_gap_compensate else 'なし'}")
     say("  すき間を前後の損の合計が最小で取る（段9-b）: "
         f"{'あり' if fm.switch_gap_min_loss else 'なし'}")
@@ -427,6 +489,22 @@ def _prepare_forward_map_plan(
         f"{'あり' if fm.switch_gap_rule else 'なし'}")
     say("  すき間を予測した最大偏差の最小で取る（案 C。段10-3）: "
         f"{f'あり（窓 {fm.switch_gap_peak_window_s} 秒）' if fm.switch_gap_min_peak else 'なし'}")
+    say("  R の山の戻し始めを基準の頂点の手前から探す（段11-4）: "
+        f"{'あり' if fm.switch_gap_peak_from_corner else 'なし（固定 2 秒）'}")
+    say("  R の山の採点で戻す前の水準のずれを数えず遅れのぶれを見込む（段12）: "
+        f"{'あり' if fm.switch_gap_peak_robust else 'なし'}")
+    say("  R の谷の上乗せを変わり目の直前から数え遅れのぶれを見込んで選ぶ（段12 谷）: "
+        f"{'あり' if fm.switch_gap_valley_robust else 'なし'}")
+    say("  R の山・谷ごとに「R のまま」と「後ろで取る」を予測の偏差で選ぶ（段11-5）: "
+        f"{f'あり（窓 {fm.switch_gap_peak_window_s} 秒）' if fm.switch_gap_choose else 'なし'}")
+    say("  すき間の処理の予測で低速の行を発進側・停止側の表で引く（段13）: "
+        f"{'あり' if fm.predict_low_speed_sides else 'なし'}")
+    say("  予測で両ペダル min・低速の行をクリープの曲線で引く（段14 L1）: "
+        f"{'あり' if fm.predict_creep_curve else 'なし'}")
+    ls = getattr(plan, "launch_shift", None)
+    say("  発進の並びを予測した偏差が最小になるよう後ろへずらす（段13）: "
+        f"{'あり' if fm.launch_shift_choose else 'なし'}"
+        + (f"（発進のずらし: {ls.summary()}）" if ls is not None else ""))
     say(
         "  アクセルの戻しの層を学習の範囲の中だけで使う（段9-c）: "
         f"{'あり' if fm.accel_release_in_range_only else 'なし'}"
@@ -1100,6 +1178,7 @@ def coast_params(ff: CoastAssistFeedforward, cfg: ResearchConfig) -> dict[str, A
         "ret": ret, "period_s": period,
         "accel_onset_effort": acc_on, "brake_onset_effort": brk_on,
         "one_pedal_per_section": cfg.forward_map.coast_one_pedal_per_section,
+        "release_on_cross": cfg.forward_map.coast_release_on_cross,  # 段14 K
     }
 
 
@@ -1114,6 +1193,7 @@ def coast_settings_of(ff: object, cfg: ResearchConfig) -> str:
         ff.coast_on_kmh, ff.coast_off_kmh, ff.coast_hold_coef, p["hold_accel_s"], p["hold_brake_s"],
         floor_onset=cfg.forward_map.coast_floor_onset,
         one_pedal_per_section=cfg.forward_map.coast_one_pedal_per_section,
+        release_on_cross=cfg.forward_map.coast_release_on_cross,
     )
 
 
@@ -1159,6 +1239,37 @@ def cut_deeper_brake_fb(ff_effort: float, fb_effort: float) -> float:
     return 0.0 if ff_effort <= 0.0 and fb_effort < 0.0 else fb_effort
 
 
+def cut_fb_at_ref_zero(
+    ff_effort: float, fb_effort: float, ref_kmh: float, stop_speed_kmh: float
+) -> float:
+    """段3 P3: 元の基準が停車速度以下の行で、FB の上乗せがブレーキを FF より深くする向きなら 0。
+    浅くする向き・基準が動いている行・アクセル側はそのまま返す。"""
+    if ref_kmh > stop_speed_kmh:
+        return fb_effort
+    return cut_deeper_brake_fb(ff_effort, fb_effort)
+
+
+def cap_p_in_breakaway_band(
+    delta_pct: float, ff_effort: float, speed_kmh: float, *, speed_top_kmh: float,
+    brake_min_pct: float, hold_pct: float, cap_pct: float,
+) -> float:
+    """段6 P1: 低速（speed_top_kmh 未満）のブレーキの行（ff_effort < 0）で FF のブレーキ開度が
+    min 以上・停車保持（hold_pct）未満のとき、P の上乗せ delta の大きさを cap_pct に抑える
+    （両方向。踏み増しも離しも）。帯の外はそのまま。"""
+    brake = -ff_effort
+    if speed_kmh >= speed_top_kmh or ff_effort >= 0.0 or not brake_min_pct <= brake < hold_pct:
+        return delta_pct
+    return max(-cap_pct, min(cap_pct, delta_pct))
+
+
+def stop_end_monotone_brake(effort: float, prev_effort: float | None) -> float:
+    """段7 P2: 停C の区間のブレーキ指令（負）を、前の周期のブレーキ指令より浅くしない。
+    前の周期が区間外・ブレーキでなければ（prev_effort が None）そのまま。"""
+    if prev_effort is None or effort >= 0.0:
+        return effort
+    return min(effort, prev_effort)
+
+
 class _ModeRun:
     """1 本のモード走行の状態。run() が 50ms 周期でモード終わりまで回す。"""
 
@@ -1174,6 +1285,18 @@ class _ModeRun:
     launch_hold: LaunchMoveHold | None = None
     _launch_hold_pct: float | None = None
     fb_no_floor: bool = False
+    # 2026-10-27 段3 P3・段6 P1・段7 P2 の既定（false のまま ＝ 今と同じ）
+    fb_ref0_no_deeper: bool = False
+    fb_ref0_cut_cycles: int = 0
+    fb_ref0_cut_pct_sum: float = 0.0
+    band_cap_pct: float | None = None  # None ＝ 機能が off（または meta に刻みが無く働かない）
+    band_cap_top_kmh: float = 7.5
+    band_cap_cycles: int = 0
+    band_cap_pct_sum: float = 0.0
+    stop_end_monotone: bool = False
+    stop_end_prev_effort: float | None = None
+    stop_end_monotone_cycles: int = 0
+    stop_end_monotone_pct_sum: float = 0.0
 
     def __init__(
         self,
@@ -1300,6 +1423,19 @@ class _ModeRun:
         self.midway_fb_no_deeper = bool(cfg.forward_map.launch_midway_fb_no_deeper)
         self.midway_fb_cut_cycles = 0  # 抑えた周期数
         self.midway_fb_cut_pct_sum = 0.0  # 抑えた量（ブレーキの深さ [%]）の合計
+        # 段3 P3: 基準 0 の行は FB もブレーキを深くしない（forward_map.fb_no_deeper_at_ref_zero）
+        self.fb_ref0_no_deeper = bool(cfg.forward_map.fb_no_deeper_at_ref_zero)
+        self.fb_ref0_cut_cycles = 0
+        self.fb_ref0_cut_pct_sum = 0.0
+        # 段6 P1: 動き出す開度の帯の P を cap に抑える（forward_map.fb_breakaway_band_cap）
+        self.band_cap_pct, self.band_cap_top_kmh, _band_text = band_cap_of(cfg, self.ff)
+        self.band_cap_cycles = 0
+        self.band_cap_pct_sum = 0.0
+        # 段7 P2: 停C の区間のブレーキ指令を浅くしない（forward_map.stop_end_brake_monotone）
+        self.stop_end_monotone = bool(cfg.forward_map.stop_end_brake_monotone)
+        self.stop_end_prev_effort = None
+        self.stop_end_monotone_cycles = 0
+        self.stop_end_monotone_pct_sum = 0.0
         # 段8-a: 基準 0 で動き出したら離しを止めて待つ（forward_map.launch_move_hold）
         self.launch_hold = None
         self._launch_hold_pct = None
@@ -1446,6 +1582,15 @@ class _ModeRun:
                     self.midway_fb_cut_cycles += 1
                     self.midway_fb_cut_pct_sum += -c10_effort
                     c10_effort = cut
+        if self.fb_ref0_no_deeper and c10_effort and isinstance(self.ff, ForwardMapFeedforward):
+            # 段3 P3: 元の基準が停車速度以下の行は FB もブレーキを深くしない
+            from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+
+            cut = cut_fb_at_ref_zero(ff_effort, c10_effort, ref, STOP_SPEED_KMH)
+            if cut != c10_effort:
+                self.fb_ref0_cut_cycles += 1
+                self.fb_ref0_cut_pct_sum += -c10_effort
+                c10_effort = cut
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
         hold_delta = self._launch_hold_step(t, speed, ff_effort)  # 段8-a（off なら 0）
         # C10 の上乗せは FF の列（accel_ff・brake_ff・plan_effort）には入れない（作ったずれが
@@ -1463,6 +1608,17 @@ class _ModeRun:
             floored = self.cfloor.apply(*args, effort, self._last_accel_actual)
             floor_raise = effort - floored
             effort = floored
+        if self.stop_end_monotone:
+            # 段7 P2: 停C の区間（τ あり・停車保持でない）はブレーキ指令を前の周期より浅くしない。
+            # 区間を抜けたら（τ なし・アクセル・惰行の 0）前の値を捨てる
+            in_end = self._stop_end_tau_s is not None and effort < 0.0
+            if in_end:
+                held = stop_end_monotone_brake(effort, self.stop_end_prev_effort)
+                if held != effort:
+                    self.stop_end_monotone_cycles += 1
+                    self.stop_end_monotone_pct_sum += effort - held
+                effort = held
+            self.stop_end_prev_effort = effort if in_end else None
         # ログの「指示開度 FF」列（FF の出力をペダル別に分けた値。ガバナー・待機位置の前）
         accel_ff, brake_ff = split_effort(
             ff_shown, cfg.vehicle.max_accel_opening_pct, cfg.vehicle.max_brake_opening_pct
@@ -1754,6 +1910,17 @@ class _ModeRun:
                 self._stop_end_tau_s = tau_end
                 self.stop_end.stats.add(True, normal - new)  # 深い向きが正
         delta = new - ff_effort
+        if self.band_cap_pct is not None:
+            # 段6 P1: 動き出す開度の帯（低速・FF がブレーキで min〜停車保持）の P は cap まで
+            capped = cap_p_in_breakaway_band(
+                delta, ff_effort, speed, speed_top_kmh=self.band_cap_top_kmh,
+                brake_min_pct=v.min_brake_opening_pct,
+                hold_pct=self.cfg.stop_brake_opening_pct, cap_pct=self.band_cap_pct,
+            )
+            if capped != delta:
+                self.band_cap_cycles += 1
+                self.band_cap_pct_sum += abs(delta - capped)
+                delta = capped
         if dob is not None:
             p_only, _ = deviation_offset_detail(fb_table, **kwargs)
             self._dob_effort = (new - p_only) if ff_effort != 0.0 else 0.0
@@ -2120,6 +2287,19 @@ async def run_mode_drive(
         say("  発進の途中の FB のブレーキ踏み増しの抑え（段6 C）: "
             f"{run.midway_fb_cut_cycles} 周期（{run.midway_fb_cut_cycles * run.interval_s:.1f}s）・"
             f"抑えた量の合計 {run.midway_fb_cut_pct_sum:.1f}%")
+    if run.fb_ref0_no_deeper:
+        say("  基準 0 の行の FB のブレーキ踏み増しの抑え（段3 P3）: "
+            f"{run.fb_ref0_cut_cycles} 周期（{run.fb_ref0_cut_cycles * run.interval_s:.1f}s）・"
+            f"抑えた量の合計 {run.fb_ref0_cut_pct_sum:.1f}%")
+    if run.band_cap_pct is not None:
+        say("  動き出す開度の帯の P の抑え（段6 P1）: "
+            f"{run.band_cap_cycles} 周期（{run.band_cap_cycles * run.interval_s:.1f}s）・"
+            f"cap {run.band_cap_pct:g}%・削った量の合計 {run.band_cap_pct_sum:.1f}%")
+    if run.stop_end_monotone:
+        say("  停C の区間のブレーキを浅くしない（段7 P2）: "
+            f"{run.stop_end_monotone_cycles} 周期"
+            f"（{run.stop_end_monotone_cycles * run.interval_s:.1f}s）・"
+            f"踏み増しにした量の合計 {run.stop_end_monotone_pct_sum:.1f}%")
     if run.c10 is not None:
         say(f"  C10（偏差の上乗せ。{c10_settings_text(run.ff)}）: {run.c10.summary()}")
     if run.dob_stats is not None:

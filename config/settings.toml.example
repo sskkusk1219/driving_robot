@@ -42,6 +42,12 @@ retries = 3
 # max_accel_g は「加減速度別可搬質量」表（1.2.2）の運用速度域で十分な可搬質量が残る値。
 # 100mm/s では accel 0.3G→40kg / brake 0.3G→50kg（高出力設定無効・水平）。
 # 注意:「加減速度は、許容値以上の設定は行わないでください」
+#
+# speed_mm_s / max_accel_g は運用値（2026-10-27 ユーザー決定）。実機で大きな動き（発進・
+# 踏み替え）は従来の 100mm/s で頭打ちだったため上げた。実機で 250/200 mm/s まで指令どおり
+# 動作しアラームなしを確認済み。speed_mm_s は max_speed_mm_s（仕様 1.2.1 の高出力設定なし
+# 上限）の 90%。max_accel_g 0.6 は仕様 1.2.2（モーター折返し・高出力設定なし・水平）の上限
+# 0.7G に余裕を見た値（取り付けは水平とユーザー確認）。
 
 [actuator.accel]
 # アクセルペダル用
@@ -49,7 +55,8 @@ model = "RCP6-RA6R-WA-42P-6-100-P3-M-MT"
 lead_mm = 6.0        # → 最低速度 7.5 mm/s
 stroke_mm = 100.0
 max_speed_mm_s = 250.0  # 高出力設定無効時（有効時は 450）
-max_accel_g = 0.3
+speed_mm_s = 225.0      # 運用の速度指令（上限の 90%）
+max_accel_g = 0.6
 
 [actuator.brake]
 # ブレーキペダル用
@@ -57,7 +64,8 @@ model = "RCP6-RA7R-WA-56P-8-100-P3-M-ML"
 lead_mm = 8.0        # → 最低速度 10.0 mm/s
 stroke_mm = 100.0
 max_speed_mm_s = 210.0  # 高出力設定無効時（有効時は 水平420 / 垂直350）
-max_accel_g = 0.3
+speed_mm_s = 190.0      # 運用の速度指令（上限の 90%）
+max_accel_g = 0.6
 
 [can]
 # python-can インターフェース名

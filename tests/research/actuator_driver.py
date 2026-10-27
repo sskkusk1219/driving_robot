@@ -50,6 +50,10 @@ _REG_ACMD = 0x9906  # 加減速指令
 _REG_CTLF = 0x9908  # 制御フラグ
 
 # デフォルト移動パラメータ
+# 2026-10-27: 下の既定値は軸ごとの指定がないときのフォールバック。運用値は
+# settings.toml [actuator.*] speed_mm_s / max_accel_g（アクセル 225・ブレーキ 190 mm/s、
+# 0.6G）で渡す。実測で大きな動き（発進・踏み替え）は 100mm/s で頭打ちだった
+# （実機で 250/200 mm/s まで指令どおり動作・アラームなしを確認）。以下は旧判断の記録:
 # VCMD は固定のまま。走行中の 1 サイクル移動量は accel 中央値 0.082mm / p95 0.215mm /
 # max 0.630mm、brake 中央値 0.040mm / max 2.244mm（実機 9eee549b 全サイクル実測）で、
 # 100mm/s・0.3G の三角プロファイル境界 3.4mm を**一度も超えない**＝走行中の移動は
@@ -61,17 +65,19 @@ _REG_CTLF = 0x9908  # 制御フラグ
 # 走行中 binding しない以上、上げる理由も現時点でない（上げるならベンチで滑らかさを
 # 比較してから。settings.toml [actuator.*] max_speed_mm_s に仕様値を記録済み）。
 _DEFAULT_SPEED_MM_S = 100  # 速度 [mm/s]
-# 0.3G。仕様の「加減速度別可搬質量」（MJ3751-2Q 1.2.2）では 100mm/s 時に accel(RA6R
-# リード6) 0.3G→40kg・brake(RA7R リード8) 0.3G→50kg（いずれも高出力設定無効・水平）と
-# ペダル反力に対して十分な余裕がある。表は 0.7G（無効時の上限列）まであるので上げる
-# 余地はあるが、本ドライバの変更方向は「微小移動で ACMD を**下げる**」なので上げない。
+# 0.3G（フォールバック）。仕様の「加減速度別可搬質量」（MJ3751-2Q 1.2.2）では 100mm/s 時に
+# accel(RA6R リード6) 0.3G→40kg・brake(RA7R リード8) 0.3G→50kg（いずれも高出力設定無効・
+# 水平）とペダル反力に対して十分な余裕がある。運用の上限は max_accel で渡す（0.6G。上記）。
 _DEFAULT_ACCEL = 30  # 加減速指令（ACMD）[0.01G 単位、設定範囲 1〜300]
 
 # ── 移動ごとの加減速度（ACMD）算出 ─────────────────────────────────────────
 # ACMD 1 単位 = 0.01G = 98.1 mm/s²（MODBUS 5-132: 単位 0.01G・設定範囲 1〜300）。
 _ACMD_UNIT_MM_S2 = 0.01 * 9810.0
-# ACMD の下限・上限。上限 30（0.3G）は従来の固定値で、定格加減速度が仕様書にもリポジトリにも
-# 記載がないため**これ以上は上げない**（超過すると移動開始指令時にアラームが発生する）。
+# ACMD の下限・上限。上限の既定 30（0.3G）は従来の固定値。運用の上限は軸ごとに
+# ActuatorDriver(max_accel=...) で渡す（settings.toml [actuator.*] max_accel_g）。
+# 2026-10-27 ユーザー決定: 0.6G。仕様 MJ3751-2Q 1.2.2（モーター折返し・高出力設定なし・
+# 水平）の上限は 0.7G で、取り付けは水平（ユーザー確認）。余裕を見て 0.6G とする。
+# 上限を超えると移動開始指令時にアラームが発生する。
 _ACMD_MIN = 1
 _ACMD_MAX = _DEFAULT_ACCEL
 # 移動を何秒かけて終わらせたいか＝制御周期に対する比。1.0 だとジッタで取りこぼすため 0.8。
@@ -87,7 +93,7 @@ _ACMD_TARGET_DUTY = 0.8
 # settings.toml に未記入のときのフォールバックで、RCP6-ROD 全バリエーションの最大リード
 # 24mm の最低速度 30mm/s よりは緩く、代表的なリード 10 相当に置く。
 _MIN_TIMED_SPEED_MM_S = 12.5
-_MAX_TIMED_SPEED_MM_S = _DEFAULT_SPEED_MM_S  # 上限＝既存の固定速度（今より速くはしない）
+_MAX_TIMED_SPEED_MM_S = _DEFAULT_SPEED_MM_S  # 旧上限（現在は軸の運用速度でクランプ）
 # 最低速度の算出式の分母（リード長 ÷ 800 ÷ 0.001秒 = リード長 ÷ 0.8）。
 _MIN_SPEED_LEAD_DIVISOR = 0.8
 
@@ -102,7 +108,7 @@ def min_speed_for_lead(lead_mm: float) -> float:
     return lead_mm / _MIN_SPEED_LEAD_DIVISOR
 
 
-def acmd_for_move(distance_mm: float, duration_s: float) -> int:
+def acmd_for_move(distance_mm: float, duration_s: float, *, acmd_max: int = _ACMD_MAX) -> int:
     """移動距離 distance_mm を duration_s かけて終える加減速指令（ACMD）を返す。
 
     **なぜ速度ではなく加減速度を可変にするか**（実機 9eee549b 実測）:
@@ -117,13 +123,13 @@ def acmd_for_move(distance_mm: float, duration_s: float) -> int:
     動かなくなる。
 
     三角プロファイル t = 2√(d/a) より a = 4d/t²。ACMD = a / 0.01G を [1, 30] にクランプする
-    （大きな移動は従来どおり 0.3G で速く、微小移動だけ緩やかになる）。
+    （大きな移動は上限 acmd_max（既定 0.3G）で速く、微小移動だけ緩やかになる）。
     """
     if distance_mm <= 0.0 or duration_s <= 0.0:
-        return _ACMD_MAX
+        return acmd_max
     accel_mm_s2 = 4.0 * distance_mm / (duration_s * duration_s)
     acmd = round(accel_mm_s2 / _ACMD_UNIT_MM_S2)
-    return max(_ACMD_MIN, min(_ACMD_MAX, acmd))
+    return max(_ACMD_MIN, min(acmd_max, acmd))
 
 _HOME_RETURN_TIMEOUT_S = 30.0
 _HOME_RETURN_POLL_INTERVAL_S = 0.1
@@ -184,6 +190,10 @@ class ActuatorDriver:
         # この軸のボールねじリード長 [mm]（settings.toml [actuator.*] lead_mm）。
         # 最低速度 = lead_mm / 0.8 の算出にだけ使う。0/None なら従来の固定既定値。
         lead_mm: float = 0.0,
+        # この軸の運用速度 [mm/s]（VCMD。settings.toml [actuator.*] speed_mm_s）。
+        speed_mm_s: float = _DEFAULT_SPEED_MM_S,
+        # この軸の ACMD 上限 [0.01G 単位]（max_accel_g × 100。設定範囲 1〜300）。
+        max_accel: int = _DEFAULT_ACCEL,
     ) -> None:
         self._port = port
         self._slave_id = slave_id
@@ -203,6 +213,8 @@ class ActuatorDriver:
         # 直近に送った目標位置 [pulse]。移動距離から ACMD を決めるのに使う（acmd_for_move）。
         self._last_commanded_pos: int | None = None
         self._lead_mm = lead_mm
+        self._speed_mm_s = speed_mm_s
+        self._max_accel = max_accel
         # 時間指定移動の下限速度。仕様の最低速度未満は「設定した速度では動きません」。
         self._min_timed_speed_mm_s = min_speed_for_lead(lead_mm)
 
@@ -405,7 +417,7 @@ class ActuatorDriver:
     async def move_to_position(
         self,
         pos: int,
-        speed_mm_s: float = _DEFAULT_SPEED_MM_S,
+        speed_mm_s: float | None = None,
         accel: int | None = None,
         *,
         smooth_over_s: float | None = None,
@@ -418,19 +430,22 @@ class ActuatorDriver:
 
         Args:
             pos: 目標位置 [pulse / 0.01mm 単位]
-            speed_mm_s: 移動速度 [mm/s]（VCMD。0.01mm/s 単位へ丸めて送出）
+            speed_mm_s: 移動速度 [mm/s]（VCMD。0.01mm/s 単位へ丸めて送出）。
+                None ならこの軸の運用速度（コンストラクタの speed_mm_s）。
             accel: 加減速指令 [0.01G 単位]。None なら smooth_over_s から算出、
-                smooth_over_s も None なら _DEFAULT_ACCEL。
+                smooth_over_s も None ならこの軸の ACMD 上限（max_accel）。
             smooth_over_s: この秒数かけて移動を終えるよう ACMD を落とす（acmd_for_move）。
                 前回指令位置からの距離で決めるため、連続指令の 1 サイクルぶんを渡す。
         """
         client = self._require_client()
+        if speed_mm_s is None:
+            speed_mm_s = self._speed_mm_s
         if accel is None:
             if smooth_over_s is not None and self._last_commanded_pos is not None:
                 distance_mm = abs(pos - self._last_commanded_pos) / 100.0
-                accel = acmd_for_move(distance_mm, smooth_over_s)
+                accel = acmd_for_move(distance_mm, smooth_over_s, acmd_max=self._max_accel)
             else:
-                accel = _DEFAULT_ACCEL
+                accel = self._max_accel
         pcmd_hi, pcmd_lo = _from_signed32(pos)
         vcmd_hi, vcmd_lo = _from_signed32(round(speed_mm_s * 100))  # VCMD は 0.01mm/s 単位
 
@@ -472,7 +487,7 @@ class ActuatorDriver:
         target_pos: int,
         current_pos: int,
         duration_s: float,
-        accel: int = _DEFAULT_ACCEL,
+        accel: int | None = None,
     ) -> None:
         """目標位置まで「指定時間かけて」移動する（速度を距離÷時間で算出）。
 
@@ -484,19 +499,19 @@ class ActuatorDriver:
             target_pos: 目標位置 [pulse / 0.01mm 単位]
             current_pos: 現在（直近指令）位置 [同]。距離算出に使う（Modbus 読みは挟まない）
             duration_s: 目標到達までの目標時間 [s]。<=0 または距離0 のときは許容最速で移動
-            accel: 加減速指令（ACMD）
+            accel: 加減速指令（ACMD）。None ならこの軸の ACMD 上限（max_accel）
 
-        速度は [この軸の最低速度, _MAX_TIMED_SPEED_MM_S] にクランプする。最低速度は
+        速度は [この軸の最低速度, この軸の運用速度] にクランプする。最低速度は
         リード長由来（min_speed_for_lead）で、下回る指令はアクチュエータが**まったく
         動かない**ため引き上げて WARNING を出す。
         """
         distance_mm = abs(target_pos - current_pos) / 100.0  # PCMD は 0.01mm 単位
         if duration_s <= 0.0 or distance_mm <= 0.0:
-            speed_mm_s = float(_MAX_TIMED_SPEED_MM_S)
+            speed_mm_s = float(self._speed_mm_s)
         else:
             speed_mm_s = distance_mm / duration_s
         min_speed = self._min_timed_speed_mm_s
-        clamped = max(min_speed, min(speed_mm_s, _MAX_TIMED_SPEED_MM_S))
+        clamped = max(min_speed, min(speed_mm_s, self._speed_mm_s))
         if clamped > speed_mm_s:
             # 仕様の最低速度を下回る指令はアクチュエータが**まったく動かない**ため、
             # 下限へ引き上げる（要求より早く着くが、動かないよりは良い）。

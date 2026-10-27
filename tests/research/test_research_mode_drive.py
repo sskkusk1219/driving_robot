@@ -1587,7 +1587,7 @@ async def test_c12_assists_in_coast_rows_and_logs_coast_effort(
     r12, csv12 = results["C12"]
     r11, csv11 = results["C11"]
     assert r11.coast_stats is None and r11.coast_settings is None
-    assert r12.coast_stats is not None and "入る 0.5 km/h" in (r12.coast_settings or "")
+    assert r12.coast_stats is not None and "入る 0.2 km/h" in (r12.coast_settings or "")
     st = r12.coast_stats
     assert st.accel_entries + st.brake_entries >= 1 and st.accel_s + st.brake_s > 0.0
     out = capsys.readouterr().out
@@ -1895,3 +1895,112 @@ async def test_fb_no_breakaway_floor_lets_p_go_deeper_than_bk(
     on, _ = deviation_offset_detail(fb, **kw)
     assert off == pytest.approx(-15.0)  # A2 あり: bk（4.0）より深い解は頭打ち → P は何も足さない
     assert on < -15.0 - 1.0  # A2 なし: ref ≦ 0.5 km/h でも bk より深く踏み増せる
+
+
+# --- 2026-10-26 段11-3: PedalTrack は pkl の meta（手順2 で測った値）を優先、無ければ yaml ---
+
+
+def _pt_meta(**over: float) -> dict[str, float]:
+    from tests.research.pedal_lag import PEDAL_TRACK_META_KEYS
+
+    base = dict(zip(PEDAL_TRACK_META_KEYS, (0.01, 105.0, 1200.0, 0.01, 105.0, 1200.0, 0.125, 0.1),
+                    strict=True))
+    base.update(over)
+    return {f"pedal_track_{k}": v for k, v in base.items()}
+
+
+def test_pedal_track_of_prefers_meta_and_falls_back_to_yaml() -> None:
+    from tests.research.config import ForwardMapSection
+    from tests.research.mode_drive import _pedal_track_of, pedal_track_source
+
+    fm = ForwardMapSection()
+    meta = _pt_meta()
+    t = _pedal_track_of(fm, meta)
+    assert (t.accel_delay_s, t.accel_max_rate_pct_s, t.accel_max_accel_pct_s2) == (
+        0.01, 105.0, 1200.0)
+    assert (t.accel_effect_lag_s, t.brake_effect_lag_s) == (0.125, 0.1)
+    assert "meta" in pedal_track_source(meta)
+    # meta なし（古い pkl）・None は yaml（config の値）
+    for m in (None, {}, {"accel_deadband_pct": 4.2}):
+        t = _pedal_track_of(fm, m)
+        assert t.accel_max_rate_pct_s == fm.pedal_track_accel_max_rate_pct_s
+        assert t.brake_effect_lag_s == fm.pedal_track_brake_effect_lag_s
+        assert "yaml" in pedal_track_source(m)
+    # 1 つ欠ける・非有限・範囲外（速さ 0 以下・遅れ負）は meta 全体を使わない
+    bad_missing = _pt_meta()
+    del bad_missing["pedal_track_brake_effect_lag_s"]
+    for bad in (bad_missing, _pt_meta(accel_max_rate_pct_s=0.0),
+                _pt_meta(accel_delay_s=float("nan")), _pt_meta(brake_effect_lag_s=-0.1)):
+        assert _pedal_track_of(fm, bad).accel_max_rate_pct_s == fm.pedal_track_accel_max_rate_pct_s
+
+
+# --- 2026-10-27 段3 P3・段6 P1・段7 P2: FB（C10 の P）まわりの 3 つの機能（既定 off） ---
+
+
+def test_cut_fb_at_ref_zero_only_cuts_deeper_brake_when_ref_is_stopped() -> None:
+    stop = 0.02
+    # 基準 0・ブレーキの行・偏差 + で P が深くする向き（負）→ 0
+    assert mdmod.cut_fb_at_ref_zero(-8.6, -9.6, 0.0, stop) == 0.0
+    # 浅くする向き（正）は通す
+    assert mdmod.cut_fb_at_ref_zero(-8.6, +0.5, 0.0, stop) == 0.5
+    # 基準が動いている行は通す（深くする向きでも）
+    assert mdmod.cut_fb_at_ref_zero(-8.6, -9.6, 0.5, stop) == -9.6
+    # アクセルの行（FF > 0）は触らない
+    assert mdmod.cut_fb_at_ref_zero(3.0, -1.0, 0.0, stop) == -1.0
+
+
+def test_cap_p_in_breakaway_band_caps_only_inside_band() -> None:
+    kw = dict(speed_top_kmh=7.5, brake_min_pct=4.2, hold_pct=18.09, cap_pct=0.25)
+    cap = mdmod.cap_p_in_breakaway_band
+    # 帯の中（低速・FF ブレーキ 8.57%）: 両方向とも |delta| ≦ cap
+    assert cap(-1.0, -8.57, 1.0, **kw) == -0.25
+    assert cap(+5.0, -8.57, 1.0, **kw) == 0.25
+    assert cap(0.1, -8.57, 1.0, **kw) == 0.1  # cap 以下はそのまま
+    # 帯の外: 車速が上限以上・FF がアクセル・ブレーキ開度が min 未満・停車保持以上
+    assert cap(-1.0, -8.57, 7.5, **kw) == -1.0
+    assert cap(-1.0, 8.57, 1.0, **kw) == -1.0
+    assert cap(-1.0, -3.0, 1.0, **kw) == -1.0
+    assert cap(-1.0, -18.09, 1.0, **kw) == -1.0
+
+
+def test_stop_end_monotone_brake_never_lets_go_inside_section() -> None:
+    f = mdmod.stop_end_monotone_brake
+    prev = None
+    out = []
+    for e in (-8.0, -9.0, -7.0, -10.0, -6.0):  # 区間の中: 踏み増すだけ
+        prev = f(e, prev)
+        out.append(prev)
+    assert out == [-8.0, -9.0, -9.0, -10.0, -10.0]
+    # 前の周期が区間外（None）なら離してよい・アクセル側（≥ 0）は触らない
+    assert f(-5.0, None) == -5.0
+    assert f(2.0, -9.0) == 2.0
+
+
+def test_band_cap_of_uses_meta_step_and_reports_missing(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    cfg = _c7_cfg(tmp_path)
+    ff = SimpleNamespace(table=SimpleNamespace(meta={
+        "launch_u_step_pct": 0.25, "stop_max_speed_kmh": 7.5}))
+    assert mdmod.band_cap_of(cfg, ff)[0] is None  # 既定 off
+    cfg.forward_map.fb_breakaway_band_cap = True
+    cap, top, text = mdmod.band_cap_of(cfg, ff)
+    assert cap == 0.25 and top == 7.5 and "あり" in text
+    cap, top, text = mdmod.band_cap_of(cfg, SimpleNamespace(table=SimpleNamespace(meta={})))
+    assert cap is None and top == 7.5 and "働かない" in text  # meta に刻みなし → 止めて知らせる
+
+
+def test_new_fb_features_default_off_and_run_defaults_are_identity() -> None:
+    fm = cfgmod.ForwardMapSection()
+    assert (fm.fb_no_deeper_at_ref_zero, fm.fb_breakaway_band_cap,
+            fm.stop_end_brake_monotone) == (False, False, False)
+    run = mdmod._ModeRun.__new__(mdmod._ModeRun)  # noqa: SLF001
+    assert run.fb_ref0_no_deeper is False and run.band_cap_pct is None
+    assert run.stop_end_monotone is False
+    # 3 つと launch_midway_fb_no_deeper は同時に true にできる（検査に引っかからない）
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.forward_map.fb_no_deeper_at_ref_zero = True
+    cfg.forward_map.fb_breakaway_band_cap = True
+    cfg.forward_map.stop_end_brake_monotone = True
+    cfg.forward_map.launch_midway_fb_no_deeper = True
+    assert cfgmod.validate_config(cfg) == []

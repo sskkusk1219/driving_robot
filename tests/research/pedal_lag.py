@@ -35,6 +35,7 @@ import csv
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -476,4 +477,172 @@ def estimate_pedal_return(csv_path: Path) -> PedalReturn:
     return PedalReturn(
         accel=_fit_return(np.array(data["accel_cmd_pct"]), np.array(data["accel_actual_pct"]), t),
         brake=_fit_return(np.array(data["brake_cmd_pct"]), np.array(data["brake_actual_pct"]), t),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-26 段11-2: ペダルの位置の動き方・位置 → 車の加速度の遅れ（PedalTrack）を手順2 から測る
+# （ProblemReport_20261026_2 段2・段3）。値は以前 yaml の forward_map.pedal_track_* にモード走行から
+# 当てはめた数字を置いていたが、本番ではモードを走れないので、手順2 の CSV と表から求める。
+
+# 動きの当てはめの格子（delay [s]・速さの上限 [%/s]・加速度の上限 [%/s^2]）
+TRACK_DELAY_GRID_S = (0.0, 0.01, 0.02, 0.03)
+# 2026-10-27 ProblemReport_20261027 段1: ペダルの速度を 225/190 mm/s・0.6G に上げたので上側を広げた
+# （225 mm/s ≒ 237 %/s・0.6G ≒ 6200 %/s^2。旧格子の上端 120・3000 に張り付いた `215040`）
+TRACK_VMAX_GRID = (
+    70.0, 80.0, 90.0, 100.0, 105.0, 110.0, 120.0, 140.0, 160.0, 180.0, 200.0, 220.0, 240.0,
+)
+TRACK_AMAX_GRID = (
+    800.0, 1000.0, 1200.0, 1400.0, 1700.0, 2000.0, 2500.0, 3000.0, 4000.0, 5000.0, 6000.0, 7000.0,
+)
+# 実位置が 1 周期でこれ以上動いた行を「動いた」とする [%]
+TRACK_MOVED_PCT = 0.05
+# 動いた行の数の下限。これ未満は「測れず」
+TRACK_MIN_MOVED_ROWS = 20
+# 位置 → 加速度の遅れ λ の探索範囲 [s]
+TRACK_LAG_GRID_S = tuple(round(0.025 * i, 3) for i in range(13))
+# 遅れの残差: 車速の下限 [km/h]・動いた行の前後の行数・基準のゆっくりした成分を引く窓の行数
+TRACK_LAG_MIN_SPEED_KMH = 3.0
+TRACK_LAG_NEAR_ROWS = 4
+TRACK_LAG_DETREND_ROWS = 81
+TRACK_LAG_SPEED_SMOOTH_ROWS = 3
+
+
+# pkl の meta に入れるキー（`pedal_track_` + 名前）。`fwd_plan.PedalTrack` のフィールド名と同じ
+PEDAL_TRACK_META_KEYS = (
+    "accel_delay_s", "accel_max_rate_pct_s", "accel_max_accel_pct_s2",
+    "brake_delay_s", "brake_max_rate_pct_s", "brake_max_accel_pct_s2",
+    "accel_effect_lag_s", "brake_effect_lag_s",
+)
+
+
+@dataclass(frozen=True)
+class PedalTrackFit:
+    """手順2 から測ったペダルの動き方（`fwd_plan.PedalTrack` の 8 値）。
+
+    ブレーキの動き（delay・速さ・加速度の上限）は手順2 に速い動きが無く測れないため、アクセルの
+    当てはめ値をそのまま使う（2026-10-26 ユーザー決定）。遅れ λ だけペダル別に測る。
+    """
+
+    measured: bool
+    reason: str = ""
+    accel_delay_s: float = math.nan
+    accel_max_rate_pct_s: float = math.nan
+    accel_max_accel_pct_s2: float = math.nan
+    brake_delay_s: float = math.nan
+    brake_max_rate_pct_s: float = math.nan
+    brake_max_accel_pct_s2: float = math.nan
+    accel_effect_lag_s: float = math.nan
+    brake_effect_lag_s: float = math.nan
+    rmse_pct: float = math.nan  # 動きの当てはめの位置の RMSE [%]（動いた行）
+    n_moved_accel: int = 0  # アクセルの実位置が動いた行数
+    n_moved_brake: int = 0  # ブレーキの同
+
+
+def _read_track_columns(csv_path: Path) -> dict[str, np.ndarray]:
+    cols = (
+        "actual_speed_kmh", "accel_cmd_pct", "accel_actual_pct", "brake_actual_pct",
+    )
+    data: dict[str, list[float]] = {c: [] for c in cols}
+    with Path(csv_path).open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            try:
+                vals = [float(row[c]) for c in cols]
+            except (KeyError, ValueError):
+                continue
+            for c, v in zip(cols, vals, strict=True):
+                data[c].append(v)
+    return {c: np.array(v) for c, v in data.items()}
+
+
+def _rolling_median(x: np.ndarray, window: int) -> np.ndarray:
+    """中心窓の移動中央値（端は窓を縮める＝min_periods=1）。"""
+    half = window // 2
+    n = len(x)
+    out = np.empty(n)
+    for i in range(n):
+        out[i] = np.median(x[max(0, i - half):min(n, i + half + 1)])
+    return out
+
+
+def _rolling_mean3(x: np.ndarray, window: int) -> np.ndarray:
+    half = window // 2
+    n = len(x)
+    cs = np.concatenate([[0.0], np.cumsum(x)])
+    lo = np.maximum(0, np.arange(n) - half)
+    hi = np.minimum(n, np.arange(n) + half + 1)
+    return (cs[hi] - cs[lo]) / (hi - lo)
+
+
+def estimate_pedal_track(
+    csv_path: Path, table: Any, *, accel_min_pct: float, brake_min_pct: float,
+    period_s: float = 0.05,
+) -> PedalTrackFit:
+    """手順2 の CSV と表から `PedalTrack` の 8 値を測る（2026-10-26 段11-2）。
+
+    動き（delay・速さの上限・加速度の上限）: アクセルの指令（min で下限）→ 実位置の列を
+    `fwd_plan._follow_pedal` で追い、実位置が動いた行（|差分| > 0.05%）の RMSE が最小の格子点を採る
+    ブレーキは同じ値を使う（手順2 に速い動きが無く測れない。ユーザー決定）。
+    遅れ λ: 実測の加速度（車速の 3 点平均の勾配）と、実位置を λ ずらして表（本体）から引いた加速度の
+    差（80 行の中央値を引いて水準のずれを除く）の二乗和を、ペダルが動いた行の前後 ±4 行・車速 3 km/h
+    超で最小にする λ（0〜0.3 s・0.025 刻み）。ペダル別。
+    動いた行が少ない・読めない・列が無いときは measured=False（reason に理由）。
+    """
+    from tests.research.fwd_plan import PedalTrack, _follow_pedal, predicted_accel  # noqa: PLC0415
+
+    try:
+        d = _read_track_columns(csv_path)
+    except OSError as exc:
+        return PedalTrackFit(measured=False, reason=f"CSV を読めない（{exc}）")
+    cmd, act = d["accel_cmd_pct"], d["accel_actual_pct"]
+    brk, v = d["brake_actual_pct"], d["actual_speed_kmh"]
+    n = len(cmd)
+    if n < 2:
+        return PedalTrackFit(measured=False, reason="CSV の行がない・列が足りない")
+    moved_a = np.zeros(n, dtype=bool)
+    moved_b = np.zeros(n, dtype=bool)
+    moved_a[1:] = np.abs(np.diff(act)) > TRACK_MOVED_PCT
+    moved_b[1:] = np.abs(np.diff(brk)) > TRACK_MOVED_PCT
+    na, nb = int(moved_a.sum()), int(moved_b.sum())
+    if na < TRACK_MIN_MOVED_ROWS:
+        return PedalTrackFit(
+            measured=False, n_moved_accel=na, n_moved_brake=nb,
+            reason=f"アクセルが動いた行 {na} 件（{TRACK_MIN_MOVED_ROWS} 件未満）",
+        )
+
+    best: tuple[float, float, float, float] | None = None
+    for dl in TRACK_DELAY_GRID_S:
+        for vm in TRACK_VMAX_GRID:
+            for am in TRACK_AMAX_GRID:
+                pos = _follow_pedal(cmd, float(act[0]), dl, vm, am, accel_min_pct, period_s)
+                rmse = float(np.sqrt(np.mean((pos[moved_a] - act[moved_a]) ** 2)))
+                if best is None or rmse < best[0]:
+                    best = (rmse, dl, vm, am)
+    assert best is not None
+    rmse, dl, vm, am = best
+
+    aa = np.gradient(_rolling_mean3(v, TRACK_LAG_SPEED_SMOOTH_ROWS), period_s)
+    base = (v > TRACK_LAG_MIN_SPEED_KMH)
+    kernel = np.ones(2 * TRACK_LAG_NEAR_ROWS + 1)
+    mask_a = base & (np.convolve(moved_a.astype(float), kernel, "same") > 0)
+    mask_b = base & (np.convolve(moved_b.astype(float), kernel, "same") > 0)
+    sse_a: dict[float, float] = {}
+    sse_b: dict[float, float] = {}
+    for lam in TRACK_LAG_GRID_S:
+        trk = PedalTrack(accel_effect_lag_s=lam, brake_effect_lag_s=lam)
+        a = predicted_accel(
+            table, v, act, brk, track=trk, accel_min_pct=accel_min_pct,
+            brake_min_pct=brake_min_pct, period_s=period_s,
+        )
+        x = aa - a
+        x = x - _rolling_median(x, TRACK_LAG_DETREND_ROWS)
+        sse_a[lam] = float(np.sum(x[mask_a] ** 2)) if mask_a.any() else math.inf
+        sse_b[lam] = float(np.sum(x[mask_b] ** 2)) if mask_b.any() else math.inf
+    lag_a = min(sse_a, key=lambda k: sse_a[k])
+    lag_b = min(sse_b, key=lambda k: sse_b[k]) if nb >= TRACK_MIN_MOVED_ROWS else lag_a
+    return PedalTrackFit(
+        measured=True, accel_delay_s=dl, accel_max_rate_pct_s=vm, accel_max_accel_pct_s2=am,
+        brake_delay_s=dl, brake_max_rate_pct_s=vm, brake_max_accel_pct_s2=am,
+        accel_effect_lag_s=lag_a, brake_effect_lag_s=lag_b,
+        rmse_pct=rmse, n_moved_accel=na, n_moved_brake=nb,
     )

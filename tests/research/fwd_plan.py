@@ -49,7 +49,7 @@ accel ≧ 要る加速度になる最初の u を探す。戻しの軸だけ・�
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -257,8 +257,27 @@ VALLEY_BOOST_ITERS = 20
 # 2026-10-26 段10-2': R の山で戻し始める行 s を探す範囲 [秒]。アクセルの連なりの最後（last + 1）から
 # 遡る長さ。None なら連なりの頭まで全部。長い連なり（US06 は 32 秒）で頭まで探すと、積み上がりの
 # 面積に連なり全体の水準のずれ（A1）が入り、それを打ち消す方へ s が動いてしまうため、
-# 変わり目の近くに限る
+# 変わり目の近くに限る。
+# 2026-10-26 段11-4: これは仮の値（データ由来でない）。switch_gap_peak_from_corner が true のときは
+# 使わず、基準の加速度が頂点へ下がり始める行から下限を決める（`_rule_peak`）。false なら今まで通り
 RULE_PEAK_RANGE_S: float | None = 2.0
+
+# 2026-10-27 段12: switch_gap_peak_robust が true のとき、`_rule_peak` の採点で
+# 「ペダルが効くまでの遅れ」をこの行数だけ前後にずらした 3 通り（−1・0・+1 行）の最大を取る。
+# 仮の値（モードの走りから。2026-10-27 US06 13 s の実測 154602・081033 で当てはまりのよい遅れが
+# 0.075〜0.10 s と 1 行ぶれた）。手順2（151009）で動いた所ごとに当てはめると、遅れが決まったのは
+# アクセル 8・ブレーキ 11 か所で 25〜75% が 0.119〜0.175 s・0.113〜0.200 s＝±1 行と食い違わない
+# （ユーザー決定 2026-10-27: ±1 行のまま）。
+# いつ決め直すか: 急な踏み替えを含む手順2 の走りができたら。
+# 山（_rule_peak）と谷（_valley_boost_gain_robust）で使う
+PEAK_ROBUST_LAG_ROWS: int = 1
+# 2026-10-27 段12 谷: switch_gap_valley_robust が true のとき、谷の倍率 f をまず粗くこの刻みで
+# 全部採点し、最小の格子点のまわりを黄金分割探索で詰める。
+# 仮の値（根拠なし）。粗く見る刻み。2026-10-27 机上で AMA 12・US06 16・UDDS 9 の谷のうち点数の極小が
+# 2 つあったのは US06 27.7 s の 1 件（f 0 と 2.1）だけ＝0.1 刻みで取り違えない。
+# 細かさは黄金分割で詰める
+VALLEY_ROBUST_GRID_F: float = 0.1
+
 # 位置を追うときの 1 周期の分割数（加速度の上限つきの動きを細かく積分する）
 PEDAL_TRACK_SUBSTEPS = 10
 # 着いたとみなす位置の幅 [%]（着いたら止める。min のわずか上に残ると「踏んでいる」扱いになるため）
@@ -382,6 +401,16 @@ def track_pedal_position(
     return pa, pb
 
 
+def _creep_of(
+    enabled: bool, speeds: Sequence[float], accels: Sequence[float]
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """2026-10-28 段14 L1: predict_creep_curve が true で曲線があるとき (速度, 加速度) の配列、
+    それ以外は None（今までと同じ）。"""
+    if not enabled or len(speeds) == 0:
+        return None
+    return np.asarray(speeds, dtype=float), np.asarray(accels, dtype=float)
+
+
 def predicted_accel(
     table: ForwardTable,
     v: np.ndarray,
@@ -392,19 +421,73 @@ def predicted_accel(
     accel_min_pct: float,
     brake_min_pct: float,
     period_s: float,
+    launch_a: np.ndarray | None = None,
+    stop_a: np.ndarray | None = None,
+    launch_b: np.ndarray | None = None,
+    stop_b: np.ndarray | None = None,
+    creep: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
     """車の時刻 j の加速度 [km/h/s]（2026-10-26 段10-1）。位置をペダルごとに effect_lag だけ後ろへ
     ずらし（直線補間）、アクセルが min 超ならアクセルの表、そうでなくブレーキが min 超ならブレーキ側
-    （u を負にして同じ表）、両方 min なら惰行。本体の表だけ（発進・停止・戻しの層は使わない）。"""
-    idx = np.arange(len(accel_pos), dtype=float)
-    pa = np.interp(idx - track.accel_effect_lag_s / period_s, idx, accel_pos)
-    pb = np.interp(idx - track.brake_effect_lag_s / period_s, idx, brake_pos)
+    （u を負にして同じ表）、両方 min なら惰行。本体の表だけ（発進・停止・戻しの層は使わない）。
+
+    2026-10-27 段13: launch_a・stop_a（アクセルの行）、launch_b・stop_b（ブレーキと惰行の行）は
+    行ごとの bool 配列（v と同じ長さ。行 j の値は計画の側の配列の行 j）。True の行はその層の表
+    （発進側 launch=True・停止側 stop=True）で引く。全部 None（既定）は今までと完全に同じ。
+
+    2026-10-28 段14 L1: creep ＝ (速度 [km/h] の昇順, クリープ加速度 [km/h/s])。None 以外なら、
+    両ペダルが min 以下（位置 − min ≦ 0）で車速が速度の最後より小さい行の
+    加速度を np.interp(v, 速度, 加速度) にする（先頭より小さい速度は先頭の値）。
+    None（既定）は今までと完全に同じ。"""
+    pa = _shift_pos(accel_pos, track.accel_effect_lag_s / period_s)
+    pb = _shift_pos(brake_pos, track.brake_effect_lag_s / period_s)
+    return _accel_by_pos(
+        table, v, pa, pb, accel_min_pct, brake_min_pct, launch_a, stop_a, launch_b, stop_b, creep
+    )
+
+
+def _shift_pos(pos: np.ndarray, lag_rows: float) -> np.ndarray:
+    """位置を lag_rows 行だけ後ろへずらす（直線補間）。"""
+    idx = np.arange(len(pos), dtype=float)
+    return np.interp(idx - lag_rows, idx, pos)
+
+
+def _accel_by_pos(
+    table: ForwardTable,
+    v: np.ndarray,
+    pa: np.ndarray,
+    pb: np.ndarray,
+    accel_min_pct: float,
+    brake_min_pct: float,
+    launch_a: np.ndarray | None,
+    stop_a: np.ndarray | None,
+    launch_b: np.ndarray | None,
+    stop_b: np.ndarray | None,
+    creep: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
+    """`predicted_accel` の表を引く部分（pa・pb は効くまでの遅れを入れ済みの位置）。"""
     ua = pa - accel_min_pct
     ub = pb - brake_min_pct
     vv = np.asarray(v, dtype=float)
     a_acc = np.asarray(table.accel(vv, np.maximum(ua, 0.0)), dtype=float)
     a_brk = np.asarray(table.accel(vv, -np.maximum(ub, 0.0)), dtype=float)
     a_coast = np.asarray(table.coast_accel(vv), dtype=float)
+    # 段13: 低速の行だけ発進側・停止側の表で引き直す（None の組は何もしない）
+    for la, sa, is_acc in ((launch_a, stop_a, True), (launch_b, stop_b, False)):
+        for flag_arr, kw in ((sa, {"stop": True}), (la, {"launch": True})):
+            if flag_arr is None or not np.any(flag_arr):
+                continue
+            m = np.asarray(flag_arr, dtype=bool)
+            if is_acc:
+                a_acc = np.where(m, table.accel(vv, np.maximum(ua, 0.0), **kw), a_acc)
+            else:
+                a_brk = np.where(m, table.accel(vv, -np.maximum(ub, 0.0), **kw), a_brk)
+                a_coast = np.where(m, table.coast_accel(vv, **kw), a_coast)
+    # 段14 L1: 両ペダル min 以下の低速の行は手順2 が測ったクリープの曲線で引く
+    if creep is not None and len(creep[0]) > 0:
+        cs, ck = creep
+        both_min = (ua <= 0.0) & (ub <= 0.0) & (vv < float(cs[-1]))
+        a_coast = np.where(both_min, np.interp(vv, cs, ck), a_coast)
     return np.where(ua > 0.0, a_acc, np.where(ub > 0.0, a_brk, a_coast))
 
 
@@ -441,6 +524,40 @@ class GapContext:
     # 2026-10-26 段10-2': R の谷の上乗せの倍率 f の記録（`_gap_compensation` が足す）
     comp_f_log: list = field(default_factory=list)
     peak_window_s: float = 2.0
+    # 2026-10-26 段11-4: True なら R の山の戻し始めを探す下限を、固定 RULE_PEAK_RANGE_S でなく
+    # 基準の加速度が頂点へ下がり始める行から決める（`_rule_peak`）
+    peak_from_corner: bool = False
+    # 2026-10-27 段12: True なら R の山の採点を、戻す前の水準のずれを数えず（案 Y）、遅れのぶれを
+    # 見込んだ（案 X）積み上がりの最大にする（`_rule_peak`）
+    peak_robust: bool = False
+    # 2026-10-27 段12 谷: True なら R の谷の上乗せの倍率 f を、数え始めを変わり目の直前へ遅らせ
+    # （案 Y）、遅れのぶれを見込んで（案 X）、粗く見てから細かく詰めて選ぶ
+    # （`_valley_boost_gain_robust`）
+    valley_robust: bool = False
+    # 2026-10-26 段11-5: True なら R の後に `_choose_pass`
+    # （山・谷ごとに R のまま／後ろで取るを選ぶ）。
+    # alt_* は 7-c の上乗せなしの effort・flag（谷の「後ろで取る」で上乗せを外す。
+    # 無ければ上乗せなし）
+    choose: bool = False
+    alt_effort: np.ndarray | None = None
+    alt_flag: np.ndarray | None = None
+    # 2026-10-27 段13: predict_low_speed_sides が true のとき、予測に渡す低速の行の表の側
+    # （全行の launch_a, stop_a, launch_b, stop_b の bool 配列）。None なら今までと同じ
+    lp_sides: tuple | None = None
+    # 2026-10-28 段14 L1: predict_creep_curve が true のときの (速度, クリープ加速度)。
+    # None なら使わない
+    creep_curve: tuple[np.ndarray, np.ndarray] | None = None
+
+    def side_kw(self, lo: int = 0, hi: int | None = None) -> dict[str, Any]:
+        """`predicted_accel` に渡す低速の表の側（行 lo〜hi の切り出し）とクリープの曲線。
+        持たなければ空。"""
+        kw: dict[str, Any] = {}
+        if self.lp_sides is not None:
+            names = ("launch_a", "stop_a", "launch_b", "stop_b")
+            kw = {k: a[lo:hi] for k, a in zip(names, self.lp_sides, strict=True)}
+        if self.creep_curve is not None:
+            kw["creep"] = self.creep_curve
+        return kw
 
 
 @dataclass
@@ -473,6 +590,14 @@ class ReturnGapStats:
     # 2026-10-26 段10-2': R の谷の上乗せ（`_gap_compensation`）の数と、倍率 f が上限に張り付いた数
     n_valley_boost: int = 0
     n_valley_f_capped: int = 0
+    # 2026-10-26 段11-5: R が置いた切り替えの記録 (kind, a, last, i, j, cut0, zr)（kind は "peak"・
+    # "valley"。cut0 ＝ R が削った前の行の始め、zr ＝ R が遅らせた後ろの行の終わり）と、
+    # 選び直しの結果
+    rule_switches: list = field(default_factory=list)
+    n_choose_back_peak: int = 0
+    n_choose_back_valley: int = 0
+    # (行 i, 種類, R の点数, 後ろで取る点数（作れなければ None）, 選んだ "R"・"back")
+    choose_log: list = field(default_factory=list)
 
     def summary(self) -> str:
         text = (
@@ -495,9 +620,51 @@ class ReturnGapStats:
                 f"・R の谷の上乗せ {self.n_valley_boost} 回（倍率 f が上限に張り付き "
                 f"{self.n_valley_f_capped} 回）"
             )
+        if self.choose_log:
+            text += (
+                f"・R/後ろの選び直し 山 {self.n_choose_back_peak} 回・"
+                f"谷 {self.n_choose_back_valley} 回"
+                f"（後ろを選んだ。対象 {len(self.choose_log)} 回）"
+            )
         if self.n_min_peak:
             text += f"・案 C で予測の最大偏差が最小の組を選んだ {self.n_min_peak} 回"
         return text
+
+
+# 2026-10-27 段13: 発進のずらし（launch_shift_choose）の定数。ずらす行数 0〜8（0.05 s 刻みで 0.4 s
+# まで）は仮の値（ProblemReport_20261027 段2 の机上で最良は 1〜2 行。上限は余裕を見た仮置き）。
+# いつ決め直すか: 実機で選ばれた δ の分布が上限に張り付いたら。
+LAUNCH_SHIFT_MAX_ROWS = 8
+# ずらす範囲: 停車保持の終わりの 2.5 s 前〜基準の動き出しの 2.0 s 後（依頼 2026-10-27。仮の値）
+LAUNCH_SHIFT_BEFORE_HOLD_END_S = 2.5
+LAUNCH_SHIFT_AFTER_GO_S = 2.0
+# 採点: 車速を基準の動き出しの 2.0 s 前から v=0 で積み、動き出しの 1.0 s 前〜1.5 s 後の |偏差| の
+# 最大で比べる（依頼 2026-10-27。仮の値）
+LAUNCH_SHIFT_INTEGRATE_FROM_S = 2.0
+LAUNCH_SHIFT_SCORE_FROM_S = 1.0
+LAUNCH_SHIFT_SCORE_TO_S = 1.5
+
+
+@dataclass
+class LaunchShiftStats:
+    """発進のずらし（`apply_launch_shift`）の集計（2026-10-27 段13）。"""
+
+    n_launch: int = 0  # 停車からの発進の数
+    deltas: list = field(default_factory=list)  # 発進ごとに選んだ δ [行]
+    scores: list = field(default_factory=list)  # (δ=0 の最悪点, 選んだ δ の最悪点) [km/h]
+    n_rejected: int = 0  # 同時踏みが増えるため候補から外した (発進, δ) の数
+
+    def summary(self) -> str:
+        """走行前の表示用。例: 「あり・発進 3 回・δ 0 行×1・2 行×2」"""
+        if not self.deltas:
+            return f"なし・発進 {self.n_launch} 回"
+        counts: dict[int, int] = {}
+        for d in self.deltas:
+            counts[d] = counts.get(d, 0) + 1
+        parts = "・".join(f"{d} 行×{counts[d]}" for d in sorted(counts))
+        shifted = sum(1 for d in self.deltas if d > 0)
+        head = "あり" if shifted else "なし"
+        return f"{head}・発進 {self.n_launch} 回・δ {parts}"
 
 
 @dataclass
@@ -535,6 +702,8 @@ class ForwardPlan:
     # bk の行）。stop_lead と同じ持ち方（launch_release_ramp=False なら None）。
     # flag は FLAG_STOP のまま
     launch_prep: np.ndarray | None = None
+    # 2026-10-27 段13: 発進のずらし（launch_shift_choose）の集計。使わなければ None
+    launch_shift: LaunchShiftStats | None = None
 
     def side_for(self, i: int, is_accel: bool) -> int | None:
         """行 i のペダル（アクセル側かブレーキ側か）で計画が引いた表 SIDE_*。
@@ -637,11 +806,21 @@ def build_plan(
     switch_gap_rule: bool = False,
     switch_gap_min_peak: bool = False,
     switch_gap_peak_window_s: float = 2.0,
+    switch_gap_peak_from_corner: bool = False,
+    switch_gap_peak_robust: bool = False,
+    switch_gap_valley_robust: bool = False,
+    switch_gap_choose: bool = False,
     pedal_track: PedalTrack | None = None,
     accel_release_in_range_only: bool = False,
+    predict_low_speed_sides: bool = False,
+    launch_shift_choose: bool = False,
+    predict_creep_curve: bool = False,
+    creep_accel_speeds_kmh: Sequence[float] = (),
+    creep_accel_kmhs: Sequence[float] = (),
     _lead_extra: np.ndarray | None = None,
     _need_add: np.ndarray | None = None,
     _aux_out: dict[str, np.ndarray] | None = None,
+    _choose_alt: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
 
@@ -676,6 +855,24 @@ def build_plan(
     谷の前の削りだけ（山の削りは補償しない）で、Δv は戻る途中のブレーキの効きを入れる。9-b も on
     なら、R の対象の切り替えは R、それ以外は 9-b。
 
+    2026-10-26 段11-5: `switch_gap_choose`（switch_gap_rule が True のときだけ効く）。
+    False は今までと
+    完全に同じ。True は、R が扱う山・谷ごとに「R のまま」と「後ろで取る」の列を作り、切り替えの前後
+    switch_gap_peak_window_s の予測した積み上げの偏差の最大の大きさが小さい方を選ぶ
+    （`_choose_pass`。同点は R）。`_choose_alt` は内部用（7-c の上乗せなしの effort・flag）。
+
+    2026-10-27 段12: `switch_gap_peak_robust`（switch_gap_rule が True のときだけ効く）。False は
+    今までと完全に同じ。True は R の山の採点だけを変える（`_rule_peak`）: 戻す前の加速中にたまった
+    予測の片寄り（実機に無い水準のずれ）を数えないよう積み上げの数え始めを遅らせ（案 Y）、ペダルが
+    効くまでの遅れを PEAK_ROBUST_LAG_ROWS 行ずらした 3 通りの積み上がりの最大の大きさで選ぶ
+    （案 X）。
+
+    2026-10-27 段12（谷）: `switch_gap_valley_robust`（switch_gap_rule が True のときだけ効く）。
+    False は今までと完全に同じ。True は R の谷の上乗せの倍率 f の決め方だけを変える
+    （`_valley_boost_gain_robust`）: 積み上がりの数え始めを上乗せを配る最初の行の 1 行前へ遅らせ
+    （案 Y）、ペダルが効くまでの遅れを PEAK_ROBUST_LAG_ROWS 行ずらした 3 通りの積み上がりの
+    最大の大きさが最小の f を、0.1 刻みで粗く見てから黄金分割で詰めて選ぶ（案 X）。
+
     2026-10-26 段10-3: `switch_gap_min_peak`（案 C）。False は今までと完全に同じ。True は、9-b と
     同じ対象のすき間の取り方を、損の最小から「予測した最大偏差」の最小に直す（`_min_peak_split`）。
     前を c 行削る・後ろを d 行遅らせる組のうち、戻す側の実際の位置が min に着く行 ≤ 次のペダルの
@@ -709,7 +906,8 @@ def build_plan(
         7.5 km/h 以上は今までと同じ。
       判定4: アクセル。低速は発進側、7.5 km/h 以上は本体（pedal と同じ）。
       (ロ) 発進の途中は踏み増さない: 発進の途中の連続区間ごとに、各行のブレーキを「その行から区間の
-        終わりまでの最深」にする（ブレーキは戻す向きにしか動かない）。惰行の行も後ろにブレーキがあれば
+        終わりまでの最深」にする（ブレーキは戻す向きにしか動かない）。
+        惰行の行も後ろにブレーキがあれば
         そのブレーキになる。値の出どころの行の flag・表（side_brake）を引き継ぐ。
 
     2026-10-22 段5-3: `release_table_min_kmh`。基準がこの車速未満のブレーキの行は、戻しの表（本体の
@@ -739,6 +937,18 @@ def build_plan(
     （表の meta の戻る時間。`ReturnTime`）にそろえる。return_gap_enabled なら最後に
     `ensure_return_gap` ですき間不足を直す。
     """
+    if launch_shift_choose:
+        # 2026-10-27 段13: 発進のずらしは、できあがった計画（すき間の処理まで済み）に後から掛ける。
+        # 内側の呼び出しは同じ引数でずらしだけ off（再帰の common には渡さない＝ずらしは 1 回だけ）
+        kw_in = dict(locals())
+        kw_in["launch_shift_choose"] = False
+        return apply_launch_shift(
+            build_plan(**kw_in), ref_at, table, stop_ref_at=stop_ref_at,
+            accel_min_pct=accel_deadband_pct, brake_min_pct=brake_deadband_pct,
+            track=pedal_track or PedalTrack(),
+            creep=_creep_of(predict_creep_curve, creep_accel_speeds_kmh, creep_accel_kmhs),
+        )
+    creep = _creep_of(predict_creep_curve, creep_accel_speeds_kmh, creep_accel_kmhs)
     la = _lag(accel_lag_s, table, "accel_lag_s", DEFAULT_ACCEL_LAG_S)
     lb = _lag(brake_lag_s, table, "brake_lag_s", DEFAULT_BRAKE_LAG_S)
     n = int(np.floor(duration_s / period_s + 1e-9)) + 1
@@ -762,7 +972,15 @@ def build_plan(
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
             "switch_gap_min_peak": switch_gap_min_peak,
             "switch_gap_peak_window_s": switch_gap_peak_window_s,
+            "switch_gap_peak_from_corner": switch_gap_peak_from_corner,
+            "switch_gap_peak_robust": switch_gap_peak_robust,
+            "switch_gap_valley_robust": switch_gap_valley_robust,
+            "switch_gap_choose": switch_gap_choose,
             "accel_release_in_range_only": accel_release_in_range_only,
+            "predict_low_speed_sides": predict_low_speed_sides,
+            "predict_creep_curve": predict_creep_curve,
+            "creep_accel_speeds_kmh": creep_accel_speeds_kmh,
+            "creep_accel_kmhs": creep_accel_kmhs,
         }
         first = build_plan(
             ref_at, duration_s, table, **common,
@@ -799,7 +1017,15 @@ def build_plan(
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
             "switch_gap_min_peak": switch_gap_min_peak,
             "switch_gap_peak_window_s": switch_gap_peak_window_s,
+            "switch_gap_peak_from_corner": switch_gap_peak_from_corner,
+            "switch_gap_peak_robust": switch_gap_peak_robust,
+            "switch_gap_valley_robust": switch_gap_valley_robust,
+            "switch_gap_choose": switch_gap_choose,
             "accel_release_in_range_only": accel_release_in_range_only,
+            "predict_low_speed_sides": predict_low_speed_sides,
+            "predict_creep_curve": predict_creep_curve,
+            "creep_accel_speeds_kmh": creep_accel_speeds_kmh,
+            "creep_accel_kmhs": creep_accel_kmhs,
             "preposition_enabled": False, "return_gap_enabled": False,
         }
         aux: dict[str, np.ndarray] = {}
@@ -813,6 +1039,14 @@ def build_plan(
                 brake_lag_s=lb, use_rule=switch_gap_rule, min_peak=switch_gap_min_peak,
                 need=base.need_accel_kmhs, accel_lag_s=la, comp=True,
                 peak_window_s=switch_gap_peak_window_s,
+                peak_from_corner=switch_gap_peak_from_corner,
+                peak_robust=switch_gap_peak_robust,
+                valley_robust=switch_gap_valley_robust,
+                lp_sides=(
+                    tuple(aux[k] for k in ("lp_la", "lp_sa", "lp_lb", "lp_sb"))
+                    if "lp_la" in aux else None
+                ),
+                creep_curve=creep,
             )
             if (switch_gap_rule or switch_gap_min_peak)
             else None
@@ -839,13 +1073,24 @@ def build_plan(
                 )
             trimmed1 = (comped.effort_pct != 0.0) & (e1 == 0.0)
             new_rows = int(np.count_nonzero(trimmed1 & ~trimmed0))
+            choose_alt = None
+            if switch_gap_choose and switch_gap_rule:  # 段11-5: 上乗せなしの effort・flag
+                nb = build_plan(
+                    ref_at, duration_s, table, **{
+                        **common_c, "preposition_enabled": preposition_enabled,
+                        "return_gap_enabled": False,
+                    },
+                    preposition_margin_pct=preposition_margin_pct,
+                    preposition_lead_s=preposition_lead_s,
+                )
+                choose_alt = (nb.effort_pct.copy(), nb.flag.copy())
             plan2 = build_plan(
                 ref_at, duration_s, table, **{
                     **common_c, "preposition_enabled": preposition_enabled,
                     "return_gap_enabled": return_gap_enabled,
                 },
                 preposition_margin_pct=preposition_margin_pct,
-                preposition_lead_s=preposition_lead_s, _need_add=add,
+                preposition_lead_s=preposition_lead_s, _need_add=add, _choose_alt=choose_alt,
             )
             if plan2.return_gap is not None:
                 plan2.return_gap.comp_events = n_ev
@@ -1039,6 +1284,25 @@ def build_plan(
                 pre_pct=launch_release_pre_pct, lead_s=launch_release_lead_s,
                 short_stop_s=launch_short_stop_s, hold_pct=stop_brake_opening_pct,
             )
+    side_accel = np.where(launch_a, SIDE_LAUNCH, np.where(stop_a, SIDE_STOP, SIDE_MAIN))
+    side_accel = np.where(relabel_a, SIDE_MAIN, side_accel)
+    side_brake = np.where(launch_b, SIDE_LAUNCH, np.where(stop_b, SIDE_STOP, SIDE_MAIN))
+    side_brake = np.where(released & ~stop_b & ~launch_b, SIDE_RELEASE, side_brake)
+    if side_brake_dir is not None:
+        side_brake = side_brake_dir
+    # 2026-10-27 段13: predict_low_speed_sides が true で表の側を持つ規則（pedal・dir）のときだけ、
+    # すき間の処理の予測（predicted_accel）に低速の行の表の側を渡す。車速は基準車速 v で
+    # meta stop_max_speed_kmh（無ければ 7.5）未満の行。legacy は側が決まらないので今までと同じ
+    lp_sides = None
+    if predict_low_speed_sides and (dir_rule or pedal_rule):
+        lowv = np.asarray(v, dtype=float) < float(table.meta.get("stop_max_speed_kmh", 7.5))
+        lp_sides = (
+            lowv & (side_accel == SIDE_LAUNCH), lowv & (side_accel == SIDE_STOP),
+            lowv & (side_brake == SIDE_LAUNCH), lowv & (side_brake == SIDE_STOP),
+        )
+        if _aux_out is not None:
+            for key, arr in zip(("lp_la", "lp_sa", "lp_lb", "lp_sb"), lp_sides, strict=True):
+                _aux_out[key] = arr.copy()
     effort = np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)
     stats = None
     ret = return_time_of(table, accel_deadband_pct, brake_deadband_pct)
@@ -1069,6 +1333,14 @@ def build_plan(
                 use_rule=switch_gap_rule, min_peak=switch_gap_min_peak, need=need,
                 accel_lag_s=la, comp=switch_gap_compensate and _need_add is None,
                 peak_window_s=switch_gap_peak_window_s,
+                peak_from_corner=switch_gap_peak_from_corner,
+                peak_robust=switch_gap_peak_robust,
+                valley_robust=switch_gap_valley_robust,
+                choose=switch_gap_choose and switch_gap_rule,
+                alt_effort=None if _choose_alt is None else _choose_alt[0],
+                alt_flag=None if _choose_alt is None else _choose_alt[1],
+                lp_sides=lp_sides,
+                creep_curve=creep,
             )
         if switch_gap_min_loss:  # 段9-b: 損の合計が最小の組（要る加速度・惰行の加速度を渡す）
             gap_stats = ensure_return_gap(
@@ -1081,12 +1353,6 @@ def build_plan(
             gap_stats = ensure_return_gap(
                 effort, flag, ret=ret, period_s=period_s, rule_ctx=rule_ctx
             )
-    side_accel = np.where(launch_a, SIDE_LAUNCH, np.where(stop_a, SIDE_STOP, SIDE_MAIN))
-    side_accel = np.where(relabel_a, SIDE_MAIN, side_accel)
-    side_brake = np.where(launch_b, SIDE_LAUNCH, np.where(stop_b, SIDE_STOP, SIDE_MAIN))
-    side_brake = np.where(released & ~stop_b & ~launch_b, SIDE_RELEASE, side_brake)
-    if side_brake_dir is not None:
-        side_brake = side_brake_dir
     return ForwardPlan(
         t_s=t, effort_pct=effort, need_accel_kmhs=need, flag=flag, period_s=period_s,
         preposition=stats, return_gap=gap_stats, stops_ahead=stops_ahead,
@@ -1096,6 +1362,197 @@ def build_plan(
         launch_midway=np.asarray(midway, dtype=bool).copy() if dir_rule else None,
         launch_prep=launch_prep,
     )
+
+
+def _launch_events(
+    stop_now: np.ndarray, flag: np.ndarray
+) -> list[tuple[int, int, int]]:
+    """停車からの発進 (停車の始め s, 基準の動き出し t0, 停車保持の終わり hold_end)。
+    t0 ＝ 停車（基準が停車速度以下の連なり）の直後の最初の行（`_launch_release_ramp` と同じ）。
+    hold_end ＝ t0 の手前の最後の FLAG_STOP の行の次（前の発進の t0 以降で探す。無ければ t0）。"""
+    n = len(stop_now)
+    low = stop_now <= STOP_SPEED_KMH
+    out: list[tuple[int, int, int]] = []
+    prev_end = 0
+    i = 0
+    while i < n:
+        if not low[i]:
+            i += 1
+            continue
+        s = i
+        while i < n and low[i]:
+            i += 1
+        if i >= n:
+            break
+        t0 = i
+        j = t0 - 1
+        while j >= prev_end and flag[j] != FLAG_STOP:
+            j -= 1
+        out.append((s, t0, j + 1 if j >= prev_end else t0))
+        prev_end = t0
+    return out
+
+
+def _shift_back(arr: np.ndarray | None, a: int, b: int, d: int) -> np.ndarray | None:
+    """行 a〜b の中身を d 行後ろへ移す（前の空いた d 行は直前の行 a−1 の値）。コピーを返す。"""
+    if arr is None:
+        return None
+    out = arr.copy()
+    if d > 0:
+        out[a + d : b + 1] = arr[a : b + 1 - d]
+        out[a : a + d] = arr[a - 1]
+    return out
+
+
+def apply_launch_shift(
+    plan: ForwardPlan,
+    ref_at: Callable[[float], float],
+    table: ForwardTable,
+    *,
+    stop_ref_at: Callable[[float], float] | None,
+    accel_min_pct: float,
+    brake_min_pct: float,
+    track: PedalTrack,
+    creep: tuple[np.ndarray, np.ndarray] | None = None,
+) -> ForwardPlan:
+    """停車からの各発進で、発進の並びを δ 行（0〜LAUNCH_SHIFT_MAX_ROWS）後ろへずらす
+    （2026-10-27 段13。すき間の処理まで済んだ計画に掛ける）。
+
+    動き出し t0 の 2.0 s 前から車速を v=0 で積み（v は 0 未満にしない）、予測した偏差
+    （車速 − 基準車速）の t0 の 1.0 s 前〜1.5 s 後の |偏差| の最大で採点する。加速度は
+    `_accel_by_pos`（ペダル位置は `track_pedal_position`。低速の行は計画の side_accel・side_brake
+    の表。車速が stop_max_speed_kmh（無ければ 7.5）未満の行）。効くまでの遅れ（アクセル・ブレーキ）
+    を ±PEAK_ROBUST_LAG_ROWS 行ずらした 3 通りの最悪で比べ（段12 の switch_gap_peak_robust と同じ
+    考え方）、最悪が一番小さい δ（同点は小さい δ）を選ぶ。
+    ずらす範囲は停車保持の終わりの 2.5 s 前〜t0 の 2.0 s 後（前の発進のずらした範囲の後ろから）。
+    effort・flag・launch_prep・launch_midway・side_accel・side_brake を同じに移し、前の空いた行は
+    直前の行の値。need_accel（基準から決まる）・stops_ahead・stop_lead は動かさない。
+    ずらした結果、両ペダルの位置が同時に min 超になる行が δ=0 より増える候補は外す
+    （片足ルール・すき間を壊さない）。"""
+    n = len(plan.effort_pct)
+    dt = plan.period_s
+    t = plan.t_s
+    ref = _eval_ref(ref_at, t)
+    stop_now = ref if stop_ref_at is None else _eval_ref(stop_ref_at, t)
+    events = _launch_events(stop_now, plan.flag)
+    stats = LaunchShiftStats(n_launch=len(events))
+    top = float(table.meta.get("stop_max_speed_kmh", 7.5))
+    eff = plan.effort_pct.copy()
+    flag = plan.flag.copy()
+    prep = None if plan.launch_prep is None else plan.launch_prep.copy()
+    mid = None if plan.launch_midway is None else plan.launch_midway.copy()
+    sa = None if plan.side_accel is None else plan.side_accel.copy()
+    sb = None if plan.side_brake is None else plan.side_brake.copy()
+    trs = [
+        replace(
+            track,
+            accel_effect_lag_s=max(track.accel_effect_lag_s + dr * dt, 0.0),
+            brake_effect_lag_s=max(track.brake_effect_lag_s + dr * dt, 0.0),
+        )
+        for dr in (-PEAK_ROBUST_LAG_ROWS, 0, PEAK_ROBUST_LAG_ROWS)
+    ]
+    tol = POSITION_RETURN_TOL_PCT
+    last_b = 0
+    for _s, t0, hold_end in events:
+        a = max(hold_end - round(LAUNCH_SHIFT_BEFORE_HOLD_END_S / dt), last_b + 1, 1)
+        b = min(t0 + round(LAUNCH_SHIFT_AFTER_GO_S / dt), n - 1)
+        r_a = max(t0 - round(LAUNCH_SHIFT_INTEGRATE_FROM_S / dt), 0)
+        k_sc0 = max(t0 - round(LAUNCH_SHIFT_SCORE_FROM_S / dt), 0)
+        k_end = min(t0 + round(LAUNCH_SHIFT_SCORE_TO_S / dt), n - 1)
+        if a + LAUNCH_SHIFT_MAX_ROWS >= b or k_end <= k_sc0:
+            stats.deltas.append(0)
+            stats.scores.append((0.0, 0.0))
+            continue
+        st = max(min(a, r_a) - 40, 0)
+        en = max(b, k_end) + 1
+        best: tuple[float, int] | None = None
+        base_viol = 0
+        score0 = 0.0
+        for d in range(LAUNCH_SHIFT_MAX_ROWS + 1):
+            e_c = _shift_back(eff, a, b, d)[st:en]
+            sa_c = None if sa is None else _shift_back(sa, a, b, d)[st:en]
+            sb_c = None if sb is None else _shift_back(sb, a, b, d)[st:en]
+            pa, pb = track_pedal_position(
+                e_c, period_s=dt, track=track, accel_min_pct=accel_min_pct,
+                brake_min_pct=brake_min_pct,
+            )
+            viol = int(np.count_nonzero((pa > accel_min_pct + tol) & (pb > brake_min_pct + tol)))
+            if d == 0:
+                base_viol = viol
+            elif viol > base_viol:
+                stats.n_rejected += 1
+                continue
+            worst = max(
+                _launch_dev_peak(
+                    table, ref[st:en], pa, pb, trv, accel_min_pct, brake_min_pct, dt, sa_c, sb_c,
+                    top, r_a - st, k_sc0 - st, k_end - st, creep,
+                )
+                for trv in trs
+            )
+            if d == 0:
+                score0 = worst
+            if best is None or worst < best[0] - 1e-9:
+                best = (worst, d)
+        assert best is not None
+        d_best = best[1]
+        stats.deltas.append(d_best)
+        stats.scores.append((score0, best[0]))
+        if d_best > 0:
+            eff = _shift_back(eff, a, b, d_best)
+            flag = _shift_back(flag, a, b, d_best)
+            prep = _shift_back(prep, a, b, d_best)
+            mid = _shift_back(mid, a, b, d_best)
+            sa = _shift_back(sa, a, b, d_best)
+            sb = _shift_back(sb, a, b, d_best)
+            last_b = b
+    return replace(
+        plan, effort_pct=eff, flag=flag, launch_prep=prep, launch_midway=mid, side_accel=sa,
+        side_brake=sb, launch_shift=stats,
+    )
+
+
+def _launch_dev_peak(
+    table: ForwardTable,
+    ref: np.ndarray,
+    pa: np.ndarray,
+    pb: np.ndarray,
+    trv: PedalTrack,
+    accel_min_pct: float,
+    brake_min_pct: float,
+    period_s: float,
+    side_a: np.ndarray | None,
+    side_b: np.ndarray | None,
+    top: float,
+    k_from: int,
+    k_sc0: int,
+    k_end: int,
+    creep: tuple[np.ndarray, np.ndarray] | None = None,
+) -> float:
+    """行 k_from から v=0 で車速を積み（v[k+1] = max(v[k] + 予測した加速度[k] × 周期, 0)）、行
+    k_sc0〜k_end の |v − 基準| の最大 [km/h]。位置 pa・pb は遅れ trv を入れて引く。"""
+    qa = _shift_pos(pa, trv.accel_effect_lag_s / period_s)
+    qb = _shift_pos(pb, trv.brake_effect_lag_s / period_s)
+    v = 0.0
+    worst = 0.0
+    for k in range(k_from, k_end + 1):
+        if k >= k_sc0:
+            worst = max(worst, abs(v - float(ref[k])))
+        if side_a is None or side_b is None:
+            fl = (None, None, None, None)
+        else:
+            low = v < top
+            fl = (
+                np.array([low and side_a[k] == SIDE_LAUNCH]),
+                np.array([low and side_a[k] == SIDE_STOP]),
+                np.array([low and side_b[k] == SIDE_LAUNCH]),
+                np.array([low and side_b[k] == SIDE_STOP]),
+            )
+        a = _accel_by_pos(
+            table, np.array([v]), qa[k : k + 1], qb[k : k + 1], accel_min_pct, brake_min_pct, *fl,
+            creep,
+        )
+        v = max(v + float(a[0]) * period_s, 0.0)
+    return worst
 
 
 def _launch_release_ramp(
@@ -1240,7 +1697,7 @@ def _gap_compensation(
         pred = predicted_accel(
             rule_ctx.table, rule_ctx.v, pa, pb, track=rule_ctx.track,
             accel_min_pct=rule_ctx.accel_min_pct, brake_min_pct=rule_ctx.brake_min_pct,
-            period_s=period_s,
+            period_s=period_s, **rule_ctx.side_kw(),
         )
     trimmed = (before != 0.0) & (after == 0.0)
     add = np.zeros(n)
@@ -1291,7 +1748,10 @@ def _gap_compensation(
             nb = round(rule_ctx.brake_lag_s / period_s)
             idx = np.minimum(np.arange(s, e) + nb, n - 1)
             dv = float(np.sum(base.need_accel_kmhs[s:e] - pred[idx])) * period_s
-            gain = _valley_boost_gain(
+            gain_fn = (
+                _valley_boost_gain_robust if rule_ctx.valley_robust else _valley_boost_gain
+            )
+            gain = gain_fn(
                 base, after, rule_ctx, k, s, nxt, m_rows, dv / ((s - k) * period_s), period_s
             )
             rule_ctx.comp_f_log.append(gain)
@@ -1347,7 +1807,7 @@ def _valley_boost_gain(
         pb = _track_one(e, False, ctx, period_s)
         pred = predicted_accel(
             ctx.table, v_loc, pa, pb, track=ctx.track, accel_min_pct=ctx.accel_min_pct,
-            brake_min_pct=ctx.brake_min_pct, period_s=period_s,
+            brake_min_pct=ctx.brake_min_pct, period_s=period_s, **ctx.side_kw(st, en),
         )
         return float(np.sum((pred[r0 - st :] - acc_loc[r0 - st :]) * period_s))
 
@@ -1363,6 +1823,92 @@ def _valley_boost_gain(
         else:
             hi = mid
     return 0.5 * (lo + hi)
+
+
+def _valley_boost_gain_robust(
+    base: ForwardPlan,
+    after: np.ndarray,
+    ctx: GapContext,
+    k: int,
+    s: int,
+    nxt: int,
+    m_target: int,
+    add0: float,
+    period_s: float,
+) -> float:
+    """R の谷の上乗せの倍率 f の頑健版（2026-10-27 段12 谷。switch_gap_valley_robust）。
+
+    局所の列の作り方は `_valley_boost_gain` の cum_of と同じ。違いは点数だけ:
+    案 Y（数え始め）: 積み上がりを上乗せを配る最初の行 k の 1 行前（w0）から r1 まで数える
+    （それより前の水準のずれは f で直せないので数えない）。
+    案 X: ペダルが効くまでの遅れ（アクセル・ブレーキ両方）を PEAK_ROBUST_LAG_ROWS 行ずらした
+    3 通り（−・0・+）の PedalTrack で予測し、点数 ＝ 3 通りのうち最大の
+    「[w0, r1] の running cum の絶対値の最大」。位置の追跡は ctx.track のまま。
+    探し方: (1) f を 0〜VALLEY_BOOST_F_MAX の VALLEY_ROBUST_GRID_F 刻みで全部採点して最小の格子点 j
+    （同点は小さい f）、(2) 区間 [grid[j−1], grid[j+1]] を黄金分割探索で
+    VALLEY_BOOST_ITERS 回詰める、
+    (3) 詰めた点の点数が格子の最小より悪ければ格子の点を返す。
+    """
+    n = len(after)
+    r0 = max(s - m_target - 10, 0)
+    r1 = min(nxt + round(0.5 / period_s), n - 1)
+    st = max(r0 - 40, 0)
+    en = r1 + 1
+    e0 = after[st:en].copy()
+    v_loc, need_loc = ctx.v[st:en], base.need_accel_kmhs[st:en]
+    acc_loc = ctx.ref_acc[st:en]
+    pa = _track_one(e0, True, ctx, period_s)  # アクセルは f に依らない
+    ks, ss = k - st, s - st
+    w0 = max(k - 1, 0)
+    trs = [
+        replace(
+            ctx.track,
+            accel_effect_lag_s=max(ctx.track.accel_effect_lag_s + dr * period_s, 0.0),
+            brake_effect_lag_s=max(ctx.track.brake_effect_lag_s + dr * period_s, 0.0),
+        )
+        for dr in (-PEAK_ROBUST_LAG_ROWS, 0, PEAK_ROBUST_LAG_ROWS)
+    ]
+
+    def score(f: float) -> float:
+        e = e0.copy()
+        u, _ = ctx.table.invert(v_loc[ks:ss], need_loc[ks:ss] + f * add0)
+        u = np.asarray(u, dtype=float)
+        e[ks:ss] = np.where(u < 0.0, -(ctx.brake_min_pct - u), e[ks:ss])
+        np.clip(e, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT, out=e)
+        pb = _track_one(e, False, ctx, period_s)
+        worst = 0.0
+        for trv in trs:
+            pred = predicted_accel(
+                ctx.table, v_loc, pa, pb, track=trv, accel_min_pct=ctx.accel_min_pct,
+                brake_min_pct=ctx.brake_min_pct, period_s=period_s, **ctx.side_kw(st, en),
+            )
+            c = np.cumsum((pred[w0 - st :] - acc_loc[w0 - st :]) * period_s)
+            worst = max(worst, float(np.max(np.abs(c))))
+        return worst
+
+    grid = np.arange(0.0, VALLEY_BOOST_F_MAX + 1e-9, VALLEY_ROBUST_GRID_F)
+    grid = np.minimum(grid, VALLEY_BOOST_F_MAX)
+    gs = [score(float(f)) for f in grid]
+    j = int(np.argmin(gs))  # 同点は先（小さい f）
+    best_f, best_s = float(grid[j]), gs[j]
+    lo = float(grid[max(j - 1, 0)])
+    hi = float(grid[min(j + 1, len(grid) - 1)])
+    inv = (math.sqrt(5.0) - 1.0) / 2.0
+    c, d = hi - inv * (hi - lo), lo + inv * (hi - lo)
+    fc, fd = score(c), score(d)
+    for _ in range(VALLEY_BOOST_ITERS):
+        if fc <= fd:
+            hi, d, fd = d, c, fc
+            c = hi - inv * (hi - lo)
+            fc = score(c)
+        else:
+            lo, c, fc = c, d, fd
+            d = lo + inv * (hi - lo)
+            fd = score(d)
+    f_g = 0.5 * (lo + hi)
+    if score(f_g) <= best_s:
+        return min(max(f_g, 0.0), VALLEY_BOOST_F_MAX)
+    return best_f
 
 
 def switch_lead_events(
@@ -1796,6 +2342,9 @@ def ensure_return_gap(
     n = len(effort)
     min_loss = need_accel is not None and coast_a is not None and coast_b is not None
     stats = ReturnGapStats(defaults_used=ret.defaults_used())
+    do_choose = rule_ctx is not None and rule_ctx.use_rule and rule_ctx.choose
+    before = effort.copy() if do_choose else None  # 段11-5: 選び直しの「元」
+    flag0 = flag.copy() if do_choose else None
     last = -1  # 直前の 0 でない行
     i = 0
     while i < n:
@@ -1891,6 +2440,8 @@ def ensure_return_gap(
                     continue
         last = i
         i += 1
+    if do_choose and stats.rule_switches:  # 段11-5
+        _choose_pass(effort, flag, before, flag0, rule_ctx, period_s, stats)
     if rule_ctx is not None:  # 段10-6: R の判定と同じ位置の物差しで数える
         stats.n_violations = count_gap_violations_by_position(
             effort, ctx=rule_ctx, period_s=period_s
@@ -1932,6 +2483,19 @@ def _rule_peak(
     解釈 2026-10-26。議論の見積もりは惰行までしか見ていなかった）。変わり目を通り過ぎた後で、
     予測車速と基準のずれの積み上がりが 0 に戻る位置。
     アクセルの位置が min に戻らない候補は使わない（全部そうなら None）。
+    2026-10-26 段11-4（ProblemReport_20261026_2）: ctx.peak_from_corner が True なら、下限を
+    固定の RANGE でなく基準から決める。k_pk ＝ 頂点 k_v の手前から、基準の加速度が（後ろ向きに
+    見て）厳密に高い間さかのぼった行（頂点の手前の最後の極大。平らなら頂点側の端）。
+    下限 s_lo ＝ max(a+1, k_pk − m)、m ＝（k_pk で戻したときアクセルの位置が min に着くまでの行数
+    r − k_pk ＋ 1 周期）＋ ceil(アクセルが効くまでの遅れ / 周期)。着かないときは
+    m ＝ ceil(遅れ / 周期) ＋ 1。データ由来（基準とペダルの値から決まる）。
+    2026-10-27 段12: ctx.peak_robust が True なら採点だけを変える（候補の選び方は同じ）。
+    案 Y（数え始め）: s_last ＝ 候補の s の最大、b_last ＝ その b、R0 ＝ s_last −（b_last − s_last）
+    − ceil(アクセルが効くまでの遅れ / 周期）。候補 s の数え始め w0 ＝ max(min(s, R0) − 1, r0)
+    （戻す前の加速中にたまった水準のずれを数えない）。案 X（遅れのずれ）: 効くまでの遅れ
+    （アクセル・ブレーキ両方）を PEAK_ROBUST_LAG_ROWS 行ずつ前後にずらした 3 通りで予測し、
+    点数 ＝ 3 通りの [w0, r1] の積み上がり（running cum）の絶対値の最大のうち最大。最小の s
+    （同点は遅い方）。
     適用: s〜last を 0、ブレーキを b から。戻り値は呼び出し側が続きを数える (last, i)。
     """
     n = len(effort)
@@ -1952,7 +2516,21 @@ def _rule_peak(
     base_a = _track_base(effort[st:en1], True, ctx, period_s)  # 候補は途中から違うだけ
     cands: list[tuple[int, int]] = []  # (s, accel の位置が min に着く行 b)
     s_lo = a + 1
-    if RULE_PEAK_RANGE_S is not None:
+    if ctx.peak_from_corner:
+        # 段11-4: 頂点 k_v の手前の最後の極大 k_pk（平らなら頂点側の端）の、戻る行数＋遅れ手前から
+        k_v = a + int(above[0]) + int(np.flatnonzero(below_all[above[0] :])[0])
+        k_pk = k_v - 1
+        while k_pk - 1 >= a and ctx.ref_acc[k_pk - 1] > ctx.ref_acc[k_pk] + 1e-6:
+            k_pk -= 1
+        lag_rows = math.ceil(ctx.track.accel_effect_lag_s / period_s)
+        e = effort[st:en1].copy()
+        e[max(k_pk, a) - st : last + 1 - st] = 0.0
+        pos = _track_from(base_a, e, True, ctx, period_s)
+        r = position_return_row(pos, k_pk - st, ctx.accel_min_pct)
+        m = lag_rows + 1 if r is None else (r + st - k_pk) + 1 + lag_rows
+        s_lo = max(s_lo, k_pk - m)
+        s_lo = min(s_lo, last + 1)
+    elif RULE_PEAK_RANGE_S is not None:
         s_lo = max(s_lo, last + 1 - round(RULE_PEAK_RANGE_S / period_s))
     for s in range(s_lo, last + 2):
         e = effort[st:en1].copy()
@@ -1975,13 +2553,44 @@ def _rule_peak(
     kw = {
         "track": ctx.track, "accel_min_pct": ctx.accel_min_pct,
         "brake_min_pct": ctx.brake_min_pct, "period_s": period_s,
+        **ctx.side_kw(st, en2),
     }
     full = predicted_accel(ctx.table, v_loc, base_a.pos, base_b.pos, **kw) - acc_loc
     prefix = np.concatenate([[0.0], np.cumsum(full * period_s)])  # prefix[k] ＝ Σ_{行 < k}
     lag_max = max(ctx.track.accel_effect_lag_s, ctx.track.brake_effect_lag_s)
     margin = math.ceil(lag_max / period_s) + 2
     best: tuple[float, int, int] | None = None
-    for s, b in cands:
+    if ctx.peak_robust:
+        # 段12: 案 Y（数え始め）と案 X（遅れのずれ 3 通り）。位置の追跡は ctx.track のまま
+        s_last = max(s for s, _ in cands)
+        b_last = next(bb for ss, bb in cands if ss == s_last)
+        lag_rows_y = math.ceil(ctx.track.accel_effect_lag_s / period_s)
+        big_r0 = s_last - (b_last - s_last) - lag_rows_y
+        kws = []
+        for dr in (-PEAK_ROBUST_LAG_ROWS, 0, PEAK_ROBUST_LAG_ROWS):
+            trv = replace(
+                ctx.track,
+                accel_effect_lag_s=max(ctx.track.accel_effect_lag_s + dr * period_s, 0.0),
+                brake_effect_lag_s=max(ctx.track.brake_effect_lag_s + dr * period_s, 0.0),
+            )
+            kws.append(dict(kw, track=trv))
+        for s, b in cands:
+            e = e_full.copy()
+            e[s - st : last + 1 - st] = 0.0
+            z = min(max(b, i), j)
+            if z > i:
+                e[i - st : z - st] = 0.0
+            pa = _track_from(base_a, e, True, ctx, period_s)
+            pb = _track_from(base_b, e, False, ctx, period_s) if z > i else base_b.pos
+            w0 = max(min(s, big_r0) - 1, r0)
+            score = 0.0
+            for kwv in kws:
+                pr = predicted_accel(ctx.table, v_loc, pa, pb, **kwv) - acc_loc
+                c = np.cumsum(pr[w0 - st : r1 - st + 1] * period_s)
+                score = max(score, float(np.max(np.abs(c))))
+            if best is None or score <= best[0] + 1e-9:
+                best = (score, s, b)
+    for s, b in [] if ctx.peak_robust else cands:  # 段12 の採点は上で済み
         e = e_full.copy()
         e[s - st : last + 1 - st] = 0.0
         z = min(max(b, i), j)
@@ -1992,7 +2601,8 @@ def _rule_peak(
         # 行 s より前は全候補で同じ（位置が違うのは行 s + 1 から）。続きだけ表を引く
         ks = s - st
         k1 = max(ks - margin, 0)
-        tail = predicted_accel(ctx.table, v_loc[k1:], pa[k1:], pb[k1:], **kw)[ks - k1 :]
+        kw_t = dict(kw, **ctx.side_kw(st + k1, en2))
+        tail = predicted_accel(ctx.table, v_loc[k1:], pa[k1:], pb[k1:], **kw_t)[ks - k1 :]
         cum = float(prefix[ks] - prefix[r0 - st] + np.sum((tail - acc_loc[ks:]) * period_s))
         if best is None or abs(cum) <= best[0] + 1e-9:
             best = (abs(cum), s, b)
@@ -2011,6 +2621,7 @@ def _rule_peak(
         stats.n_delayed += 1
         stats.delayed_s += (z - i) * period_s
     stats.n_rule_peak += 1
+    stats.rule_switches.append(("peak", a, last, i, j, min(s, last + 1), z))
     if z >= j:  # ブレーキの連なりが全部消えた
         return s - 1, j
     return z, z + 1
@@ -2047,6 +2658,10 @@ def _rule_valley(
         r = position_return_row(pos, last - c + 1 - st, ctx.brake_min_pct)
         if r is not None and r + 1 + st <= i:
             if c > 0:
+                jn = i  # アクセルの連なりの終わり（選び直しの記録用）
+                while jn < n and effort[jn] > 0.0 and flag[jn] not in (FLAG_STOP, FLAG_PREPOS):
+                    jn += 1
+                stats.rule_switches.append(("valley", a, last, i, jn, last - c + 1, i))
                 effort[last - c + 1 : last + 1] = 0.0
                 flag[last - c + 1 : last + 1] = FLAG_COAST
                 stats.n_cut += 1
@@ -2055,6 +2670,131 @@ def _rule_valley(
                 stats.rule_valley_spans.append((last - c + 1, last + 1))
             return i, i + 1
     return None
+
+
+def _choose_score(
+    e_loc: np.ndarray, lo: int, w0: int, w1: int, ctx: GapContext, period_s: float
+) -> float:
+    """局所の列 e_loc（行 lo〜）の、行 w0〜w1 の予測した積み上げの偏差の最大の大きさ（2026-10-26
+    段11-5）。両ペダルの位置を追い、
+    車の時刻の（予測した加速度 − 基準の傾き）× 周期を w0 から積み上げ、
+    その |積み上げ| の最大。案 C（`_min_peak_split`）と同じ物差し。"""
+    hi = lo + len(e_loc)
+    pa = _track_one(e_loc, True, ctx, period_s)
+    pb = _track_one(e_loc, False, ctx, period_s)
+    pred = predicted_accel(
+        ctx.table, ctx.v[lo:hi], pa, pb, track=ctx.track, accel_min_pct=ctx.accel_min_pct,
+        brake_min_pct=ctx.brake_min_pct, period_s=period_s, **ctx.side_kw(lo, hi),
+    )
+    d = (pred - ctx.ref_acc[lo:hi]) * period_s
+    cum = np.cumsum(d[w0 - lo : w1 - lo + 1])
+    return float(np.max(np.abs(cum))) if cum.size else 0.0
+
+
+def _choose_back_rows(
+    e: np.ndarray,
+    f: np.ndarray,
+    off: int,
+    rec: tuple,
+    z: int,
+    before: np.ndarray,
+    flag0: np.ndarray,
+    ctx: GapContext,
+) -> None:
+    """「後ろで取る」の書き換えを e・f（行 off〜）に適用する（2026-10-26 段11-5）。
+    前のペダル: R が削った行 [cut0, last] を元（before）へ戻す。
+    谷は 7-c の上乗せも外す（上乗せなしの
+    列 ctx.alt_effort があれば、いま踏んでいる同じ向きの行 [a, cut0) をそれへ）。
+    後ろのペダル: 行 i〜z−1 を惰行にし、R が遅らせた行 [z, zr) は元へ戻す。"""
+    kind, a, last, i, _j, cut0, zr = rec
+    n_loc = len(e)
+
+    def put(r0: int, r1: int, src_e: np.ndarray, src_f: np.ndarray) -> None:
+        r0, r1 = max(r0, off), min(r1, off + n_loc)
+        if r0 < r1:
+            e[r0 - off : r1 - off] = src_e[r0:r1]
+            f[r0 - off : r1 - off] = src_f[r0:r1]
+
+    put(cut0, last + 1, before, flag0)
+    if kind == "valley" and ctx.alt_effort is not None:
+        r0, r1 = max(a, off), min(cut0, off + n_loc)
+        for r in range(r0, r1):
+            cur = e[r - off]
+            alt = ctx.alt_effort[r]
+            if cur < 0.0 and alt < 0.0:  # 谷の戻す側はブレーキ（負）。山の R は上乗せしない
+                e[r - off] = alt
+    if z < zr:
+        put(z, zr, before, flag0)
+    r0, r1 = max(i, off), min(z, off + n_loc)
+    if r0 < r1:
+        e[r0 - off : r1 - off] = 0.0
+        f[r0 - off : r1 - off] = FLAG_COAST
+
+
+def _choose_pass(
+    effort: np.ndarray,
+    flag: np.ndarray,
+    before: np.ndarray,
+    flag0: np.ndarray,
+    ctx: GapContext,
+    period_s: float,
+    stats: ReturnGapStats,
+) -> None:
+    """R が置いた山・谷ごとに「R のまま」と「後ろで取る」を選ぶ（2026-10-26 段11-5。
+    ProblemReport_20261026_2）。ensure_return_gap の最後（R・9-b・C の処理が全部済んだ列）で呼ぶ。
+
+    後ろで取る ＝ 前のペダル（R が削った行）を元（R の前の列 `before`）へ戻して要る間踏み、
+    次のペダルを
+    前のペダルの位置が min に着く行 r の次の行（z ＝ r + 1。安全網は前の周期の実開度で見る）まで
+    遅らせる（9-最終の形）。谷は 7-c の上乗せも外す（`ctx.alt_effort`）。
+    位置が着かない・次のペダルの
+    連なりが全部消える（z ≥ 連なりの終わり）・停車保持／先置きの行を書き換えるときは作れない
+    （R のまま）。
+    点数 ＝ 切り替えの最初の行 i の前後 switch_gap_peak_window_s 秒（行 w0 = i − W 〜 i + W）の、
+    予測した（加速度 − 基準の傾き）× 周期を w0 から積み上げた |積み上げ| の最大（`_choose_score`）。
+    後ろが厳密に小さいときだけ後ろ（同点は R）。時刻順に、
+    いまの列（先の選び直しを反映）で点数を出す。
+    """
+    n = len(effort)
+    skip = (FLAG_STOP, FLAG_PREPOS)
+    w = max(int(round(ctx.peak_window_s / period_s)), 1)
+    warm = 80
+    for rec in sorted(stats.rule_switches, key=lambda r: r[3]):
+        kind, a, last, i, j, cut0, zr = rec
+        leaving_accel = kind == "peak"
+        mn = ctx.accel_min_pct if leaving_accel else ctx.brake_min_pct
+        w0, w1 = max(i - w, 0), min(n - 1, i + w)
+        lo = max(min(w0, cut0, a) - warm, 0)
+        # 1. 前のペダルを元へ戻した列で、位置が min に着く行を探す
+        hz = min(n, max(w1 + 1, last + 1 + round(4.0 / period_s)) + 1)
+        e_pre = effort[lo:hz].copy()
+        e_pre[max(cut0, lo) - lo : last + 1 - lo] = before[max(cut0, lo) : last + 1]
+        pos = _track_one(e_pre, leaving_accel, ctx, period_s)
+        r = position_return_row(pos, last + 1 - lo, mn)
+        score_r = None
+        score_b = None
+        choice = "R"
+        z = None if r is None else max(r + 1 + lo, i)
+        ok = z is not None and z < j and not (
+            (flag0[cut0 : last + 1] == FLAG_STOP).any()
+            or (flag0[cut0 : last + 1] == FLAG_PREPOS).any()
+            or any(int(flag[k]) in skip for k in range(i, min(z, n)))
+        )
+        hi = min(n, max(w1 + 1, (z or 0) + 1))
+        e_r = effort[lo:hi].copy()
+        score_r = _choose_score(e_r, lo, w0, w1, ctx, period_s)
+        if ok:
+            e_b, f_b = e_r.copy(), flag[lo:hi].copy()
+            _choose_back_rows(e_b, f_b, lo, rec, z, before, flag0, ctx)
+            score_b = _choose_score(e_b, lo, w0, w1, ctx, period_s)
+            if score_b < score_r - 1e-9:
+                choice = "back"
+                _choose_back_rows(effort, flag, 0, rec, z, before, flag0, ctx)
+                if leaving_accel:
+                    stats.n_choose_back_peak += 1
+                else:
+                    stats.n_choose_back_valley += 1
+        stats.choose_log.append((i, kind, score_r, score_b, choice))
 
 
 def _track_one(e: np.ndarray, accel: bool, ctx: GapContext, period_s: float) -> np.ndarray:
@@ -2173,7 +2913,7 @@ def _min_peak_split(
     def pred_of(e_loc: np.ndarray, pa: np.ndarray, pb: np.ndarray) -> np.ndarray:
         return predicted_accel(
             ctx.table, v_loc, pa, pb, track=ctx.track, accel_min_pct=ctx.accel_min_pct,
-            brake_min_pct=ctx.brake_min_pct, period_s=period_s,
+            brake_min_pct=ctx.brake_min_pct, period_s=period_s, **ctx.side_kw(st, hi),
         )
 
     def column(c: int) -> np.ndarray:  # c 行削った列（c > 0 で comp なら上乗せ入り）

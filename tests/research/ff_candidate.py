@@ -804,8 +804,17 @@ class ForwardMapFeedforward:
         switch_gap_rule: bool = False,
         switch_gap_min_peak: bool = False,
         switch_gap_peak_window_s: float = 2.0,
+        switch_gap_peak_from_corner: bool = False,
+        switch_gap_peak_robust: bool = False,
+        switch_gap_valley_robust: bool = False,
+        switch_gap_choose: bool = False,
         pedal_track: PedalTrack | None = None,
         accel_release_in_range_only: bool = False,
+        predict_low_speed_sides: bool = False,
+        launch_shift_choose: bool = False,
+        predict_creep_curve: bool = False,
+        creep_accel_speeds_kmh: Sequence[float] = (),
+        creep_accel_kmhs: Sequence[float] = (),
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
 
@@ -847,8 +856,17 @@ class ForwardMapFeedforward:
             switch_gap_rule=switch_gap_rule,
             switch_gap_min_peak=switch_gap_min_peak,
             switch_gap_peak_window_s=switch_gap_peak_window_s,
+            switch_gap_peak_from_corner=switch_gap_peak_from_corner,
+            switch_gap_peak_robust=switch_gap_peak_robust,
+            switch_gap_valley_robust=switch_gap_valley_robust,
+            switch_gap_choose=switch_gap_choose,
             pedal_track=pedal_track,
             accel_release_in_range_only=accel_release_in_range_only,
+            predict_low_speed_sides=predict_low_speed_sides,
+            launch_shift_choose=launch_shift_choose,
+            predict_creep_curve=predict_creep_curve,
+            creep_accel_speeds_kmh=creep_accel_speeds_kmh,
+            creep_accel_kmhs=creep_accel_kmhs,
         )
         return self._plan
 

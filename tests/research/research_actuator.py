@@ -64,13 +64,13 @@ class ResearchActuatorDriver(ActuatorDriver):
         """
         last = self.last_command_pos
         if last is None:
-            return None                      # 親の既定（_DEFAULT_ACCEL）に任せる
+            return None                      # 親の既定（この軸の ACMD 上限）に任せる
         distance_mm = abs(pos - last) / 100.0
         monitor = self._last_monitor
         if monitor is not None and (monitor.moving or not monitor.pos_done):
             remaining_mm = abs(pos - monitor.position_pulse) / 100.0
             distance_mm = max(distance_mm, remaining_mm)
-        return acmd_for_move(distance_mm, smooth_over_s)
+        return acmd_for_move(distance_mm, smooth_over_s, acmd_max=self._max_accel)
 
     async def move_to_position(
         self,
@@ -83,12 +83,10 @@ class ResearchActuatorDriver(ActuatorDriver):
         # move_to_position_timed もここを通る（本番の実装が move_to_position に委ねている）
         if accel is None and smooth_over_s is not None:
             accel = self._acmd_for_move(pos, smooth_over_s)
-        if speed_mm_s is None:
-            await super().move_to_position(pos, accel=accel, smooth_over_s=smooth_over_s)
-        else:
-            await super().move_to_position(
-                pos, speed_mm_s=speed_mm_s, accel=accel, smooth_over_s=smooth_over_s
-            )
+        # speed_mm_s=None は親がこの軸の運用速度（コンストラクタの speed_mm_s）に置き換える
+        await super().move_to_position(
+            pos, speed_mm_s=speed_mm_s, accel=accel, smooth_over_s=smooth_over_s
+        )
         self.last_command_pos = pos
 
     async def read_monitor(self) -> AxisMonitor:

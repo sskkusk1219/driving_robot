@@ -39,8 +39,13 @@ def _assist(effort: list[float], flag: list[int]) -> CoastAssist:
     )
 
 
-def _all_coast(n: int = 100) -> CoastAssist:
-    return _assist([0.0] * n, [FLAG_COAST] * n)
+def _all_coast(n: int = 100, **kw: object) -> CoastAssist:
+    effort, flag = [0.0] * n, [FLAG_COAST] * n
+    return CoastAssist(
+        np.array(effort), np.array(flag), np.arange(n) * DT,
+        on_kmh=ON, off_kmh=OFF, hold_accel_s=HOLD, hold_brake_s=HOLD, ret=RET, period_s=DT,
+        accel_onset_effort=ACCEL_ONSET, brake_onset_effort=BRAKE_ONSET, **kw,
+    )
 
 
 def _step(ca: CoastAssist, i: int, dev: float, speed: float = 30.0) -> str | None:
@@ -81,6 +86,29 @@ def test_releases_when_sign_flips_after_hold() -> None:
     for i in range(1, 10):
         _step(ca, i, 0.6)
     assert _step(ca, 10, -0.3) is None  # 符号が逆（行き過ぎ）→ 離す
+
+
+def test_release_on_cross_releases_during_hold_only_when_enabled() -> None:
+    # 2026-10-28 段14 K: 保持の途中で符号が逆になったら離す（既定 off は保持が済むまで踏み続ける）
+    off = _all_coast()
+    on = _all_coast(release_on_cross=True)
+    for ca in (off, on):
+        assert _step(ca, 0, 0.6) == PEDAL_ACCEL
+        assert _step(ca, 3, -0.3) == (PEDAL_ACCEL if ca is off else None)
+    assert on.stats.released_cross == 1 and off.stats.released_cross == 0
+    assert "符号が逆になり保持の途中で離した 1 回" in on.stats.summary()
+    # 離した直後は入り直しの間隔（保持時間）が効く。ブレーキ側も同様
+    assert _step(on, 4, 0.6) is None and on.stats.blocked_reentry == 1
+    cb = _all_coast(release_on_cross=True)
+    assert _step(cb, 0, -0.6) == PEDAL_BRAKE
+    assert _step(cb, 3, 0.3) is None and cb.stats.released_cross == 1
+    # 符号が同じなら保持中は踏み続ける
+    cc = _all_coast(release_on_cross=True)
+    _step(cc, 0, 0.6)
+    assert _step(cc, 3, 0.05) == PEDAL_ACCEL and cc.stats.released_cross == 0
+    assert "符号が逆になったら保持の途中でも離す あり" in coast_settings_text(
+        0.5, 0.2, 4.0, 1.5, 2.0, release_on_cross=True
+    )
 
 
 def test_one_pedal_per_coast_section_and_cleared_on_non_coast_row() -> None:

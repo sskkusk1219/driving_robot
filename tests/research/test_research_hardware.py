@@ -500,3 +500,73 @@ async def test_research_driver_counts_retries_per_op() -> None:
 def test_stub_actuator_exposes_empty_retry_counts() -> None:
     stub = hwmod.StubActuator("accel")
     assert stub.retry_counts == {} and stub.op_counts == {}
+
+
+# ── 軸ごとの速度・加減速度（settings.toml [actuator.*] speed_mm_s / max_accel_g） ─────
+
+
+def _last_written_vcmd(client: MagicMock) -> int:
+    values = client.write_registers.await_args.kwargs["values"]
+    return (values[4] << 16) | values[5]
+
+
+def test_acmd_for_move_cap_argument_defaults_to_old_limit() -> None:
+    # 既定は従来どおり 0.3G 上限。上限を渡せば大きな移動はその値まで上がる
+    assert acmd_for_move(50.0, 0.04) == 30
+    assert acmd_for_move(50.0, 0.04, acmd_max=60) == 60
+    assert acmd_for_move(0.10, 0.04, acmd_max=60) == acmd_for_move(0.10, 0.04)
+
+
+@pytest.mark.asyncio
+async def test_driver_uses_instance_speed_and_accel_limit() -> None:
+    driver, client = _research_driver()
+    driver._speed_mm_s = 225.0
+    driver._max_accel = 60
+    await driver.move_to_position(_pct_to_pulse(50.0))
+    assert _last_written_vcmd(client) == 22500
+    assert _last_written_accel(client) == 60
+    # smooth_over_s 付きの大きな移動も軸の上限まで
+    await driver.move_to_position(_pct_to_pulse(0.0), smooth_over_s=0.04)
+    assert _last_written_accel(client) == 60
+
+
+@pytest.mark.asyncio
+async def test_driver_defaults_keep_old_speed_and_accel() -> None:
+    driver, client = _research_driver()
+    await driver.move_to_position(_pct_to_pulse(50.0))
+    assert _last_written_vcmd(client) == 10000
+    assert _last_written_accel(client) == 30
+
+
+@pytest.mark.asyncio
+async def test_timed_move_clamps_to_instance_speed() -> None:
+    driver = ResearchActuatorDriver(
+        port="/dev/ttyUSB0", slave_id=1, speed_mm_s=190.0, max_accel=60
+    )
+    client = MagicMock()
+    ok = MagicMock()
+    ok.isError.return_value = False
+    client.write_registers = AsyncMock(return_value=ok)
+    driver._client = client
+    await driver.move_to_position_timed(_pct_to_pulse(100.0), 0, 0.01)
+    assert _last_written_vcmd(client) == 19000
+    assert _last_written_accel(client) == 60
+
+
+def test_load_settings_reads_speed_and_validates(tmp_path: Path) -> None:
+    from tests.research.app_settings import load_settings
+
+    ok = tmp_path / "ok.toml"
+    ok.write_text(
+        "[actuator.accel]\nmax_speed_mm_s = 250.0\nspeed_mm_s = 225.0\nmax_accel_g = 0.6\n"
+        "[actuator.brake]\nmax_speed_mm_s = 210.0\nspeed_mm_s = 190.0\nmax_accel_g = 0.6\n"
+    )
+    s = load_settings(ok)
+    assert s.actuator.accel.speed_mm_s == 225.0
+    assert s.actuator.brake.speed_mm_s == 190.0
+    assert s.actuator.brake.max_accel_g == 0.6
+
+    bad = tmp_path / "bad.toml"
+    bad.write_text("[actuator.brake]\nmax_speed_mm_s = 210.0\nspeed_mm_s = 250.0\n")
+    with pytest.raises(ValueError):
+        load_settings(bad)

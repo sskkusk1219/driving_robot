@@ -9,6 +9,7 @@
         [--ref-csv CSV] [--out-dir DIR]
     .venv/bin/python -m tests.research.fwd_tool model [--map PKL] [--train CSV ...]
         [--check CSV ...] [--ref-check CSV ...] [--save]
+    .venv/bin/python -m tests.research.fwd_tool attach-pedal-track --pkl IN --csv CSV --out OUT
 """
 
 from __future__ import annotations
@@ -1506,6 +1507,28 @@ def run_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_attach_pedal_track(args: argparse.Namespace) -> int:
+    """既存の pkl に、手順2 の CSV から測ったペダルの動き方（PedalTrack の 8 値）を meta として
+    付けて、新しい pkl に保存する（2026-10-26 段11-2。元の pkl は書き換えない）。"""
+    from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
+    from tests.research.pattern_drive import _attach_pedal_track  # noqa: PLC0415
+
+    src, out = Path(args.pkl), Path(args.out)
+    if out.exists():
+        print(f"保存先 {out} が既にある。上書きしない")
+        return 2
+    if out.resolve() == src.resolve():
+        print("保存先が元の pkl と同じ。別の名前にする")
+        return 2
+    table = load_forward_map(src)
+    _attach_pedal_track(table, Path(args.csv))
+    if "pedal_track_accel_delay_s" not in table.meta:
+        print("測れなかったので保存しない")
+        return 1
+    print(f"保存: {save_table(table, out)}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fwd_tool", description="順モデル（C7〜C9）のオフライン道具")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1529,6 +1552,14 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--u-step", type=float, default=2.0)
     b.add_argument("--min-s", type=float, default=1.0)
     b.set_defaults(func=run_build)
+
+    ap = sub.add_parser(
+        "attach-pedal-track", help="pkl にペダルの動き方（手順2 の CSV から測る）を付けて別名で保存"
+    )
+    ap.add_argument("--pkl", required=True, help="元の表の pkl（書き換えない）")
+    ap.add_argument("--csv", required=True, help="手順2 の走行 CSV")
+    ap.add_argument("--out", required=True, help="保存先 pkl（既にあれば失敗）")
+    ap.set_defaults(func=run_attach_pedal_track)
 
     sc = sub.add_parser("score", help="検証ログで順モデルを採点する")
     add_train(sc)
