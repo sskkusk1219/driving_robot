@@ -654,8 +654,35 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
         else "／".join(f"{g:g}%:{_f(sec, 1)}s" for g, sec in zip(grid, layers, strict=False))
         + ("" if table.stop_release_accel is not None else "（層は作らず）")
     )
+    # 2026-10-28 段3: 局所の効きの倍率の表（マスの数・中央値）と低速の階段の秒数（お知らせのみ）
+    lg_parts: list[str] = []
+    for pedal, label in (("brake", "ブレーキ"), ("accel", "アクセル")):
+        ent = m.get(f"local_gain_{pedal}")
+        if not ent:
+            lg_parts.append(f"{label}なし")
+            continue
+        filled = [
+            r for row, nrow in zip(ent["ratio"], ent["n"], strict=False)
+            for r, c in zip(row, nrow, strict=False) if c > 0
+        ]
+        total = sum(len(row) for row in ent["ratio"])
+        metrics[f"local_gain_{pedal}_cells"] = float(len(filled))
+        med = float(np.median(filled)) if filled else 1.0
+        metrics[f"local_gain_{pedal}_median"] = med
+        lg_parts.append(f"{label} 測れたマス {len(filled)}/{total}・中央値 {_f(med)}倍")
+    st_p, st_r = m.get("low_stair_press_s"), m.get("low_stair_release_s")
+    if st_p is not None:
+        metrics["low_stair_press_s"] = float(st_p)
+    if st_r is not None:
+        metrics["low_stair_release_s"] = float(st_r)
     parts = [
         f"開度の元 {src if src else '-（古い pkl は実開度）'}",
+        "局所の効きの倍率 " + "／".join(lg_parts),
+        "低速の階段 "
+        + (
+            "なし" if st_p is None
+            else f"踏む向き {_f(float(st_p), 1)}s・離す向き {_f(float(st_r or 0.0), 1)}s"
+        ),
         f"停止側の戻しの層 {'作る' if layer_on else '作らない'}設定（{stop_part}）",
         f"アクセルの戻し量の入力 {'あり' if a_in else 'なし'}設定"
         + "・アクセルの戻し "

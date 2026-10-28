@@ -31,6 +31,13 @@
   `plan_release_stations` で車速を決める（戻しの間に下がる車速を引いても クリープ ＋ 5 以上・
   最小の間隔・上端からの間隔）。見込み秒数に戻しの流れの分を足す。
 
+- 小さな動き（2026-10-28 段2。learning.ramp_dither_*）: 有効なら、目標減速度が `dither_max_g` 以下
+  の段には下りのブレーキの dither を測る車速の数だけ、保持（上りの途中）のある段にはアクセルの
+  dither を min(`dither_accel_max_n`, 保持の数) 回、見込み秒数に足す（上限の見積り。帯に入らなければ
+  実際は少ない）。1 回 ＝ 4 つの開度 × `dither_hold_s` ＋ 切り替え 1 回（`turn_s`）。枠
+  `budget_s` の扱いは変えず、足した結果 1 周目が枠を超えれば `over_budget` になる（表示の警告・
+  「うち dither」で分かる）。
+
 使い方:
     .venv/bin/python -m tests.research.ramp_planner [--config PATH]
   config の modes.coverage_mode_names の各モードを DB から読み、(a) 車速帯 × G の帯の秒数、
@@ -96,6 +103,9 @@ class RampLevel:
     stations_up_only: bool = False
     # 2026-10-14 段2o-5: 下りで山からブレーキを離す「戻し」を入れる車速 [km/h]（いちばん弱い段以外）
     release_stations: tuple[float, ...] = ()
+    # 2026-10-28 段2: 見込み秒数に足した dither の回数の上限（ブレーキ・アクセル）。0 は入れない
+    dither_brake_n: int = 0
+    dither_accel_n: int = 0
 
 
 @dataclass(frozen=True)
@@ -106,6 +116,7 @@ class RampPlan:
     budget_s: float
     over_budget: bool  # 1 周目だけで枠を超えた
     cruise_s: float
+    dither_s: float = 0.0  # 2026-10-28 段2: total_est_s のうち dither の見込み分（周回を含む）
 
     def execution_order(
         self,
@@ -406,6 +417,11 @@ def cruise_hold_est_s(
     return n_stations * (cruise_hold_s + 2.0 * turn_s + settle_s) * (2.0 if both_ways else 1.0)
 
 
+def dither_est_s(n: int, *, hold_s: float, turn_s: float) -> float:
+    """dither の見込み秒数: 1 回 ＝ 4 つの開度 × 保持 ＋ 切り替え 1 回（g_ref の戻し）。"""
+    return max(0, n) * (4.0 * hold_s + turn_s)
+
+
 def min_top_kmh(
     g: float, *, min_at_g_s: float, launch_s: float, turn_s: float, edge_g: float
 ) -> float:
@@ -431,6 +447,8 @@ def plan_ramps(
     release_fracs: Sequence[float] = (), release_move_s: float = 1.0,
     release_hold_s: Sequence[float] = (),
     max_passes: int = MAX_PASSES,
+    dither_enabled: bool = False, dither_hold_s: float = 1.5, dither_brake_n: int = 0,
+    dither_max_g: float = 0.1, dither_accel_max_n: int = 0,
 ) -> RampPlan:
     """段ごとの上端の車速・見込み秒数・周回数を決める。
 
@@ -446,6 +464,9 @@ def plan_ramps(
     見込み秒数に戻しの分（`release_est_s`）を足す。
     2026-10-17 段2o-8: `max_passes` ＝ 1 段あたりの最大周回数（learning.ramp_max_passes）。1 なら
     枠が余っても 2 周目を足さない。
+    2026-10-28 段2: `dither_enabled` なら dither の見込み（上限）を足す。ブレーキは `dither_brake_n`
+    ＝ 測る車速の数を、目標減速度 g ≤ `dither_max_g` の段に。アクセルは保持のある段に
+    min(`dither_accel_max_n`, 保持の数) 回。
     """
     runs: list[RampLevel] = []
     skipped: list[float] = []
@@ -485,12 +506,14 @@ def plan_ramps(
                 min_gap_kmh=g * G_TO_KMHS * (min_at_g_s + turn_s),
                 drop_kmh=release_drop_kmh(g, release_fracs, release_hold_s, release_move_s),
             )
+        d_brake = dither_brake_n if dither_enabled and g <= dither_max_g else 0
+        d_accel = min(dither_accel_max_n, len(stations)) if dither_enabled else 0
         est = estimate_s(g, top, hold_s=hold_s, turn_s=turn_s) + cruise_hold_est_s(
             len(stations), cruise_hold_s=cruise_hold_s, turn_s=turn_s, both_ways=not up_only
         ) + release_est_s(
             len(release), fracs=release_fracs, hold_s=release_hold_s, move_s=release_move_s,
             turn_s=turn_s,
-        )
+        ) + dither_est_s(d_brake + d_accel, hold_s=dither_hold_s, turn_s=turn_s)
         runs.append(
             RampLevel(
                 g=g,
@@ -503,6 +526,8 @@ def plan_ramps(
                 stations=stations,
                 stations_up_only=up_only,
                 release_stations=release,
+                dither_brake_n=d_brake,
+                dither_accel_n=d_accel,
             )
         )
     remaining = budget_s - sum(r.est_s for r in runs)
@@ -518,6 +543,7 @@ def plan_ramps(
         RampLevel(
             r.g, r.top_kmh, r.mode_accel_s, r.mode_decel_s, r.est_s, passes[r.g], r.raised,
             r.stations, r.stations_up_only, r.release_stations,
+            r.dither_brake_n, r.dither_accel_n,
         )
         for r in runs
     )
@@ -528,6 +554,11 @@ def plan_ramps(
         budget_s=budget_s,
         over_budget=over_budget,
         cruise_s=counts.cruise_s,
+        dither_s=sum(
+            dither_est_s(r.dither_brake_n + r.dither_accel_n, hold_s=dither_hold_s, turn_s=turn_s)
+            * r.passes
+            for r in final
+        ),
     )
 
 
@@ -545,6 +576,12 @@ def cruise_kwargs(cfg: Any) -> dict[str, Any]:
         "cruise_fine_max_kmh": lr.ramp_cruise_fine_max_kmh,
         "cruise_coarse_step_kmh": lr.ramp_cruise_coarse_step_kmh,
         "cruise_min_kmh": cfg.feedforward.creep_speed_kmh + CRUISE_MIN_MARGIN_KMH,
+        # 2026-10-28 段2: 小さな動き（dither）の見込み
+        "dither_enabled": lr.ramp_dither_enabled,
+        "dither_hold_s": lr.ramp_dither_hold_s,
+        "dither_brake_n": len(lr.ramp_dither_brake_speeds_kmh),
+        "dither_max_g": lr.ramp_dither_max_g,
+        "dither_accel_max_n": lr.ramp_dither_accel_max_n,
     }
 
 
@@ -609,6 +646,18 @@ def format_plan_table(plan: RampPlan) -> str:
                 f"{lv.g:g}G: 下りの戻し {', '.join(f'{v:g}' for v in lv.release_stations)} km/h"
                 f"（{len(lv.release_stations)} 回）"
             )
+    for lv in plan.levels:
+        if lv.dither_brake_n or lv.dither_accel_n:
+            out.append(
+                f"{lv.g:g}G: 小さな動き（dither）ブレーキ 最大 {lv.dither_brake_n} 回・"
+                f"アクセル 最大 {lv.dither_accel_n} 回"
+            )
+    if plan.dither_s > 0.0:
+        over = "（枠を超えている）" if plan.total_est_s > plan.budget_s else ""
+        out.append(
+            f"うち dither の見込み（上限）: {plan.dither_s:.0f} 秒"
+            f"（合計 {plan.total_est_s:.0f} 秒 / 枠 {plan.budget_s:.0f} 秒{over}）"
+        )
     if any(lv.raised for lv in plan.levels):
         out.append(
             "* 上端の車速は、モードから決めた上端より高い「最小の上端」"

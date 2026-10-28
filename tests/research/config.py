@@ -510,6 +510,22 @@ class LearningSection:
     # 外し、うち 2.0 秒が戻しの行だった。効く先: fwd_cv／fwd_final／pattern_drive（meta
     # stop_approach_exclusion に残る）。2026-10-23 段5-8 で none を採る。
     stop_approach_exclusion: str = "none"
+    # 2026-10-28 段2（ProblemReport_20261028）: 効き始めの少し先での小さな動き（dither）。既定 off
+    # （off なら今と完全に同じ走り）。値の根拠・効く先・決める時期は config_testVehicle.yaml の
+    # 同キーに書く。ブレーキは下りの測る車速ごとに RAMP_BRAKE_DITHER、アクセルは上りの途中の保持の
+    # 後に RAMP_ACCEL_DITHER（どちらも u0±Δ を各 hold 秒）
+    ramp_dither_enabled: bool = False
+    ramp_dither_brake_speeds_kmh: list[float] = field(
+        default_factory=lambda: [100.0, 75.0, 50.0, 30.0]
+    )
+    ramp_dither_brake_u0_from_onset_pct: list[float] = field(
+        default_factory=lambda: [0.5, 1.5, 2.5]
+    )
+    ramp_dither_deltas_pct: list[float] = field(default_factory=lambda: [0.25, 0.5])
+    ramp_dither_hold_s: float = 1.5
+    ramp_dither_max_g: float = 0.13
+    ramp_dither_accel_band_pct: float = 10.0
+    ramp_dither_accel_max_n: int = 3
 
 
 @dataclass
@@ -534,6 +550,15 @@ class PedalSearchSection:
     # 細かく踏む（踏み過ぎ防止）。
     # 位置指令は 0.01mm 単位（PCON-CB の PCMD）なので 0.01mm = 1 pulse が機械的な下限
     brake_step_mm: float = 0.1
+    # 2026-10-28 段1（ProblemReport_20261028）: 停車保持の後の低速の階段。既定 off（off なら
+    # 今と同じ動き）。値の根拠・効く先・決める時期は config_testVehicle.yaml の同キーに書く
+    low_stair_enabled: bool = False
+    low_stair_step_pct: float = 0.1  # 止まった開度から下げる刻み [%]
+    low_stair_hold_s: float = 7.0  # 各段の保持 [s]
+    low_stair_max_steps: int = 10  # 離す向きの段数の上限
+    low_stair_press_max_steps: int = 20  # 踏む向きの段数の上限（停車保持の開度の浅いほうも上限）
+    low_stair_repeats: int = 2  # 離す・踏むの繰り返し回数
+    low_stair_creep_margin_kmh: float = 0.3  # クリープに着いたとみなす余裕 [km/h]
 
 
 @dataclass
@@ -808,6 +833,24 @@ class ForwardMapSection:
     # 机上で比べて決める）。
     # 効く先: fwd_plan.build_plan の戻しの解き直し。決める時期: 段5-3 の机上の後の実機 1 組
     release_table_min_kmh: float = 0.0
+    # 2026-10-28 段4（ProblemReport_20261028）: true で、low_speed_side_rule が dir のとき、低速
+    # （pkl meta stop_max_speed_kmh 未満）の離す向きの行（ブレーキを浅くした行）を、本体の戻しの
+    # 表ではなく停止側の戻しの層（pkl の stop_release_*。learning.stop_release_layer_enabled で
+    # 作る）で
+    # 解き直す。層が pkl に無ければ今と同じ。C10・DOB・予測もその行は停止側の表を引く。
+    # 根拠: 議論（2026-10-28）で、低速の離す向きのブレーキの 65% が本体の戻しの表で開度を決めて
+    # いて、本体はクリープを知らない（7.75% で表 −1.1・実測 +0.39 km/h/s）。
+    # 既定 false ＝ 今と完全に同じ。効く先: 7.5 km/h 未満の離す向きの指令。決める時期: 段6 の実機
+    low_speed_release_stop_layer: bool = False
+    # 2026-10-28 段4 (ア): true で、C10（P と DOB の上乗せ）の差を、pkl meta の局所の効きの倍率
+    # （local_gain_brake / local_gain_accel。手順2 の dither から。効き始めからの開度 × 車速の表）で
+    # 割る。倍率は 1 以上・表の外・7.5 km/h 未満・meta なしは 1（今と同じ）。ペダル別のキー。
+    # 根拠: 議論（2026-10-28）で、効き始め＋約 3% までの局所の効きは表の傾きの 2.1〜2.7 倍
+    # （アクセルは机上で効き始めの近くが約 5 倍）。C10 は「足りない加速度 ÷ 表の傾き」で踏む量を
+    # 決めるので 2〜3 倍踏みすぎる。既定 false ＝ 今と同じ。効く先: C10 の上乗せ。
+    # 決める時期: ブレーキは段6、アクセルは段7 の実機
+    local_gain_brake: bool = False
+    local_gain_accel: bool = False
     # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
     # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
     # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・
@@ -1822,6 +1865,31 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         lr8.stop_approach_exclusion in ("depth", "window", "none"),
         "learning.stop_approach_exclusion は depth か window か none",
     )
+    # 2026-10-28 段2: 効き始めの少し先での小さな動き
+    need(
+        all(v > 0.0 for v in lr8.ramp_dither_brake_speeds_kmh)
+        and all(
+            a > b for a, b in zip(
+                lr8.ramp_dither_brake_speeds_kmh, lr8.ramp_dither_brake_speeds_kmh[1:],
+                strict=False,
+            )
+        ),
+        "learning.ramp_dither_brake_speeds_kmh は正値の降順（空なら ブレーキの dither なし）: "
+        f"{lr8.ramp_dither_brake_speeds_kmh}",
+    )
+    need(
+        len(lr8.ramp_dither_deltas_pct) > 0 and all(d > 0.0 for d in lr8.ramp_dither_deltas_pct),
+        "learning.ramp_dither_deltas_pct は空でなく、各値が正",
+    )
+    need(lr8.ramp_dither_hold_s > 0.0, "learning.ramp_dither_hold_s は正値")
+    need(
+        len(lr8.ramp_dither_brake_u0_from_onset_pct) > 0
+        and all(d >= 0.0 for d in lr8.ramp_dither_brake_u0_from_onset_pct),
+        "learning.ramp_dither_brake_u0_from_onset_pct は空でなく、各値が 0 以上",
+    )
+    need(lr8.ramp_dither_max_g > 0.0, "learning.ramp_dither_max_g は正値")
+    need(lr8.ramp_dither_accel_band_pct > 0.0, "learning.ramp_dither_accel_band_pct は正値")
+    need(lr8.ramp_dither_accel_max_n >= 0, "learning.ramp_dither_accel_max_n は 0 以上")
     need(cfg.learning.ramp_min_at_g_s >= 0.0, "learning.ramp_min_at_g_s は 0 以上")
     need(
         cfg.learning.ramp_launch_g_rate_gps >= 0.0, "learning.ramp_launch_g_rate_gps は 0 以上"
@@ -1887,6 +1955,16 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         0.01 <= ps.brake_step_mm <= 5.0,
         f"pedal_search.brake_step_mm が範囲外(0.01<=mm<=5): {ps.brake_step_mm}",
+    )
+
+    need(ps.low_stair_step_pct > 0.0, "pedal_search.low_stair_step_pct は正値")
+    need(ps.low_stair_hold_s > 0.0, "pedal_search.low_stair_hold_s は正値")
+    need(ps.low_stair_max_steps >= 1, "pedal_search.low_stair_max_steps は 1 以上")
+    need(ps.low_stair_press_max_steps >= 1, "pedal_search.low_stair_press_max_steps は 1 以上")
+    need(ps.low_stair_repeats >= 1, "pedal_search.low_stair_repeats は 1 以上")
+    need(
+        ps.low_stair_creep_margin_kmh > 0.0,
+        "pedal_search.low_stair_creep_margin_kmh は正値",
     )
 
     ds = cfg.decel_stop

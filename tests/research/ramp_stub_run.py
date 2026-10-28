@@ -114,6 +114,10 @@ async def _run(args: argparse.Namespace) -> int:
         f"({g:g}, {t:g}, 保持 {len(st)}{'・上りだけ' if up_only else ''}, 戻し {len(rel)})"
         for g, t, st, up_only, rel in order))  # 2026-10-14 段2o-5: 5 つ目は戻す車速
 
+    if lr.ramp_dither_enabled:  # 2026-10-28 段2: dither の見込み（上限）を足した結果
+        say(f"小さな動き（dither）の見込み（上限）: {plan.dither_s:.0f} 秒 "
+            f"（合計の見込み {plan.total_est_s:.0f} 秒 / 枠 {plan.budget_s:.0f} 秒"
+            f"{'・1 周目で枠を超える' if plan.over_budget else ''}）")
     hw = hwmod.build_hardware(cfg, hwmod.HW_STUB)
     vehicle = hw.can.vehicle  # type: ignore[attr-defined]
     vehicle.accel_gain_kmhs_per_pct *= args.gain_scale

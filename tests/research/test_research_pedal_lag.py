@@ -281,6 +281,20 @@ def test_estimate_pedal_return_recovers_delay_and_rate(tmp_path: Path) -> None:
     assert not res.brake.measured and res.brake.n == 0 and "件" in res.brake.reason
 
 
+def test_estimate_pedal_return_skips_dither_and_stair_phases(tmp_path: Path) -> None:
+    # 段5b: dither・低速の階段の phase で指令が下がった場面は使わない
+    csv_path = _write_return_csv(tmp_path / "r.csv", [5, 10, 15, 25, 40, 20], 0.10, 100.0)
+    lines = csv_path.read_text(encoding="utf-8").splitlines()
+    out = [lines[0] + ",phase"]
+    for i, line in enumerate(lines[1:]):
+        scene = i // 40  # 1 場面 40 行（保持 20・戻し 20）
+        out.append(line + ("," + ("RAMP_BRAKE_DITHER" if scene < 2 else "LOW_RELEASE_STAIR"
+                                  if scene == 2 else "RAMP_DOWN")))
+    csv_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    a = pedal_lag.estimate_pedal_return(csv_path).accel
+    assert a.measured and a.n == 3
+
+
 def test_estimate_pedal_return_brake_pedal_and_other_values(tmp_path: Path) -> None:
     csv_path = _write_return_csv(
         tmp_path / "b.csv", [10, 20, 30, 45], 0.20, 50.0, pedal="brake"

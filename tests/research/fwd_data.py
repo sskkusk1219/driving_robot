@@ -44,6 +44,11 @@ PHASE_BRAKE_SEARCH = "BRAKE_SEARCH"  # PEDAL_SEARCH: クリープからブレー
 PHASE_BRAKE_STEP = "BRAKE_STEP"  # PRE_DRIVE_CHECK: ブレーキを刻んで停止確認
 # PATTERN_DRIVE: G ランプの発進でブレーキをゆっくり離す（動き出す前の）区間
 PHASE_RAMP_LAUNCH_RELEASE = "RAMP_LAUNCH_RELEASE"
+# 2026-10-28 段3: PEDAL_SEARCH の低速の階段（pedal_search.PHASE_LOW_*_STAIR と同じ文字列）。
+# 踏む向き（クリープ → 停車）は停止側の表、離す向き（停車 → クリープ）の動いている行は
+# 停止側の戻しの層の行に使う
+PHASE_LOW_PRESS_STAIR = "LOW_PRESS_STAIR"
+PHASE_LOW_RELEASE_STAIR = "LOW_RELEASE_STAIR"
 SEGMENT_GAP_S = 0.5  # 仮値: 行間がこれ以上空いたらセグメントを切る
 STOP_SPEED_KMH = 0.5  # 実車速がこれ未満の行は停車として捨てる
 DEFAULT_ACCEL_WINDOW_S = 1.0  # 加速度の窓幅（前後 0.5 秒）

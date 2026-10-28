@@ -539,3 +539,51 @@ def test_plan_ramps_release_levels_estimate_and_execution_order() -> None:
     assert item[4] == lv.release_stations
     assert "戻し" in rp.format_plan_table(rel)
     assert "戻し" in rp.format_band_table(c)
+
+
+def test_plan_ramps_dither_estimate_is_added_only_when_enabled_and_for_weak_levels() -> None:
+    """2026-10-28 段2: dither の見込み（上限）。off なら今と同じ。on なら目標減速度が
+    dither_max_g 以下の段にブレーキの測る車速の数、保持のある段にアクセル min(max_n, 保持の数) 回、
+    1 回 ＝ 4 × hold ＋ turn を足す。dither_s は周回を含む合計。"""
+    c = _release_counts()
+    kw = dict(
+        mode_min_s=2.0, max_speed_kmh=140.0, budget_s=1e9, turn_s=1.0, cruise_min_kmh=15.0,
+        cruise_fine_max_kmh=100.0, cruise_coarse_step_kmh=20.0, cruise_hold_s=7.0,
+    )
+    plain = rp.plan_ramps(c, **kw)
+    off = rp.plan_ramps(c, **kw, dither_enabled=False, dither_brake_n=3, dither_accel_max_n=3)
+    assert [lv.est_s for lv in off.levels] == [lv.est_s for lv in plain.levels]
+    assert off.dither_s == 0.0 and plain.dither_s == 0.0
+    on = rp.plan_ramps(
+        c, **kw, dither_enabled=True, dither_hold_s=1.5, dither_brake_n=3, dither_max_g=0.1,
+        dither_accel_max_n=3,
+    )
+    per = 4.0 * 1.5 + 1.0
+    total = 0.0
+    for lv, base in zip(on.levels, plain.levels, strict=True):
+        want_brake = 3 if lv.g <= 0.1 else 0
+        want_accel = min(3, len(lv.stations))
+        assert (lv.dither_brake_n, lv.dither_accel_n) == (want_brake, want_accel)
+        assert lv.est_s == pytest.approx(base.est_s + (want_brake + want_accel) * per)
+        total += (want_brake + want_accel) * per * lv.passes
+    assert total > 0.0 and on.dither_s == pytest.approx(total)
+    assert on.total_est_s > plain.total_est_s
+    text = rp.format_plan_table(on)
+    assert "dither" in text and "dither" not in rp.format_plan_table(plain)
+
+
+def test_plan_ramps_dither_can_push_the_first_pass_over_budget() -> None:
+    """dither を足した結果 1 周目が枠を超えたら over_budget になり、表示にも出る。"""
+    c = _release_counts()
+    kw = dict(
+        mode_min_s=2.0, max_speed_kmh=140.0, turn_s=1.0, cruise_min_kmh=15.0,
+        cruise_fine_max_kmh=100.0, cruise_coarse_step_kmh=20.0, cruise_hold_s=7.0,
+    )
+    base = rp.plan_ramps(c, **kw, budget_s=1e9, max_passes=1)
+    budget = base.total_est_s + 1.0
+    assert not rp.plan_ramps(c, **kw, budget_s=budget, max_passes=1).over_budget
+    on = rp.plan_ramps(
+        c, **kw, budget_s=budget, max_passes=1, dither_enabled=True, dither_hold_s=1.5,
+        dither_brake_n=3, dither_max_g=0.1, dither_accel_max_n=3,
+    )
+    assert on.over_budget and "枠を超えている" in rp.format_plan_table(on)

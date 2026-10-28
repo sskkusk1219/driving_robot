@@ -405,6 +405,36 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
       安全網: STOP_RELEASE_TIMEOUT_S 経っても終わらなければ同じ。
     - 入らない段: 目標減速度が stop_release_max_g を超える段（強い段）、u ≧ 0 の段。
       1 回の下りにつき 1 回だけ入る。
+
+2026-10-28 段2（ProblemReport_20261028 手順2 B）: 効き始めの少し先で、ブレーキ・アクセルを小さく
+    動かして局所の効き（1% あたりの加速度の変化）と効くまでの遅れを測る（`learning.ramp_dither_*`。
+    既定 off ＝ 今と完全に同じ走り）。RAMP_RELEASE（段2o-5）・HOLD_STEP（段2o-2）と同じ作り。
+    - ブレーキ（新フェーズ `_Phase.RAMP_BRAKE_DITHER`。CSV の phase 名も同じ）: RAMP_DOWN で
+      ブレーキのラッチ後（`_rp_brake_latched`）、実車速 ≤ まだ使っていない測る車速
+      （ramp_dither_brake_speeds_kmh）を切った周期に、今の u が帯の中かどうかに関係なく入る
+      （2026-10-28 段5 の実機 101618: 帯より浅い 4.2〜5.5% で 9 回中 6 回飛ばした）。ラッチ前・
+      安全網の車速以下（RAMP_RELEASE 中・停止前の戻し中を含む）なら、その車速は飛ばす
+      （使ったことにする）。
+      中心 u0 は「今の u」ではなく、効き始め（今の pkl の meta `brake_onset_u_pct`。`pattern_drive`
+      が読んで `ramp_dither_brake_onset_u_pct` に渡す。読めなければ入らない）＋
+      ramp_dither_brake_u0_from_onset_pct（入るたびに順に使う・通し番号で巡回）の深さ（min から）。
+      u0±Δ は min〜ブレーキの上限に切る。入る前の u から u0 へは、その周期にステップで移る
+      （制御の項なし）。入る段は目標減速度が ramp_dither_max_g 以下の弱い段だけ。
+      ブレーキを深くする向きを + に u0＋Δ → u0 → u0−Δ → u0 を各 ramp_dither_hold_s 秒、ステップ
+      （その周期で指令を切り替える）で動かす。Δ は ramp_dither_deltas_pct を入るたびに交互に使う。
+    - アクセル（`_Phase.RAMP_ACCEL_DITHER`）: 上りの途中の保持（RAMP_CRUISE）が完了したとき、今の
+      アクセル開度（min からの量 ＝ u）が accel の効き始め（meta `accel_onset_u_pct`）〜 ＋
+      ramp_dither_accel_band_pct の中なら、同じ形の動きを入れてから保持を出る。1 本の G ランプにつき
+      最大 ramp_dither_accel_max_n 回。u0−Δ が min 未満になる場合は min（u ＝ 0）にクランプする。
+    - G を守る手当て（RAMP_RELEASE と同じ）: `_step_ramp` で早く返す（`_ramp_control` を呼ばない・
+      上限 G のマップに貯めない・`_rp_down_g` にも入れない）。出るとき（流れの最後・実車速が安全網
+      〔ブレーキは ramp_release_min_kmh〕以下・アクセルは頭打ち超え／上端到達）は、ブレーキは
+      `_ramp_release_exit`、アクセルは `_ramp_cruise_exit` で元の区間へ戻し、g_ref を 0 → 目標へ
+      ramp_turn_time_s で直線、v_ref ＝ 実車速、e_前 ＝ 0（取り返しに行かない）。使った時間は
+      下り・上りの時間切れから除く。開度の上下限・最高速超えの安全網はそのまま。ブレーキの流れは
+      アクセル 0（hi ＝ 0）、アクセルの流れはブレーキ 0 なので両踏みにならない。
+    - 結果: `RampResult.dither_brake_s`・`dither_brake_n`・`dither_brake_skipped`・
+      `dither_accel_s`・`dither_accel_n`・`dither_accel_skipped`。
 """
 
 from __future__ import annotations
@@ -549,6 +579,15 @@ class RampResult:
     accel_onset_pct: float | None = None
     brake_onset_pct: float | None = None
     step_accel_below_onset_n: int = 0
+    # 2026-10-28 段2: 効き始めの少し先での小さな動き（RAMP_BRAKE_DITHER・RAMP_ACCEL_DITHER）の
+    # 合計秒数・入った回数・飛ばした回数（帯の外・ラッチ前など）。
+    # down_s・cruise_s は dither の時間を含まない
+    dither_brake_s: float = 0.0
+    dither_brake_n: int = 0
+    dither_brake_skipped: int = 0
+    dither_accel_s: float = 0.0
+    dither_accel_n: int = 0
+    dither_accel_skipped: int = 0
 
 
 @dataclass(frozen=True)
@@ -581,6 +620,10 @@ class _Phase(Enum):
     HOLD_STEP = auto()
     # G ランプ走行（段2o-5）: 下りの途中でブレーキを山から離す戻し（RAMP_DOWN の途中）
     RAMP_RELEASE = auto()
+    # G ランプ走行（段2 2026-10-28）: 効き始めの少し先での小さな動き
+    # （下りのブレーキ・上りの保持の後のアクセル）
+    RAMP_BRAKE_DITHER = auto()
+    RAMP_ACCEL_DITHER = auto()
     DONE = auto()
 
 
@@ -599,7 +642,7 @@ STOP_RELEASE_TIMEOUT_S = 30.0
 # G ランプの区間（順に RAMP_UP → RAMP_HOLD → RAMP_DOWN。2026-10-10 段2l-10 で RAMP_HOLD を追加）
 _RAMP_PHASES = (
     _Phase.RAMP_UP, _Phase.RAMP_CRUISE, _Phase.RAMP_HOLD, _Phase.HOLD_STEP, _Phase.RAMP_DOWN,
-    _Phase.RAMP_RELEASE,
+    _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER, _Phase.RAMP_ACCEL_DITHER,
 )
 
 
@@ -766,6 +809,19 @@ class PatternLoopConfig:
     stop_release_escape_s: float = field(default=0.5)
     stop_release_escape_decel_kmhs: float = field(default=0.1)
     stop_release_max_g: float = field(default=0.2)
+    # 2026-10-28 段2: 効き始めの少し先での小さな動き（learning.ramp_dither_* から渡す。false なら
+    # 今と同じ走り）。効き始め（min からの量）は pkl の meta から `pattern_drive` が渡す
+    # （None なら入らない）
+    ramp_dither_enabled: bool = field(default=False)
+    ramp_dither_brake_speeds_kmh: tuple[float, ...] = field(default=(100.0, 75.0, 50.0, 30.0))
+    ramp_dither_brake_u0_from_onset_pct: tuple[float, ...] = field(default=(0.5, 1.5, 2.5))
+    ramp_dither_deltas_pct: tuple[float, ...] = field(default=(0.25, 0.5))
+    ramp_dither_hold_s: float = field(default=1.5)
+    ramp_dither_max_g: float = field(default=0.13)
+    ramp_dither_accel_band_pct: float = field(default=10.0)
+    ramp_dither_accel_max_n: int = field(default=3)
+    ramp_dither_brake_onset_u_pct: float | None = field(default=None)
+    ramp_dither_accel_onset_u_pct: float | None = field(default=None)
 
 
 class ActuatorDriverProtocol(Protocol):
@@ -971,6 +1027,7 @@ class PatternLoop:
         # 結果用の積算（区間を切り替えるたびに足す）。キーは up / cruise / hold / down
         self._rp_acc: dict[str, float] = {
             "up": 0.0, "cruise": 0.0, "hold": 0.0, "down": 0.0, "release": 0.0,
+            "dither_brake": 0.0, "dither_accel": 0.0,
         }
         # 下りの戻し（RAMP_RELEASE。2026-10-14 段2o-5）。RAMP_UP の頭で作り直す
         self._rp_release_done: set[int] = set()  # 戻し済み（飛ばした分を含む）の点の番号
@@ -988,6 +1045,19 @@ class PatternLoop:
         self._rp_stop_release_nonneg_s = 0.0  # 実加速度 ≧ 0 が続いた秒数
         self._rp_stop_release_last_t: float | None = None
         self._rp_u_hist: deque[tuple[float, float]] = deque()  # 下りの u の履歴 (時刻, u)
+        # 効き始めの少し先での小さな動き（段2 2026-10-28）。RAMP_UP の頭で作り直す
+        # （通し番号は持ち越す）
+        self._rp_dither_brake_done: set[int] = set()  # 使った（飛ばした分を含む）測る車速の番号
+        self._rp_dither_brake_n = 0
+        self._rp_dither_brake_skipped = 0
+        self._rp_dither_accel_n = 0
+        self._rp_dither_accel_skipped = 0
+        self._rp_dither_seq_brake = 0  # Δ を交互に使う通し番号（ループの間続く）
+        self._rp_dither_seq_accel = 0
+        self._rp_dither_seq_u0 = 0  # u0 の効き始めからの量の巡回の通し番号（ループの間続く）
+        self._rp_dither_t0 = 0.0
+        self._rp_dither_u0 = 0.0
+        self._rp_dither_delta = 0.0
         self._rp_seg_t = 0.0  # 今の区間の積算の起点
         self._rp_up_g: list[float] = []  # 加速側の実測 G（符号つき。窓が溜まってから）
         self._rp_down_g: list[float] = []  # 減速側の実測 G（符号つき）
@@ -1464,14 +1534,14 @@ class PatternLoop:
             # 2026-10-10 段2l-10: RAMP_HOLD も RAMP_UP と同じ（アクセルに入った後は下限 0。
             # 発進が終わらないまま来たときは今の u から離す向きだけ）
             lo = 0.0 if self._rp_accel_reached else min(0.0, self._rp_u)
-        elif self._phase is _Phase.RAMP_CRUISE:
+        elif self._phase in (_Phase.RAMP_CRUISE, _Phase.RAMP_ACCEL_DITHER):
             # 2026-10-13 段2o-2: 保持の下限は、ブレーキ側（u ＜ 0）で入ったときは今の u
             # （離す向きだけ）、
             # 0 以上なら 0。下りのラッチ（上限 0）は外してアクセルで保つ。`_rp_accel_reached` を
             # 見て下限 0 にすると、ブレーキを踏んだまま入ったとき 1 周期でブレーキが抜ける
             lo = min(0.0, self._rp_u)
         elif (self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched) or (
-            self._phase is _Phase.RAMP_RELEASE
+            self._phase in (_Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER)
         ):
             hi = 0.0  # 戻し（段2o-5）はブレーキ側（u ≤ 0）だけ。u は `_ramp_release_u` が決める
         return lo, hi
@@ -1480,7 +1550,7 @@ class PatternLoop:
         """G ランプの u がブレーキ側を指すか（RAMP_DOWN のラッチ後、または u ＜ 0）。"""
         if self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched:
             return True
-        if self._phase is _Phase.RAMP_RELEASE:
+        if self._phase in (_Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER):
             return True  # 戻しの間はブレーキの領域（u ＝ 0 でも待機位置 ＝ min）
         return self._rp_u < 0.0
 
@@ -1524,7 +1594,7 @@ class PatternLoop:
         # 2026-10-14 段2o-5: RAMP_RELEASE もラッチ後の RAMP_DOWN と同じ（u ＝ 0 でブレーキ ＝ min。
         # 0% へ飛ばさない）
         if (self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched) or (
-            self._phase is _Phase.RAMP_RELEASE
+            self._phase in (_Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER)
         ):
             accel = 0.0
             brake = ff.brake_deadband_pct - u
@@ -1581,7 +1651,15 @@ class PatternLoop:
         self._rp_down_begun = False
         self._rp_cruise_n = 0
         self._rp_cruise_done_n = 0
-        self._rp_acc = {"up": 0.0, "cruise": 0.0, "hold": 0.0, "down": 0.0, "release": 0.0}
+        self._rp_acc = {
+            "up": 0.0, "cruise": 0.0, "hold": 0.0, "down": 0.0, "release": 0.0,
+            "dither_brake": 0.0, "dither_accel": 0.0,
+        }
+        self._rp_dither_brake_done = set()
+        self._rp_dither_brake_n = 0
+        self._rp_dither_brake_skipped = 0
+        self._rp_dither_accel_n = 0
+        self._rp_dither_accel_skipped = 0
         self._rp_release_done = set()
         self._rp_release_n = 0
         self._rp_release_skipped = 0
@@ -1691,7 +1769,10 @@ class PatternLoop:
         cfg = self._config
         g = pattern.target_g
         g_min = min(max(0.0, cfg.ramp_edge_g), g)  # 発進の始まり・停止の終わりの下げ止め
-        if self._phase in (_Phase.HOLD_STEP, _Phase.RAMP_RELEASE):
+        if self._phase in (
+            _Phase.HOLD_STEP, _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER,
+            _Phase.RAMP_ACCEL_DITHER,
+        ):
             # 開度を固定で持つ（基準は進めない。2026-10-13 段2o-2。戻しも同じ。2026-10-14 段2o-5:
             # 戻しを出るときの `_rp_turn_g0` が 0 になり、g_ref は 0 → −G で始まる）
             return 0.0
@@ -2179,7 +2260,11 @@ class PatternLoop:
             # 段2o-10 A: 発進のゆっくり離しの間は偏差の項・基準を使わない（v_ref は 0 のまま）。
             # 過渡の点は上限 G マップにも結果の G にも入れない
             return None
-        if self._phase in (_Phase.HOLD_STEP, _Phase.RAMP_RELEASE):
+        if self._phase in (
+            _Phase.HOLD_STEP, _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER,
+            _Phase.RAMP_ACCEL_DITHER,
+        ):
+            # 2026-10-28 段2: 効き始めの少し先での小さな動き（dither）も同じ（開度を固定で持つ）。
             # 2026-10-13 段2o-2: 遅れの測定のステップは開度を固定で持つ。偏差の項は使わず、
             # 過渡の点を上限 G マップに貯めない（`_rp_hist` の更新・加速度の測定は上でしている）。
             # 2026-10-14 段2o-5: 下りの戻し（RAMP_RELEASE）も同じ。戻り値が None なので実測 G の
@@ -2267,6 +2352,12 @@ class PatternLoop:
             else:
                 self._advance_ramp_release(speed, now)
             return
+        if self._phase is _Phase.RAMP_BRAKE_DITHER:
+            self._advance_ramp_dither_brake(speed, now)
+            return
+        if self._phase is _Phase.RAMP_ACCEL_DITHER:
+            self._advance_ramp_dither_accel(pattern, speed, now)
+            return
         if self._phase is _Phase.RAMP_DOWN and self._config.stop_release_enabled:
             self._rp_u_hist.append((now, self._rp_u))  # 山の開度（直近の u の最深）用
             while self._rp_u_hist and now - self._rp_u_hist[0][0] > STOP_RELEASE_PEAK_WINDOW_S:
@@ -2336,6 +2427,8 @@ class PatternLoop:
             return
         if self._ramp_release_try_enter(pattern, speed, now):
             return
+        if self._ramp_dither_brake_try_enter(pattern, speed, now):
+            return
         if self._stop_release_try_enter(pattern, speed, now):
             return
         self._ramp_cruise_try_enter(pattern, speed, now, measured_accel)
@@ -2358,6 +2451,7 @@ class PatternLoop:
             _Phase.RAMP_UP: "up", _Phase.RAMP_CRUISE: "cruise",
             _Phase.RAMP_HOLD: "hold", _Phase.HOLD_STEP: "hold", _Phase.RAMP_DOWN: "down",
             _Phase.RAMP_RELEASE: "release",
+            _Phase.RAMP_BRAKE_DITHER: "dither_brake", _Phase.RAMP_ACCEL_DITHER: "dither_accel",
         }.get(self._phase)
         if key is not None:
             self._rp_acc[key] += max(0.0, now - self._rp_seg_t)
@@ -2462,6 +2556,10 @@ class PatternLoop:
             or (up and speed >= pattern.top_kmh)
             or (not up and speed <= STOP_SPEED_KMH)
         )
+        if done and up and not (timed_out or unsafe) and self._ramp_dither_accel_try_enter(
+            now
+        ):
+            return  # 2026-10-28 段2: 保持を出る直前に小さな動き（出るのは dither の後）
         if done or timed_out or unsafe:
             self._ramp_cruise_exit(pattern, speed, now, done)
 
@@ -2706,6 +2804,137 @@ class PatternLoop:
         if self._rp_blend_left > 0.0:  # 浅くする向き（u_peak が今より浅い）は寄せない
             self._rp_blend_left = self._rp_blend_time_left = 0.0
 
+    # ── 効き始めの少し先での小さな動き（段2 2026-10-28）─────────────────────
+    def _ramp_dither_total_s(self) -> float:
+        """dither の流れの全体の秒数 ＝ 4 つの開度 × ramp_dither_hold_s。"""
+        return 4.0 * self._config.ramp_dither_hold_s
+
+    def _ramp_dither_u(self, t: float, *, brake: bool) -> float:
+        """dither に入ってから t 秒後の u。ブレーキは「深くする向き」を + にして
+        u0＋Δ → u0 → u0−Δ → u0（u は負がブレーキなので深さ ＝ −u）、アクセルは u0＋Δ → u0 → u0−Δ →
+        u0（u が増える向きが +）。各 ramp_dither_hold_s 秒、ステップ。u の範囲 [lo, hi] に丸め、
+        ブレーキは u ≦ 0（待機位置 ＝ min より浅くしない）、アクセルは u ≧ 0（min 未満は min）。"""
+        hold = max(self._config.ramp_dither_hold_s, 1e-6)
+        k = min(3, int(t / hold))
+        sign = (1.0, 0.0, -1.0, 0.0)[k]
+        u0, delta = self._rp_dither_u0, self._rp_dither_delta
+        u = u0 - sign * delta if brake else u0 + sign * delta
+        lo, hi = self._ramp_u_limits()
+        return min(hi, max(lo, u))
+
+    def _ramp_dither_brake_try_enter(
+        self, pattern: GRampPattern, speed: float, now: float
+    ) -> bool:
+        """下り（RAMP_DOWN）で、測る車速に着いたら RAMP_BRAKE_DITHER へ入る。入ったら True。
+
+        実車速 ≤ まだ使っていない測る車速（複数当てはまるときは 1 点だけ使い、残りは飛ばして済みに
+        する）で、ブレーキのラッチ後・u ＜ 0・実車速が安全網（ramp_release_min_kmh）より上、
+        のときだけ入る（今の u が効き始めの帯の中かどうかは問わない）。中心 u0 は効き始め ＋
+        ramp_dither_brake_u0_from_onset_pct[通し番号 % 個数] の深さ。当てはまらない点は飛ばす
+        （`dither_brake_skipped`。上端より上の点は数えない）。入れない設定（off・効き始めが
+        読めない・車速の列が空・強い段）では状態を変えない。
+        """
+        cfg = self._config
+        speeds = cfg.ramp_dither_brake_speeds_kmh
+        on = cfg.ramp_dither_brake_onset_u_pct
+        if (
+            not cfg.ramp_dither_enabled or not speeds or not cfg.ramp_dither_deltas_pct
+            or on is None or pattern.target_g > cfg.ramp_dither_max_g
+        ):
+            return False
+        cands = [
+            i for i, st in enumerate(speeds)
+            if i not in self._rp_dither_brake_done and speed <= st
+        ]
+        if not cands:
+            return False
+        self._rp_dither_brake_done.update(cands)
+        ok = (
+            self._rp_brake_latched and self._rp_u < 0.0
+            and speed > max(cfg.ramp_release_min_kmh, STOP_SPEED_KMH)
+        )
+        self._rp_dither_brake_skipped += sum(
+            1 for i in cands if speeds[i] <= pattern.top_kmh
+        ) - (1 if ok else 0)
+        if not ok:
+            return False
+        self._ramp_account(now)
+        assert self._phase_started_at is not None
+        self._rp_down_prior_s += max(0.0, now - self._phase_started_at)  # 時間切れから除く
+        self._rp_blend_left = self._rp_blend_time_left = 0.0  # 寄せ残りは捨てる
+        self._rp_down_brake_blend_pending = False
+        self._rp_blend_release = False
+        deltas = cfg.ramp_dither_deltas_pct
+        self._rp_dither_delta = deltas[self._rp_dither_seq_brake % len(deltas)]
+        self._rp_dither_seq_brake += 1
+        offs = cfg.ramp_dither_brake_u0_from_onset_pct or (0.0,)
+        off = offs[self._rp_dither_seq_u0 % len(offs)]
+        self._rp_dither_seq_u0 += 1
+        lo, hi = self._ramp_u_limits()
+        u0 = min(min(hi, 0.0), max(lo, -(on + off)))  # min〜上限に切る
+        self._rp_dither_u0 = u0
+        self._rp_u = u0  # 入る前の u から u0 へはステップで移る（制御の項なし）
+        self._rp_release_u_peak = u0  # 出るとき `_ramp_release_exit` が u0 へ寄せる
+        self._rp_dither_t0 = now
+        self._rp_dither_brake_n += 1
+        self._phase = _Phase.RAMP_BRAKE_DITHER  # `_enter_phase` は通さない（`_rp_hist` を残す）
+        self._skip_count = 0
+        return True
+
+    def _advance_ramp_dither_brake(self, speed: float, now: float) -> None:
+        """RAMP_BRAKE_DITHER の前進。u を流れの時刻から決め（制御の項なし）、流れが終わるか、
+        実車速が安全網（ramp_release_min_kmh。0 なら停車）以下になったら
+        `_ramp_release_exit`（RAMP_DOWN へ戻し、g_ref を 0 → −G・v_ref ＝ 実車速・e_前 ＝ 0）。"""
+        cfg = self._config
+        t = max(0.0, now - self._rp_dither_t0)
+        if t >= self._ramp_dither_total_s() or speed <= max(
+            cfg.ramp_release_min_kmh, STOP_SPEED_KMH
+        ):
+            self._ramp_release_exit(speed, now)
+            return
+        self._rp_u = self._ramp_dither_u(t, brake=True)
+
+    def _ramp_dither_accel_try_enter(self, now: float) -> bool:
+        """上りの保持（RAMP_CRUISE）が完了したとき、今のアクセル開度（u）が効き始め 〜 ＋ band の
+        中なら RAMP_ACCEL_DITHER へ入る。入ったら True。1 本の G ランプにつき最大
+        ramp_dither_accel_max_n 回。帯の外は `dither_accel_skipped`。"""
+        cfg = self._config
+        on = cfg.ramp_dither_accel_onset_u_pct
+        if (
+            not cfg.ramp_dither_enabled or on is None or not cfg.ramp_dither_deltas_pct
+            or self._rp_dither_accel_n >= cfg.ramp_dither_accel_max_n
+        ):
+            return False
+        u = self._rp_u
+        if not (on <= u <= on + cfg.ramp_dither_accel_band_pct):
+            self._rp_dither_accel_skipped += 1
+            return False
+        self._ramp_account(now)  # ここまでは保持の時間
+        deltas = cfg.ramp_dither_deltas_pct
+        self._rp_dither_delta = deltas[self._rp_dither_seq_accel % len(deltas)]
+        self._rp_dither_seq_accel += 1
+        self._rp_dither_u0 = u
+        self._rp_dither_t0 = now
+        self._rp_dither_accel_n += 1
+        self._phase = _Phase.RAMP_ACCEL_DITHER  # `_enter_phase` は通さない（`_rp_hist` を残す）
+        self._skip_count = 0
+        return True
+
+    def _advance_ramp_dither_accel(self, pattern: GRampPattern, speed: float, now: float) -> None:
+        """RAMP_ACCEL_DITHER の前進。流れが終わるか、安全網（実車速が最高速の頭打ちを超えた・上端に
+        着いた）で `_ramp_cruise_exit`（保持を完了して RAMP_UP へ。g_ref は 0 → +G、
+        v_ref ＝ 実車速・e_前 ＝ 0）。dither の間の長い間隔で基準・積分が進まないよう制御の時刻は
+        空にする。dither の時間は保持の開始から数えるので、上りの時間切れから除かれる。"""
+        t = max(0.0, now - self._rp_dither_t0)
+        if (
+            t >= self._ramp_dither_total_s() or speed > self._accel_speed_cap
+            or speed >= pattern.top_kmh
+        ):
+            self._rp_ctl_t = None
+            self._ramp_cruise_exit(pattern, speed, now, True)
+            return
+        self._rp_u = self._ramp_dither_u(t, brake=False)
+
     # ── 遅れの測定のステップ（HOLD_STEP。2026-10-13 段2o-2）──────────────
     def _ramp_step_targets(self, speed: float, u_hold: float) -> list[float] | None:
         """HOLD_STEP の開度 u の列（5 つ）。アクセルの踏み増しの大きさが決まらなければ None
@@ -2919,6 +3148,12 @@ class PatternLoop:
                 accel_onset_pct=self._onset_pct.get(PEDAL_ACCEL),
                 brake_onset_pct=self._onset_pct.get(PEDAL_BRAKE),
                 step_accel_below_onset_n=self.step_accel_below_onset_n,
+                dither_brake_s=self._rp_acc["dither_brake"],
+                dither_brake_n=self._rp_dither_brake_n,
+                dither_brake_skipped=self._rp_dither_brake_skipped,
+                dither_accel_s=self._rp_acc["dither_accel"],
+                dither_accel_n=self._rp_dither_accel_n,
+                dither_accel_skipped=self._rp_dither_accel_skipped,
             )
         )
 

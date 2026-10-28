@@ -14,6 +14,10 @@ tests/hardware/test_calibration.py で測る）で表し、待機位置かつ効
                            停止確認開度とする。車速が下がっている間は踏み増さない。
                            vehicle.max_brake_opening_pct まで踏んでも停車しなければエラー
     3. 停車保持         … 停止確認開度 + stop_hold_margin_pct まで刻んで踏み、そのまま保持する
+4. 低速の階段       … （pedal_search.low_stair_enabled のときだけ。2026-10-28 段1）停車保持の後、
+                       止まった開度 − k × 刻み（k=1,2,…）を順に下げて保持し（LOW_RELEASE_STAIR）、
+                       クリープに着いたら同じ開度を逆順に踏んで保持し（LOW_PRESS_STAIR）、停車で終わる。
+                       これを low_stair_repeats 回。最後は停車保持の開度へ戻して G ランプへ渡す
 
 いきなり目標開度を踏まないのは、クリープ中の急制動とペダルへの衝撃を避けるため。連続移動に
 しないのは、アクチュエータの最低速度（ブレーキ 10mm/s）で踏み続けると、むだ時間 0.6〜0.9s と
@@ -43,6 +47,7 @@ estimate_dynamics_params の推定値で上書きされないようにした。
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -65,6 +70,10 @@ MOVE_DWELL_MIN_S = 0.2
 PHASE_CREEP_WAIT = "CREEP_WAIT"
 PHASE_BRAKE_SEARCH = "BRAKE_SEARCH"
 PHASE_STOP_HOLD = "STOP_HOLD"
+# 2026-10-28 段1（ProblemReport_20261028）: 停車保持の後に入れる低速の階段（low_stair_enabled）
+PHASE_LOW_RELEASE_STAIR = "LOW_RELEASE_STAIR"  # 離す向き: 浅い方へ（停車 → クリープ）
+PHASE_LOW_PRESS_STAIR = "LOW_PRESS_STAIR"  # 踏む向き: 同じ開度を戻す方へ（クリープ → 停車）
+STAIR_TAIL_S = 2.0  # 各段の保持の終わりに車速・加速度を測る時間 [s]
 
 
 @dataclass(frozen=True)
@@ -238,6 +247,178 @@ async def _search_brake(
             return pos
 
 
+def low_stair_openings(
+    stop_confirm_pct: float,
+    step_pct: float,
+    max_steps: int,
+    *,
+    min_pct: float,
+    max_pct: float,
+) -> list[float]:
+    """低速の階段の開度の列 [%]（離す向きの順＝浅くなる順）を返す。
+
+    止まった開度（stop_confirm_pct）から k × step_pct（k=1..max_steps）下げた開度。
+    [min_pct, max_pct] に切る。min に当たったらそれ以上は同じ値になるので、そこで列を終える。
+    車の固定値は持たず、止まった開度からの量だけで決める。
+    """
+    out: list[float] = []
+    for k in range(1, max_steps + 1):
+        pct = round(min(max_pct, max(min_pct, stop_confirm_pct - k * step_pct)), 4)
+        if out and pct == out[-1]:
+            break
+        out.append(pct)
+    return out
+
+
+def low_stair_press_openings(
+    start_pct: float,
+    step_pct: float,
+    max_steps: int,
+    *,
+    hold_pct: float,
+    max_pct: float,
+) -> list[float]:
+    """踏む向きの開度の列 [%]（深くなる順）。start_pct（離す向きで最後に居た開度）から
+    k × step_pct（k=1..max_steps）深くした開度。停車保持の開度（hold_pct）と max_pct の浅いほうで
+    切り、そこに当たったらそこで列を終える（同じ値を繰り返さない）。
+    """
+    cap = min(hold_pct, max_pct)
+    out: list[float] = []
+    for k in range(1, max_steps + 1):
+        pct = round(min(cap, start_pct + k * step_pct), 4)
+        if pct <= start_pct or (out and pct == out[-1]):
+            break
+        out.append(pct)
+    return out
+
+
+def stair_release_done(speed_kmh: float, creep_kmh: float, margin_kmh: float) -> bool:
+    """離す向きの終わり: 車速がクリープ車速 − 余裕 以上（クリープに着いた）。"""
+    return speed_kmh >= creep_kmh - margin_kmh
+
+
+def stair_press_done(speed_kmh: float) -> bool:
+    """踏む向きの終わり: 車速が停車の閾値未満（止まった）。"""
+    return speed_kmh < VEHICLE_STOP_SPEED_KMH
+
+
+def low_stair_estimate_s(cfg: ResearchConfig) -> float:
+    """低速の階段の最大所要時間 [s]（全段・全繰り返しを使い切ったとき。say の見込み用）。"""
+    s = cfg.pedal_search
+    per_step = s.low_stair_hold_s + _move_dwell_s(cfg)
+    steps = s.low_stair_max_steps + s.low_stair_press_max_steps
+    return s.low_stair_repeats * steps * per_step
+
+
+async def _stair_direction(
+    hw: ResearchHardware,
+    cfg: ResearchConfig,
+    openings: list[float],
+    *,
+    done: Callable[[float], bool],
+    label: str,
+) -> tuple[int, bool]:
+    """openings を順に踏み、各段で low_stair_hold_s 保持して車速を測る。
+
+    各段の結果（開度・保持の終わり STAIR_TAIL_S の平均車速と加速度）を say で出す。
+    done(平均車速) が True になった段で終わる。返り値は (最後に踏んだ段の添字, done で終わったか)。
+    開度は呼び出し側で [min, max] に切ってある前提。アクセルには触れない（min のまま）。
+    """
+    s = cfg.pedal_search
+    move_dwell = _move_dwell_s(cfg)
+    tail = min(STAIR_TAIL_S, s.low_stair_hold_s)
+    lead = max(0.0, s.low_stair_hold_s - tail)
+    half = tail / 2.0
+    last = -1
+    for i, pct in enumerate(openings):
+        await hw.brake.move_to_position(opening_to_pulse(pct), smooth_over_s=move_dwell)
+        last = i
+        if lead > 0.0:
+            await asyncio.sleep(lead)
+        first = await mean_speed(hw, half)
+        second = await mean_speed(hw, half)
+        speed = (first + second) / 2.0
+        accel = (second - first) / half  # 前半・後半の窓の中心は half 離れている
+        finished = done(speed)
+        say(f"  {label} {i + 1}/{len(openings)}: ブレーキ {pct:5.2f}%  "
+            f"保持の終わり {tail:g}s 平均 {speed:6.2f} km/h・加速度 {accel:+.3f} km/h/s"
+            f"{'  → 終わり' if finished else ''}")
+        if finished:
+            return last, True
+    return last, False
+
+
+async def run_low_stair(
+    hw: ResearchHardware,
+    cfg: ResearchConfig,
+    *,
+    creep_kmh: float,
+    stop_confirm_pct: float,
+    hold_pct: float,
+    log: SessionLog | None = None,
+) -> None:
+    """停車保持の後の低速の階段（離す向き → 踏む向き）を low_stair_repeats 回行う。
+
+    終わったら停車保持の開度（hold_pct）まで刻んで踏み直して返す（G ランプへ渡す状態）。
+    """
+    s = cfg.pedal_search
+    v = cfg.vehicle
+    openings = low_stair_openings(
+        stop_confirm_pct, s.low_stair_step_pct, s.low_stair_max_steps,
+        min_pct=v.min_brake_opening_pct, max_pct=v.max_brake_opening_pct,
+    )
+    est = low_stair_estimate_s(cfg)
+    say(f"低速の階段: 止まった開度 {stop_confirm_pct:.2f}% から {s.low_stair_step_pct:g}% 刻みで "
+        f"最大 {len(openings)} 段（{openings[0]:.2f}% → {openings[-1]:.2f}%）、保持 "
+        f"{s.low_stair_hold_s:g}s、{s.low_stair_repeats} 回繰り返し。クリープ車速 "
+        f"{creep_kmh:.2f} − {s.low_stair_creep_margin_kmh:g} km/h 以上で離す向きの終わり、"
+        f"{VEHICLE_STOP_SPEED_KMH:g} km/h 未満で踏む向きの終わり。"
+        f"所要の見込み 最大 約 {est / 60.0:.1f} 分（途中で終われば短くなる）")
+    hold_pulse = opening_to_pulse(hold_pct)
+    stopped = True  # 停車保持から始まる
+    pos = hold_pulse
+    for rep in range(1, s.low_stair_repeats + 1):
+        if not stopped:  # 前の繰り返しが停車で終わらなかったときは、止まった状態へ戻してから始める
+            pos = await step_to_position(
+                hw.brake, pos, hold_pulse,
+                step_pulse=search_step_pulse(cfg), dwell_s=HOLD_STEP_DWELL_S,
+            )
+        mark(log, SECTION_PEDAL_SEARCH, PHASE_LOW_RELEASE_STAIR)
+        say(f"低速の階段 {rep}/{s.low_stair_repeats} 離す向き")
+        last, reached = await _stair_direction(
+            hw, cfg, openings,
+            done=lambda sp: stair_release_done(sp, creep_kmh, s.low_stair_creep_margin_kmh),
+            label="離す",
+        )
+        if not reached:
+            say(f"  段数の上限（{len(openings)} 段）でクリープに着きませんでした")
+        # 踏む向き: 離す向きで最後に居た開度から刻みずつ深く踏み、止まるまで続ける
+        # （離す向きの列の長さに縛られない。上限は low_stair_press_max_steps と停車保持の開度）
+        press = low_stair_press_openings(
+            openings[last], s.low_stair_step_pct, s.low_stair_press_max_steps,
+            hold_pct=hold_pct, max_pct=v.max_brake_opening_pct,
+        )
+        mark(log, SECTION_PEDAL_SEARCH, PHASE_LOW_PRESS_STAIR)
+        say(f"低速の階段 {rep}/{s.low_stair_repeats} 踏む向き")
+        pos = opening_to_pulse(openings[last])
+        if press:
+            last_press, stopped = await _stair_direction(
+                hw, cfg, press, done=stair_press_done, label="踏む"
+            )
+            pos = opening_to_pulse(press[last_press])
+        else:
+            stopped = False
+        if not stopped:
+            say(f"  踏む向きの上限（最大 {s.low_stair_press_max_steps} 段・"
+                f"停車保持 {hold_pct:.2f}% まで）でも停車しませんでした。停車保持へ戻します")
+    # 停車保持の開度へ戻す（G ランプの前提。今までの停車保持と同じ位置）
+    mark(log, SECTION_PEDAL_SEARCH, PHASE_STOP_HOLD)
+    await step_to_position(
+        hw.brake, pos, hold_pulse,
+        step_pulse=search_step_pulse(cfg), dwell_s=HOLD_STEP_DWELL_S,
+    )
+
+
 async def run_pedal_search(
     hw: ResearchHardware,
     cfg: ResearchConfig,
@@ -275,6 +456,11 @@ async def run_pedal_search(
         hw.brake, stop_pos, opening_to_pulse(hold_pct),
         step_pulse=hold_step, dwell_s=HOLD_STEP_DWELL_S,
     )
+
+    if s.low_stair_enabled:
+        await run_low_stair(
+            hw, cfg, creep_kmh=base, stop_confirm_pct=stop_pct, hold_pct=hold_pct, log=log
+        )
 
     result = PedalSearchResult(
         creep_speed_kmh=round(base, 2),

@@ -366,3 +366,198 @@ def test_apply_to_profile_overrides_measured_values() -> None:
     # u の原点（名前は不感帯のまま）は 2-0 で上書きしない。yaml の min のまま
     assert ffp.accel_deadband_pct == cfg.vehicle.min_accel_opening_pct
     assert ffp.brake_deadband_pct == cfg.vehicle.min_brake_opening_pct
+
+
+# ── 低速の階段（2026-10-28 段1。ProblemReport_20261028） ─────────────────────
+
+
+def test_low_stair_openings_steps_down_from_stop_confirm() -> None:
+    got = psmod.low_stair_openings(10.0, 0.25, 4, min_pct=2.9, max_pct=40.0)
+    assert got == [9.75, 9.5, 9.25, 9.0]
+
+
+def test_low_stair_openings_clamp_to_min_and_stop_there() -> None:
+    # min（3.0%）に当たったら同じ値を繰り返さず列を終える
+    got = psmod.low_stair_openings(3.5, 0.25, 8, min_pct=3.0, max_pct=40.0)
+    assert got == [3.25, 3.0]
+    # 上限（max）にも切る（止まった開度が max を超える場合）
+    got = psmod.low_stair_openings(50.0, 0.25, 2, min_pct=3.0, max_pct=40.0)
+    assert got == [40.0]
+
+
+def test_low_stair_press_openings_deepen_from_start_and_cap_at_hold() -> None:
+    got = psmod.low_stair_press_openings(
+        7.38, 0.1, 20, hold_pct=7.7, max_pct=40.0
+    )
+    assert got == [7.48, 7.58, 7.68, 7.7]  # 停車保持（7.7）に当たったらそこで終える
+    got = psmod.low_stair_press_openings(7.0, 0.1, 3, hold_pct=17.0, max_pct=40.0)
+    assert got == [7.1, 7.2, 7.3]  # 段数の上限
+    assert psmod.low_stair_press_openings(8.0, 0.1, 3, hold_pct=8.0, max_pct=40.0) == []
+
+
+def test_stair_done_predicates() -> None:
+    assert psmod.stair_release_done(4.7, 5.0, 0.3)
+    assert not psmod.stair_release_done(4.69, 5.0, 0.3)
+    assert psmod.stair_press_done(VEHICLE_STOP_SPEED_KMH - 0.01)
+    assert not psmod.stair_press_done(VEHICLE_STOP_SPEED_KMH)
+
+
+def test_low_stair_defaults_off_and_validated(tmp_path: Path) -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.pedal_search.low_stair_enabled is False
+    ps = cfg.pedal_search
+    ps.low_stair_step_pct = 0.0
+    ps.low_stair_max_steps = 0
+    assert any("low_stair_step_pct" in p for p in cfgmod.validate_config(cfg))
+    assert any("low_stair_max_steps" in p for p in cfgmod.validate_config(cfg))
+
+
+class _PositionCAN:
+    """ブレーキ位置から車速を決めるスタブ CAN（速度の関数 f(開度%) を渡す）。"""
+
+    def __init__(self, hw_ref: list, f) -> None:  # type: ignore[no-untyped-def]
+        self._hw_ref, self._f = hw_ref, f
+
+    async def read_speed(self) -> float:
+        return self._f(pulse_to_opening(self._hw_ref[0].brake.position))
+
+
+def _stair_hw(f):  # type: ignore[no-untyped-def]
+    ref: list = []
+    hw = hwmod.ResearchHardware(
+        accel=hwmod.StubActuator("accel", connected=True),
+        brake=hwmod.StubActuator("brake", connected=True),
+        can=_PositionCAN(ref, f),  # type: ignore[arg-type]
+        ups=None,  # type: ignore[arg-type]
+        hw_mode=hwmod.HW_STUB,
+    )
+    ref.append(hw)
+    return hw
+
+
+def _fast_stair_cfg() -> cfgmod.ResearchConfig:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.pedal_search.low_stair_hold_s = 0.2
+    cfg.pedal_search.low_stair_step_pct = 0.5
+    cfg.pedal_search.low_stair_max_steps = 6
+    cfg.pedal_search.low_stair_repeats = 1
+    return cfg
+
+
+async def test_run_low_stair_release_ends_at_creep_press_ends_at_stop() -> None:
+    cfg = _fast_stair_cfg()
+    # 止まった開度 10%。9.0% 以下でクリープ（5 km/h）、それより深い（>9.0%）では停車
+    hw = _stair_hw(lambda pct: 5.0 if pct <= 9.0 + 1e-6 else 0.0)
+    visited: list[float] = []
+    original = hw.brake.move_to_position
+
+    async def record(pos: int, *, smooth_over_s: float | None = None) -> None:
+        visited.append(round(pulse_to_opening(pos), 1))
+        await original(pos, smooth_over_s=smooth_over_s)
+
+    hw.brake.move_to_position = record  # type: ignore[method-assign]
+    accel_before = hw.accel.position
+
+    await psmod.run_low_stair(
+        hw, cfg, creep_kmh=5.0, stop_confirm_pct=10.0, hold_pct=13.0
+    )
+
+    # 離す: 9.5（停車）→ 9.0（クリープで終わり）。踏む: 9.5（停車で終わり）。その後 hold_pct へ刻む
+    assert visited[:3] == [9.5, 9.0, 9.5]
+    assert visited[-1] == 13.0
+    assert hw.accel.position == accel_before  # アクセルは動かさない
+
+
+async def test_run_low_stair_release_stops_at_max_steps_without_creep() -> None:
+    cfg = _fast_stair_cfg()
+    cfg.pedal_search.low_stair_max_steps = 3
+    hw = _stair_hw(lambda pct: 0.0)  # ずっと停車（クリープに着かない）
+    visited: list[float] = []
+    original = hw.brake.move_to_position
+
+    async def record(pos: int, *, smooth_over_s: float | None = None) -> None:
+        visited.append(round(pulse_to_opening(pos), 1))
+        await original(pos, smooth_over_s=smooth_over_s)
+
+    hw.brake.move_to_position = record  # type: ignore[method-assign]
+
+    await psmod.run_low_stair(hw, cfg, creep_kmh=5.0, stop_confirm_pct=10.0, hold_pct=11.0)
+
+    # 3 段で終わり（9.5, 9.0, 8.5）。踏む向きは 9.0 で停車して終わり
+    assert visited[:4] == [9.5, 9.0, 8.5, 9.0]
+
+
+async def test_run_low_stair_clamps_to_brake_min() -> None:
+    cfg = _fast_stair_cfg()
+    cfg.vehicle.min_brake_opening_pct = 9.0
+    hw = _stair_hw(lambda pct: 0.0)
+    visited: list[float] = []
+    original = hw.brake.move_to_position
+
+    async def record(pos: int, *, smooth_over_s: float | None = None) -> None:
+        visited.append(round(pulse_to_opening(pos), 1))
+        await original(pos, smooth_over_s=smooth_over_s)
+
+    hw.brake.move_to_position = record  # type: ignore[method-assign]
+
+    await psmod.run_low_stair(hw, cfg, creep_kmh=5.0, stop_confirm_pct=10.0, hold_pct=10.5)
+
+    assert min(visited) >= 9.0 - 0.01
+
+
+async def test_pedal_search_low_stair_off_matches_baseline(tmp_path: Path) -> None:
+    """既定 off では階段の phase を mark せず、ブレーキの動きは停車保持で終わる（今と同じ）。"""
+    cfg = _tmp_cfg(tmp_path)
+    assert cfg.pedal_search.low_stair_enabled is False
+    hw = await _ready_stub(cfg)
+    hw.can.vehicle.brake_gain_kmhs_per_pct = 1.5  # type: ignore[attr-defined]
+
+    class _Log:
+        phases: list[str] = []
+
+        def mark(self, section: str, phase: str) -> None:
+            self.phases.append(phase)
+
+    log = _Log()
+    result = await psmod.run_pedal_search(hw, cfg, window_s=WINDOW_S, log=log)  # type: ignore[arg-type]
+    assert psmod.PHASE_LOW_RELEASE_STAIR not in log.phases
+    assert hw.brake.position == opening_to_pulse(result.stop_brake_opening_pct)
+    await hwmod.shutdown(hw)
+
+
+async def test_run_low_stair_press_goes_deeper_than_release_list_until_stop() -> None:
+    cfg = _fast_stair_cfg()
+    cfg.pedal_search.low_stair_step_pct = 0.1
+    cfg.pedal_search.low_stair_max_steps = 2
+    cfg.pedal_search.low_stair_press_max_steps = 20
+    # 止まった開度 10%。離す向きは 9.9（動く）で 5 km/h（クリープ）。踏む向きは 10.3% 以上で停車
+    hw = _stair_hw(lambda pct: 0.0 if pct >= 10.25 else 5.0)
+    visited: list[float] = []
+    original = hw.brake.move_to_position
+
+    async def record(pos: int, *, smooth_over_s: float | None = None) -> None:
+        visited.append(round(pulse_to_opening(pos), 1))
+        await original(pos, smooth_over_s=smooth_over_s)
+
+    hw.brake.move_to_position = record  # type: ignore[method-assign]
+    await psmod.run_low_stair(hw, cfg, creep_kmh=5.0, stop_confirm_pct=10.0, hold_pct=12.0)
+    # 離す: 9.9（クリープで終わり）。踏む: 10.0, 10.1, 10.2, 10.3（停車で終わり）。離す列を越える
+    assert visited[:5] == [9.9, 10.0, 10.1, 10.2, 10.3]
+
+
+async def test_run_low_stair_press_stops_at_press_max_steps() -> None:
+    cfg = _fast_stair_cfg()
+    cfg.pedal_search.low_stair_step_pct = 0.1
+    cfg.pedal_search.low_stair_max_steps = 2
+    cfg.pedal_search.low_stair_press_max_steps = 3
+    hw = _stair_hw(lambda pct: 5.0)  # 止まらない
+    visited: list[float] = []
+    original = hw.brake.move_to_position
+
+    async def record(pos: int, *, smooth_over_s: float | None = None) -> None:
+        visited.append(round(pulse_to_opening(pos), 1))
+        await original(pos, smooth_over_s=smooth_over_s)
+
+    hw.brake.move_to_position = record  # type: ignore[method-assign]
+    await psmod.run_low_stair(hw, cfg, creep_kmh=5.0, stop_confirm_pct=10.0, hold_pct=12.0)
+    assert visited[:4] == [9.9, 10.0, 10.1, 10.2]  # 踏む向きは 3 段で打ち切り

@@ -391,6 +391,13 @@ RETURN_CMD_STEADY_TOL_PCT = 0.3
 # 場面の数の下限。これ未満は「測れず」
 RETURN_MIN_SCENES = 3
 
+# 2026-10-28 ProblemReport_20261028 段5b: 戻しの場面に使わない phase。小さな動き（dither）は入った
+# 周期に中心 u0 へ段で移り、低速の階段は停車保持から一気に離すので、G ランプの戻しと別の動き方の
+# 場面が混ざり、当てはめの傾きが負になった（`111335` のブレーキ: 16 件のうち dither 5・階段 1）
+RETURN_EXCLUDED_PHASES = frozenset(
+    {"RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER", "LOW_RELEASE_STAIR", "LOW_PRESS_STAIR"}
+)
+
 
 @dataclass(frozen=True)
 class PedalReturnFit:
@@ -413,12 +420,16 @@ class PedalReturn:
     brake: PedalReturnFit
 
 
-def _fit_return(cmd: np.ndarray, actual: np.ndarray, t: np.ndarray) -> PedalReturnFit:
+def _fit_return(
+    cmd: np.ndarray, actual: np.ndarray, t: np.ndarray, excluded: np.ndarray | None = None
+) -> PedalReturnFit:
     amounts: list[float] = []
     times: list[float] = []
     n = len(cmd)
     for i in range(1, n):
         if not cmd[i - 1] - cmd[i] >= RETURN_MIN_DROP_PCT:
+            continue
+        if excluded is not None and excluded[i]:
             continue
         target = cmd[i] + RETURN_SETTLE_TOL_PCT
         k_end = min(n, i + RETURN_SEARCH_ROWS)
@@ -456,11 +467,13 @@ def estimate_pedal_return(csv_path: Path) -> PedalReturn:
     `RETURN_SETTLE_TOL_PCT`」以下になるまで指令が動かない所。戻した量 = 直前の実開度 − 新しい指令、
     時間 = 実開度が戻った時刻 − 指令が下がった時刻。最小二乗で 時間 = 遅れ + 量 / 速さ を当てる。
     場面が `RETURN_MIN_SCENES` 未満・速さ 0 以下は「測れず」（reason に理由）。
-    全セクションの行を使う。
+    全セクションの行を使う。ただし指令が下がった行の phase が `RETURN_EXCLUDED_PHASES` の場面は
+    使わない（phase 列が無い CSV は今までどおり）。
     読めない CSV・列が無い CSV は両方「測れず」。
     """
     cols = ("elapsed_s", "accel_cmd_pct", "brake_cmd_pct", "accel_actual_pct", "brake_actual_pct")
     data: dict[str, list[float]] = {c: [] for c in cols}
+    excluded: list[bool] = []
     try:
         with Path(csv_path).open(newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -470,13 +483,19 @@ def estimate_pedal_return(csv_path: Path) -> PedalReturn:
                     continue
                 for c, v in zip(cols, vals, strict=True):
                     data[c].append(v)
+                excluded.append(row.get("phase") in RETURN_EXCLUDED_PHASES)
     except OSError as exc:
         miss = PedalReturnFit(n=0, reason=f"CSV を読めない（{exc}）")
         return PedalReturn(accel=miss, brake=miss)
     t = np.array(data["elapsed_s"])
+    ex = np.array(excluded, dtype=bool)
     return PedalReturn(
-        accel=_fit_return(np.array(data["accel_cmd_pct"]), np.array(data["accel_actual_pct"]), t),
-        brake=_fit_return(np.array(data["brake_cmd_pct"]), np.array(data["brake_actual_pct"]), t),
+        accel=_fit_return(
+            np.array(data["accel_cmd_pct"]), np.array(data["accel_actual_pct"]), t, ex
+        ),
+        brake=_fit_return(
+            np.array(data["brake_cmd_pct"]), np.array(data["brake_actual_pct"]), t, ex
+        ),
     )
 
 

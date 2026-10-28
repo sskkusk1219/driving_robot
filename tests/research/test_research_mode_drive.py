@@ -1386,6 +1386,97 @@ async def test_c10_adds_throttle_when_behind_and_row_case_matters(
     assert 0.0 < d_behind_b < d_behind
 
 
+def _gain_entry(ratio: float) -> dict:
+    """局所の効きの倍率の表（車速 30〜50・開度の列 −50〜+100 の全部のマスが同じ倍率）。"""
+    return {
+        "speed_rep_kmh": [30.0, 50.0],
+        "u_from_onset_pct": [-50.0, 100.0],
+        "ratio": [[ratio, ratio], [ratio, ratio]],
+        "n": [[3, 3], [3, 3]],
+    }
+
+
+async def test_c10_local_gain_divides_the_offset_per_pedal_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _c10_cfg(tmp_path)
+    run = await _c10_run_obj(cfg, monkeypatch)
+    plan = run.ff.plan
+    ia = int(np.flatnonzero(plan.effort_pct > 4.0 + 1.0)[0])
+    ib = int(np.flatnonzero((plan.effort_pct < 0.0) & (plan.flag != 4))[0])
+    ta, ea = float(plan.t_s[ia]), float(plan.effort_pct[ia])
+    tb_, eb = float(plan.t_s[ib]), float(plan.effort_pct[ib])
+    meta = run.ff.table.meta
+    meta.update(accel_onset_u_pct=1.0, brake_onset_u_pct=1.0)
+    ref = 40.0
+
+    def offsets() -> tuple[float, float]:
+        a = run._c10_offset(ta, ref, ref - 2.0, ea)  # noqa: SLF001
+        b = run._c10_offset(tb_, ref, ref - 2.0, eb)  # noqa: SLF001
+        return a, b
+
+    base_a, base_b = offsets()
+    assert base_a != 0.0 and base_b != 0.0
+    assert run.c10.accel_gain_cycles == 0 and run.c10.brake_gain_cycles == 0
+    # meta に倍率があってもキーが false なら今と同じ
+    meta["local_gain_accel"] = _gain_entry(2.0)
+    meta["local_gain_brake"] = _gain_entry(2.0)
+    assert offsets() == (base_a, base_b)
+    # ブレーキだけ true: ブレーキの差が半分（アクセルは変わらない）
+    cfg.forward_map.local_gain_brake = True
+    a, b = offsets()
+    assert a == base_a and b == pytest.approx(base_b / 2.0)
+    assert run.c10.brake_gain_cycles == 1 and run.c10.accel_gain_cycles == 0
+    assert run.c10.brake_gain_cut_sum_pct == pytest.approx(abs(base_b) / 2.0)
+    # アクセルだけ true
+    cfg.forward_map.local_gain_brake = False
+    cfg.forward_map.local_gain_accel = True
+    a, b = offsets()
+    assert a == pytest.approx(base_a / 2.0) and b == base_b
+    assert run.c10.accel_gain_cycles == 1
+    # 7.5 km/h 未満の行・meta なしは 1（今と同じ）。車速の範囲外は端の行の倍率
+    low = run._c10_offset(ta, 5.0, 3.0, ea)  # noqa: SLF001
+    cfg.forward_map.local_gain_accel = False
+    assert low == run._c10_offset(ta, 5.0, 3.0, ea)  # noqa: SLF001
+    plain = run._c10_offset(ta, 90.0, 88.0, ea)  # noqa: SLF001
+    cfg.forward_map.local_gain_accel = True
+    assert run._c10_offset(ta, 90.0, 88.0, ea) == pytest.approx(plain / 2.0)  # noqa: SLF001
+    del meta["local_gain_accel"]
+    assert run._c10_offset(ta, ref, ref - 2.0, ea) == base_a  # noqa: SLF001
+    meta["local_gain_accel"] = _gain_entry(2.0)
+    del meta["accel_onset_u_pct"]  # 効き始めが無ければ 1
+    assert run._c10_offset(ta, ref, ref - 2.0, ea) == base_a  # noqa: SLF001
+    assert "倍率で割った" in run.c10.summary()
+    text = mdmod.c10_settings_text(run.ff, cfg.forward_map)
+    assert "倍率 ブレーキ off（表あり） / アクセル on（表あり）" in text
+    assert "倍率" not in mdmod.c10_settings_text(run.ff)  # fm なしは今までと同じ文
+
+
+async def test_c10_local_gain_divides_before_the_min_clamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _c10_cfg(tmp_path)
+    run = await _c10_run_obj(cfg, monkeypatch)
+    plan = run.ff.plan
+    amin = cfg.vehicle.min_accel_opening_pct
+    ia = int(np.flatnonzero(plan.effort_pct > amin + 1.0)[0])
+    ta = float(plan.t_s[ia])
+    e = amin + 1.0  # min の 1% 上。減らす量が 1% を超えると min で止まる
+    meta = run.ff.table.meta
+    meta.update(accel_onset_u_pct=0.0, local_gain_accel=_gain_entry(4.0))
+    ref = 40.0
+    found = False
+    for dev in (1.0, 2.0, 3.0, 5.0, 8.0, 12.0):
+        cfg.forward_map.local_gain_accel = False
+        off = run._c10_offset(ta, ref, ref + dev, e)  # noqa: SLF001
+        cfg.forward_map.local_gain_accel = True
+        on = run._c10_offset(ta, ref, ref + dev, e)  # noqa: SLF001
+        if off == pytest.approx(-1.0) and on > -1.0 + 1e-9:
+            found = True  # 割る前なら min で止まる量が、割ると止まらず 1/4 になる
+            break
+    assert found
+
+
 async def test_c10_zero_c_is_identical_to_c8_and_leaves_ff_column(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

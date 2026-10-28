@@ -46,6 +46,10 @@ MIN_FLAT_BINS = 2
 MIN_EFFECT_BINS = 2
 # 反対ペダル・自ペダル下限の判定の許容 [%]。アクチュエータの位置の揺れ。
 OTHER_MIN_TOL_PCT = 0.2
+# 効き始めの計算に使わない phase。HOLD_STEP は遅れの測定の階段、dither（2026-10-28 段3）は
+# 効き始めの先での小さな動き（開度を意図的に往復させる行で、折れ点の当てはめを乱す）。
+# CSV の phase 名（pattern_loop の _Phase の名前と同じ。tests 内で独立に持つ）
+EXCLUDED_PHASES = frozenset({"HOLD_STEP", "RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER"})
 # これ以下は停車とみなして捨てる [km/h]。fwd_data.STOP_SPEED_KMH と同じ値。
 STOP_SPEED_KMH = 0.5
 
@@ -227,7 +231,7 @@ def onset_from_series(
 
 
 def _read_csv(path: Path, pattern_contains: str) -> dict[str, np.ndarray]:
-    """G ランプ行（pattern に部分一致・HOLD_STEP 以外）だけ読む。"""
+    """G ランプ行（pattern に部分一致・EXCLUDED_PHASES 以外）だけ読む。"""
     cols: dict[str, list[float]] = {
         "t": [],
         "v": [],
@@ -238,7 +242,7 @@ def _read_csv(path: Path, pattern_contains: str) -> dict[str, np.ndarray]:
         for row in csv.DictReader(f):
             if pattern_contains not in row.get("pattern", ""):
                 continue
-            if row.get("phase", "") == "HOLD_STEP":
+            if row.get("phase", "") in EXCLUDED_PHASES:
                 continue
             try:
                 vals = (

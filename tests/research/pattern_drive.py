@@ -90,7 +90,7 @@ from typing import Any
 
 import numpy as np
 
-from tests.research import pedal_lag
+from tests.research import local_gain, pedal_lag
 from tests.research.app_settings import SafetySettings
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.coast_curve import estimate_coast_decel_curve
@@ -406,6 +406,14 @@ def _fmt_pct(value: float | None) -> str:
     return "  -  " if value is None else f"{value:.2f}%"
 
 
+def _ramp_total_s(r: RampResult) -> float:
+    """G ランプ 1 本の合計秒数（加速・保持・減速・途中保持・戻し・dither）。"""
+    return (
+        r.up_s + r.hold_s + r.down_s + r.cruise_s + r.release_s + r.dither_brake_s
+        + r.dither_accel_s
+    )
+
+
 def result_table(
     order: Sequence[tuple[Any, ...]], results: Sequence[RampResult], total_s: float,
     *, hold_s: float = 0.0, turn_s: float = 0.0,
@@ -422,7 +430,9 @@ def result_table(
     head = (
         "段 | 狙いG | 上端km/h | 見込み秒 | 加速秒 | 保持秒 | 減速秒 | 合計秒 | "
         "加速G中央値 | 減速G中央値 | 最高km/h | 途中保持 秒 | 途中保持 達成/入った | "
-        "戻し 秒 | 戻し 入った/飛ばした | 効き始め アクセル | 効き始め ブレーキ"
+        "戻し 秒 | 戻し 入った/飛ばした | 効き始め アクセル | 効き始め ブレーキ | "
+        "dither ブレーキ 秒 | dither ブレーキ 入った/飛ばした | dither アクセル 秒 | "
+        "dither アクセル 入った/飛ばした"
     )
     lines = [head, "-" * len(head)]
     for i, item in enumerate(order):
@@ -437,12 +447,15 @@ def result_table(
         lines.append(
             f"{i + 1:>2} | {g:.3f} | {top_text:>6} | {est:>7.0f} | {r.up_s:>6.1f} "
             f"| {r.hold_s:>6.1f} "
-            f"| {r.down_s:>6.1f} | {r.up_s + r.hold_s + r.down_s + r.cruise_s + r.release_s:>6.1f} "
+            f"| {r.down_s:>6.1f} | {_ramp_total_s(r):>6.1f} "
             f"| {_fmt_g(r.accel_g_median):>11} "
             f"| {_fmt_g(r.decel_g_median):>11} | {r.max_speed_kmh:>7.1f}"
             f" | {r.cruise_s:>6.1f} | {r.cruise_done}/{r.cruise_n}"
             f" | {r.release_s:>6.1f} | {r.release_n}/{r.release_skipped}"
             f" | {_fmt_pct(r.accel_onset_pct):>8} | {_fmt_pct(r.brake_onset_pct):>8}"
+            # 2026-10-28 段2: 効き始めの少し先での小さな動き（dither。合計秒に含む）
+            f" | {r.dither_brake_s:>6.1f} | {r.dither_brake_n}/{r.dither_brake_skipped}"
+            f" | {r.dither_accel_s:>6.1f} | {r.dither_accel_n}/{r.dither_accel_skipped}"
         )
     lines.append(f"全体の所要秒数: {total_s:.0f} s（{total_s / 60:.1f} 分）")
     return "\n".join(lines)
@@ -530,6 +543,28 @@ def build_patterns(
     return [*coast_downs, *ramps]
 
 
+def _dither_onsets_from_model(cfg: ResearchConfig) -> tuple[float | None, float | None]:
+    """今の pkl（feedforward.model_path）の meta から (ブレーキ, アクセル) の効き始め（min からの量
+    [%]。`brake_onset_u_pct`・`accel_onset_u_pct`）を読む（2026-10-28 段2）。pkl が無い・読めない・
+    キーが無い・0 以下の値は None（その dither は入れない）。"""
+    from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
+
+    try:
+        meta = load_forward_map(Path(cfg.feedforward.model_path)).meta
+    except Exception:  # noqa: BLE001 - 読めなければ dither を入れないだけ
+        return None, None
+
+    def pick(key: str) -> float | None:
+        v = meta.get(key)
+        try:
+            f = float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) and f > 0.0 else None
+
+    return pick("brake_onset_u_pct"), pick("accel_onset_u_pct")
+
+
 def loop_config_from_config(
     cfg: ResearchConfig, *, stop_confirm_pct: float | None = None
 ) -> PatternLoopConfig:
@@ -539,6 +574,9 @@ def loop_config_from_config(
     開度から始める）。
     """
     lr = cfg.learning
+    dither_onsets = (
+        _dither_onsets_from_model(cfg) if lr.ramp_dither_enabled else (None, None)
+    )
     return PatternLoopConfig(
         coast_timeout_s=lr.coast_timeout_s,
         creep_launch_settle_kmhs=lr.creep_launch_settle_kmhs,
@@ -591,6 +629,18 @@ def loop_config_from_config(
         stop_release_escape_s=lr.stop_release_escape_s,
         stop_release_escape_decel_kmhs=lr.stop_release_escape_decel_kmhs,
         stop_release_max_g=lr.stop_release_max_g,
+        # 2026-10-28 段2: 効き始めの少し先での小さな動き。効き始めは今の pkl の meta から
+        # （読めなければ入らない）
+        ramp_dither_enabled=lr.ramp_dither_enabled,
+        ramp_dither_brake_speeds_kmh=tuple(lr.ramp_dither_brake_speeds_kmh),
+        ramp_dither_deltas_pct=tuple(lr.ramp_dither_deltas_pct),
+        ramp_dither_hold_s=lr.ramp_dither_hold_s,
+        ramp_dither_brake_u0_from_onset_pct=tuple(lr.ramp_dither_brake_u0_from_onset_pct),
+        ramp_dither_max_g=lr.ramp_dither_max_g,
+        ramp_dither_accel_band_pct=lr.ramp_dither_accel_band_pct,
+        ramp_dither_accel_max_n=lr.ramp_dither_accel_max_n,
+        ramp_dither_brake_onset_u_pct=dither_onsets[0],
+        ramp_dither_accel_onset_u_pct=dither_onsets[1],
         ramp_release_min_kmh=cfg.feedforward.creep_speed_kmh + CRUISE_MIN_MARGIN_KMH,
         gov_soft_frac=lr.gov_soft_frac,
         # 待機位置 ＝ min（2026-10-08 段2l-6。待機しないなら掛けない）と、発進の開始位置
@@ -704,6 +754,23 @@ async def run_pattern_drive(
             f"それぞれ {holds} 秒保持（0 は待機位置）。出たら {loop_config.ramp_turn_time_s:g} "
             f"秒かけて 0 → -G。実車速が {loop_config.ramp_release_min_kmh:g} km/h 以下で打ち切り。"
             "戻し中は制御の項なし・表と中央値に貯めない")
+    if loop_config.ramp_dither_enabled:
+        b_on, a_on = (
+            loop_config.ramp_dither_brake_onset_u_pct, loop_config.ramp_dither_accel_onset_u_pct
+        )
+        deltas = "・".join(f"{d:g}" for d in loop_config.ramp_dither_deltas_pct)
+        speeds = "・".join(f"{v:g}" for v in loop_config.ramp_dither_brake_speeds_kmh)
+        lc = loop_config
+        say(f"効き始めの少し先の小さな動き（段2 2026-10-28）: u0＋Δ → u0 → u0−Δ → u0 を各 "
+            f"{lc.ramp_dither_hold_s:g} 秒（Δ ＝ {deltas}%）。ブレーキは下りで {speeds} km/h を "
+            f"切ったとき、目標減速度が {lc.ramp_dither_max_g:g}G 以下の段で、今の開度に関係なく入る"
+            f"（中心 u0 ＝ 効き始め（{'なし' if b_on is None else f'{b_on:g}%'}）＋ "
+            f"{'・'.join(f'{d:g}' for d in lc.ramp_dither_brake_u0_from_onset_pct)}% を入るたびに"
+            "順に使う）。アクセルは上りの保持の後、"
+            f"効き始め（{'なし' if a_on is None else f'{a_on:g}%'}）〜 ＋ "
+            f"{lc.ramp_dither_accel_band_pct:g}% の中なら 1 本につき最大 "
+            f"{lc.ramp_dither_accel_max_n} 回。効き始めが pkl の meta から読めないペダルは"
+            "入れない")
     if any(isinstance(p, GRampPattern) and p.lag_step for p in patterns):
         say(f"遅れの測定: 上端で定速になったら、開度を固定で {loop_config.ramp_lag_step_hold_s:g} "
             f"秒ずつステップ（アクセル踏み増し {loop_config.ramp_lag_step_g:g}G 相当 → 戻し → "
@@ -1000,6 +1067,52 @@ def _attach_pedal_track(table: Any, csv_path: Path) -> None:
         f"ブレーキ {fit.brake_effect_lag_s:g}s")
 
 
+def _attach_local_gain(
+    table: Any, csv_path: Path, brake_speeds_kmh: Sequence[float] | None = None
+) -> bool:
+    """表の meta に、局所の効きの倍率の表（ブレーキ・アクセル）と効くまでの遅れを入れる
+    （2026-10-28 段3。ProblemReport_20261028）。
+
+    手順2 の CSV の dither の区間（RAMP_BRAKE_DITHER・RAMP_ACCEL_DITHER）から
+    `local_gain.fit_pedal` で測る。倍率は「実測の局所の傾き ÷ この表の傾き」なので、表を作り直したら
+    付け直す。dither が無い CSV・何も測れなかったときは meta に何も入れない（False）。
+    ブレーキの車速の行は brake_speeds_kmh（learning.ramp_dither_brake_speeds_kmh。None は
+    90・60・30）。
+    """
+    amin = float(table.meta.get("accel_deadband_pct", math.nan))
+    bmin = float(table.meta.get("brake_deadband_pct", math.nan))
+    if not (math.isfinite(amin) and math.isfinite(bmin)):
+        say("  局所の効き: 表の meta に min が無く測れず。meta に入れない")
+        return False
+    runs = local_gain.read_dither_runs(csv_path)
+    if not runs:
+        say("  局所の効き: dither の区間なし。meta に入れない")
+        return False
+    reps = list(brake_speeds_kmh) if brake_speeds_kmh else [90.0, 60.0, 30.0]
+    brake = local_gain.fit_pedal(
+        runs, local_gain.PEDAL_BRAKE, table, pedal_min_pct=bmin,
+        onset_u_pct=table.meta.get("brake_onset_u_pct"), speed_reps_kmh=reps,
+    )
+    accel = local_gain.fit_pedal(
+        runs, local_gain.PEDAL_ACCEL, table, pedal_min_pct=amin,
+        onset_u_pct=table.meta.get("accel_onset_u_pct"),
+    )
+    for label, fit in (("ブレーキ", brake), ("アクセル", accel)):
+        if fit.entry is None:
+            say(f"  局所の効き[{label}]: 倍率の表なし（{fit.reason}）")
+        else:
+            med = float(np.median(fit.cell_medians))
+            say(f"  局所の効き[{label}]: 区間 {fit.n_runs}・倍率が出た区間 {fit.n_used}・"
+                f"マス {fit.n_cells}（車速の行 {fit.entry['speed_rep_kmh']} km/h、"
+                f"列 {fit.entry['u_from_onset_pct'][0]:g}〜{fit.entry['u_from_onset_pct'][-1]:g}%）"
+                f"・中央値 {med:.2f}倍")
+        if fit.lag_s is None:
+            say(f"  効くまでの遅れ[{label}]: 測れず")
+        else:
+            say(f"  効くまでの遅れ[{label}]: {fit.lag_s:.3f}s（切り替え {fit.lag_n} 件）")
+    return local_gain.attach_to_meta(table.meta, brake, accel, csv_path.name)
+
+
 def _build_table_model(
     profile: VehicleProfile,
     csv_path: Path,
@@ -1008,6 +1121,7 @@ def _build_table_model(
     *,
     announce: bool = True,
     lags: MeasuredLags | None = None,
+    local_gain_brake_speeds_kmh: Sequence[float] | None = None,
 ) -> _BuiltModel:
     """C7: 走行 CSV から順モデルの表（車速 × 効く開度 u → 加速度）を作って保存する。
 
@@ -1025,6 +1139,7 @@ def _build_table_model(
     _attach_onsets(table, profile, csv_path)
     _attach_returns(table, csv_path)
     _attach_pedal_track(table, csv_path)
+    _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh)
     path = save_table(table, _forward_pkl_path(models_dir, "fwd_table", hw_mode))
     say(f"  u の原点（min）: アクセル {st.accel_deadband_pct:g}・"
         f"ブレーキ {st.brake_deadband_pct:g} %（vehicle.min_*_opening_pct）、"
@@ -1085,6 +1200,8 @@ def _attach_low_speed_tables(
         PHASE_BRAKE_SEARCH,
         PHASE_BRAKE_STEP,
         PHASE_CREEP_WAIT,
+        PHASE_LOW_PRESS_STAIR,
+        PHASE_LOW_RELEASE_STAIR,
         PHASE_RAMP_LAUNCH_RELEASE,
         STOP_SPEED_KMH,
         concat_rows,
@@ -1127,9 +1244,15 @@ def _attach_low_speed_tables(
     creep_zero = take_rows(
         creep, (creep.speed_kmh >= STOP_SPEED_KMH) & (np.abs(creep.u_pct) < 1e-9)
     )
-    stop_rows = concat_rows(
-        [brake_step, brake_search, take_rows(pattern, near_stop), creep_zero], "stop"
-    )
+    # 2026-10-28 段3: 低速の階段。踏む向きの行（停車を含む）は停止側の行、離す向きの動いている行は
+    # 停止側の戻しの層の行（離す向き）。階段の phase が無い CSV（古い CSV）は行が 0 で、今までと同じ
+    press_stair = read((SECTION_PEDAL_SEARCH,), (PHASE_LOW_PRESS_STAIR,))
+    release_stair = read((SECTION_PEDAL_SEARCH,), (PHASE_LOW_RELEASE_STAIR,))
+    release_stair = take_rows(release_stair, release_stair.speed_kmh >= STOP_SPEED_KMH)
+    stop_parts = [brake_step, brake_search, take_rows(pattern, near_stop), creep_zero]
+    if len(press_stair.speed_kmh) > 0:
+        stop_parts.append(press_stair)
+    stop_rows = concat_rows(stop_parts, "stop")
 
     min_speed = STOP_SPEED_KMH if creep_launch_min_speed_kmh is None else creep_launch_min_speed_kmh
     # 段7-a: 動き出す開度だけ別のしきい値で測れる（None なら上の min_speed。比較は >=）
@@ -1160,9 +1283,10 @@ def _attach_low_speed_tables(
         # （動いている・u < 0。車速は attach_stop_release が stop_max_speed_kmh 未満に絞る。
         # 発進の区間でブレーキを離している行を含む）を足す。停車の手前の行は 1 回だけ数える
         near_or_brake = near_stop | ((pattern.u_pct < 0.0) & (pattern.speed_kmh >= STOP_SPEED_KMH))
-        stop_release_rows = concat_rows(
-            [brake_step, brake_search, take_rows(pattern, near_or_brake)], "stop_release"
-        )
+        release_parts = [brake_step, brake_search, take_rows(pattern, near_or_brake)]
+        if len(release_stair.speed_kmh) > 0:  # 段3: 離す向きの階段（動いている行）
+            release_parts.append(release_stair)
+        stop_release_rows = concat_rows(release_parts, "stop_release")
         table = attach_stop_release(table, stop_release_rows, creep_speed_kmh=creep_speed_kmh)
     if side_row_speed_rep == "data":
         table = apply_side_row_speed_rep(table, launch_rows, stop_rows)
@@ -1171,6 +1295,11 @@ def _attach_low_speed_tables(
     table.meta["side_table_opening_source"] = side_table_opening_source
     table.meta["side_table_accel_window_s"] = side_table_accel_window_s
     table.meta["stop_release_layer_enabled"] = bool(stop_release_layer_enabled)
+    stair_press_s = float(press_stair.dt_row_s.sum())
+    stair_release_s = float(release_stair.dt_row_s.sum())
+    if stair_press_s > 0.0 or stair_release_s > 0.0:  # 古い CSV は meta も今までと同じ
+        table.meta["low_stair_press_s"] = stair_press_s
+        table.meta["low_stair_release_s"] = stair_release_s
     if creep_speed_kmh <= 0.0:
         say("  発進側・停止側: クリープ車速が 0 なので作らない")
     if table.launch_accel is None:
@@ -1202,6 +1331,10 @@ def _attach_low_speed_tables(
                 for g, sec, ok in zip(grid, layer_s, built, strict=True)
             )
             say(f"  停止側の戻しの層: {cells}、頭打ち {table.meta['stop_release_max_pct']:.2f}%")
+    say(f"  低速の階段（段3）: 踏む向き {stair_press_s:.1f} 秒（停止側の行へ）・"
+        f"離す向き（動いている行）{stair_release_s:.1f} 秒"
+        f"（停止側の戻しの層の行へ。層 {'作る' if stop_release_layer_enabled else '作らない'}"
+        "設定）")
     say(f"  発進側・停止側の表の開度の元: {side_table_opening_source}、加速度の窓 "
         f"{side_table_accel_window_s:g} 秒")
     if table.launch_accel is not None:
@@ -1237,6 +1370,7 @@ def _build_forward_model(
     side_row_speed_rep: str = "grid",
     accel_push_input_enabled: bool = False,
     stop_approach_exclusion: str = "depth",
+    local_gain_brake_speeds_kmh: Sequence[float] | None = None,
 ) -> _BuiltModel:
     """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
 
@@ -1267,7 +1401,8 @@ def _build_forward_model(
 
     say("順モデル（C8）: まず C7 の表を作り（格子と設定の元）、続けてニューラルネットを学習 …")
     like = _build_table_model(
-        profile, csv_path, models_dir, hw_mode, announce=False, lags=lags
+        profile, csv_path, models_dir, hw_mode, announce=False, lags=lags,
+        local_gain_brake_speeds_kmh=local_gain_brake_speeds_kmh,
     )
     st = fwd_tool.settings_of_table(
         load_forward_map(Path(like.model_path)), _forward_settings(profile, lags)
@@ -1351,6 +1486,7 @@ def _build_forward_model(
     _attach_onsets(table, profile, csv_path)
     _attach_returns(table, csv_path)
     _attach_pedal_track(table, csv_path)
+    _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh)
     path = save_table(table, _forward_pkl_path(models_dir, "fwd_model", hw_mode))
     say(f"モデル保存: {path}")
     return _BuiltModel(model_path=str(path), metrics={}, c7_path=like.model_path)
@@ -1522,7 +1658,10 @@ def build_ff_model(
         )
         _say_pedal_lags(lags, cfg.learning.ramp_lag_speeds_kmh)
     if candidate == "C7":
-        built = _build_table_model(profile, csv_path, models_dir, hw_mode, lags=lags)
+        built = _build_table_model(
+            profile, csv_path, models_dir, hw_mode, lags=lags,
+            local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
+        )
     elif candidate in ("C8", "C10", "C11", "C12", "C13", "C14", "C15"):  # C10〜C15: C8 と同じ pkl
         built = _build_forward_model(
             profile, csv_path, models_dir, hw_mode,
@@ -1538,6 +1677,7 @@ def build_ff_model(
             launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,
             side_row_speed_rep=cfg.learning.side_row_speed_rep,
             stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
+            local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
         )
     else:
         built = _build_poly_model(
@@ -1615,6 +1755,7 @@ def build_ff_model(
             launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,
             side_row_speed_rep=cfg.learning.side_row_speed_rep,
             stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
+            local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
         )
         checks = run_checks_now()
     say(step2_check.format_checks(checks))

@@ -1552,3 +1552,54 @@ def test_step14_keys_default_false_and_validated() -> None:
     cfg.feedforward.creep_accel_speeds_kmh = []
     cfg.feedforward.creep_accel_kmhs = []
     assert any("predict_creep_curve" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_ramp_dither_settings_default_off_and_validation() -> None:
+    """2026-10-28 段2: 効き始めの少し先での小さな動き。dataclass の既定・本体 yaml とも off、
+    値は仕様どおり。範囲外は検証で弾く。"""
+    fresh = cfgmod.LearningSection()
+    assert fresh.ramp_dither_enabled is False
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.ramp_dither_enabled is False
+    assert list(lr.ramp_dither_brake_speeds_kmh) == [100.0, 75.0, 50.0, 30.0]
+    assert list(lr.ramp_dither_brake_u0_from_onset_pct) == [0.5, 1.5, 2.5]
+    assert list(lr.ramp_dither_deltas_pct) == [0.25, 0.5]
+    assert lr.ramp_dither_hold_s == pytest.approx(1.5)
+    assert lr.ramp_dither_max_g == pytest.approx(0.13)
+    assert lr.ramp_dither_accel_band_pct == pytest.approx(10.0)
+    assert lr.ramp_dither_accel_max_n == 3
+    assert list(fresh.ramp_dither_brake_speeds_kmh) == [100.0, 75.0, 50.0, 30.0]
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    for key, bad, good in (
+        ("ramp_dither_brake_speeds_kmh", [30.0, 60.0], [100.0, 75.0, 50.0, 30.0]),
+        ("ramp_dither_brake_speeds_kmh", [0.0], [100.0, 75.0, 50.0, 30.0]),
+        ("ramp_dither_deltas_pct", [], [0.25, 0.5]),
+        ("ramp_dither_deltas_pct", [0.0], [0.25, 0.5]),
+        ("ramp_dither_hold_s", 0.0, 1.5),
+        ("ramp_dither_brake_u0_from_onset_pct", [], [0.5, 1.5, 2.5]),
+        ("ramp_dither_brake_u0_from_onset_pct", [-0.1], [0.5, 1.5, 2.5]),
+        ("ramp_dither_max_g", 0.0, 0.13),
+        ("ramp_dither_accel_band_pct", 0.0, 10.0),
+        ("ramp_dither_accel_max_n", -1, 3),
+    ):
+        setattr(lr, key, bad)
+        assert problems_about(key), (key, bad)
+        setattr(lr, key, good)
+        assert not problems_about(key)
+    lr.ramp_dither_brake_speeds_kmh = []  # 空はブレーキの dither なし（許す）
+    assert not problems_about("ramp_dither_brake_speeds_kmh")
+
+
+def test_step4_local_gain_and_release_layer_keys_default_false() -> None:
+    """2026-10-28 段4: 新キーの既定は false（yaml の値は決める時期まで固定しない）。"""
+    fm0 = cfgmod.ForwardMapSection()
+    assert fm0.low_speed_release_stop_layer is False
+    assert fm0.local_gain_brake is False
+    assert fm0.local_gain_accel is False
+    cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
+    assert cfgmod.validate_config(cfg) == []  # キーは yaml にある（値は固定しない）

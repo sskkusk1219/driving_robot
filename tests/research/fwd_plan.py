@@ -101,6 +101,10 @@ SIDE_MAIN = 0
 SIDE_LAUNCH = 1
 SIDE_STOP = 2
 SIDE_RELEASE = 3
+# 2026-10-28 段4: 低速の離す向きを停止側の戻しの層（stop_side＋戻し量）で解き直した行
+# （ブレーキ側）。
+# low_speed_release_stop_layer が true のときだけ入る。表の引き方は停止側（SIDE_STOP と同じ）
+SIDE_STOP_RELEASE = 4
 LOW_SPEED_SIDE_RULES = ("legacy", "pedal", "dir")
 
 FLAG_LABELS = {
@@ -795,6 +799,7 @@ def build_plan(
     stop_lead: bool = False,
     low_speed_side_rule: str = "legacy",
     release_table_min_kmh: float = 0.0,
+    low_speed_release_stop_layer: bool = False,
     switch_lead: bool = False,
     launch_midway_brake_cap: bool = False,
     launch_release_ramp: bool = False,
@@ -962,6 +967,7 @@ def build_plan(
             "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
+            "low_speed_release_stop_layer": low_speed_release_stop_layer,
             "launch_midway_brake_cap": launch_midway_brake_cap,
             "launch_release_ramp": launch_release_ramp,
             "launch_release_lead_s": launch_release_lead_s,
@@ -1007,6 +1013,7 @@ def build_plan(
             "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
+            "low_speed_release_stop_layer": low_speed_release_stop_layer,
             "launch_midway_brake_cap": launch_midway_brake_cap,
             "launch_release_ramp": launch_release_ramp,
             "launch_release_lead_s": launch_release_lead_s,
@@ -1224,13 +1231,20 @@ def build_plan(
     if dir_rule:
         # 段5-6: 低速で発進の途中でない行（停止側で解いた行）も、7.5 km/h 以上と同じく本体の戻しの
         # （stop_side=None）で解き直す。停止側の戻しの層は使わない
-        if body_release:
+        # 2026-10-28 段4: low_speed_release_stop_layer が true で表が停止側の戻しの層を持つとき、
+        # 低速（low）の行だけ停止側＋戻し量で解き直す（7.5 km/h 以上は本体のまま）
+        stop_layer_rows = None
+        if low_speed_release_stop_layer and stop_release:
+            stop_layer_rows = low
+        if body_release or stop_layer_rows is not None:
             body_redo = is_brake & ~stop & ~launch_b
             if release_table_min_kmh > 0.0:  # 段5-3: 低速は dir が決める
                 body_redo &= (v >= release_table_min_kmh) | low
+            if not body_release:  # 本体の戻しが無いときは層の行（低速）だけ
+                body_redo &= low
             released = _resolve_releases(
                 effort, body_redo, u_b, v, need_b, table, brake_deadband_pct, accel_deadband_pct,
-                period_s, stop_side=None,
+                period_s, stop_side=stop_layer_rows,
             )
     elif body_release or stop_release:
         redo = np.zeros(n, dtype=bool)
@@ -1265,9 +1279,12 @@ def build_plan(
     side_brake_dir = None
     if dir_rule:
         # 戻しで解き直した行（低速の停止側だった行を含む）は SIDE_RELEASE、それ以外は上の表のまま
+        released_side = np.full(n, SIDE_RELEASE)
+        if stop_layer_rows is not None:  # 段4: 低速で停止側の層で解いた行は SIDE_STOP_RELEASE
+            released_side = np.where(stop_layer_rows, SIDE_STOP_RELEASE, SIDE_RELEASE)
         side_brake_dir = np.where(
             launch_b, SIDE_LAUNCH,
-            np.where(released, SIDE_RELEASE, np.where(stop_b, SIDE_STOP, SIDE_MAIN)),
+            np.where(released, released_side, np.where(stop_b, SIDE_STOP, SIDE_MAIN)),
         )
         # (ロ) 発進の途中は踏み増さない（区間ごとに後ろからの最深に置き換える）
         _no_deeper_brake_in_midway(effort, flag, side_brake_dir, midway)
@@ -1298,7 +1315,7 @@ def build_plan(
         lowv = np.asarray(v, dtype=float) < float(table.meta.get("stop_max_speed_kmh", 7.5))
         lp_sides = (
             lowv & (side_accel == SIDE_LAUNCH), lowv & (side_accel == SIDE_STOP),
-            lowv & (side_brake == SIDE_LAUNCH), lowv & (side_brake == SIDE_STOP),
+            lowv & (side_brake == SIDE_LAUNCH), lowv & _is_stop_side(side_brake),
         )
         if _aux_out is not None:
             for key, arr in zip(("lp_la", "lp_sa", "lp_lb", "lp_sb"), lp_sides, strict=True):
@@ -1545,7 +1562,7 @@ def _launch_dev_peak(
                 np.array([low and side_a[k] == SIDE_LAUNCH]),
                 np.array([low and side_a[k] == SIDE_STOP]),
                 np.array([low and side_b[k] == SIDE_LAUNCH]),
-                np.array([low and side_b[k] == SIDE_STOP]),
+                np.array([low and bool(_is_stop_side(side_b[k]))]),
             )
         a = _accel_by_pos(
             table, np.array([v]), qa[k : k + 1], qb[k : k + 1], accel_min_pct, brake_min_pct, *fl,
@@ -2106,7 +2123,12 @@ def _side_flags(
     if side is None:
         lv, sv = low_speed_sides(table, need_kmhs, ref_kmh, stops_ahead)
         return bool(lv), bool(sv)
-    return side == SIDE_LAUNCH, side == SIDE_STOP
+    return side == SIDE_LAUNCH, bool(_is_stop_side(side))
+
+
+def _is_stop_side(side: Any) -> Any:
+    """表の側が停止側の表を引くか（SIDE_STOP と、段4 の SIDE_STOP_RELEASE）。配列も受ける。"""
+    return (side == SIDE_STOP) | (side == SIDE_STOP_RELEASE)
 
 
 def deviation_offset(table: ForwardTable, **kwargs: Any) -> float:
@@ -2130,6 +2152,7 @@ def deviation_offset_detail(
     stops_ahead: bool = False,
     dob_kmhs: float = 0.0,
     side: int | None = None,
+    gain_ratio: float = 1.0,
 ) -> tuple[float, bool]:
     """C10: 開度の列の 1 行（effort）に、偏差の分だけ上乗せした effort [%] を返す（段2p）。
 
@@ -2156,7 +2179,11 @@ def deviation_offset_detail(
     - side（2026-10-22 段5-2）: 計画がその行のペダルで引いた表（ForwardPlan.side_accel /
       side_brake。SIDE_LAUNCH ＝ 発進側・SIDE_STOP ＝ 停止側・それ以外 ＝ 本体）。None なら上の
       `low_speed_sides`
-      で決める（今までと同じ）。
+      で決める（今までと同じ）。SIDE_STOP_RELEASE（段4。低速の離す向きを停止側の戻しの層で解いた行）は
+      停止側の表（戻し量なし）で引く。
+    - gain_ratio（2026-10-28 段4 (ア)）: 局所の効きの倍率（表の傾きに対する実測の傾き。1 以上）。
+      上乗せの差 Δu ＝ (P と DOB の合計) をこれで割ってから min のクランプにかける。既定 1.0 は
+      今までと同じ出力。
     """
     if flag in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS) or effort == 0.0:
         return effort, False
@@ -2169,6 +2196,8 @@ def deviation_offset_detail(
     u0, _ = table.invert(ref_kmh, need_kmhs, launch=launch, stop=stop)
     u1, _ = table.invert(row_kmh, need_kmhs + d_a - dob_kmhs, launch=launch, stop=stop)
     du = float(u1) - float(u0)
+    if gain_ratio != 1.0:
+        du /= gain_ratio
     raw = effort + du
     if is_accel:
         new, clamped = max(raw, accel_min_pct), raw < accel_min_pct

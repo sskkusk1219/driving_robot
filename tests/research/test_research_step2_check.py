@@ -397,6 +397,26 @@ def test_i1_table_extras_is_informational_and_reports_seconds() -> None:
     assert sc._judge("I1", item.metrics) == sc.STATUS_OK
 
 
+def test_i1_shows_local_gain_cells_and_low_stair_seconds() -> None:
+    """2026-10-28 段3: 倍率の表のマスの数・中央値と低速の階段の秒数（お知らせ。NG にしない）。"""
+    entry = {
+        "speed_rep_kmh": [30.0, 90.0],
+        "u_from_onset_pct": [0.0, 0.5],
+        "ratio": [[2.0, 1.0], [1.0, 3.0]],
+        "n": [[2, 0], [0, 1]],
+    }
+    item = sc.check_table_extras(
+        _table(local_gain_brake=entry, low_stair_press_s=30.5, low_stair_release_s=40.0), None
+    )
+    assert "ブレーキ 測れたマス 2/4・中央値 2.50倍" in item.value and "アクセルなし" in item.value
+    assert "踏む向き 30.5s・離す向き 40.0s" in item.value
+    assert item.metrics["local_gain_brake_cells"] == 2.0
+    assert item.metrics["low_stair_release_s"] == pytest.approx(40.0)
+    assert item.status == sc.STATUS_OK
+    old = sc.check_table_extras(_table(), None)
+    assert "ブレーキなし" in old.value and "低速の階段 なし" in old.value
+
+
 def test_d1_plan_is_built_like_step3(monkeypatch) -> None:
     """2026-10-23: D1 は手順3（mode_drive）と同じ表・引数で計画を作る。
     A2 の床は表に掛かり、stop_lead は候補が C15 のときだけ効く。"""

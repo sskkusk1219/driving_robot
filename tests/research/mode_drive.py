@@ -44,6 +44,7 @@ from typing import Any
 
 import numpy as np
 
+from tests.research import local_gain
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.axis_safety import AxisSafetyNet
 from tests.research.config import ConfigError, ResearchConfig
@@ -366,6 +367,7 @@ def forward_map_plan_args(
         stop_lead=stop_end and fm.stop_lead_enabled,
         low_speed_side_rule=fm.low_speed_side_rule,  # 段5-2
         release_table_min_kmh=fm.release_table_min_kmh,  # 段5-3
+        low_speed_release_stop_layer=fm.low_speed_release_stop_layer,  # 段4（2026-10-28）
         switch_lead=fm.switch_lead_enabled,  # 段5-5c
         launch_midway_brake_cap=fm.launch_midway_brake_cap,  # 段5-6 追加 A1
         launch_release_ramp=fm.launch_release_ramp,  # 段7-b
@@ -519,7 +521,7 @@ def _prepare_forward_map_plan(
             lag_accel_s=None if lag_a is None else float(lag_a),
             lag_brake_s=None if lag_b is None else float(lag_b),
         )
-        say(f"  C10（偏差の上乗せ）: {c10_settings_text(ff)}")
+        say(f"  C10（偏差の上乗せ）: {c10_settings_text(ff, fm)}")
     if isinstance(ff, DisturbanceObserverFeedforward):
         # 2026-10-18 段2q: Tq ＝ dob_tq_coef × 上の遅れ（C10 の τ と同じ元）。
         # どちらにも無いペダルは None で、そのペダルは DOB を使わない
@@ -909,6 +911,20 @@ class C10Stats:
     brake_clamp_events: int = 0
     brake_clamp_cycles: int = 0
     period_s: float = 0.05
+    # 段4 (ア): 局所の効きの倍率（1 超）で上乗せを割った周期数と、割って減らした量の合計 [%]
+    accel_gain_cycles: int = 0
+    brake_gain_cycles: int = 0
+    accel_gain_cut_sum_pct: float = 0.0
+    brake_gain_cut_sum_pct: float = 0.0
+
+    def add_gain(self, *, is_accel: bool, cut_pct: float) -> None:
+        """倍率で割った 1 周期ぶん。cut_pct は割らなかった上乗せとの差の大きさ [%]。"""
+        if is_accel:
+            self.accel_gain_cycles += 1
+            self.accel_gain_cut_sum_pct += abs(cut_pct)
+        else:
+            self.brake_gain_cycles += 1
+            self.brake_gain_cut_sum_pct += abs(cut_pct)
 
     def add(self, *, is_accel: bool, delta_pct: float, clamped: bool, prev_clamped: bool) -> None:
         """1 周期ぶんを足す。delta_pct は上乗せ後 − 今の列（変わらなければ 0）。"""
@@ -947,17 +963,25 @@ class C10Stats:
 
     def summary(self) -> str:
         p = self.period_s
+        gain = ""
+        if self.accel_gain_cycles or self.brake_gain_cycles:
+            gain = (
+                f"／倍率で割った: アクセル {self.accel_gain_cycles} 周期・"
+                f"減らした量の合計 {self.accel_gain_cut_sum_pct:.1f}%、"
+                f"ブレーキ {self.brake_gain_cycles} 周期・"
+                f"合計 {self.brake_gain_cut_sum_pct:.1f}%"
+            )
         return (
             f"アクセル {self.accel_s:.1f}s（上乗せ量の平均 {self.accel_mean_pct:.2f}%・"
             f"最大 {self.accel_max_pct:.2f}%・min で止めた {self.accel_clamp_events} 回/"
             f"{self.accel_clamp_cycles * p:.1f}s）／"
             f"ブレーキ {self.brake_s:.1f}s（平均 {self.brake_mean_pct:.2f}%・"
             f"最大 {self.brake_max_pct:.2f}%・min で止めた {self.brake_clamp_events} 回/"
-            f"{self.brake_clamp_cycles * p:.1f}s）"
+            f"{self.brake_clamp_cycles * p:.1f}s）" + gain
         )
 
 
-def c10_settings_text(ff: object) -> str:
+def c10_settings_text(ff: object, fm: object | None = None) -> str:
     """C10 の設定の表示（走行前とレポートで同じ文）。C10 でなければ「なし」。"""
     if not isinstance(ff, DeviationForwardFeedforward):
         return "なし"
@@ -966,10 +990,21 @@ def c10_settings_text(ff: object) -> str:
     def tau(v: float | None) -> str:
         return f"{v:.1f}s" if v is not None else "上乗せなし（遅れが測れていない）"
 
-    return (
+    text = (
         f"c={ff.deviation_c:g}・τ アクセル {tau(ff.tau_accel_s)} / ブレーキ {tau(ff.tau_brake_s)}"
         f"・表の行 {case}"
     )
+    if fm is not None:
+        # 段4 (ア): 局所の効きの倍率で割るか（キー）と、pkl の meta に倍率の表があるか
+        meta = ff.table.meta
+
+        def gain(pedal: str) -> str:
+            on = bool(getattr(fm, f"local_gain_{pedal}", False))
+            has = bool(meta.get(f"local_gain_{pedal}"))
+            return f"{'on' if on else 'off'}（表{'あり' if has else 'なし'}）"
+
+        text += f"・倍率 ブレーキ {gain('brake')} / アクセル {gain('accel')}"
+    return text
 
 
 @dataclass
@@ -1780,11 +1815,16 @@ class _ModeRun:
         "legacy" は今までどおり
         `low_speed_sides`（need ＞ 0 → 発進側、停車へ向かう減速 → 停止側）。"""
         # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
-        from tests.research.fwd_plan import SIDE_LAUNCH, SIDE_STOP, low_speed_sides  # noqa: PLC0415
+        from tests.research.fwd_plan import (  # noqa: PLC0415
+            SIDE_LAUNCH,
+            SIDE_STOP,
+            SIDE_STOP_RELEASE,
+            low_speed_sides,
+        )
 
         side = plan.side_for(i, is_accel)
         if side is not None:
-            return side == SIDE_LAUNCH, side == SIDE_STOP
+            return side == SIDE_LAUNCH, side in (SIDE_STOP, SIDE_STOP_RELEASE)
         ahead = bool(plan.stops_ahead[i]) if plan.stops_ahead is not None else False
         launch, stop = low_speed_sides(
             self.ff.table, float(plan.need_accel_kmhs[i]), ref, ahead  # type: ignore[attr-defined]
@@ -1876,6 +1916,11 @@ class _ModeRun:
             "side": plan.side_for(i, ff_effort > 0.0),
         }
         fb_table = self._fb_table()  # 段8-b
+        # 段4 (ア): 局所の効きの倍率で、P と DOB の上乗せの差を割る（deviation_offset_detail の
+        # 中で、min のクランプの前）。停C の引き直し・DOB の分け方も同じ倍率。
+        # キー off・meta なしは 1
+        gain_ratio = self._local_gain_ratio(float(kwargs["row_kmh"]), ff_effort)
+        kwargs["gain_ratio"] = gain_ratio
         dob = self.dob
         # C11: 押しているペダルの行にだけ、そのペダルの外乱の推定を引いて表を引く。
         # DOB の分は「P ＋ DOB の上乗せ − P だけの上乗せ」で別に出す（ログ・集計用）
@@ -1888,6 +1933,11 @@ class _ModeRun:
         if dob is not None:
             d_row *= self._dob_weight(speed, int(plan.flag[i]), ref)
         new, clamped = deviation_offset_detail(fb_table, dob_kmhs=d_row, **kwargs)
+        if gain_ratio != 1.0 and ff_effort != 0.0:
+            kwargs["gain_ratio"] = 1.0
+            undivided, _ = deviation_offset_detail(fb_table, dob_kmhs=d_row, **kwargs)
+            kwargs["gain_ratio"] = gain_ratio
+            self.c10.add_gain(is_accel=ff_effort > 0.0, cut_pct=undivided - new)
         if self.stop_end is not None:
             # C15 停C: 停車まぎわのブレーキの行は、P の τ を「基準が 0 になるまでの残り時間
             # （ブレーキの遅れより短くしない）」にして引き直し、開度の範囲に収める
@@ -1933,6 +1983,25 @@ class _ModeRun:
             )
         self._c10_prev_clamped = clamped
         return delta
+
+    def _local_gain_ratio(self, row_kmh: float, ff_effort: float) -> float:
+        """段4 (ア): 今の FF の開度（そのペダルの min からの量 − 効き始め）と車速の行での局所の
+        効きの倍率。そのペダルのキーが false・meta なし・表の外・7.5 km/h 未満は 1.0。"""
+        if ff_effort == 0.0:
+            return 1.0
+        fm = self.cfg.forward_map
+        is_accel = ff_effort > 0.0
+        if not (fm.local_gain_accel if is_accel else fm.local_gain_brake):
+            return 1.0
+        meta = self.ff.table.meta  # type: ignore[attr-defined]
+        pedal = "accel" if is_accel else "brake"
+        onset = meta.get(f"{pedal}_onset_u_pct")
+        if onset is None or not np.isfinite(onset):
+            return 1.0
+        v = self.cfg.vehicle
+        pmin = v.min_accel_opening_pct if is_accel else v.min_brake_opening_pct
+        u_from_onset = abs(ff_effort) - pmin - float(onset)
+        return local_gain.local_gain_at(meta.get(f"local_gain_{pedal}"), row_kmh, u_from_onset)
 
     def _coast_assist(
         self, t: float, ref: float, ref_t: float, speed: float, ff_effort: float
@@ -2261,7 +2330,9 @@ async def run_mode_drive(
         overruns=run.overruns,
         governor_cycles=run.governor_cycles,
         interlock=run.interlock,
-        c10_settings=None if run.c10 is None else c10_settings_text(run.ff),
+        c10_settings=(
+            None if run.c10 is None else c10_settings_text(run.ff, run.cfg.forward_map)
+        ),
         c10=run.c10,
         dob_settings=None if run.dob is None else dob_settings_text(run.ff),
         dob=run.dob_stats,
@@ -2301,7 +2372,10 @@ async def run_mode_drive(
             f"（{run.stop_end_monotone_cycles * run.interval_s:.1f}s）・"
             f"踏み増しにした量の合計 {run.stop_end_monotone_pct_sum:.1f}%")
     if run.c10 is not None:
-        say(f"  C10（偏差の上乗せ。{c10_settings_text(run.ff)}）: {run.c10.summary()}")
+        say(
+            f"  C10（偏差の上乗せ。{c10_settings_text(run.ff, run.cfg.forward_map)}）: "
+            f"{run.c10.summary()}"
+        )
     if run.dob_stats is not None:
         say(f"  C11（DOB。{dob_settings_text(run.ff)}）: {run.dob_stats.summary()}")
         if run.dob is not None and run.dob.fast_need_kmhs > 0.0 and (

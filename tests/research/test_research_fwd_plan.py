@@ -20,6 +20,7 @@ from tests.research.fwd_plan import (
     SIDE_MAIN,
     SIDE_RELEASE,
     SIDE_STOP,
+    SIDE_STOP_RELEASE,
     ForwardPlan,
     build_plan,
     coast_assist_effort,
@@ -1421,6 +1422,88 @@ def test_dir_rule_low_decel_then_ease_uses_stop_then_release_when_shallower() ->
     for i in low_rows:
         if plan.side_brake[i] == SIDE_RELEASE:
             assert u[i] > float(u[max(i - w, 0) : i].min()) - 1e-9
+
+
+def _release_low_table_with_stop_layer() -> ForwardTable:
+    """_release_low_table に、停止側の戻しの層（戻し量 × 0.2 × |u| で効きが弱まる）を付けた表。"""
+    from tests.research.fwd_map import RELEASE_GRID_PCT  # noqa: PLC0415
+
+    tb, _ = _release_low_table()
+    tb.meta["stop_release_max_pct"] = 8.0
+    g = tb.u_grid
+    tb.stop_release_grid = np.array(RELEASE_GRID_PCT, dtype=float)
+    tb.stop_release_accel = np.stack(
+        [tb.stop_accel + np.where(g < 0, 0.2 * r * -g, 0.0)[None, :] for r in RELEASE_GRID_PCT]
+    )
+    return tb
+
+
+def test_low_speed_release_stop_layer_solves_low_rows_with_the_stop_layer() -> None:
+    tb = _release_low_table_with_stop_layer()
+    kw = dict(low_speed_side_rule="dir")
+    base = plan_for(_decel_then_ease, 5.0, tb, **kw)
+    off = plan_for(_decel_then_ease, 5.0, tb, low_speed_release_stop_layer=False, **kw)
+    on = plan_for(_decel_then_ease, 5.0, tb, low_speed_release_stop_layer=True, **kw)
+    # off は今までと完全に同じ
+    assert np.array_equal(base.effort_pct, off.effort_pct)
+    assert np.array_equal(base.side_brake, off.side_brake)
+    assert not np.any(base.side_brake == SIDE_STOP_RELEASE)
+    v = np.array([_decel_then_ease(float(x)) for x in on.t_s])
+    low = v < 7.5
+    # 低速の行で層で解いた行は SIDE_STOP_RELEASE になる（本体の戻し SIDE_RELEASE は低速から消える）
+    layer_rows = np.flatnonzero(on.side_brake == SIDE_STOP_RELEASE)
+    assert len(layer_rows) > 5 and np.all(low[layer_rows])
+    assert not np.any(on.side_brake[low] == SIDE_RELEASE)
+    # 層の行は、停止側＋戻し量で解いた値（accel(stop=True, release=m からの浅さ)が要る加速度）
+    u = np.where(on.effort_pct < -BD, on.effort_pct + BD, 0.0)
+    w = int(round(3.0 / on.period_s))
+    for i in layer_rows[:10]:
+        m = float(u[max(i - w, 0) : i].min())
+        got = tb.accel(float(v[i]), float(u[i]), stop=True, release=float(u[i]) - m)
+        assert got == pytest.approx(on.need_accel_kmhs[i], abs=0.05)
+    # 7.5 km/h 以上は変わらない
+    hi = np.flatnonzero(~low)
+    assert np.array_equal(on.effort_pct[hi], off.effort_pct[hi])
+    assert np.array_equal(on.side_brake[hi], off.side_brake[hi])
+    # 層を持たない表では、キー on でも今と同じ
+    tb2, _ = _release_low_table()
+    a = plan_for(_decel_then_ease, 5.0, tb2, **kw)
+    b = plan_for(_decel_then_ease, 5.0, tb2, low_speed_release_stop_layer=True, **kw)
+    assert np.array_equal(a.effort_pct, b.effort_pct)
+    assert np.array_equal(a.side_brake, b.side_brake)
+
+
+def test_side_stop_release_picks_the_stop_table_in_deviation_and_coast_assist() -> None:
+    t = linear_table()
+    t.stop_accel = t.accel_grid.copy()
+    cols = t.u_grid < 0
+    base_col = (-2.0 - 0.01 * t.speed_rep)[:, None]
+    t.stop_accel[:, cols] = (t.accel_grid[:, cols] - base_col) * 2.0 + base_col
+    t.meta["stop_max_speed_kmh"] = 25.0
+    kw = dict(effort=-15.0, need=-3.0, ref=10.0, dev=1.0)
+    stop = _dev(t, side=SIDE_STOP, **kw)
+    assert stop != pytest.approx(_dev(t, side=SIDE_RELEASE, **kw))
+    assert _dev(t, side=SIDE_STOP_RELEASE, **kw) == pytest.approx(stop)
+    ck = dict(is_accel=False, dev=1.0, need=-3.0, ref=10.0)
+    assert _coast(t, side=SIDE_STOP_RELEASE, **ck) == pytest.approx(_coast(t, side=SIDE_STOP, **ck))
+
+
+def test_gain_ratio_divides_the_offset_before_the_min_clamp() -> None:
+    t = linear_table()
+    plain = _dev(t, effort=12.0, dev=2.0)
+    half = _dev(t, effort=12.0, dev=2.0, gain_ratio=2.0)
+    assert half - 12.0 == pytest.approx((plain - 12.0) / 2.0)
+    assert _dev(t, effort=12.0, dev=2.0, gain_ratio=1.0) == plain
+    # 減らす向き: 割ってから min で止める（割る前なら止まる量でも、割ると止まらない）
+    du = 2.0 / 5.0 / ACCEL_SLOPE  # 割る前の減らす量
+    assert _dev(t, effort=AD + 1.0, dev=-2.0) == AD and du > 1.0
+    assert _dev(t, effort=AD + 1.0, dev=-2.0, gain_ratio=4.0) == pytest.approx(AD + 1.0 - du / 4.0)
+    _, clamped = deviation_offset_detail(
+        t, effort=AD + 1.0, flag=FLAG_MEASURED, need_kmhs=0.0, ref_kmh=50.0, row_kmh=50.0,
+        dev_kmh=-2.0, tau_accel_s=5.0, tau_brake_s=5.0, accel_min_pct=AD, brake_min_pct=BD,
+        gain_ratio=4.0,
+    )
+    assert not clamped
 
 
 def test_no_deeper_brake_in_midway_helper() -> None:

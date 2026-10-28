@@ -3655,3 +3655,399 @@ def test_stop_release_never_presses_both_pedals() -> None:
     assert all(r[3] <= 0.0 for r in seg)
     lo, hi = loop._ramp_u_limits() if loop._phase is _Phase.RAMP_RELEASE else (0.0, 0.0)
     assert hi == 0.0 and lo <= 0.0
+
+
+# ── 効き始めの少し先での小さな動き（RAMP_BRAKE_DITHER・RAMP_ACCEL_DITHER。2026-10-28 段2）──
+
+
+def _dither_config(**kw: object) -> PatternLoopConfig:
+    base = PatternLoopConfig(
+        ramp_dither_enabled=True, ramp_dither_brake_speeds_kmh=(30.0,),
+        ramp_dither_deltas_pct=(0.5, 0.25), ramp_dither_hold_s=0.5,
+        ramp_dither_brake_u0_from_onset_pct=(0.5, 1.5, 2.5), ramp_dither_max_g=0.13,
+        ramp_dither_accel_band_pct=10.0, ramp_dither_accel_max_n=3,
+        ramp_dither_brake_onset_u_pct=6.0, ramp_dither_accel_onset_u_pct=0.0,
+        ramp_release_min_kmh=10.0,
+    )
+    return dataclasses.replace(base, **kw)  # type: ignore[arg-type]
+
+
+class _DitherKine(_Kine):
+    """RAMP_BRAKE_DITHER の間は −0.4G で減速する車（それ以外は _Kine と同じ。保持・アクセルの
+    dither は一定）。"""
+
+    def step(self, dt: float = 0.1) -> None:
+        if self.loop._phase is _Phase.RAMP_BRAKE_DITHER:
+            self.v = max(0.0, self.v - 0.4 * self.g * G_TO_KMHS * dt)
+        else:
+            super().step(dt)
+
+
+def _run_dither_down(
+    loop: PatternLoop, p: plmod.GRampPattern, *, u_down: float = -7.0, t_max: float = 120.0
+) -> list[tuple[float, str, float, float, float, float]]:
+    """RAMP_DOWN の間は u を u_down 以下（ブレーキ側）に保って回す。
+    [(t, phase 名, 車速, u, アクセル指令, ブレーキ指令)]。結果が記録されたら止める。"""
+    kine = _DitherKine(loop, p.target_g, v0=40.0)
+    loop._phase = _Phase.RAMP_DOWN
+    loop._phase_started_at = 0.0
+    loop._rp_brake_latched = True
+    loop._rp_u = u_down
+    rows: list[tuple[float, str, float, float, float, float]] = []
+    t = 0.0
+    while t < t_max and not loop.ramp_results:
+        if loop._phase is _Phase.RAMP_DOWN and kine.v > 0.0:
+            loop._rp_u = min(loop._rp_u, u_down)
+            loop._rp_brake_latched = True
+        a, b = _cycle(loop, p, kine.v, t)
+        rows.append((t, loop._phase.name, kine.v, loop._rp_u, a, b))
+        kine.step()
+        t += 0.1
+    return rows
+
+
+def test_dither_off_is_the_old_behaviour() -> None:
+    """既定（off）、または on でも効き始めが読めない（None）なら、phase の並びは同じで
+    dither の列は 0。"""
+    p = _release_ramp(stations=(), g=0.1)
+    names: list[list[str]] = []
+    for cfg in (
+        PatternLoopConfig(ramp_release_min_kmh=10.0),
+        _dither_config(ramp_dither_enabled=False),
+        _dither_config(ramp_dither_brake_onset_u_pct=None),
+    ):
+        loop = _loop([p], config=cfg)
+        rows = _run_dither_down(loop, p)
+        names.append([r[1] for r in rows])
+        assert not any("DITHER" in r[1] for r in rows)
+        r0 = loop.ramp_results[0]
+        assert (r0.dither_brake_s, r0.dither_brake_n, r0.dither_brake_skipped) == (0.0, 0, 0)
+        assert (r0.dither_accel_s, r0.dither_accel_n) == (0.0, 0)
+    assert names[0] == names[1] == names[2]
+
+
+def test_brake_dither_enters_inside_ramp_down_and_steps_u0_pm_delta() -> None:
+    """30 km/h を切ると RAMP_DOWN の中で RAMP_BRAKE_DITHER に入り、u0 ＝ −（効き始め 6.0 ＋ 0.5）
+    ＝ −6.5（今の u −7.0 ではない）。u は u0−Δ → u0 → u0+Δ → u0（深くする向きが +。u は負が
+    ブレーキ。Δ ＝ 0.5・各 0.5 秒・ステップ）。出たら RAMP_DOWN に戻る。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_dither_config())
+    rows = _run_dither_down(loop, p)
+    names = [r[1] for r in rows]
+    i0 = names.index("RAMP_BRAKE_DITHER")
+    assert names[i0 - 1] == "RAMP_DOWN"
+    seg = [r for r in rows if r[1] == "RAMP_BRAKE_DITHER"]
+    assert rows[i0][2] <= 30.0  # 測る車速を切った周期
+    # 入った周期の u が u0。以後 ステップで 4 つの開度
+    plateaus: list[float] = []
+    for r in seg:
+        if not plateaus or abs(plateaus[-1] - r[3]) > 1e-9:
+            plateaus.append(r[3])
+    u0 = loop._rp_dither_u0
+    assert u0 == pytest.approx(-6.5)  # 効き始め 6.0 ＋ 0.5（今の u −7.0 ではない）
+    assert seg[0][3] == pytest.approx(-6.5)  # 入った周期にステップで u0 へ移る
+    assert plateaus[-4:] == pytest.approx([u0 - 0.5, u0, u0 + 0.5, u0])
+    assert seg[-1][0] - seg[0][0] == pytest.approx(2.0, abs=0.2)  # 4 × 0.5 秒
+    assert "RAMP_DOWN" in names[names.index("RAMP_BRAKE_DITHER"):]
+    r0 = loop.ramp_results[0]
+    assert (r0.dither_brake_n, r0.dither_brake_skipped) == (1, 0)
+    assert r0.dither_brake_s == pytest.approx(2.0, abs=0.3)
+
+
+def test_brake_dither_alternates_delta_between_runs() -> None:
+    """Δ は測る車速ごとに交互（0.5 → 0.25）。2 本目の流れは Δ ＝ 0.25。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_dither_config())
+    _run_dither_down(loop, p)
+    assert loop._rp_dither_delta == 0.5 and loop._rp_dither_seq_brake == 1
+    loop.ramp_results.clear()
+    loop._rp_dither_brake_done.clear()
+    rows = _run_dither_down(loop, p)
+    seg = [r[3] for r in rows if r[1] == "RAMP_BRAKE_DITHER"]
+    u0 = loop._rp_dither_u0
+    assert min(seg) == pytest.approx(u0 - 0.25) and max(seg) == pytest.approx(u0 + 0.25)
+
+
+def test_brake_dither_enters_even_when_opening_is_outside_the_old_band() -> None:
+    """今の u が浅い（−2.0）・深い（−12.0）でも入る。u0 は今の u に関係なく −6.5。"""
+    p = _release_ramp(stations=(), g=0.1)
+    for u_down in (-2.0, -12.0):
+        loop = _loop([p], config=_dither_config())
+        rows = _run_dither_down(loop, p, u_down=u_down)
+        assert any(r[1] == "RAMP_BRAKE_DITHER" for r in rows)
+        r0 = loop.ramp_results[0]
+        assert (r0.dither_brake_n, r0.dither_brake_skipped) == (1, 0)
+        assert loop._rp_dither_u0 == pytest.approx(-6.5)
+
+
+def test_brake_dither_u0_cycles_through_offsets_by_entry_number() -> None:
+    """u0 ＝ −（効き始め ＋ 0.5 / 1.5 / 2.5）を入るたびに順に使い、4 回目は 0.5 に戻る。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_dither_config())
+    got: list[float] = []
+    for _ in range(4):
+        loop.ramp_results.clear()
+        loop._rp_dither_brake_done.clear()
+        _run_dither_down(loop, p)
+        got.append(loop._rp_dither_u0)
+    assert got == pytest.approx([-6.5, -7.5, -8.5, -6.5])
+
+
+def test_brake_dither_u0_and_steps_are_clamped_to_min_and_limit() -> None:
+    """u0 が深すぎれば下限 lo、浅すぎれば min（u ＝ 0）に切る。u0±Δ も範囲内。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_dither_config(ramp_dither_brake_u0_from_onset_pct=(500.0,)))
+    rows = _run_dither_down(loop, p)
+    lo, _ = loop._ramp_u_limits()
+    assert loop._rp_dither_u0 == pytest.approx(lo)
+    assert all(r[3] >= lo - 1e-9 for r in rows if r[1] == "RAMP_BRAKE_DITHER")
+    loop = _loop([p], config=_dither_config(
+        ramp_dither_brake_onset_u_pct=0.1, ramp_dither_brake_u0_from_onset_pct=(0.0,),
+        ramp_dither_deltas_pct=(0.5,),
+    ))
+    rows = _run_dither_down(loop, p)
+    seg = [r[3] for r in rows if r[1] == "RAMP_BRAKE_DITHER"]
+    assert loop._rp_dither_u0 == pytest.approx(-0.1)
+    assert max(seg) <= 0.0 and min(seg) == pytest.approx(-0.6)  # 浅い側は min（0）を越えない
+
+
+def test_brake_dither_max_g_includes_0125g_but_not_stronger() -> None:
+    """既定の max_g 0.13 では 0.125G の段に入り、0.14G の段には入らない。"""
+    assert PatternLoopConfig().ramp_dither_max_g == pytest.approx(0.13)
+    assert PatternLoopConfig().ramp_dither_brake_speeds_kmh == (100.0, 75.0, 50.0, 30.0)
+    for g, enters in ((0.125, True), (0.14, False)):
+        p = _release_ramp(stations=(), g=g)
+        loop = _loop([p], config=_dither_config())
+        rows = _run_dither_down(loop, p)
+        assert any(r[1] == "RAMP_BRAKE_DITHER" for r in rows) is enters
+
+
+def test_brake_dither_does_not_enter_during_ramp_release() -> None:
+    """RAMP_RELEASE 中は入らない（RAMP_RELEASE → RAMP_BRAKE_DITHER の直接の遷移はない）。
+    戻しが終わって RAMP_DOWN に戻ってから入る。"""
+    p = _release_ramp(stations=(35.0,), g=0.1)
+    loop = _loop([p], config=_dither_config(**dataclasses.asdict(_release_config())))
+    kine = _ReleaseKine(loop, p.target_g, v0=40.0)
+    loop._phase, loop._phase_started_at = _Phase.RAMP_DOWN, 0.0
+    loop._rp_brake_latched, loop._rp_u = True, -7.0
+    names: list[str] = []
+    t = 0.0
+    while t < 120.0 and not loop.ramp_results:
+        if loop._phase is _Phase.RAMP_DOWN and kine.v > 0.0:
+            loop._rp_u = min(loop._rp_u, -7.0)
+            loop._rp_brake_latched = True
+        _cycle(loop, p, kine.v, t)
+        names.append(loop._phase.name)
+        kine.step()
+        t += 0.1
+    assert "RAMP_RELEASE" in names
+    pairs = list(zip(names, names[1:], strict=False))
+    assert ("RAMP_RELEASE", "RAMP_BRAKE_DITHER") not in pairs
+
+
+def test_brake_dither_does_not_enter_on_strong_g_steps() -> None:
+    """目標減速度が ramp_dither_max_g を超える段には入らない（飛ばした数にも数えない）。"""
+    p = _release_ramp(stations=(), g=0.25)
+    loop = _loop([p], config=_dither_config())
+    rows = _run_dither_down(loop, p)
+    assert not any(r[1] == "RAMP_BRAKE_DITHER" for r in rows)
+    r0 = loop.ramp_results[0]
+    assert (r0.dither_brake_n, r0.dither_brake_skipped) == (0, 0)
+    assert loop._rp_dither_brake_done == set()
+
+
+def test_brake_dither_never_presses_both_pedals_and_stays_on_the_brake_side() -> None:
+    """全周期でアクセル指令 0・ブレーキ指令 ≧ min、u ≦ 0。上下限（hi ＝ 0）も守る。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_dither_config())
+    _, bdb = _deadbands(loop)
+    rows = _run_dither_down(loop, p)
+    seg = [r for r in rows if r[1] == "RAMP_BRAKE_DITHER"]
+    assert seg
+    assert all(r[4] == 0.0 and r[5] >= bdb for r in seg)
+    assert all(r[3] <= 0.0 for r in seg)
+    loop._phase = _Phase.RAMP_BRAKE_DITHER
+    lo, hi = loop._ramp_u_limits()
+    assert hi == 0.0 and lo < 0.0 and loop._ramp_on_brake()
+
+
+def test_brake_dither_does_not_feed_glimit_or_down_g_or_control() -> None:
+    """dither の間は glimit に点を足さず、`_rp_down_g` にも入れず、制御の項も呼ばない。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_dither_config())
+    _, bdb = _deadbands(loop)
+    added: list[str] = []
+    orig_add = loop.glimit.add
+
+    def spy(pedal: str, speed: float, opening: float, accel: float) -> None:
+        added.append(loop._phase.name)
+        orig_add(pedal, speed, opening, accel)
+
+    loop.glimit.add = spy  # type: ignore[method-assign]
+    controls: list[str] = []
+    orig_ctl = loop._ramp_control
+
+    def ctl(*args: object, **kw: object) -> None:
+        controls.append(loop._phase.name)
+        orig_ctl(*args, **kw)  # type: ignore[arg-type]
+
+    loop._ramp_control = ctl  # type: ignore[method-assign]
+    loop._brake_actual_pct = bdb + 7.0
+    loop._accel_actual_pct = 0.0
+    rows = _run_dither_down(loop, p)
+    assert any(r[1] == "RAMP_BRAKE_DITHER" for r in rows)
+    assert "RAMP_BRAKE_DITHER" not in added and "RAMP_BRAKE_DITHER" not in controls
+    assert "RAMP_DOWN" in controls  # 外では制御している（テストの前提）
+
+
+def test_brake_dither_exit_returns_to_down_with_vref_at_speed_and_excludes_time() -> None:
+    """出た後は RAMP_DOWN: v_ref ＝ 実車速・前の偏差 ＝ 0・g_ref は 0 から。下りの時間切れから
+    dither の時間が除かれる（`_rp_down_prior_s` に入る前の分だけ。dither の間は数えない）。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_dither_config())
+    rows = _run_dither_down(loop, p)
+    # dither の次の周期（RAMP_DOWN に戻った直後）を作り直して確かめる
+    loop2 = _loop([p], config=_dither_config())
+    kine = _DitherKine(loop2, 0.1, v0=40.0)
+    loop2._phase, loop2._phase_started_at = _Phase.RAMP_DOWN, 0.0
+    loop2._rp_brake_latched, loop2._rp_u = True, -7.0
+    t = 0.0
+    while loop2._phase is not _Phase.RAMP_BRAKE_DITHER and t < 60.0:
+        loop2._rp_u = min(loop2._rp_u, -7.0)
+        _cycle(loop2, p, kine.v, t)
+        kine.step()
+        t += 0.1
+    prior = loop2._rp_down_prior_s
+    assert prior > 0.0
+    while loop2._phase is _Phase.RAMP_BRAKE_DITHER and t < 60.0:
+        _cycle(loop2, p, kine.v, t)
+        kine.step()
+        t += 0.1
+    assert loop2._phase is _Phase.RAMP_DOWN
+    assert loop2._rp_vref == pytest.approx(kine.v, abs=0.5)
+    assert loop2._rp_turn_g0 == 0.0 and loop2._rp_e_prev == 0.0
+    assert loop2._rp_down_prior_s == pytest.approx(prior)  # dither の間は数えない
+    assert rows  # 上の通し走行も終わっている
+
+
+def test_brake_dither_safety_exit_at_low_speed() -> None:
+    """流れの途中でも実車速が安全網（ramp_release_min_kmh）以下になったら RAMP_DOWN へ戻る。"""
+    p = _release_ramp(stations=(), g=0.1)
+    loop = _loop([p], config=_dither_config(ramp_dither_hold_s=3.0, ramp_release_min_kmh=29.0))
+    rows = _run_dither_down(loop, p)
+    seg = [r for r in rows if r[1] == "RAMP_BRAKE_DITHER"]
+    # 入ってから 12 秒の流れだが、車速が 29 km/h 以下になった時点で出る（−0.4G は 約 1.4 km/h/s）
+    assert seg and seg[-1][0] - seg[0][0] < 6.0
+
+
+def _run_dither_up(
+    loop: PatternLoop, p: plmod.GRampPattern, *, u_cruise: float | None = 3.0,
+    t_max: float = 200.0,
+) -> list[tuple[float, str, float, float, float, float]]:
+    """保持（RAMP_CRUISE）の間は u を u_cruise に保って回す。
+    [(t, phase 名, 車速, u, アクセル指令, ブレーキ指令)]。結果が記録されたら止める。"""
+    kine = _DitherKine(loop, p.target_g, v0=5.0)
+    rows: list[tuple[float, str, float, float, float, float]] = []
+    t = 0.0
+    while t < t_max and not loop.ramp_results:
+        if u_cruise is not None and loop._phase is _Phase.RAMP_CRUISE:
+            loop._rp_u = u_cruise
+        a, b = _cycle(loop, p, kine.v, t)
+        rows.append((t, loop._phase.name, kine.v, loop._rp_u, a, b))
+        kine.step()
+        t += 0.1
+    return rows
+
+
+def test_accel_dither_follows_ramp_cruise_and_steps_u0_pm_delta() -> None:
+    """保持が完了したとき u が効き始め 〜 ＋ band の中なら RAMP_ACCEL_DITHER（RAMP_CRUISE の後・
+    RAMP_UP の前）。u は u0＋Δ → u0 → u0−Δ → u0。両踏みにならない（ブレーキ指令 0）。"""
+    p = _cruise_ramp(g=0.1, top_kmh=40.0, stations=(20.0,), up_only=True)
+    loop = _loop([p], config=_dither_config(
+        ramp_dither_accel_onset_u_pct=1.0, ramp_dither_brake_speeds_kmh=()
+    ))
+    rows = _run_dither_up(loop, p, u_cruise=3.0)
+    names = [r[1] for r in rows]
+    i = names.index("RAMP_ACCEL_DITHER")
+    assert names[i - 1] == "RAMP_CRUISE" and names[names.index("RAMP_ACCEL_DITHER", i):][-1] != ""
+    j = max(k for k, n in enumerate(names) if n == "RAMP_ACCEL_DITHER")
+    assert names[j + 1] == "RAMP_UP"
+    seg = [r for r in rows if r[1] == "RAMP_ACCEL_DITHER"]
+    plateaus: list[float] = []
+    for r in seg:
+        if not plateaus or abs(plateaus[-1] - r[3]) > 1e-9:
+            plateaus.append(r[3])
+    d = loop._rp_dither_delta
+    u0 = loop._rp_dither_u0
+    assert d == 0.5 and u0 == pytest.approx(3.0, abs=0.5)
+    assert plateaus[-4:] == pytest.approx([u0 + d, u0, u0 - d, u0])
+    assert all(r[5] == 0.0 for r in seg)  # ブレーキ指令 0（両踏みにならない）
+    r0 = loop.ramp_results[0]
+    assert (r0.dither_accel_n, r0.dither_brake_n) == (1, 0)
+    assert r0.dither_accel_s == pytest.approx(2.0, abs=0.3)
+    assert r0.cruise_done == 1
+
+
+def test_accel_dither_clamps_u_minus_delta_to_min_and_uses_no_control() -> None:
+    """u0 − Δ が min（u ＝ 0）未満になる場合は min にクランプ。制御の項は呼ばない。"""
+    p = _cruise_ramp(g=0.1, top_kmh=40.0, stations=(20.0,), up_only=True)
+    loop = _loop([p], config=_dither_config(ramp_dither_deltas_pct=(0.5,)))
+    controls: list[str] = []
+    orig_ctl = loop._ramp_control
+
+    def ctl(*args: object, **kw: object) -> None:
+        controls.append(loop._phase.name)
+        orig_ctl(*args, **kw)  # type: ignore[arg-type]
+
+    loop._ramp_control = ctl  # type: ignore[method-assign]
+    rows = _run_dither_up(loop, p, u_cruise=0.2)  # u0 ≈ 0.2: u0−Δ < 0
+    seg = [r for r in rows if r[1] == "RAMP_ACCEL_DITHER"]
+    assert seg and min(r[3] for r in seg) >= 0.0
+    assert min(r[3] for r in seg) == 0.0
+    assert "RAMP_ACCEL_DITHER" not in controls
+
+
+def test_accel_dither_skips_outside_band_and_respects_max_n() -> None:
+    """帯の外（効き始めより浅い・band より深い）は入らず skipped に数える。1 本あたり
+    ramp_dither_accel_max_n 回まで。"""
+    p = _cruise_ramp(g=0.1, top_kmh=40.0, stations=(15.0, 25.0), up_only=True)
+    for u in (-0.5, 15.0):
+        loop = _loop([p], config=_dither_config(
+        ramp_dither_accel_onset_u_pct=1.0, ramp_dither_brake_speeds_kmh=()
+    ))
+        rows = _run_dither_up(loop, p, u_cruise=u)
+        assert not any(r[1] == "RAMP_ACCEL_DITHER" for r in rows)
+        r0 = loop.ramp_results[0]
+        assert r0.dither_accel_n == 0 and r0.dither_accel_skipped == 2
+    loop = _loop(
+        [p], config=_dither_config(ramp_dither_accel_onset_u_pct=1.0, ramp_dither_accel_max_n=1)
+    )
+    _run_dither_up(loop, p, u_cruise=3.0)
+    r0 = loop.ramp_results[0]
+    assert r0.dither_accel_n == 1 and r0.cruise_n == 2
+    # 既定どおり 2 回まで入れる（保持が 2 つ）
+    loop = _loop([p], config=_dither_config(
+        ramp_dither_accel_onset_u_pct=1.0, ramp_dither_brake_speeds_kmh=()
+    ))
+    _run_dither_up(loop, p, u_cruise=3.0)
+    assert loop.ramp_results[0].dither_accel_n == 2
+
+
+def test_accel_dither_time_is_excluded_from_the_up_leg_timeout() -> None:
+    """dither の時間は保持の開始から数えるので、上りの時間切れの経過から除かれる
+    （`_rp_up_cruise_s` に dither の秒数が入る）。"""
+    p = _cruise_ramp(g=0.1, top_kmh=40.0, stations=(20.0,), up_only=True)
+    base = _loop([p])
+    _run_dither_up(base, p, u_cruise=3.0)
+    with_d = _loop([p], config=_dither_config(
+        ramp_dither_accel_onset_u_pct=1.0, ramp_dither_brake_speeds_kmh=()
+    ))
+    _run_dither_up(with_d, p, u_cruise=3.0)
+    assert with_d._rp_up_cruise_s - base._rp_up_cruise_s == pytest.approx(2.0, abs=0.4)
+
+
+def test_dither_phases_are_part_of_the_ramp_phase_set() -> None:
+    assert _Phase.RAMP_BRAKE_DITHER in plmod._RAMP_PHASES
+    assert _Phase.RAMP_ACCEL_DITHER in plmod._RAMP_PHASES
+    assert _Phase.RAMP_BRAKE_DITHER.name == "RAMP_BRAKE_DITHER"
+    assert _Phase.RAMP_ACCEL_DITHER.name == "RAMP_ACCEL_DITHER"

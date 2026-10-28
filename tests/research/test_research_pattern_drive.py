@@ -510,7 +510,10 @@ def test_save_drive_figure_writes_png(tmp_path: Path) -> None:
 def _fake_table_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """C7 の表づくり（fwd_tool）を差し替える。ここで見るのは物理定数の推定と保存の流れ。"""
 
-    def fake(profile, csv_path, models_dir, hw_mode, *, announce=True, lags=None):  # type: ignore[no-untyped-def]
+    def fake(  # type: ignore[no-untyped-def]
+        profile, csv_path, models_dir, hw_mode, *, announce=True, lags=None,
+        local_gain_brake_speeds_kmh=None,
+    ):
         path = tmp_path / "results" / "models" / f"fwd_table_fake_{hw_mode}.pkl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x")
@@ -761,7 +764,7 @@ def _seed_outlier_setup(
         stop_release_layer_enabled=False, accel_release_input_enabled=False,
         launch_accel_side_source="extrapolate", side_table_accel_window_s=0.5,
         launch_rows_to_stop_max=False, side_row_speed_rep="grid", stop_approach_exclusion="depth",
-        accel_push_input_enabled=False,
+        accel_push_input_enabled=False, local_gain_brake_speeds_kmh=None,
     ):
         seeds_seen.append(tuple(seeds))
         path = tmp_path / "results" / "models" / f"fwd_model_fake_{len(seeds_seen)}.pkl"
@@ -1114,3 +1117,146 @@ def test_loop_config_passes_stop_release_settings() -> None:
     cfg.learning.stop_release_max_g = 0.15
     lc = pdmod.loop_config_from_config(cfg)
     assert lc.stop_release_enabled is False and lc.stop_release_max_g == 0.15
+
+
+def test_loop_config_dither_reads_onsets_from_the_pkl_meta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-10-28 段2: ramp_dither_enabled が true のとき、今の pkl の meta（brake_onset_u_pct・
+    accel_onset_u_pct。min からの量）を PatternLoopConfig へ渡す。読めない・キーなし・0 以下は None
+    （その dither は入らない）。off なら pkl を読まず、設定値だけ渡す。"""
+    import types
+
+    from tests.research import fwd_map
+
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    calls: list[str] = []
+
+    def fake_load(path: Path) -> object:
+        calls.append(str(path))
+        return types.SimpleNamespace(meta={"brake_onset_u_pct": 6.4, "accel_onset_u_pct": 0.0})
+
+    monkeypatch.setattr(fwd_map, "load_forward_map", fake_load)
+    off = pdmod.loop_config_from_config(cfg)
+    assert off.ramp_dither_enabled is False and calls == []
+    assert off.ramp_dither_brake_onset_u_pct is None and off.ramp_dither_accel_onset_u_pct is None
+    cfg.learning.ramp_dither_enabled = True
+    on = pdmod.loop_config_from_config(cfg)
+    assert on.ramp_dither_enabled is True and calls == [cfg.feedforward.model_path]
+    assert on.ramp_dither_brake_onset_u_pct == pytest.approx(6.4)
+    assert on.ramp_dither_accel_onset_u_pct is None  # 0 以下は None
+    assert on.ramp_dither_brake_speeds_kmh == (100.0, 75.0, 50.0, 30.0)
+    assert on.ramp_dither_brake_u0_from_onset_pct == (0.5, 1.5, 2.5)
+    assert on.ramp_dither_deltas_pct == (0.25, 0.5)
+    assert on.ramp_dither_hold_s == 1.5 and on.ramp_dither_max_g == 0.13
+    assert on.ramp_dither_accel_band_pct == 10.0 and on.ramp_dither_accel_max_n == 3
+
+    def broken(path: Path) -> object:
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(fwd_map, "load_forward_map", broken)
+    gone = pdmod.loop_config_from_config(cfg)
+    assert gone.ramp_dither_brake_onset_u_pct is None and gone.ramp_dither_accel_onset_u_pct is None
+
+
+def test_result_table_shows_dither_columns_and_adds_them_to_the_total() -> None:
+    """2026-10-28 段2: 結果の表に dither（ブレーキ・アクセル別の秒と入った/飛ばした）を出し、
+    合計秒に含める。"""
+    from tests.research.pattern_loop import RampResult
+
+    r = RampResult(
+        pattern_idx=0, target_g=0.1, top_kmh=60.0, up_s=10.0, down_s=20.0, accel_g_median=0.1,
+        decel_g_median=0.1, max_speed_kmh=60.0, dither_brake_s=6.0, dither_brake_n=3,
+        dither_brake_skipped=1, dither_accel_s=4.0, dither_accel_n=2, dither_accel_skipped=0,
+    )
+    text = pdmod.result_table([(0.1, 60.0)], [r], 100.0)
+    assert "dither ブレーキ 秒" in text and "dither アクセル 入った/飛ばした" in text
+    row = text.splitlines()[2]
+    assert "3/1" in row and "2/0" in row
+    assert " 40.0 " in row  # 合計秒 ＝ 10 ＋ 20 ＋ 6 ＋ 4
+
+
+# ── 段3（ProblemReport_20261028）: 低速の階段の行の取り込み ───────────────────────────
+
+
+def _stair_csv(path: Path, *, with_stair: bool) -> None:
+    import csv as _csv
+
+    cols = ["section", "phase", "elapsed_s", "actual_speed_kmh", "accel_cmd_pct", "brake_cmd_pct",
+            "accel_actual_pct", "brake_actual_pct"]
+    rows: list[list[Any]] = []
+    t = 0.0
+
+    def block(section: str, phase: str, speeds: list[float], brake: float) -> None:
+        nonlocal t
+        for v in speeds:
+            t += 0.05
+            rows.append([section, phase, f"{t:.3f}", v, 6.0, brake, 6.0, brake])
+        t += 5.0  # セグメントを切る
+
+    block("PEDAL_SEARCH", "BRAKE_SEARCH", [3.0 - 0.01 * i for i in range(60)], 9.0)
+    if with_stair:
+        block("PEDAL_SEARCH", "LOW_RELEASE_STAIR", [0.0] * 30 + [2.0] * 30, 8.5)
+        block("PEDAL_SEARCH", "LOW_PRESS_STAIR", [2.0] * 30 + [0.0] * 10, 9.0)
+    with path.open("w", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(cols)
+        w.writerows(rows)
+
+
+def _capture_low_speed(monkeypatch, csv_path: Path, *, layer: bool) -> dict[str, Any]:
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from tests.research import fwd_map
+    from tests.research.fwd_tool import DeadbandLag
+
+    got: dict[str, Any] = {}
+
+    def attach_launch(table, rows, **kw):
+        table.meta["launch_rows_s"] = 0.0
+        return table
+
+    def attach_stop(table, rows, **kw):
+        got["stop"] = rows
+        table.meta["stop_rows_s"] = 0.0
+        return table
+
+    def attach_stop_release(table, rows, **kw):
+        got["release"] = rows
+        return table
+
+    monkeypatch.setattr(fwd_map, "attach_launch", attach_launch)
+    monkeypatch.setattr(fwd_map, "attach_stop", attach_stop)
+    monkeypatch.setattr(fwd_map, "attach_stop_release", attach_stop_release)
+    table = SimpleNamespace(
+        meta={}, launch_accel=None, stop_accel=None, stop_release_accel=None,
+        coast_accel=lambda v: np.zeros_like(np.asarray(v, dtype=float)),
+    )
+    pdmod._attach_low_speed_tables(
+        table, csv_path, DeadbandLag(6.0, 6.0), creep_speed_kmh=4.0,
+        stop_release_layer_enabled=layer,
+    )
+    got["meta"] = table.meta
+    return got
+
+
+def test_low_stair_rows_go_to_stop_rows_and_moving_release_rows_to_layer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    old, new = tmp_path / "old.csv", tmp_path / "new.csv"
+    _stair_csv(old, with_stair=False)
+    _stair_csv(new, with_stair=True)
+    g_old = _capture_low_speed(monkeypatch, old, layer=True)
+    g_new = _capture_low_speed(monkeypatch, new, layer=True)
+    n_old, n_new = len(g_old["stop"].speed_kmh), len(g_new["stop"].speed_kmh)
+    assert n_new > n_old  # 踏む向きの行（停車の行を含む）が足された
+    # 離す向きは動いている行（速度 ≥ 0.5）だけが層の行に入る
+    added_release = len(g_new["release"].speed_kmh) - len(g_old["release"].speed_kmh)
+    assert 0 < added_release <= 30
+    assert g_new["meta"]["low_stair_release_s"] > 0.0 and g_new["meta"]["low_stair_press_s"] > 0.0
+    # 古い CSV（階段の phase なし）: 行も meta も今までと同じ（階段の meta キーなし）
+    assert "low_stair_press_s" not in g_old["meta"]
+    # 層を作らない設定では、離す向きの行は使わない
+    assert "release" not in _capture_low_speed(monkeypatch, new, layer=False)

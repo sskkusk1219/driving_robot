@@ -10,6 +10,7 @@
     .venv/bin/python -m tests.research.fwd_tool model [--map PKL] [--train CSV ...]
         [--check CSV ...] [--ref-check CSV ...] [--save]
     .venv/bin/python -m tests.research.fwd_tool attach-pedal-track --pkl IN --csv CSV --out OUT
+    .venv/bin/python -m tests.research.fwd_tool attach-local-gain --pkl IN --csv CSV --out OUT
 """
 
 from __future__ import annotations
@@ -1529,6 +1530,29 @@ def run_attach_pedal_track(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_attach_local_gain(args: argparse.Namespace) -> int:
+    """既存の pkl に、手順2 の CSV の dither から測った局所の効きの倍率の表と効くまでの遅れ
+    （local_gain_brake・local_gain_accel・dither_*_lag_s）を meta として付けて、新しい pkl に
+    保存する
+    （2026-10-28 段3。倍率はその pkl の表の傾きで割る。元の pkl は書き換えない）。"""
+    from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
+    from tests.research.pattern_drive import _attach_local_gain  # noqa: PLC0415
+
+    src, out = Path(args.pkl), Path(args.out)
+    if out.exists():
+        print(f"保存先 {out} が既にある。上書きしない")
+        return 2
+    if out.resolve() == src.resolve():
+        print("保存先が元の pkl と同じ。別の名前にする")
+        return 2
+    table = load_forward_map(src)
+    if not _attach_local_gain(table, Path(args.csv), args.brake_speeds):
+        print("測れなかったので保存しない")
+        return 1
+    print(f"保存: {save_table(table, out)}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fwd_tool", description="順モデル（C7〜C9）のオフライン道具")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1560,6 +1584,19 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--csv", required=True, help="手順2 の走行 CSV")
     ap.add_argument("--out", required=True, help="保存先 pkl（既にあれば失敗）")
     ap.set_defaults(func=run_attach_pedal_track)
+
+    lg = sub.add_parser(
+        "attach-local-gain",
+        help="pkl に局所の効きの倍率の表と遅れ（手順2 の dither から測る）を付けて別名で保存",
+    )
+    lg.add_argument("--pkl", required=True, help="元の表の pkl（書き換えない）")
+    lg.add_argument("--csv", required=True, help="手順2 の走行 CSV")
+    lg.add_argument("--out", required=True, help="保存先 pkl（既にあれば失敗）")
+    lg.add_argument(
+        "--brake-speeds", nargs="+", type=float, default=None, metavar="KMH",
+        help="ブレーキの車速の行の代表（省略: learning.ramp_dither_brake_speeds_kmh）",
+    )
+    lg.set_defaults(func=run_attach_local_gain)
 
     sc = sub.add_parser("score", help="検証ログで順モデルを採点する")
     add_train(sc)
