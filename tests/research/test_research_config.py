@@ -1603,3 +1603,11 @@ def test_step4_local_gain_and_release_layer_keys_default_false() -> None:
     assert fm0.local_gain_accel is False
     cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
     assert cfgmod.validate_config(cfg) == []  # キーは yaml にある（値は固定しない）
+
+
+def test_coast_band_release_at_zero_default_false() -> None:
+    # 2026-10-30 ProblemReport_20261030_惰行 段1: 惰行の帯の離しを差 0 にする案 B は既定 off
+    assert cfgmod.ForwardMapSection().coast_band_release_at_zero is False
+    cfg = _load_default()
+    assert cfg.forward_map.coast_band_release_at_zero is False
+    assert cfgmod.validate_config(cfg) == []

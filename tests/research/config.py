@@ -710,6 +710,9 @@ class ForwardMapSection:
     # 惰行の帯 [km/h/s]。要る加速度が惰行の加速度から ± この値以内ならペダルを踏まない。
     # feedforward.coast_band_kmhs（C1 用）とは別物
     coast_band_kmhs: float = 0.25
+    # 2026-10-30 ProblemReport_20261030_惰行 段1 案 B: true なら帯は「入る」側にだけ使い、離すのは
+    # 要る加速度 − 惰行の加速度が 0 になったとき（ヒステリシス）。既定 false ＝ 今と完全に同じ
+    coast_band_release_at_zero: bool = False
     # 要る加速度を測る窓の幅 [s]
     need_window_s: float = 1.0
     # None なら pkl の meta の値（表を作ったときの遅れ）を使う

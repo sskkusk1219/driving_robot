@@ -359,6 +359,7 @@ def forward_map_plan_args(
         brake_lag_s=fm.brake_lag_s,
         need_window_s=fm.need_window_s,
         coast_band_kmhs=fm.coast_band_kmhs,
+        coast_band_release_at_zero=fm.coast_band_release_at_zero,  # 段1（2026-10-30）
         preposition_enabled=fm.preposition_enabled,
         preposition_margin_pct=fm.preposition_margin_pct,
         preposition_lead_s=fm.preposition_lead_s,

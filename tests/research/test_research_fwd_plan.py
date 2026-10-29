@@ -3197,3 +3197,84 @@ def test_predict_creep_curve_off_identical_and_gap_context_passes_curve() -> Non
         brake_lag_s=0.4, creep_curve=(np.array([0.5, 5.0]), np.array([2.2, 0.0])),
     )
     assert set(ctx.side_kw()) == {"creep"}
+
+
+# ---- 2026-10-30 段1 案 B: coast_band_release_at_zero ----------------------------------------
+
+
+def _band_ref(t: float) -> float:
+    """区間ごとの傾き（惰行の加速度 −2 に対する差 = 傾き + 2）: 0〜2 s は +2.5（アクセル）、
+    2〜4 s は +0.1（帯の内側）、4〜6 s は −0.1（帯の内側で符号が変わる）、6〜8 s は −0.6
+    （ブレーキ）、8〜10 s は −0.2（帯の内側）。"""
+    knots = [(0.0, 2.5), (2.0, -1.9), (4.0, -2.1), (6.0, -2.6), (8.0, -2.2)]
+    v, t0, s = 50.0, 0.0, knots[0][1]
+    for k, sl in knots:
+        if t <= k:
+            break
+        v += s * (k - t0)
+        t0, s = k, sl
+    return v + s * (t - t0)
+
+
+def _band_plan(**kw):
+    table = linear_table(coast_at_zero=-2.0, v_coef=0.0)
+    return plan_for(
+        _band_ref, 10.0, table, accel_lag_s=0.0, brake_lag_s=0.0, need_window_s=0.1, **kw
+    )
+
+
+def test_band_release_default_false_is_identical() -> None:
+    a = _band_plan()
+    b = _band_plan(coast_band_release_at_zero=False)
+    assert np.array_equal(a.effort_pct, b.effort_pct) and np.array_equal(a.flag, b.flag)
+    assert a.effort_pct[idx(a, 3.0)] == 0.0  # 帯の内側はふつうの惰行
+
+
+def test_band_release_keeps_pedal_inside_band_and_releases_on_sign_change() -> None:
+    off = _band_plan()
+    on = _band_plan(coast_band_release_at_zero=True)
+    # 入る行は同じ（アクセル 1 s・ブレーキ 7 s）
+    assert on.effort_pct[idx(on, 1.0)] > 0.0 and off.effort_pct[idx(off, 1.0)] > 0.0
+    assert on.effort_pct[idx(on, 7.0)] < 0.0 and off.effort_pct[idx(off, 7.0)] < 0.0
+    # 帯の内側（差 +0.1）でも前がアクセルなら続く。開度は表を逆に引いた値
+    assert off.effort_pct[idx(off, 3.0)] == 0.0 and off.flag[idx(off, 3.0)] == FLAG_COAST
+    assert on.effort_pct[idx(on, 3.0)] == pytest.approx(AD + 0.1 / ACCEL_SLOPE)
+    # 差の符号が変わると離す（差 −0.1 は反対の帯の内側＝惰行）
+    assert on.effort_pct[idx(on, 5.0)] == 0.0 and on.flag[idx(on, 5.0)] == FLAG_COAST
+    # ブレーキも帯の内側（差 −0.2）で続く
+    assert off.effort_pct[idx(off, 9.0)] == 0.0
+    assert on.effort_pct[idx(on, 9.0)] == pytest.approx(-(BD + 0.2 / BRAKE_SLOPE))
+
+
+def test_band_hysteresis_pure_function() -> None:
+    from tests.research.fwd_plan import _band_hysteresis
+
+    ok = np.ones(6, dtype=bool)
+    no_reset = np.zeros(6, dtype=bool)
+    da = np.array([0.5, 0.1, -0.1, 0.1, -0.6, -0.1])
+    db = da.copy()
+    a, b = _band_hysteresis(da, db, ok, ok, 0.25, no_reset)
+    assert a.tolist() == [True, True, False, False, False, False]
+    assert b.tolist() == [False, False, False, False, True, True]
+    # u が踏める向きでなくなったら続かない
+    ok_a = np.array([True, False, True, True, True, True])
+    a, _ = _band_hysteresis(da, db, ok_a, ok, 0.25, no_reset)
+    assert a.tolist() == [True, False, False, False, False, False]
+    # 反対の帯を越えていれば、離した行からすぐ反対のペダル
+    a, b = _band_hysteresis(
+        np.array([0.5, -0.5]), np.array([0.5, -0.5]), ok[:2], ok[:2], 0.25, no_reset[:2]
+    )
+    assert a.tolist() == [True, False] and b.tolist() == [False, True]
+
+
+def test_band_hysteresis_resets_on_stop_rows() -> None:
+    from tests.research.fwd_plan import _band_hysteresis
+
+    ok = np.ones(4, dtype=bool)
+    d = np.array([0.5, 0.1, 0.1, 0.1])
+    reset = np.array([False, True, False, False])
+    a, _ = _band_hysteresis(d, d, ok, ok, 0.25, reset)
+    # 行 1 は停車保持（後で上書き）。その後は「前のペダルなし」なので帯の内側は惰行
+    assert a.tolist() == [True, True, False, False]
+    a2, _ = _band_hysteresis(d, d, ok, ok, 0.25, np.zeros(4, dtype=bool))
+    assert a2.tolist() == [True, True, True, True]
