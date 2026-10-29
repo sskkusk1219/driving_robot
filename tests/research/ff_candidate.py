@@ -816,6 +816,8 @@ class ForwardMapFeedforward:
         predict_creep_curve: bool = False,
         creep_accel_speeds_kmh: Sequence[float] = (),
         creep_accel_kmhs: Sequence[float] = (),
+        coast_band_release_at_zero: bool = False,
+        coast_fill_max_s: float = 0.0,
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
 
@@ -869,6 +871,8 @@ class ForwardMapFeedforward:
             predict_creep_curve=predict_creep_curve,
             creep_accel_speeds_kmh=creep_accel_speeds_kmh,
             creep_accel_kmhs=creep_accel_kmhs,
+            coast_band_release_at_zero=coast_band_release_at_zero,  # 2026-10-30 案 B
+            coast_fill_max_s=coast_fill_max_s,  # 2026-10-30 案 D
         )
         return self._plan
 
