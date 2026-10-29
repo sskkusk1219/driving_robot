@@ -94,6 +94,7 @@ FLAG_FILLED = POINT_FILLED
 FLAG_OUT = POINT_OUT
 FLAG_COAST = 3
 FLAG_STOP = 4
+FLAG_COAST_FILL = 6  # 2026-10-30 段2 案 D: 短い惰行を前後のペダルで埋めた行（FB は効く）
 FLAG_PREPOS = 5  # 2026-10-16 段2o-6: 次に踏むペダルを min から効き始めの手前へ先に置いている区間
 # 2026-10-22 段5-2: 行ごとに引いた表（ForwardPlan.side_accel / side_brake。int）。
 # 戻しの表（SIDE_RELEASE）は、ブレーキ側で戻し量を見て解き直した行だけに入る
@@ -114,6 +115,7 @@ FLAG_LABELS = {
     FLAG_COAST: "惰行",
     FLAG_STOP: "停車保持",
     FLAG_PREPOS: "先置き",
+    FLAG_COAST_FILL: "惰行の埋め",
 }
 
 
@@ -708,6 +710,13 @@ class ForwardPlan:
     launch_prep: np.ndarray | None = None
     # 2026-10-27 段13: 発進のずらし（launch_shift_choose）の集計。使わなければ None
     launch_shift: LaunchShiftStats | None = None
+    # 2026-10-30 段2 案 D: 埋めた惰行の本数と行数（coast_fill_max_s が 0 なら 0）
+    coast_fill_runs: int = 0
+    coast_fill_rows: int = 0
+
+    def coast_fill_s(self) -> float:
+        """案 D で埋めた惰行の秒数。"""
+        return self.coast_fill_rows * self.period_s
 
     def side_for(self, i: int, is_accel: bool) -> int | None:
         """行 i のペダル（アクセル側かブレーキ側か）で計画が引いた表 SIDE_*。
@@ -792,6 +801,7 @@ def build_plan(
     need_window_s: float = DEFAULT_NEED_WINDOW_S,
     coast_band_kmhs: float = DEFAULT_COAST_BAND_KMHS,
     coast_band_release_at_zero: bool = False,
+    coast_fill_max_s: float = 0.0,
     preposition_enabled: bool = False,
     preposition_margin_pct: float = 0.5,
     preposition_lead_s: float = 0.2,
@@ -972,6 +982,7 @@ def build_plan(
             "period_s": period_s, "accel_lag_s": accel_lag_s, "brake_lag_s": brake_lag_s,
             "need_window_s": need_window_s, "coast_band_kmhs": coast_band_kmhs,
             "coast_band_release_at_zero": coast_band_release_at_zero,
+            "coast_fill_max_s": coast_fill_max_s,
             "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
@@ -1019,6 +1030,7 @@ def build_plan(
             "period_s": period_s, "accel_lag_s": accel_lag_s, "brake_lag_s": brake_lag_s,
             "need_window_s": need_window_s, "coast_band_kmhs": coast_band_kmhs,
             "coast_band_release_at_zero": coast_band_release_at_zero,
+            "coast_fill_max_s": coast_fill_max_s,
             "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
@@ -1338,6 +1350,18 @@ def build_plan(
             for key, arr in zip(("lp_la", "lp_sa", "lp_lb", "lp_sb"), lp_sides, strict=True):
                 _aux_out[key] = arr.copy()
     effort = np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)
+    fill_runs = fill_rows = 0
+    if coast_fill_max_s > 0.0:
+        # 2026-10-30 段2 案 D: 停車保持の上書きの後・先置き／すき間の前に短い惰行を埋める
+        fill_runs, fill_rows = _fill_short_coasts(
+            effort, flag,
+            np.broadcast_to(need_a - coast_a, (n,)), np.broadcast_to(need_b - coast_b, (n,)),
+            u_a, u_b,
+            max_s=coast_fill_max_s, period_s=period_s,
+            accel_min_pct=accel_deadband_pct, brake_min_pct=brake_deadband_pct,
+            accel_hold_pct=_hold_opening(table, "accel_onset_u_pct", accel_deadband_pct),
+            brake_hold_pct=_hold_opening(table, "brake_onset_u_pct", brake_deadband_pct),
+        )
     stats = None
     ret = return_time_of(table, accel_deadband_pct, brake_deadband_pct)
     if preposition_enabled:
@@ -1394,8 +1418,79 @@ def build_plan(
         side_rule="dir" if dir_rule else ("pedal" if pedal_rule else "legacy"),
         switch_lead_s=_lead_extra,
         launch_midway=np.asarray(midway, dtype=bool).copy() if dir_rule else None,
-        launch_prep=launch_prep,
+        launch_prep=launch_prep, coast_fill_runs=fill_runs, coast_fill_rows=fill_rows,
     )
+
+
+def _hold_opening(table: ForwardTable, key: str, min_pct: float) -> float:
+    """効き始めの開度の大きさ [%] ＝ min ＋ |meta の効き始め u|。meta が無い・NaN なら min だけ。"""
+    on = table.meta.get(key)
+    if on is None or not np.isfinite(on):
+        return float(min_pct)
+    return float(min_pct) + abs(float(on))
+
+
+def _fill_short_coasts(
+    effort: np.ndarray,
+    flag: np.ndarray,
+    diff_a: np.ndarray,
+    diff_b: np.ndarray,
+    u_a: np.ndarray,
+    u_b: np.ndarray,
+    *,
+    max_s: float,
+    period_s: float,
+    accel_min_pct: float,
+    brake_min_pct: float,
+    accel_hold_pct: float,
+    brake_hold_pct: float,
+) -> tuple[int, int]:
+    """短い惰行を前後のペダルで埋める（2026-10-30 段2 案 D。effort・flag をその場で書き換える）。
+
+    FLAG_COAST の連続区間のうち長さ < max_s のものが対象。区間の前か後ろが停車保持（FLAG_STOP）・
+    計画の端・ペダルなし（effort 0）なら埋めない。前後が同じペダルならそのペダル、違うなら行ごとに
+    差の符号（diff_a > 0 ならアクセル、diff_b < 0 ならブレーキ。両方・どちらでもなければ直前の
+    ペダル）で選ぶ。開度は、差が選んだペダルの向きで u が踏める向きの行は表を逆に引いた値
+    （min ＋ |u|）、そうでない行は効き始めの開度（accel_hold_pct・brake_hold_pct）で保つ。
+    埋めた行の flag は FLAG_COAST_FILL。戻り値は (埋めた本数, 埋めた行数)。
+    """
+    n = len(effort)
+    runs = rows = 0
+    i = 0
+    while i < n:
+        if flag[i] != FLAG_COAST:
+            i += 1
+            continue
+        s = i
+        while i < n and flag[i] == FLAG_COAST:
+            i += 1
+        e = i  # 区間は [s, e)
+        if (e - s) * period_s >= max_s - 1e-9 or s == 0 or e >= n:
+            continue
+        if flag[s - 1] == FLAG_STOP or flag[e] == FLAG_STOP:
+            continue
+        before, after = effort[s - 1], effort[e]
+        if before == 0.0 or after == 0.0:
+            continue
+        prev_accel = before > 0.0
+        same = prev_accel == (after > 0.0)
+        for r in range(s, e):
+            if same:
+                use_accel = prev_accel
+            else:
+                a_dir, b_dir = diff_a[r] > 0.0, diff_b[r] < 0.0
+                use_accel = bool(a_dir) if a_dir != b_dir else prev_accel
+            if use_accel:
+                in_dir = diff_a[r] > 0.0 and u_a[r] > 0.0
+                val = accel_min_pct + float(u_a[r]) if in_dir else accel_hold_pct
+            else:
+                in_dir = diff_b[r] < 0.0 and u_b[r] < 0.0
+                val = -(brake_min_pct + abs(float(u_b[r]))) if in_dir else -brake_hold_pct
+            effort[r] = float(np.clip(val, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT))
+            flag[r] = FLAG_COAST_FILL
+        runs += 1
+        rows += e - s
+    return runs, rows
 
 
 def _band_hysteresis(

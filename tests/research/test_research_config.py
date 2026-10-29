@@ -1611,3 +1611,14 @@ def test_coast_band_release_at_zero_default_false() -> None:
     cfg = _load_default()
     assert cfg.forward_map.coast_band_release_at_zero is False
     assert cfgmod.validate_config(cfg) == []
+
+
+def test_coast_fill_max_s_default_zero_and_validated() -> None:
+    # 2026-10-30 ProblemReport_20261030_惰行 段2: 短い惰行を埋める案 D は既定 0（無効）
+    assert cfgmod.ForwardMapSection().coast_fill_max_s == 0.0
+    cfg = _load_default()
+    assert cfg.forward_map.coast_fill_max_s == 0.0
+    cfg.forward_map.coast_fill_max_s = 2.0
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.coast_fill_max_s = -0.1
+    assert any("coast_fill_max_s" in p for p in cfgmod.validate_config(cfg))

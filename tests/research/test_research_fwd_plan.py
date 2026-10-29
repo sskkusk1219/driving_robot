@@ -3278,3 +3278,112 @@ def test_band_hysteresis_resets_on_stop_rows() -> None:
     assert a.tolist() == [True, True, False, False]
     a2, _ = _band_hysteresis(d, d, ok, ok, 0.25, np.zeros(4, dtype=bool))
     assert a2.tolist() == [True, True, True, True]
+
+
+# ---- 2026-10-30 段2 案 D: coast_fill_max_s ---------------------------------------------------
+
+
+def _piecewise_ref(knots: list[tuple[float, float]]):
+    """(区間の終わり, 傾き) の並びから基準車速を作る（開始 50 km/h）。惰行の加速度は −2。"""
+
+    def ref(t: float) -> float:
+        v, t0 = 50.0, 0.0
+        for k, sl in knots:
+            if t <= k:
+                return v + sl * (t - t0)
+            v += sl * (k - t0)
+            t0 = k
+        return v + knots[-1][1] * (t - t0)
+
+    return ref
+
+
+def _fill_plan(knots, **kw):
+    table = linear_table(coast_at_zero=-2.0, v_coef=0.0)
+    table.meta.update({"accel_onset_u_pct": 2.0, "brake_onset_u_pct": -3.0})
+    return plan_for(
+        _piecewise_ref(knots), 10.0, table, accel_lag_s=0.0, brake_lag_s=0.0, need_window_s=0.1,
+        **kw,
+    )
+
+
+def test_coast_fill_default_zero_is_identical_and_leaves_gap() -> None:
+    knots = [(3.0, 0.5), (4.0, -1.8), (7.0, 0.5)]
+    a = _fill_plan(knots)
+    b = _fill_plan(knots, coast_fill_max_s=0.0)
+    assert np.array_equal(a.effort_pct, b.effort_pct) and np.array_equal(a.flag, b.flag)
+    assert a.flag[idx(a, 3.5)] == FLAG_COAST and a.effort_pct[idx(a, 3.5)] == 0.0
+    assert a.coast_fill_rows == 0 and a.coast_fill_s() == 0.0
+
+
+def test_coast_fill_same_pedal_in_direction_and_at_onset() -> None:
+    from tests.research.fwd_plan import FLAG_COAST_FILL
+
+    # 3〜4 s は差 +0.2（アクセルの向き・帯の内側）、6〜7 s は差 −0.1（向きでない）
+    knots = [(3.0, 0.5), (4.0, -1.8), (6.0, 0.5), (7.0, -2.1), (9.0, 0.5)]
+    p = _fill_plan(knots, coast_fill_max_s=2.0)
+    i1, i2 = idx(p, 3.5), idx(p, 6.5)
+    assert p.flag[i1] == FLAG_COAST_FILL and p.flag[i2] == FLAG_COAST_FILL
+    assert p.effort_pct[i1] == pytest.approx(AD + 0.2 / ACCEL_SLOPE)  # 表を逆に引いた開度
+    assert p.effort_pct[i2] == pytest.approx(AD + 2.0)  # 効き始め（min + meta）で保つ
+    assert p.coast_fill_runs == 2 and p.coast_fill_rows > 0
+    assert p.coast_fill_s() == pytest.approx(p.coast_fill_rows * p.period_s)
+    # 埋めた行は FB が効く（FLAG_COAST の行では上乗せが 0 だが、埋めた行は上乗せされる）
+    kw = dict(
+        effort=float(p.effort_pct[i1]), need_kmhs=float(p.need_accel_kmhs[i1]), ref_kmh=50.0,
+        row_kmh=50.0, dev_kmh=1.0, tau_accel_s=1.0, tau_brake_s=1.0, accel_min_pct=AD,
+        brake_min_pct=BD,
+    )
+    table = linear_table(coast_at_zero=-2.0, v_coef=0.0)
+    e_fill, _ = deviation_offset_detail(table, flag=int(p.flag[i1]), **kw)
+    e_coast, _ = deviation_offset_detail(table, flag=FLAG_COAST, **kw)
+    assert e_coast == kw["effort"] and e_fill > kw["effort"]
+
+
+def test_coast_fill_different_pedals_split_by_sign_of_difference() -> None:
+    from tests.research.fwd_plan import FLAG_COAST_FILL
+
+    # 3〜3.5 s は差 +0.2（アクセル側）、3.5〜4 s は差 −0.2（ブレーキ側）。前後はアクセル・ブレーキ
+    knots = [(3.0, 0.5), (3.5, -1.8), (4.0, -2.2), (7.0, -3.0)]
+    p = _fill_plan(knots, coast_fill_max_s=2.0)
+    ia, ib = idx(p, 3.25), idx(p, 3.75)
+    assert p.flag[ia] == FLAG_COAST_FILL and p.flag[ib] == FLAG_COAST_FILL
+    assert p.effort_pct[ia] == pytest.approx(AD + 0.2 / ACCEL_SLOPE)
+    assert p.effort_pct[ib] == pytest.approx(-(BD + 0.2 / BRAKE_SLOPE))
+
+
+def test_coast_fill_long_gap_is_not_filled() -> None:
+    knots = [(3.0, 0.5), (4.0, -1.8), (7.0, 0.5)]
+    p = _fill_plan(knots, coast_fill_max_s=0.5)  # 区間は約 1 s ≥ 0.5 s
+    assert p.flag[idx(p, 3.5)] == FLAG_COAST and p.coast_fill_runs == 0
+
+
+def test_fill_short_coasts_skips_stop_edges_and_no_pedal() -> None:
+    from tests.research.fwd_plan import FLAG_COAST_FILL, _fill_short_coasts
+
+    def run(flag_list, effort_list):
+        flag = np.array(flag_list)
+        effort = np.array(effort_list, dtype=float)
+        z = np.zeros(len(flag))
+        out = _fill_short_coasts(
+            effort, flag, z + 0.2, z - 0.2, z + 1.0, z - 1.0, max_s=2.0, period_s=0.1,
+            accel_min_pct=AD, brake_min_pct=BD, accel_hold_pct=AD + 2.0, brake_hold_pct=BD + 3.0,
+        )
+        return out, flag, effort
+
+    C, S, M = FLAG_COAST, FLAG_STOP, FLAG_MEASURED
+    # 前が停車保持／後ろが停車保持／計画の端／前がペダルなし → 埋めない
+    for fl, ef in (
+        ([S, C, C, M], [-STOP_PCT, 0, 0, 10.0]),
+        ([M, C, C, S], [10.0, 0, 0, -STOP_PCT]),
+        ([C, C, M, M], [0, 0, 10.0, 10.0]),
+        ([M, M, C, C], [10.0, 10.0, 0, 0]),
+        ([C, C, C, M], [0, 0, 0, 10.0]),
+    ):
+        (runs, rows), flag, effort = run(fl, ef)
+        assert (runs, rows) == (0, 0) and FLAG_COAST_FILL not in flag.tolist()
+    # 前後がアクセル → 差 +0.2・u_a +1 なので表の値（AD + 1.0）で埋める
+    (runs, rows), flag, effort = run([M, C, C, M], [10.0, 0, 0, 12.0])
+    assert (runs, rows) == (1, 2)
+    assert flag.tolist() == [M, FLAG_COAST_FILL, FLAG_COAST_FILL, M]
+    assert effort[1] == pytest.approx(AD + 1.0)
