@@ -1,6 +1,8 @@
 # 20261030 短い惰行でペダルを離さず、踏んだまま次のペダルへ渡す（惰行の帯の見直し）
 
-**状態: 進行中（段3 完了・決まっている止め S: 別の ProblemReport の終了待ち。作業はブランチ `feat/coast-band`・worktree `../driving_robot_coast`）**
+**状態: クローズ（2026-10-31）**
+
+結論: 案 B（離すときは帯を使わない、`forward_map.coast_band_release_at_zero: true`）を本体に採った（ユーザー決定 2026-10-31）。実機 WLTP `180014` で 327 s は −0.58 → −0.13、620 s は +0.49 → +0.21 km/h（惰行 1.70 → 0.25 s・0.80 → 0.20 s）。3 モード合計の \|偏差\|>0.5 は 7.20 → 9.55 s だが、増えた分は計画が変わらない／今も出る場面（UDDS 1254.9 s の保持・WLTP 1741 s の高速の減速）で、ばらつきと判断。案 D は FB の不具合（効き始めで保つ行で C10 が −9% 跳ねる。US06 `210949` で −2.65 km/h）があり、既定オフのまま不採用。
 
 ProblemReport_20261029 の ±0.5 の未達で、WLTP の長い 2 件（327 s・620 s）は、計画が「惰行の帯」（要る加速度と惰行の加速度の差が ±0.25 km/h/s 未満なら惰行）でペダルを離したことが原因だった。惰行の行は FB も効かない。案 B（離すときは帯を使わない）と案 D（短い惰行を埋める）を実装し、実機 3 モードで比べる。
 
@@ -50,9 +52,9 @@ ProblemReport_20261029 の ±0.5 の未達で、WLTP の長い 2 件（327 s・6
 | 1 | 案 B: 離すときは帯を使わない（`forward_map.coast_band_release_at_zero`、既定 false） | なし（オフライン） | ✅ 完了（`d7efc9f`。既定オフで計画は前と完全に同じ。Claude 2026-10-30） |
 | 2 | 案 D: 短い惰行を埋める（`forward_map.coast_fill_max_s`、既定 0 = 無効） | なし（オフライン） | ✅ 完了（`ce12091`。同上。Claude 2026-10-30） |
 | 3 | 机上で 4 通り（今・B・D・B+D）の計画を比べる（惰行の秒数・本数、切り替えの回数、327 s・620 s の開度）＋スタブで流れを確認 | スタブ | ✅ 完了（走行中の惰行 WLTP 134→B 102・D 88・B+D 67 s。スタブで引数の渡し漏れを直した。Claude 2026-10-30） |
-| 3b | main へ取り込み（もう一方のコミットの後）・変更箇所のテストと段3 の机上をやり直す | なし（オフライン） | ⏸ ユーザー確認待ち（別の ProblemReport の終了待ち） |
-| 4 | 実機で 3 通り（B・D・B+D）× 3 モード（WLTP・UDDS・US06）を走る。今の値は 10-29 の `070530`・`073644`・`081414` | 実機（手順3 ×9、約 3 時間 10 分） | ⬜ 未着手 |
-| 5 | 比べて採る案を決め、本体 yaml に反映し、本レポートをまとめる | なし（オフライン） | ⬜ 未着手 |
+| 3b | main へ取り込み（もう一方のコミットの後）・変更箇所のテストと段3 の机上をやり直す | なし（オフライン） | ✅ 完了（`8af4e44`。衝突は yaml の model_path 1 行・既定オフで計画は前と同じ・机上はブランチと同じ。Claude 2026-10-30） |
+| 4 | 実機で 3 通り（B・D・B+D）× 3 モード（WLTP・UDDS・US06）を走る。今の値は 20261030_UDDS の段15 `143411`・`150547`・`154330` | 実機（手順3 ×9、約 3 時間 10 分） | ✅ 完了（9 本 exit 0・ガバナー 0・md5 一致。Claude 2026-10-30） |
+| 5 | 比べて採る案を決め、本体 yaml に反映し、本レポートをまとめる | なし（オフライン） | ✅ 完了（B を本体 on・D は不具合ありで off のまま。ユーザー 2026-10-31） |
 
 止めてユーザーに聞くのは次のときだけ:
 - **S（決まっている止め）: 段3 の後。別の ProblemReport が終わるまで待つ。終わったら main へ取り込み（段3b）、ユーザーの「実機やってよい」で段4 へ**
@@ -165,28 +167,54 @@ ProblemReport_20261029 の ±0.5 の未達で、WLTP の長い 2 件（327 s・6
 - 重なる `config.py`・`mode_drive.py`・`config_testVehicle.yaml`（・`ff_candidate.py`）の衝突は Claude が直す。変更箇所のテスト・既定オフで計画が同じことの確認・段3 の机上をやり直す
 - 段4 は、ユーザーの「実機やってよい」の後、取り込んだ main の作業フォルダから走る
 
+**結果**（Claude 確認 2026-10-30）
+
+- もう一方（20261030_UDDS）が `7d2df7c` で main にコミットされ、クローズしたとユーザーから連絡。ユーザー「こちらのレポートの計画を進めて」
+- `git merge --no-ff feat/coast-band` → `8af4e44`。衝突は yaml の `model_path` の 1 行だけ（main の `fwd_model_20261028_220204_hpi2_hold.pkl` を採った）。`config.py`・`mode_drive.py`・`ff_candidate.py` は自動でまとまった
+- `ruff check tests/research` OK。`test_research_fwd_plan.py`・`test_research_config.py`・`test_research_ff_candidate.py` は通過。`test_research_mode_drive.py` は 34 件失敗するが、取り込み前の main（`7d2df7c`）でも同じ 34 件が失敗する（主な理由 `ConfigError: forward_map.hold_pi_enabled は表の候補（C7〜C15）だけで使えます`。本体 yaml で `hold_pi_enabled` を on にしたため、C1 などの設定で作るテストが落ちる。本件とは無関係・直していない）
+- 既定オフの確認: 取り込み前（`7d2df7c`）と後のコードで、本体 yaml の WLTP・UDDS・US06 の計画（開度・flag）が完全に一致
+- 段3 の机上を main でやり直した: 数値はブランチでの結果と同じ（新しい pkl は表が同じで、meta に保持の値を足しただけのため）
+- **比べる相手を変えた**: pkl と保持の設定が変わったので、今の値は 10-29 ではなく、20261030_UDDS の段15（WLTP `143411`・UDDS `150547`・US06 `154330`）にする。そのコピー `s15_*.yaml` と今の本体の違いは `hold_points_enabled`（手順2 だけで使う）の 1 行で、手順3 の走りは同じ
+
 ### 段4: 実機 3 通り × 3 モード
 
 **内容**
 
-- 本体 yaml から `runs/s30c_<案>_<mode>.yaml` を作る（本体との違いは `wltp_mode_name` と `coast_band_release_at_zero`・`coast_fill_max_s` だけ・diff で確認）。`chmod a-w` し md5 を `scratchpad/s30c.md5` に控える（`run-yaml-copies-can-be-overwritten`）
-- 今の値は 10-29 の `070530`（WLTP）・`073644`（UDDS）・`081414`（US06）。同じ pkl・同じシミュレータ（10-29 の跳びの修正の後）なので走り直さない
+- 本体 yaml から `runs/s30k<案>_<mode>.yaml` を作る（`s30c_udds.yaml` が別の件で使われていたので `s30k` にした）（本体との違いは `wltp_mode_name` と `coast_band_release_at_zero`・`coast_fill_max_s` だけ・diff で確認）。`chmod a-w` し md5 を `scratchpad/s30k.md5` に控える（`run-yaml-copies-can-be-overwritten`）
+- 今の値は 20261030_UDDS 段15 の `143411`（WLTP）・`150547`（UDDS）・`154330`（US06）。同じ pkl・同じ手順3 の設定なので走り直さない
 - 同じ設定でもばらつくので、合計の秒数だけでなく、場面ごと（327 s・620 s などの短い惰行の事象）に比べる（`run-to-run-variability-warmup`）
 
 **実行手順**（Claude が実行）
 
 ```bash
 # コピー作り（B: 離すときは帯を使わない / D: 短い惰行を 2.0 s まで埋める / BD: 両方）。diff が表示される
-bash tests/research/results/analysis/mk_yaml.sh s30c_B  coast_band_release_at_zero=true
-bash tests/research/results/analysis/mk_yaml.sh s30c_D  coast_fill_max_s=2.0
-bash tests/research/results/analysis/mk_yaml.sh s30c_BD coast_band_release_at_zero=true coast_fill_max_s=2.0
-chmod a-w tests/research/results/analysis/runs/s30c_*.yaml
-for v in B D BD; do for m in wltp udds us06; do
-  .venv/bin/python -m tests.research.main --steps 1,3 --hw real --config tests/research/results/analysis/runs/s30c_${v}_$m.yaml; echo "$v $m exit=$?"
-done; done
+bash tests/research/results/analysis/mk_yaml.sh s30kB  coast_band_release_at_zero=true
+bash tests/research/results/analysis/mk_yaml.sh s30kD  coast_fill_max_s=2.0
+bash tests/research/results/analysis/mk_yaml.sh s30kBD coast_band_release_at_zero=true coast_fill_max_s=2.0
+chmod a-w tests/research/results/analysis/runs/s30k*_*.yaml
+# 順番はモードごとに案を回す（1 本目の温まりのずれを 1 案に寄せないため）
+for n in s30kB_wltp s30kD_wltp s30kBD_wltp s30kD_udds s30kBD_udds s30kB_udds s30kBD_us06 s30kB_us06 s30kD_us06; do
+  .venv/bin/python -m tests.research.main --steps 1,3 --hw real --config tests/research/results/analysis/runs/$n.yaml > tests/research/results/analysis/runs/run_$n.log 2>&1; echo "$n exit=$?"
+done
 ```
 
 見るもの: 9 本とも exit 0・ガバナー 0・同時踏み 0。走行時間（WLTP 1800・UDDS 1369・US06 600 s）とモード名がコピーどおりか。md5 一致
+
+**結果**（Claude 確認 2026-10-30。走行は haiku のサブエージェント、解析は opus）
+
+| 名前 | CSV | exit | 走行時間 | 1 周期以上の遅れ | ガバナー |
+|---|---|---|---|---|---|
+| B・WLTP | `drive_log_real_20261030_180014.csv` | 0 | 1800 s | 1 | 0 |
+| D・WLTP | `183153` | 0 | 1800 s | 1 | 0 |
+| B+D・WLTP | `190339` | 0 | 1800 s | 2 | 0 |
+| D・UDDS | `193513` | 0 | 1372 s | 0 | 0 |
+| B+D・UDDS | `195936` | 0 | 1372 s | 0 | 0 |
+| B・UDDS | `202357` | 0 | 1372 s | 0 | 0 |
+| B+D・US06 | `204747` | 0 | 600 s | 0 | 0 |
+| B・US06 | `205849` | 0 | 600 s | 0 | 0 |
+| D・US06 | `210949` | 0 | 600 s | 0 | 0 |
+
+- 走行ログ `runs/run_s30k*.log`。走った後の `md5sum -c scratchpad/s30k.md5` は 9 件とも一致
 
 ### 段5: 比較と採否
 
@@ -202,6 +230,42 @@ done; done
 - 採った案を本体 yaml に反映する（コメントに決定日・根拠 CSV、`feedback-settings-must-match-decisions`）。`test_research_config.py` を回す（`research-config-tests-pin-yaml`）
 - 本レポートを結果でまとめてクローズし、ユーザーに報告する
 
+**結果**（Claude 確認 2026-10-30。`scratchpad/s30k_eval.py`・`s30k_local.py`）
+
+| モード | 案 | 最大 [km/h] | p95 | 符号反転（最大回/5s） | ペダルの往復 全体・60 s 最大 [回/s] | 同時踏み | \|偏差\|>0.5 [s] | >1 [s] | 走行中の惰行 [s] |
+|---|---|---|---|---|---|---|---|---|---|
+| WLTP | 今 `143411` | 0.68 | 0.23 | 2 | 1.45・1.93 | 0.05 s | 2.15 | 0 | 107.4 |
+| | B `180014` | 0.73 | 0.21 | 1 | 1.46・1.85 | 0 | 2.25 | 0 | 77.8 |
+| | D `183153` | 0.67 | 0.23 | 2 | 1.52・1.89 | 0.05 s | 2.70 | 0 | 56.9 |
+| | B+D `190339` | **1.82** | 0.22 | 3 | 1.51・1.90 | 0 | 6.95 | 2.70 | 46.3 |
+| UDDS | 今 `150547` | 0.72 | 0.26 | 3 | 1.43・1.86 | 0 | 2.15 | 0 | 83.4 |
+| | B `202357` | 0.76 | 0.26 | 3 | 1.63・2.01 | 0 | 4.35 | 0 | 44.4 |
+| | D `193513` | 0.80 | 0.27 | 3 | 1.65・2.12 | 0 | 3.40 | 0 | 38.6 |
+| | B+D `195936` | 0.61 | 0.25 | 3 | 1.56・2.04 | 0.05 s | 2.90 | 0 | 19.0 |
+| US06 | 今 `154330` | 0.71 | 0.29 | 3 | 1.84・3.00 | 0 | 2.90 | 0 | 23.9 |
+| | B `205849` | 0.74 | 0.29 | 3 | 1.85・3.25 | 0 | 2.95 | 0 | 14.2 |
+| | D `210949` | **2.65** | 0.31 | 2 | 1.84・3.21 | 0 | 6.25 | 2.05 | 11.0 |
+| | B+D `204747` | **2.58** | 0.31 | 2 | 1.89・3.13 | 0 | 5.05 | 1.95 | 11.0 |
+
+- \|偏差\|>0.5 の 3 モード合計: 今 7.20・B 9.55・D 12.35・B+D 14.90 s → 決め方（合計がいちばん少ない案、ただし今より悪くならないこと）では、どの案も採れない → **D3**
+- **狙った 2 つの場面は B で直った**（WLTP）: 327 s は惰行 1.70 → 0.25 s・偏差 −0.58 → −0.13、620 s は惰行 0.80 → 0.20 s・偏差 +0.49 → +0.21。「惰行中か惰行の後 1 s 以内」の >0.5 は 0.45 → 0 s
+- B で増えた分の中身（計画が今と変わった行の ±2 s の中・外に分けた）:
+  - WLTP: 変わった所 1.10 → 1.45 s。327 s（0.45 s）が消え、1741〜1745 s（97 km/h の減速、今も同じ所に出る）が 0.65 → 1.45 s に延びた。B はここで惰行 0.3 s の代わりにブレーキ 6.1〜6.2%（効き始め 6.15% のすぐ上）を保つ。D（0.50 s）・B+D（0.70 s）では延びていないので、ばらつきの可能性が残る（推測）
+  - UDDS: 変わった所 0.55 → 1.90 s。1254.9 s（1.6 km/h の保持、1.15 s）が主。保持の場面の FF は 4 案とも同じで、B を含む B+D では最大 0.18 km/h なので、ばらつきと見る（推測）。ほかは停車の手前の 0.05〜0.45 s
+  - US06: 変わった所 0.85 → 0.45 s（減った）
+- **D の不具合**（D・B+D の大外れの原因。生データで確認）: 埋めた行で「効き始めで保つ」とき、FB（C10）の上乗せが跳ねた。US06 477.0 s（79 km/h）は、埋めた最初の行で C10 が **−9.37%**、ブレーキ指令が 15.5% になり、偏差は +0.22 → −2.65 km/h。その後は FB がブレーキを min に張り付かせ、2 s 戻せなかった（アクセルは片足ルールで使えない）。WLTP 236.0 s（49 km/h）も同じ（C10 −9.47%、−1.82 km/h）。原因: C10 の上乗せは「表を逆に引いた開度 u0」と「偏差を足して引いた u1」の差。効き始めで保つ行は、要る加速度が惰行で足りる向き（表で引くとアクセル側の u0 ＞ 0）なので、ブレーキ側の u1 との差が −9% と大きくなる。B の行は、表で引いたペダルと同じ側なので起きない
+- ペダルの往復: B は WLTP・US06 で ±0.01、UDDS で +0.20 回/s（決め方の上限 +0.2 ちょうど）
+
+**決定**（ユーザー 2026-10-31）: **B だけ本体に採る**（D は既定オフのまま。選んだ選択肢「狙った 2 場面は直ったので B を本体 on にする。合計の増えはばらつきと見なす」）
+
+- 本体 yaml `forward_map.coast_band_release_at_zero: true`（コメントに決定日・根拠 CSV）。`coast_fill_max_s: 0.0` のコメントに不採用の理由（不具合）を足した
+- `test_research_config.py` の yaml の値のテストを true に直した（コードの既定 `ForwardMapSection` は false のまま）。113 件通過
+- 残ること（次の議論の種。本レポートでは扱わない）
+  - D を使うなら、効き始めで保つ行の FB の基準（u0）を保つ開度に合わせる修正が先
+  - B のときの 1741〜1745 s（97 km/h の減速で効き始めのすぐ上のブレーキを保つ）が延びるか、次の走りで見る
+  - 327.7 s の折れ目でアクセル 10.9% → min を一段で戻す（効き始めまで緩めて下ろさない）。ユーザーの「使い切ってから移る」は、折れ目の前後に偏差が残るなら段を足す（2026-10-30 議論）
+  - `test_research_mode_drive.py` の 34 件の失敗（`hold_pi_enabled` の設定チェック。20261030_UDDS 由来）
+
 ## 進捗ログ
 
 | 日付 | 内容 |
@@ -209,3 +273,6 @@ done; done
 | 2026-10-30 | 議論: 327 s・620 s はどちらも惰行の帯（差 ±0.24 が帯 0.25 の内側）で離したのが原因と机上で確認。ユーザー決定: B 採用・D も候補（B+D も比べる）。計画作成（段0 完了）。次は Claude が段1 |
 | 2026-10-30 | ユーザー決定: 別の ProblemReport とぶつからないよう worktree `../driving_robot_coast`（ブランチ `feat/coast-band`）で段1〜3。段3 の後で止め、もう一方の後に取り込み、実機はユーザーの合図の後。段1 開始 |
 | 2026-10-30 | 段1（`d7efc9f`）・段2（`ce12091`）・段3 完了。既定オフで計画は前と完全に同じ。スタブで引数の渡し漏れを直した（`8eccec3`）。worktree の yaml を 10-29 の実走の設定にそろえた（`edd4111`）。机上の走行中の惰行 WLTP 134→B 102・B+D 67 s。止め S（別の ProblemReport の終了待ち） |
+| 2026-10-30 | 段3b 完了: もう一方のクローズ後に main へ取り込み（`8af4e44`、衝突は model_path 1 行）。既定オフで計画同じ・机上同じ。比べる相手を 20261030_UDDS 段15 に変更。段4 実機 9 本を開始（コピー `s30k*`） |
+| 2026-10-30 | 段4 実機 9 本完了（exit 0・md5 一致）。段5: B で 327 s・620 s は直った（−0.58→−0.13・+0.49→+0.21）が、>0.5 の 3 モード合計は 今 7.20・B 9.55・D 12.35・B+D 14.90 s。D に FB の不具合（効き始めで保つ行で C10 が −9% 跳ねる）。D3 でユーザーと相談 |
+| 2026-10-31 | **ユーザー決定: B だけ本体 on（`coast_band_release_at_zero: true`）、D は不具合ありで off のまま → 本問題クローズ** |

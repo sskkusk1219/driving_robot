@@ -1607,9 +1607,10 @@ def test_step4_local_gain_and_release_layer_keys_default_false() -> None:
 
 def test_coast_band_release_at_zero_default_false() -> None:
     # 2026-10-30 ProblemReport_20261030_惰行 段1: 惰行の帯の離しを差 0 にする案 B は既定 off
+    # （コードの既定）。2026-10-31 ユーザー決定で本体 yaml は on
     assert cfgmod.ForwardMapSection().coast_band_release_at_zero is False
     cfg = _load_default()
-    assert cfg.forward_map.coast_band_release_at_zero is False
+    assert cfg.forward_map.coast_band_release_at_zero is True
     assert cfgmod.validate_config(cfg) == []
 
 
