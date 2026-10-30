@@ -31,6 +31,9 @@ FAST = {
     "pedal_search.creep_timeout_s": 10.0,
     "pedal_search.stop_hold_margin_pct": 3.0,
     "feedforward.creep_rate_kmhs": 3.0,  # クリープ速度まで早く上げる
+    # 2026-10-30: 本体 yaml は手順2 で 4 点の保持を走る。実時間で数十秒かかるので、ここでは切る
+    # （4 点の保持は test_research_hold_points.py・test_research_hold_attach.py で見る）
+    "pedal_search.hold_points_enabled": False,
 }
 
 
@@ -89,8 +92,10 @@ async def test_search_starts_from_min_finds_stop_and_holds(tmp_path: Path) -> No
     assert await hw.can.read_speed() < VEHICLE_STOP_SPEED_KMH
     # 結果は不感帯を持たない（クリープ車速・停止確認・停車保持開度＋書き戻し用のブレーキ min）
     assert set(result.__dataclass_fields__) == {
-        "creep_speed_kmh", "stop_confirm_pct", "stop_brake_opening_pct", "brake_min_pct"
+        "creep_speed_kmh", "stop_confirm_pct", "stop_brake_opening_pct", "brake_min_pct",
+        "hold_points", "brake_search_pairs",  # 2026-10-30 段6: 手順13 用（手順2 では空 / 記録のみ）
     }
+    assert result.hold_points == ()
     # スタブは YAML を書き換えない
     assert cfg.source_path.read_text(encoding="utf-8") == yaml_before
     await hwmod.shutdown(hw)

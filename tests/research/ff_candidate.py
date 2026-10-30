@@ -48,7 +48,7 @@ from __future__ import annotations
 import pickle
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -319,7 +319,7 @@ def train_inverse_model_effective(
         "stop_horizon_s": stop_horizon_s,
         "speed_clip_max": speed_clip_max,
         "profile_id": profile.id,
-        "trained_at": datetime.now(tz=UTC).isoformat(),
+        "trained_at": datetime.now().astimezone().isoformat(),
         "metrics": fit_metrics,
         # 研究用の追加キー（load_model は読み飛ばす）。学習セットの作り方を pkl に残す
         "training_rows": TRAINING_ROWS_EFFECTIVE,

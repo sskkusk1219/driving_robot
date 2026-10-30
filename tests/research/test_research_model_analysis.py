@@ -180,3 +180,11 @@ def test_run_metrics_rejects_pedal_separated_pkl(tmp_path) -> None:
             model_path, tmp_path / "does_not_exist.csv", tmp_path,
             accel_db=5.0, brake_db=8.0,
         )
+
+
+def test_trained_at_jst_converts_utc_strings_to_local_time() -> None:
+    """旧 pkl の UTC 文字列（tz 付き・naive とも）がローカル時刻の表示になること。"""
+    local = datetime(2026, 10, 1, 3, 4, 5, tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    assert ma._trained_at_jst("2026-10-01T03:04:05.123456+00:00") == local
+    assert ma._trained_at_jst("2026-10-01T03:04:05") == local
+    assert ma._trained_at_jst("not-a-date-xxxxxxxxxxxx") == "not-a-date-xxxxxxxx"

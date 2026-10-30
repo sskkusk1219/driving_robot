@@ -47,14 +47,20 @@ estimate_dynamics_params の推定値で上書きされないようにした。
 from __future__ import annotations
 
 import asyncio
+import math
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
+import numpy as np
+
 from tests.research.config import ResearchConfig
 from tests.research.drive_log import SECTION_PEDAL_SEARCH, SessionLog, mark
 from tests.research.hardware import ActuatorProtocol, DriveError, ResearchHardware
-from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, VehicleProfile
+from tests.research.hold_scene import HoldScenePI
+from tests.research.pattern_loop import AXIS_SMOOTH_DUTY, fit_slope
+from tests.research.research_types import G_TO_KMHS, VEHICLE_STOP_SPEED_KMH, VehicleProfile
 from tests.research.term import say
 from tests.research.vehicle import STROKE_LIMIT_PULSE, opening_to_pulse, pulse_to_opening
 
@@ -74,6 +80,30 @@ PHASE_STOP_HOLD = "STOP_HOLD"
 PHASE_LOW_RELEASE_STAIR = "LOW_RELEASE_STAIR"  # 離す向き: 浅い方へ（停車 → クリープ）
 PHASE_LOW_PRESS_STAIR = "LOW_PRESS_STAIR"  # 踏む向き: 同じ開度を戻す方へ（クリープ → 停車）
 STAIR_TAIL_S = 2.0  # 各段の保持の終わりに車速・加速度を測る時間 [s]
+# 2026-10-30 段6（ProblemReport_20261030）: 手順13 の 4 点の保持
+PHASE_LOW_HOLD = "LOW_HOLD"
+# 基準を上げる傾き [km/h/s]。UDDS 1251→1252 s の基準が 0→1.6 km/h と 1 s で上がるのと同じ傾き
+# （その後 1256 s まで 1.6 km/h 一定。この立ち上がり方で保てるかを見る点なので同じにする）
+HOLD_REF_RAMP_KMHS = 1.6
+HOLD_OVERSPEED_MARGIN_KMH = 1.0  # クリープ車速 + これを超えたら、その点は保てずで打ち切る [km/h]
+# 1 刻み寄せの 1 周期の移動量 [pulse] ＝ アクチュエータの最小刻み 1 個（100 ÷ ストローク [pulse] ＝
+# 約 0.0105%）。pattern_loop の _ramp_min_step_pct（キャリブレーションのストロークから求める）と同じ
+HOLD_MIN_STEP_PULSE = 1
+
+
+@dataclass(frozen=True)
+class HoldPointResult:
+    """4 点の保持の 1 点の結果。speed_kmh・opening_pct は帯の中だった行の平均
+    （帯の中の行が無いときは None）。"""
+
+    target_kmh: float
+    held: bool
+    speed_kmh: float | None
+    opening_pct: float | None
+    in_band_s: float  # 帯の中だった時間の合計 [s]
+    elapsed_s: float  # 基準が上がり始めてから終わるまで [s]
+    initial_opening_pct: float  # 初めの開度（BRAKE_SEARCH の補間）[%]
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +113,10 @@ class PedalSearchResult:
     stop_brake_opening_pct: float  # 絶対開度（内部は絶対開度のまま。yaml へは min からの量で書く）
     # 2026-10-08 段2l-7: yaml へ「止まった開度＋マージン − ブレーキの min」で書くための min [%]
     brake_min_pct: float = 0.0
+    # 2026-10-30 段6: 手順13 の 4 点の保持の結果（低い順。走らなければ空）と、BRAKE_SEARCH の
+    # (開度 [%], 平均車速 [km/h]) の組（_search_brake が段ごとに記録する）
+    hold_points: tuple[HoldPointResult, ...] = ()
+    brake_search_pairs: tuple[tuple[float, float], ...] = ()
 
     def apply_to_profile(self, profile: VehicleProfile) -> VehicleProfile:
         """実測した停車保持開度・クリープ平衡車速をプロファイルに反映したコピーを返す。"""
@@ -209,12 +243,15 @@ def _step_line(pos: int, speed: float, base: float, mark: str) -> str:
 
 
 async def _search_brake(
-    hw: ResearchHardware, cfg: ResearchConfig, base: float, start_pos: int, step: int
+    hw: ResearchHardware, cfg: ResearchConfig, base: float, start_pos: int, step: int,
+    record: list[tuple[float, float]] | None = None,
 ) -> int:
     """ブレーキを start_pos（min）から刻んで踏み、停止確認できた位置 [pulse] を返す。
 
     車速が下がっている間（直前の刻みで onset_margin_kmh 以上下がった）は踏み増さない
     （踏み過ぎ防止）。vehicle.max_brake_opening_pct まで踏んでも停車しなければ DriveError。
+    record を渡すと、刻みごとの (その開度 [%], 平均車速 [km/h]) を追記する（2026-10-30 段6。
+    手順13 の 4 点の保持の初めの開度の補間に使う）。
     """
     s = cfg.pedal_search
     max_pct = cfg.vehicle.max_brake_opening_pct  # 機構保護の上限を探索の上限にも使う
@@ -241,6 +278,12 @@ async def _search_brake(
             await hw.brake.move_to_position(pos, smooth_over_s=move_dwell)
         speed = await mean_speed(hw, s.dwell_s)
         last_drop, last_speed = last_speed - speed, speed
+        if record is not None:
+            entry = (pulse_to_opening(pos), speed)
+            if record and record[-1][0] == entry[0]:  # 減速中の保持＝同じ開度の測り直し（後を採る）
+                record[-1] = entry
+            else:
+                record.append(entry)
         say(_step_line(pos, speed, base, "減速中のため保持" if holding else ""))
         if speed < VEHICLE_STOP_SPEED_KMH:
             say(f"停止確認: {pos} pulse = {pulse_to_opening(pos):.2f}%")
@@ -419,14 +462,324 @@ async def run_low_stair(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 手順13: 4 点の保持の開度（2026-10-30 段6。ProblemReport_20261030）
+# ─────────────────────────────────────────────────────────────────────
+
+
+def hold_point_speeds(
+    creep_kmh: float, fractions: list[float], extra_kmh: list[float]
+) -> list[float]:
+    """4 点の保持の車速 [km/h]（低い順）。クリープ車速 × fractions ＋ extra_kmh のうち、
+    停車速度より大きくクリープ車速より小さいものだけ。重複（小数 3 桁で同じ）は 1 つにする。"""
+    cands = [creep_kmh * f for f in fractions] + list(extra_kmh)
+    out: list[float] = []
+    for v in sorted(round(c, 3) for c in cands):
+        if VEHICLE_STOP_SPEED_KMH < v < creep_kmh and (not out or v != out[-1]):
+            out.append(v)
+    return out
+
+
+def hold_initial_opening(
+    pairs: list[tuple[float, float]], speed_kmh: float, fallback_pct: float
+) -> float:
+    """初めの開度 [%]: BRAKE_SEARCH の (開度, 平均車速) の組を、車速の昇順に並べて speed_kmh で
+    線形補間する（端の外は端の値）。車速は開度に対して単調に下がる前提。組が 2 つ未満なら
+    fallback_pct（動き出す開度）。"""
+    if len(pairs) < 2:
+        return fallback_pct
+    ordered = sorted((v, u) for u, v in pairs)
+    return float(np.interp(speed_kmh, [p[0] for p in ordered], [p[1] for p in ordered]))
+
+
+def hold_band_ok(accel_kmhs: float | None, band_g: float) -> bool:
+    """実測の加速度の大きさが ±band_g [G] 以内か（測れていない＝None は False）。
+    pattern_loop の RAMP_CRUISE と同じ判定（abs(加速度 [km/h/s]) ÷ G_TO_KMHS ≤ band_g）。"""
+    return accel_kmhs is not None and abs(accel_kmhs) / G_TO_KMHS <= band_g
+
+
+def hold_dead(error: float, deadband: float) -> float:
+    """不感帯を引いた偏差 e′。|e| ≤ deadband なら 0、外側は e − deadband × sign(e)（連続）。
+    pattern_loop の _dead と同じ（持ち込み）。"""
+    if abs(error) <= deadband:
+        return 0.0
+    return error - math.copysign(deadband, error)
+
+
+def hold_min_step_delta_pulse(dev_kmh: float, deadband_kmh: float, dt_s: float) -> int:
+    """1 刻み寄せ（PI を使わない保持。手順2 用）の 1 周期のブレーキ指令の動き [pulse]。
+
+    pattern_loop の RAMP_CRUISE で感度が未知のとき（no_sens）の動かし方と同じ: e′ ＝ 不感帯を
+    引いた偏差（dev ＝ 基準 − 実車速）の向きへ最小刻み 1 個（HOLD_MIN_STEP_PULSE）だけ動かす。
+    e′ ＝ 0 または dt ≤ 0 なら動かさない。遅すぎ（e′ ＞ 0）は浅く（開度が減る向き ＝ 負）、
+    速すぎ（e′ ＜ 0）は深く（正）。"""
+    e_dead = hold_dead(dev_kmh, deadband_kmh)
+    if e_dead == 0.0 or dt_s <= 0.0:
+        return 0
+    return -int(math.copysign(HOLD_MIN_STEP_PULSE, e_dead))
+
+
+def hold_verdict(
+    in_band_s: float, since_ref_start_s: float, hold_s: float, timeout_s: float
+) -> bool | None:
+    """保てたか。帯の中の合計が hold_s に達したら True（途切れても合計は戻さない）、
+    基準が上がり始めてから timeout_s 経っても達しなければ False、まだなら None。"""
+    if in_band_s >= hold_s:
+        return True
+    if since_ref_start_s >= timeout_s:
+        return False
+    return None
+
+
+def hold_breakaway_pct(meta: dict[str, Any], min_pct: float) -> float:
+    """0 km/h の端の開度 [%] ＝ ブレーキの min ＋ |pkl meta の launch_breakaway_u_pct|
+    （動き出す開度。無ければ KeyError）。手順2 の自動付与と手順13 が共有する。"""
+    return float(min_pct) + abs(float(meta["launch_breakaway_u_pct"]))
+
+
+def hold_opening_meta(
+    points: list[HoldPointResult] | tuple[HoldPointResult, ...],
+    *,
+    creep_kmh: float,
+    breakaway_pct: float,
+    min_pct: float,
+    source_csv: str,
+) -> dict[str, Any]:
+    """pkl の meta["hold_opening"]（hold_scene.hold_opening_points が読む形）を作る。
+    speed_kmh・opening_pct は帯の中の平均（保てなかった点は狙い・初めの開度。補間に使われない）。"""
+    return {
+        "points": [
+            {
+                "speed_kmh": float(p.target_kmh if p.speed_kmh is None else p.speed_kmh),
+                "opening_pct": float(
+                    p.initial_opening_pct if p.opening_pct is None else p.opening_pct
+                ),
+                "held": bool(p.held),
+                "target_kmh": float(p.target_kmh),
+                "in_band_s": float(p.in_band_s),
+                "elapsed_s": float(p.elapsed_s),
+                "initial_opening_pct": float(p.initial_opening_pct),
+            }
+            for p in points
+        ],
+        "creep_kmh": float(creep_kmh),
+        "breakaway_pct": float(breakaway_pct),
+        "min_pct": float(min_pct),
+        "source_csv": source_csv,
+    }
+
+
+async def _wait_stopped(hw: ResearchHardware, cfg: ResearchConfig) -> None:
+    """平均車速が停車速度未満になるまで待つ（stop_confirm_max_wait_s まで）。"""
+    limit = cfg.pedal_search.stop_confirm_max_wait_s
+    waited = 0.0
+    while True:
+        speed = await mean_speed(hw, 1.0)
+        waited += 1.0
+        if speed < VEHICLE_STOP_SPEED_KMH:
+            return
+        if waited >= limit:
+            raise DriveError(
+                f"停車保持へ戻しても {limit:g}s 以内に停車しません（車速 {speed:.2f} km/h）"
+            )
+
+
+async def _run_hold_point(
+    hw: ResearchHardware,
+    cfg: ResearchConfig,
+    *,
+    target_kmh: float,
+    creep_kmh: float,
+    hold_pct: float,
+    initial_pct: float,
+    pre_pct: float,
+    kp: float | None,
+    ki: float | None,
+) -> tuple[HoldPointResult, int]:
+    """1 点を保つ。戻り値は (結果, 終わったときの指令位置 [pulse])。
+
+    基準 = 0 から HOLD_REF_RAMP_KMHS で target_kmh まで上げ、その後一定。ブレーキだけで保つ
+    （アクセルは min のまま）。指令 = −初めの開度 ＋ HoldScenePI の上乗せ（偏差 = 基準 − 実車速）。
+    停車保持の開度から、基準を上げる前に max(pre_pct, 初めの開度)（pre_pct ＝ 動き出す開度）まで
+    刻み送り（step_to_position）で寄せておく（止まったまま。手順3 の launch_release_ramp が
+    動き出す開度まで離してから発進するのと同じ考え）。その後は刻み送りと同じ速さ
+    （search_step_pulse ÷ HOLD_STEP_DWELL_S）を上限に 1 周期ずつ寄せ、上限で追いつかない周期は
+    PI の積分を進めない（止まったまま積分だけがたまって、離れた後に行き過ぎるのを防ぐ）。
+
+    kp・ki が None のとき（手順2。まだ PI が無い）は PI を使わず、G ランプの定速の保持で感度が
+    未知のときと同じ 1 刻み寄せにする: 1 周期ごとに、不感帯（learning.ramp_dev_deadband_kmh）を
+    引いた偏差の向きへ、指令を最小刻み 1 個（HOLD_MIN_STEP_PULSE）だけ動かす（遅すぎなら浅く）。
+    動かす範囲は [min のブレーキ, 停車保持の開度]。判定・記録・停車保持への戻しは PI のときと同じ。
+    """
+    lr = cfg.learning
+    interval = cfg.control.loop_interval_s
+    window_s = cfg.decel_stop.slope_window_s
+    timeout_s = lr.ramp_turn_time_s + lr.ramp_cruise_timeout_s
+    ramp_end_s = target_kmh / HOLD_REF_RAMP_KMHS
+    slew_pulse = max(1, round(search_step_pulse(cfg) / HOLD_STEP_DWELL_S * interval))
+    pi = (
+        HoldScenePI(
+            kp=kp, ki=ki, dt_s=interval,
+            lo_pct=cfg.vehicle.min_brake_opening_pct, hi_pct=hold_pct,
+        )
+        if kp is not None and ki is not None else None
+    )
+    deadband = max(0.0, lr.ramp_dev_deadband_kmh)
+    lo_pulse = opening_to_pulse(cfg.vehicle.min_brake_opening_pct)
+    hi_pulse = opening_to_pulse(hold_pct)
+    ff_effort = -initial_pct
+    cmd_pos = opening_to_pulse(max(pre_pct, initial_pct))
+    await step_to_position(
+        hw.brake, opening_to_pulse(hold_pct), cmd_pos,
+        step_pulse=search_step_pulse(cfg), dwell_s=HOLD_STEP_DWELL_S,
+    )
+    hist: deque[tuple[float, float]] = deque()
+    in_band_s = 0.0
+    sum_speed = sum_open = 0.0
+    n_band = 0
+    note = ""
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    last = t0
+    held: bool | None = None
+    while held is None:
+        now = loop.time()
+        t = now - t0
+        dt = interval if now == t0 else now - last
+        last = now
+        try:
+            speed = await hw.can.read_speed()
+        except Exception as exc:
+            raise DriveError(f"CAN 車速を読めません（{type(exc).__name__}: {exc}）") from exc
+        if speed > creep_kmh + HOLD_OVERSPEED_MARGIN_KMH:
+            note = f"車速 {speed:.2f} km/h がクリープ車速 + {HOLD_OVERSPEED_MARGIN_KMH:g} を超えた"
+            held = False
+            break
+        ref = min(t * HOLD_REF_RAMP_KMHS, target_kmh)
+        if pi is None:
+            cmd_pos += hold_min_step_delta_pulse(ref - speed, deadband, dt)
+            cmd_pos = min(hi_pulse, max(lo_pulse, cmd_pos))
+        else:
+            i_before = pi.integral if pi.active else 0.0
+            effort, _ = pi.step(ref - speed, ff_effort)  # 範囲 [min, 停車保持] はここで収まる
+            want = opening_to_pulse(-effort)
+            if abs(want - cmd_pos) > slew_pulse:
+                pi.integral = i_before  # 寄せの上限で追いつかない周期は積分を進めない
+            cmd_pos += max(-slew_pulse, min(slew_pulse, want - cmd_pos))
+        await hw.brake.move_to_position(cmd_pos, smooth_over_s=interval * AXIS_SMOOTH_DUTY)
+        actual_pct = pulse_to_opening(await hw.brake.read_position())
+        # 実測の加速度: pattern_loop の RAMP_CRUISE と同じ（直近 slope_window_s の最小二乗の傾き、
+        # 3 点そろってから）
+        hist.append((t, speed))
+        while hist and t - hist[0][0] > window_s:
+            hist.popleft()
+        accel = fit_slope([a for a, _ in hist], [b for _, b in hist]) if len(hist) >= 3 else None
+        # 帯を数えるのは基準が一定になってから。止まった車も加速度 0 なので、停車速度以下の行は
+        # 数えない（G ランプの定速の保持は走っている車速でしか判定しないので、そこだけ足した条件。
+        # スタブで 1.25 km/h の点が 0.018 km/h のまま「保てた」になった）
+        if (
+            t >= ramp_end_s
+            and speed > VEHICLE_STOP_SPEED_KMH
+            and hold_band_ok(accel, lr.ramp_cruise_band_g)
+        ):
+            in_band_s += dt
+            sum_speed += speed
+            sum_open += actual_pct
+            n_band += 1
+        held = hold_verdict(in_band_s, t, lr.ramp_cruise_hold_s, timeout_s)
+        if held is None:
+            await asyncio.sleep(max(0.0, t0 + t + interval - loop.time()))
+    elapsed = loop.time() - t0
+    result = HoldPointResult(
+        target_kmh=round(target_kmh, 3), held=bool(held),
+        speed_kmh=sum_speed / n_band if n_band else None,
+        opening_pct=sum_open / n_band if n_band else None,
+        in_band_s=round(in_band_s, 3), elapsed_s=round(elapsed, 3),
+        initial_opening_pct=round(initial_pct, 3), note=note,
+    )
+    return result, cmd_pos
+
+
+async def run_hold_points(
+    hw: ResearchHardware,
+    cfg: ResearchConfig,
+    *,
+    creep_kmh: float,
+    hold_pct: float,
+    brake_search_pairs: list[tuple[float, float]],
+    kp: float | None,
+    ki: float | None,
+    fallback_opening_pct: float,
+    log: SessionLog | None = None,
+) -> list[HoldPointResult]:
+    """停車保持の状態から 4 点（hold_point_speeds）を低い順に保つ（run_low_stair と同じ位置づけ）。
+
+    点ごとに _run_hold_point → 停車保持の開度へ刻み送りで戻す → 停車を待つ、を繰り返し、
+    最後は停車保持で返す。初めの開度は BRAKE_SEARCH の組（hold_initial_opening）。
+    kp・ki が None なら PI を使わず 1 刻み寄せで保つ（手順2。_run_hold_point 参照）。
+    """
+    s = cfg.pedal_search
+    lr = cfg.learning
+    speeds = hold_point_speeds(creep_kmh, s.hold_points_fractions, s.hold_points_extra_kmh)
+    if not speeds:
+        say("4 点の保持: 点がありません（クリープ車速が低すぎる）")
+        return []
+    listed = ", ".join(f"{v:.3f}" for v in speeds)
+    cut_s = lr.ramp_turn_time_s + lr.ramp_cruise_timeout_s
+    how = (
+        f"PI（Kp {kp:.4f}・Ki {ki:.4f}）" if kp is not None and ki is not None else
+        f"1 刻み寄せ（1 周期ごとに偏差の向きへ {HOLD_MIN_STEP_PULSE} pulse・不感帯 "
+        f"{lr.ramp_dev_deadband_kmh:g} km/h）"
+    )
+    say(f"4 点の保持: 点 {listed} km/h（クリープ {creep_kmh:.2f} km/h）。"
+        f"基準は {HOLD_REF_RAMP_KMHS:g} km/h/s で上げて一定・ブレーキだけで {how}。"
+        f"加速度 ±{lr.ramp_cruise_band_g:g} G の帯が合計 "
+        f"{lr.ramp_cruise_hold_s:g}s で保てた・{cut_s:g}s で打ち切り")
+    hold_pulse = opening_to_pulse(hold_pct)
+    out: list[HoldPointResult] = []
+    for i, target in enumerate(speeds, 1):
+        initial = hold_initial_opening(brake_search_pairs, target, fallback_opening_pct)
+        initial = min(max(initial, cfg.vehicle.min_brake_opening_pct), hold_pct)
+        mark(log, SECTION_PEDAL_SEARCH, PHASE_LOW_HOLD)
+        say(f"  点 {i}/{len(speeds)}: {target:.3f} km/h・初めの開度 {initial:.2f}%")
+        res, pos = await _run_hold_point(
+            hw, cfg, target_kmh=target, creep_kmh=creep_kmh, hold_pct=hold_pct,
+            initial_pct=initial, pre_pct=fallback_opening_pct, kp=kp, ki=ki,
+        )
+        out.append(res)
+        got = "" if res.speed_kmh is None else (
+            f"帯の平均 {res.speed_kmh:.3f} km/h・{res.opening_pct:.2f}%")
+        say(f"    → {'保てた' if res.held else '保てず'}  {got}  帯 {res.in_band_s:.1f}s・"
+            f"{res.elapsed_s:.1f}s{'  ' + res.note if res.note else ''}")
+        mark(log, SECTION_PEDAL_SEARCH, PHASE_STOP_HOLD)
+        await step_to_position(
+            hw.brake, pos, hold_pulse,
+            step_pulse=search_step_pulse(cfg), dwell_s=HOLD_STEP_DWELL_S,
+        )
+        await _wait_stopped(hw, cfg)
+    return out
+
+
 async def run_pedal_search(
     hw: ResearchHardware,
     cfg: ResearchConfig,
     *,
     window_s: float | None = None,
     log: SessionLog | None = None,
+    save: bool = True,
+    hold_points: bool | None = None,
+    hold_pi: tuple[float, float] | None = None,
+    breakaway_pct: float | None = None,
 ) -> PedalSearchResult:
-    """クリープ車速と停車保持開度を測り、停車保持の状態で返す。実機のときだけ YAML へ保存する。"""
+    """クリープ車速と停車保持開度を測り、停車保持の状態で返す。実機のときだけ YAML へ保存する。
+
+    2026-10-30 段6: save=False なら実機でも yaml へ書き戻さない（手順13 は読み取り専用の yaml）。
+    hold_points（None なら pedal_search.hold_points_enabled）が真なら、最後に 4 点の保持
+    （run_hold_points）を走る。hold_pi = (Kp, Ki)（pkl meta["hold_pi"]）があれば PI で保つ
+    （手順13）。None なら PI を使わず 1 刻み寄せで保つ（手順2。PI は後でそのログから求める）。
+    breakaway_pct は
+    BRAKE_SEARCH の組が足りないときの初めの開度（動き出す開度。None なら停止確認開度）。
+    """
     s = cfg.pedal_search
     v = cfg.vehicle
     brake_step = brake_step_pulse(cfg)
@@ -445,7 +798,8 @@ async def run_pedal_search(
 
     base = await wait_creep_stable(hw, cfg, window_s=window_s)
     mark(log, SECTION_PEDAL_SEARCH, PHASE_BRAKE_SEARCH)
-    stop_pos = await _search_brake(hw, cfg, base, brake_min, brake_step)
+    pairs: list[tuple[float, float]] = [(v.min_brake_opening_pct, base)]  # min ＝ クリープ車速
+    stop_pos = await _search_brake(hw, cfg, base, brake_min, brake_step, record=pairs)
 
     mark(log, SECTION_PEDAL_SEARCH, PHASE_STOP_HOLD)
     stop_pct = pulse_to_opening(stop_pos)
@@ -462,14 +816,28 @@ async def run_pedal_search(
             hw, cfg, creep_kmh=base, stop_confirm_pct=stop_pct, hold_pct=hold_pct, log=log
         )
 
+    points: list[HoldPointResult] = []
+    if s.hold_points_enabled if hold_points is None else hold_points:
+        points = await run_hold_points(
+            hw, cfg, creep_kmh=base, hold_pct=hold_pct, brake_search_pairs=pairs,
+            kp=None if hold_pi is None else hold_pi[0],
+            ki=None if hold_pi is None else hold_pi[1],
+            fallback_opening_pct=stop_pct if breakaway_pct is None else breakaway_pct,
+            log=log,
+        )
+
     result = PedalSearchResult(
         creep_speed_kmh=round(base, 2),
         stop_confirm_pct=round(stop_pct, 2),
         stop_brake_opening_pct=hold_pct,
         brake_min_pct=cfg.vehicle.min_brake_opening_pct,
+        hold_points=tuple(points),
+        brake_search_pairs=tuple(pairs),
     )
     _print_result(result, s.stop_hold_margin_pct)
-    if hw.is_real:
+    if not save:
+        say(f"save=False のため {cfg.source_path} は更新しません")
+    elif hw.is_real:
         save_to_config(cfg, result)
     else:
         say(f"スタブのため {cfg.source_path} は更新しません（実機の値を模擬値で上書きしないため）")

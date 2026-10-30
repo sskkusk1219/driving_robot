@@ -100,6 +100,8 @@ def _tmp_cfg(tmp_path: Path) -> cfgmod.ResearchConfig:
             # 段2l-6 から手順2 の対象は C7・C8 だけ（C1〜C5 は ConfigError）。C7 に固定
             # （既定 yaml は C7/C8 のこともある）
             "feedforward.candidate": "C7",
+            # 2026-10-30: 本体 yaml は 4 点の保持を走る。偽の pkl には付けられないので切る
+            "pedal_search.hold_points_enabled": False,
             "vehicle.min_accel_opening_pct": MIN_ACCEL_PCT,
             "vehicle.min_brake_opening_pct": MIN_BRAKE_PCT,
             # 走行後の緩減速を短くする（判定ロジックは既定と同じ）
@@ -1260,3 +1262,20 @@ def test_low_stair_rows_go_to_stop_rows_and_moving_release_rows_to_layer(
     assert "low_stair_press_s" not in g_old["meta"]
     # 層を作らない設定では、離す向きの行は使わない
     assert "release" not in _capture_low_speed(monkeypatch, new, layer=False)
+
+
+def test_forward_pkl_and_model_default_stamp_is_local_time(tmp_path: Path) -> None:
+    """順モデルの pkl 名のスタンプは走行ログ CSV と同じローカル時刻（JST）であること。
+
+    UTC 命名に戻ると 9 時間ずれるため、この assert が落ちて検知できる。
+    """
+    from tests.research import fwd_tool  # noqa: PLC0415
+
+    paths = [
+        pdmod._forward_pkl_path(tmp_path, "fwd_model", "real"),
+        fwd_tool.model_default_path(),
+    ]
+    for p in paths:
+        stamp = "_".join(p.stem.split("_")[2:4])
+        t = datetime.strptime(stamp, "%Y%m%d_%H%M%S")  # noqa: DTZ007 - naive比較
+        assert abs(t - datetime.now()) < timedelta(minutes=5)  # noqa: DTZ005

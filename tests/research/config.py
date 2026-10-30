@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -559,6 +560,11 @@ class PedalSearchSection:
     low_stair_press_max_steps: int = 20  # 踏む向きの段数の上限（停車保持の開度の浅いほうも上限）
     low_stair_repeats: int = 2  # 離す・踏むの繰り返し回数
     low_stair_creep_margin_kmh: float = 0.3  # クリープに着いたとみなす余裕 [km/h]
+    # 2026-10-30 段6（ProblemReport_20261030）: 手順13 の 4 点の保持。既定 off（手順2 では走らない）
+    # 値の根拠・効く先・決める時期は config_testVehicle.yaml の同キーに書く
+    hold_points_enabled: bool = False
+    hold_points_fractions: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
+    hold_points_extra_kmh: list[float] = field(default_factory=lambda: [1.6])
 
 
 @dataclass
@@ -1051,6 +1057,54 @@ class ForwardMapSection:
     # 人は止まる前は踏み増すだけ。既定 false ＝ 今と完全に同じ。
     # 効く先: C15 の停止まぎわ。決める時期: 段7 の実機
     stop_end_brake_monotone: bool = False
+    # 2026-10-30 ProblemReport_20261030 段4: true なら、保持の場面（元の基準の t〜t＋L の傾きの
+    # 大きさが
+    # learning.ramp_cruise_band_g × 9.80665 × 3.6 km/h/s 以下、かつ 停車速度 < 基準 <
+    # feedforward.creep_speed_kmh。L ＝ brake_lag_s）の周期で、C10 の P・DOB の上乗せ・惰行の補助・
+    # midway/ref0 の切り取り・launch_move_hold の足しを止め、開度の単位の PI
+    # （上乗せ ＝ Kp·偏差 ＋ I。偏差 ＝ ぼかした基準 − 実車速。Kp・Ki は pkl の
+    # meta["hold_pi"]）に替える。
+    # 最終の指令はブレーキの [min, 停車保持] に収め、はみ出す向きの積分は進めない。
+    # 場面に入る周期で I ＝ 0、出たら捨てる。meta["hold_pi"] が無ければ走行前に ConfigError。
+    # 根拠: UDDS 1251〜1256 s（基準 1.6 km/h 一定）で P と DOB の上乗せが車速の谷で跳ね、ブレーキが
+    # 0.5 s 周期で往復（`073644`）。Kp・Ki は BRAKE_SEARCH の 1 次遅れ当てはめから IMC で決めた値
+    # （データ由来。hold_pi.py）。既定 false ＝ 今と完全に同じ。
+    # 効く先: 保持の場面の最終指令。ログ: hold_scene・hold_pi_effort_pct。
+    # 決める時期: 段5 の UDDS 実機
+    hold_pi_enabled: bool = False
+    # 2026-10-30 段7: true なら、保持の場面の FF を meta["hold_opening"] の点（保てた点＋両端）の
+    # 基準車速での線形補間に置き換える（計画の列は変えず実行時に置き換え。ログの FF 列にもこの値）。
+    # meta が無ければ今の FF のまま（走行前に表示）。hold_pi_enabled が false なら場面の判定自体が
+    # 無いので何も起きない。根拠: 保持に要る開度は手順13 の実測（データ由来）。
+    # 既定 false ＝ 今と完全に同じ。効く先: 保持の場面の FF。決める時期: 段7 の実機
+    hold_ff_enabled: bool = False
+    # 2026-10-30 段8: 保持の FF のブレーキ開度に足す量 [%]（正 ＝ ブレーキを深く）。FB の頑丈さを
+    # 確かめるためだけの値（±0.3 を仮値。段8 の実機）。hold_ff_enabled のときだけ効く。
+    # 既定 0 ＝ 今と完全に同じ。効く先: 保持の場面の FF。決める時期: 段8 の実機の後
+    hold_ff_offset_pct: float = 0.0
+    # 2026-10-30 ProblemReport_20261030 段7: 保持の場面の PI の積分の不感帯 [km/h]。
+    # |偏差| ≤ この値の周期は積分を進めない（P の項はそのまま）。
+    # 根拠: 合成パターン `071258` で車速は 1.49〜1.50 km/h の段に落ち着き（偏差 +0.10〜+0.11）、
+    # その間も積分がブレーキを約 3.4 s ごとに 1 刻み（0.011%）浅くし、
+    # 5 回の跳ね上がり（1.50 → 約 3 km/h）のうち 4 回がその直後だった。
+    # 0.15 は 1.49〜1.50 の段を含む値（ユーザー決定。この車の段の位置に合わせた値で、
+    # 他車では 0.1〜0.15 の許容の目安として扱う）。
+    # 既定 0 ＝ 不感帯なし（今と同じ）。効く先: 保持の場面の積分だけ（手順13 は 0 のまま）。
+    # 決める時期: 段7 の合成パターンの再走・段9
+    hold_pi_deadband_kmh: float = 0.0
+    # 2026-10-30 段11（案 A）: true なら、保持の区間の直前で基準が停車速度〜クリープ車速の中にあり
+    # 保持の車速へ単調に向かう行（上り）も保持の場面にする。上りの FF ＝ 保持の開度（L 先の基準）
+    # − L 先の基準の傾き ÷ c（c ＝ meta hold_pi の K ÷ T）。hold_pi_enabled・hold_ff_enabled と
+    # meta hold_opening が要る。既定 false ＝ 今と完全に同じ。ログ: hold_scene ＝ 2
+    hold_lead_in_enabled: bool = False
+    # 2026-10-30 段13（案 B）: true なら、保持の場面（上りも含む）の PI の P の偏差を
+    # 「Tp 秒先の基準 −（今の車速 ＋ 実測の加速度 × Tp）」にする
+    # （Tp ＝ L ＋ 窓 ÷ 2、L は meta hold_pi、窓は decel_stop.slope_window_s）。
+    # 実測の加速度は直近 decel_stop.slope_window_s の CAN 車速の最小二乗の傾き
+    # （G ランプの定速の保持と同じ測り方）で、
+    # ±ramp_cruise_band_g の帯の中は 0（段に止まっている）。積分は今の偏差のまま（不感帯も同じ）。
+    # hold_pi_enabled が要る。既定 false ＝ 今と完全に同じ。ログ: hold_accel_kmhs・hold_pred_dev_kmh
+    hold_accel_pred_enabled: bool = False
 
 
 @dataclass
@@ -1541,6 +1595,23 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         not fm.launch_move_hold or fm.launch_release_ramp,
         "forward_map.launch_move_hold は launch_release_ramp が true のときだけ使える",
     )
+    need(
+        math.isfinite(fm.hold_ff_offset_pct),
+        f"forward_map.hold_ff_offset_pct は有限の数: {fm.hold_ff_offset_pct}",
+    )
+    need(
+        math.isfinite(fm.hold_pi_deadband_kmh) and fm.hold_pi_deadband_kmh >= 0.0,
+        f"forward_map.hold_pi_deadband_kmh は 0 以上の有限の数: {fm.hold_pi_deadband_kmh}",
+    )
+    need(
+        not fm.hold_lead_in_enabled or (fm.hold_pi_enabled and fm.hold_ff_enabled),
+        "forward_map.hold_lead_in_enabled は hold_pi_enabled・hold_ff_enabled "
+        "が true のときだけ使える",
+    )
+    need(
+        not fm.hold_accel_pred_enabled or fm.hold_pi_enabled,
+        "forward_map.hold_accel_pred_enabled は hold_pi_enabled が true のときだけ使える",
+    )
     for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")
     need(fm.deviation_c >= 0.0, f"forward_map.deviation_c は 0 以上: {fm.deviation_c}")
@@ -1965,6 +2036,14 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         ps.low_stair_creep_margin_kmh > 0.0,
         "pedal_search.low_stair_creep_margin_kmh は正値",
+    )
+    need(
+        all(isinstance(x, (int, float)) and 0.0 < x < 1.0 for x in ps.hold_points_fractions),
+        "pedal_search.hold_points_fractions は 0 より大きく 1 より小さい数のリスト",
+    )
+    need(
+        all(isinstance(x, (int, float)) and x > 0.0 for x in ps.hold_points_extra_kmh),
+        "pedal_search.hold_points_extra_kmh は正の数のリスト",
     )
 
     ds = cfg.decel_stop

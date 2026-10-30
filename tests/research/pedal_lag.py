@@ -395,7 +395,10 @@ RETURN_MIN_SCENES = 3
 # 周期に中心 u0 へ段で移り、低速の階段は停車保持から一気に離すので、G ランプの戻しと別の動き方の
 # 場面が混ざり、当てはめの傾きが負になった（`111335` のブレーキ: 16 件のうち dither 5・階段 1）
 RETURN_EXCLUDED_PHASES = frozenset(
-    {"RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER", "LOW_RELEASE_STAIR", "LOW_PRESS_STAIR"}
+    {
+        "RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER", "LOW_RELEASE_STAIR", "LOW_PRESS_STAIR",
+        "LOW_HOLD",  # 2026-10-30 段6: 手順13 の 4 点の保持（PI で動かす）
+    }
 )
 
 

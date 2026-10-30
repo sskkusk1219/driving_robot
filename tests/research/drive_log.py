@@ -152,6 +152,19 @@ CSV_COLUMNS: tuple[str, ...] = (
     # 2026-10-22 段5-5c: 切り替えの先読みで要る加速度を見る時刻を早めた秒数。
     # FF の行だけ（先読みなしは空欄）
     "ff_switch_lead_s",
+    # 2026-10-30 段4: 保持の場面の PI（forward_map.hold_pi_enabled。ProblemReport_20261030）。
+    # hold_scene ＝ その周期が保持の場面なら 1・そうでなければ 0（機能 off は空欄）、
+    # hold_pi_effort_pct ＝ PI の上乗せ [%]（場面の外は空欄）、
+    # hold_ff_pct ＝ 場面で使った保持の FF のブレーキ開度 [%]（置き換えないときは空欄）
+    "hold_scene",
+    "hold_pi_effort_pct",
+    "hold_ff_pct",
+    # 2026-10-30 段13: 先読みの P（forward_map.hold_accel_pred_enabled）。
+    # hold_accel_kmhs ＝ 帯で丸めた実測の加速度 [km/h/s]、
+    # hold_pred_dev_kmh ＝ P に使った先読みの偏差
+    # （場面の外・off は空欄）
+    "hold_accel_kmhs",
+    "hold_pred_dev_kmh",
 )
 
 
@@ -199,6 +212,11 @@ class DriveSample:
     stop_end_tau_s: float | None = None  # C15 の停C の τ [s]（区間の行だけ。他は None）
     ff_side_accel: int | None = None  # 計画がその行のアクセル側で引いた表（SIDE_*。FF の行だけ）
     ff_side_brake: int | None = None  # 同、ブレーキ側
+    hold_scene: int | None = None  # 段4: 保持の場面なら 1（上りは 2）・外は 0（機能 off は None）
+    hold_pi_effort_pct: float | None = None  # 段4: PI の上乗せ（場面の外・off は None）
+    hold_ff_pct: float | None = None  # 段7: 場面で使った保持の FF の開度（置き換えないときは None）
+    hold_accel_kmhs: float | None = None  # 段13: 帯で丸めた実測の加速度（場面の外・off は None）
+    hold_pred_dev_kmh: float | None = None  # 段13: P に使った先読みの偏差（同上）
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -291,6 +309,11 @@ class SessionLog:
         ff_side_accel: int | None = None,
         ff_side_brake: int | None = None,
         ff_switch_lead_s: float | None = None,
+        hold_scene: int | None = None,
+        hold_pi_effort_pct: float | None = None,
+        hold_ff_pct: float | None = None,
+        hold_accel_kmhs: float | None = None,
+        hold_pred_dev_kmh: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -330,6 +353,11 @@ class SessionLog:
             ff_side_accel=ff_side_accel,
             ff_side_brake=ff_side_brake,
             ff_switch_lead_s=ff_switch_lead_s,
+            hold_scene=hold_scene,
+            hold_pi_effort_pct=hold_pi_effort_pct,
+            hold_ff_pct=hold_ff_pct,
+            hold_accel_kmhs=hold_accel_kmhs,
+            hold_pred_dev_kmh=hold_pred_dev_kmh,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -526,6 +554,11 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 "" if s.ff_side_accel is None else str(s.ff_side_accel),
                 "" if s.ff_side_brake is None else str(s.ff_side_brake),
                 _fmt(s.ff_switch_lead_s),
+                "" if s.hold_scene is None else str(s.hold_scene),
+                _fmt(s.hold_pi_effort_pct),
+                _fmt(s.hold_ff_pct),
+                _fmt(s.hold_accel_kmhs),
+                _fmt(s.hold_pred_dev_kmh),
             ])
 
 

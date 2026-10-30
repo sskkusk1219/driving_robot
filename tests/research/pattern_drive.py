@@ -136,7 +136,11 @@ from tests.research.pattern_loop import (
 )
 from tests.research.pedal_gain import apply_pedal_gains, estimate_gain_curve
 from tests.research.pedal_lag import PedalLagResult
-from tests.research.pedal_search import PedalSearchResult
+from tests.research.pedal_search import (
+    PedalSearchResult,
+    hold_breakaway_pct,
+    hold_opening_meta,
+)
 from tests.research.ramp_planner import CRUISE_MIN_MARGIN_KMH, estimate_s
 from tests.research.research_types import (
     DriveLog,
@@ -877,10 +881,13 @@ class _BuiltModel:
 
 
 def _forward_pkl_path(models_dir: Path, prefix: str, hw_mode: str) -> Path:
-    """順モデルの pkl 名（UTC）。スタブは `_stub` を付け、実機の pkl と紛れないようにする。"""
-    from datetime import UTC, datetime  # noqa: PLC0415
+    """順モデルの pkl 名（ローカル時刻 = JST。走行ログ CSV と揃える）。
 
-    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    2026-10-29 より前の pkl は UTC 名。スタブは `_stub` を付け、実機の pkl と紛れないようにする。
+    """
+    from datetime import datetime  # noqa: PLC0415
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = "" if hw_mode == HW_REAL else f"_{hw_mode}"
     return models_dir / f"{prefix}_{stamp}{suffix}.pkl"
 
@@ -1582,6 +1589,80 @@ def _replace_seeds(seeds: Sequence[int], outliers: Sequence[int]) -> tuple[int, 
     return tuple(out)
 
 
+_FORWARD_CANDIDATES = ("C7", "C8", "C10", "C11", "C12", "C13", "C14", "C15")
+
+
+def attach_hold_data(
+    cfg: ResearchConfig, model_path: str | Path, csv_path: Path, pedal: PedalSearchResult | None
+) -> Any | None:
+    """手順2 の 4 点の保持（LOW_HOLD。PI を使わず 1 刻み寄せで保った記録）から、保持用の PI
+    （meta["hold_pi"]）と保持の開度（meta["hold_opening"]）を求め、2-2 が保存した pkl に付けて
+    同じパスへ保存する（2026-10-30。fwd_tool attach-hold-pi --phase LOW_HOLD と手順13 の
+    hold_opening と同じ求め方）。
+
+    4 点の保持が無効（pedal_search.hold_points_enabled が false）・pedal が無い（作り直しだけ）
+    なら何もせず None。結果はチェック項目 H1（step2_check.CheckItem）で返す:
+    付けられたら OK。点が無い・1 点も保てなかった・PI を求められないときは、日本語の理由を出し、
+    forward_map.hold_pi_enabled が true なら NG（手順2 の学習結果のチェックエラー）、false なら
+    SKIP（お知らせ。付けられた分だけは pkl に残す）。LOW_HOLD の行は学習に使わない
+    （学習データの読みは section/phase で絞るので入らない）。
+    """
+    from tests.research import hold_pi, step2_check  # noqa: PLC0415
+    from tests.research.fwd_map import load_forward_map, save_table  # noqa: PLC0415
+
+    if pedal is None or not cfg.pedal_search.hold_points_enabled:
+        return None
+    name = "hold_attach"
+    needed = cfg.forward_map.hold_pi_enabled
+    bad = step2_check.STATUS_NG if needed else step2_check.STATUS_SKIP
+    table = load_forward_map(Path(model_path))
+    problems: list[str] = []
+    done: list[str] = []
+    points = pedal.hold_points
+    if not points:
+        problems.append("4 点の保持の点がありません（クリープ車速が低すぎる）")
+    elif not any(p.held for p in points):
+        problems.append(f"4 点の保持で 1 点も保てませんでした（{len(points)} 点）")
+    else:
+        try:
+            res = hold_pi.attach_hold_pi_low_hold(
+                table.meta, csv_path, deviation_c=cfg.forward_map.deviation_c
+            )
+            done.append(
+                f"hold_pi（Kp {res['kp_pct_per_kmh']:.4f}・Ki {res['ki_pct_per_kmh_s']:.4f}・"
+                f"使った点 {res['steps_used']}/{res['steps_total']}）"
+            )
+        except hold_pi.HoldPiError as exc:
+            problems.append(f"保持用 PI を求められません: {exc}")
+    if points:
+        try:
+            min_pct = cfg.vehicle.min_brake_opening_pct
+            table.meta["hold_opening"] = hold_opening_meta(
+                points, creep_kmh=pedal.creep_speed_kmh,
+                breakaway_pct=hold_breakaway_pct(table.meta, min_pct),
+                min_pct=min_pct, source_csv=csv_path.name,
+            )
+            done.append(f"hold_opening（{len(points)} 点）")
+        except KeyError:
+            problems.append(
+                "pkl の meta に launch_breakaway_u_pct がありません（保持の開度を作れません）"
+            )
+    if done:
+        save_table(table, Path(model_path))
+        say(f"4 点の保持から付けて保存: {model_path}（{'・'.join(done)}）")
+    if problems:
+        for msg in problems:
+            say(f"4 点の保持の自動付与: {msg}")
+        if not needed:
+            say("forward_map.hold_pi_enabled が false なので、NG にはしません（お知らせ）")
+        return step2_check.CheckItem(
+            "H1", name, bad, "付けられず", str(csv_path.name), "・".join(problems)
+        )
+    return step2_check.CheckItem(
+        "H1", name, step2_check.STATUS_OK, "・".join(done), str(csv_path.name), ""
+    )
+
+
 def build_ff_model(
     cfg: ResearchConfig,
     csv_path: Path,
@@ -1758,6 +1839,11 @@ def build_ff_model(
             local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
         )
         checks = run_checks_now()
+    if candidate in _FORWARD_CANDIDATES:
+        # 4 点の保持（手順2 の LOW_HOLD）から PI と保持の開度を、yaml を書く前の pkl に付ける
+        hold_item = attach_hold_data(cfg, built.model_path, csv_path, pedal)
+        if hold_item is not None:
+            checks.append(hold_item)
     say(step2_check.format_checks(checks))
     ng = step2_check.ng_items(checks)
     model_path, metrics = built.model_path, built.metrics

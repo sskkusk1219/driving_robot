@@ -99,7 +99,11 @@ from tests.research.pattern_drive import (
     run_pattern_drive,
 )
 from tests.research.pedal_arbiter import enabled_arbiter_features
-from tests.research.pedal_search import run_pedal_search
+from tests.research.pedal_search import (
+    hold_breakaway_pct,
+    hold_opening_meta,
+    run_pedal_search,
+)
 from tests.research.pre_drive_check import PHASE_PRE_CHECK, run_pre_drive_check
 from tests.research.ramp_planner import (
     count_bands_for_modes,
@@ -572,6 +576,102 @@ async def step12_fel_learning(ctx: RunContext) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 手順 13: 4 点の保持の開度（2026-10-30 段6。ProblemReport_20261030）
+# ─────────────────────────────────────────────────────────────────────
+
+
+def hold_pkl_path(model_path: str | Path) -> Path:
+    """手順13 の保存先: 元の pkl と同じ場所の `<元の stem>_hold.pkl`。"""
+    src = Path(model_path)
+    return src.with_name(f"{src.stem}_hold{src.suffix}")
+
+
+async def prepare_step13(ctx: RunContext) -> None:
+    """走行前チェックの前に、今の pkl に meta["hold_pi"]・launch_breakaway_u_pct があり、
+    保存先がまだ無いことを確かめる（ハードを動かす前に止める）。"""
+    cfg = ctx.config
+    model_path = cfg.feedforward.model_path
+    if not Path(model_path).exists():
+        raise ConfigError(f"feedforward.model_path の pkl がありません: {model_path}")
+    meta = load_forward_map(Path(model_path)).meta
+    if not meta.get("hold_pi"):
+        raise ConfigError(
+            f"pkl の meta に hold_pi がありません（fwd_tool attach-hold-pi で付ける）: {model_path}"
+        )
+    if meta.get("launch_breakaway_u_pct") is None:
+        raise ConfigError(f"pkl の meta に launch_breakaway_u_pct がありません: {model_path}")
+    out = hold_pkl_path(model_path)
+    if out.exists():
+        raise ConfigError(f"保存先 {out} が既にあります（上書きしません）")
+
+
+async def step13_hold_points(ctx: RunContext) -> None:
+    """ペダル探索 → 4 点の保持だけを走り、今の pkl（yaml の model_path）に保持の開度
+    （meta["hold_opening"]）を付け足して `<元の stem>_hold.pkl` に保存する。
+
+    yaml へは何も書かない（save=False。model_path も書き換えない）。元の pkl も書き換えない。
+    """
+    hw = ctx.require_hardware()
+    cfg = ctx.config
+    model_path = Path(cfg.feedforward.model_path)
+    table = load_forward_map(model_path)
+    info = table.meta.get("hold_pi")
+    if not info:
+        raise ConfigError(f"pkl の meta に hold_pi がありません: {model_path}")
+    breakaway = hold_breakaway_pct(table.meta, cfg.vehicle.min_brake_opening_pct)
+    log = ctx.session_log
+    say("13-0. ペダル探索（クリープ車速・BRAKE_SEARCH・停車保持）→ 4 点の保持")
+    try:
+        pedal = await run_pedal_search(
+            hw, cfg, log=log, save=False, hold_points=True,
+            hold_pi=(float(info["kp_pct_per_kmh"]), float(info["ki_pct_per_kmh_s"])),
+            breakaway_pct=breakaway,
+        )
+    finally:
+        if log is not None:
+            await log.close()  # 失敗してもそこまでのログを残す
+    if log is None or log.csv_path is None:
+        raise DriveError("走行ログがありません（source_csv を決められません）")
+    if not pedal.hold_points:
+        raise DriveError("4 点の保持の点がありません（クリープ車速が低すぎる）")
+    out = hold_pkl_path(model_path)
+    if out.exists():
+        raise DriveError(f"保存先 {out} が既にあります（上書きしません）")
+    new = load_forward_map(model_path)  # 走行中に書き換わっていてもよいよう、元を読み直す
+    new.meta["hold_opening"] = hold_opening_meta(
+        pedal.hold_points, creep_kmh=pedal.creep_speed_kmh, breakaway_pct=breakaway,
+        min_pct=cfg.vehicle.min_brake_opening_pct, source_csv=log.csv_path.name,
+    )
+    saved = save_table(new, out)
+    say()
+    say("4 点の保持の結果:")
+    say("  狙い km/h  保てた  実車速 km/h  開度 %   帯の秒  かかった秒  初めの開度 %")
+    for p in pedal.hold_points:
+        sp = "    -    " if p.speed_kmh is None else f"{p.speed_kmh:9.3f}"
+        op = "   -  " if p.opening_pct is None else f"{p.opening_pct:6.2f}"
+        say(f"  {p.target_kmh:9.3f}  {'○' if p.held else '×'}      {sp}  {op}  "
+            f"{p.in_band_s:6.1f}  {p.elapsed_s:9.1f}  {p.initial_opening_pct:10.2f}"
+            f"{'  ' + p.note if p.note else ''}")
+    say(f"両端: 0 km/h = {breakaway:.2f}%（min + |launch_breakaway_u_pct|）・"
+        f"クリープ {pedal.creep_speed_kmh:.2f} km/h = {cfg.vehicle.min_brake_opening_pct:.2f}%")
+    say(f"保存: {saved}（元の pkl・yaml の model_path は書き換えていません）")
+    extra = cfg.pedal_search.hold_points_extra_kmh
+    missed = [
+        p for p in pedal.hold_points
+        if not p.held and any(abs(p.target_kmh - e) < 1e-6 for e in extra)
+    ]
+    if missed:
+        say()
+        say("*" * 60)
+        say(f"*** 警告: {', '.join(f'{p.target_kmh:g}' for p in missed)} km/h が保てなかった"
+            "＝ D1（この車で一定の基準が保てない。シミュレータ側の問題として報告し、"
+            "段7 以降は止めて聞く） ***")
+        say("*" * 60)
+    say()
+    say("手順 13 完了。使うには yaml の model_path を保存先へ替えます（自動では替えません）。")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 手順 3: FF のみで WLTP モード走行 → CSV / 図 / レポート
 # ─────────────────────────────────────────────────────────────────────
 
@@ -774,6 +874,13 @@ STEPS: tuple[Step, ...] = (
         drives=True,
         prepare=prepare_step12,
         has_ref=True,
+    ),
+    Step(
+        13,
+        "ペダル探索 → 4 点の保持だけを走り、今の pkl に保持の開度を付けて別名で保存",
+        step13_hold_points,
+        drives=True,
+        prepare=prepare_step13,
     ),
 )
 _STEP_BY_NUMBER = {step.number: step for step in STEPS}

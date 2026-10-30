@@ -309,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--check", nargs="+", default=[str(x) for x in DEFAULT_CHECK], metavar="CSV")
     p.add_argument("--ref-check", nargs="+", default=[str(x) for x in REF_CHECK], metavar="CSV")
     p.add_argument("--out", default=None, help="保存先 pkl（省略: results/models/fwd_model_*.pkl）")
-    p.add_argument("--save", action="store_true", help="fwd_model_<UTC>.pkl に保存")
+    p.add_argument("--save", action="store_true", help="fwd_model_<JST>.pkl に保存")
     p.add_argument("--smoke", action="store_true", help="max_iter 3 の動作確認（保存しない）")
     return p
 

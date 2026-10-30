@@ -69,8 +69,23 @@ from tests.research.ff_candidate import (
 )
 from tests.research.ff_params import research_ff_params
 from tests.research.hardware import ActuatorProtocol, DriveError, ResearchHardware
+from tests.research.hold_scene import (
+    HoldInterval,
+    HoldScenePI,
+    banded_accel,
+    hold_lead_in_intervals,
+    hold_opening_points,
+    hold_scene_intervals,
+    in_hold_interval,
+    interp_hold_opening,
+    lead_in_ff_pct,
+    min_scene_length_s,
+    predicted_deviation,
+    slope_threshold_kmhs,
+)
 from tests.research.launch_hold import LaunchMoveHold, launch_hold_gain
 from tests.research.pattern_drive import _overcurrent_limit_ma, _release_pedals
+from tests.research.pattern_loop import fit_slope
 from tests.research.pedal_arbiter import (
     PedalArbiter,
     enabled_arbiter_features,
@@ -434,6 +449,149 @@ def make_launch_hold(
     return hold, f"あり・{note}・bk ＝ {bk:.2f}%"
 
 
+@dataclass
+class HoldSceneSetup:
+    """保持の場面の設定（forward_map.hold_pi_enabled。2026-10-30 段4・7・8）。"""
+
+    pi: HoldScenePI
+    lag_s: float  # 場面の判定に使う L（ブレーキの遅れ。P の τ と同じ取り方）
+    slope_max_kmhs: float  # 基準の傾きのしきい値
+    stop_kmh: float  # 場面の車速の下限（含まない）
+    creep_kmh: float  # 場面の車速の上限（含まない）
+    intervals: list[HoldInterval]  # 走行前に求めた、残った区間（長さ ≥ min_length_s）
+    min_length_s: float  # 区間の長さの下限 ＝ 2 ×（λ ＋ L）
+    dropped_intervals: int  # 短くて外した区間の数
+    step_s: float  # 区間を求めた刻み ＝ 走行の周期
+    points: list[tuple[float, float]] | None  # 保持の開度の点（hold_ff_enabled で meta あり）
+    offset_pct: float  # 保持の FF に足す量（正 ＝ ブレーキを深く）
+    text: str  # 走行前の表示
+    # 段11（案 A）: 保持の区間の直前の上り（hold_lead_in_enabled。off は空・None）
+    lead_ins: list[HoldInterval] = field(default_factory=list)
+    plant_c: float | None = None  # c ＝ K ÷ T [km/h/s per %]（meta hold_pi の K_kmh_per_pct・T_s）
+    # 段13（案 B）: P の偏差の先読み（hold_accel_pred_enabled。off は False）
+    accel_pred: bool = False
+    tp_s: float = 0.0  # Tp ＝ L ＋ 窓 ÷ 2（meta hold_pi の L_s・decel_stop.slope_window_s）
+    accel_window_s: float = 1.0  # 加速度を測る窓（decel_stop.slope_window_s）
+    accel_band_kmhs: float = 0.0  # この大きさ以下の加速度は 0 とする（ramp_cruise_band_g の換算）
+
+
+def make_hold_scene(
+    cfg: ResearchConfig, ff: Any, mode: DrivingMode | None = None
+) -> HoldSceneSetup | None:
+    """保持の場面の設定を作る。hold_pi_enabled が false なら None。true で FF が表の候補でない・
+    pkl に meta["hold_pi"] が無い・ブレーキの遅れが決まらないときは ConfigError
+    （走行前に落とす）。場面の区間は走行前に基準全体から求める（下限 ＝ 2 ×（λ ＋ L）。
+    λ・L は meta["hold_pi"] の lambda_s・L_s）。"""
+    fm = cfg.forward_map
+    if not fm.hold_pi_enabled:
+        return None
+    if mode is None:
+        raise ConfigError("保持の場面の区間を求めるには走行モードが要ります")
+    from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+
+    if not isinstance(ff, ForwardMapFeedforward):
+        raise ConfigError("forward_map.hold_pi_enabled は表の候補（C7〜C15）だけで使えます")
+    meta = ff.table.meta
+    info = meta.get("hold_pi")
+    if not info:
+        raise ConfigError(
+            "forward_map.hold_pi_enabled が true ですが、pkl の meta に hold_pi がありません"
+            f"（fwd_tool attach-hold-pi で付ける。{cfg.feedforward.model_path}）"
+        )
+    lag = fm.brake_lag_s if fm.brake_lag_s is not None else meta.get("brake_lag_s")
+    if lag is None or not float(lag) > 0.0:
+        raise ConfigError(
+            "保持の場面の L（ブレーキの遅れ）が決まりません: brake_lag_s が yaml にも pkl にもない"
+        )
+    try:
+        kp, ki = float(info["kp_pct_per_kmh"]), float(info["ki_pct_per_kmh_s"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ConfigError(f"meta['hold_pi'] に Kp・Ki がありません（{exc}）") from exc
+    try:
+        lam_s, pi_lag_s = float(info["lambda_s"]), float(info["L_s"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ConfigError(f"meta['hold_pi'] に lambda_s・L_s がありません（{exc}）") from exc
+    slope = slope_threshold_kmhs(cfg.learning.ramp_cruise_band_g)
+    creep = cfg.feedforward.creep_speed_kmh
+    lag = float(lag)
+    step_s = cfg.control.loop_interval_s
+    min_len = min_scene_length_s(lam_s, pi_lag_s)
+    intervals, dropped = hold_scene_intervals(
+        ReferenceSpeed(mode).at, mode.reference_speed[-1].time_s, step_s, lag,
+        slope_max_kmhs=slope, stop_kmh=STOP_SPEED_KMH, creep_kmh=creep, min_length_s=min_len,
+    )
+    pi = HoldScenePI(
+        kp=kp, ki=ki, dt_s=cfg.control.loop_interval_s,
+        lo_pct=cfg.vehicle.min_brake_opening_pct, hi_pct=cfg.stop_brake_opening_pct,
+        deadband_kmh=fm.hold_pi_deadband_kmh,
+    )
+    points = hold_opening_points(meta) if fm.hold_ff_enabled else None
+    text = (
+        f"PI あり・Kp {kp:.4f} %/(km/h)・Ki {ki:.4f} %/(km/h·s)・L {lag:g}s・"
+        f"場面 ＝ 基準の傾き ≤ {slope:.3f} km/h/s かつ {STOP_SPEED_KMH:g} < 基準 < {creep:g} km/h・"
+        f"指令は [{pi.lo_pct:g}, {pi.hi_pct:g}]%・積分の不感帯 {pi.deadband_kmh:g} km/h"
+        f"\n    区間の長さの下限 {min_len:.2f}s（2 ×（λ {lam_s:g} ＋ L {pi_lag_s:g}））・"
+        f"残った区間 {len(intervals)} 個・外した区間 {dropped} 個"
+    )
+    for iv in intervals:
+        text += (f"\n    区間 開始 {iv.start_s:.2f}s・長さ {iv.length_s:.2f}s・"
+                 f"車速 {iv.mean_kmh:.2f} km/h")
+    if fm.hold_ff_enabled:
+        if points is None:
+            text += "\n    保持の FF: meta['hold_opening'] なし → 今の FF のまま"
+        else:
+            pts = "・".join(f"{v:g} km/h:{o:.2f}%" for v, o in points)
+            text += f"\n    保持の FF: {pts}（足す量 {fm.hold_ff_offset_pct:+g}%）"
+    lead_ins: list[HoldInterval] = []
+    plant_c: float | None = None
+    if fm.hold_lead_in_enabled:
+        if not fm.hold_ff_enabled or points is None:
+            raise ConfigError(
+                "forward_map.hold_lead_in_enabled には hold_ff_enabled と"
+                " pkl の meta hold_opening が要ります"
+            )
+        try:
+            plant_k, plant_t = float(info["K_kmh_per_pct"]), float(info["T_s"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConfigError(
+                "forward_map.hold_lead_in_enabled には meta['hold_pi'] の"
+                f" K_kmh_per_pct・T_s が要ります（{exc}）"
+            ) from exc
+        if not (
+            math.isfinite(plant_k) and math.isfinite(plant_t) and plant_k > 0.0 and plant_t > 0.0
+        ):
+            raise ConfigError(
+                "meta['hold_pi'] の K_kmh_per_pct・T_s は正の有限の数が要ります"
+                f"（K {plant_k}・T {plant_t}）"
+            )
+        plant_c = plant_k / plant_t
+        lead_ins = hold_lead_in_intervals(
+            ReferenceSpeed(mode).at, intervals, step_s, stop_kmh=STOP_SPEED_KMH, creep_kmh=creep,
+        )
+        total = sum(iv.length_s for iv in lead_ins)
+        text += (f"\n    上り（段11）: {len(lead_ins)} 区間（合計 {total:g} s）・"
+                 f"c ＝ K÷T ＝ {plant_c:.3f} km/h/s per %")
+        for iv in lead_ins:
+            text += (f"\n    上り 開始 {iv.start_s:.2f}s・長さ {iv.length_s:.2f}s・"
+                     f"向かう先 {iv.mean_kmh:.2f} km/h")
+    # 2026-10-30 段14: λ＋L（1.09 s）では加速度の効き Kp×Tp×c ≒ 1.0 で、測りの遅れ
+    # （窓の半分＋ブレーキの遅れ）に対して強すぎ、UDDS `133341` で 1.5 s 周期・
+    # 合成 +0.3% `132812` で 2 s 周期の行き来が出た。Tp は加速度を測ってから効くまでの
+    # 遅れ（L ＋ 窓 ÷ 2）にする
+    tp_s = pi_lag_s + cfg.decel_stop.slope_window_s / 2.0
+    if fm.hold_accel_pred_enabled:
+        text += (f"\n    P の偏差の先読み（段13）: Tp ＝ L＋窓÷2 ＝ {tp_s:g} s・"
+                 f"加速度の窓 {cfg.decel_stop.slope_window_s:g} s・帯 ±{slope:.3f} km/h/s")
+    return HoldSceneSetup(
+        pi=pi, lag_s=lag, slope_max_kmhs=slope, stop_kmh=STOP_SPEED_KMH, creep_kmh=creep,
+        intervals=intervals, min_length_s=min_len, dropped_intervals=dropped, step_s=step_s,
+        points=points, offset_pct=fm.hold_ff_offset_pct, text=text,
+        lead_ins=lead_ins, plant_c=plant_c,
+        accel_pred=fm.hold_accel_pred_enabled, tp_s=tp_s,
+        accel_window_s=cfg.decel_stop.slope_window_s, accel_band_kmhs=slope,
+    )
+
+
 def band_cap_of(cfg: ResearchConfig, ff: Any) -> tuple[float | None, float, str]:
     """段6 P1: (cap [%]・帯の車速の上限 [km/h]・設定の表示文)。cap は pkl meta の launch_u_step_pct
     （手順2 が動き出す開度を探した刻み）。off・meta に刻みが無いときの cap は None（働かない）。"""
@@ -481,6 +639,8 @@ def _prepare_forward_map_plan(
         f"{'あり' if fm.fb_no_breakaway_floor else 'なし'}")
     say("  基準 0 の行は FB もブレーキを深くしない（段3 P3）: "
         f"{'あり' if fm.fb_no_deeper_at_ref_zero else 'なし'}")
+    hold_setup = make_hold_scene(cfg, ff, mode)  # hold_pi_enabled で meta が無ければ ConfigError
+    say(f"  保持の場面の PI（2026-10-30 段4）: {'なし' if hold_setup is None else hold_setup.text}")
     say(f"  動き出す開度の帯の P を刻みに抑える（段6 P1）: {band_cap_of(cfg, ff)[2]}")
     say("  停C の区間のブレーキ指令を浅くしない（段7 P2）: "
         f"{'あり' if fm.stop_end_brake_monotone else 'なし'}")
@@ -1320,6 +1480,10 @@ class _ModeRun:
     launch_hold: LaunchMoveHold | None = None
     _launch_hold_pct: float | None = None
     fb_no_floor: bool = False
+    # 2026-10-30 段4: 保持の場面（off のまま ＝ 今と同じ）
+    hold: HoldSceneSetup | None = None
+    hold_scene_cycles: int = 0
+    hold_lead_in_cycles: int = 0  # 段11: うち上りの周期
     # 2026-10-27 段3 P3・段6 P1・段7 P2 の既定（false のまま ＝ 今と同じ）
     fb_ref0_no_deeper: bool = False
     fb_ref0_cut_cycles: int = 0
@@ -1480,6 +1644,11 @@ class _ModeRun:
                 self._launch_hold_pct = 0.0
         # 段8-b: P・惰行の補助の表の引き直しだけ A2 を外す（forward_map.fb_no_breakaway_floor）
         self.fb_no_floor = bool(cfg.forward_map.fb_no_breakaway_floor)
+        # 段4: 保持の場面の PI（forward_map.hold_pi_enabled）
+        self.hold = make_hold_scene(cfg, self.ff, self.mode)
+        self.hold_scene_cycles = 0
+        self.hold_lead_in_cycles = 0
+        self._hold_speed_win: deque[tuple[float, float]] = deque()  # 段13: (t, CAN 車速)
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
         self._accel_blocked = False
@@ -1609,7 +1778,71 @@ class _ModeRun:
             coast_effort = self._coast_assist(t, ref, ref_t, speed, ff_effort)
             if coast_effort != 0.0:
                 c10_effort, coast_active = coast_effort, True
-        if self.midway_fb_no_deeper and c10_effort and isinstance(self.ff, ForwardMapFeedforward):
+        # 段4: 保持の場面。P・DOB の上乗せ・惰行の補助・切り取り・launch_move_hold の足しを止め、
+        # 開度の単位の PI に替える（hold_ff_enabled なら FF も保持の開度に置き換える）
+        plan_effort = ff_effort  # ログの plan_effort_pct は計画のまま
+        hold_scene: int | None = None
+        hold_pi_pct: float | None = None
+        hold_ff_pct: float | None = None
+        hold_add = 0.0
+        hold_accel: float | None = None
+        hold_pred_dev: float | None = None
+        if self.hold is not None:
+            h = self.hold
+            measured_accel: float | None = None
+            if h.accel_pred:
+                # 段13: 直近の窓の CAN 車速の最小二乗の傾き（場面の外でも更新して窓を満たす）
+                win = self._hold_speed_win
+                win.append((t, speed))
+                while win and win[0][0] < t - h.accel_window_s - 1e-9:
+                    win.popleft()
+                if len(win) >= 3:
+                    measured_accel = fit_slope([w[0] for w in win], [w[1] for w in win])
+            # 走行前に求めた区間（長さの下限つき）のどれかに t が入っているか
+            hold_scene = int(in_hold_interval(h.intervals, t, h.step_s))
+            if not hold_scene and h.lead_ins and in_hold_interval(h.lead_ins, t, h.step_s):
+                hold_scene = 2  # 段11: 保持の区間の直前の上り
+            if hold_scene:
+                self.hold_scene_cycles += 1
+                if hold_scene == 2:
+                    self.hold_lead_in_cycles += 1
+                    # 上りの FF ＝ 保持の開度（L 先の基準）− L 先の基準の傾き ÷ c（元の基準）
+                    assert h.points is not None and h.plant_c is not None
+                    ahead = t + h.lag_s
+                    r0 = self.ref.at(ahead)
+                    slope_ahead = (self.ref.at(ahead + h.step_s) - r0) / h.step_s
+                    hold_ff_pct = (
+                        lead_in_ff_pct(
+                            h.points, r0, slope_ahead, h.plant_c, h.pi.lo_pct, h.pi.hi_pct
+                        )
+                        + h.offset_pct
+                    )
+                    ff_effort = -hold_ff_pct
+                elif h.points is not None:
+                    hold_ff_pct = interp_hold_opening(h.points, ref) + h.offset_pct
+                    ff_effort = -hold_ff_pct
+                # 偏差は P と同じ（目標側の基準 − CAN 車速。この場面は予測が NaN ＝ 使わない）
+                p_dev: float | None = None
+                if h.accel_pred:
+                    hold_accel = banded_accel(measured_accel, h.accel_band_kmhs)
+                    p_dev = predicted_deviation(
+                        self.ref_t.at(t + h.tp_s), speed, hold_accel, h.tp_s
+                    )
+                    hold_pred_dev = p_dev
+                _, hold_pi_pct = h.pi.step(ref_t - speed, ff_effort, p_dev)
+                hold_add = hold_pi_pct
+                c10_effort = None if c10_effort is None else 0.0
+                coast_active = False
+                self._coast_effort = 0.0
+                self._stop_end_tau_s = None
+                if self.dob is not None:
+                    self._dob_effort = 0.0
+            else:
+                h.pi.reset()
+        if (
+            self.midway_fb_no_deeper and not hold_scene and c10_effort
+            and isinstance(self.ff, ForwardMapFeedforward)
+        ):
             plan = self.ff.plan
             if plan.is_launch_midway(plan.index_at(t)):
                 cut = cut_deeper_brake_fb(ff_effort, c10_effort)
@@ -1617,7 +1850,10 @@ class _ModeRun:
                     self.midway_fb_cut_cycles += 1
                     self.midway_fb_cut_pct_sum += -c10_effort
                     c10_effort = cut
-        if self.fb_ref0_no_deeper and c10_effort and isinstance(self.ff, ForwardMapFeedforward):
+        if (
+            self.fb_ref0_no_deeper and not hold_scene and c10_effort
+            and isinstance(self.ff, ForwardMapFeedforward)
+        ):
             # 段3 P3: 元の基準が停車速度以下の行は FB もブレーキを深くしない
             from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
 
@@ -1627,10 +1863,15 @@ class _ModeRun:
                 self.fb_ref0_cut_pct_sum += -c10_effort
                 c10_effort = cut
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
-        hold_delta = self._launch_hold_step(t, speed, ff_effort)  # 段8-a（off なら 0）
+        if hold_scene:
+            hold_delta = 0.0
+            if self.launch_hold is not None:
+                self._launch_hold_pct = 0.0
+        else:
+            hold_delta = self._launch_hold_step(t, speed, ff_effort)  # 段8-a（off なら 0）
         # C10 の上乗せは FF の列（accel_ff・brake_ff・plan_effort）には入れない（作ったずれが
         # 今までと同じ意味で比べられるように）。実際に出す effort にだけ足す
-        effort = ff_effort + (c10_effort or 0.0) + pid_effort + hold_delta
+        effort = ff_effort + (c10_effort or 0.0) + pid_effort + hold_delta + hold_add
         ff_shown = ff_effort  # ログの FF 列に出す値（C14 の下限を掛けたもの）
         floor_raise: float | None = None
         if self.cfloor is not None:
@@ -1723,7 +1964,7 @@ class _ModeRun:
                 brake_pos=brake_pos,
                 accel_current=accel_current,
                 brake_current=brake_current,
-                plan_effort_pct=ff_effort,
+                plan_effort_pct=plan_effort,
                 trim_effort_pct=pid_effort,
                 applied_effort_pct=effort,
                 phase=phase,
@@ -1751,6 +1992,9 @@ class _ModeRun:
                     ff_side_accel=self._ff_side_now(t, True),
                     ff_side_brake=self._ff_side_now(t, False),
                     ff_switch_lead_s=self._ff_switch_lead_now(t),
+                    hold_scene=hold_scene, hold_pi_effort_pct=hold_pi_pct,
+                    hold_ff_pct=hold_ff_pct,
+                    hold_accel_kmhs=hold_accel, hold_pred_dev_kmh=hold_pred_dev,
                 )
             )
         if segment != self._segment:
@@ -2366,6 +2610,10 @@ async def run_mode_drive(
         say("  動き出す開度の帯の P の抑え（段6 P1）: "
             f"{run.band_cap_cycles} 周期（{run.band_cap_cycles * run.interval_s:.1f}s）・"
             f"cap {run.band_cap_pct:g}%・削った量の合計 {run.band_cap_pct_sum:.1f}%")
+    if run.hold is not None:
+        say("  保持の場面の PI（段4）: "
+            f"{run.hold_scene_cycles} 周期（{run.hold_scene_cycles * run.interval_s:.1f}s）"
+            f"（うち上り {run.hold_lead_in_cycles} 周期）")
     if run.stop_end_monotone:
         say("  停C の区間のブレーキを浅くしない（段7 P2）: "
             f"{run.stop_end_monotone_cycles} 周期"

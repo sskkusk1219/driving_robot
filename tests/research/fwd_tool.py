@@ -11,6 +11,7 @@
         [--check CSV ...] [--ref-check CSV ...] [--save]
     .venv/bin/python -m tests.research.fwd_tool attach-pedal-track --pkl IN --csv CSV --out OUT
     .venv/bin/python -m tests.research.fwd_tool attach-local-gain --pkl IN --csv CSV --out OUT
+    .venv/bin/python -m tests.research.fwd_tool attach-hold-pi --pkl IN --csv CSV --out OUT
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import math
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -1416,8 +1417,8 @@ def select_model(evals: Sequence[ModelEval]) -> tuple[str | None, str]:
 
 
 def model_default_path(now: datetime | None = None) -> Path:
-    """results/models/fwd_model_<UTC>.pkl（pkl 名は UTC）。"""
-    stamp = (now or datetime.now(UTC)).strftime("%Y%m%d_%H%M%S")
+    """results/models/fwd_model_<JST>.pkl（ローカル時刻。2026-10-29 より前の pkl は UTC 名）。"""
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
     return MODELS_DIR / f"fwd_model_{stamp}.pkl"
 
 
@@ -1553,6 +1554,52 @@ def run_attach_local_gain(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_attach_hold_pi(args: argparse.Namespace) -> int:
+    """既存の pkl に、手順2 の BRAKE_SEARCH から求めた低速の保持用 PI の値（meta["hold_pi"]）を
+    付けて、新しい pkl に保存する（2026-10-30。元の pkl は書き換えない）。"""
+    from tests.research import hold_pi  # noqa: PLC0415
+    from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
+
+    src, out = Path(args.pkl), Path(args.out)
+    if out.exists():
+        print(f"保存先 {out} が既にある。上書きしない")
+        return 2
+    if out.resolve() == src.resolve():
+        print("保存先が元の pkl と同じ。別の名前にする")
+        return 2
+    table = load_forward_map(src)
+    lag = args.brake_lag_s if args.brake_lag_s is not None else table.meta.get("brake_lag_s")
+    if lag is None or not math.isfinite(float(lag)):
+        print("brake_lag_s が pkl の meta に無い。--brake-lag-s で渡す")
+        return 2
+    dev_c = load_config(Path(args.config)).forward_map.deviation_c
+    csv_path = Path(args.csv)
+    try:
+        if args.phase == hold_pi.PHASE_LOW_HOLD:
+            res = hold_pi.hold_pi_low_hold_from_csv(csv_path, lag_s=float(lag), deviation_c=dev_c)
+        else:
+            res = hold_pi.hold_pi_from_csv(csv_path, lag_s=float(lag), deviation_c=dev_c)
+    except hold_pi.HoldPiError as e:
+        print(f"エラー: {e}")
+        return 1
+    head = f"- CSV: `{csv_path.name}`・L={float(lag):g}s・deviation_c={dev_c:g}"
+    if res["source"] == hold_pi.PHASE_LOW_HOLD:
+        print(head)
+        print("\n".join(hold_pi.point_table_lines(res["per_step"])))
+        print(f"\n- 使った点 {res['steps_used']} / {res['steps_total']}")
+    else:
+        print(f"{head}・クリープ {res['creep_kmh']:.3f} km/h")
+        print("\n".join(hold_pi.step_table_lines(res["per_step"])))
+        print(f"\n- 使った段 {res['steps_used']} / {res['steps_total']}")
+    print(f"- K = {res['K_kmh_per_pct']:.4f} km/h/%・T = {res['T_s']:.3f} s・"
+          f"λ = {res['lambda_s']:.3f} s・Ti = {res['Ti_s']:.3f} s")
+    print(f"- Kp = {res['kp_pct_per_kmh']:.4f} %/(km/h)・"
+          f"Ki = {res['ki_pct_per_kmh_s']:.4f} %/(km/h·s)")
+    table.meta["hold_pi"] = res
+    print(f"保存: {save_table(table, out)}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fwd_tool", description="順モデル（C7〜C9）のオフライン道具")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1598,6 +1645,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lg.set_defaults(func=run_attach_local_gain)
 
+    hp = sub.add_parser(
+        "attach-hold-pi",
+        help="pkl に低速の保持用 PI の値（手順2 の BRAKE_SEARCH から求める）を付けて別名で保存",
+    )
+    hp.add_argument("--pkl", required=True, help="元の表の pkl（書き換えない）")
+    hp.add_argument("--csv", required=True, help="手順2 の走行 CSV")
+    hp.add_argument("--out", required=True, help="保存先 pkl（既にあれば失敗）")
+    hp.add_argument(
+        "--brake-lag-s", type=float, default=None, help="省略: pkl の meta の brake_lag_s"
+    )
+    hp.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="deviation_c を読む設定")
+    hp.add_argument(
+        "--phase", choices=["BRAKE_SEARCH", "LOW_HOLD"], default="BRAKE_SEARCH",
+        help="K・T を測る区間（LOW_HOLD: 手順13 の 4 点の保持。積分器に近い車向き）",
+    )
+    hp.set_defaults(func=run_attach_hold_pi)
+
     sc = sub.add_parser("score", help="検証ログで順モデルを採点する")
     add_train(sc)
     sc.add_argument("--map", default=None, help="表の pkl（省略: 学習ログからその場で作る）")
@@ -1629,7 +1693,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ref-check", nargs="+", default=None, metavar="CSV",
         help="参考の検証ログ（表を出すだけ。選定・学習に使わない）",
     )
-    mo.add_argument("--save", action="store_true", help="選んだモデルを fwd_model_<UTC>.pkl に保存")
+    mo.add_argument("--save", action="store_true", help="選んだモデルを fwd_model_<JST>.pkl に保存")
     mo.set_defaults(func=run_model)
     return p
 

@@ -30,7 +30,7 @@ import csv
 import pickle
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -173,6 +173,21 @@ def build_training_set(
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _trained_at_jst(raw: Any) -> str:
+    """pkl の trained_at を JST（ローカル時刻）の `%Y-%m-%d %H:%M:%S` にする。
+
+    tz 付きはローカルへ変換、naive（旧 pkl）は UTC とみなして変換。読めなければ先頭 19 文字。
+    """
+    text = str(raw or "")
+    try:
+        t = datetime.fromisoformat(text)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=UTC)
+        return t.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return text[:19].replace("T", " ")
+
+
 def score(y: np.ndarray, pred: np.ndarray) -> dict[str, float]:
     """metrics と同じ指標（R² は分散があるときだけ）を予測値から出す。"""
     out = {
@@ -230,7 +245,7 @@ def saved_models_table(model_path: Path) -> str:
         a, b = m.get("accel", {}), m.get("brake", {})
         rows.append([
             f"{'★ ' if path.name == model_path.name else ''}`{path.name}`",
-            str(data.get("trained_at", ""))[:19].replace("T", " "),
+            _trained_at_jst(data.get("trained_at")),
             _fmt(a, "r2"), _fmt(a, "rmse", 2), _fmt(a, "mae", 2), f"{a.get('n', 0):.0f}",
             _fmt(b, "r2"), _fmt(b, "rmse", 2), _fmt(b, "mae", 2), f"{b.get('n', 0):.0f}",
             f"{data.get('speed_clip_max', float('nan')):.1f}",
@@ -238,7 +253,7 @@ def saved_models_table(model_path: Path) -> str:
     return "\n\n".join([
         "### M-1 保存済みモデルの指標（学習データ上。★ = config の model_path）",
         md_table(
-            ["モデル", "学習日時(UTC)", "アクセル R²", "アクセル RMSE[%]", "アクセル MAE[%]",
+            ["モデル", "学習日時(JST)", "アクセル R²", "アクセル RMSE[%]", "アクセル MAE[%]",
              "アクセル n", "ブレーキ R²", "ブレーキ RMSE[%]", "ブレーキ MAE[%]", "ブレーキ n",
              "学習最高車速[km/h]"],
             rows,
