@@ -403,7 +403,8 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
       終わりと同じ。次のパターンが停車保持へ踏む）。逃げ道: 実加速度 ≧ 0 が stop_release_escape_s
       続いたら、同じく結果を記録して `_finish_pattern`（走っていれば DRIVE_BRAKE ＝ 停車復帰）。
       安全網: STOP_RELEASE_TIMEOUT_S 経っても終わらなければ同じ。
-    - 入らない段: 目標減速度が stop_release_max_g を超える段（強い段）、u ≧ 0 の段。
+    - 入らない段: 目標減速度が stop_release_max_g（2026-10-31 から 0.35 ＝ 全段が入る）を超える段、
+      u ≧ 0 の段。
       1 回の下りにつき 1 回だけ入る。
 
 2026-10-28 段2（ProblemReport_20261028 手順2 B）: 効き始めの少し先で、ブレーキ・アクセルを小さく
@@ -808,7 +809,7 @@ class PatternLoopConfig:
     stop_release_rate_pct_s: float = field(default=2.0)
     stop_release_escape_s: float = field(default=0.5)
     stop_release_escape_decel_kmhs: float = field(default=0.1)
-    stop_release_max_g: float = field(default=0.2)
+    stop_release_max_g: float = field(default=0.35)
     # 2026-10-28 段2: 効き始めの少し先での小さな動き（learning.ramp_dither_* から渡す。false なら
     # 今と同じ走り）。効き始め（min からの量）は pkl の meta から `pattern_drive` が渡す
     # （None なら入らない）

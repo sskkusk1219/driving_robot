@@ -1313,7 +1313,7 @@ def test_stop_release_and_stop_exclusion_settings_default_and_validation() -> No
     assert lr.stop_release_rate_pct_s == pytest.approx(2.0)
     assert lr.stop_release_escape_s == pytest.approx(0.5)
     assert lr.stop_release_escape_decel_kmhs == pytest.approx(0.1)
-    assert lr.stop_release_max_g == pytest.approx(0.2)
+    assert lr.stop_release_max_g == pytest.approx(0.35)
     assert lr.stop_approach_exclusion == "none"
     assert cfgmod.validate_config(cfg) == []
     for ok in ("window", "depth"):
@@ -1333,7 +1333,7 @@ def test_stop_release_and_stop_exclusion_settings_default_and_validation() -> No
         ("stop_release_rate_pct_s", 0.0, 2.0),
         ("stop_release_escape_s", -1.0, 0.5),
         ("stop_release_escape_decel_kmhs", -0.1, 0.1),
-        ("stop_release_max_g", 0.0, 0.2),
+        ("stop_release_max_g", 0.0, 0.35),
         ("stop_release_fracs", [], [0.25, 0.5]),
         ("stop_release_fracs", [0.0], [0.25, 0.5]),
         ("stop_release_fracs", [1.5], [0.25, 0.5]),

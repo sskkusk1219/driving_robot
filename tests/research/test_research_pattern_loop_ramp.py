@@ -3488,7 +3488,7 @@ def test_launch_release_disabled_by_empty_rates_keeps_old_flow() -> None:
 def _stop_config(**kw: object) -> PatternLoopConfig:
     base = PatternLoopConfig(
         stop_release_enabled=True, stop_release_start_kmh=7.5, stop_release_fracs=(0.25, 0.5),
-        stop_release_rate_pct_s=2.0, stop_release_escape_s=0.5, stop_release_max_g=0.2,
+        stop_release_rate_pct_s=2.0, stop_release_escape_s=0.5, stop_release_max_g=0.35,
     )
     return dataclasses.replace(base, **kw)  # type: ignore[arg-type]
 
@@ -3626,16 +3626,18 @@ def test_stop_release_escape_when_speed_is_constant_slightly_negative() -> None:
 
 
 def test_stop_release_skips_strong_steps_and_non_brake() -> None:
-    """目標減速度が stop_release_max_g を超える段（0.25G）には入らない。0.2G ちょうどは入る。
-    u ＜ 0 でない（ブレーキを踏んでいない）下りも入らない。"""
+    """目標減速度が stop_release_max_g を超える段には入らない。既定 0.35G（2026-10-31 に 0.2 から
+    変更）では 0.25G・0.35G ちょうども入る。u ＜ 0 でない（ブレーキを踏んでいない）下りも
+    入らない。"""
     strong = _release_ramp(stations=(), g=0.25)
-    loop = _loop([strong], config=_stop_config())
+    loop = _loop([strong], config=_stop_config(stop_release_max_g=0.2))
     rows = _run_stop(loop, strong, _StopKine(loop, 0.25))
     assert not any(r[1] == "RAMP_STOP_RELEASE" for r in rows)
-    edge = _release_ramp(stations=(), g=0.2)
-    loop = _loop([edge], config=_stop_config())
-    rows = _run_stop(loop, edge, _StopKine(loop, 0.2))
-    assert any(r[1] == "RAMP_STOP_RELEASE" for r in rows)
+    for g in (0.25, 0.35):
+        edge = _release_ramp(stations=(), g=g)
+        loop = _loop([edge], config=_stop_config())
+        rows = _run_stop(loop, edge, _StopKine(loop, g))
+        assert any(r[1] == "RAMP_STOP_RELEASE" for r in rows), g
     weak = _release_ramp(stations=(), g=0.1)
     loop = _loop([weak], config=_stop_config())
     t, v = 0.0, 40.0

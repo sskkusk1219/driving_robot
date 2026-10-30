@@ -890,7 +890,8 @@ learning:
   # 保つ。戻しても減速が止まったら（加速度 >= 0 が stop_release_escape_s 続く）停車保持へ踏む。
   # 目標減速度が stop_release_max_g を超える強い段には入れない。phase は RAMP_STOP_RELEASE。
   # false は今と同じ走り。根拠: モードの B5 は約 74 秒あるのに手順2 の学習データは 5.3 秒
-  # （start 7.5・fracs・rate 2.0 は半分データ由来、escape 0.5・max_g 0.2 は仮値）。
+  # （start 7.5・fracs・rate 2.0 は半分データ由来、escape 0.5 は仮値）。
+  # max_g は 2026-10-31 に 0.2 → 0.35（最強段）: 0.25・0.35G も一定 G のまま停車は危険なので全段で入れる。
   # 効く先: 手順2 の所要が約 +10 秒。2026-10-23 段5-8 で採る（ramp_release_enabled と組で）
   stop_release_enabled: true
   stop_release_start_kmh: 7.5
@@ -899,7 +900,7 @@ learning:
   stop_release_escape_s: 0.5
   # 逃げ道の判定は加速度 >= −この値 [km/h/s]（速度一定を拾う。仮値・根拠なし。実機の後に決める）
   stop_release_escape_decel_kmhs: 0.1
-  stop_release_max_g: 0.2
+  stop_release_max_g: 0.35
   # 2026-10-23 段5-8: 停車まぎわ除外の外し方。depth ＝ 5 km/h 未満かつ u <= −8% の行（今まで）、
   # none ＝ 外さない、window ＝ 加速度の窓が停車の瞬間にかかる行だけ。効く先: 手順2 の C8 系の表（meta
   # stop_approach_exclusion）。2026-10-23 段5-8 で none を採る（机上で戻し 7.5〜20 の残差 0.422 → 0.217）
