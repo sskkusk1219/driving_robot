@@ -94,6 +94,7 @@ FLAG_FILLED = POINT_FILLED
 FLAG_OUT = POINT_OUT
 FLAG_COAST = 3
 FLAG_STOP = 4
+FLAG_COAST_FILL = 6  # 2026-10-30 段2 案 D: 短い惰行を前後のペダルで埋めた行（FB は効く）
 FLAG_PREPOS = 5  # 2026-10-16 段2o-6: 次に踏むペダルを min から効き始めの手前へ先に置いている区間
 # 2026-10-22 段5-2: 行ごとに引いた表（ForwardPlan.side_accel / side_brake。int）。
 # 戻しの表（SIDE_RELEASE）は、ブレーキ側で戻し量を見て解き直した行だけに入る
@@ -114,6 +115,7 @@ FLAG_LABELS = {
     FLAG_COAST: "惰行",
     FLAG_STOP: "停車保持",
     FLAG_PREPOS: "先置き",
+    FLAG_COAST_FILL: "惰行の埋め",
 }
 
 
@@ -708,6 +710,13 @@ class ForwardPlan:
     launch_prep: np.ndarray | None = None
     # 2026-10-27 段13: 発進のずらし（launch_shift_choose）の集計。使わなければ None
     launch_shift: LaunchShiftStats | None = None
+    # 2026-10-30 段2 案 D: 埋めた惰行の本数と行数（coast_fill_max_s が 0 なら 0）
+    coast_fill_runs: int = 0
+    coast_fill_rows: int = 0
+
+    def coast_fill_s(self) -> float:
+        """案 D で埋めた惰行の秒数。"""
+        return self.coast_fill_rows * self.period_s
 
     def side_for(self, i: int, is_accel: bool) -> int | None:
         """行 i のペダル（アクセル側かブレーキ側か）で計画が引いた表 SIDE_*。
@@ -791,6 +800,8 @@ def build_plan(
     brake_lag_s: float | None = None,
     need_window_s: float = DEFAULT_NEED_WINDOW_S,
     coast_band_kmhs: float = DEFAULT_COAST_BAND_KMHS,
+    coast_band_release_at_zero: bool = False,
+    coast_fill_max_s: float = 0.0,
     preposition_enabled: bool = False,
     preposition_margin_pct: float = 0.5,
     preposition_lead_s: float = 0.2,
@@ -828,6 +839,12 @@ def build_plan(
     _choose_alt: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> ForwardPlan:
     """基準車速から開度の列を作る（走る前に全時刻ぶんを解く）。
+
+    2026-10-30 段1 案 B: `coast_band_release_at_zero`。False は今までと完全に同じ。True は惰行の帯を
+    「入る」側にだけ使う（`_band_hysteresis`）: 前の行がアクセルなら、要る加速度 − 惰行の加速度 > 0
+    かつ u_a > 0 の間はアクセルのまま（ブレーキも同様）。離したあと反対側の帯を越えれば
+    その行から反対のペダル。停車保持の行で状態を戻す。低速の表の側を決める判定（dir・pedal の
+    midway）は今までの帯のまま。
 
     2026-10-24 段7-b: `launch_release_ramp`。False は今までと完全に同じ。True は停車からの発進の
     ブレーキを基準の動き出しに合わせて離す（`_launch_release_ramp`）。t0 ＝ 停車の後に基準（停車の
@@ -964,6 +981,8 @@ def build_plan(
             "stop_brake_opening_pct": stop_brake_opening_pct, "stop_horizon_s": stop_horizon_s,
             "period_s": period_s, "accel_lag_s": accel_lag_s, "brake_lag_s": brake_lag_s,
             "need_window_s": need_window_s, "coast_band_kmhs": coast_band_kmhs,
+            "coast_band_release_at_zero": coast_band_release_at_zero,
+            "coast_fill_max_s": coast_fill_max_s,
             "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
@@ -1010,6 +1029,8 @@ def build_plan(
             "stop_brake_opening_pct": stop_brake_opening_pct, "stop_horizon_s": stop_horizon_s,
             "period_s": period_s, "accel_lag_s": accel_lag_s, "brake_lag_s": brake_lag_s,
             "need_window_s": need_window_s, "coast_band_kmhs": coast_band_kmhs,
+            "coast_band_release_at_zero": coast_band_release_at_zero,
+            "coast_fill_max_s": coast_fill_max_s,
             "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
@@ -1205,6 +1226,14 @@ def build_plan(
     want_brake = ~want_accel & (need_b - coast_b <= -coast_band_kmhs + 1e-12)
     is_accel = want_accel & (u_a > 0.0)
     is_brake = want_brake & (u_b < 0.0)
+    if coast_band_release_at_zero:
+        # 2026-10-30 段1 案 B: 入るのは今までの帯、離すのは差が 0 になったとき（時刻順）。
+        # 停車保持の行で状態をリセットする。need の選択も決め直したペダルに合わせる
+        is_accel, is_brake = _band_hysteresis(
+            np.broadcast_to(need_a - coast_a, (n,)), np.broadcast_to(need_b - coast_b, (n,)),
+            u_a > 0.0, u_b < 0.0, coast_band_kmhs, stop,
+        )
+        want_accel, want_brake = is_accel, is_brake
     effort = np.zeros(n)
     effort[is_accel] = accel_deadband_pct + u_a[is_accel]
     effort[is_brake] = -(brake_deadband_pct + np.abs(u_b[is_brake]))
@@ -1321,6 +1350,18 @@ def build_plan(
             for key, arr in zip(("lp_la", "lp_sa", "lp_lb", "lp_sb"), lp_sides, strict=True):
                 _aux_out[key] = arr.copy()
     effort = np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)
+    fill_runs = fill_rows = 0
+    if coast_fill_max_s > 0.0:
+        # 2026-10-30 段2 案 D: 停車保持の上書きの後・先置き／すき間の前に短い惰行を埋める
+        fill_runs, fill_rows = _fill_short_coasts(
+            effort, flag,
+            np.broadcast_to(need_a - coast_a, (n,)), np.broadcast_to(need_b - coast_b, (n,)),
+            u_a, u_b,
+            max_s=coast_fill_max_s, period_s=period_s,
+            accel_min_pct=accel_deadband_pct, brake_min_pct=brake_deadband_pct,
+            accel_hold_pct=_hold_opening(table, "accel_onset_u_pct", accel_deadband_pct),
+            brake_hold_pct=_hold_opening(table, "brake_onset_u_pct", brake_deadband_pct),
+        )
     stats = None
     ret = return_time_of(table, accel_deadband_pct, brake_deadband_pct)
     if preposition_enabled:
@@ -1377,8 +1418,121 @@ def build_plan(
         side_rule="dir" if dir_rule else ("pedal" if pedal_rule else "legacy"),
         switch_lead_s=_lead_extra,
         launch_midway=np.asarray(midway, dtype=bool).copy() if dir_rule else None,
-        launch_prep=launch_prep,
+        launch_prep=launch_prep, coast_fill_runs=fill_runs, coast_fill_rows=fill_rows,
     )
+
+
+def _hold_opening(table: ForwardTable, key: str, min_pct: float) -> float:
+    """効き始めの開度の大きさ [%] ＝ min ＋ |meta の効き始め u|。meta が無い・NaN なら min だけ。"""
+    on = table.meta.get(key)
+    if on is None or not np.isfinite(on):
+        return float(min_pct)
+    return float(min_pct) + abs(float(on))
+
+
+def _fill_short_coasts(
+    effort: np.ndarray,
+    flag: np.ndarray,
+    diff_a: np.ndarray,
+    diff_b: np.ndarray,
+    u_a: np.ndarray,
+    u_b: np.ndarray,
+    *,
+    max_s: float,
+    period_s: float,
+    accel_min_pct: float,
+    brake_min_pct: float,
+    accel_hold_pct: float,
+    brake_hold_pct: float,
+) -> tuple[int, int]:
+    """短い惰行を前後のペダルで埋める（2026-10-30 段2 案 D。effort・flag をその場で書き換える）。
+
+    FLAG_COAST の連続区間のうち長さ < max_s のものが対象。区間の前か後ろが停車保持（FLAG_STOP）・
+    計画の端・ペダルなし（effort 0）なら埋めない。前後が同じペダルならそのペダル、違うなら行ごとに
+    差の符号（diff_a > 0 ならアクセル、diff_b < 0 ならブレーキ。両方・どちらでもなければ直前の
+    ペダル）で選ぶ。開度は、差が選んだペダルの向きで u が踏める向きの行は表を逆に引いた値
+    （min ＋ |u|）、そうでない行は効き始めの開度（accel_hold_pct・brake_hold_pct）で保つ。
+    埋めた行の flag は FLAG_COAST_FILL。戻り値は (埋めた本数, 埋めた行数)。
+    """
+    n = len(effort)
+    runs = rows = 0
+    i = 0
+    while i < n:
+        if flag[i] != FLAG_COAST:
+            i += 1
+            continue
+        s = i
+        while i < n and flag[i] == FLAG_COAST:
+            i += 1
+        e = i  # 区間は [s, e)
+        if (e - s) * period_s >= max_s - 1e-9 or s == 0 or e >= n:
+            continue
+        if flag[s - 1] == FLAG_STOP or flag[e] == FLAG_STOP:
+            continue
+        before, after = effort[s - 1], effort[e]
+        if before == 0.0 or after == 0.0:
+            continue
+        prev_accel = before > 0.0
+        same = prev_accel == (after > 0.0)
+        for r in range(s, e):
+            if same:
+                use_accel = prev_accel
+            else:
+                a_dir, b_dir = diff_a[r] > 0.0, diff_b[r] < 0.0
+                use_accel = bool(a_dir) if a_dir != b_dir else prev_accel
+            if use_accel:
+                in_dir = diff_a[r] > 0.0 and u_a[r] > 0.0
+                val = accel_min_pct + float(u_a[r]) if in_dir else accel_hold_pct
+            else:
+                in_dir = diff_b[r] < 0.0 and u_b[r] < 0.0
+                val = -(brake_min_pct + abs(float(u_b[r]))) if in_dir else -brake_hold_pct
+            effort[r] = float(np.clip(val, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT))
+            flag[r] = FLAG_COAST_FILL
+        runs += 1
+        rows += e - s
+    return runs, rows
+
+
+def _band_hysteresis(
+    diff_a: np.ndarray,
+    diff_b: np.ndarray,
+    ok_a: np.ndarray,
+    ok_b: np.ndarray,
+    band: float,
+    reset: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """惰行の帯のヒステリシス（2026-10-30 段1 案 B。`coast_band_release_at_zero`）。
+
+    diff_a ＝ 要る加速度（アクセル側）− 惰行の加速度、diff_b ＝ ブレーキ側の同じ差。
+    ok_a ＝ u_a > 0、ok_b ＝ u_b < 0（そのペダルが実際に踏める行）。
+    (is_accel, is_brake) を時刻順に決める。
+      入る: 今までと同じ。diff_a >= band でアクセル、そうでなく diff_b <= −band でブレーキ
+        （それぞれ ok も要る）
+      続ける: 前の行がアクセルなら diff_a > 0 かつ ok_a の間はアクセル。前の行がブレーキなら
+        diff_b < 0 かつ ok_b の間はブレーキ
+      続けられなくなった行は、通常の「入る」判定（反対のペダルの帯を越えていれば反対、でなければ惰行）
+    reset の行（停車保持）の後は「前のペダルなし」に戻す。"""
+    n = len(diff_a)
+    is_a = np.zeros(n, dtype=bool)
+    is_b = np.zeros(n, dtype=bool)
+    prev = 0  # 1 ＝ アクセル、−1 ＝ ブレーキ、0 ＝ なし
+    eps = 1e-12
+    for i in range(n):
+        da, db = float(diff_a[i]), float(diff_b[i])
+        if prev == 1 and da > 0.0 and ok_a[i]:
+            cur = 1
+        elif prev == -1 and db < 0.0 and ok_b[i]:
+            cur = -1
+        elif da >= band - eps:
+            cur = 1 if ok_a[i] else 0
+        elif db <= -band + eps:
+            cur = -1 if ok_b[i] else 0
+        else:
+            cur = 0
+        is_a[i] = cur == 1
+        is_b[i] = cur == -1
+        prev = 0 if reset[i] else cur
+    return is_a, is_b
 
 
 def _launch_events(
