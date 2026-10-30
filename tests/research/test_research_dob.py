@@ -297,3 +297,34 @@ def test_fast_tq_ignores_wrong_direction() -> None:
     assert obs.n_fast_accel == 0 and obs.n_fast_brake == 0
     _run(obs, 10, u=-10.0, extra=0.2, t0=t + 1.0, v0=v, need_kmhs=-8.0)
     assert obs.n_fast_brake > 0 and obs.n_fast_accel == 0
+
+
+def test_split_low_off_ignores_low_box_flag() -> None:
+    """段1（2026-10-31）: split_low が false なら low_box を渡しても今までと同じ。"""
+    base, off = _obs(), _obs()
+    _run(base, 30, u=10.0, extra=-0.4)
+    _run(off, 30, u=10.0, extra=-0.4, low_box=True)
+    assert off.d_accel == base.d_accel and off.n_accel == base.n_accel
+    assert off.d_accel_low == 0.0 and off.n_accel_low == 0
+
+
+def test_split_low_box_updates_only_low_and_carries_over() -> None:
+    obs = PedalDisturbanceObserver(
+        _Table(), tq_accel_s=1.0, tq_brake_s=1.0, lag_accel_s=0.0, lag_brake_s=0.0,
+        split_low=True,
+    )
+    t, v = _run(obs, 80, u=10.0, extra=-0.3, low_box=True)
+    assert obs.d_accel == 0.0 and obs.n_accel == 0  # 本体の箱は動かない
+    assert obs.d_accel_low == pytest.approx(-0.3, abs=0.01) and obs.n_accel_low > 0
+    assert obs.estimate(is_accel=True, low=True) == obs.d_accel_low
+    assert obs.estimate(is_accel=True) == 0.0
+    low_before = obs.d_accel_low
+    # 本体の箱の期間: 低速の箱は動かず保たれる
+    t, v = _run(obs, 80, u=10.0, extra=0.2, t0=t, v0=v)
+    assert obs.d_accel_low == low_before
+    assert obs.d_accel == pytest.approx(0.2, abs=0.01)
+    # 次の低速は前回の値から続ける（0 に戻らない）
+    _run(obs, 2, u=10.0, extra=-0.3, t0=t, v0=v, low_box=True)
+    assert obs.d_accel_low == pytest.approx(low_before, abs=0.05)
+    # ブレーキ側の低速の箱は別
+    assert obs.d_brake_low == 0.0 and obs.n_brake_low == 0

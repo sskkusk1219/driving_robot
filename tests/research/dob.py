@@ -46,6 +46,7 @@ class PedalDisturbanceObserver:
         tq_fast_accel_s: float | None = None,
         tq_fast_brake_s: float | None = None,
         fast_need_kmhs: float = 0.0,
+        split_low: bool = False,
     ) -> None:
         self.table = table
         self.tq_accel_s = tq_accel_s
@@ -66,12 +67,22 @@ class PedalDisturbanceObserver:
         self.d_brake = 0.0
         self.n_accel = 0  # 推定を更新した周期数
         self.n_brake = 0
+        # 2026-10-31 ProblemReport_20261031_DOBが逆向き 段1: 低速の箱。split_low で low_box の周期は
+        # こちらだけを更新し、本体の箱（d_accel・d_brake）には持ち込まない。リセットしない
+        # （前回の低速の値を次の低速へ引き継ぐ）
+        self.split_low = split_low
+        self.d_accel_low = 0.0
+        self.d_brake_low = 0.0
+        self.n_accel_low = 0
+        self.n_brake_low = 0
         # (時刻, u, 最大開度か, ガバナーか) の履歴
         self._hist: deque[tuple[float, float, bool, bool]] = deque()
         self._prev_t: float | None = None
         self._prev_speed: float | None = None
 
-    def estimate(self, *, is_accel: bool) -> float:
+    def estimate(self, *, is_accel: bool, low: bool = False) -> float:
+        if low:
+            return self.d_accel_low if is_accel else self.d_brake_low
         return self.d_accel if is_accel else self.d_brake
 
     def _delayed(self, tau: float) -> tuple[float, bool, bool] | None:
@@ -166,6 +177,7 @@ class PedalDisturbanceObserver:
         stop: bool,
         side_tables: bool = False,
         need_kmhs: float | None = None,
+        low_box: bool = False,
     ) -> str | None:
         """1 周期ぶん進める。推定を更新したペダル（PEDAL_ACCEL / PEDAL_BRAKE）を返す。
         更新しなければ None。
@@ -180,6 +192,9 @@ class PedalDisturbanceObserver:
         あり、更新するペダルの向きで強いとき（アクセル ≥ +fast_need_kmhs・
         ブレーキ ≤ −fast_need_kmhs）だけ、その周期の更新を速い Tq で行う。外れたら元の Tq に戻る
         （推定値はそのまま引き継ぐ）。
+        low_box（段1。既定 False）: split_low かつ True の周期は、低速の箱（d_*_low）だけを
+        更新する。
+        予測（どの表を引くか）は変わらない。
         """
         self._hist.append((t, u_now, at_limit_now, governed))
         prev_t, prev_v = self._prev_t, self._prev_speed
@@ -245,6 +260,16 @@ class PedalDisturbanceObserver:
         if fast:
             tq = min(tq, tq_fast)  # type: ignore[type-var]
         alpha = min(1.0, dt / tq)
+        if self.split_low and low_box:
+            if is_accel:
+                self.d_accel_low += alpha * (e - self.d_accel_low)
+                self.n_accel_low += 1
+                self.n_fast_accel += int(fast)
+                return PEDAL_ACCEL
+            self.d_brake_low += alpha * (e - self.d_brake_low)
+            self.n_brake_low += 1
+            self.n_fast_brake += int(fast)
+            return PEDAL_BRAKE
         if is_accel:
             self.d_accel += alpha * (e - self.d_accel)
             self.n_accel += 1
