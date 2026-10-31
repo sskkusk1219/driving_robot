@@ -290,10 +290,9 @@ def test_plan_band_row_lookup_in_mode_drive() -> None:
 def test_launch_brake_band_default_false_and_config_checks() -> None:
     assert cfgmod.ForwardMapSection().launch_brake_band is False
     cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
-    assert cfg.forward_map.launch_brake_band is False
+    # 2026-11-01 段4 で採用: 本体 yaml は true（依存する設定が揃っている）
+    assert cfg.forward_map.launch_brake_band is True
     assert cfgmod.validate_config(cfg) == []
-    cfg.forward_map.launch_brake_band = True
-    assert cfgmod.validate_config(cfg) == []  # 本体 yaml は依存する設定が揃っている
     for name in ("launch_release_ramp", "hold_pi_enabled", "hold_ff_enabled"):
         c2 = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
         c2.forward_map.launch_brake_band = True
