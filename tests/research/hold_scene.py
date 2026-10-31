@@ -36,7 +36,7 @@ Tp ＝ L ＋ 窓 ÷ 2（加速度を測ってから効くまでの遅れ）。
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -204,6 +204,101 @@ def lead_in_ff_pct(
     if math.isfinite(c_kmhs_per_pct) and c_kmhs_per_pct > 0.0 and math.isfinite(slope_ahead_kmhs):
         slope_term = slope_ahead_kmhs / c_kmhs_per_pct
     return min(max(base - slope_term, lo_pct), hi_pct)
+
+
+def lead_in_ff_at(
+    ref_at: Callable[[float], float],
+    t_s: float,
+    lag_s: float,
+    step_s: float,
+    points: list[tuple[float, float]],
+    c_kmhs_per_pct: float,
+    lo_pct: float,
+    hi_pct: float,
+    offset_pct: float,
+) -> float:
+    """時刻 t の上りの FF（ブレーキ開度。正 [%]）＝ lead_in_ff_pct（L 先の基準・傾き）＋ offset。
+    mode_drive の上り（hold_scene ＝ 2）・発進のブレーキの帯（hold_scene ＝ 3）と
+    fwd_plan.build_plan の帯の行が同じ式を使う（2026-10-31 発進のブレーキの帯）。"""
+    ahead = t_s + lag_s
+    r0 = ref_at(ahead)
+    slope_ahead = (ref_at(ahead + step_s) - r0) / step_s
+    return lead_in_ff_pct(points, r0, slope_ahead, c_kmhs_per_pct, lo_pct, hi_pct) + offset_pct
+
+
+def launch_band_intervals(
+    ref_at: Callable[[float], float],
+    duration_s: float,
+    step_s: float,
+    lag_s: float,
+    *,
+    stop_kmh: float,
+    creep_kmh: float,
+    creep_speeds_kmh: Sequence[float],
+    creep_accel_kmhs: Sequence[float],
+    ff_pct_at: Callable[[float], float],
+    return_seconds: Callable[[float], float],
+    exclude: Sequence[HoldInterval] = (),
+) -> list[HoldInterval]:
+    """2026-10-31 発進のブレーキの帯（案 B。ProblemReport_20261031_発進でブレーキを離すのが
+    早い 段3）。
+
+    停車（基準 ≤ stop_kmh）から基準が動き出す行 t_go（基準が stop_kmh を超える最初の行）ごとに、
+    t_go から「L 先の基準の傾き ＞ クリープの曲線（L 先の基準）」になる手前までを区間にする。
+    傾き ＝ (ref(t+L+刻み) − ref(t+L)) ÷ 刻み（上りの FF と同じ）、曲線 ＝ np.interp(ref(t+L),
+    creep_speeds_kmh, creep_accel_kmhs)（手順2 が測ったクリープの加速度）。区間の中は
+    stop_kmh < 基準(t) < creep_kmh かつ L 先の基準 < creep_kmh。この間は両ペダル min でもクリープが
+    基準の傾き以上の加速度を出せるので、アクセルを使わずブレーキの帯で動かせる。
+    対象外: 長さ < return_seconds(その区間の最後の行の FF の開度) ＋ L（ブレーキを min へ戻して
+    アクセルへ踏み替える時間に足りない）／exclude（保持の区間・上り）と時間が重なるもの
+    （既存を優先）。start_s ＝ t_go − L（周期に丸める。
+    2026-11-01 修正 2）、length_s ＝ 周期数 × 刻み、mean_kmh ＝ 区間の基準の平均。"""
+    out: list[HoldInterval] = []
+    n = int(math.floor(duration_s / step_s + 1e-9)) + 1
+    xs = np.asarray(creep_speeds_kmh, dtype=float)
+    ys = np.asarray(creep_accel_kmhs, dtype=float)
+    prev_stopped = False
+    k = 0
+    while k < n:
+        t = k * step_s
+        r = ref_at(t)
+        stopped = r <= stop_kmh
+        if not (prev_stopped and not stopped):
+            prev_stopped = stopped
+            k += 1
+            continue
+        # 発進: 行 k が t_go
+        j = k
+        speeds: list[float] = []
+        while j < n:
+            tj = j * step_s
+            rj = ref_at(tj)
+            ahead = tj + lag_s
+            ra = ref_at(ahead)
+            slope = (ref_at(ahead + step_s) - ra) / step_s
+            if not (
+                stop_kmh < rj < creep_kmh and ra < creep_kmh
+                and slope <= float(np.interp(ra, xs, ys)) + 1e-9
+            ):
+                break
+            speeds.append(rj)
+            j += 1
+        if j > k:
+            length = (j - k) * step_s
+            need_s = return_seconds(ff_pct_at((j - 1) * step_s)) + lag_s
+            # 2026-11-01 修正 2: 指令の時刻で見た帯は t_go − L（FF が L 先の基準 ref(t+L) で
+            # 決まるため。離しの直線が bk に着く行と同じ）から始める。長さの下限は伸ばす前の長さ
+            # （基準が動き出してからの時間）で判定する（伸ばした後だと短い発進が増えて対象が変わる）
+            k0 = int(np.clip(round(k - lag_s / step_s), 0, k))
+            start = k0 * step_s
+            length += (k - k0) * step_s
+            overlap = any(iv.start_s < start + length - 1e-9 and start < iv.end_s - 1e-9
+                          for iv in exclude)
+            if length - (k - k0) * step_s >= need_s - 1e-9 and not overlap:
+                out.append(HoldInterval(start, length, sum(speeds) / len(speeds)))
+        prev_stopped = False
+        k = max(j, k + 1)
+    return out
 
 
 def hold_opening_points(meta: Any) -> list[tuple[float, float]] | None:

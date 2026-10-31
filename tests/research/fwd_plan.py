@@ -642,6 +642,13 @@ class ReturnGapStats:
 # まで）は仮の値（ProblemReport_20261027 段2 の机上で最良は 1〜2 行。上限は余裕を見た仮置き）。
 # いつ決め直すか: 実機で選ばれた δ の分布が上限に張り付いたら。
 LAUNCH_SHIFT_MAX_ROWS = 8
+
+# 2026-10-31 発進のすき間（案 A。launch_gap_tight）: 発進のブレーキ → アクセルで減らす行数。
+# 形の定数: アクセルが指令の 1 行後に動く分の 1 行だけ（この車の数値ではない）。ReturnTime.seconds
+# の余裕 1 周期は削らない: 安全網（pedal_interlock）は前の周期の実開度で判定するので、その見える分。
+# 2 行詰めるとアクセルの最初の 1 周期が安全網で止まり（UDDS `202357` の発進 14 回で、L+3 行の
+# 実開度が min ＋0.29〜0.33 %）、実際のすき間は 1 行詰めと同じ 4 行になる。
+LAUNCH_GAP_TIGHT_ROWS = 1
 # ずらす範囲: 停車保持の終わりの 2.5 s 前〜基準の動き出しの 2.0 s 後（依頼 2026-10-27。仮の値）
 LAUNCH_SHIFT_BEFORE_HOLD_END_S = 2.5
 LAUNCH_SHIFT_AFTER_GO_S = 2.0
@@ -650,6 +657,16 @@ LAUNCH_SHIFT_AFTER_GO_S = 2.0
 LAUNCH_SHIFT_INTEGRATE_FROM_S = 2.0
 LAUNCH_SHIFT_SCORE_FROM_S = 1.0
 LAUNCH_SHIFT_SCORE_TO_S = 1.5
+
+
+@dataclass(frozen=True)
+class LaunchBandSpec:
+    """2026-10-31 発進のブレーキの帯（案 B。launch_brake_band）: build_plan が帯の行を置く入力。
+    intervals ＝ (開始 [s], 長さ [s])（hold_scene.launch_band_intervals の区間）、
+    ff_at(t) ＝ 時刻 t のブレーキ開度 [%]（正。上りと同じ FF ＝ hold_scene.lead_in_ff_at）。"""
+
+    intervals: tuple[tuple[float, float], ...]
+    ff_at: Callable[[float], float]
 
 
 @dataclass
@@ -714,6 +731,9 @@ class ForwardPlan:
     # 2026-10-30 段2 案 D: 埋めた惰行の本数と行数（coast_fill_max_s が 0 なら 0）
     coast_fill_runs: int = 0
     coast_fill_rows: int = 0
+    # 2026-10-31 発進のブレーキの帯（案 B）: 帯の行（アクセルを使わずブレーキの FF で動かす行）。
+    # launch_band を渡さなければ None。launch_shift_choose はこの発進を対象から外す
+    launch_band: np.ndarray | None = None
 
     def coast_fill_s(self) -> float:
         """案 D で埋めた惰行の秒数。"""
@@ -832,6 +852,8 @@ def build_plan(
     accel_release_in_range_only: bool = False,
     predict_low_speed_sides: bool = False,
     launch_shift_choose: bool = False,
+    launch_gap_tight: bool = False,
+    launch_band: LaunchBandSpec | None = None,
     predict_creep_curve: bool = False,
     creep_accel_speeds_kmh: Sequence[float] = (),
     creep_accel_kmhs: Sequence[float] = (),
@@ -856,6 +878,13 @@ def build_plan(
     t_go まで直線で bk へ。以下なら停車の区間を bk で待つ。どちらも t_go までのブレーキ・惰行の行は
     浅くしない。meta が無ければ何もしない。A1 の後・np.clip の前（先置き・すき間の確保はその後に
     今までどおり掛かる）。
+
+    2026-10-31 発進のブレーキの帯（案 B）: `launch_band`（None は今までと完全に同じ）。渡すと
+    `launch_release_ramp` の後で、帯の区間の行を effort ＝ −ff_at(t)（ブレーキ。上りと同じ FF）・
+    flag ＝ FLAG_MEASURED・launch_prep ＝ True にし、区間のアクセル・惰行の行を消す。
+    区間の終わりからの
+    アクセルへの踏み替えは ensure_return_gap に任せる。launch_shift_choose はこの発進を対象から外す
+    （ForwardPlan.launch_band）。launch_release_ramp が要る。
 
     2026-10-24 段7-c: `switch_gap_compensate`。False は今までと完全に同じ。True は、アクセル ⇔
     ブレーキの切り替え（停車保持・先置きをまたぐものは除く。`switch_lead_events` と同じ対象）で
@@ -973,12 +1002,24 @@ def build_plan(
         # 内側の呼び出しは同じ引数でずらしだけ off（再帰の common には渡さない＝ずらしは 1 回だけ）
         kw_in = dict(locals())
         kw_in["launch_shift_choose"] = False
-        return apply_launch_shift(
-            build_plan(**kw_in), ref_at, table, stop_ref_at=stop_ref_at,
-            accel_min_pct=accel_deadband_pct, brake_min_pct=brake_deadband_pct,
-            track=pedal_track or PedalTrack(),
+        shift_kw = dict(
+            stop_ref_at=stop_ref_at, accel_min_pct=accel_deadband_pct,
+            brake_min_pct=brake_deadband_pct, track=pedal_track or PedalTrack(),
             creep=_creep_of(predict_creep_curve, creep_accel_speeds_kmh, creep_accel_kmhs),
         )
+        if launch_gap_tight:
+            # 2026-10-31 発進のすき間（案 A）: δ は詰めない計画（今の本体と同じ）で選び、その δ を
+            # 詰めた計画にそのまま当てる。詰めた計画で選び直すと δ が 0 に戻り、アクセルが今より
+            # 早まる（アクセルは早くない、というレポートの事実に反する）。狙いはブレーキの最後の
+            # 行だけ 1 行遅く、アクセルの時刻・δ は今と同じ
+            kw_off = dict(kw_in, launch_gap_tight=False)
+            chosen = apply_launch_shift(build_plan(**kw_off), ref_at, table, **shift_kw)
+            tight = apply_launch_shift(
+                build_plan(**kw_in), ref_at, table, **shift_kw,
+                deltas=chosen.launch_shift.deltas,
+            )
+            return replace(tight, launch_shift=chosen.launch_shift)
+        return apply_launch_shift(build_plan(**kw_in), ref_at, table, **shift_kw)
     creep = _creep_of(predict_creep_curve, creep_accel_speeds_kmh, creep_accel_kmhs)
     la = _lag(accel_lag_s, table, "accel_lag_s", DEFAULT_ACCEL_LAG_S)
     lb = _lag(brake_lag_s, table, "brake_lag_s", DEFAULT_BRAKE_LAG_S)
@@ -1002,6 +1043,8 @@ def build_plan(
             "launch_release_lead_s": launch_release_lead_s,
             "launch_release_pre_pct": launch_release_pre_pct,
             "launch_short_stop_s": launch_short_stop_s,
+            "launch_gap_tight": launch_gap_tight,
+            "launch_band": launch_band,
             "switch_gap_compensate": switch_gap_compensate,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1051,6 +1094,8 @@ def build_plan(
             "launch_release_lead_s": launch_release_lead_s,
             "launch_release_pre_pct": launch_release_pre_pct,
             "launch_short_stop_s": launch_short_stop_s,
+            "launch_gap_tight": launch_gap_tight,
+            "launch_band": launch_band,
             "switch_lead": switch_lead, "_lead_extra": _lead_extra,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1093,7 +1138,8 @@ def build_plan(
         # 上乗せ後の 2 回目の確保は、列に上乗せが入っているので候補に重ねて上乗せしない
         ctx_c2 = replace(ctx_c, comp=False) if ctx_c is not None else None
         add, dv_total, n_ev, trimmed0 = _gap_compensation(
-            base, aux, ret_c, period_s, min_loss=switch_gap_min_loss, rule_ctx=ctx_c
+            base, aux, ret_c, period_s, min_loss=switch_gap_min_loss, rule_ctx=ctx_c,
+            launch_prep=_gap_prep_of(base) if launch_gap_tight else None,
         )
         if n_ev > 0:
             comped = build_plan(
@@ -1104,11 +1150,12 @@ def build_plan(
                 ensure_return_gap(
                     e1, comped.flag.copy(), ret=ret_c, period_s=period_s,
                     need_accel=base.need_accel_kmhs, coast_a=aux["coast_a"], coast_b=aux["coast_b"],
-                    rule_ctx=ctx_c2,
+                    rule_ctx=ctx_c2, launch_prep=_gap_prep_of(comped) if launch_gap_tight else None,
                 )
             else:
                 ensure_return_gap(
-                    e1, comped.flag.copy(), ret=ret_c, period_s=period_s, rule_ctx=ctx_c2
+                    e1, comped.flag.copy(), ret=ret_c, period_s=period_s, rule_ctx=ctx_c2,
+                    launch_prep=_gap_prep_of(comped) if launch_gap_tight else None,
                 )
             trimmed1 = (comped.effort_pct != 0.0) & (e1 == 0.0)
             new_rows = int(np.count_nonzero(trimmed1 & ~trimmed0))
@@ -1354,6 +1401,23 @@ def build_plan(
                 pre_pct=launch_release_pre_pct, lead_s=launch_release_lead_s,
                 short_stop_s=launch_short_stop_s, hold_pct=stop_brake_opening_pct,
             )
+    launch_band_rows = None
+    if launch_band is not None:
+        # 2026-10-31 発進のブレーキの帯（案 B）: ramp の後・clip の前。区間の行を上りと同じ FF の
+        # ブレーキにし（アクセル・惰行の行は消える）、launch_prep にする（発進の踏み替えとして扱う）
+        if launch_prep is None:
+            raise ValueError("launch_band には launch_release_ramp が要ります")
+        launch_band_rows = np.zeros(n, dtype=bool)
+        # 区間の始めは t_go − L（hold_scene.launch_band_intervals）。離しの直線が bk に着く行と同じ
+        # なので、bk に固定する行は要らない
+        for start_s, length_s in launch_band.intervals:
+            i0 = int(round(start_s / period_s))
+            i1 = min(i0 + int(round(length_s / period_s)), n)
+            for r in range(max(i0, 0), i1):
+                effort[r] = -float(launch_band.ff_at(r * period_s))
+                flag[r] = FLAG_MEASURED
+                launch_prep[r] = True
+                launch_band_rows[r] = True
     side_accel = np.where(launch_a, SIDE_LAUNCH, np.where(stop_a, SIDE_STOP, SIDE_MAIN))
     side_accel = np.where(relabel_a, SIDE_MAIN, side_accel)
     side_brake = np.where(launch_b, SIDE_LAUNCH, np.where(stop_b, SIDE_STOP, SIDE_MAIN))
@@ -1403,6 +1467,14 @@ def build_plan(
         )
     gap_stats = None
     if return_gap_enabled:
+        # 2026-10-31 発進のすき間（案 A）: 発進の行の印を渡すのは launch_gap_tight のときだけ
+        # 2026-11-01 修正 2: 帯の行は詰める対象から外す（帯の終わりのブレーキは浅く、
+        # 切り上げに余りがない）
+        gap_prep = None
+        if launch_gap_tight:
+            gap_prep = launch_prep
+            if launch_prep is not None and launch_band_rows is not None:
+                gap_prep = launch_prep & ~launch_band_rows
         rule_ctx = None
         if switch_gap_rule or switch_gap_min_peak:  # 段10-2・3: 案 R・C（ペダルの実際の位置）
             rule_ctx = GapContext(
@@ -1429,11 +1501,11 @@ def build_plan(
                 effort, flag, ret=ret, period_s=period_s, need_accel=need,
                 coast_a=np.broadcast_to(np.asarray(coast_a, dtype=float), (n,)),
                 coast_b=np.broadcast_to(np.asarray(coast_b, dtype=float), (n,)),
-                rule_ctx=rule_ctx,
+                rule_ctx=rule_ctx, launch_prep=gap_prep,
             )
         else:
             gap_stats = ensure_return_gap(
-                effort, flag, ret=ret, period_s=period_s, rule_ctx=rule_ctx
+                effort, flag, ret=ret, period_s=period_s, rule_ctx=rule_ctx, launch_prep=gap_prep
             )
     return ForwardPlan(
         t_s=t, effort_pct=effort, need_accel_kmhs=need, flag=flag, period_s=period_s,
@@ -1443,6 +1515,9 @@ def build_plan(
         switch_lead_s=_lead_extra,
         launch_midway=np.asarray(midway, dtype=bool).copy() if dir_rule else None,
         launch_prep=launch_prep, coast_fill_runs=fill_runs, coast_fill_rows=fill_rows,
+        # 2026-11-01 発進のブレーキの帯（案 B）の修正: すき間の処理・補償の後の最終の effort が
+        # ブレーキの行だけ印を残す（すき間の 0 の行は印なし → 走行中は計画の FF をそのまま使う）
+        launch_band=None if launch_band_rows is None else (launch_band_rows & (effort < 0.0)),
     )
 
 
@@ -1609,6 +1684,7 @@ def apply_launch_shift(
     brake_min_pct: float,
     track: PedalTrack,
     creep: tuple[np.ndarray, np.ndarray] | None = None,
+    deltas: Sequence[int] | None = None,
 ) -> ForwardPlan:
     """停車からの各発進で、発進の並びを δ 行（0〜LAUNCH_SHIFT_MAX_ROWS）後ろへずらす
     （2026-10-27 段13。すき間の処理まで済んだ計画に掛ける）。
@@ -1623,7 +1699,11 @@ def apply_launch_shift(
     effort・flag・launch_prep・launch_midway・side_accel・side_brake を同じに移し、前の空いた行は
     直前の行の値。need_accel（基準から決まる）・stops_ahead・stop_lead は動かさない。
     ずらした結果、両ペダルの位置が同時に min 超になる行が δ=0 より増える候補は外す
-    （片足ルール・すき間を壊さない）。"""
+    （片足ルール・すき間を壊さない）。
+
+    2026-10-31 発進のすき間（案 A）: deltas を渡すと、選び直さずに発進ごとにその δ（発進の順）を
+    掛ける（launch_gap_tight の計画に、詰めない計画で選んだ δ を当てるため）。
+    None は今までと同じ。"""
     n = len(plan.effort_pct)
     dt = plan.period_s
     t = plan.t_s
@@ -1638,6 +1718,7 @@ def apply_launch_shift(
     mid = None if plan.launch_midway is None else plan.launch_midway.copy()
     sa = None if plan.side_accel is None else plan.side_accel.copy()
     sb = None if plan.side_brake is None else plan.side_brake.copy()
+    lband = None if plan.launch_band is None else plan.launch_band.copy()
     trs = [
         replace(
             track,
@@ -1648,13 +1729,15 @@ def apply_launch_shift(
     ]
     tol = POSITION_RETURN_TOL_PCT
     last_b = 0
-    for _s, t0, hold_end in events:
+    for ev_k, (_s, t0, hold_end) in enumerate(events):
         a = max(hold_end - round(LAUNCH_SHIFT_BEFORE_HOLD_END_S / dt), last_b + 1, 1)
         b = min(t0 + round(LAUNCH_SHIFT_AFTER_GO_S / dt), n - 1)
         r_a = max(t0 - round(LAUNCH_SHIFT_INTEGRATE_FROM_S / dt), 0)
         k_sc0 = max(t0 - round(LAUNCH_SHIFT_SCORE_FROM_S / dt), 0)
         k_end = min(t0 + round(LAUNCH_SHIFT_SCORE_TO_S / dt), n - 1)
-        if a + LAUNCH_SHIFT_MAX_ROWS >= b or k_end <= k_sc0:
+        band_launch = plan.launch_band is not None and bool(plan.launch_band[t0 : t0 + 2].any())
+        if band_launch or a + LAUNCH_SHIFT_MAX_ROWS >= b or k_end <= k_sc0:
+            # 2026-10-31 発進のブレーキの帯（案 B）: 帯の発進はずらさない（δ ＝ 0）
             stats.deltas.append(0)
             stats.scores.append((0.0, 0.0))
             continue
@@ -1690,6 +1773,8 @@ def apply_launch_shift(
                 best = (worst, d)
         assert best is not None
         d_best = best[1]
+        if deltas is not None:  # 2026-10-31 発進のすき間: 渡された δ をそのまま使う
+            d_best = int(deltas[ev_k]) if ev_k < len(deltas) else 0
         stats.deltas.append(d_best)
         stats.scores.append((score0, best[0]))
         if d_best > 0:
@@ -1699,10 +1784,14 @@ def apply_launch_shift(
             mid = _shift_back(mid, a, b, d_best)
             sa = _shift_back(sa, a, b, d_best)
             sb = _shift_back(sb, a, b, d_best)
+            lband = _shift_back(lband, a, b, d_best)
             last_b = b
+    if lband is not None:
+        # 2026-11-01 発進のブレーキの帯（案 B）の修正: 印は最終の effort がブレーキの行だけ
+        lband = lband & (eff < 0.0)
     return replace(
         plan, effort_pct=eff, flag=flag, launch_prep=prep, launch_midway=mid, side_accel=sa,
-        side_brake=sb, launch_shift=stats,
+        side_brake=sb, launch_band=lband, launch_shift=stats,
     )
 
 
@@ -1848,6 +1937,7 @@ def _gap_compensation(
     *,
     min_loss: bool = False,
     rule_ctx: GapContext | None = None,
+    launch_prep: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, int, np.ndarray]:
     """段7-c: ensure_return_gap が戻す側の最後を惰行に削る切り替えを拾い、上乗せする分を返す。
 
@@ -1874,11 +1964,12 @@ def _gap_compensation(
         gap_st = ensure_return_gap(
             after, base.flag.copy(), ret=ret, period_s=period_s,
             need_accel=base.need_accel_kmhs, coast_a=aux["coast_a"], coast_b=aux["coast_b"],
-            rule_ctx=rule_ctx,
+            rule_ctx=rule_ctx, launch_prep=launch_prep,
         )
     else:
         gap_st = ensure_return_gap(
-            after, base.flag.copy(), ret=ret, period_s=period_s, rule_ctx=rule_ctx
+            after, base.flag.copy(), ret=ret, period_s=period_s, rule_ctx=rule_ctx,
+            launch_prep=launch_prep,
         )
     peak_starts = {sp[0] for sp in gap_st.rule_peak_spans}
     valley_starts = {sp[0] for sp in gap_st.rule_valley_spans}
@@ -2538,6 +2629,7 @@ def ensure_return_gap(
     coast_a: np.ndarray | None = None,
     coast_b: np.ndarray | None = None,
     rule_ctx: GapContext | None = None,
+    launch_prep: np.ndarray | None = None,
 ) -> ReturnGapStats:
     """アクセル⇔ブレーキの全部の切り替えで、すき間（戻す側の指令が 0 の行数）を戻る時間 T 以上にする
     （effort・flag を書き換える。2026-10-17 段2o-9）。
@@ -2568,6 +2660,15 @@ def ensure_return_gap(
     選ぶ（すき間が足りていても、戻す側の実際の位置が次のペダルの最初の行に間に合わないなら
     選び直す）。組が無ければ今までの手順
     （9-b が on なら 9-b）。
+
+    2026-10-31 発進のすき間（案 A。`launch_gap_tight`）: launch_prep（発進の行の印）を渡すと、
+    戻す側の最後の行が launch_prep のブレーキで、次がアクセルの切り替え（停車からの発進）だけ、
+    要るすき間を LAUNCH_GAP_TIGHT_ROWS 行減らす（下限 1 行）。詰めるのは前で削る経路だけ
+    （戻す側の最後の行が FLAG_STOP などで次のペダルを遅らせる経路・9-b の組み方は詰めない。
+    アクセルを今より早めないため）。削る量・違反の数え方は詰めた行数を使う。
+    案 R・C（rule_ctx）は切り替え先の惰行の加速度が負のときだけで、発進（クリープで
+    正）は通らない前提なので、通った場合は R・C の置き方のまま（詰めない）。
+    None は今までと完全に同じ。
     """
     n = len(effort)
     min_loss = need_accel is not None and coast_a is not None and coast_b is not None
@@ -2584,7 +2685,11 @@ def ensure_return_gap(
         if last >= 0 and (effort[last] > 0.0) != (effort[i] > 0.0):
             stats.n_switches += 1
             gap = i - last - 1
-            need = ret.gap_rows(float(effort[last]), period_s)
+            slack = _launch_gap_slack(effort, launch_prep, last, i)
+            if flag[last] == FLAG_STOP or min_loss:  # 遅らせる経路・9-b は詰めない
+                slack = 0
+            need_full = ret.gap_rows(float(effort[last]), period_s)
+            need = _tight_rows(need_full, slack)
             a = last  # 戻す側の連なり（同じ向きの 0 でない行）の先頭
             leaving_accel = effort[last] > 0.0
             while a > 0 and effort[a - 1] != 0.0 and (effort[a - 1] > 0.0) == leaving_accel:
@@ -2621,7 +2726,7 @@ def ensure_return_gap(
                 if pick is None and gap < need and min_loss:
                     pick = _min_loss_split(
                         effort, flag, a, last, i, gap, ret, period_s,
-                        need_accel, coast_a, coast_b,
+                        need_accel, coast_a, coast_b, slack=slack,
                     )
                 if pick is not None:  # 段9-b・C: 前で c 行削り、後ろで d 行遅らせる
                     c, d = pick
@@ -2643,7 +2748,9 @@ def ensure_return_gap(
                 cut = None
                 if flag[last] != FLAG_STOP:
                     for c in range(1, last - a + 1):  # 先頭の 1 行は残す
-                        if gap + c >= ret.gap_rows(float(effort[last - c]), period_s):
+                        if gap + c >= _tight_rows(
+                            ret.gap_rows(float(effort[last - c]), period_s), slack
+                        ):
                             cut = c
                             break
                 if cut is not None:
@@ -2657,7 +2764,7 @@ def ensure_return_gap(
                     sign = effort[i] > 0.0
                     d = 0
                     while (
-                        gap + d < need and k < n and effort[k] != 0.0
+                        gap + d < need_full and k < n and effort[k] != 0.0
                         and (effort[k] > 0.0) == sign
                     ):
                         effort[k] = 0.0
@@ -2674,12 +2781,37 @@ def ensure_return_gap(
         _choose_pass(effort, flag, before, flag0, rule_ctx, period_s, stats)
     if rule_ctx is not None:  # 段10-6: R の判定と同じ位置の物差しで数える
         stats.n_violations = count_gap_violations_by_position(
-            effort, ctx=rule_ctx, period_s=period_s
+            effort, ctx=rule_ctx, period_s=period_s, launch_prep=launch_prep
         )
         stats.by_position = True
     else:
-        stats.n_violations = count_gap_violations(effort, ret=ret, period_s=period_s)
+        stats.n_violations = count_gap_violations(
+            effort, ret=ret, period_s=period_s, launch_prep=launch_prep
+        )
     return stats
+
+
+def _gap_prep_of(plan: ForwardPlan) -> np.ndarray | None:
+    """2026-11-01 修正 2: すき間を詰める対象の印 ＝ launch_prep から帯の行（案 B）を除いたもの。"""
+    if plan.launch_prep is None or plan.launch_band is None:
+        return plan.launch_prep
+    return plan.launch_prep & ~plan.launch_band
+
+
+def _launch_gap_slack(
+    effort: np.ndarray, launch_prep: np.ndarray | None, last: int, i: int
+) -> int:
+    """2026-10-31 発進のすき間（案 A）: 切り替え (last → i) が発進のブレーキ → アクセルなら
+    詰める行数
+    （LAUNCH_GAP_TIGHT_ROWS）、それ以外・launch_prep が None なら 0。"""
+    if launch_prep is None or not (effort[last] < 0.0 < effort[i]) or not launch_prep[last]:
+        return 0
+    return LAUNCH_GAP_TIGHT_ROWS
+
+
+def _tight_rows(rows: int, slack: int) -> int:
+    """要るすき間の行数から slack 行詰める（詰めるときだけ下限 1 行。slack 0 は rows のまま）。"""
+    return max(rows - slack, 1) if slack > 0 else rows
 
 
 def _rule_peak(
@@ -3225,6 +3357,7 @@ def _min_loss_split(
     need_accel: np.ndarray,
     coast_a: np.ndarray,
     coast_b: np.ndarray,
+    slack: int = 0,
 ) -> tuple[int, int] | None:
     """段9-b: すき間不足の切り替えで、前を c 行削り・後ろを d 行遅らせる組 (c, d) のうち、
     gap + c + d ≥ gap_rows(effort[last − c]) を満たし損が最小のものを返す。
@@ -3255,7 +3388,7 @@ def _min_loss_split(
     best: tuple[float, int, int] | None = None
     for c in range(0, last - a + 1):
         for d in range(0, d_max + 1):
-            if gap + c + d < ret.gap_rows(float(effort[last - c]), period_s):
+            if gap + c + d < _tight_rows(ret.gap_rows(float(effort[last - c]), period_s), slack):
                 continue
             key = (float(front_loss[c] + back_loss[d]), d, c)
             if best is None or key[0] < best[0] - 1e-12 or (
@@ -3265,25 +3398,40 @@ def _min_loss_split(
     return None if best is None else (best[2], best[1])
 
 
-def count_gap_violations(effort: np.ndarray, *, ret: ReturnTime, period_s: float) -> int:
-    """アクセル⇔ブレーキの切り替えで、すき間が戻る時間 T に足りない数。"""
+def count_gap_violations(
+    effort: np.ndarray,
+    *,
+    ret: ReturnTime,
+    period_s: float,
+    launch_prep: np.ndarray | None = None,
+) -> int:
+    """アクセル⇔ブレーキの切り替えで、すき間が戻る時間 T に足りない数。
+    launch_prep（2026-10-31 発進のすき間）: 渡すと発進のブレーキ → アクセルは詰めた分を引いて
+    数える。"""
     count = 0
     last = -1
     for i in np.flatnonzero(effort != 0.0).tolist():
         if last >= 0 and (effort[last] > 0.0) != (effort[i] > 0.0):
-            if i - last - 1 < ret.gap_rows(float(effort[last]), period_s):
+            slack = _launch_gap_slack(effort, launch_prep, last, i)
+            if i - last - 1 < _tight_rows(ret.gap_rows(float(effort[last]), period_s), slack):
                 count += 1
         last = i
     return count
 
 
 def count_gap_violations_by_position(
-    effort: np.ndarray, *, ctx: GapContext, period_s: float
+    effort: np.ndarray,
+    *,
+    ctx: GapContext,
+    period_s: float,
+    launch_prep: np.ndarray | None = None,
 ) -> int:
     """2026-10-26 段10-6: 案 R と同じ物差しのすき間不足の数。アクセル⇔ブレーキの切り替えで、
     戻す側の位置（PedalTrack で追う）が min＋0.05 に着く行 ＋ 1 が次のペダルの最初の行より
     後なら不足。
-    `count_gap_violations`（指令の最後の値で決める戻る時間）は R が置いた切り替えを不足と数える。"""
+    `count_gap_violations`（指令の最後の値で決める戻る時間）は R が置いた切り替えを不足と数える。
+    launch_prep（2026-10-31 発進のすき間）: 渡すと発進のブレーキ → アクセルは詰めた行数だけ
+    次のペダルが早くてもよいとして数える。"""
     pa, pb = track_pedal_position(
         effort, period_s=period_s, track=ctx.track,
         accel_min_pct=ctx.accel_min_pct, brake_min_pct=ctx.brake_min_pct,
@@ -3297,7 +3445,8 @@ def count_gap_violations_by_position(
                 pa if leaving_accel else pb, last,
                 ctx.accel_min_pct if leaving_accel else ctx.brake_min_pct,
             )
-            if r is None or r + 1 > i:
+            slack = _launch_gap_slack(effort, launch_prep, last, i)
+            if r is None or r + 1 - slack > i:
                 count += 1
         last = i
     return count
