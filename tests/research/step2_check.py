@@ -15,9 +15,11 @@ import numpy as np
 from tests.research.config import DEFAULT_CONFIG_PATH, ResearchConfig, load_config
 from tests.research.fwd_data import DEFAULT_ACCEL_LAG_S, DEFAULT_BRAKE_LAG_S, FwdRows
 from tests.research.fwd_map import (
+    FINE_RELEASE_BANDS_KMH,
     LOW_RELEASE_BAND_MAX_KMH,
     RELEASE_GRID_PCT,
     ForwardTable,
+    fine_release_seconds_by_band,
     load_forward_map,
     release_seconds_in_band,
 )
@@ -609,6 +611,10 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
     - アクセルの戻し量 0.3% 以上の行の秒数と、頭打ち（戻し量の p95）
     - ブレーキの戻しの行 7.5〜20 km/h の秒数（meta の brake_release_band_s。無い古い pkl は
       手順2 の行から数える）
+    - 2026-10-31 段3: 効き始めより深いブレーキで戻し量 0.1〜1% の行の秒数を車速帯
+      （7.5〜20・20〜40・40〜60・60〜80・80〜100・100〜140 km/h）ごとに。効き始めは meta の
+      brake_onset_u_pct（min からの量）。手順2 の「ゆっくり戻す」がこの穴をどれだけ埋めたかを見る
+      お知らせ（rows が無い・効き始めが無いときは「-」）
     """
     name = "表の作り方（段4-3のお知らせ）"
     if table is None:
@@ -675,6 +681,20 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
         metrics["low_stair_press_s"] = float(st_p)
     if st_r is not None:
         metrics["low_stair_release_s"] = float(st_r)
+    # 2026-10-31 段3: 効き始めより深く戻し量 0.1〜1% のブレーキの行の秒数（車速帯ごと。表示だけ）
+    fine_part = "-"
+    brake_onset = m.get("brake_onset_u_pct")
+    if rows and brake_onset is not None and math.isfinite(float(brake_onset)):
+        fine = np.sum(
+            [fine_release_seconds_by_band(r, float(brake_onset)) for r in rows], axis=0
+        )
+        edges = FINE_RELEASE_BANDS_KMH
+        fine_part = "／".join(
+            f"{lo:g}〜{hi:g}:{_f(float(sec), 1)}s"
+            for lo, hi, sec in zip(edges[:-1], edges[1:], fine, strict=True)
+        )
+        for lo, hi, sec in zip(edges[:-1], edges[1:], fine, strict=True):
+            metrics[f"brake_fine_release_s_{lo:g}_{hi:g}"] = float(sec)
     parts = [
         f"開度の元 {src if src else '-（古い pkl は実開度）'}",
         "局所の効きの倍率 " + "／".join(lg_parts),
@@ -694,6 +714,7 @@ def check_table_extras(table: ForwardTable | None, rows: Sequence[FwdRows] | Non
            + ("" if table.accel_push_grid is not None else "（表は作らず）")),
         f"ブレーキの戻し {lo:g}〜{hi:g} km/h "
         + ("-" if band_s is None else f"{_f(float(band_s), 1)}s"),
+        f"効き始めより深いブレーキの戻し 0.1〜1% の秒数（km/h）{fine_part}",
     ]
     return CheckItem(
         "I1", name, STATUS_OK, "・".join(parts), "-", "お知らせ（NG にしない）", metrics

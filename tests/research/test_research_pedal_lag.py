@@ -403,3 +403,10 @@ def test_estimate_pedal_track_unreadable_csv(tmp_path: Path) -> None:
         tmp_path / "none.csv", _StubTable(), accel_min_pct=4.2, brake_min_pct=4.2
     )
     assert not fit.measured and "読めない" in fit.reason
+
+
+def test_release_sweep_is_excluded_from_return_scenes() -> None:
+    """2026-10-31 段3: ゆっくり戻す測定は戻り時間の場面に使わない。"""
+    from tests.research.pedal_lag import RETURN_EXCLUDED_PHASES  # noqa: PLC0415
+
+    assert "RAMP_RELEASE_SWEEP" in RETURN_EXCLUDED_PHASES

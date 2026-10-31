@@ -48,8 +48,14 @@ MIN_EFFECT_BINS = 2
 OTHER_MIN_TOL_PCT = 0.2
 # 効き始めの計算に使わない phase。HOLD_STEP は遅れの測定の階段、dither（2026-10-28 段3）は
 # 効き始めの先での小さな動き（開度を意図的に往復させる行で、折れ点の当てはめを乱す）。
+# 2026-10-31 段3: RAMP_RELEASE_SWEEP（0.25 %/s で戻す・踏み増す。戻しの表の穴埋め用）も除く。
+# 効き始めは「G ランプで踏み込んだ向き」の折れ点として定義していて、ゆっくり戻した後に同じ開度まで
+# 踏み増す行は通り方が違う（同じ開度でも通り方で加速度が変わる）ので、有効にしても結果が動かない
+# ようにする。
 # CSV の phase 名（pattern_loop の _Phase の名前と同じ。tests 内で独立に持つ）
-EXCLUDED_PHASES = frozenset({"HOLD_STEP", "RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER"})
+EXCLUDED_PHASES = frozenset(
+    {"HOLD_STEP", "RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER", "RAMP_RELEASE_SWEEP"}
+)
 # これ以下は停車とみなして捨てる [km/h]。fwd_data.STOP_SPEED_KMH と同じ値。
 STOP_SPEED_KMH = 0.5
 

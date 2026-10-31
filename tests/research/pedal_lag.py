@@ -398,6 +398,9 @@ RETURN_EXCLUDED_PHASES = frozenset(
     {
         "RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER", "LOW_RELEASE_STAIR", "LOW_PRESS_STAIR",
         "LOW_HOLD",  # 2026-10-30 段6: 手順13 の 4 点の保持（PI で動かす）
+        # 2026-10-31 段3: ゆっくり戻す測定（0.25 %/s。1 周期の指令の下がりは場面の下限より小さく、
+        # 戻りは指令に追いつくので場面にならないが、「速く戻した場面」だけを測る定義を守る）
+        "RAMP_RELEASE_SWEEP",
     }
 )
 

@@ -1361,6 +1361,39 @@ def release_seconds_in_band(
     return float(np.sum(rows.dt_row_s[m]))
 
 
+# 2026-10-31 段3（ProblemReport_20261031_効き始めの近くのブレーキ）: 効き始めの近くの小さな戻し
+# （戻し量 0.1〜1%）の行が車速帯ごとに何秒あるかを step2 のチェックに出す（表示だけ）。車速帯は
+# 戻しの表の穴（0.2〜0.8% の戻し・80 km/h 以上）を見るための区切り（仮値。判定には使わない）
+FINE_RELEASE_BANDS_KMH = (7.5, 20.0, 40.0, 60.0, 80.0, 100.0, 140.0)
+FINE_RELEASE_MIN_PCT = 0.1
+FINE_RELEASE_MAX_PCT = 1.0
+
+
+def fine_release_seconds_by_band(
+    rows: FwdRows,
+    onset_u_pct: float,
+    edges_kmh: Sequence[float] = FINE_RELEASE_BANDS_KMH,
+    *,
+    release_lo_pct: float = FINE_RELEASE_MIN_PCT,
+    release_hi_pct: float = FINE_RELEASE_MAX_PCT,
+) -> list[float]:
+    """「効き始め（min からの量 onset_u_pct）より深いブレーキで、戻し量が release_lo_pct 以上
+    release_hi_pct 以下」の行の合計秒数を、車速帯 [edges[i], edges[i+1]) ごとに返す
+    （2026-10-31 段3。step2 のチェックの表示用）。ブレーキは u < 0 で、深さ ＝ −u。"""
+    depth = -np.asarray(rows.u_pct, dtype=float)
+    base = (
+        (rows.u_pct < 0.0)
+        & (depth > onset_u_pct)
+        & (rows.release_pct >= release_lo_pct - 1e-12)
+        & (rows.release_pct <= release_hi_pct + 1e-12)
+    )
+    out: list[float] = []
+    for lo, hi in zip(edges_kmh[:-1], edges_kmh[1:], strict=True):
+        m = base & (rows.speed_kmh >= lo) & (rows.speed_kmh < hi)
+        out.append(float(np.sum(rows.dt_row_s[m])))
+    return out
+
+
 def attach_release(
     table: ForwardTable,
     release_accel: np.ndarray,

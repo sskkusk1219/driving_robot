@@ -34,6 +34,7 @@ from tests.research.fwd_map import (
     blend_sub_min,
     build_table,
     extend_launch_rows_to_stop_max,
+    fine_release_seconds_by_band,
     load_forward_map,
     refine_u_grid,
     release_bin_edges,
@@ -911,6 +912,20 @@ def test_release_seconds_in_band_counts_braking_release_rows() -> None:
     r = FwdRows(**{**base.__dict__, "release_pct": np.array([1.0, 1.0, 1.0, 1.0, 1.0, 0.1])})
     # 7.5〜20 km/h・u < 0・戻し量 0.3% 以上: 添字 1・2 だけ
     assert release_seconds_in_band(r, 7.5) == pytest.approx(0.2)
+
+
+def test_fine_release_seconds_by_band_counts_deep_small_releases() -> None:
+    """2026-10-31 段3: 効き始めより深いブレーキで戻し量 0.1〜1% の行を車速帯ごとに数える。"""
+    v = np.array([10.0, 30.0, 50.0, 70.0, 90.0, 120.0, 150.0, 90.0, 90.0, 90.0, 90.0])
+    u = np.array([-6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -2.0, 2.0, -6.0, -6.0])
+    base = make_rows(v, u, np.zeros(len(v)), 0.1)
+    rel = np.array([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.5, 0.05])
+    r = FwdRows(**{**base.__dict__, "release_pct": rel})
+    sec = fine_release_seconds_by_band(r, 3.0)
+    # 帯 7.5〜20・20〜40・40〜60・60〜80・80〜100・100〜140（150 は範囲外）。
+    # 添字 7 は効き始め 3 より浅い（深さ 2）、8 はアクセル、9 は戻し量 1.5、10 は 0.05 で除外
+    assert sec == pytest.approx([0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
+    assert fine_release_seconds_by_band(r, 7.0) == pytest.approx([0.0] * 6)
 
 
 def test_attach_launch_sub_min_weight_default_false_is_unchanged() -> None:

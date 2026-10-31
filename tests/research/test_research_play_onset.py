@@ -114,3 +114,10 @@ def test_step_onset_refit_widens_span():
                               coast_fn=_coast, sign=1.0)  # fmt: skip
         assert r.onset_pct is not None, (off, r.reason)
         assert 10.2 <= r.onset_pct <= 10.7, (off, r.onset_pct)
+
+
+def test_release_sweep_rows_are_excluded_from_onset_reading() -> None:
+    """2026-10-31 段3: ゆっくり戻す測定の行は効き始めの折れ点に使わない。"""
+    from tests.research.play_onset import EXCLUDED_PHASES  # noqa: PLC0415
+
+    assert "RAMP_RELEASE_SWEEP" in EXCLUDED_PHASES

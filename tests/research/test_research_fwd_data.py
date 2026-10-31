@@ -424,6 +424,46 @@ def test_read_fwd_rows_release_uses_full_series_before_dropping(tmp_path: Path) 
     assert np.all(r.release_pct[r.t_s > 4.5] == 0.0)
 
 
+def _sweep_series(dt: float = 0.1):
+    """ゆっくり戻す測定の形（2026-10-31 段3）: 深さ 6% から 0.25 %/s で 8 秒戻し（→ 4%）、
+    同じ速さで 8 秒踏み増す（→ 6%）。"""
+    n = int(8.0 / dt)
+    depth = np.concatenate([6.0 - 0.25 * dt * np.arange(n), 4.0 + 0.25 * dt * np.arange(n)])
+    return np.arange(2 * n) * dt, depth
+
+
+def test_release_amount_for_slow_release_then_repress() -> None:
+    t, depth = _sweep_series()
+    rel = release_amount(t, -depth, 3.0)
+    n = len(t) // 2
+    # 戻す間: 山は 3 秒前の開度 → 戻し量は 0.25 %/s × 3 s = 0.75（最初の 3 秒は 0 から立ち上がる）
+    assert rel[0] == 0.0 and rel[int(1.5 / 0.1)] == pytest.approx(0.375, abs=0.02)
+    assert np.allclose(rel[int(3.0 / 0.1) : n], 0.75, atol=0.02)
+    assert rel.max() <= 0.75 + 1e-9
+    # 踏み増す間: 窓の最小が今の u なので戻し量は 0 へ落ちる（窓 3 秒で山が移る）
+    assert np.allclose(rel[n + int(3.2 / 0.1) :], 0.0, atol=1e-9)
+
+
+def test_read_fwd_rows_keeps_release_sweep_rows_and_release_amount(tmp_path: Path) -> None:
+    """RAMP_RELEASE_SWEEP の行は捨てられず（phases 既定 None）、戻し量が 0.1〜1% の行になる。
+    phases を渡す所だけが列挙を要する（学習の読みは渡さない）。"""
+    t, depth = _sweep_series()
+    rows = [
+        {
+            "elapsed_s": float(ti), "actual_speed_kmh": 60.0, "accel_actual_pct": 0.0,
+            "brake_actual_pct": BD + float(d), "section": "PATTERN_DRIVE",
+            "phase": "RAMP_RELEASE_SWEEP", "governor_active": 0,
+        }
+        for ti, d in zip(t, depth, strict=True)
+    ]
+    path = write_csv(tmp_path / "sw.csv", rows)
+    r = read(path)
+    assert len(r) > 0.9 * len(t)
+    assert ((r.release_pct >= 0.1) & (r.release_pct <= 1.0)).sum() > 0.3 * len(r)
+    assert len(read(path, phases=("RAMP_RELEASE_SWEEP",))) == len(r)
+    assert len(read(path, phases=("RAMP_RELEASE",))) == 0
+
+
 def test_take_and_concat_rows_carry_release() -> None:
     a = synth_launch_rows([1.0, 2.0, 3.0], [-1.0, -2.0, -3.0], [0.0, 1.0, 2.0])
     a = FwdRows(**{**a.__dict__, "release_pct": np.array([0.0, 0.5, 1.5])})

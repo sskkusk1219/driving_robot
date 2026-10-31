@@ -350,6 +350,33 @@ def test_format_checks_lists_every_item() -> None:
     assert "X1" in text and "X2" in text and "SKIP" in text and "a=1.5000" in text
 
 
+def test_i1_shows_fine_release_seconds_by_speed_band_without_ng() -> None:
+    """2026-10-31 段3: 効き始めより深く戻し量 0.1〜1% のブレーキの行の秒数を車速帯ごとに表示。
+    NG にしない。効き始め・rows が無ければ「-」。"""
+    from tests.research.fwd_data import FwdRows  # noqa: PLC0415
+
+    v = np.array([10.0, 30.0, 90.0, 90.0, 150.0])
+    u = np.array([-6.0, -6.0, -6.0, -2.0, -6.0])
+    n = len(v)
+    rows = [
+        FwdRows(
+            speed_kmh=v, u_pct=u, accel_kmhs=np.zeros(n), t_s=np.arange(n) * 0.1, dt_s=0.1,
+            source="synthetic", dt_row_s=np.full(n, 0.1),
+            release_pct=np.array([0.5, 0.5, 0.5, 0.5, 0.5]),
+        )
+    ]
+    item = sc.check_table_extras(_table(brake_onset_u_pct=3.0), rows)
+    assert item.status == sc.STATUS_OK
+    assert "7.5〜20:0.1s" in item.value and "80〜100:0.1s" in item.value
+    assert "100〜140:0.0s" in item.value
+    assert item.metrics["brake_fine_release_s_80_100"] == pytest.approx(0.1)
+    assert item.metrics["brake_fine_release_s_100_140"] == pytest.approx(0.0)
+    none_item = sc.check_table_extras(_table(), rows)  # 効き始めが無い
+    assert none_item.status == sc.STATUS_OK
+    assert "brake_fine_release_s_80_100" not in none_item.metrics
+    assert sc.check_table_extras(_table(brake_onset_u_pct=3.0), None).status == sc.STATUS_OK
+
+
 def test_i1_table_extras_is_informational_and_reports_seconds() -> None:
     """2026-10-20 段4-3: 表の作り方のお知らせ。開度の元・停止側の戻しの層の秒数・アクセルの戻しの
     秒数と頭打ち・ブレーキの戻しの 7.5〜20 km/h の秒数。NG にしない。"""
