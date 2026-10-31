@@ -1607,6 +1607,7 @@ def test_step4_local_gain_and_release_layer_keys_default_false() -> None:
     assert fm0.low_speed_release_stop_layer is False
     assert fm0.local_gain_brake is False
     assert fm0.local_gain_accel is False
+    assert fm0.c10_release_table is False  # 2026-10-31 段4 案2
     cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
     assert cfgmod.validate_config(cfg) == []  # キーは yaml にある（値は固定しない）
 

@@ -3428,3 +3428,88 @@ def test_stop_approach_lead_zero_is_identical_and_positive_keeps_stop_table() ->
     far = np.flatnonzero(~approach)
     assert np.array_equal(on.effort_pct[far], base.effort_pct[far])
     assert np.array_equal(on.side_brake[far], base.side_brake[far])
+
+
+# ─── C10 の上乗せを戻しの表で引く（release_peak_u_pct。2026-10-31 段4 案2） ───────
+
+
+def _steep_release_table(c: float = 4.0) -> ForwardTable:
+    """本体は a = −2.5 + 0.6u（u<0）。戻しの層は戻し量 r の分だけ加速度が c·r 上がる
+    （戻す側の線の傾き 0.6 + c ＝ 4.6 km/h/s/% で本体より急。実機は 3〜7 対 1.2〜1.4）。"""
+    from tests.research.fwd_map import RELEASE_GRID_PCT, attach_release  # noqa: PLC0415
+    from tests.research.test_research_fwd_map import release_table  # noqa: PLC0415
+
+    tb = release_table(with_release=False)
+    slices = np.stack([tb.accel_grid + np.where(tb.u_grid < 0, c * r, 0.0)[None, :]
+                       for r in RELEASE_GRID_PCT])
+    return attach_release(
+        tb, slices, release_pct=np.linspace(0.1, 12.0, 1000), dt_row_s=np.full(1000, 0.05)
+    )
+
+
+def _rel_dev(table, *, effort, need=-3.0, ref=50.0, dev=1.0, **kw):
+    return deviation_offset(
+        table, effort=effort, flag=FLAG_MEASURED, need_kmhs=need, ref_kmh=ref, row_kmh=ref,
+        dev_kmh=dev, tau_accel_s=5.0, tau_brake_s=5.0, accel_min_pct=AD, brake_min_pct=BD, **kw,
+    )
+
+
+def test_c10_release_table_off_is_identical() -> None:
+    tb = _steep_release_table()
+    for e, need, dev in ((-12.0, -3.0, 1.0), (-12.0, -3.0, -1.0), (12.0, 0.5, 2.0)):
+        base = _rel_dev(tb, effort=e, need=need, dev=dev)
+        assert _rel_dev(tb, effort=e, need=need, dev=dev, release_peak_u_pct=None) == base
+        assert _rel_dev(tb, effort=e, need=need, dev=dev, release_peak_u_pct=0.0) == base
+    # 戻しの表の無い表は、山を渡しても同じ
+    from tests.research.test_research_fwd_map import release_table  # noqa: PLC0415
+
+    plain = release_table(with_release=False)
+    assert _rel_dev(plain, effort=-12.0, release_peak_u_pct=-8.0) == _rel_dev(
+        plain, effort=-12.0
+    )
+
+
+def test_c10_release_table_deeper_than_peak_matches_main_slope() -> None:
+    tb = _steep_release_table()
+    # 要る加速度 −9（v=50 で u ≒ −10.8）は山 −3 より深い（踏み増す向き）→ 戻し量 0 ＝ 本体と同じ
+    e = -(BD + 10.8)
+    for dev in (-0.5, 0.5):
+        got = _rel_dev(tb, effort=e, need=-9.0, dev=dev, release_peak_u_pct=-3.0)
+        assert got == pytest.approx(_rel_dev(tb, effort=e, need=-9.0, dev=dev))
+
+
+def test_c10_release_table_shrinks_delta_while_releasing() -> None:
+    tb = _steep_release_table()
+    e = -(BD + 3.0)  # 山 −10 から戻している最中
+    plain = _rel_dev(tb, effort=e, need=-3.0, dev=1.0)  # 遅れ → 浅く
+    rel = _rel_dev(tb, effort=e, need=-3.0, dev=1.0, release_peak_u_pct=-10.0)
+    assert plain > e and rel > e  # 向きは同じ
+    # 戻している最中は表が急（同じ加速度に対して開度の動きが小さい）→ Δu が小さい
+    assert abs(rel - e) < abs(plain - e)
+    # 深くする向き（dev < 0）も同じ
+    plain_d = _rel_dev(tb, effort=e, need=-3.0, dev=-1.0)
+    rel_d = _rel_dev(tb, effort=e, need=-3.0, dev=-1.0, release_peak_u_pct=-10.0)
+    assert plain_d < e and rel_d < e and abs(rel_d - e) < abs(plain_d - e)
+    # DOB の分にも同じ表で効く
+    dob_plain = _rel_dev(tb, effort=e, need=-3.0, dev=0.0, dob_kmhs=0.5)
+    dob_rel = _rel_dev(tb, effort=e, need=-3.0, dev=0.0, dob_kmhs=0.5, release_peak_u_pct=-10.0)
+    assert abs(dob_rel - e) < abs(dob_plain - e)
+
+
+def test_c10_release_table_skips_low_speed_stop_and_accel() -> None:
+    tb = _steep_release_table()
+    e = -(BD + 3.0)
+    # 7.5 km/h 未満（meta stop_max_speed_kmh 既定 7.5）は対象外
+    assert _rel_dev(tb, effort=e, ref=5.0, release_peak_u_pct=-10.0) == _rel_dev(
+        tb, effort=e, ref=5.0
+    )
+    # アクセルの行は不変
+    assert _rel_dev(tb, effort=12.0, need=0.5, dev=2.0, release_peak_u_pct=-10.0) == _rel_dev(
+        tb, effort=12.0, need=0.5, dev=2.0
+    )
+    # 停止側の表を引く行は不変
+    tb.stop_accel = tb.accel_grid.copy()
+    tb.meta["stop_max_speed_kmh"] = 60.0
+    assert _rel_dev(tb, effort=e, stops_ahead=True, release_peak_u_pct=-10.0) == _rel_dev(
+        tb, effort=e, stops_ahead=True
+    )

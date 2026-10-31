@@ -2232,6 +2232,14 @@ class _ModeRun:
             # 段5-2: 計画が行ごとに決めた表（規則が legacy なら None ＝ 今までと同じ）
             "side": plan.side_for(i, ff_effort > 0.0),
         }
+        # 2026-10-31 段4 案2（c10_release_table）: ブレーキの行は、実開度の山（直近
+        # RELEASE_WINDOW_S 秒の最深の u）からの戻し量つきの表で Δu を引く。
+        # 山が無ければ None ＝ 今までと同じ
+        if (
+            self.cfg.forward_map.c10_release_table and self.dob is not None
+            and ff_effort < 0.0
+        ):
+            kwargs["release_peak_u_pct"] = self.dob.recent_peak_brake(t)
         fb_table = self._fb_table()  # 段8-b
         # 段4 (ア): 局所の効きの倍率で、P と DOB の上乗せの差を割る（deviation_offset_detail の
         # 中で、min のクランプの前）。停C の引き直し・DOB の分け方も同じ倍率。

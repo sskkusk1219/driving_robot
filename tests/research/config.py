@@ -938,6 +938,14 @@ class ForwardMapSection:
     # 決める時期: ブレーキは段6、アクセルは段7 の実機
     local_gain_brake: bool = False
     local_gain_accel: bool = False
+    # 2026-10-31 ProblemReport_20261031_効き始めの近くのブレーキ 段4 案2: true で、C10（P と DOB の
+    # 上乗せ）のブレーキの行（7.5 km/h 以上・本体の表）の Δu を、直近 RELEASE_WINDOW_S 秒の
+    # 実開度の山からの戻し量つきの表（release_accel）で引く（fwd_plan.deviation_offset_detail の
+    # release_peak_u_pct）。山を超えて踏み増す向きは本体と同じ。別の倍率は持たない。
+    # 根拠: ブレーキは少し戻すと効きが急に落ちる（戻す側 3〜7 km/h/s/%、本体の表 1.2〜1.4）。本体の
+    # 傾きで Δu を引くと戻している最中はループのゲインが 3〜4 倍になり往復する。
+    # 効く先: 効き始めの近くのブレーキの往復。決める時期: 段8 の実機。既定 false ＝ 今と完全に同じ
+    c10_release_table: bool = False
     # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
     # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
     # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・

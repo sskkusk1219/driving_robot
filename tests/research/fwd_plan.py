@@ -2331,6 +2331,7 @@ def deviation_offset_detail(
     dob_kmhs: float = 0.0,
     side: int | None = None,
     gain_ratio: float = 1.0,
+    release_peak_u_pct: float | None = None,
 ) -> tuple[float, bool]:
     """C10: 開度の列の 1 行（effort）に、偏差の分だけ上乗せした effort [%] を返す（段2p）。
 
@@ -2362,6 +2363,14 @@ def deviation_offset_detail(
     - gain_ratio（2026-10-28 段4 (ア)）: 局所の効きの倍率（表の傾きに対する実測の傾き。1 以上）。
       上乗せの差 Δu ＝ (P と DOB の合計) をこれで割ってから min のクランプにかける。既定 1.0 は
       今までと同じ出力。
+    - release_peak_u_pct（2026-10-31 ProblemReport_20261031_効き始めの近くのブレーキ 段4 案2。
+      `forward_map.c10_release_table`）: 直近 RELEASE_WINDOW_S 秒の実開度の山（ブレーキの最深の u。
+      min からの量で負。None または 0 以上は山なし）。ブレーキの行で、本体の表を引き（発進側・停止側
+      でない）、基準・引く車速がどちらも meta stop_max_speed_kmh（無ければ 7.5）以上のとき、Δu を
+      「戻し量つきの表」で引く: u0・u1 とも、プレーンな逆引きの u が山より浅い（戻している）なら
+      `_solve_with_release`（accel(v, u, release = u − 山) ≧ 要る加速度の最初の u）で置き換える。
+      山以上に踏み増す向きは戻し量 0 ＝ 本体と同じ。戻している最中は表の傾きが急なので同じ
+      加速度の上乗せに対する Δu が小さくなる。P と DOB の両方に効く。None は今までと同じ出力。
     """
     if flag in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS) or effort == 0.0:
         return effort, False
@@ -2373,7 +2382,21 @@ def deviation_offset_detail(
     d_a = dev_kmh / tau if tau > 0.0 else 0.0
     u0, _ = table.invert(ref_kmh, need_kmhs, launch=launch, stop=stop)
     u1, _ = table.invert(row_kmh, need_kmhs + d_a - dob_kmhs, launch=launch, stop=stop)
-    du = float(u1) - float(u0)
+    u0, u1 = float(u0), float(u1)
+    if (
+        release_peak_u_pct is not None and release_peak_u_pct < 0.0 and not is_accel
+        and not launch and not stop and table.release_grid is not None
+        and min(ref_kmh, row_kmh) >= float(table.meta.get("stop_max_speed_kmh", 7.5))
+    ):
+        peak = float(release_peak_u_pct)
+        if u0 > peak:
+            r0 = _solve_with_release(table, ref_kmh, need_kmhs, peak)
+            u0 = u0 if r0 is None else r0
+        need1 = need_kmhs + d_a - dob_kmhs
+        if u1 > peak:
+            r1 = _solve_with_release(table, row_kmh, need1, peak)
+            u1 = u1 if r1 is None else r1
+    du = u1 - u0
     if gain_ratio != 1.0:
         du /= gain_ratio
     raw = effort + du
@@ -3280,6 +3303,30 @@ def count_gap_violations_by_position(
     return count
 
 
+def _solve_with_release(
+    table: ForwardTable, v: float, need: float, m: float, on_stop: bool = False
+) -> float | None:
+    """山 m（< 0。直近の最深の u）からの戻し量つきでブレーキの要る加速度 need になる u ∈ (m, 0]
+    を解く（accel(v, u, release = u − m) ≧ need になる最初の u。格子点で評価して交差を直線補間。
+    `_resolve_releases` の解き方。2026-10-31 段4 で関数に切り出し、C10 の c10_release_table が
+    共用）。
+    完全に離しても届かなければ None。"""
+    grid = table.u_grid
+    pts = np.concatenate([[m], grid[(grid > m) & (grid < 0.0)], [0.0]])
+    f = np.asarray(table.accel(v, pts, release=pts - m, stop=on_stop), dtype=float) - need
+    hit = np.flatnonzero(f >= 0.0)
+    if len(hit) == 0:
+        return None
+    j = int(hit[0])
+    if j == 0:
+        u_new = m
+    else:
+        f0, f1 = f[j - 1], f[j]
+        frac = 0.0 if f1 == f0 else float(np.clip(-f0 / (f1 - f0), 0.0, 1.0))
+        u_new = float(pts[j - 1] + frac * (pts[j] - pts[j - 1]))
+    return min(u_new, 0.0)
+
+
 def _resolve_releases(
     effort: np.ndarray,
     redo: np.ndarray,
@@ -3306,28 +3353,14 @@ def _resolve_releases(
         effort + brake_deadband_pct,
         np.where(effort > accel_deadband_pct, effort - accel_deadband_pct, 0.0),
     )
-    grid = table.u_grid
     for i in np.flatnonzero(redo):
         m = float(u[max(i - w, 0) : i].min()) if i > 0 else 0.0
         if m >= 0.0 or float(u_b0[i]) <= m:
             continue  # 戻していない（直近の最小が 0 以上）か、戻し量 0 の解がすでに m より深い
-        pts = np.concatenate([[m], grid[(grid > m) & (grid < 0.0)], [0.0]])
         on_stop = stop_side is not None and bool(stop_side[i])
-        f = (
-            np.asarray(table.accel(float(v[i]), pts, release=pts - m, stop=on_stop), dtype=float)
-            - need_b[i]
-        )
-        hit = np.flatnonzero(f >= 0.0)
-        if len(hit) == 0:
+        u_new = _solve_with_release(table, float(v[i]), float(need_b[i]), m, on_stop)
+        if u_new is None:
             continue  # 完全に離しても要る加速度に届かない: 戻し量 0 の解のまま
-        j = int(hit[0])
-        if j == 0:
-            u_new = m
-        else:
-            f0, f1 = f[j - 1], f[j]
-            frac = 0.0 if f1 == f0 else float(np.clip(-f0 / (f1 - f0), 0.0, 1.0))
-            u_new = float(pts[j - 1] + frac * (pts[j] - pts[j - 1]))
-        u_new = min(u_new, 0.0)
         u[i] = u_new
         effort[i] = -(brake_deadband_pct + abs(u_new))
         changed[i] = True

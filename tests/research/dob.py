@@ -151,6 +151,17 @@ class PedalDisturbanceObserver:
         C13 の車速のフィルタ・予測器が同じ引き方で表を引く）。履歴が足りなければ None。"""
         return self._delayed(tau)
 
+    def recent_peak_brake(self, t: float) -> float | None:
+        """時刻 t の手前（t を含まない）の直近 release_window_s 秒に出したブレーキの山
+        （u の最小。負）。ブレーキが無い・履歴が無い・窓 0 は None。`_release` が戻し量に使う
+        「直近 release_window_s 秒の u の最小」と同じ量を、今の周期の開度を解く前に取る
+        （C10 の c10_release_table。2026-10-31 段4）。"""
+        if self.release_window_s <= 0.0:
+            return None
+        t0 = t - self.release_window_s
+        m = min((u for ht, u, _, _ in self._hist if t0 - 1e-9 <= ht < t - 1e-9), default=0.0)
+        return m if m < 0.0 else None
+
     def release_at(self, tau: float, u_d: float) -> float:
         """時刻 τ のブレーキの戻し量（`_release` の公開名。段2u）。"""
         return self._release(tau, u_d)

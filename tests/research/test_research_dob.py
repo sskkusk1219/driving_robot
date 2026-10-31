@@ -328,3 +328,27 @@ def test_split_low_box_updates_only_low_and_carries_over() -> None:
     assert obs.d_accel_low == pytest.approx(low_before, abs=0.05)
     # ブレーキ側の低速の箱は別
     assert obs.d_brake_low == 0.0 and obs.n_brake_low == 0
+
+
+def test_recent_peak_brake_is_min_u_in_window_before_now() -> None:
+    """c10_release_table（2026-10-31 段4）: 今の手前 release_window_s 秒のブレーキの最深の u。"""
+    obs = PedalDisturbanceObserver(
+        _Table(), tq_accel_s=1.0, tq_brake_s=1.0, lag_accel_s=0.0, lag_brake_s=0.0,
+        release_window_s=1.0,
+    )
+    assert obs.recent_peak_brake(0.0) is None  # 履歴なし
+    t = 0.0
+    for u in (-2.0, -9.0, -6.0, -4.0):
+        obs.update(t=t, speed_kmh=50.0, u_now=u, governed=False, at_limit_now=False,
+                   launch=False, stop=True)  # 推定は更新しない（履歴だけ）
+        t += DT
+    assert obs.recent_peak_brake(t) == -9.0  # 今の周期（t）は含まない
+    assert obs.recent_peak_brake(t + 0.9) == -4.0  # 窓 1.0 s の外の -9 は落ちる
+    assert obs.recent_peak_brake(t + 5.0) is None  # 窓の中に何もない
+    # アクセル（u > 0）だけなら山なし
+    acc = PedalDisturbanceObserver(
+        _Table(), tq_accel_s=1.0, tq_brake_s=1.0, lag_accel_s=0.0, lag_brake_s=0.0
+    )
+    acc.update(t=0.0, speed_kmh=50.0, u_now=5.0, governed=False, at_limit_now=False,
+               launch=False, stop=True)  # 推定は更新しない（履歴だけ）
+    assert acc.recent_peak_brake(0.1) is None
