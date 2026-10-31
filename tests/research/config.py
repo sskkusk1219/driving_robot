@@ -321,6 +321,15 @@ class LearningSection:
     # 2026-10-23 段5-8 で true を採用（yaml も true）。
     # 戻す車速・周回数・見込み秒数は planner のままなので、戻しの有無だけを比べられる
     ramp_release_enabled: bool = True
+    # 2026-10-31 段2（ProblemReport_20261031_効き始めの近くのブレーキ）: ゆっくり戻す測定
+    # （RAMP_RELEASE_SWEEP）。下りのブレーキを一定の速さ ramp_release_sweep_rate_pct_s で戻し、
+    # 加速度が惰行に戻ったら止めて、同じ速さで入った開度まで踏み増す。戻す量は決めない。
+    # 場所は planner がモードから決める（ramp_release_sweep_est_s は見込み秒数。1 回あたり）。
+    # ramp_release_sweep_timeout_s は 1 回（戻す＋踏み増す）の打ち切り。既定 off ＝ 今と同じ走り
+    ramp_release_sweep_enabled: bool = False
+    ramp_release_sweep_rate_pct_s: float = 0.25
+    ramp_release_sweep_timeout_s: float = 40.0
+    ramp_release_sweep_est_s: float = 25.0
     # 2026-10-13 段2o-2: ペダルの遅れの測定。G ランプの後ろに、ramp_lag_speeds_kmh の各車速を
     # 上端とする段（狙いの G は ramp_lag_approach_g）を足し、定速の保持の後に開度を固定で
     # ステップさせる
@@ -2004,6 +2013,12 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         f" 0 以上（空なら戻しを入れない）: {rel_f} / {rel_h}",
     )
     need(cfg.learning.ramp_release_move_s > 0.0, "learning.ramp_release_move_s は正値")
+    need(
+        cfg.learning.ramp_release_sweep_rate_pct_s > 0.0
+        and cfg.learning.ramp_release_sweep_timeout_s > 0.0
+        and cfg.learning.ramp_release_sweep_est_s >= 0.0,
+        "learning.ramp_release_sweep_rate_pct_s・_timeout_s は正値、_est_s は 0 以上",
+    )
     # 2026-10-23 段5-8: 停止前の戻し B-1・停車まぎわ除外
     lr8 = cfg.learning
     need(lr8.stop_release_start_kmh > 0.0, "learning.stop_release_start_kmh は正値")

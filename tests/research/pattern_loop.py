@@ -436,6 +436,26 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
       アクセル 0（hi ＝ 0）、アクセルの流れはブレーキ 0 なので両踏みにならない。
     - 結果: `RampResult.dither_brake_s`・`dither_brake_n`・`dither_brake_skipped`・
       `dither_accel_s`・`dither_accel_n`・`dither_accel_skipped`。
+
+2026-10-31 段2（ProblemReport_20261031_効き始めの近くのブレーキ）: ゆっくり戻す測定
+    （`learning.ramp_release_sweep_*`。既定 off ＝ 今と完全に同じ走り）。RAMP_RELEASE（段2o-5）と
+    同じ作り。少し戻すと効きが急に落ちる帯の戻しの表のデータを、戻す量を決めずに取る。
+    - 新フェーズ `_Phase.RAMP_RELEASE_SWEEP`（CSV の phase 名も同じ）。入り方は RAMP_RELEASE と
+      同じ（`GRampPattern.sweep_stations`。ラッチ後・u ＜ 0・実車速 ≦ 場所・安全網の車速より上）。
+      さらに、その車速の惰行の減速（コーストダウンで測った `glimit.coast_decel_kmhs`）が場所の
+      目標減速度以上なら飛ばす（惰行だけで足りるのでブレーキは踏まない。`sweep_skipped`）。
+      同じ周期に RAMP_RELEASE の場所にも当たるときは RAMP_RELEASE が先で、sweep の点は次の周期以降。
+    - 戻す: 入った時点の u から一定の速さ `ramp_release_sweep_rate_pct_s` で 0（待機位置 ＝ min）
+      へ戻す。制御の項なし。min より浅くしない。
+    - 止める: 実加速度が惰行（≧ −惰行の減速）に戻った状態が `stop_release_escape_s`（0.5 秒。
+      停止前の戻しの「逃げ道」と同じ持続）続いたら戻すのをやめる。惰行の減速が無い車速帯は判定できないので、
+      u が 0 に着いたところで止める。
+    - 踏み増す: 止めた所から同じ速さで入った時点の u まで戻し、`_ramp_release_exit` で RAMP_DOWN へ
+      （u_peak ＝ 入った時点の u）。安全網: 実車速 ≦ ramp_release_min_kmh、
+      `ramp_release_sweep_timeout_s`（打ち切りは `sweep_timeout_n`）。G を守る手当ては
+      RAMP_RELEASE と同じ（`_ramp_control` を呼ばない・上限 G のマップに貯めない・`_rp_down_g` に
+      入れない・使った時間は下りの時間切れから除く）。
+    - 結果: `RampResult.sweep_s`・`sweep_n`・`sweep_skipped`・`sweep_timeout_n`。
 """
 
 from __future__ import annotations
@@ -548,6 +568,9 @@ class GRampPattern(LearningPattern):
     lag_step: bool = False
     # 2026-10-14 段2o-5: 下りで山からブレーキを離す「戻し」の車速 [km/h]（昇順。空なら従来どおり）
     release_stations: tuple[float, ...] = ()
+    # 2026-10-31 段2（ProblemReport_20261031_効き始めの近くのブレーキ）: 下りでブレーキを一定の
+    # 速さでゆっくり戻し、惰行に戻るまでを測る車速 [km/h]（昇順。空なら従来どおり）
+    sweep_stations: tuple[float, ...] = ()
     # 2026-10-31 段2（ProblemReport_20261031_停止間際 B）: 停止の手前の測定。
     # stop_approach=True の本は、上りを accel_g、下りを target_g の一定 G で走り、停止前の戻し・
     # 下りの戻し・dither・途中の保持に入らず、停車（STOP_SPEED_KMH 以下）まで一定 G のまま下りる。
@@ -605,6 +628,12 @@ class RampResult:
     dither_accel_s: float = 0.0
     dither_accel_n: int = 0
     dither_accel_skipped: int = 0
+    # 2026-10-31 段2: ゆっくり戻す（RAMP_RELEASE_SWEEP）の合計秒数・入った回数・飛ばした回数・
+    # 打ち切り（時間切れ）の回数。down_s は含まない
+    sweep_s: float = 0.0
+    sweep_n: int = 0
+    sweep_skipped: int = 0
+    sweep_timeout_n: int = 0
 
 
 @dataclass(frozen=True)
@@ -641,6 +670,8 @@ class _Phase(Enum):
     # （下りのブレーキ・上りの保持の後のアクセル）
     RAMP_BRAKE_DITHER = auto()
     RAMP_ACCEL_DITHER = auto()
+    # G ランプ走行（段2 2026-10-31）: 下りでブレーキを一定の速さでゆっくり戻し、惰行に戻るまでを測る
+    RAMP_RELEASE_SWEEP = auto()
     DONE = auto()
 
 
@@ -660,6 +691,7 @@ STOP_RELEASE_TIMEOUT_S = 30.0
 _RAMP_PHASES = (
     _Phase.RAMP_UP, _Phase.RAMP_CRUISE, _Phase.RAMP_HOLD, _Phase.HOLD_STEP, _Phase.RAMP_DOWN,
     _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER, _Phase.RAMP_ACCEL_DITHER,
+    _Phase.RAMP_RELEASE_SWEEP,
 )
 
 
@@ -823,6 +855,10 @@ class PatternLoopConfig:
     ramp_release_min_kmh: float = field(default=0.0)
     # 2026-10-16 段2o-6: false なら戻しに入らない（learning.ramp_release_enabled から渡す）
     ramp_release_enabled: bool = field(default=True)
+    # 2026-10-31 段2: ゆっくり戻す測定（learning.ramp_release_sweep_* から渡す。false は今と同じ）
+    ramp_release_sweep_enabled: bool = field(default=False)
+    ramp_release_sweep_rate_pct_s: float = field(default=0.25)
+    ramp_release_sweep_timeout_s: float = field(default=40.0)
     # 2026-10-23 段5-8: 停止前の戻し B-1（learning.stop_release_* から渡す。false なら今と同じ走り）
     stop_release_enabled: bool = field(default=False)
     stop_release_start_kmh: float = field(default=7.5)
@@ -1049,7 +1085,7 @@ class PatternLoop:
         # 結果用の積算（区間を切り替えるたびに足す）。キーは up / cruise / hold / down
         self._rp_acc: dict[str, float] = {
             "up": 0.0, "cruise": 0.0, "hold": 0.0, "down": 0.0, "release": 0.0,
-            "dither_brake": 0.0, "dither_accel": 0.0,
+            "dither_brake": 0.0, "dither_accel": 0.0, "sweep": 0.0,
         }
         # 下りの戻し（RAMP_RELEASE。2026-10-14 段2o-5）。RAMP_UP の頭で作り直す
         self._rp_release_done: set[int] = set()  # 戻し済み（飛ばした分を含む）の点の番号
@@ -1057,6 +1093,17 @@ class PatternLoop:
         self._rp_release_u_peak = 0.0  # 入った時点の u（山の開度。負）
         self._rp_release_n = 0
         self._rp_release_skipped = 0
+        # ゆっくり戻す（RAMP_RELEASE_SWEEP。2026-10-31 段2）。RAMP_UP の頭で作り直す
+        self._rp_sweep_done: set[int] = set()  # 使った（飛ばした分を含む）場所の番号
+        self._rp_sweep_t0 = 0.0  # 入った時刻
+        self._rp_sweep_u0 = 0.0  # 入った時点の u（負）
+        self._rp_sweep_turn_t = 0.0  # 戻すのをやめて踏み増しへ移った時刻
+        self._rp_sweep_u_turn: float | None = None  # 踏み増しへ移った時点の u（戻す間は None）
+        self._rp_sweep_coast_s = 0.0  # 加速度が惰行に戻った状態が続いた秒数
+        self._rp_sweep_last_t: float | None = None
+        self._rp_sweep_n = 0
+        self._rp_sweep_skipped = 0
+        self._rp_sweep_timeout_n = 0
         # 停止前の戻し B-1（段5-8）。active は RAMP_RELEASE が停止前の戻しのとき True
         self._rp_stop_release_active = False
         self._rp_stop_release_done = False  # この下りで入った（または入れない）
@@ -1567,7 +1614,9 @@ class PatternLoop:
             # 見て下限 0 にすると、ブレーキを踏んだまま入ったとき 1 周期でブレーキが抜ける
             lo = min(0.0, self._rp_u)
         elif (self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched) or (
-            self._phase in (_Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER)
+            self._phase in (
+                _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER, _Phase.RAMP_RELEASE_SWEEP
+            )
         ):
             hi = 0.0  # 戻し（段2o-5）はブレーキ側（u ≤ 0）だけ。u は `_ramp_release_u` が決める
         return lo, hi
@@ -1576,7 +1625,9 @@ class PatternLoop:
         """G ランプの u がブレーキ側を指すか（RAMP_DOWN のラッチ後、または u ＜ 0）。"""
         if self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched:
             return True
-        if self._phase in (_Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER):
+        if self._phase in (
+            _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER, _Phase.RAMP_RELEASE_SWEEP
+        ):
             return True  # 戻しの間はブレーキの領域（u ＝ 0 でも待機位置 ＝ min）
         return self._rp_u < 0.0
 
@@ -1620,7 +1671,9 @@ class PatternLoop:
         # 2026-10-14 段2o-5: RAMP_RELEASE もラッチ後の RAMP_DOWN と同じ（u ＝ 0 でブレーキ ＝ min。
         # 0% へ飛ばさない）
         if (self._phase is _Phase.RAMP_DOWN and self._rp_brake_latched) or (
-            self._phase in (_Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER)
+            self._phase in (
+                _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER, _Phase.RAMP_RELEASE_SWEEP
+            )
         ):
             accel = 0.0
             brake = ff.brake_deadband_pct - u
@@ -1679,7 +1732,7 @@ class PatternLoop:
         self._rp_cruise_done_n = 0
         self._rp_acc = {
             "up": 0.0, "cruise": 0.0, "hold": 0.0, "down": 0.0, "release": 0.0,
-            "dither_brake": 0.0, "dither_accel": 0.0,
+            "dither_brake": 0.0, "dither_accel": 0.0, "sweep": 0.0,
         }
         self._rp_dither_brake_done = set()
         self._rp_dither_brake_n = 0
@@ -1689,6 +1742,10 @@ class PatternLoop:
         self._rp_release_done = set()
         self._rp_release_n = 0
         self._rp_release_skipped = 0
+        self._rp_sweep_done = set()
+        self._rp_sweep_n = 0
+        self._rp_sweep_skipped = 0
+        self._rp_sweep_timeout_n = 0
         self._rp_stop_release_active = False
         self._rp_stop_release_done = False
         self._rp_u_hist.clear()
@@ -1806,7 +1863,7 @@ class PatternLoop:
         g_min_up = min(max(0.0, cfg.ramp_edge_g), g_up)
         if self._phase in (
             _Phase.HOLD_STEP, _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER,
-            _Phase.RAMP_ACCEL_DITHER,
+            _Phase.RAMP_ACCEL_DITHER, _Phase.RAMP_RELEASE_SWEEP,
         ):
             # 開度を固定で持つ（基準は進めない。2026-10-13 段2o-2。戻しも同じ。2026-10-14 段2o-5:
             # 戻しを出るときの `_rp_turn_g0` が 0 になり、g_ref は 0 → −G で始まる）
@@ -2345,7 +2402,7 @@ class PatternLoop:
             return None
         if self._phase in (
             _Phase.HOLD_STEP, _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER,
-            _Phase.RAMP_ACCEL_DITHER,
+            _Phase.RAMP_ACCEL_DITHER, _Phase.RAMP_RELEASE_SWEEP,
         ):
             # 2026-10-28 段2: 効き始めの少し先での小さな動き（dither）も同じ（開度を固定で持つ）。
             # 2026-10-13 段2o-2: 遅れの測定のステップは開度を固定で持つ。偏差の項は使わず、
@@ -2436,6 +2493,9 @@ class PatternLoop:
             else:
                 self._advance_ramp_release(speed, now)
             return
+        if self._phase is _Phase.RAMP_RELEASE_SWEEP:
+            self._advance_ramp_release_sweep(speed, now, measured_g)
+            return
         if self._phase is _Phase.RAMP_BRAKE_DITHER:
             self._advance_ramp_dither_brake(speed, now)
             return
@@ -2513,6 +2573,8 @@ class PatternLoop:
             return
         if self._ramp_release_try_enter(pattern, speed, now):
             return
+        if self._ramp_sweep_try_enter(pattern, speed, now):
+            return
         if self._ramp_dither_brake_try_enter(pattern, speed, now):
             return
         if self._stop_release_try_enter(pattern, speed, now):
@@ -2536,7 +2598,7 @@ class PatternLoop:
         key = {
             _Phase.RAMP_UP: "up", _Phase.RAMP_CRUISE: "cruise",
             _Phase.RAMP_HOLD: "hold", _Phase.HOLD_STEP: "hold", _Phase.RAMP_DOWN: "down",
-            _Phase.RAMP_RELEASE: "release",
+            _Phase.RAMP_RELEASE: "release", _Phase.RAMP_RELEASE_SWEEP: "sweep",
             _Phase.RAMP_BRAKE_DITHER: "dither_brake", _Phase.RAMP_ACCEL_DITHER: "dither_accel",
         }.get(self._phase)
         if key is not None:
@@ -2894,6 +2956,95 @@ class PatternLoop:
         if self._rp_blend_left > 0.0:  # 浅くする向き（u_peak が今より浅い）は寄せない
             self._rp_blend_left = self._rp_blend_time_left = 0.0
 
+    # ── ゆっくり戻す（RAMP_RELEASE_SWEEP。2026-10-31 段2）──────────────────
+    def _ramp_sweep_try_enter(self, pattern: GRampPattern, speed: float, now: float) -> bool:
+        """下り（RAMP_DOWN）で、場所の車速に着いたら RAMP_RELEASE_SWEEP へ入る。入ったら True。
+
+        入り方は `_ramp_release_try_enter` と同じ（実車速 ≤ まだ使っていない場所のうちいちばん近い
+        1 点だけ使い、残りは飛ばして済みにする。ラッチ後・u ＜ 0・実車速が安全網より上）。加えて、
+        その車速の惰行の減速が場所の目標減速度以上なら飛ばす（惰行だけで足りる。ブレーキの踏み方が
+        弱い段でも惰行より強い G を出していなければ、戻しても惰行に戻る所が測れない）。
+        """
+        cfg = self._config
+        if pattern.stop_approach or not cfg.ramp_release_sweep_enabled:
+            return False
+        stations = pattern.sweep_stations
+        if not stations:
+            return False
+        cands = [
+            i for i, st in enumerate(stations)
+            if i not in self._rp_sweep_done and speed <= st
+        ]
+        if not cands:
+            return False
+        self._rp_sweep_done.update(cands)
+        coast = self.glimit.coast_decel_kmhs(speed)
+        pick_ok = (
+            self._rp_brake_latched and self._rp_u < 0.0
+            and speed > max(cfg.ramp_release_min_kmh, STOP_SPEED_KMH)
+            and not (coast is not None and coast >= pattern.target_g * G_TO_KMHS)
+        )
+        self._rp_sweep_skipped += len(cands) - (1 if pick_ok else 0)
+        if not pick_ok:
+            return False
+        self._ramp_account(now)
+        assert self._phase_started_at is not None
+        self._rp_down_prior_s += max(0.0, now - self._phase_started_at)  # 時間切れから除く
+        self._rp_blend_left = self._rp_blend_time_left = 0.0  # 寄せ残りは捨てる
+        self._rp_down_brake_blend_pending = False
+        self._rp_blend_release = False
+        self._rp_sweep_u0 = self._rp_u
+        self._rp_release_u_peak = self._rp_u  # 出るとき `_ramp_release_exit` が入った u へ寄せる
+        self._rp_sweep_t0 = now
+        self._rp_sweep_u_turn = None
+        self._rp_sweep_coast_s = 0.0
+        self._rp_sweep_last_t = now
+        self._rp_sweep_n += 1
+        self._phase = _Phase.RAMP_RELEASE_SWEEP  # `_enter_phase` は通さない（`_rp_hist` を残す）
+        self._skip_count = 0
+        return True
+
+    def _advance_ramp_release_sweep(
+        self, speed: float, now: float, measured_g: float | None
+    ) -> None:
+        """RAMP_RELEASE_SWEEP の前進。戻す間は u を入った u0 から一定の速さで 0 へ。実加速度が惰行
+        （≧ −惰行の減速）に戻った状態が stop_release_escape_s 続くか、u が 0 に着いたら、そこから
+        同じ速さで u0 まで踏み増し、着いたら `_ramp_release_exit`。実車速が安全網
+        （ramp_release_min_kmh。0 なら停車）以下、または ramp_release_sweep_timeout_s を超えたら
+        その場で `_ramp_release_exit`（打ち切りは時間切れだけ数える）。制御の項は使わない。"""
+        cfg = self._config
+        t = max(0.0, now - self._rp_sweep_t0)
+        last = self._rp_sweep_last_t
+        dt = 0.0 if last is None else min(max(0.0, now - last), 10.0 * self._interval_s)
+        self._rp_sweep_last_t = now
+        if t >= cfg.ramp_release_sweep_timeout_s:
+            self._rp_sweep_timeout_n += 1
+            self._ramp_release_exit(speed, now)
+            return
+        if speed <= max(cfg.ramp_release_min_kmh, STOP_SPEED_KMH):
+            self._ramp_release_exit(speed, now)
+            return
+        rate = cfg.ramp_release_sweep_rate_pct_s
+        u0 = self._rp_sweep_u0
+        if self._rp_sweep_u_turn is None:
+            self._rp_u = min(0.0, u0 + rate * t)
+            coast = self.glimit.coast_decel_kmhs(speed)
+            if (
+                coast is not None and measured_g is not None
+                and measured_g * G_TO_KMHS >= -coast
+            ):
+                self._rp_sweep_coast_s += dt
+            else:
+                self._rp_sweep_coast_s = 0.0
+            # 惰行の減速が無い車速帯は判定できないので、u が 0（待機位置 ＝ min）に着いたら折り返す
+            if self._rp_sweep_coast_s >= cfg.stop_release_escape_s or self._rp_u >= 0.0:
+                self._rp_sweep_u_turn = self._rp_u
+                self._rp_sweep_turn_t = now
+            return
+        self._rp_u = max(u0, self._rp_sweep_u_turn - rate * (now - self._rp_sweep_turn_t))
+        if self._rp_u <= u0:
+            self._ramp_release_exit(speed, now)
+
     # ── 効き始めの少し先での小さな動き（段2 2026-10-28）─────────────────────
     def _ramp_dither_total_s(self) -> float:
         """dither の流れの全体の秒数 ＝ 4 つの開度 × ramp_dither_hold_s。"""
@@ -3245,6 +3396,10 @@ class PatternLoop:
                 dither_accel_s=self._rp_acc["dither_accel"],
                 dither_accel_n=self._rp_dither_accel_n,
                 dither_accel_skipped=self._rp_dither_accel_skipped,
+                sweep_s=self._rp_acc["sweep"],
+                sweep_n=self._rp_sweep_n,
+                sweep_skipped=self._rp_sweep_skipped,
+                sweep_timeout_n=self._rp_sweep_timeout_n,
             )
         )
 

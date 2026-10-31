@@ -1696,3 +1696,24 @@ def test_launch_table_sub_min_weight_defaults_false() -> None:
     （段5 の 6 モードの後、ユーザー決定で採用）。"""
     assert cfgmod.LearningSection().launch_table_sub_min_weight is False
     assert _load_default().learning.launch_table_sub_min_weight is True
+
+
+def test_ramp_release_sweep_settings_default_off_and_validation() -> None:
+    """2026-10-31 段2: ゆっくり戻す測定。dataclass の既定・本体 yaml とも off。範囲外は弾く。"""
+    fresh = cfgmod.LearningSection()
+    assert fresh.ramp_release_sweep_enabled is False
+    assert fresh.ramp_release_sweep_rate_pct_s == pytest.approx(0.25)
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.ramp_release_sweep_enabled is False
+    assert lr.ramp_release_sweep_rate_pct_s == pytest.approx(0.25)
+    assert cfgmod.validate_config(cfg) == []
+    for key, bad, good in (
+        ("ramp_release_sweep_rate_pct_s", 0.0, 0.25),
+        ("ramp_release_sweep_timeout_s", 0.0, 40.0),
+        ("ramp_release_sweep_est_s", -1.0, 25.0),
+    ):
+        setattr(lr, key, bad)
+        assert any("ramp_release_sweep" in p for p in cfgmod.validate_config(cfg)), key
+        setattr(lr, key, good)
+        assert cfgmod.validate_config(cfg) == []

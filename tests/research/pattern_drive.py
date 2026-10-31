@@ -384,6 +384,9 @@ def _describe(pattern: LearningPattern, *, hold_s: float = 0.0, turn_s: float = 
         if pattern.release_stations:  # 2026-10-14 段2o-5
             extra += (f"。下りの {', '.join(f'{v:g}' for v in pattern.release_stations)} km/h で"
                       "ブレーキを山から離す戻し")
+        if pattern.sweep_stations:  # 2026-10-31 段2
+            extra += (f"。下りの {', '.join(f'{v:g}' for v in pattern.sweep_stations)} km/h で"
+                      "ブレーキを一定の速さでゆっくり戻す（惰行に戻るまで）")
         return (f"G ランプ  狙い {pattern.target_g:g}G で加速 → 上端 {pattern.top_kmh:g} km/h で"
                 f" {hold_s:g} 秒保持 → {pattern.target_g:g}G で減速"
                 f"（見込み {est:.0f}s。"
@@ -428,10 +431,10 @@ def _fmt_pct(value: float | None) -> str:
 
 
 def _ramp_total_s(r: RampResult) -> float:
-    """G ランプ 1 本の合計秒数（加速・保持・減速・途中保持・戻し・dither）。"""
+    """G ランプ 1 本の合計秒数（加速・保持・減速・途中保持・戻し・dither・ゆっくり戻す）。"""
     return (
         r.up_s + r.hold_s + r.down_s + r.cruise_s + r.release_s + r.dither_brake_s
-        + r.dither_accel_s
+        + r.dither_accel_s + r.sweep_s
     )
 
 
@@ -453,7 +456,7 @@ def result_table(
         "加速G中央値 | 減速G中央値 | 最高km/h | 途中保持 秒 | 途中保持 達成/入った | "
         "戻し 秒 | 戻し 入った/飛ばした | 効き始め アクセル | 効き始め ブレーキ | "
         "dither ブレーキ 秒 | dither ブレーキ 入った/飛ばした | dither アクセル 秒 | "
-        "dither アクセル 入った/飛ばした"
+        "dither アクセル 入った/飛ばした | ゆっくり戻す 秒 | ゆっくり戻す 入った/飛ばした/打ち切り"
     )
     lines = [head, "-" * len(head)]
     for i, item in enumerate(order):
@@ -477,6 +480,8 @@ def result_table(
             # 2026-10-28 段2: 効き始めの少し先での小さな動き（dither。合計秒に含む）
             f" | {r.dither_brake_s:>6.1f} | {r.dither_brake_n}/{r.dither_brake_skipped}"
             f" | {r.dither_accel_s:>6.1f} | {r.dither_accel_n}/{r.dither_accel_skipped}"
+            # 2026-10-31 段2: ゆっくり戻す（RAMP_RELEASE_SWEEP。合計秒に含む）
+            f" | {r.sweep_s:>6.1f} | {r.sweep_n}/{r.sweep_skipped}/{r.sweep_timeout_n}"
         )
     lines.append(f"全体の所要秒数: {total_s:.0f} s（{total_s / 60:.1f} 分）")
     return "\n".join(lines)
@@ -547,6 +552,8 @@ def build_patterns(
          （`stations_up_only`。省略は False）
          2026-10-14 段2o-5: 5 つ目（あれば）は下りで山からブレーキを離す戻しの車速
          （`release_stations`。省略は空）
+         2026-10-31 段1: 6 つ目（あれば）はブレーキをゆっくり戻して惰行に戻るまでを測る車速
+         （`sweep_stations`。省略は空）
 
     2026-10-13 段2o-2: `with_lag` が True のとき（手順2 の本番）、G ランプの後ろに遅れの測定の段を
       足す: `learning.ramp_lag_speeds_kmh` の各車速を上端とする、狙いの G が
@@ -576,6 +583,7 @@ def build_patterns(
             stations_kmh=tuple(item[2]) if len(item) > 2 else (),
             stations_up_only=bool(item[3]) if len(item) > 3 else False,
             release_stations=tuple(item[4]) if len(item) > 4 else (),
+            sweep_stations=tuple(item[5]) if len(item) > 5 else (),
         )
         for item in ramp_order
     ]
@@ -673,6 +681,10 @@ def loop_config_from_config(
         ramp_release_move_s=lr.ramp_release_move_s,
         ramp_release_hold_s=tuple(lr.ramp_release_hold_s),
         ramp_release_enabled=lr.ramp_release_enabled,
+        # 2026-10-31 段2: ゆっくり戻す測定（RAMP_RELEASE_SWEEP）
+        ramp_release_sweep_enabled=lr.ramp_release_sweep_enabled,
+        ramp_release_sweep_rate_pct_s=lr.ramp_release_sweep_rate_pct_s,
+        ramp_release_sweep_timeout_s=lr.ramp_release_sweep_timeout_s,
         # 2026-10-23 段5-8: 停止前の戻し B-1
         stop_release_enabled=lr.stop_release_enabled,
         stop_release_start_kmh=lr.stop_release_start_kmh,
@@ -806,6 +818,13 @@ async def run_pattern_drive(
             f"それぞれ {holds} 秒保持（0 は待機位置）。出たら {loop_config.ramp_turn_time_s:g} "
             f"秒かけて 0 → -G。実車速が {loop_config.ramp_release_min_kmh:g} km/h 以下で打ち切り。"
             "戻し中は制御の項なし・表と中央値に貯めない")
+    if any(isinstance(p, GRampPattern) and p.sweep_stations for p in patterns):
+        say("ゆっくり戻す（段2 2026-10-31）: 場所に着いたら（ブレーキを踏んでいて、惰行より強い"
+            " G の"
+            f"ときだけ）山の開度から {loop_config.ramp_release_sweep_rate_pct_s:g} %/s で戻し、"
+            "加速度が惰行に戻ったら止めて、同じ速さで山の開度まで踏み増して出る。"
+            f"{loop_config.ramp_release_sweep_timeout_s:g} 秒・"
+            f"実車速 {loop_config.ramp_release_min_kmh:g} km/h 以下で打ち切り。制御の項なし")
     if loop_config.ramp_dither_enabled:
         b_on, a_on = (
             loop_config.ramp_dither_brake_onset_u_pct, loop_config.ramp_dither_accel_onset_u_pct

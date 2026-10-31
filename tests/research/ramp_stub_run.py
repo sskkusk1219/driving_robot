@@ -76,9 +76,9 @@ async def _wait_stopped(hw: hwmod.ResearchHardware, timeout_s: float = 60.0) -> 
 
 def select_order(
     plan: RampPlan, *, full: bool, levels: list[float] | None
-) -> list[tuple[float, float, tuple[float, ...], bool, tuple[float, ...]]]:
-    """走る段（G, 上端, 保持する車速, 上りだけか, 戻す車速）。--full は全段、無ければ levels
-    （既定 SHORT_LEVELS）だけ。"""
+) -> list[tuple[float, float, tuple[float, ...], bool, tuple[float, ...], tuple[float, ...]]]:
+    """走る段（G, 上端, 保持する車速, 上りだけか, 戻す車速, ゆっくり戻す車速）。--full は全段、
+    無ければ levels（既定 SHORT_LEVELS）だけ。"""
     order = plan.execution_order()
     if full:
         return order
@@ -111,8 +111,9 @@ async def _run(args: argparse.Namespace) -> int:
         return 2
     say(f"モード: {', '.join(names)}")
     say("走る段 (G, 上端 km/h): " + ", ".join(
-        f"({g:g}, {t:g}, 保持 {len(st)}{'・上りだけ' if up_only else ''}, 戻し {len(rel)})"
-        for g, t, st, up_only, rel in order))  # 2026-10-14 段2o-5: 5 つ目は戻す車速
+        f"({g:g}, {t:g}, 保持 {len(st)}{'・上りだけ' if up_only else ''}, 戻し {len(rel)}"
+        f"{f', ゆっくり戻す {len(sw)}' if sw else ''})"
+        for g, t, st, up_only, rel, sw in order))  # 5 つ目は戻す車速・6 つ目はゆっくり戻す車速
 
     if lr.ramp_dither_enabled:  # 2026-10-28 段2: dither の見込み（上限）を足した結果
         say(f"小さな動き（dither）の見込み（上限）: {plan.dither_s:.0f} 秒 "

@@ -148,8 +148,9 @@ def test_execution_order_pass1_then_pass2_ascending() -> None:
     order = plan.execution_order()
     gs = [g for g, *_ in order]
     assert gs == [0.02, 0.1, 0.2, 0.02, 0.1, 0.2]
-    assert order[1] == (0.1, plan.levels[1].top_kmh, (), False, ())
-    assert all(len(item) == 5 for item in order)  # 段2o-5: 5 つ目は戻す車速
+    assert order[1] == (0.1, plan.levels[1].top_kmh, (), False, (), ())
+    # 段2o-5: 5 つ目は戻す車速・2026-10-31 段1: 6 つ目はゆっくり戻す車速
+    assert all(len(item) == 6 for item in order)
 
 
 def test_table_formatting_runs() -> None:
@@ -427,7 +428,7 @@ def test_plan_ramps_up_only_stations_on_other_levels() -> None:
     others = plan.levels[1:]
     assert any(lv.stations for lv in others)
     assert all(lv.stations_up_only == bool(lv.stations) for lv in others)
-    assert all(len(item) == 5 for item in plan.execution_order())  # 段2o-5: 5 つ目は戻す車速
+    assert all(len(item) == 6 for item in plan.execution_order())
     lv = next(lv for lv in others if lv.stations)
     base = rp.estimate_s(lv.g, lv.top_kmh, turn_s=2.0)
     assert lv.est_s == pytest.approx(base + len(lv.stations) * (7.0 + 4.0 + 3.0))
@@ -587,3 +588,80 @@ def test_plan_ramps_dither_can_push_the_first_pass_over_budget() -> None:
         dither_brake_n=3, dither_max_g=0.1, dither_accel_max_n=3,
     )
     assert on.over_budget and "枠を超えている" in rp.format_plan_table(on)
+
+
+# ── ゆっくり戻す場所（plan_release_sweeps。2026-10-31 段1）──────────────────
+
+
+def _sweep_counts() -> rp.BandCounts:
+    """段 (0.02, 0.1, 0.2) × 車速帯 10 本（0–100 km/h）。どの段も上端は 100 km/h。
+    戻しの秒数: 80–90 帯は段 1 が 1.5・段 2 が 1.0（合計 2.5）、30–40 帯は段 2 が 3.0、
+    50–60 帯は最弱の段 0 だけ 5.0。"""
+    accel = np.zeros((10, 3))
+    accel[9, :] = 3.0
+    release = np.zeros((10, 3))
+    release[8, 1] = 1.5
+    release[8, 2] = 1.0
+    release[3, 2] = 3.0
+    release[5, 0] = 5.0
+    return rp.BandCounts(LEVELS, 10.0, accel, np.zeros((10, 3)), 0.0, release_s=release)
+
+
+_SWEEP_KW = {"mode_min_s": 2.0, "max_speed_kmh": 140.0, "budget_s": 1e9, "cruise_min_kmh": 8.0}
+
+
+def test_sweep_off_gives_the_same_plan_as_before() -> None:
+    c = _sweep_counts()
+    base = rp.plan_ramps(c, **_SWEEP_KW)
+    off = rp.plan_ramps(c, **_SWEEP_KW, sweep_enabled=False, sweep_est_s=25.0)
+    assert off == base
+    assert all(lv.sweep_stations == () for lv in off.levels)
+    assert all(item[5] == () for item in off.execution_order())
+    assert "ゆっくり戻す" not in rp.format_plan_table(off)
+
+
+def test_sweep_picks_high_speed_bands_summed_over_levels_and_assigns_the_max_level() -> None:
+    c = _sweep_counts()
+    plan = rp.plan_ramps(c, **_SWEEP_KW, sweep_enabled=True, sweep_est_s=25.0)
+    by_g = {lv.g: lv.sweep_stations for lv in plan.levels}
+    # 85 km/h は段 1（1.5）＋段 2（1.0）の合計 2.5 で拾い、秒数が最大の段 1 へ。段ごとの
+    # plan_release_stations（2 秒以上）は段 1 でも 85 を拾えない
+    assert by_g[0.1] == (85.0,)
+    assert 85.0 not in rp.plan_release_stations(
+        c, 1, mode_min_s=2.0, fine_max_kmh=100.0, coarse_step_kmh=20.0, min_kmh=8.0,
+        top_kmh=100.0, min_gap_kmh=0.0, drop_kmh=0.0,
+    )
+    assert by_g[0.2] == (35.0,)  # 段 2 だけの 3.0 秒
+    assert by_g[0.02] == ()  # 最弱の段へは割り当てない（50–60 帯は誰にも割り当てない）
+    order = plan.execution_order()
+    assert all(len(item) == 6 for item in order)
+    assert [item[5] for item in order if item[0] == 0.1] == [(85.0,)] * 2  # 2 周分
+
+
+def test_sweep_adds_estimated_seconds_and_shows_in_the_table() -> None:
+    c = _sweep_counts()
+    kw = {**_SWEEP_KW, "turn_s": 1.0}
+    base = rp.plan_ramps(c, **kw)
+    plan = rp.plan_ramps(c, **kw, sweep_enabled=True, sweep_est_s=25.0)
+    for b, s in zip(base.levels, plan.levels, strict=True):
+        assert s.est_s == pytest.approx(b.est_s + len(s.sweep_stations) * (25.0 + 1.0))
+    assert plan.total_est_s > base.total_est_s
+    table = rp.format_plan_table(plan)
+    assert "ゆっくり戻す 85 km/h（1 回）" in table
+    assert "うちゆっくり戻すは周回込みで" in table
+
+
+def test_sweep_respects_min_speed_mode_min_s_and_top_gap() -> None:
+    c = _sweep_counts()
+    tops = {1: 100.0, 2: 100.0}
+    gaps = {1: 0.0, 2: 0.0}
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0}
+    # 合計が mode_min_s 未満の帯は拾わない（85 は 2.5 秒）
+    assert rp.plan_release_sweeps(c, tops, gaps, mode_min_s=2.6, **kw) == {2: (35.0,)}
+    # 最小の車速（min_kmh）未満は外す
+    assert rp.plan_release_sweeps(c, tops, gaps, mode_min_s=2.0, **{**kw, "min_kmh": 40.0}) == {
+        1: (85.0,)
+    }
+    # 上端までの間隔が足りない段は割り当てない（段 1 の上端 90 ＋ 間隔 10 → 85 は 5 足りない）
+    got = rp.plan_release_sweeps(c, {1: 90.0, 2: 100.0}, {1: 10.0, 2: 10.0}, mode_min_s=2.0, **kw)
+    assert got[2] == (35.0, 85.0)

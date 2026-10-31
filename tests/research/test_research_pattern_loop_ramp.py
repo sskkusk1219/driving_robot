@@ -4269,3 +4269,232 @@ def test_stop_approach_at_or_above_release_start_keeps_pi_and_plain_ramp_unchang
     u0 = loop._rp_u
     _ctl(loop, p, 5.0, 0.1, accel_kmhs=-0.02 * G_TO_KMHS)
     assert loop._rp_u - u0 != pytest.approx(gain * (g_ref + 0.02) * 0.1, rel=1e-3)
+
+
+# ── ゆっくり戻す（RAMP_RELEASE_SWEEP。2026-10-31 段2）─────────────────────
+
+
+def _sweep_ramp(
+    stations: tuple[float, ...] = (60.0,), g: float = 0.1, top_kmh: float = 80.0
+) -> plmod.GRampPattern:
+    return plmod.GRampPattern(
+        PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0, hold_duration_s=0.0,
+        target_g=g, top_kmh=top_kmh, sweep_stations=stations,
+    )
+
+
+def _sweep_config(**kw: object) -> PatternLoopConfig:
+    base = PatternLoopConfig(
+        ramp_release_sweep_enabled=True, ramp_release_sweep_rate_pct_s=1.0,
+        ramp_release_sweep_timeout_s=40.0, ramp_release_min_kmh=10.0,
+    )
+    return dataclasses.replace(base, **kw)  # type: ignore[arg-type]
+
+
+class _SweepKine(_Kine):
+    """RAMP_RELEASE_SWEEP の間は、惰行の減速 ＋ 効きの傾き × max(0, 深さ − 遊び) で減速する車
+    （遊び play_pct より浅くすると惰行に戻る）。ほかの区間は −G（_Kine と同じ）。"""
+
+    def __init__(
+        self, loop: PatternLoop, g: float, v0: float = 0.1, *, coast: float = 0.5,
+        slope: float = 0.5, play_pct: float = 2.0,
+    ) -> None:
+        super().__init__(loop, g, v0)
+        self.coast, self.slope, self.play = coast, slope, play_pct
+
+    def step(self, dt: float = 0.1) -> None:
+        if self.loop._phase is _Phase.RAMP_RELEASE_SWEEP:
+            depth = max(0.0, -self.loop._rp_u - self.play)
+            self.v = max(0.0, self.v - (self.coast + self.slope * depth) * dt)
+        else:
+            super().step(dt)
+
+
+def _run_sweep(
+    loop: PatternLoop, p: plmod.GRampPattern, kine: _Kine, *, u_down: float = -6.0,
+    t_max: float = 200.0,
+) -> list[tuple[float, str, float, float]]:
+    """RAMP_DOWN の間は u を u_down 以下に保って回す。戻り値は [(t, phase 名, 車速, u)]。"""
+    rows: list[tuple[float, str, float, float]] = []
+    t = 0.0
+    while t < t_max and not loop.ramp_results:
+        if loop._phase is _Phase.RAMP_DOWN and kine.v > 0.0:
+            loop._rp_u = min(loop._rp_u, u_down)
+            loop._rp_brake_latched = True
+        _cycle(loop, p, kine.v, t)
+        rows.append((t, loop._phase.name, kine.v, loop._rp_u))
+        kine.step()
+        t += 0.1
+    return rows
+
+
+def _sweep_loop(p: plmod.GRampPattern, *, coast: float | None = 0.5, **cfg: object) -> PatternLoop:
+    loop = _loop([p], config=_sweep_config(**cfg))
+    if coast is not None:
+        for v in range(5, 100, 10):
+            loop.glimit.add_coast(float(v), coast)
+    return loop
+
+
+def test_sweep_off_or_without_stations_is_the_old_behaviour() -> None:
+    """既定 off、または場所が空なら RAMP_RELEASE_SWEEP に入らず、結果の数は全部 0。"""
+    for stations, cfg in (
+        ((60.0,), {"ramp_release_sweep_enabled": False}), ((), {}),
+    ):
+        p = _sweep_ramp(stations=stations)
+        loop = _sweep_loop(p, **cfg)
+        rows = _run_sweep(loop, p, _SweepKine(loop, 0.1))
+        assert not any(ph == "RAMP_RELEASE_SWEEP" for _, ph, _, _ in rows)
+        r = loop.ramp_results[0]
+        assert (r.sweep_s, r.sweep_n, r.sweep_skipped, r.sweep_timeout_n) == (0.0, 0, 0, 0)
+    assert PatternLoopConfig().ramp_release_sweep_enabled is False
+
+
+def test_sweep_enters_at_the_station_and_releases_at_a_constant_rate() -> None:
+    """場所に着くと入り、入った u0 から 1 %/s（テストの設定）で一定に戻る。"""
+    p = _sweep_ramp()
+    loop = _sweep_loop(p)
+    rows = _run_sweep(loop, p, _SweepKine(loop, 0.1))
+    seg = [(t, u, v) for t, ph, v, u in rows if ph == "RAMP_RELEASE_SWEEP"]
+    assert seg, "RAMP_RELEASE_SWEEP に入っていない"
+    t0, u0, v_in = seg[0]
+    assert u0 == pytest.approx(-6.0, abs=0.5) and v_in <= 60.0
+    # 入った周期の次から、止めるまで傾きが一定（+1 %/s）
+    rising = [(t, u) for t, u, _ in seg if u < -1.9]
+    assert len(rising) > 10
+    for (ta, ua), (tb, ub) in zip(rising, rising[1:], strict=False):
+        if ub > ua:
+            assert (ub - ua) / (tb - ta) == pytest.approx(1.0, abs=0.05)
+    r = loop.ramp_results[0]
+    assert (r.sweep_n, r.sweep_skipped, r.sweep_timeout_n) == (1, 0, 0)
+    assert r.sweep_s > 0.0
+
+
+def test_sweep_stops_when_the_acceleration_returns_to_coast_and_presses_back() -> None:
+    """遊び 2% の車では u ≒ −2 で惰行に戻る。その少し先で戻すのをやめ（0 まで戻さない）、同じ速さで
+    入った u0 まで踏み増して RAMP_DOWN へ出る。"""
+    p = _sweep_ramp()
+    loop = _sweep_loop(p)
+    rows = _run_sweep(loop, p, _SweepKine(loop, 0.1))
+    seg = [(t, u) for t, ph, _, u in rows if ph == "RAMP_RELEASE_SWEEP"]
+    u0 = seg[0][1]
+    u_turn = max(u for _, u in seg)
+    # 遊びの深さ（−2%）のあたりで折り返す。加速度の窓と持続 0.5 秒の分だけ遅れて浅い側へ越す
+    # が、0 までは戻さない
+    assert -3.0 < u_turn < -0.3
+    k = max(range(len(seg)), key=lambda i: seg[i][1])
+    down = [u for _, u in seg[: k + 1]]
+    up = [u for _, u in seg[k:]]
+    assert down == sorted(down) and up == sorted(up, reverse=True)  # 戻す → 踏み増す
+    assert up[-1] == pytest.approx(u0, abs=0.15)  # 入った開度まで踏み増して出る
+    names = [ph for _, ph, _, _ in rows]
+    i_out = max(i for i, ph in enumerate(names) if ph == "RAMP_RELEASE_SWEEP")
+    assert names[i_out + 1] == "RAMP_DOWN"
+    assert loop._rp_vref > 0.0 and loop._rp_turn_g0 == 0.0  # _ramp_release_exit と同じ出方
+
+
+def test_sweep_without_coast_data_turns_at_zero_and_never_goes_shallower_than_min() -> None:
+    """惰行の減速が無い車速帯では判定できないので、u が 0（min）に着いたところで折り返す。
+    min より浅く（u ＞ 0）はしない。"""
+    p = _sweep_ramp()
+    loop = _sweep_loop(p, coast=None)
+    rows = _run_sweep(loop, p, _SweepKine(loop, 0.1))
+    seg = [u for _, ph, _, u in rows if ph == "RAMP_RELEASE_SWEEP"]
+    assert max(seg) == pytest.approx(0.0, abs=1e-9)
+    assert all(u <= 0.0 for u in seg)
+    assert loop.ramp_results[0].sweep_n == 1
+
+
+def test_sweep_command_is_brake_only_and_never_below_min() -> None:
+    p = _sweep_ramp()
+    loop = _sweep_loop(p)
+    kine = _SweepKine(loop, 0.1)
+    _, bdb = _deadbands(loop)
+    t = 0.0
+    n = 0
+    while t < 200.0 and not loop.ramp_results:
+        if loop._phase is _Phase.RAMP_DOWN and kine.v > 0.0:
+            loop._rp_u = min(loop._rp_u, -6.0)
+            loop._rp_brake_latched = True
+        a, b = _cycle(loop, p, kine.v, t)
+        if loop._phase is _Phase.RAMP_RELEASE_SWEEP:
+            n += 1
+            assert a == 0.0 and b >= bdb - 1e-9  # アクセルは 0・ブレーキは min 以上
+            assert loop._ramp_on_brake()
+            lo, hi = loop._ramp_u_limits()
+            assert hi == 0.0 and lo < 0.0
+        kine.step()
+        t += 0.1
+    assert n > 0
+
+
+def test_sweep_does_not_run_control_or_feed_the_down_g_median() -> None:
+    p = _sweep_ramp()
+    loop = _sweep_loop(p)
+    calls: list[str] = []
+    orig = loop._ramp_control
+
+    def spy(*a: object, **k: object) -> None:
+        calls.append(loop._phase.name)
+        return orig(*a, **k)  # type: ignore[no-any-return, arg-type]
+
+    loop._ramp_control = spy  # type: ignore[method-assign, assignment]
+    _run_sweep(loop, p, _SweepKine(loop, 0.1))
+    assert "RAMP_RELEASE_SWEEP" not in calls
+    assert loop.ramp_results[0].sweep_n == 1
+
+
+def test_sweep_is_skipped_when_coast_is_at_least_the_target_decel() -> None:
+    """その車速の惰行の減速が場所の目標減速度以上なら（惰行だけで足りる）飛ばして数える。"""
+    p = _sweep_ramp()
+    loop = _sweep_loop(p, coast=0.1 * G_TO_KMHS)  # 目標減速度と同じ
+    rows = _run_sweep(loop, p, _SweepKine(loop, 0.1))
+    assert not any(ph == "RAMP_RELEASE_SWEEP" for _, ph, _, _ in rows)
+    r = loop.ramp_results[0]
+    assert (r.sweep_n, r.sweep_skipped) == (0, 1)
+
+
+def test_sweep_is_skipped_when_u_is_not_on_the_brake() -> None:
+    p = _sweep_ramp(stations=(60.0, 40.0))
+    loop = _sweep_loop(p)
+    loop._ramp_control = lambda *a, **k: None  # type: ignore[method-assign, assignment]
+    kine = _SweepKine(loop, 0.1)
+    t = 0.0
+    while t < 200.0 and not loop.ramp_results:
+        if loop._phase is _Phase.RAMP_DOWN:
+            loop._rp_u = max(loop._rp_u, 0.0)  # ブレーキを踏んでいない
+            loop._rp_brake_latched = False
+        _cycle(loop, p, kine.v, t)
+        kine.step()
+        t += 0.1
+    r = loop.ramp_results[0]
+    assert (r.sweep_n, r.sweep_skipped) == (0, 2)
+
+
+def test_sweep_is_cut_off_by_timeout_and_by_the_creep_range() -> None:
+    # 時間切れ: 2 秒で出る（1 %/s なので折り返す前）。数える
+    p = _sweep_ramp()
+    loop = _sweep_loop(p, ramp_release_sweep_timeout_s=2.0)
+    rows = _run_sweep(loop, p, _SweepKine(loop, 0.1))
+    seg = [t for t, ph, _, _ in rows if ph == "RAMP_RELEASE_SWEEP"]
+    assert seg[-1] - seg[0] < 2.3
+    r = loop.ramp_results[0]
+    assert (r.sweep_n, r.sweep_timeout_n) == (1, 1)
+    # 安全網の車速（ramp_release_min_kmh）以下で出る。着いた時点で既に下なら飛ばす
+    q = _sweep_ramp(stations=(14.0,))
+    loop2 = _sweep_loop(q)
+    kine = _SweepKine(loop2, 0.1)
+    for _t, ph, v, _u in _run_sweep(loop2, q, kine):
+        if ph == "RAMP_RELEASE_SWEEP":
+            assert v > 10.0 - 1e-9 - 0.6  # 安全網（10 km/h）を割る前に出る
+    r2 = loop2.ramp_results[0]
+    assert r2.sweep_n == 1 and r2.sweep_timeout_n == 0
+    z = _sweep_ramp(stations=(9.0,))
+    loop3 = _sweep_loop(z)
+    _run_sweep(loop3, z, _SweepKine(loop3, 0.1))
+    assert (loop3.ramp_results[0].sweep_n, loop3.ramp_results[0].sweep_skipped) == (0, 1)
+
+
+def test_sweep_phase_is_part_of_the_ramp_phase_set() -> None:
+    assert _Phase.RAMP_RELEASE_SWEEP in plmod._RAMP_PHASES
+    assert _Phase.RAMP_RELEASE_SWEEP.name == "RAMP_RELEASE_SWEEP"

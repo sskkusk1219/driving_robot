@@ -50,7 +50,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -106,6 +106,9 @@ class RampLevel:
     # 2026-10-28 段2: 見込み秒数に足した dither の回数の上限（ブレーキ・アクセル）。0 は入れない
     dither_brake_n: int = 0
     dither_accel_n: int = 0
+    # 2026-10-31 段1（ProblemReport_20261031_効き始めの近くのブレーキ）: ブレーキを一定の速さで
+    # ゆっくり戻して惰行に戻るまでを測る場所 [km/h]（いちばん弱い段以外。sweep が off なら空）
+    sweep_stations: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -120,20 +123,26 @@ class RampPlan:
 
     def execution_order(
         self,
-    ) -> list[tuple[float, float, tuple[float, ...], bool, tuple[float, ...]]]:
+    ) -> list[tuple[float, float, tuple[float, ...], bool, tuple[float, ...], tuple[float, ...]]]:
         """走る順: 1 周目を G の昇順 → 2 周目を G の昇順。
 
-        要素は (g, top_kmh, stations, stations_up_only)。
+        要素は (g, top_kmh, stations, stations_up_only, release_stations, sweep_stations)。
         2026-10-13 段2o-2: 3 つ目に保持する車速 stations を足した（保持のない段は空）。
         2026-10-14 段2o-4: 4 つ目に stations_up_only（True なら上りだけで保持）を足した。
         2026-10-14 段2o-5: 5 つ目に戻しを入れる車速 release_stations を足した（戻しのない段は空）。
+        2026-10-31 段1: 6 つ目にゆっくり戻す場所 sweep_stations を足した（無い段・off は空）。
         """
-        order: list[tuple[float, float, tuple[float, ...], bool, tuple[float, ...]]] = []
+        order: list[
+            tuple[float, float, tuple[float, ...], bool, tuple[float, ...], tuple[float, ...]]
+        ] = []
         # 2026-10-17 段2o-8: 定数ではなく各段の passes の最大まで回す（ramp_max_passes で変わる）
         max_p = max((lv.passes for lv in self.levels), default=0)
         for p in range(1, max_p + 1):
             order.extend(
-                (lv.g, lv.top_kmh, lv.stations, lv.stations_up_only, lv.release_stations)
+                (
+                    lv.g, lv.top_kmh, lv.stations, lv.stations_up_only, lv.release_stations,
+                    lv.sweep_stations,
+                )
                 for lv in self.levels
                 if lv.passes >= p
             )
@@ -457,6 +466,59 @@ def plan_release_stations(
     return tuple(out)
 
 
+def plan_release_sweeps(
+    counts: BandCounts, tops: Mapping[int, float], gaps: Mapping[int, float], *,
+    mode_min_s: float, fine_max_kmh: float, coarse_step_kmh: float, min_kmh: float,
+) -> dict[int, tuple[float, ...]]:
+    """ゆっくり戻す場所 [km/h]（段の番号 → 昇順の車速）（2026-10-31 段1）。
+
+    モードの `release_s`（走行中に終わる減速の戻しの秒数。車速帯 × 段）を段方向に足し、その合計が
+    `mode_min_s` 秒以上ある車速帯（`plan_release_stations` と同じ `_band_station_kmh` の車速に
+    まとめる）を拾う。`plan_release_stations` は段ごとに絞るので 80 km/h 以上の高速は残らないが、
+    ここは足してから絞るので残る。各車速には、その車速の戻しの秒数が最大の段を 1 つ割り当てる
+    （同点は弱い段）。
+    割り当てる段は `tops`（段の番号 → 上端の車速。走る段だけ。いちばん弱い段〔番号 0〕は除く）の
+    うち、上端までの間隔が `gaps[段]` 以上あるもの。同じ段の中でも間隔が `gaps[段]` 未満の点は
+    外す（低い車速の側を残す）。車速が `min_kmh` 未満の点は外す。その車速の惰行の減速より弱い段か
+    どうかは planner では分からないので、実行時に判定して飛ばす（`RAMP_RELEASE_SWEEP`）。
+    """
+    arr = counts.release_s
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        return {}
+    width = counts.speed_bin_kmh
+    by_station: dict[float, np.ndarray] = {}
+    for k in range(arr.shape[0]):
+        v = _band_station_kmh(k, width, fine_max_kmh, coarse_step_kmh)
+        by_station[v] = by_station.get(v, np.zeros(arr.shape[1])) + arr[k]
+    eps = 1e-9
+    picked: dict[int, list[float]] = {}
+    for v in sorted(by_station):
+        sec = by_station[v]
+        if v < min_kmh - eps or float(sec.sum()) < mode_min_s:
+            continue
+        best: int | None = None
+        for i in sorted(tops):
+            if i == 0 or i >= len(sec) or sec[i] <= 0.0:
+                continue
+            if tops[i] - v < gaps.get(i, 0.0) - eps:
+                continue
+            if best is None or sec[i] > sec[best]:
+                best = i
+        if best is None:
+            continue
+        lst = picked.setdefault(best, [])
+        if lst and v - lst[-1] < gaps.get(best, 0.0) - eps:
+            continue
+        lst.append(v)
+    return {i: tuple(vs) for i, vs in picked.items()}
+
+
+def sweep_est_total_s(n_stations: int, *, sweep_est_s: float, turn_s: float) -> float:
+    """ゆっくり戻す測定の見込み秒数（2026-10-31 段1）。1 回 ＝ sweep_est_s（戻す時間 ＋ 踏み増す時間
+    ＋ 余裕）＋ 切り替え（出てから 0 → −G へ戻す ramp_turn_time_s）。"""
+    return n_stations * (sweep_est_s + turn_s)
+
+
 def cruise_hold_est_s(
     n_stations: int, *, cruise_hold_s: float, turn_s: float, settle_s: float = 3.0,
     both_ways: bool = True,
@@ -500,6 +562,7 @@ def plan_ramps(
     max_passes: int = MAX_PASSES,
     dither_enabled: bool = False, dither_hold_s: float = 1.5, dither_brake_n: int = 0,
     dither_max_g: float = 0.1, dither_accel_max_n: int = 0,
+    sweep_enabled: bool = False, sweep_est_s: float = 0.0,
 ) -> RampPlan:
     """段ごとの上端の車速・見込み秒数・周回数を決める。
 
@@ -518,7 +581,31 @@ def plan_ramps(
     2026-10-28 段2: `dither_enabled` なら dither の見込み（上限）を足す。ブレーキは `dither_brake_n`
     ＝ 測る車速の数を、目標減速度 g ≤ `dither_max_g` の段に。アクセルは保持のある段に
     min(`dither_accel_max_n`, 保持の数) 回。
+    2026-10-31 段1: `sweep_enabled` なら、いちばん弱い段以外に、ゆっくり戻す場所
+    （`plan_release_sweeps`）を入れ、1 回あたり `sweep_est_s` ＋ 切り替えを見込み秒数に足す
+    （周回数の割り当てにも効く）。off なら計画は今と完全に同じ。
     """
+    def _top_of(i: int, g: float) -> float | None:
+        enough = np.flatnonzero(
+            (counts.accel_s[:, i] >= mode_min_s) | (counts.decel_s[:, i] >= mode_min_s)
+        )
+        if len(enough) == 0:
+            return None
+        mode_top = (int(enough.max()) + 1) * counts.speed_bin_kmh
+        floor_top = min_top_kmh(
+            g, min_at_g_s=min_at_g_s, launch_s=launch_s, turn_s=turn_s, edge_g=edge_g
+        )
+        return min(max(mode_top, floor_top), max_speed_kmh)
+
+    sweeps: dict[int, tuple[float, ...]] = {}
+    if sweep_enabled and counts.release_s.size > 0:
+        tops = {i: t for i, g in enumerate(counts.levels) if (t := _top_of(i, g)) is not None}
+        sweeps = plan_release_sweeps(
+            counts, tops,
+            {i: counts.levels[i] * G_TO_KMHS * (min_at_g_s + turn_s) for i in tops},
+            mode_min_s=mode_min_s, fine_max_kmh=cruise_fine_max_kmh,
+            coarse_step_kmh=cruise_coarse_step_kmh, min_kmh=cruise_min_kmh,
+        )
     runs: list[RampLevel] = []
     skipped: list[float] = []
     for i, g in enumerate(counts.levels):
@@ -564,7 +651,9 @@ def plan_ramps(
         ) + release_est_s(
             len(release), fracs=release_fracs, hold_s=release_hold_s, move_s=release_move_s,
             turn_s=turn_s,
-        ) + dither_est_s(d_brake + d_accel, hold_s=dither_hold_s, turn_s=turn_s)
+        ) + dither_est_s(
+            d_brake + d_accel, hold_s=dither_hold_s, turn_s=turn_s
+        ) + sweep_est_total_s(len(sweeps.get(i, ())), sweep_est_s=sweep_est_s, turn_s=turn_s)
         runs.append(
             RampLevel(
                 g=g,
@@ -579,6 +668,7 @@ def plan_ramps(
                 release_stations=release,
                 dither_brake_n=d_brake,
                 dither_accel_n=d_accel,
+                sweep_stations=sweeps.get(i, ()),
             )
         )
     remaining = budget_s - sum(r.est_s for r in runs)
@@ -594,7 +684,7 @@ def plan_ramps(
         RampLevel(
             r.g, r.top_kmh, r.mode_accel_s, r.mode_decel_s, r.est_s, passes[r.g], r.raised,
             r.stations, r.stations_up_only, r.release_stations,
-            r.dither_brake_n, r.dither_accel_n,
+            r.dither_brake_n, r.dither_accel_n, r.sweep_stations,
         )
         for r in runs
     )
@@ -633,6 +723,9 @@ def cruise_kwargs(cfg: Any) -> dict[str, Any]:
         "dither_brake_n": len(lr.ramp_dither_brake_speeds_kmh),
         "dither_max_g": lr.ramp_dither_max_g,
         "dither_accel_max_n": lr.ramp_dither_accel_max_n,
+        # 2026-10-31 段1: ゆっくり戻す測定の見込み
+        "sweep_enabled": lr.ramp_release_sweep_enabled,
+        "sweep_est_s": lr.ramp_release_sweep_est_s,
     }
 
 
@@ -697,6 +790,19 @@ def format_plan_table(plan: RampPlan) -> str:
                 f"{lv.g:g}G: 下りの戻し {', '.join(f'{v:g}' for v in lv.release_stations)} km/h"
                 f"（{len(lv.release_stations)} 回）"
             )
+    for lv in plan.levels:
+        if lv.sweep_stations:
+            out.append(
+                f"{lv.g:g}G: ゆっくり戻す {', '.join(f'{v:g}' for v in lv.sweep_stations)} km/h"
+                f"（{len(lv.sweep_stations)} 回）"
+            )
+    if any(lv.sweep_stations for lv in plan.levels):
+        n_sw = sum(len(lv.sweep_stations) * lv.passes for lv in plan.levels)
+        over = "（枠を超えている）" if plan.total_est_s > plan.budget_s else ""
+        out.append(
+            f"うちゆっくり戻すは周回込みで {n_sw} 回"
+            f"（合計 {plan.total_est_s:.0f} 秒 / 枠 {plan.budget_s:.0f} 秒{over}）"
+        )
     for lv in plan.levels:
         if lv.dither_brake_n or lv.dither_accel_n:
             out.append(
