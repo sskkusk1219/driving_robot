@@ -869,6 +869,18 @@ class ForwardMapSection:
     # （停車保持の行・停車速度以下・惰行の補助中は更新しない）。既定 false ＝ 今と完全に同じ。
     # 効く先: 境目付近で上乗せの表と推定の表が食い違う周期。決める時期: 段6-2 の実機の後
     dob_low_speed_align: bool = False
+    # 2026-10-31 ProblemReport_20261031_DOBが逆向き 段1: true なら DOB の推定をペダルごとに
+    # 低速の箱（基準車速が境目 7.5 km/h 未満の周期で更新）と本体の箱に分け、使うときは
+    # d ＝ s × 本体 ＋ (1 − s) × w × 低速、s ＝ clip((v − blend_lo) / (blend_hi − blend_lo), 0, 1)
+    # で混ぜる（低速で学んだ値を 16 km/h のブレーキへ持ち込まない）。dob_low_speed_fade・
+    # dob_low_speed_align が両方 true のときだけ（検証）。既定 false ＝ 今と完全に同じ。
+    # 効く先: 7.5〜10 km/h 前後の DOB の上乗せ。決める時期: 段3 の実機で on/off
+    dob_split_low_speed: bool = False
+    # blend_lo 5.0・blend_hi 10.0 は仮の値（データ由来ではない）: 境目 7.5 km/h から表の車速の
+    # 行の幅 2.5 km/h を 1 行ずつ下・上へ。効く先: 境目の上乗せの段差（広いほど段差は小さいが
+    # 低速の値が遠くまで混ざる）。決める時期: 段3 の実機で 7.5 km/h 前後の偏差を見て
+    dob_split_blend_lo_kmh: float = 5.0
+    dob_split_blend_hi_kmh: float = 10.0
     # 2026-10-22 段5-2: 低速（meta の stop_max_speed_kmh 未満）で、発進側・停止側のどちらの表を
     # 引くか。"legacy" ＝ 今まで（発進側 ＝ 要る加速度 ＞ 0、停止側 ＝ 減速かつ停車の 0.5 秒前から。
     # 残りは本体・戻しの表）。"pedal" ＝ アクセルはいつでも発進側、ブレーキは発進の途中だけ発進側
@@ -1713,6 +1725,16 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         fm.dob_fast_need_kmhs > 0.0,
         f"forward_map.dob_fast_need_kmhs は正値: {fm.dob_fast_need_kmhs}",
+    )
+    need(
+        not fm.dob_split_low_speed or (fm.dob_low_speed_fade and fm.dob_low_speed_align),
+        "forward_map.dob_split_low_speed は dob_low_speed_fade と dob_low_speed_align が"
+        "両方 true のときだけ使える",
+    )
+    need(
+        0.0 < fm.dob_split_blend_lo_kmh < fm.dob_split_blend_hi_kmh,
+        "forward_map.dob_split_blend_lo_kmh は正値で dob_split_blend_hi_kmh 未満: "
+        f"{fm.dob_split_blend_lo_kmh}（hi {fm.dob_split_blend_hi_kmh}）",
     )
     need(fm.coast_on_kmh > 0.0, f"forward_map.coast_on_kmh は正値: {fm.coast_on_kmh}")
     need(

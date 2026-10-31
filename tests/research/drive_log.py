@@ -122,6 +122,10 @@ CSV_COLUMNS: tuple[str, ...] = (
     "dob_accel_kmhs",
     "dob_brake_kmhs",
     "dob_effort_pct",
+    # 2026-10-31 ProblemReport_20261031_DOBが逆向き 段1: DOB の低速の箱の推定 [km/h/s]
+    # （dob_split_low_speed が on の C11 の行だけ。off・他は空欄）
+    "dob_accel_low_kmhs",
+    "dob_brake_low_kmhs",
     # 2026-10-18 段2r: C12（惰行の補助）が惰行の行に出した開度 [%]（正＝アクセル・負＝ブレーキ。
     # 補助していない周期は 0。C12 の行だけ、他は空欄）。c10_effort_pct にも同じ値が入る
     "coast_effort_pct",
@@ -204,6 +208,8 @@ class DriveSample:
     dob_accel_kmhs: float | None = None
     dob_brake_kmhs: float | None = None
     dob_effort_pct: float | None = None
+    dob_accel_low_kmhs: float | None = None
+    dob_brake_low_kmhs: float | None = None
     launch_hold_pct: float | None = None  # 段8-a: 発進で足したブレーキの深さ（機能 off は None）
     coast_effort_pct: float | None = None  # C12 の惰行の補助の開度（C12 の行だけ。他は None）
     # C13 の車速のフィルタの推定・L 秒先の予測・P の上乗せに使った偏差（C13 の行だけ。他は None）
@@ -302,6 +308,8 @@ class SessionLog:
         dob_accel_kmhs: float | None = None,
         dob_brake_kmhs: float | None = None,
         dob_effort_pct: float | None = None,
+        dob_accel_low_kmhs: float | None = None,
+        dob_brake_low_kmhs: float | None = None,
         coast_effort_pct: float | None = None,
         launch_hold_pct: float | None = None,
         speed_est_kmh: float | None = None,
@@ -347,6 +355,8 @@ class SessionLog:
             dob_accel_kmhs=dob_accel_kmhs,
             dob_brake_kmhs=dob_brake_kmhs,
             dob_effort_pct=dob_effort_pct,
+            dob_accel_low_kmhs=dob_accel_low_kmhs,
+            dob_brake_low_kmhs=dob_brake_low_kmhs,
             coast_effort_pct=coast_effort_pct,
             launch_hold_pct=launch_hold_pct,
             speed_est_kmh=speed_est_kmh,
@@ -549,6 +559,8 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.dob_accel_kmhs),
                 _fmt(s.dob_brake_kmhs),
                 _fmt(s.dob_effort_pct),
+                _fmt(s.dob_accel_low_kmhs),
+                _fmt(s.dob_brake_low_kmhs),
                 _fmt(s.coast_effort_pct),
                 _fmt(s.launch_hold_pct),
                 _fmt(s.speed_est_kmh),

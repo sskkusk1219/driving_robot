@@ -1200,10 +1200,23 @@ class DobStats:
     brake_effort_abs_sum: float = 0.0
     accel_effort_max: float = 0.0
     brake_effort_max: float = 0.0
+    accel_low_cycles: int = 0  # 低速の箱（dob_split_low_speed）を更新した周期数
+    brake_low_cycles: int = 0
+    accel_low_final: float = 0.0
+    brake_low_final: float = 0.0
     period_s: float = 0.05
 
-    def add_estimate(self, *, is_accel: bool, d: float) -> None:
-        """推定を更新した周期の d [km/h/s] を足す。"""
+    def add_estimate(self, *, is_accel: bool, d: float, low: bool = False) -> None:
+        """推定を更新した周期の d [km/h/s] を足す。low ＝ 更新したのが低速の箱（本体の集計には
+        混ぜず、低速の箱の周期数と最終値だけ数える）。"""
+        if low:
+            if is_accel:
+                self.accel_low_cycles += 1
+                self.accel_low_final = d
+            else:
+                self.brake_low_cycles += 1
+                self.brake_low_final = d
+            return
         if is_accel:
             self.accel_cycles += 1
             self.accel_sum += d
@@ -1265,12 +1278,23 @@ def dob_fade_weight(v_kmh: float, stop_kmh: float, top_kmh: float) -> float:
     return min(1.0, max(0.0, (v_kmh - stop_kmh) / (top_kmh - stop_kmh)))
 
 
+def dob_split_text(fm: Any) -> str:
+    """段1（ProblemReport_20261031_DOBが逆向き）の低速の箱の設定の表示。"""
+    if not fm.dob_split_low_speed:
+        return "低速の箱を分ける なし"
+    return (
+        f"低速の箱を分ける あり（混ぜ始め {fm.dob_split_blend_lo_kmh:g}・"
+        f"混ぜ終わり {fm.dob_split_blend_hi_kmh:g} km/h）"
+    )
+
+
 def dob_low_speed_text(fm: Any) -> str:
     """段6-2 の設定の表示（走行前）。"""
     return (
         f"薄める {'あり' if fm.dob_low_speed_fade else 'なし'}・"
         f"境目と表を基準車速でそろえる {'あり' if fm.dob_low_speed_align else 'なし'}・"
         f"停C の τ を普段より弱くしない {'あり' if fm.stop_end_tau_cap_normal else 'なし'}"
+        + (f"・{dob_split_text(fm)}" if fm.dob_split_low_speed else "")
     )
 
 
@@ -1594,6 +1618,7 @@ class _ModeRun:
                 release_window_s=RELEASE_WINDOW_S,
                 tq_fast_accel_s=self.ff.tq_fast_accel_s, tq_fast_brake_s=self.ff.tq_fast_brake_s,
                 fast_need_kmhs=self.ff.dob_fast_need_kmhs,
+                split_low=cfg.forward_map.dob_split_low_speed,
             )
             self.dob_stats = DobStats(period_s=self.interval_s)
         # C12（惰行の補助）: C12 のときだけ状態機械と集計を持つ
@@ -2019,6 +2044,14 @@ class _ModeRun:
                     dob_accel_kmhs=None if self.dob is None else self.dob.d_accel,
                     dob_brake_kmhs=None if self.dob is None else self.dob.d_brake,
                     dob_effort_pct=self._dob_effort,
+                    dob_accel_low_kmhs=(
+                        self.dob.d_accel_low if self.dob is not None and self.dob.split_low
+                        else None
+                    ),
+                    dob_brake_low_kmhs=(
+                        self.dob.d_brake_low if self.dob is not None and self.dob.split_low
+                        else None
+                    ),
                     coast_effort_pct=None if self.coast is None else self._coast_effort,
                     launch_hold_pct=self._launch_hold_pct,
                     speed_est_kmh=self._speed_est,
@@ -2208,14 +2241,15 @@ class _ModeRun:
         dob = self.dob
         # C11: 押しているペダルの行にだけ、そのペダルの外乱の推定を引いて表を引く。
         # DOB の分は「P ＋ DOB の上乗せ − P だけの上乗せ」で別に出す（ログ・集計用）
-        d_row = 0.0 if dob is None or ff_effort == 0.0 else dob.estimate(is_accel=ff_effort > 0.0)
+        d_row = (
+            0.0 if dob is None or ff_effort == 0.0
+            else self._dob_estimate(ff_effort > 0.0, speed, int(plan.flag[i]), ref)
+        )
         # 2026-10-18 段2q ③ `135125` の修正: 推定を更新しない低速の行（発進の前のブレーキを離す所
         # など）では使わない。そこで持ち越したブレーキの推定（−0.05〜−0.35）がブレーキを浅くし、
         # 発進で早く動き出した（アクセルを踏み始めた瞬間の偏差 +0.04〜+0.37 → +0.32〜+0.90）
         # 2026-10-23 段6-2: 設定が両方 false なら今までと同じ（低速の行は 0）。
         # dob_low_speed_fade なら 1 → 0 へ連続に薄める（`_dob_weight`）
-        if dob is not None:
-            d_row *= self._dob_weight(speed, int(plan.flag[i]), ref)
         new, clamped = deviation_offset_detail(fb_table, dob_kmhs=d_row, **kwargs)
         if gain_ratio != 1.0 and ff_effort != 0.0:
             kwargs["gain_ratio"] = 1.0
@@ -2344,7 +2378,7 @@ class _ModeRun:
             # 段2r ②: 補助中のそのペダルは手順2 の効き始め以上に置く（meta に無ければ下限なし）
             on = ff.table.meta.get("accel_onset_u_pct" if is_accel else "brake_onset_u_pct")
             kwargs["onset_u_pct"] = None if on is None else float(on)
-        d = dob.estimate(is_accel=is_accel) * self._dob_weight(speed, int(plan.flag[i]), ref)
+        d = self._dob_estimate(is_accel, speed, int(plan.flag[i]), ref)
         fb_table = self._fb_table()  # 段8-b
         with_dob = coast_assist_effort(fb_table, dob_kmhs=d, **kwargs)
         without = coast_assist_effort(fb_table, **kwargs) if d != 0.0 else with_dob
@@ -2397,6 +2431,23 @@ class _ModeRun:
             return 0.0
         return dob_fade_weight(
             self._dob_boundary_speed(speed, ref), DOB_FADE_START_KMH, self._dob_low_top()
+        )
+
+    def _dob_estimate(self, is_accel: bool, speed: float, flag: int, ref: float | None) -> float:
+        """使う DOB の推定 d（C10 の行・惰行の補助に渡す）。dob_split_low_speed が false なら
+        今までと同じ「推定 × 重み w」。true なら d ＝ s × 本体の箱 ＋ (1 − s) × w × 低速の箱、
+        s ＝ clip((v − 混ぜ始め) / (混ぜ終わり − 混ぜ始め), 0, 1)（v は `_dob_boundary_speed`。
+        混ぜ始め以下は低速の箱だけ、混ぜ終わり以上は本体の箱だけ。2026-10-31 段1）。"""
+        dob = self.dob
+        assert dob is not None
+        w = self._dob_weight(speed, flag, ref)
+        fm = self.cfg.forward_map
+        if not fm.dob_split_low_speed:
+            return dob.estimate(is_accel=is_accel) * w
+        lo, hi = fm.dob_split_blend_lo_kmh, fm.dob_split_blend_hi_kmh
+        s = min(1.0, max(0.0, (self._dob_boundary_speed(speed, ref) - lo) / (hi - lo)))
+        return s * dob.estimate(is_accel=is_accel) + (1.0 - s) * w * dob.estimate(
+            is_accel=is_accel, low=True
         )
 
     def _dob_follow_plan_tables(self) -> bool:
@@ -2459,6 +2510,9 @@ class _ModeRun:
             u = -(brake - v.min_brake_opening_pct)
         else:
             u = 0.0
+        # 段1: 基準車速（align でなければ実車速）が境目未満の周期は、低速の箱を更新する
+        # （dob_split_low_speed が true のときだけ効く）
+        low_box = self._dob_boundary_speed(speed, ref) < self._dob_low_top()
         # C13: DOB の実加速度は、車速のフィルタの推定車速の差分から（C11・C12 は CAN 車速の差分）
         pedal = dob.update(
             t=t, speed_kmh=speed if self._speed_est is None else self._speed_est,
@@ -2469,10 +2523,14 @@ class _ModeRun:
             launch=bool(launch), stop=bool(stop) or held,
             side_tables=follow and not held,
             need_kmhs=float(plan.need_accel_kmhs[i]),
+            low_box=low_box,
         )
         if pedal is not None:
             is_accel = pedal == PEDAL_ACCEL
-            self.dob_stats.add_estimate(is_accel=is_accel, d=dob.estimate(is_accel=is_accel))
+            used_low = dob.split_low and low_box
+            self.dob_stats.add_estimate(
+                is_accel=is_accel, d=dob.estimate(is_accel=is_accel, low=used_low), low=used_low
+            )
 
     def _apply_interlock(self, accel: float, brake: float) -> tuple[float, float]:
         """実開度の安全網（2026-10-17 段2o-9）: もう一方のペダルの実開度（前の周期のまとめ読み）が
@@ -2682,6 +2740,14 @@ async def run_mode_drive(
         )
     if run.dob_stats is not None:
         say(f"  C11（DOB。{dob_settings_text(run.ff)}）: {run.dob_stats.summary()}")
+        if run.dob is not None and run.dob.split_low:
+            ds = run.dob_stats
+            pp = ds.period_s
+            say(
+                "  C11 低速の箱（段1）: 更新 "
+                f"アクセル {ds.accel_low_cycles * pp:.1f}s（最終 {ds.accel_low_final:+.3f}）・"
+                f"ブレーキ {ds.brake_low_cycles * pp:.1f}s（最終 {ds.brake_low_final:+.3f}） km/h/s"
+            )
         if run.dob is not None and run.dob.fast_need_kmhs > 0.0 and (
             run.dob.tq_fast_accel_s is not None or run.dob.tq_fast_brake_s is not None
         ):
