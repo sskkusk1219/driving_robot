@@ -173,6 +173,12 @@ CSV_COLUMNS: tuple[str, ...] = (
     # 停C の先読み（forward_map.stop_end_accel_pred_enabled）。
     # stop_pred_dev_kmh ＝ 停C の区間で P に使った先読みの偏差（区間外・off は空欄）
     "stop_pred_dev_kmh",
+    # 2026-11-01 段6d（ProblemReport_20261031_効き始めの近くのブレーキ）: C10 の偏差の積分 I。
+    # c10_integral_pct ＝ c10_effort_pct のうち I の分 [%]（アクセル正・ブレーキ負）、
+    # c10_integral_kmhs ＝ I が出す加速度 a_I [km/h/s]。側は accel_ff_pct / brake_ff_pct で分かる。
+    # どちらかの側が on の走行だけ（I を使わない周期は 0。両方 off は空欄）
+    "c10_integral_pct",
+    "c10_integral_kmhs",
 )
 
 
@@ -228,6 +234,8 @@ class DriveSample:
     hold_accel_kmhs: float | None = None  # 段13: 帯で丸めた実測の加速度（場面の外・off は None）
     hold_pred_dev_kmh: float | None = None  # 段13: P に使った先読みの偏差（同上）
     stop_pred_dev_kmh: float | None = None  # 段3: 停C の区間で P に使った先読みの偏差（同上）
+    c10_integral_pct: float | None = None  # 段6d: c10_effort_pct のうち I の分
+    c10_integral_kmhs: float | None = None  # 段6d: I が出す加速度 a_I
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -328,6 +336,8 @@ class SessionLog:
         hold_accel_kmhs: float | None = None,
         hold_pred_dev_kmh: float | None = None,
         stop_pred_dev_kmh: float | None = None,
+        c10_integral_pct: float | None = None,
+        c10_integral_kmhs: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -375,6 +385,8 @@ class SessionLog:
             hold_accel_kmhs=hold_accel_kmhs,
             hold_pred_dev_kmh=hold_pred_dev_kmh,
             stop_pred_dev_kmh=stop_pred_dev_kmh,
+            c10_integral_pct=c10_integral_pct,
+            c10_integral_kmhs=c10_integral_kmhs,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -579,6 +591,8 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.hold_accel_kmhs),
                 _fmt(s.hold_pred_dev_kmh),
                 _fmt(s.stop_pred_dev_kmh),
+                _fmt(s.c10_integral_pct),
+                _fmt(s.c10_integral_kmhs),
             ])
 
 

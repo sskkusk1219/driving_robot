@@ -949,6 +949,18 @@ class ForwardMapSection:
     # 傾きで Δu を引くと戻している最中はループのゲインが 3〜4 倍になり往復する。
     # 効く先: 効き始めの近くのブレーキの往復。決める時期: 段8 の実機。既定 false ＝ 今と完全に同じ
     c10_release_table: bool = False
+    # 2026-11-01 ProblemReport_20261031_効き始めの近くのブレーキ 段6d: true で C10 の上乗せに偏差の
+    # 積分 I を足す（7.5 km/h 以上の、FF がそのペダルの行。ブレーキとアクセルは別のキーと別の量）。
+    # I_dev ＋＝ dev × dt、加速度 a_I ＝ I_dev ÷（τ × Ti）を P の加速度に足して P・DOB と同じ入口で
+    # 開度に直す。FF が別のペダル・惰行・7.5 km/h 未満・停車で 0 に戻し、惰行の補助の行と
+    # min・上限・片足ルール・ガバナーで切られた向きへは貯めない。
+    # 根拠: 偏差が 0 になると P が手放し急な戻しの線を踏む。Ti ＝ c10_integral_ti_coef × τ。
+    # 4 は積分の形の相手に PI を掛ける定番の比（SIMC 則）で半分データ由来、τ は手順2 で測った
+    # 遅れ由来。効く先: 効き始めの近くのブレーキの往復。決める時期: 段6e の実機。
+    # 既定 false ＝ 今と完全に同じ
+    c10_integral_brake: bool = False
+    c10_integral_accel: bool = False
+    c10_integral_ti_coef: float = 4.0
     # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
     # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
     # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・
@@ -1795,6 +1807,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         0.0 < fm.dob_split_blend_lo_kmh < fm.dob_split_blend_hi_kmh,
         "forward_map.dob_split_blend_lo_kmh は正値で dob_split_blend_hi_kmh 未満: "
         f"{fm.dob_split_blend_lo_kmh}（hi {fm.dob_split_blend_hi_kmh}）",
+    )
+    need(
+        fm.c10_integral_ti_coef > 0.0,
+        f"forward_map.c10_integral_ti_coef は正値: {fm.c10_integral_ti_coef}",
     )
     need(fm.coast_on_kmh > 0.0, f"forward_map.coast_on_kmh は正値: {fm.coast_on_kmh}")
     need(

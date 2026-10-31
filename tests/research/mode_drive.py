@@ -47,6 +47,7 @@ import numpy as np
 from tests.research import local_gain
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.axis_safety import AxisSafetyNet
+from tests.research.c10_integral import C10Integral
 from tests.research.config import ConfigError, ResearchConfig
 from tests.research.creep_floor import CreepFloor, StopArrivals, creep_floor_opening_pct
 from tests.research.dob import PEDAL_ACCEL, PedalDisturbanceObserver
@@ -817,6 +818,7 @@ def _prepare_forward_map_plan(
         )
         say(f"  C11（DOB）: {dob_settings_text(ff)}")
         say(f"  低速の DOB・停C の τ（段6-2）: {dob_low_speed_text(fm)}")
+        say(f"  C10 の偏差の積分 I（段6d）: {c10_integral_text(fm)}")
     if isinstance(ff, CoastAssistFeedforward):
         # 2026-10-18 段2r: 惰行の補助。保持時間 ＝ 係数 × (遅れ ＋ 効き始めまでの戻り時間)
         ff.set_coast(
@@ -1405,6 +1407,17 @@ def dob_split_text(fm: Any) -> str:
     )
 
 
+def c10_integral_text(fm: Any) -> str:
+    """段6d（偏差の積分 I）の設定の表示（走行前）。"""
+    if not (fm.c10_integral_brake or fm.c10_integral_accel):
+        return "なし"
+    sides = "・".join(
+        n for n, on in (("ブレーキ", fm.c10_integral_brake), ("アクセル", fm.c10_integral_accel))
+        if on
+    )
+    return f"あり（{sides}・Ti ＝ {fm.c10_integral_ti_coef:g} × τ）"
+
+
 def dob_low_speed_text(fm: Any) -> str:
     """段6-2 の設定の表示（走行前）。"""
     return (
@@ -1721,6 +1734,22 @@ class _ModeRun:
             if isinstance(self.ff, DeviationForwardFeedforward) else None
         )
         self._c10_prev_clamped = False
+        # 段6d: C10 の偏差の積分 I（C10 で、どちらかの側が on のときだけ）
+        fm_ci = cfg.forward_map
+        self.c10_int: C10Integral | None = (
+            C10Integral(
+                brake_on=fm_ci.c10_integral_brake, accel_on=fm_ci.c10_integral_accel,
+                ti_coef=fm_ci.c10_integral_ti_coef,
+            )
+            if self.c10 is not None and (fm_ci.c10_integral_brake or fm_ci.c10_integral_accel)
+            else None
+        )
+        self._ci_pct: float | None = None  # 今の周期の c10_effort のうち I の分 [%]
+        self._ci_kmhs: float | None = None  # 今の周期の a_I [km/h/s]
+        self._ci_prev_t: float | None = None
+        self._ci_active = False  # 今の周期が I を貯める行か
+        self._ci_clamped = False  # 今の周期に min で浅く切られた
+        self._ci_deep = False  # 今の周期に上限で深く切られた
         # C11（DOB）: C11 のときだけ推定器と集計を持つ
         self.dob: PedalDisturbanceObserver | None = None
         self.dob_stats: DobStats | None = None
@@ -1951,6 +1980,8 @@ class _ModeRun:
             # C13: 車速のフィルタを進め、L 秒先の予測から P の上乗せに使う偏差を決める
             self._predictor_step(t, ref_t, speed, ff_effort)
         c10_effort: float | None = None
+        self._ci_active = False
+        self._ci_pct = self._ci_kmhs = None if self.c10_int is None else 0.0
         self._stop_end_tau_s = None
         self._stop_pred_dev = None
         if self._stop_pred_tp_s is not None:
@@ -1973,6 +2004,8 @@ class _ModeRun:
             coast_effort = self._coast_assist(t, ref, ref_t, speed, ff_effort)
             if coast_effort != 0.0:
                 c10_effort, coast_active = coast_effort, True
+        if self.c10_int is not None and ff_effort == 0.0 and not coast_active:
+            self.c10_int.reset()  # 段6d: 惰行（補助なし）は 0 に戻す。補助の行は保つ
         # 段4: 保持の場面。P・DOB の上乗せ・惰行の補助・切り取り・launch_move_hold の足しを止め、
         # 開度の単位の PI に替える（hold_ff_enabled なら FF も保持の開度に置き換える）
         plan_effort = ff_effort  # ログの plan_effort_pct は計画のまま
@@ -2036,6 +2069,10 @@ class _ModeRun:
                 self._stop_end_tau_s = None
                 if self.dob is not None:
                     self._dob_effort = 0.0
+                if self.c10_int is not None:
+                    self.c10_int.reset()
+                    self._ci_active = False
+                    self._ci_pct = self._ci_kmhs = 0.0
             else:
                 h.pi.reset()
         if (
@@ -2118,6 +2155,15 @@ class _ModeRun:
         if governed:
             self.governor_cycles += 1
         accel, brake = self._apply_interlock(accel, brake)
+        if self.c10_int is not None and self._ci_active:
+            # 段6d: 指令が片足ルール・ガバナーなどで浅く切られたか（min・上限の分は _c10_offset で）
+            if effort < 0.0:
+                shallow = brake < -effort - 0.05
+            else:
+                shallow = accel < effort - 0.05
+            self.c10_int.note_cut(
+                shallow=shallow or governed or self._ci_clamped, deep=self._ci_deep
+            )
         if self.dob is not None:
             self._dob_update(t, ref_t, speed, accel, brake, governed, coast_active)
         phase = (
@@ -2203,6 +2249,7 @@ class _ModeRun:
                     hold_ff_pct=hold_ff_pct,
                     hold_accel_kmhs=hold_accel, hold_pred_dev_kmh=hold_pred_dev,
                     stop_pred_dev_kmh=self._stop_pred_dev,
+                    c10_integral_pct=self._ci_pct, c10_integral_kmhs=self._ci_kmhs,
                 )
             )
         if segment != self._segment:
@@ -2375,6 +2422,26 @@ class _ModeRun:
             and ff_effort < 0.0
         ):
             kwargs["release_peak_u_pct"] = self.dob.recent_peak_brake(t)
+        # 段6d: 偏差の積分 I。7.5 km/h 以上の、FF がそのペダルの行だけで貯める。それ以外は 0 に戻す
+        # （惰行の行は呼び出し側で補助の有無を見て決める）。P の偏差と同じ dev を足す
+        ci = self.c10_int
+        integral_kmhs = 0.0
+        if ci is not None and ff_effort != 0.0:
+            is_accel_ci = ff_effort > 0.0
+            tau_ci = ff.tau_accel_s if is_accel_ci else ff.tau_brake_s
+            top_ci = float(ff.table.meta.get("stop_max_speed_kmh") or 7.5)
+            eligible = (
+                int(plan.flag[i]) not in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS)
+                and min(ref, float(kwargs["row_kmh"])) >= top_ci
+            )
+            dt_ci = 0.0 if self._ci_prev_t is None else t - self._ci_prev_t
+            integral_kmhs = ci.row(
+                is_accel=is_accel_ci, eligible=eligible, dev_kmh=float(kwargs["dev_kmh"]),
+                dt_s=dt_ci, tau_s=tau_ci,
+            )
+            self._ci_active = eligible and ci.side_on(is_accel_ci) and bool(tau_ci and tau_ci > 0.0)
+        self._ci_prev_t = t
+        kwargs["integral_kmhs"] = integral_kmhs
         fb_table = self._fb_table()  # 段8-b
         # 段4 (ア): 局所の効きの倍率で、P と DOB の上乗せの差を割る（deviation_offset_detail の
         # 中で、min のクランプの前）。停C の引き直し・DOB の分け方も同じ倍率。
@@ -2436,6 +2503,15 @@ class _ModeRun:
                 new = self.stop_end.clamp(new, ff_effort)
                 self._stop_end_tau_s = tau_end
                 self.stop_end.stats.add(True, normal - new)  # 深い向きが正
+        if ci is not None and self._ci_active:
+            from tests.research.fwd_plan import EFFORT_LIMIT_PCT  # noqa: PLC0415
+
+            self._ci_clamped = clamped
+            self._ci_deep = abs(new) >= EFFORT_LIMIT_PCT - 1e-9
+            self._ci_kmhs = integral_kmhs
+            kwargs["integral_kmhs"] = 0.0
+            without_i, _ = deviation_offset_detail(fb_table, dob_kmhs=d_row, **kwargs)
+            self._ci_pct = new - without_i
         delta = new - ff_effort
         if self.band_cap_pct is not None:
             # 段6 P1: 動き出す開度の帯（低速・FF がブレーキで min〜停車保持）の P は cap まで
