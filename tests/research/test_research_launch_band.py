@@ -58,7 +58,8 @@ def _bands(ref, dur=10.0, *, ret_s=0.2, ff=8.0, exclude=()):
 
 def test_band_starts_at_t_go_and_ends_before_slope_exceeds_curve() -> None:
     (iv,) = _bands(_weak_launch)
-    assert iv.start_s == pytest.approx(3.05)  # 基準が 0.02 を超える最初の行
+    # 2026-11-01 修正 2: 基準が 0.02 を超える最初の行（3.05 s）の L（0.155 s → 3 行）前から始める
+    assert iv.start_s == pytest.approx(3.05 - 3 * DT)
     # 4.0 s で傾きが 1.6 → 5.3（曲線は 1.6 km/h 付近で約 1.7）。L 先の傾きが超える手前で終わる
     assert 3.6 < iv.end_s < 4.0
     ahead = iv.end_s - DT + LAG
@@ -86,8 +87,10 @@ def test_band_is_limited_to_creep_speed() -> None:
 
 def test_band_skipped_when_shorter_than_return_time_plus_lag() -> None:
     (iv,) = _bands(_weak_launch, ret_s=0.2)
-    assert _bands(_weak_launch, ret_s=iv.length_s - LAG + 0.01) == []  # 長さ < 戻る時間 + L
-    assert len(_bands(_weak_launch, ret_s=iv.length_s - LAG)) == 1  # ちょうどは残す
+    # 長さの判定は伸ばす前（t_go から終わりまで）の長さ。伸ばした分（3 行）は数えない
+    base = iv.length_s - 3 * DT
+    assert _bands(_weak_launch, ret_s=base - LAG + 0.01) == []  # 長さ < 戻る時間 + L
+    assert len(_bands(_weak_launch, ret_s=base - LAG)) == 1  # ちょうどは残す
 
 
 def test_band_skipped_when_overlapping_existing_interval() -> None:
@@ -156,16 +159,16 @@ def test_plan_band_rows_are_brake_only_and_accel_follows() -> None:
     # 区間の中にアクセルの行が無い。ブレーキの行は FF そのもの（-8.5）か、後ろのすき間で 0
     band = on.effort_pct[i0:i1]
     assert (band <= 0.0).all() and band[0] == pytest.approx(-8.5)
-    # 2026-11-01 修正: 印は effort がブレーキの行だけ（終わりのすき間の 0 の行は印なし）
+    # 2026-11-01 修正: 印はブレーキの行だけ（終わりのすき間の 0 の行は印なし）
     assert on.launch_band is not None
     assert np.array_equal(on.launch_band[i0:i1], on.effort_pct[i0:i1] < 0.0)
     assert on.launch_band[i0]
     assert not on.launch_band[:i0].any() and not on.launch_band[i1:].any()
     assert on.launch_prep[i0:i1].all()
-    # 離しの時刻: off は動き出しの前（t0 の前の行）に min へ切るが、on は帯の終わり近くまでブレーキ
+    # 離しの時刻: off は t_go − L の行で min へ切るが、on は帯の終わり近くまでブレーキ
     last_b_off = int(np.flatnonzero(off.effort_pct[: i1 + 20] < 0.0)[-1])
     last_b_on = int(np.flatnonzero(on.effort_pct[: i1 + 20] < 0.0)[-1])
-    assert last_b_off < i0 <= last_b_on
+    assert last_b_off < last_b_on and i0 <= last_b_on
     assert on.return_gap.n_violations == 0
     # アクセルは帯の後
     assert int(np.flatnonzero(on.effort_pct > 0.0)[0]) >= i1 - 1
@@ -345,7 +348,7 @@ def test_launch_band_for_on_gives_spec_and_plan_args(tmp_path: Path) -> None:
     mode = _mode_weak()
     ff = mdmod.load_feedforward(cfg)
     spec, bands = mdmod.launch_band_for(cfg, mode, ff.table)
-    assert len(bands) == 1 and bands[0].start_s == pytest.approx(3.05)
+    assert len(bands) == 1 and bands[0].start_s == pytest.approx(3.0)  # t_go − L（1 行）
     assert spec.intervals == ((bands[0].start_s, bands[0].length_s),)
     # FF は上りと同じ式（保持の開度 − 傾き ÷ c）
     t = bands[0].start_s
@@ -386,20 +389,59 @@ def test_launch_band_for_missing_meta_or_curve_is_config_error(tmp_path: Path) -
         mdmod.launch_band_for(cfg3, mode, mdmod.load_feedforward(cfg3).table)
 
 
-def test_plan_accel_rows_before_band_start_are_replaced_by_bk() -> None:
-    # 発進側の表が「基準が動く前からアクセル」と言う計画でも、帯の前の行（t_go の次〜帯の始め）は
-    # bk のブレーキで、帯の中にアクセルは無い
+def test_plan_band_starts_at_t_go_minus_lag_and_has_no_accel() -> None:
+    # 2026-11-01 修正 2: 帯は t_go − L の行から。発進側の表が「基準が動く前からアクセル」と言う
+    # 計画でも、帯の中にアクセルは無く、両ペダル同時もない
     ivs = _bands(_weak, 16.0)
     spec = LaunchBandSpec(tuple((iv.start_s, iv.length_s) for iv in ivs), lambda t: 8.5)
-    off = _plan(_weak, table=_tb(2.0))
     on = _plan(_weak, spec, table=_tb(2.0))
     i0 = int(round(ivs[0].start_s / DT))
     i1 = i0 + int(round(ivs[0].length_s / DT))
-    i_go = int(round(i0 - LAG / DT))
-    assert (off.effort_pct[i_go + 1 : i0] > 0.0).any()  # 前提: off は帯の前にアクセルがある
-    assert (on.effort_pct[i_go + 1 : i1] <= 0.0).all()
-    assert (on.effort_pct[i_go + 1 : i0] <= -(BD + abs(BK_U)) + 1e-9).all()
+    t_go_row = int(round(8.05 / DT))
+    assert i0 == t_go_row - int(round(LAG / DT))
+    assert (on.effort_pct[i0:i1] <= 0.0).all()
     pa, pb = track_pedal_position(
         on.effort_pct, period_s=DT, track=PedalTrack(), accel_min_pct=AD, brake_min_pct=BD
     )
     assert int(np.count_nonzero((pa > AD + 0.05) & (pb > BD + 0.05))) == 0
+
+
+def test_plan_first_band_row_ff_is_near_bk() -> None:
+    # 区間の最初の行の FF は ref(t_go)（≒ 0）から計算される → bk（動き出す開度）付近。
+    # 上りと同じ式で「− 傾き ÷ c」が引かれる（傾き 1.6 km/h/s ÷ c 6.8 ≒ 0.24%）ぶんだけ浅い
+    bk = BD + abs(BK_U)
+    ivs = _bands(_weak, 16.0)
+    ref_at = _weak
+    pts = [(0.0, bk), (5.0, bk - 3.0)]  # 車速 0 で bk、上がるほど浅い保持の開度
+    c = 6.8
+
+    def ff(t: float) -> float:
+        return lead_in_ff_at(ref_at, t, LAG, DT, pts, c, BD, 18.0, 0.0)
+
+    t0 = ivs[0].start_s
+    assert ff(t0) == pytest.approx(bk - 1.6 / c, abs=0.1)
+    spec = LaunchBandSpec(tuple((iv.start_s, iv.length_s) for iv in ivs), ff)
+    on = _plan(_weak, spec)
+    i0 = int(round(t0 / DT))
+    assert -on.effort_pct[i0] == pytest.approx(bk - 1.6 / c, abs=0.1)
+
+
+def test_plan_band_end_gap_not_tightened_by_launch_gap_tight() -> None:
+    # 2026-11-01 修正 2: 帯の終わり → アクセルのすき間は launch_gap_tight on でも off と同じ行数
+    ivs = _bands(_weak, 16.0)
+    spec = LaunchBandSpec(tuple((iv.start_s, iv.length_s) for iv in ivs), lambda t: 8.5)
+    a, b = _plan(_weak, spec, launch_gap_tight=False), _plan(_weak, spec, launch_gap_tight=True)
+    assert np.array_equal(a.effort_pct, b.effort_pct)
+    assert b.return_gap.n_violations == 0
+
+
+def test_plan_strong_launch_gap_still_tightened() -> None:
+    # 強い発進（帯なし）は今どおり launch_gap_tight で詰まる（帯の入力を渡しても同じ）
+    def strong(t: float) -> float:
+        return _strong_launch(t - 5.0)
+
+    spec = LaunchBandSpec((), lambda t: 8.5)
+    on = _plan(strong, spec, launch_gap_tight=True)
+    assert on.return_gap.n_violations == 0
+    ref = plan_for(strong, 16.0, _tb(), **dict(_PLAN_KW, launch_gap_tight=True))
+    assert np.array_equal(ref.effort_pct, on.effort_pct)

@@ -251,7 +251,8 @@ def launch_band_intervals(
     基準の傾き以上の加速度を出せるので、アクセルを使わずブレーキの帯で動かせる。
     対象外: 長さ < return_seconds(その区間の最後の行の FF の開度) ＋ L（ブレーキを min へ戻して
     アクセルへ踏み替える時間に足りない）／exclude（保持の区間・上り）と時間が重なるもの
-    （既存を優先）。start_s ＝ t_go、length_s ＝ 周期数 × 刻み、mean_kmh ＝ 区間の基準の平均。"""
+    （既存を優先）。start_s ＝ t_go − L（周期に丸める。
+    2026-11-01 修正 2）、length_s ＝ 周期数 × 刻み、mean_kmh ＝ 区間の基準の平均。"""
     out: list[HoldInterval] = []
     n = int(math.floor(duration_s / step_s + 1e-9)) + 1
     xs = np.asarray(creep_speeds_kmh, dtype=float)
@@ -285,10 +286,15 @@ def launch_band_intervals(
         if j > k:
             length = (j - k) * step_s
             need_s = return_seconds(ff_pct_at((j - 1) * step_s)) + lag_s
-            start = k * step_s
+            # 2026-11-01 修正 2: 指令の時刻で見た帯は t_go − L（FF が L 先の基準 ref(t+L) で
+            # 決まるため。離しの直線が bk に着く行と同じ）から始める。長さの下限は伸ばす前の長さ
+            # （基準が動き出してからの時間）で判定する（伸ばした後だと短い発進が増えて対象が変わる）
+            k0 = int(np.clip(round(k - lag_s / step_s), 0, k))
+            start = k0 * step_s
+            length += (k - k0) * step_s
             overlap = any(iv.start_s < start + length - 1e-9 and start < iv.end_s - 1e-9
                           for iv in exclude)
-            if length >= need_s - 1e-9 and not overlap:
+            if length - (k - k0) * step_s >= need_s - 1e-9 and not overlap:
                 out.append(HoldInterval(start, length, sum(speeds) / len(speeds)))
         prev_stopped = False
         k = max(j, k + 1)
