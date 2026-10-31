@@ -620,22 +620,20 @@ def test_sweep_off_gives_the_same_plan_as_before() -> None:
     assert "ゆっくり戻す" not in rp.format_plan_table(off)
 
 
-def test_sweep_picks_high_speed_bands_summed_over_levels_and_assigns_the_max_level() -> None:
+_SWEEP_GRID = (15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0)  # min_kmh 8 以上〜戻しがある最高の帯
+
+
+def test_sweep_fills_the_grid_up_to_the_highest_release_band_with_the_weakest_level() -> None:
+    # 2026-11-01 段6c: モードの秒数（0 の帯も）によらず、戻しがある最も高い帯（80–90）までの格子の
+    # 全部に、番号 0 以外でいちばん G が弱い段（0.1G）を置く。段 2（0.2G）・最弱の段 0 は置かない
     c = _sweep_counts()
     plan = rp.plan_ramps(c, **_SWEEP_KW, sweep_enabled=True, sweep_est_s=25.0)
     by_g = {lv.g: lv.sweep_stations for lv in plan.levels}
-    # 85 km/h は段 1（1.5）＋段 2（1.0）の合計 2.5 で拾い、秒数が最大の段 1 へ。段ごとの
-    # plan_release_stations（2 秒以上）は段 1 でも 85 を拾えない
-    assert by_g[0.1] == (85.0,)
-    assert 85.0 not in rp.plan_release_stations(
-        c, 1, mode_min_s=2.0, fine_max_kmh=100.0, coarse_step_kmh=20.0, min_kmh=8.0,
-        top_kmh=100.0, min_gap_kmh=0.0, drop_kmh=0.0,
-    )
-    assert by_g[0.2] == (35.0,)  # 段 2 だけの 3.0 秒
-    assert by_g[0.02] == ()  # 最弱の段へは割り当てない（50–60 帯は誰にも割り当てない）
+    assert by_g[0.1] == _SWEEP_GRID  # 15・25・45・65・75 は秒数 0 の帯
+    assert by_g[0.2] == () and by_g[0.02] == ()
     order = plan.execution_order()
     assert all(len(item) == 6 for item in order)
-    assert [item[5] for item in order if item[0] == 0.1] == [(85.0,)] * 2  # 2 周分
+    assert [item[5] for item in order if item[0] == 0.1] == [_SWEEP_GRID] * 2  # 2 周分
 
 
 def test_sweep_adds_estimated_seconds_and_shows_in_the_table() -> None:
@@ -647,57 +645,71 @@ def test_sweep_adds_estimated_seconds_and_shows_in_the_table() -> None:
         assert s.est_s == pytest.approx(b.est_s + len(s.sweep_stations) * (25.0 + 1.0))
     assert plan.total_est_s > base.total_est_s
     table = rp.format_plan_table(plan)
-    assert "ゆっくり戻す 85 km/h（1 回）" in table
+    assert "ゆっくり戻す 15, 25, 35, 45, 55, 65, 75, 85 km/h（8 回）" in table
     assert "うちゆっくり戻すは周回込みで" in table
 
 
-def test_sweep_respects_min_speed_mode_min_s_and_top_gap() -> None:
+def test_sweep_respects_min_speed_highest_band_and_top_gap() -> None:
     c = _sweep_counts()
     tops = {1: 100.0, 2: 100.0}
     gaps = {1: 0.0, 2: 0.0}
     kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0}
-    # 合計が mode_min_s 未満の帯は拾わない（85 は 2.5 秒）
-    assert rp.plan_release_sweeps(c, tops, gaps, mode_min_s=2.6, **kw) == {2: (35.0,)}
     # 最小の車速（min_kmh）未満は外す
-    assert rp.plan_release_sweeps(c, tops, gaps, mode_min_s=2.0, **{**kw, "min_kmh": 40.0}) == {
-        1: (85.0,)
-    }
-    # 上端までの間隔が足りない段は割り当てない（段 1 の上端 90 ＋ 間隔 10 → 85 は 5 足りない）
-    got = rp.plan_release_sweeps(c, {1: 90.0, 2: 100.0}, {1: 10.0, 2: 10.0}, mode_min_s=2.0, **kw)
-    assert got[2] == (35.0, 85.0)
+    got = rp.plan_release_sweeps(c, tops, gaps, **{**kw, "min_kmh": 40.0})
+    assert got == {1: (45.0, 55.0, 65.0, 75.0, 85.0)}
+    # 戻しが 1 つも無ければ置かない
+    empty = rp.BandCounts(LEVELS, 10.0, np.zeros((10, 3)), np.zeros((10, 3)), 0.0,
+                          release_s=np.zeros((10, 3)))
+    assert rp.plan_release_sweeps(empty, tops, gaps, **kw) == {}
+    # 上端までの間隔が足りない段は割り当てない（段 1 の上端 90 ＋ 間隔 10 → 85 は 5 足りず段 2 へ）
+    got = rp.plan_release_sweeps(c, {1: 90.0, 2: 100.0}, {1: 10.0, 2: 10.0}, **kw)
+    assert 85.0 in got[2] and 85.0 not in got[1]
+    # 同じ段の中の間隔 gaps 未満は外す（低い車速の側を残し、外れた車速は次に弱い段へ）
+    got = rp.plan_release_sweeps(c, tops, {1: 15.0, 2: 15.0}, **kw)
+    assert got[1] == (15.0, 35.0, 55.0, 75.0) and got[2] == (25.0, 45.0, 65.0, 85.0)
 
 
-def test_sweep_moves_to_the_next_level_when_the_top_level_has_a_release_station_there() -> None:
-    # 2026-11-01 段6b: 85 km/h は段 1 が最大だが、段 1 の下りの戻しが 85 にあれば段 2 へ回す。
-    # 間隔 gaps 未満しか離れていない戻しも「重なり」。段 2 にも戻しがあれば置かない
+def test_sweep_overlapping_a_fast_release_moves_to_the_next_level_or_goes_in_front_of_it() -> None:
+    # 2026-11-01 段6c: 段 1 の下りの戻しが 85 にあり、間隔 gaps 未満に置けない 85 は、段 2 が空いて
+    # いれば段 2 へ回す。段 2 にも戻しがあるなら、速い戻しがちょうど 85 にある弱い方（段 1）に置く
+    # （続けて両方）。ちょうどの点が無ければ置かない（近いだけの点では置けない）
     c = _sweep_counts()
     tops = {1: 100.0, 2: 100.0}
     gaps = {1: 5.0, 2: 5.0}
-    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0, "mode_min_s": 2.0}
-    assert rp.plan_release_sweeps(c, tops, gaps, **kw)[1] == (85.0,)
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0}
+    assert rp.plan_release_sweeps(c, tops, gaps, **kw)[1] == _SWEEP_GRID
     got = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (85.0,)}, **kw)
-    assert got[2] == (35.0, 85.0) and 1 not in got
-    near = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (82.0,)}, **kw)
-    assert near[2] == (35.0, 85.0)
+    assert got[2] == (85.0,) and got[1] == _SWEEP_GRID[:-1]
+    both = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (85.0,), 2: (85.0,)}, **kw)
+    assert both[1] == _SWEEP_GRID and 2 not in both  # 続けて両方（段 1 の 85 は速い戻しの前）
+    near = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (82.0,), 2: (82.0,)}, **kw)
+    assert 85.0 not in near.get(1, ()) and 85.0 not in near.get(2, ())
     far = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (75.0,)}, **kw)
-    assert far[1] == (85.0,)
-    none = rp.plan_release_sweeps(
-        c, tops, gaps, release_by_level={1: (85.0,), 2: (85.0,)}, **kw
+    assert far[1][-1] == 85.0 and far[2] == (75.0,)  # 75 だけ段 2（段 1 の戻しと重なる）
+    # 続けて両方は、同じ段に既に置いた点との間隔 (v) を見ない（35 に置いた後の 45 も、段 1 の
+    # 速い戻しがちょうど 45 にあれば、gaps 30 未満でも段 1 に置く）
+    close = rp.plan_release_sweeps(
+        c, tops, {1: 30.0, 2: 30.0}, release_by_level={1: (35.0, 45.0), 2: (35.0, 45.0)}, **kw
     )
-    assert none == {2: (35.0,)}
+    assert 35.0 in close[1] and 45.0 in close[1]
 
 
 def test_sweep_only_uses_levels_stronger_than_the_coast_decel() -> None:
     # 惰行の減速が 1.0 km/h/s（G_TO_KMHS 換算で 0.1G 未満の段は弱い）。段 1（0.1G）が惰行以下なら
-    # 85 km/h は段 2（0.2G）へ。渡さなければ判定しない
+    # 全部段 2（0.2G）へ。渡さなければ判定しない
     c = _sweep_counts()
     tops = {1: 100.0, 2: 100.0}
     gaps = {1: 0.0, 2: 0.0}
-    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0, "mode_min_s": 2.0,
-          "levels": LEVELS}
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0, "levels": LEVELS}
     coast = 0.1 * rp.G_TO_KMHS + 0.01
-    assert rp.plan_release_sweeps(c, tops, gaps, **kw)[1] == (85.0,)
+    assert rp.plan_release_sweeps(c, tops, gaps, **kw)[1] == _SWEEP_GRID
     got = rp.plan_release_sweeps(
         c, tops, gaps, coast_speeds_kmh=(0.0, 200.0), coast_decels_kmhs=(coast, coast), **kw
     )
-    assert 1 not in got and got[2] == (35.0, 85.0)
+    assert 1 not in got and got[2] == _SWEEP_GRID
+    # 惰行が段 2 でも強い車速（高速側だけ）は置かない
+    steep = rp.plan_release_sweeps(
+        c, tops, gaps, coast_speeds_kmh=(0.0, 50.0, 200.0),
+        coast_decels_kmhs=(coast, coast, 100.0), **kw
+    )
+    assert 85.0 not in steep[2] and 15.0 in steep[2] and 1 not in steep

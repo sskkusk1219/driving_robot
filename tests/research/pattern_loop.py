@@ -2575,9 +2575,12 @@ class PatternLoop:
             self._ramp_record_result(pattern, now)
             self._finish_pattern(speed, now)
             return
-        if self._ramp_release_try_enter(pattern, speed, now):
-            return
+        # 2026-11-01 段6c: 同じ周期に速い戻しとゆっくり戻すの両方の点に当たったら、ゆっくり戻すを
+        # 先に入れる（速い戻しの点は使い済みにも飛ばしにもしない。ゆっくり戻すから RAMP_DOWN へ
+        # 出た後の周期に、まだ実車速 ≤ その点なので通常の入り方で速い戻しへ入る）
         if self._ramp_sweep_try_enter(pattern, speed, now):
+            return
+        if self._ramp_release_try_enter(pattern, speed, now):
             return
         if self._ramp_dither_brake_try_enter(pattern, speed, now):
             return

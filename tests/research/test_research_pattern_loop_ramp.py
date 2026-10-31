@@ -4511,3 +4511,82 @@ def test_sweep_rate_follows_depth_minus_onset_over_time_with_the_configured_floo
     loop._onset_pct[PEDAL_BRAKE] = bmin + 3.0
     assert loop._sweep_rate(-7.0) == pytest.approx(1.0)  # (7 − 3) ÷ 4
     assert loop._sweep_rate(-3.4) == pytest.approx(0.25)  # 差 0.4 ÷ 4 = 0.1 → 下限
+
+
+# ── ゆっくり戻すと速い戻しが同じ周期に当たるとき（2026-11-01 段6c）─────────────
+
+
+def _both_ramp(
+    sweeps: tuple[float, ...], releases: tuple[float, ...], g: float = 0.1, top_kmh: float = 80.0
+) -> plmod.GRampPattern:
+    return plmod.GRampPattern(
+        PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0, hold_duration_s=0.0,
+        target_g=g, top_kmh=top_kmh, sweep_stations=sweeps, release_stations=releases,
+    )
+
+
+def _both_loop(p: plmod.GRampPattern, **cfg: object) -> PatternLoop:
+    loop = _loop([p], config=_sweep_config(
+        ramp_release_fracs=(0.5, 0.0), ramp_release_move_s=1.0, ramp_release_hold_s=(1.5, 2.0),
+        **cfg,
+    ))
+    for v in range(5, 100, 10):
+        loop.glimit.add_coast(float(v), 0.5)
+    return loop
+
+
+def _phase_runs(rows: list[tuple[float, str, float, float]]) -> list[str]:
+    out: list[str] = []
+    for _t, ph, _v, _u in rows:
+        if ph in ("RAMP_RELEASE_SWEEP", "RAMP_RELEASE") and (not out or out[-1] != ph):
+            out.append(ph)
+    return out
+
+
+def test_sweep_and_release_on_the_same_station_run_sweep_first_then_release() -> None:
+    """同じ周期に両方の点に当たったら、ゆっくり戻す → 速い戻しの順に両方入る。速い戻しの点は
+    飛ばしにも数えない。"""
+    p = _both_ramp((60.0,), (60.0,))
+    loop = _both_loop(p)
+    rows = _run_sweep(loop, p, _SweepKine(loop, 0.1))
+    assert _phase_runs(rows) == ["RAMP_RELEASE_SWEEP", "RAMP_RELEASE"]
+    r = loop.ramp_results[0]
+    assert (r.sweep_n, r.sweep_skipped) == (1, 0)
+    assert (r.release_n, r.release_skipped) == (1, 0)
+
+
+def test_only_one_of_the_two_in_a_cycle_works_as_before() -> None:
+    # ゆっくり戻すだけ（速い戻しの点が別の車速）。速い戻しは自分の車速で入る
+    p = _both_ramp((60.0,), (40.0,))
+    loop = _both_loop(p)
+    rows = _run_sweep(loop, p, _SweepKine(loop, 0.1))
+    assert _phase_runs(rows) == ["RAMP_RELEASE_SWEEP", "RAMP_RELEASE"]
+    r = loop.ramp_results[0]
+    assert (r.sweep_n, r.release_n, r.release_skipped) == (1, 1, 0)
+    first_release = next(v for _t, ph, v, _u in rows if ph == "RAMP_RELEASE")
+    assert first_release <= 40.0 + 0.5  # 40 km/h まで下がってから
+    # 速い戻しだけ
+    q = _both_ramp((), (60.0,))
+    loop2 = _both_loop(q)
+    rows2 = _run_sweep(loop2, q, _SweepKine(loop2, 0.1))
+    assert _phase_runs(rows2) == ["RAMP_RELEASE"]
+    assert (loop2.ramp_results[0].sweep_n, loop2.ramp_results[0].release_n) == (0, 1)
+
+
+def test_sweep_skipped_in_a_shared_cycle_lets_the_fast_release_run() -> None:
+    # u がブレーキ側でない（ゆっくり戻すは飛ばし）→ 速い戻しも u ≥ 0 なので飛ばし。順序が逆でも
+    # 飛ばしの数は変わらない（ゆっくり戻す 1・速い戻し 1）
+    p = _both_ramp((60.0,), (60.0,))
+    loop = _both_loop(p)
+    loop._ramp_control = lambda *a, **k: None  # type: ignore[method-assign, assignment]
+    kine = _SweepKine(loop, 0.1)
+    t = 0.0
+    while t < 200.0 and not loop.ramp_results:
+        if loop._phase is _Phase.RAMP_DOWN:
+            loop._rp_u = max(loop._rp_u, 0.0)
+            loop._rp_brake_latched = False
+        _cycle(loop, p, kine.v, t)
+        kine.step()
+        t += 0.1
+    r = loop.ramp_results[0]
+    assert (r.sweep_n, r.sweep_skipped, r.release_n, r.release_skipped) == (0, 1, 0, 1)

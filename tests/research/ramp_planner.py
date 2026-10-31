@@ -468,72 +468,84 @@ def plan_release_stations(
 
 def plan_release_sweeps(
     counts: BandCounts, tops: Mapping[int, float], gaps: Mapping[int, float], *,
-    mode_min_s: float, fine_max_kmh: float, coarse_step_kmh: float, min_kmh: float,
+    fine_max_kmh: float, coarse_step_kmh: float, min_kmh: float,
     release_by_level: Mapping[int, Sequence[float]] | None = None,
     levels: Sequence[float] = (),
     coast_speeds_kmh: Sequence[float] = (), coast_decels_kmhs: Sequence[float] = (),
 ) -> dict[int, tuple[float, ...]]:
-    """ゆっくり戻す場所 [km/h]（段の番号 → 昇順の車速）（2026-10-31 段1）。
+    """ゆっくり戻す場所 [km/h]（段の番号 → 昇順の車速）（2026-10-31 段1・2026-11-01 段6c）。
 
-    モードの `release_s`（走行中に終わる減速の戻しの秒数。車速帯 × 段）を段方向に足し、その合計が
-    `mode_min_s` 秒以上ある車速帯（`plan_release_stations` と同じ `_band_station_kmh` の車速に
-    まとめる）を拾う。`plan_release_stations` は段ごとに絞るので 80 km/h 以上の高速は残らないが、
-    ここは足してから絞るので残る。各車速には、その車速の戻しの秒数が最大の段を 1 つ割り当てる
-    （同点は弱い段）。
-    割り当てる段は `tops`（段の番号 → 上端の車速。走る段だけ。いちばん弱い段〔番号 0〕は除く）の
-    うち、上端までの間隔が `gaps[段]` 以上あるもの。同じ段の中でも間隔が `gaps[段]` 未満の点は
-    外す（低い車速の側を残す）。車速が `min_kmh` 未満の点は外す。
-    2026-11-01 段6b（実機の手順2 で分かった 2 点の直し）:
-    - 重ならない: `release_by_level`（段の番号 → その段の下りの戻しの車速 `plan_release_stations`）
-      に、その車速と `gaps[段]` 未満しか離れていない点（同じ点を含む）がある段は候補から外し、
-      モードの秒数が次に多い段へ回す。候補が無ければその車速は置かない（同じ段の既存の戻しが先に
-      入ってゆっくり戻すが飛ばされていたため）。
-    - 惰行より強い段だけ: `coast_speeds_kmh`・`coast_decels_kmhs`（yaml の惰行カーブ）が渡された
-      ら、その車速の惰行の減速より 段の G × G_TO_KMHS が大きい段に限る（惰行の方が強いとブレーキを
-      踏まず、戻しても惰行に戻る所が測れない）。渡されなければ判定しない。実行時の飛ばしも残す。
+    2026-11-01 段6c（ユーザー決定）: 戻しの表はニューラルネット（入力: 車速・開度・戻し量）で作る
+    ので、ゆっくり戻すはモードの秒数がある所に限らず、ネットの入力の範囲を埋めるように置く
+    （段1〜6b の「`mode_min_s` 秒以上ある帯だけ・秒数が最大の段」は廃止）。
+    - 車速の候補: `plan_release_stations` と同じ `_band_station_kmh` の格子のうち `min_kmh` 以上で、
+      モード全体（`counts.release_s` を全段で足した合計）が 0 より大きい最も高い帯の車速以下。
+    - 各車速には、次の条件を満たす段のうち G がいちばん弱い段を 1 つ置く（入る開度が効き始めに
+      近く、狙いの帯を測れるため）: (i) 番号 0 以外（`tops` は走る段だけ）(ii) 上端 `tops[段]`
+      まで `gaps[段]` 以上 (iii) `levels` と惰行カーブ（`coast_speeds_kmh`・`coast_decels_kmhs`）が
+      渡されたら、段の G × G_TO_KMHS ＞ その車速の惰行の減速（惰行の方が強いとブレーキを踏まず、
+      戻しても惰行に戻る所が測れない）(iv) その段の `release_by_level`（下りの戻しの車速）と
+      `gaps[段]` 未満の距離に無い (v) その段に既に置いたゆっくり戻すと `gaps[段]` 未満に無い。
+    - (i)〜(iii) は満たすが (iv)(v) で置けない車速は「続けて両方」にする: (i)〜(iii) を満たす段の
+      うち、その車速ちょうどに `release_by_level` の点がある G がいちばん弱い段に置く（速い戻しの
+      前のゆっくり戻す。その段に既に置いた点との間隔 (v) は見ない。速い戻しの車速どうしは既に離れ
+      ているため）。それも無ければ置かない。続けて両方かどうかの印は持たない（`pattern_loop` が
+      同じ周期に速い戻しの点にも当たるかで決め、ゆっくり戻す → 速い戻しの順で入れる）。
+    2026-11-01 段6b から残る条件: (iv) の重ならない判定・(iii) の惰行より強い段だけ。実行時の
+    惰行の飛ばしも残す。
     """
     arr = counts.release_s
     if arr.ndim != 2 or arr.shape[0] == 0:
         return {}
     width = counts.speed_bin_kmh
-    by_station: dict[float, np.ndarray] = {}
-    for k in range(arr.shape[0]):
-        v = _band_station_kmh(k, width, fine_max_kmh, coarse_step_kmh)
-        by_station[v] = by_station.get(v, np.zeros(arr.shape[1])) + arr[k]
+    total = arr.sum(axis=1)
+    grid = sorted(
+        {_band_station_kmh(k, width, fine_max_kmh, coarse_step_kmh) for k in range(arr.shape[0])}
+    )
+    filled = [
+        _band_station_kmh(k, width, fine_max_kmh, coarse_step_kmh)
+        for k in range(arr.shape[0]) if total[k] > 0.0
+    ]
+    if not filled:
+        return {}
+    highest = max(filled)
     eps = 1e-9
+    rel = release_by_level or {}
+
+    def _weak_first(i: int) -> tuple[float, int]:
+        return (levels[i] if i < len(levels) else float(i), i)
+
     picked: dict[int, list[float]] = {}
-    for v in sorted(by_station):
-        sec = by_station[v]
-        if v < min_kmh - eps or float(sec.sum()) < mode_min_s:
+    for v in grid:
+        if v < min_kmh - eps or v > highest + eps:
             continue
-        best: int | None = None
         coast_v = (
             float(np.interp(v, coast_speeds_kmh, coast_decels_kmhs))
             if len(coast_speeds_kmh) >= 2 and len(coast_speeds_kmh) == len(coast_decels_kmhs)
             else None
         )
-        for i in sorted(tops):
-            if i == 0 or i >= len(sec) or sec[i] <= 0.0:
+        elig = [
+            i for i in tops
+            if i != 0 and i < arr.shape[1] and tops[i] - v >= gaps.get(i, 0.0) - eps
+            and not (coast_v is not None and i < len(levels) and levels[i] * G_TO_KMHS <= coast_v)
+        ]
+        free = [
+            i for i in elig
+            if not any(abs(r - v) < max(gaps.get(i, 0.0), eps) for r in rel.get(i, ()))
+            and not (
+                picked.get(i) and v - picked[i][-1] < gaps.get(i, 0.0) - eps
+            )
+        ]
+        if free:
+            best = min(free, key=_weak_first)
+        else:
+            # 続けて両方: その車速ちょうどに速い戻しの点がある段（ゆっくり戻すが先に入る）
+            same = [i for i in elig if any(abs(r - v) < 1e-6 for r in rel.get(i, ()))]
+            if not same:
                 continue
-            if tops[i] - v < gaps.get(i, 0.0) - eps:
-                continue
-            if coast_v is not None and i < len(levels) and levels[i] * G_TO_KMHS <= coast_v:
-                continue
-            near = gaps.get(i, 0.0)
-            if any(
-                abs(r - v) < max(near, eps)
-                for r in (release_by_level or {}).get(i, ())
-            ):
-                continue
-            if best is None or sec[i] > sec[best]:
-                best = i
-        if best is None:
-            continue
-        lst = picked.setdefault(best, [])
-        if lst and v - lst[-1] < gaps.get(best, 0.0) - eps:
-            continue
-        lst.append(v)
-    return {i: tuple(vs) for i, vs in picked.items()}
+            best = min(same, key=_weak_first)
+        picked.setdefault(best, []).append(v)
+    return {i: tuple(vs) for i, vs in sorted(picked.items())}
 
 
 def sweep_est_total_s(n_stations: int, *, sweep_est_s: float, turn_s: float) -> float:
@@ -610,6 +622,8 @@ def plan_ramps(
     （周回数の割り当てにも効く）。off なら計画は今と完全に同じ。
     2026-11-01 段6b: ゆっくり戻す場所は、各段の `plan_release_stations` が決まった後に決める
     （同じ車速の段は避け、`sweep_coast_*`〔惰行カーブ〕より強い段だけ）。
+    2026-11-01 段6c: ゆっくり戻す場所はモードの秒数によらず、ネットの入力の範囲を埋める車速に
+    置く（G がいちばん弱い段。重なる所は同じ段の速い戻しの前に続けて入れる）。
     """
     def _top_of(i: int, g: float) -> float | None:
         enough = np.flatnonzero(
@@ -639,7 +653,7 @@ def plan_ramps(
         sweeps = plan_release_sweeps(
             counts, tops,
             {i: counts.levels[i] * G_TO_KMHS * (min_at_g_s + turn_s) for i in tops},
-            mode_min_s=mode_min_s, fine_max_kmh=cruise_fine_max_kmh,
+            fine_max_kmh=cruise_fine_max_kmh,
             coarse_step_kmh=cruise_coarse_step_kmh, min_kmh=cruise_min_kmh,
             release_by_level={i: _release_of(i, counts.levels[i], t) for i, t in tops.items()},
             levels=counts.levels,
