@@ -659,6 +659,16 @@ LAUNCH_SHIFT_SCORE_FROM_S = 1.0
 LAUNCH_SHIFT_SCORE_TO_S = 1.5
 
 
+@dataclass(frozen=True)
+class LaunchBandSpec:
+    """2026-10-31 発進のブレーキの帯（案 B。launch_brake_band）: build_plan が帯の行を置く入力。
+    intervals ＝ (開始 [s], 長さ [s])（hold_scene.launch_band_intervals の区間）、
+    ff_at(t) ＝ 時刻 t のブレーキ開度 [%]（正。上りと同じ FF ＝ hold_scene.lead_in_ff_at）。"""
+
+    intervals: tuple[tuple[float, float], ...]
+    ff_at: Callable[[float], float]
+
+
 @dataclass
 class LaunchShiftStats:
     """発進のずらし（`apply_launch_shift`）の集計（2026-10-27 段13）。"""
@@ -721,6 +731,9 @@ class ForwardPlan:
     # 2026-10-30 段2 案 D: 埋めた惰行の本数と行数（coast_fill_max_s が 0 なら 0）
     coast_fill_runs: int = 0
     coast_fill_rows: int = 0
+    # 2026-10-31 発進のブレーキの帯（案 B）: 帯の行（アクセルを使わずブレーキの FF で動かす行）。
+    # launch_band を渡さなければ None。launch_shift_choose はこの発進を対象から外す
+    launch_band: np.ndarray | None = None
 
     def coast_fill_s(self) -> float:
         """案 D で埋めた惰行の秒数。"""
@@ -840,6 +853,7 @@ def build_plan(
     predict_low_speed_sides: bool = False,
     launch_shift_choose: bool = False,
     launch_gap_tight: bool = False,
+    launch_band: LaunchBandSpec | None = None,
     predict_creep_curve: bool = False,
     creep_accel_speeds_kmh: Sequence[float] = (),
     creep_accel_kmhs: Sequence[float] = (),
@@ -864,6 +878,13 @@ def build_plan(
     t_go まで直線で bk へ。以下なら停車の区間を bk で待つ。どちらも t_go までのブレーキ・惰行の行は
     浅くしない。meta が無ければ何もしない。A1 の後・np.clip の前（先置き・すき間の確保はその後に
     今までどおり掛かる）。
+
+    2026-10-31 発進のブレーキの帯（案 B）: `launch_band`（None は今までと完全に同じ）。渡すと
+    `launch_release_ramp` の後で、帯の区間の行を effort ＝ −ff_at(t)（ブレーキ。上りと同じ FF）・
+    flag ＝ FLAG_MEASURED・launch_prep ＝ True にし、区間のアクセル・惰行の行を消す。
+    区間の終わりからの
+    アクセルへの踏み替えは ensure_return_gap に任せる。launch_shift_choose はこの発進を対象から外す
+    （ForwardPlan.launch_band）。launch_release_ramp が要る。
 
     2026-10-24 段7-c: `switch_gap_compensate`。False は今までと完全に同じ。True は、アクセル ⇔
     ブレーキの切り替え（停車保持・先置きをまたぐものは除く。`switch_lead_events` と同じ対象）で
@@ -1023,6 +1044,7 @@ def build_plan(
             "launch_release_pre_pct": launch_release_pre_pct,
             "launch_short_stop_s": launch_short_stop_s,
             "launch_gap_tight": launch_gap_tight,
+            "launch_band": launch_band,
             "switch_gap_compensate": switch_gap_compensate,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1073,6 +1095,7 @@ def build_plan(
             "launch_release_pre_pct": launch_release_pre_pct,
             "launch_short_stop_s": launch_short_stop_s,
             "launch_gap_tight": launch_gap_tight,
+            "launch_band": launch_band,
             "switch_lead": switch_lead, "_lead_extra": _lead_extra,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1378,6 +1401,39 @@ def build_plan(
                 pre_pct=launch_release_pre_pct, lead_s=launch_release_lead_s,
                 short_stop_s=launch_short_stop_s, hold_pct=stop_brake_opening_pct,
             )
+    launch_band_rows = None
+    if launch_band is not None:
+        # 2026-10-31 発進のブレーキの帯（案 B）: ramp の後・clip の前。区間の行を上りと同じ FF の
+        # ブレーキにし（アクセル・惰行の行は消える）、launch_prep にする（発進の踏み替えとして扱う）
+        if launch_prep is None:
+            raise ValueError("launch_band には launch_release_ramp が要ります")
+        launch_band_rows = np.zeros(n, dtype=bool)
+        bkm_b = table.meta.get("launch_breakaway_u_pct")
+        bk_b = (
+            brake_deadband_pct + abs(float(bkm_b))
+            if bkm_b is not None and np.isfinite(bkm_b) else None
+        )
+        for start_s, length_s in launch_band.intervals:
+            i0 = int(round(start_s / period_s))
+            i1 = min(i0 + int(round(length_s / period_s)), n)
+            if bk_b is not None:
+                # 離しの直線は t_go（= i0 − 遅れの行数）で bk に着いて終わる。t_go の次の行から帯の
+                # 始めまでは、すき間の処理や先置きで bk より浅く（0 や効き始めの手前に）なる行を
+                # bk に保つ（車が帯の前に動き出さない）。弱い発進なのでこの間にアクセルは要らない
+                # （窓が基準の立ち上がりを先に拾ったアクセルの行も bk のブレーキにする）
+                i_go = int(np.clip(round(i0 - lb / period_s), 0, i0))
+                for r in range(i_go + 1, i0):
+                    was_accel = effort[r] > 0.0
+                    if was_accel or -effort[r] < bk_b:
+                        effort[r] = -bk_b
+                    if was_accel or flag[r] == FLAG_COAST:
+                        flag[r] = FLAG_STOP
+                    launch_prep[r] = True
+            for r in range(max(i0, 0), i1):
+                effort[r] = -float(launch_band.ff_at(r * period_s))
+                flag[r] = FLAG_MEASURED
+                launch_prep[r] = True
+                launch_band_rows[r] = True
     side_accel = np.where(launch_a, SIDE_LAUNCH, np.where(stop_a, SIDE_STOP, SIDE_MAIN))
     side_accel = np.where(relabel_a, SIDE_MAIN, side_accel)
     side_brake = np.where(launch_b, SIDE_LAUNCH, np.where(stop_b, SIDE_STOP, SIDE_MAIN))
@@ -1469,6 +1525,7 @@ def build_plan(
         switch_lead_s=_lead_extra,
         launch_midway=np.asarray(midway, dtype=bool).copy() if dir_rule else None,
         launch_prep=launch_prep, coast_fill_runs=fill_runs, coast_fill_rows=fill_rows,
+        launch_band=launch_band_rows,
     )
 
 
@@ -1685,7 +1742,9 @@ def apply_launch_shift(
         r_a = max(t0 - round(LAUNCH_SHIFT_INTEGRATE_FROM_S / dt), 0)
         k_sc0 = max(t0 - round(LAUNCH_SHIFT_SCORE_FROM_S / dt), 0)
         k_end = min(t0 + round(LAUNCH_SHIFT_SCORE_TO_S / dt), n - 1)
-        if a + LAUNCH_SHIFT_MAX_ROWS >= b or k_end <= k_sc0:
+        band_launch = plan.launch_band is not None and bool(plan.launch_band[t0 : t0 + 2].any())
+        if band_launch or a + LAUNCH_SHIFT_MAX_ROWS >= b or k_end <= k_sc0:
+            # 2026-10-31 発進のブレーキの帯（案 B）: 帯の発進はずらさない（δ ＝ 0）
             stats.deltas.append(0)
             stats.scores.append((0.0, 0.0))
             continue

@@ -1069,6 +1069,22 @@ class ForwardMapSection:
     # （UDDS `202357` ほか）。効く先: 発進でブレーキを離す時刻（fwd_plan.ensure_return_gap）。
     # 決める時期: 段2 の実機。既定 false ＝ 今と完全に同じ
     launch_gap_tight: bool = False
+    # 2026-10-31 発進のブレーキの帯（案 B。ProblemReport_20261031_発進でブレーキを離すのが早い
+    # 段3）:
+    # true なら、停車からの発進で基準の傾きがクリープの曲線（feedforward.creep_accel_*）より下の間
+    # （L 先の基準の傾き ≦ クリープの加速度。基準 < creep_speed_kmh）だけ、アクセルを使わず、
+    # ブレーキを
+    # 保持の上り（hold_lead_in）と同じ FF（保持の開度 − 傾き ÷ c）＋保持の場面の PI で動かす。
+    # 傾きが曲線を上回る手前で今の踏み替え（すき間は ensure_return_gap。戻す深さが浅いので
+    # 短くなる）。
+    # 長さが「戻る時間（その区間の FF の開度）＋ブレーキの遅れ」より短い発進、上り・保持の区間と
+    # 重なる発進は対象外。launch_release_ramp・hold_pi_enabled・hold_ff_enabled と
+    # feedforward.creep_accel_*、pkl の meta hold_opening・hold_pi が要る（無ければ ConfigError）。
+    # 根拠: UDDS 1251 s（基準の傾き 1.6）はブレーキだけの発進で最大 +0.09〜+0.33、同じ傾きの
+    # 346 s は min へ離して +0.34〜+0.55（`193513`〜`202357`）。効く先: 弱い発進（UDDS 346・510・
+    # 1052・1100・1196 s、US06 500・567 s）の最大偏差。決める時期: 段4 の実機。
+    # 既定 false ＝ 今と完全に同じ。ログ: hold_scene ＝ 3
+    launch_brake_band: bool = False
     # 2026-10-28 ProblemReport_20261027 段14 L1: true なら、すき間の処理・発進のずらしの予測
     # （fwd_plan.predicted_accel）で、両ペダルが min（位置 − min ≦ 0）かつ車速が
     # feedforward.creep_accel_speeds_kmh の最後（5.0 km/h）未満の行の加速度を、手順2 が測った
@@ -1683,6 +1699,17 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         not fm.launch_gap_tight or fm.launch_release_ramp,
         "forward_map.launch_gap_tight は launch_release_ramp が true のときだけ使える",
+    )
+    need(
+        not fm.launch_brake_band
+        or (fm.launch_release_ramp and fm.hold_pi_enabled and fm.hold_ff_enabled),
+        "forward_map.launch_brake_band は launch_release_ramp・hold_pi_enabled・hold_ff_enabled "
+        "が true のときだけ使える",
+    )
+    need(
+        not (fm.launch_brake_band and not ff.creep_accel_speeds_kmh),
+        "forward_map.launch_brake_band は feedforward.creep_accel_speeds_kmh が"
+        " 空でないときだけ true にできる",
     )
     need(
         math.isfinite(fm.hold_ff_offset_pct),

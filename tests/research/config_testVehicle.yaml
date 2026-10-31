@@ -424,6 +424,13 @@ forward_map:
   # 根拠: 発進の踏み替え 74 回でブレーキが min に着いてからアクセルが動くまで 0.15 s 空いていた（UDDS `202357` ほか）。
   # 効く先: 発進でブレーキを離す時刻。決める時期: 段2 の実機（採るまで false）
   launch_gap_tight: false
+  # 2026-10-31 発進のブレーキの帯（案 B。ProblemReport_20261031_発進でブレーキを離すのが早い 段3）: true なら停車からの
+  # 発進で、基準の傾き（L 先）がクリープの曲線（feedforward.creep_accel_*）以下の間だけ、アクセルを使わずブレーキを
+  # 保持の上り（hold_lead_in）と同じ FF ＋保持の場面の PI で動かす。傾きが曲線を上回る手前で今の踏み替え。
+  # launch_release_ramp・hold_pi_enabled・hold_ff_enabled と pkl の meta hold_opening・hold_pi が要る（無ければ ConfigError）。
+  # 根拠: UDDS 1251 s はブレーキだけの発進で最大 +0.09〜+0.33、同じ傾きの 346 s は min へ離して +0.34〜+0.55。
+  # 効く先: 弱い発進（UDDS 346・510・1052・1100・1196 s、US06 500・567 s）。決める時期: 段4 の実機（採るまで false）。ログ: hold_scene ＝ 3
+  launch_brake_band: false
   # 2026-10-28 段14 L1: true なら予測（案 R・C・発進のずらし）で、両ペダル min・車速 5.0 km/h 未満の行の
   # 加速度を手順2 が測ったクリープの曲線（feedforward.creep_accel_*）にする。発進側の表は +1.51 km/h/s、
   # 実測は約 2.2。predict_low_speed_sides が true のときだけ使える。決める時期: 段14 の実機（既定 off）

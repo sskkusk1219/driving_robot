@@ -80,7 +80,7 @@ if TYPE_CHECKING:
     # 実行時は使うメソッドの中で import する（fwd_map・fwd_plan は ff_bias 経由でこのモジュールを
     # import するため、先頭で import すると循環する）
     from tests.research.fwd_map import ForwardTable
-    from tests.research.fwd_plan import ForwardPlan, PedalTrack
+    from tests.research.fwd_plan import ForwardPlan, LaunchBandSpec, PedalTrack
 
 __all__ = [
     "CandidateC2",
@@ -815,6 +815,7 @@ class ForwardMapFeedforward:
         predict_low_speed_sides: bool = False,
         launch_shift_choose: bool = False,
         launch_gap_tight: bool = False,
+        launch_band: LaunchBandSpec | None = None,
         predict_creep_curve: bool = False,
         creep_accel_speeds_kmh: Sequence[float] = (),
         creep_accel_kmhs: Sequence[float] = (),
@@ -872,6 +873,7 @@ class ForwardMapFeedforward:
             predict_low_speed_sides=predict_low_speed_sides,
             launch_shift_choose=launch_shift_choose,
             launch_gap_tight=launch_gap_tight,  # 2026-10-31 発進のすき間（案 A）
+            launch_band=launch_band,  # 2026-10-31 発進のブレーキの帯（案 B）
             predict_creep_curve=predict_creep_curve,
             creep_accel_speeds_kmh=creep_accel_speeds_kmh,
             creep_accel_kmhs=creep_accel_kmhs,
