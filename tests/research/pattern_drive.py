@@ -141,7 +141,12 @@ from tests.research.pedal_search import (
     hold_breakaway_pct,
     hold_opening_meta,
 )
-from tests.research.ramp_planner import CRUISE_MIN_MARGIN_KMH, estimate_s
+from tests.research.ramp_planner import (
+    CRUISE_MIN_MARGIN_KMH,
+    estimate_s,
+    stop_approach_est_s,
+    stop_approach_top_kmh,
+)
 from tests.research.research_types import (
     DriveLog,
     DriveLogData,
@@ -359,6 +364,18 @@ def _describe(pattern: LearningPattern, *, hold_s: float = 0.0, turn_s: float = 
                 "定速になるまで保持 → 開度を固定でステップ（アクセル踏み増し・戻し・離す・"
                 f"ブレーキ踏み増し・戻し）→ {pattern.target_g:g}G で減速"
             )
+        if pattern.stop_approach:  # 2026-10-31 段2: 停止の手前の測定
+            up_g = pattern.up_g
+            est = stop_approach_est_s(
+                pattern.target_g, up_g, pattern.top_kmh,
+                hold_s=hold_s if pattern.hold_s is None else pattern.hold_s, turn_s=turn_s,
+            )
+            return (
+                f"停止の手前の測定  狙い {up_g:g}G で加速 → 上端 {pattern.top_kmh:g} km/h で "
+                f"{hold_s if pattern.hold_s is None else pattern.hold_s:g} 秒保持 → "
+                f"{pattern.target_g:g}G の一定 G で停車まで減速（見込み {est:.0f}s。停止前の戻し・"
+                "戻し・dither・途中の保持なし）"
+            )
         extra = ""
         if pattern.stations_kmh:  # 2026-10-13 段2o-2
             ways = "上りだけ" if pattern.stations_up_only else "上り下りとも"  # 2026-10-14 段2o-5
@@ -484,6 +501,34 @@ def require_forward_candidate(cfg: ResearchConfig) -> None:
         )
 
 
+def stop_approach_patterns(cfg: ResearchConfig) -> list[GRampPattern]:
+    """停止の手前の測定の G ランプ（一定 G で停車まで下りる。2026-10-31 段2。
+    ProblemReport_20261031_停止間際 B）。手順2（`build_patterns`）と手順14 が共有する。
+
+    `learning.stop_approach_g_levels` の G ごとに `stop_approach_counts` 本。上りは
+    `stop_approach_accel_g`、下りは G、上端は `ramp_planner.stop_approach_top_kmh`、保持は
+    `stop_approach_hold_s`。停止前の戻し・下りの戻し・dither・途中の保持には入らない
+    （`GRampPattern.stop_approach`）。`stop_approach_enabled` は見ない（呼ぶ側が決める）。
+    """
+    lr = cfg.learning
+    out: list[GRampPattern] = []
+    for g, n in zip(lr.stop_approach_g_levels, lr.stop_approach_counts, strict=True):
+        top = stop_approach_top_kmh(
+            g, release_start_kmh=lr.stop_release_start_kmh, turn_s=lr.ramp_turn_time_s,
+            settle_s=lr.stop_approach_settle_s,
+        )
+        out.extend(
+            GRampPattern(
+                kind=PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0,
+                hold_duration_s=0.0, target_g=g, top_kmh=top,
+                accel_g=lr.stop_approach_accel_g, stop_approach=True,
+                hold_s=lr.stop_approach_hold_s,
+            )
+            for _ in range(n)
+        )
+    return out
+
+
 def build_patterns(
     cfg: ResearchConfig, profile: VehicleProfile, ramp_order: Sequence[tuple[Any, ...]],
     *, with_lag: bool = False,
@@ -544,7 +589,9 @@ def build_patterns(
             )
             for v in lr.ramp_lag_speeds_kmh
         ]
-    return [*coast_downs, *ramps]
+    # 2026-10-31 段2: 停止の手前の測定はパターン列の先頭（コーストダウンより前）
+    approach = stop_approach_patterns(cfg) if cfg.learning.stop_approach_enabled else []
+    return [*approach, *coast_downs, *ramps]
 
 
 def _dither_onsets_from_model(cfg: ResearchConfig) -> tuple[float | None, float | None]:
@@ -612,6 +659,7 @@ def loop_config_from_config(
         ramp_g_levels=tuple(lr.ramp_g_levels),
         ramp_hold_time_s=lr.ramp_hold_time_s,
         ramp_dev_deadband_kmh=lr.ramp_dev_deadband_kmh,
+        ramp_gprop_without_sensitivity=lr.ramp_gprop_without_sensitivity,
         ramp_actuator_lag_tol_pct=lr.ramp_actuator_lag_tol_pct,
         # 2026-10-13 段2o-2: いちばん弱い段の途中の定速保持
         ramp_cruise_band_g=lr.ramp_cruise_band_g,
@@ -1155,6 +1203,251 @@ def _build_table_model(
     return _BuiltModel(model_path=str(path), metrics={})
 
 
+@dataclass(frozen=True)
+class _StopParts:
+    """停止側の行の材料（`_collect_stop_rows` の結果。2026-10-31 段2 で切り出し）。"""
+
+    rows: Any  # 停止側の行（stop）
+    brake_step: Any
+    brake_search: Any
+    near_stop: Any  # pattern の行のうち停車の手前の行の真偽値
+    press_stair: Any
+
+
+def _side_table_reader(
+    csv_path: Path, st: Any, *, side_table_opening_source: str, side_table_accel_window_s: float
+) -> Callable[..., Any]:
+    """発進側・停止側の表の行を CSV から読む関数 read(sections, phases=None) を返す
+    （開度の元・窓・ずれ許容なし・停車の行を残す。2026-10-31 段2 で `_attach_low_speed_tables`
+    から切り出した。読み方は変えていない）。"""
+    from tests.research import fwd_tool  # noqa: PLC0415
+
+    def read(sections: Sequence[str], phases: Sequence[str] | None = None) -> Any:
+        extra: dict[str, Any] = {} if phases is None else {"phases": tuple(phases)}
+        (rows,) = fwd_tool.read_logs(
+            [csv_path], st, opening_source=side_table_opening_source, actuator_lag_tol_pct=None,
+            keep_stopped=True, accel_window_s=side_table_accel_window_s, sections=tuple(sections),
+            **extra,
+        )
+        return rows
+
+    return read
+
+
+def _collect_stop_rows(read: Callable[..., Any], pattern: Any, lm: Any, creep: Any) -> _StopParts:
+    """停止側の行（BRAKE_STEP・BRAKE_SEARCH・pattern の停車の手前の行・CREEP_WAIT の u = 0 の行・
+    低速の踏む向きの階段）を集めて連結する。2026-10-31 段2（ProblemReport_20261031_停止間際 B）で
+    `_attach_low_speed_tables` から切り出した（計算は同じ）。pattern・lm（発進の区間）・creep は
+    呼ぶ側が読んだもの。"""
+    from tests.research.fwd_cv import stop_approach_mask  # noqa: PLC0415
+    from tests.research.fwd_data import (  # noqa: PLC0415
+        PHASE_BRAKE_SEARCH,
+        PHASE_BRAKE_STEP,
+        PHASE_LOW_PRESS_STAIR,
+        STOP_SPEED_KMH,
+        concat_rows,
+        stop_approach_rows,
+        take_rows,
+    )
+
+    brake_step = read((SECTION_PRE_DRIVE_CHECK,), (PHASE_BRAKE_STEP,))
+    brake_search = read((SECTION_PEDAL_SEARCH,), (PHASE_BRAKE_SEARCH,))
+    near_stop = (
+        (stop_approach_rows(pattern) | stop_approach_mask(pattern.speed_kmh, pattern.u_pct))
+        & ~lm & (pattern.speed_kmh >= STOP_SPEED_KMH)
+    )
+    creep_zero = take_rows(
+        creep, (creep.speed_kmh >= STOP_SPEED_KMH) & (np.abs(creep.u_pct) < 1e-9)
+    )
+    # 2026-10-28 段3: 低速の階段。踏む向きの行（停車を含む）は停止側の行。階段の phase が無い CSV
+    # （古い CSV）は行が 0 で、今までと同じ
+    press_stair = read((SECTION_PEDAL_SEARCH,), (PHASE_LOW_PRESS_STAIR,))
+    stop_parts = [brake_step, brake_search, take_rows(pattern, near_stop), creep_zero]
+    if len(press_stair.speed_kmh) > 0:
+        stop_parts.append(press_stair)
+    return _StopParts(
+        rows=concat_rows(stop_parts, "stop"), brake_step=brake_step, brake_search=brake_search,
+        near_stop=near_stop, press_stair=press_stair,
+    )
+
+
+def stop_rows_from_csv(
+    csv_path: Path, st: Any, *, side_table_opening_source: str = "actual",
+    side_table_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+) -> Any:
+    """CSV 1 本から停止側の表の材料（停止側の行 FwdRows）を作る（2026-10-31 段2）。
+    `_attach_low_speed_tables` の停止側と同じ集め方（手順14 が今回の CSV にも使う）。"""
+    from tests.research.fwd_data import (  # noqa: PLC0415
+        PHASE_CREEP_WAIT,
+        launch_mask,
+    )
+
+    read = _side_table_reader(
+        csv_path, st, side_table_opening_source=side_table_opening_source,
+        side_table_accel_window_s=side_table_accel_window_s,
+    )
+    pattern = read((SECTION_PATTERN_DRIVE,))
+    lm = launch_mask(pattern)
+    creep = read((SECTION_PEDAL_SEARCH,), (PHASE_CREEP_WAIT,))
+    return _collect_stop_rows(read, pattern, lm, creep).rows
+
+
+def rebuild_stop_side(
+    table: Any, *, source_csvs: Sequence[Path], new_csv: Path, creep_speed_kmh: float,
+    default_opening_source: str = "actual", default_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+    sub_min_weight: bool = False,
+) -> Any:
+    """今の表（pkl）の停止側だけを「作ったときの CSV の停止側の行 ＋ new_csv の停止側の行」で
+    作り直した新しい表を返す（2026-10-31 段2。手順14。ProblemReport_20261031_停止間際 B）。
+
+    停止側の行は `stop_rows_from_csv`（`_attach_low_speed_tables` と同じ集め方）を各 CSV に掛けて
+    連結し、`attach_stop` に渡す（引数も `_attach_low_speed_tables` と同じ。窓と開度の元は表の meta
+    の `stop_accel_window_s`・`side_table_opening_source`、読めなければ default_*）。遅れ L・
+    min（u の原点）・開度の元は表の meta に合わせる（`fwd_tool.settings_of_table`）。
+    他の表・meta はそのまま（attach_stop が更新する stop_* の meta だけ変わる）。meta
+    `stop_approach_csv` に new_csv の名前を残す。
+    sub_min_weight（2026-10-31 段2d 案1。learning.stop_table_sub_min_weight）: True で、停止側の
+    しきい値に届かないマスも重みで使う（`attach_stop`）。
+
+    後段で停止側に依存する処理は、`launch_rows_to_stop_max`（発進側を停止側の車速の行まで広げる）と
+    `side_row_speed_rep == "data"`（行の代表車速を学習データの中央値にする）だけ。どちらかが
+    有効な表は、これだけを掛け直しても元の作り方と同じにならないので ValueError にする
+    （停止側の戻しの層は停止側の行を使わないので掛け直し不要）。
+    """
+    from tests.research import fwd_tool  # noqa: PLC0415
+    from tests.research.fwd_data import concat_rows  # noqa: PLC0415
+    from tests.research.fwd_map import attach_stop  # noqa: PLC0415
+    from tests.research.fwd_tool import DeadbandLag  # noqa: PLC0415
+
+    meta = table.meta
+    if meta.get("launch_rows_to_stop_max") or meta.get("side_row_speed_rep") == "data":
+        raise ValueError(
+            "この表は launch_rows_to_stop_max か side_row_speed_rep: data で作られていて、"
+            "停止側だけの作り直しでは元と同じにならない"
+        )
+    base = DeadbandLag(
+        float(meta.get("accel_deadband_pct", 0.0)), float(meta.get("brake_deadband_pct", 0.0))
+    )
+    st = fwd_tool.settings_of_table(table, base)
+    opening_source = str(meta.get("side_table_opening_source", default_opening_source))
+    window = meta.get("stop_accel_window_s")
+    if window is None or not math.isfinite(float(window)):
+        window = default_accel_window_s
+    parts = [
+        stop_rows_from_csv(
+            Path(p), st, side_table_opening_source=opening_source,
+            side_table_accel_window_s=float(window),
+        )
+        for p in [*source_csvs, new_csv]
+    ]
+    rows = concat_rows(parts, "stop")
+    out = attach_stop(
+        table, rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=float(window),
+        sub_min_weight=sub_min_weight,
+    )
+    out.meta["stop_approach_csv"] = Path(new_csv).name
+    return out
+
+
+def _collect_launch_rows(read: Any, pattern: Any, lm: Any, creep: Any) -> Any:
+    """発進側の行（発進の区間・CREEP_WAIT・RAMP_LAUNCH_RELEASE の停車中の行）を連結して返す
+    （2026-10-31 段4b。`_attach_low_speed_tables` から切り出した。計算は同じ）。"""
+    from tests.research.fwd_data import (  # noqa: PLC0415
+        PHASE_RAMP_LAUNCH_RELEASE,
+        STOP_SPEED_KMH,
+        concat_rows,
+        take_rows,
+    )
+
+    release = read((SECTION_PATTERN_DRIVE,), (PHASE_RAMP_LAUNCH_RELEASE,))
+    release = take_rows(release, release.speed_kmh < STOP_SPEED_KMH)
+    return concat_rows([take_rows(pattern, lm), creep, release], "launch")
+
+
+def rebuild_launch_side(
+    table: Any, *, source_csvs: Sequence[Path], creep_speed_kmh: float,
+    sub_min_weight: bool = False,
+    default_opening_source: str = "actual", default_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+) -> Any:
+    """今の表（pkl）の発進側だけを、source_csvs（1 本）の発進側の行で作り直した新しい表を返す
+    （2026-10-31 段4b。ProblemReport_20261031_停止間際 案1・ユーザー決定。`rebuild_stop_side` の
+    発進側版）。
+
+    行の集め方は `_collect_launch_rows`、動き出す開度は `launch_breakaway`
+    （`_attach_low_speed_tables` と同じ。車速のしきい値は表の meta `launch_breakaway_move_kmh`）。
+    `attach_launch` のあと、元の
+    作り方と同じ順で `extend_launch_rows_to_stop_max`（meta `launch_rows_to_stop_max`）・
+    `apply_launch_accel_measured`（meta `launch_accel_side_source` が measured）を掛け直す。
+    窓と開度の元は表の meta、読めなければ default_*。遅れ L・min は表の meta に合わせる
+    （`fwd_tool.settings_of_table`）。他の表・meta はそのまま。
+    sub_min_weight: True で、しきい値に届かないマスも重みで使う（`attach_launch`・
+    `apply_launch_accel_measured`）。
+
+    動き出す開度と測り直しは CSV 1 本ごとに求めるので source_csvs は 1 本だけ。
+    `side_row_speed_rep == "data"`（停止側の行も要る）の表、発進側の窓などが meta に無くて元と同じ
+    にならない表は ValueError。
+    """
+    from tests.research import fwd_tool  # noqa: PLC0415
+    from tests.research.fwd_data import (  # noqa: PLC0415
+        PHASE_CREEP_WAIT,
+        STOP_SPEED_KMH,
+        launch_breakaway,
+        launch_mask,
+    )
+    from tests.research.fwd_map import (  # noqa: PLC0415
+        apply_launch_accel_measured,
+        attach_launch,
+        extend_launch_rows_to_stop_max,
+    )
+    from tests.research.fwd_tool import DeadbandLag  # noqa: PLC0415
+
+    meta = table.meta
+    if len(source_csvs) != 1:
+        raise ValueError("発進側の作り直しは CSV 1 本だけ（動き出す開度と測り直しが CSV 単位）")
+    if meta.get("side_row_speed_rep") == "data":
+        raise ValueError(
+            "この表は side_row_speed_rep: data で作られていて、発進側だけの作り直しでは元と同じに"
+            "ならない"
+        )
+    csv_path = Path(source_csvs[0])
+    base = DeadbandLag(
+        float(meta.get("accel_deadband_pct", 0.0)), float(meta.get("brake_deadband_pct", 0.0))
+    )
+    st = fwd_tool.settings_of_table(table, base)
+    opening_source = str(meta.get("side_table_opening_source", default_opening_source))
+    window = meta.get("side_table_accel_window_s")
+    if window is None or not math.isfinite(float(window)):
+        window = default_accel_window_s
+    window = float(window)
+    read = _side_table_reader(
+        csv_path, st, side_table_opening_source=opening_source,
+        side_table_accel_window_s=window,
+    )
+    pattern = read((SECTION_PATTERN_DRIVE,))
+    lm = launch_mask(pattern)
+    creep = read((SECTION_PEDAL_SEARCH,), (PHASE_CREEP_WAIT,))
+    launch_rows = _collect_launch_rows(read, pattern, lm, creep)
+    min_speed = float(meta.get("launch_breakaway_move_kmh", STOP_SPEED_KMH))
+    breakaway = launch_breakaway(
+        csv_path, brake_min_pct=st.brake_deadband_pct, brake_lag_s=st.brake_lag_s,
+        min_speed_kmh=min_speed, opening_source=opening_source,
+    )
+    out = attach_launch(
+        table, launch_rows, creep_speed_kmh=creep_speed_kmh, breakaway=breakaway,
+        accel_window_s=window, sub_min_weight=sub_min_weight,
+    )
+    out.meta["launch_breakaway_move_kmh"] = float(min_speed)
+    if meta.get("launch_rows_to_stop_max"):
+        out = extend_launch_rows_to_stop_max(out)
+    else:
+        out.meta["launch_rows_to_stop_max"] = False
+    if meta.get("launch_accel_side_source") == "measured":
+        out = apply_launch_accel_measured(out, pattern, sub_min_weight=sub_min_weight)
+    else:
+        out.meta["launch_accel_side_source"] = "extrapolate"
+    return out
+
+
 def _attach_low_speed_tables(
     table: Any,
     csv_path: Path,
@@ -1169,6 +1462,8 @@ def _attach_low_speed_tables(
     side_table_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
     launch_rows_to_stop_max: bool = False,
     side_row_speed_rep: str = "grid",
+    stop_table_sub_min_weight: bool = False,
+    launch_table_sub_min_weight: bool = False,
 ) -> Any:
     """C8 の表に、発進側（launch_accel）と停止側（stop_accel）を付けて返す（2026-10-18 段2o-10）。
 
@@ -1201,20 +1496,13 @@ def _attach_low_speed_tables(
     "grid"）が "data" なら、発進側・停止側の置き換えた行の代表車速を学習データの車速の中央値にする
     （`fwd_map.apply_side_row_speed_rep`。最後に行う）。どちらも既定は今と同じ。
     """
-    from tests.research import fwd_tool  # noqa: PLC0415
-    from tests.research.fwd_cv import stop_approach_mask  # noqa: PLC0415
     from tests.research.fwd_data import (  # noqa: PLC0415
-        PHASE_BRAKE_SEARCH,
-        PHASE_BRAKE_STEP,
         PHASE_CREEP_WAIT,
-        PHASE_LOW_PRESS_STAIR,
         PHASE_LOW_RELEASE_STAIR,
-        PHASE_RAMP_LAUNCH_RELEASE,
         STOP_SPEED_KMH,
         concat_rows,
         launch_breakaway,
         launch_mask,
-        stop_approach_rows,
         take_rows,
     )
     from tests.research.fwd_map import (  # noqa: PLC0415
@@ -1226,40 +1514,23 @@ def _attach_low_speed_tables(
         extend_launch_rows_to_stop_max,
     )
 
-    def read(sections: Sequence[str], phases: Sequence[str] | None = None) -> Any:
-        extra: dict[str, Any] = {} if phases is None else {"phases": tuple(phases)}
-        (rows,) = fwd_tool.read_logs(
-            [csv_path], st, opening_source=side_table_opening_source, actuator_lag_tol_pct=None,
-            keep_stopped=True, accel_window_s=side_table_accel_window_s, sections=tuple(sections),
-            **extra,
-        )
-        return rows
+    read = _side_table_reader(
+        csv_path, st, side_table_opening_source=side_table_opening_source,
+        side_table_accel_window_s=side_table_accel_window_s,
+    )
 
     pattern = read((SECTION_PATTERN_DRIVE,))
     lm = launch_mask(pattern)
     creep = read((SECTION_PEDAL_SEARCH,), (PHASE_CREEP_WAIT,))
-    release = read((SECTION_PATTERN_DRIVE,), (PHASE_RAMP_LAUNCH_RELEASE,))
-    release = take_rows(release, release.speed_kmh < STOP_SPEED_KMH)
-    launch_rows = concat_rows([take_rows(pattern, lm), creep, release], "launch")
+    # 発進側の行の集め方は `_collect_launch_rows`（`rebuild_launch_side` と共有）
+    launch_rows = _collect_launch_rows(read, pattern, lm, creep)
 
-    brake_step = read((SECTION_PRE_DRIVE_CHECK,), (PHASE_BRAKE_STEP,))
-    brake_search = read((SECTION_PEDAL_SEARCH,), (PHASE_BRAKE_SEARCH,))
-    near_stop = (
-        (stop_approach_rows(pattern) | stop_approach_mask(pattern.speed_kmh, pattern.u_pct))
-        & ~lm & (pattern.speed_kmh >= STOP_SPEED_KMH)
-    )
-    creep_zero = take_rows(
-        creep, (creep.speed_kmh >= STOP_SPEED_KMH) & (np.abs(creep.u_pct) < 1e-9)
-    )
-    # 2026-10-28 段3: 低速の階段。踏む向きの行（停車を含む）は停止側の行、離す向きの動いている行は
-    # 停止側の戻しの層の行（離す向き）。階段の phase が無い CSV（古い CSV）は行が 0 で、今までと同じ
-    press_stair = read((SECTION_PEDAL_SEARCH,), (PHASE_LOW_PRESS_STAIR,))
+    # 停止側の行の集め方は `stop_rows_from_csv`（手順14 が別の CSV にも掛ける）と共有する
+    stop = _collect_stop_rows(read, pattern, lm, creep)
+    brake_step, brake_search = stop.brake_step, stop.brake_search
+    near_stop, press_stair, stop_rows = stop.near_stop, stop.press_stair, stop.rows
     release_stair = read((SECTION_PEDAL_SEARCH,), (PHASE_LOW_RELEASE_STAIR,))
     release_stair = take_rows(release_stair, release_stair.speed_kmh >= STOP_SPEED_KMH)
-    stop_parts = [brake_step, brake_search, take_rows(pattern, near_stop), creep_zero]
-    if len(press_stair.speed_kmh) > 0:
-        stop_parts.append(press_stair)
-    stop_rows = concat_rows(stop_parts, "stop")
 
     min_speed = STOP_SPEED_KMH if creep_launch_min_speed_kmh is None else creep_launch_min_speed_kmh
     # 段7-a: 動き出す開度だけ別のしきい値で測れる（None なら上の min_speed。比較は >=）
@@ -1272,17 +1543,21 @@ def _attach_low_speed_tables(
     table = attach_launch(
         table, launch_rows, creep_speed_kmh=creep_speed_kmh, breakaway=breakaway,
         accel_window_s=side_table_accel_window_s,
+        sub_min_weight=launch_table_sub_min_weight,  # 2026-10-31 段4b 案1
     )
     table.meta["launch_breakaway_move_kmh"] = float(min_speed)
     table = attach_stop(
-        table, stop_rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=side_table_accel_window_s
+        table, stop_rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=side_table_accel_window_s,
+        sub_min_weight=stop_table_sub_min_weight,  # 2026-10-31 段2d 案1
     )
     if launch_rows_to_stop_max:
         table = extend_launch_rows_to_stop_max(table)
     else:
         table.meta["launch_rows_to_stop_max"] = False
     if launch_accel_side_source == "measured":
-        table = apply_launch_accel_measured(table, pattern)
+        table = apply_launch_accel_measured(
+            table, pattern, sub_min_weight=launch_table_sub_min_weight,
+        )
     else:
         table.meta["launch_accel_side_source"] = "extrapolate"
     if stop_release_layer_enabled:
@@ -1378,6 +1653,8 @@ def _build_forward_model(
     accel_push_input_enabled: bool = False,
     stop_approach_exclusion: str = "depth",
     local_gain_brake_speeds_kmh: Sequence[float] | None = None,
+    stop_table_sub_min_weight: bool = False,
+    launch_table_sub_min_weight: bool = False,
 ) -> _BuiltModel:
     """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
 
@@ -1449,6 +1726,8 @@ def _build_forward_model(
         side_table_accel_window_s=side_table_accel_window_s,
         launch_rows_to_stop_max=launch_rows_to_stop_max,
         side_row_speed_rep=side_row_speed_rep,
+        stop_table_sub_min_weight=stop_table_sub_min_weight,
+        launch_table_sub_min_weight=launch_table_sub_min_weight,
     )
     # 2026-10-14 段2o-5: 戻しの表は build_final_table が付ける（final_config の既定で作る）
     rel_s = float(table.meta.get("release_rows_s", 0.0))
@@ -1759,6 +2038,8 @@ def build_ff_model(
             side_row_speed_rep=cfg.learning.side_row_speed_rep,
             stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
             local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
+            stop_table_sub_min_weight=cfg.learning.stop_table_sub_min_weight,
+            launch_table_sub_min_weight=cfg.learning.launch_table_sub_min_weight,
         )
     else:
         built = _build_poly_model(
@@ -1837,6 +2118,8 @@ def build_ff_model(
             side_row_speed_rep=cfg.learning.side_row_speed_rep,
             stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
             local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
+            stop_table_sub_min_weight=cfg.learning.stop_table_sub_min_weight,
+            launch_table_sub_min_weight=cfg.learning.launch_table_sub_min_weight,
         )
         checks = run_checks_now()
     if candidate in _FORWARD_CANDIDATES:

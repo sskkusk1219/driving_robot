@@ -21,6 +21,7 @@ from tests.research.fwd_plan import (
     SIDE_RELEASE,
     SIDE_STOP,
     SIDE_STOP_RELEASE,
+    STOP_SPEED_KMH,
     ForwardPlan,
     build_plan,
     coast_assist_effort,
@@ -3387,3 +3388,43 @@ def test_fill_short_coasts_skips_stop_edges_and_no_pedal() -> None:
     assert (runs, rows) == (1, 2)
     assert flag.tolist() == [M, FLAG_COAST_FILL, FLAG_COAST_FILL, M]
     assert effort[1] == pytest.approx(AD + 1.0)
+
+
+def _decel_then_ease_stopping(t: float) -> float:
+    """減速して 0.9 s で緩め（_decel_then_ease と同じ形）、3.5〜4.0 s で 0 へ向かい停車する基準。"""
+    base = _decel_then_ease(t)
+    if t <= 3.0:
+        return base
+    return max(0.0, base * (1.0 - (t - 3.0) / 0.8))
+
+
+def test_stop_approach_lead_zero_is_identical_and_positive_keeps_stop_table() -> None:
+    """2026-10-31 段1: lead=0 は今と同じ。lead>0 は停車へ向かう低速の行を戻しの表で解き直さない。"""
+    tb, _ = _release_low_table()
+    kw = dict(low_speed_side_rule="dir")
+    ref = _decel_then_ease_stopping
+    base = plan_for(ref, 5.0, tb, **kw)
+    zero = plan_for(ref, 5.0, tb, stop_approach_lead_s=0.0, **kw)
+    assert np.array_equal(base.effort_pct, zero.effort_pct)
+    assert np.array_equal(base.flag, zero.flag)
+    assert np.array_equal(base.side_brake, zero.side_brake)
+
+    lead = 1.5
+    on = plan_for(ref, 5.0, tb, stop_approach_lead_s=lead, **kw)
+    t = on.t_s
+    v = np.array([ref(float(x)) for x in t])
+    # 停車へ向かう低速の行 ＝ 低速で、t〜t+lead のどこかで基準が停車速度以下
+    probe = np.arange(0.0, lead + 1e-9, on.period_s)
+    near = np.array([any(ref(float(x + d)) <= STOP_SPEED_KMH for d in probe) for x in t])
+    approach = (v < 7.5) & near
+    brake = (on.flag != FLAG_STOP) & (on.effort_pct < 0.0)
+    # 比較用: 今は戻しの表で解き直された行が、停車へ向かう行に含まれていること（テストの前提）
+    assert np.any(approach & brake & (base.side_brake == SIDE_RELEASE))
+    # 停車へ向かう行は SIDE_STOP のまま（released が False）
+    rows = np.flatnonzero(approach & brake)
+    assert np.all(on.side_brake[rows] == SIDE_STOP)
+    assert not np.any(on.side_brake[approach] == SIDE_RELEASE)
+    # 停車から遠い行は今と同じ
+    far = np.flatnonzero(~approach)
+    assert np.array_equal(on.effort_pct[far], base.effort_pct[far])
+    assert np.array_equal(on.side_brake[far], base.side_brake[far])

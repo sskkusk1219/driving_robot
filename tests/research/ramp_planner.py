@@ -274,6 +274,57 @@ def estimate_s(g: float, top_kmh: float, *, hold_s: float = 0.0, turn_s: float =
     return 2.0 * top_kmh / (g * G_TO_KMHS) + RAMP_OVERHEAD_S + hold_s + 2.0 * turn_s
 
 
+def stop_approach_top_kmh(
+    g: float, *, release_start_kmh: float, turn_s: float, settle_s: float
+) -> float:
+    """停止の手前の測定（一定 G で停車まで下りる G ランプ）の上端の車速 [km/h]
+    （2026-10-31 段2。ProblemReport_20261031_停止間際 B）。
+
+    ceil((release_start_kmh ＋ G × G_TO_KMHS × (turn_s ÷ 2 ＋ settle_s)) ÷ 5) × 5。
+    下りの頭で 0 → −G に切り替える間（turn_s ÷ 2 ぶん）とブレーキの遅れ・立ち上がり（settle_s）に
+    車が進むぶんを見込み、停止前の戻しの開始車速（7.5 km/h。この測定では戻さないが比べる目安）を
+    切る前に一定 G へ着かせる。5 km/h 刻みに切り上げる。
+    """
+    raw = release_start_kmh + g * G_TO_KMHS * (turn_s / 2.0 + settle_s)
+    return float(math.ceil(raw / 5.0 - 1e-9) * 5)
+
+
+def stop_approach_est_s(
+    g: float, accel_g: float, top_kmh: float, *, hold_s: float, turn_s: float
+) -> float:
+    """停止の手前の測定 1 本の見込み秒数: 上り top ÷ (accel_g × G_TO_KMHS) ＋ 下り
+    top ÷ (g × G_TO_KMHS) ＋ つなぎ ＋ 保持 ＋ 切り替え 2 回（2026-10-31 段2）。"""
+    return (
+        top_kmh / (accel_g * G_TO_KMHS) + top_kmh / (g * G_TO_KMHS)
+        + RAMP_OVERHEAD_S + hold_s + 2.0 * turn_s
+    )
+
+
+def format_stop_approach(cfg: Any) -> str:
+    """停止の手前の測定（learning.stop_approach_*）の別行の説明。無効なら空文字。"""
+    lr = cfg.learning
+    if not lr.stop_approach_enabled:
+        return ""
+    lines = [
+        "停止の手前の測定（一定 G で停車まで。パターン列の先頭。"
+        f"上りは {lr.stop_approach_accel_g:g}G・上端で {lr.stop_approach_hold_s:g} 秒保持）:"
+    ]
+    total = 0.0
+    for g, n in zip(lr.stop_approach_g_levels, lr.stop_approach_counts, strict=True):
+        top = stop_approach_top_kmh(
+            g, release_start_kmh=lr.stop_release_start_kmh, turn_s=lr.ramp_turn_time_s,
+            settle_s=lr.stop_approach_settle_s,
+        )
+        est = stop_approach_est_s(
+            g, lr.stop_approach_accel_g, top, hold_s=lr.stop_approach_hold_s,
+            turn_s=lr.ramp_turn_time_s,
+        )
+        total += est * n
+        lines.append(f"  下り {g:g}G × {n} 本: 上端 {top:g} km/h、1 本の見込み {est:.0f} 秒")
+    lines.append(f"  見込みの合計 {total:.0f} 秒（{total / 60.0:.1f} 分。上の段の表には含まない）")
+    return "\n".join(lines)
+
+
 def _band_station_kmh(k: int, width: float, fine_max_kmh: float, coarse_step_kmh: float) -> float:
     """車速帯の番号 k → 保持する車速 [km/h]（2026-10-14 段2o-4 で共通化）。
 

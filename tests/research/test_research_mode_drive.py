@@ -2095,3 +2095,104 @@ def test_new_fb_features_default_off_and_run_defaults_are_identity() -> None:
     cfg.forward_map.stop_end_brake_monotone = True
     cfg.forward_map.launch_midway_fb_no_deeper = True
     assert cfgmod.validate_config(cfg) == []
+
+
+# ─── 停C の先読みの偏差（2026-10-31 段3 ProblemReport_20261031_停止間際 FB） ─────────
+
+
+class _LinearRef:
+    """時刻 t の基準 ＝ 30 − 3 × (t − 12)（減速区間 12〜16 s の途中、傾き −3）。"""
+
+    def at(self, t: float) -> float:
+        return 30.0 - 3.0 * (t - 12.0)
+
+
+async def _stop_pred_run(
+    cfg: cfgmod.ResearchConfig, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> mdmod._ModeRun:
+    cfg.forward_map.stop_end_accel_pred_enabled = enabled
+    cfg.forward_map.hold_pi_enabled = False  # この試験は保持の場面を使わない
+    cfg.forward_map.hold_accel_pred_enabled = False
+    run = await _c10_run_obj(cfg, monkeypatch)
+    run.ff.table.meta["stop_max_speed_kmh"] = 40.0
+    mode = _mode(_C10_MODE_POINTS)
+    run.ff.set_stop_end(lead_enabled=True, p_enabled=True, lead_s=5.0)
+    run.stop_end = mdmod.make_stop_end(run.ff, cfg, mode)
+    run.c10 = mdmod.C10Stats(period_s=0.05)
+    run.ref = run.ref_t = _LinearRef()
+    run._stop_end_tau_s = None
+    run._stop_pred_dev = None
+    run._stop_pred_tp_s = mdmod.stop_end_pred_tp_s(cfg, run.ff) if enabled else None
+    run._stop_speed_win = mdmod.deque()
+    return run
+
+
+def _feed_window(run: mdmod._ModeRun, t_end: float, accel: float, speed_end: float) -> None:
+    """窓へ、t_end までの 0.05 s 刻みの車速（傾き accel）を入れる（本物の周期の更新と同じ作り）。"""
+    w = run.cfg.decel_stop.slope_window_s
+    n = int(round(w / 0.05))
+    for k in range(n, -1, -1):
+        tk = t_end - 0.05 * k
+        run._stop_speed_win.append((tk, speed_end - accel * 0.05 * k, run.ref_t.at(tk)))
+
+
+async def test_stop_end_pred_tp_is_brake_lag_plus_half_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _c10_cfg(tmp_path, candidate="C15")
+    run = await _stop_pred_run(cfg, monkeypatch, True)
+    assert mdmod.stop_end_pred_tp_s(cfg, run.ff) == pytest.approx(
+        0.05 + cfg.decel_stop.slope_window_s / 2.0
+    )
+    cfg.forward_map.brake_lag_s = 0.2  # yaml の上書きが優先
+    assert mdmod.stop_end_pred_tp_s(cfg, run.ff) == pytest.approx(
+        0.2 + cfg.decel_stop.slope_window_s / 2.0
+    )
+
+
+async def test_stop_end_pred_on_changes_only_inside_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _c10_cfg(tmp_path, candidate="C15")
+    off = await _stop_pred_run(cfg, monkeypatch, False)
+    on = await _stop_pred_run(cfg, monkeypatch, True)
+    t_in, t_out = 14.0, 8.0  # 14 s: 基準 24 で 5 s 以内に 0 になる / 8 s: 5 s 以内に 0 にならない
+    eb = float(off.ff.plan.effort_pct[off.ff.plan.index_at(t_in)])
+    assert eb < 0.0
+    speed = 22.0
+    # (a) off: 窓があっても今の偏差のまま（_stop_pred_dev は None）
+    _feed_window(off, t_in, -3.0, speed)
+    d_off = off._c10_offset(t_in, off.ref.at(t_in), speed, eb)  # noqa: SLF001
+    assert off._stop_pred_dev is None  # noqa: SLF001
+    # (b) on・加速度が基準どおり（−3）: 先読みの偏差 ＝ 今の偏差 ＝ 同じ指令
+    _feed_window(on, t_in, -3.0, speed)
+    d_on = on._c10_offset(t_in, on.ref.at(t_in), speed, eb)  # noqa: SLF001
+    tp = on._stop_pred_tp_s  # noqa: SLF001
+    assert tp is not None and on._stop_end_tau_s is not None  # noqa: SLF001
+    assert on._stop_pred_dev == pytest.approx(on.ref.at(t_in) - speed)  # noqa: SLF001
+    assert d_on == pytest.approx(d_off)
+    # 実測の加速度が基準より急（−4）なら、先読みの偏差は今の偏差より小さい（速すぎ→深く）
+    on2 = await _stop_pred_run(cfg, monkeypatch, True)
+    _feed_window(on2, t_in, -4.0, speed)
+    on2._c10_offset(t_in, on2.ref.at(t_in), speed, eb)  # noqa: SLF001
+    assert on2._stop_pred_dev == pytest.approx(  # noqa: SLF001
+        on2.ref.at(t_in) - speed + tp  # 基準 −3・実測 −4: 遅すぎ側（正）
+    )
+    # 2026-10-31 段3d: 予測車速が 0 以下になる入力（0.1 + (-3)*tp < 0）は先読みせず
+    # 今の偏差（基準 ref_t(t) − 車速）
+    on4 = await _stop_pred_run(cfg, monkeypatch, True)
+    _feed_window(on4, t_in, -3.0, 0.1)
+    on4._c10_offset(t_in, on4.ref.at(t_in), 0.1, eb)  # noqa: SLF001
+    assert on4._stop_pred_dev == pytest.approx(on4.ref_t.at(t_in) - 0.1)  # noqa: SLF001
+    # 窓が 3 点未満なら今の偏差
+    on3 = await _stop_pred_run(cfg, monkeypatch, True)
+    on3._stop_speed_win.append((t_in, speed, on3.ref_t.at(t_in)))  # noqa: SLF001
+    assert on3._c10_offset(t_in, on3.ref.at(t_in), speed, eb) == pytest.approx(d_off)  # noqa: SLF001
+    assert on3._stop_pred_dev is None  # noqa: SLF001
+    # (c) 区間外（τ を引き直さない行）は今のまま・先読みを使わない
+    eo = float(on.ff.plan.effort_pct[on.ff.plan.index_at(t_out)])
+    on4 = await _stop_pred_run(cfg, monkeypatch, True)
+    _feed_window(on4, t_out, -4.0, 30.0)
+    on4._c10_offset(t_out, on4.ref.at(t_out), 30.0, eo)  # noqa: SLF001
+    assert on4._stop_pred_dev is None  # noqa: SLF001
+    assert on4._stop_end_tau_s is None  # noqa: SLF001

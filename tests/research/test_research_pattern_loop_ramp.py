@@ -2516,6 +2516,47 @@ def test_one_sided_down_returns_toward_release_when_decel_exceeds_the_upper_edge
     assert loop._rp_u <= u1
 
 
+def _gprop_du(*, down: bool, enabled: bool, accel_g: float | None) -> tuple[float, float, float]:
+    """感度なしの 2 周期目の u の変化。(du, 期待する G 比例の du, 最小刻み) を返す。"""
+    loop, p = (_one_sided_down if down else _one_sided_up)(sens=None)
+    loop._config = dataclasses.replace(loop._config, ramp_gprop_without_sensitivity=enabled)
+    speed = 50.0
+    g_ref = loop._ramp_gref(p, 0.1)
+    kmhs = None if accel_g is None else accel_g * G_TO_KMHS
+    u0 = loop._rp_u
+    _ctl(loop, p, speed, 0.1, accel_kmhs=kmhs)
+    gain = loop._config.coast_accel_rate_gain
+    expect = 0.0 if accel_g is None else gain * (g_ref - accel_g) * 0.1
+    return loop._rp_u - u0, expect, _min_step(loop)
+
+
+def test_gprop_without_sensitivity_default_false_keeps_min_step() -> None:
+    """2026-10-31 段2b（D1）: 既定（false）は今までの最小刻み。"""
+    assert PatternLoopConfig().ramp_gprop_without_sensitivity is False
+    du, _, step = _gprop_du(down=False, enabled=False, accel_g=0.0)
+    assert abs(du) == pytest.approx(step)
+
+
+def test_gprop_without_sensitivity_up_moves_by_gain_times_g_error() -> None:
+    """true・効きの強さ無し・実測の G ありで、du ＝ gain ×（狙い − 実測）× dt（踏む向き）。"""
+    du, expect, step = _gprop_du(down=False, enabled=True, accel_g=0.0)
+    assert expect > 5 * step
+    assert du == pytest.approx(expect, rel=1e-6) and du > 0.0
+    # 実測が無い周期は最小刻み
+    du, _, step = _gprop_du(down=False, enabled=True, accel_g=None)
+    assert abs(du) == pytest.approx(step)
+
+
+def test_gprop_without_sensitivity_down_presses_brake_when_decel_is_short() -> None:
+    """RAMP_DOWN: g_ref が負で実測の減速が足りなければ u が減る（ブレーキを踏む）。
+    減速が狙いより強ければ（上端の内側でも）ブレーキを緩める向き。"""
+    du, expect, _ = _gprop_du(down=True, enabled=True, accel_g=0.0)
+    assert expect < 0.0 and du == pytest.approx(expect, rel=1e-6)
+    # 上端（0.0625G）を超える減速: 狙いとの差で緩める（u が増える）
+    du, _, _ = _gprop_du(down=True, enabled=True, accel_g=-0.1)
+    assert du == pytest.approx(100.0 * (0.1 - 0.045) * 0.1, rel=1e-6)
+
+
 def test_one_sided_return_without_sensitivity_uses_one_min_step() -> None:
     loop, p = _one_sided_up(sens=None)
     u0 = loop._rp_u
@@ -4053,3 +4094,178 @@ def test_dither_phases_are_part_of_the_ramp_phase_set() -> None:
     assert _Phase.RAMP_ACCEL_DITHER in plmod._RAMP_PHASES
     assert _Phase.RAMP_BRAKE_DITHER.name == "RAMP_BRAKE_DITHER"
     assert _Phase.RAMP_ACCEL_DITHER.name == "RAMP_ACCEL_DITHER"
+
+
+# ── 停止の手前の測定（GRampPattern.stop_approach。2026-10-31 段2）───────────
+
+
+def _approach_ramp(
+    g: float = 0.1, accel_g: float | None = 0.2, hold_s: float | None = 1.0, top_kmh: float = 40.0,
+    stop_approach: bool = True,
+) -> plmod.GRampPattern:
+    return plmod.GRampPattern(
+        PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0, hold_duration_s=0.0,
+        target_g=g, top_kmh=top_kmh, accel_g=accel_g, stop_approach=stop_approach, hold_s=hold_s,
+    )
+
+
+def test_stop_approach_defaults_keep_the_old_pattern() -> None:
+    p = _ramp(0.1)
+    assert p.accel_g is None and p.stop_approach is False and p.hold_s is None
+    assert p.up_g == 0.1
+    assert _approach_ramp().up_g == 0.2
+
+
+def test_stop_approach_does_not_enter_stop_release() -> None:
+    """停止前の戻しが有効でも stop_approach の本は入らない（RAMP_STOP_RELEASE なし・
+    回数も進まない）。同じ本でも stop_approach=False なら入る。"""
+    on = _approach_ramp(g=0.1, accel_g=None, hold_s=None)
+    off = _approach_ramp(g=0.1, accel_g=None, hold_s=None, stop_approach=False)
+    loop_on = _loop([on], config=_stop_config())
+    rows_on = _run_stop(loop_on, on, _StopKine(loop_on, 0.1))
+    assert not any(r[1] == "RAMP_STOP_RELEASE" for r in rows_on)
+    assert loop_on._rp_stop_release_n == 0
+    # 一定 G のまま停車まで（戻しの区間 RAMP_RELEASE も無い）
+    assert not any(r[1] == "RAMP_RELEASE" for r in rows_on)
+    assert len(loop_on.ramp_results) == 1
+    loop_off = _loop([off], config=_stop_config())
+    rows_off = _run_stop(loop_off, off, _StopKine(loop_off, 0.1))
+    assert any(r[1] == "RAMP_STOP_RELEASE" for r in rows_off)
+
+
+def test_stop_approach_does_not_enter_release_dither_or_cruise() -> None:
+    """下りの戻し・dither・途中の保持の点が渡されていても入らない。"""
+    p = dataclasses.replace(
+        _approach_ramp(g=0.1, accel_g=None, hold_s=None),
+        stations_kmh=(15.0,), release_stations=(25.0,),
+    )
+    cfg = _stop_config(
+        ramp_dither_enabled=True, ramp_dither_brake_onset_u_pct=1.0,
+        ramp_dither_brake_speeds_kmh=(30.0,), ramp_dither_max_g=1.0,
+        ramp_release_fracs=(0.5, 0.0), ramp_release_move_s=1.0, ramp_release_hold_s=(1.5, 2.0),
+        ramp_release_min_kmh=10.0,
+    )
+    loop = _loop([p], config=cfg)
+    rows = _run_stop(loop, p, _StopKine(loop, 0.1))
+    names = {r[1] for r in rows}
+    assert not names & {"RAMP_CRUISE", "RAMP_RELEASE", "RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER"}
+    assert "RAMP_STOP_RELEASE" not in names
+    # 同じ設定で stop_approach=False なら、戻し・保持のどれかには入る
+    q = dataclasses.replace(p, stop_approach=False)
+    loop2 = _loop([q], config=cfg)
+    names2 = {r[1] for r in _run_stop(loop2, q, _StopKine(loop2, 0.1))}
+    assert names2 & {"RAMP_CRUISE", "RAMP_RELEASE", "RAMP_BRAKE_DITHER", "RAMP_STOP_RELEASE"}
+
+
+def test_stop_approach_launch_does_not_release_slowly() -> None:
+    """発進のゆっくり離し ② も fast_rate（2 %/s）。slow_rates の通し番号は進めない。"""
+    p = _approach_ramp(g=0.1, accel_g=0.1, hold_s=None, top_kmh=200.0)
+    cfg = PatternLoopConfig(
+        ramp_launch_fast_rate_pctps=2.0, ramp_launch_release_margin_pct=2.0,
+        ramp_launch_slow_rates_pctps=(0.25, 0.5), stop_confirm_pct=5.0,
+        creep_launch_min_speed_kmh=1.0,
+    )
+    loop = _loop([p], config=cfg, launched=False)
+    assert loop._rp_lr_active
+    assert loop._rp_lr_slow == pytest.approx(2.0)
+    assert loop._rp_launch_seq == 0
+    # 通常の本は slow_rates を使う
+    normal = _loop([_ramp(0.1, top_kmh=200.0)], config=cfg, launched=False)
+    assert normal._rp_lr_slow == pytest.approx(0.25) and normal._rp_launch_seq == 1
+
+
+def test_stop_approach_up_uses_accel_g_and_down_uses_target_g() -> None:
+    p = _approach_ramp(g=0.05, accel_g=0.2)
+    loop = _loop([p])
+    loop._phase = _Phase.RAMP_UP
+    loop._rp_launch_started = None
+    assert loop._ramp_gref(p, 0.0) == pytest.approx(0.2)  # 動き出す前
+    assert loop._ramp_phase_g(p) == pytest.approx(0.2)
+    loop._rp_launch_started = 0.0  # 発進の立ち上げの後は accel_g
+    assert loop._ramp_gref(p, 100.0) == pytest.approx(0.2)
+    loop._phase = _Phase.RAMP_DOWN
+    loop._rp_turn_started = 0.0
+    loop._rp_turn_g0 = 0.0
+    loop._rp_vref = 50.0
+    assert loop._ramp_gref(p, 100.0) == pytest.approx(-0.05)
+    assert loop._ramp_phase_g(p) == pytest.approx(0.05)
+    # 発進の寄せの時間は上りの G から
+    cfg = dataclasses.replace(PatternLoopConfig(), ramp_launch_g_rate_gps=0.1)
+    loop2 = _loop([p], config=cfg)
+    base = _loop([_ramp(0.05)], config=cfg)
+    assert loop2._ramp_launch_blend_time_s(p) > base._ramp_launch_blend_time_s(_ramp(0.05))
+
+
+def test_stop_approach_accelerates_at_accel_g_and_holds_hold_s() -> None:
+    """上りは accel_g（g=0.05 でも 0.2G で上る）、保持は hold_s（ramp_hold_time_s ではない）。"""
+    fast = _approach_ramp(g=0.05, accel_g=0.2, hold_s=1.0, top_kmh=40.0)
+    slow = _approach_ramp(g=0.05, accel_g=None, hold_s=None, top_kmh=40.0, stop_approach=False)
+    cfg = PatternLoopConfig(ramp_hold_time_s=7.0)
+    la = _loop([fast], config=cfg)
+    ka = _Kine(la, 0.2)  # 上りは 0.2G
+    _run_kine(la, fast, ka, t_max=300.0)
+    lb = _loop([slow], config=cfg)
+    kb = _Kine(lb, 0.05)
+    _run_kine(lb, slow, kb, t_max=300.0)
+    ra, rb = la.ramp_results[0], lb.ramp_results[0]
+    # 保持（切り替え ramp_turn_time_s を含む）は hold_s の分だけ短い
+    assert rb.hold_s - ra.hold_s == pytest.approx(7.0 - 1.0, abs=0.3)
+    # 上りの所要は accel_g で短い（0.2G と 0.05G の差）
+    assert ra.up_s < rb.up_s * 0.6
+
+
+# ── 2026-10-31 段2c: stop_approach の下りは 7.5 km/h 未満で G 比例 ──────────
+
+
+def _approach_down(speed: float, *, stop_approach: bool = True, u: float = -5.0):
+    p = _approach_ramp(g=0.08, accel_g=None, hold_s=None, top_kmh=200.0,
+                       stop_approach=stop_approach)
+    loop = _loop([p], config=PatternLoopConfig(ramp_g_levels=LEVELS))
+    loop._enter_phase(_Phase.RAMP_DOWN, 0.0)
+    _seed_sensitivity(loop, PEDAL_BRAKE, 0.4, speed)
+    loop._rp_u = u
+    loop._rp_brake_latched = True
+    loop._rp_blend_decided = True
+    loop._rp_vref = speed + 3.0  # 基準は車より速い（PI なら緩める向きの偏差）
+    _ctl(loop, p, speed, 0.0)
+    loop._rp_e_prev = 0.0
+    return loop, p
+
+
+def test_stop_approach_below_release_start_uses_g_proportional_both_directions() -> None:
+    gain = PatternLoopConfig().coast_accel_rate_gain
+    for accel_g, sign in ((-0.02, -1.0), (-0.15, 1.0)):  # 減速不足→踏む / 強すぎ→戻す
+        loop, p = _approach_down(5.0)
+        g_ref = loop._ramp_gref(p, 0.1)
+        u0 = loop._rp_u
+        _ctl(loop, p, 5.0, 0.1, accel_kmhs=accel_g * G_TO_KMHS)
+        expect = gain * (g_ref - accel_g) * 0.1
+        assert loop._rp_u - u0 == pytest.approx(expect, rel=1e-6)
+        assert (loop._rp_u - u0) * sign > 0.0
+    # 実測の加速度が無い周期は動かさない
+    loop, p = _approach_down(5.0)
+    u0 = loop._rp_u
+    _ctl(loop, p, 5.0, 0.1, accel_kmhs=None)
+    assert loop._rp_u == u0
+
+
+def test_stop_approach_g_proportional_never_goes_to_accel_side() -> None:
+    loop, p = _approach_down(5.0, u=-0.01)
+    _ctl(loop, p, 5.0, 0.1, accel_kmhs=-0.5 * G_TO_KMHS)  # 強すぎ → 大きく戻す
+    assert loop._rp_u <= 0.0
+
+
+def test_stop_approach_at_or_above_release_start_keeps_pi_and_plain_ramp_unchanged() -> None:
+    gain = PatternLoopConfig().coast_accel_rate_gain
+    # 7.5 km/h 以上は今の PI（G 比例の式にならない）
+    loop, p = _approach_down(10.0)
+    g_ref = loop._ramp_gref(p, 0.1)
+    u0 = loop._rp_u
+    _ctl(loop, p, 10.0, 0.1, accel_kmhs=-0.02 * G_TO_KMHS)
+    assert loop._rp_u - u0 != pytest.approx(gain * (g_ref + 0.02) * 0.1, rel=1e-3)
+    # 普通の G ランプ（stop_approach=False）は 5 km/h でも PI のまま
+    loop, p = _approach_down(5.0, stop_approach=False)
+    g_ref = loop._ramp_gref(p, 0.1)
+    u0 = loop._rp_u
+    _ctl(loop, p, 5.0, 0.1, accel_kmhs=-0.02 * G_TO_KMHS)
+    assert loop._rp_u - u0 != pytest.approx(gain * (g_ref + 0.02) * 0.1, rel=1e-3)

@@ -548,6 +548,22 @@ class GRampPattern(LearningPattern):
     lag_step: bool = False
     # 2026-10-14 段2o-5: 下りで山からブレーキを離す「戻し」の車速 [km/h]（昇順。空なら従来どおり）
     release_stations: tuple[float, ...] = ()
+    # 2026-10-31 段2（ProblemReport_20261031_停止間際 B）: 停止の手前の測定。
+    # stop_approach=True の本は、上りを accel_g、下りを target_g の一定 G で走り、停止前の戻し・
+    # 下りの戻し・dither・途中の保持に入らず、停車（STOP_SPEED_KMH 以下）まで一定 G のまま下りる。
+    # 2026-10-31 段2c: 下りで実車速が stop_release_start_kmh 未満の間は、基準車速を追わず G 比例
+    # （coast_accel_rate_gain ×（目標 G − 今の G）× dt）で両方向に合わせる。
+    # RAMP_HOLD の保持は hold_s、発進のゆっくり離しの ② も fast_rate（ゆっくり離さない）。
+    # accel_g が None なら上りも target_g、hold_s が None なら ramp_hold_time_s
+    # （既定は今と同じ動き）
+    accel_g: float | None = None
+    stop_approach: bool = False
+    hold_s: float | None = None
+
+    @property
+    def up_g(self) -> float:
+        """上り（RAMP_UP・RAMP_HOLD の頭）の狙いの G。accel_g が None なら target_g。"""
+        return self.target_g if self.accel_g is None else self.accel_g
 
 
 @dataclass(frozen=True)
@@ -779,6 +795,11 @@ class PatternLoopConfig:
     ramp_hold_time_s: float = field(default=7.0)
     # 偏差の不感帯 [km/h]（仮の値。車速の細かい揺れで開度を動かさない）
     ramp_dev_deadband_kmh: float = field(default=0.5)
+    # 2026-10-31 段2b（ProblemReport_20261031_停止間際 D1）: ペダルの効きの強さが無い周期は、
+    # 最小刻みの代わりにコーストダウンの加速と同じ G 比例
+    # （coast_accel_rate_gain ×（狙い − 実測の G）× dt）で動かす
+    # （learning.ramp_gprop_without_sensitivity から渡す。根拠は yaml のコメント）
+    ramp_gprop_without_sensitivity: bool = field(default=False)
     # 指令と実開度のずれがこれを超え、さらに離れる向きに指令を動かす周期は基準を待たせる [%]
     # （仮の値。表の開度のマス幅 2%）
     ramp_actuator_lag_tol_pct: float = field(default=2.0)
@@ -1158,6 +1179,10 @@ class PatternLoop:
             self._phase_started_at = now
         if self._started_at is None:
             self._started_at = now
+            if self._phase is _Phase.RAMP_UP:
+                # 2026-10-31 段2: 最初のパターンが G ランプのとき（_enter_phase を通らない）も
+                # 結果用の積算の起点を最初の周期にする（0 のままだと加速秒が壁時計の値になる）
+                self._rp_seg_t = now
 
         try:
             speed = await self._can_reader.read_speed()
@@ -1708,8 +1733,14 @@ class PatternLoop:
         rates = cfg.ramp_launch_slow_rates_pctps
         if not rates:
             return
-        slow = rates[self._rp_launch_seq % len(rates)]
-        self._rp_launch_seq += 1
+        pat = self._patterns[self._pattern_idx] if self._pattern_idx < len(self._patterns) else None
+        if isinstance(pat, GRampPattern) and pat.stop_approach:
+            # 2026-10-31 段2: 停止の手前の測定はゆっくり離さない（② も fast_rate。
+            # 通し番号は進めない）
+            slow = cfg.ramp_launch_fast_rate_pctps
+        else:
+            slow = rates[self._rp_launch_seq % len(rates)]
+            self._rp_launch_seq += 1
         if self._rp_u >= 0.0 or slow <= 0.0 or cfg.ramp_launch_fast_rate_pctps <= 0.0:
             return
         stop = cfg.stop_confirm_pct
@@ -1770,6 +1801,9 @@ class PatternLoop:
         cfg = self._config
         g = pattern.target_g
         g_min = min(max(0.0, cfg.ramp_edge_g), g)  # 発進の始まり・停止の終わりの下げ止め
+        # 2026-10-31 段2（ProblemReport_20261031_停止間際 B）: 上りは accel_g（None なら target_g）
+        g_up = pattern.up_g
+        g_min_up = min(max(0.0, cfg.ramp_edge_g), g_up)
         if self._phase in (
             _Phase.HOLD_STEP, _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER,
             _Phase.RAMP_ACCEL_DITHER,
@@ -1787,13 +1821,13 @@ class PatternLoop:
             if self._rp_resume_started is not None:
                 # 保持から上りへ戻した後: 0 → +G を ramp_turn_time_s で直線（2026-10-13 段2o-2）
                 if cfg.ramp_turn_time_s <= 0.0:
-                    return g
+                    return g_up
                 frac = (now - self._rp_resume_started) / cfg.ramp_turn_time_s
-                return g * min(1.0, max(0.0, frac))
+                return g_up * min(1.0, max(0.0, frac))
             if self._rp_launch_started is None or cfg.ramp_launch_time_s <= 0.0:
-                return g
+                return g_up
             frac = (now - self._rp_launch_started) / cfg.ramp_launch_time_s
-            return g_min + (g - g_min) * min(1.0, max(0.0, frac))
+            return g_min_up + (g_up - g_min_up) * min(1.0, max(0.0, frac))
         if self._phase is _Phase.RAMP_HOLD:
             if cfg.ramp_turn_time_s <= 0.0:
                 return 0.0
@@ -1814,12 +1848,20 @@ class PatternLoop:
     def _ramp_upper_g(self, pattern: GRampPattern) -> float | None:
         """段の G の上端 [G]（2026-10-12 段2l-12）。ramp_g_levels の中で target_g より大きい
         最小の段 g_next があれば (target_g ＋ g_next) ÷ 2（`ramp_planner.level_lower_edges` と
-        同じ境目）。いちばん強い段・一覧が空なら None（戻さない）。"""
-        g = pattern.target_g
+        同じ境目）。いちばん強い段・一覧が空なら None（戻さない）。
+        2026-10-31 段2: 上り（RAMP_UP）は accel_g（None なら target_g）を段の G とする。"""
+        g = pattern.up_g if self._phase is _Phase.RAMP_UP else pattern.target_g
         upper = [lv for lv in self._config.ramp_g_levels if lv > g + 1e-9]
         if not upper:
             return None
         return (g + min(upper)) / 2.0
+
+    def _ramp_phase_g(self, pattern: GRampPattern) -> float:
+        """今の区間の狙いの G。2026-10-31 段2: 上り（RAMP_UP・RAMP_HOLD）は accel_g（None なら
+        target_g）、それ以外（下り）は target_g。"""
+        if self._phase in (_Phase.RAMP_UP, _Phase.RAMP_HOLD):
+            return pattern.up_g
+        return pattern.target_g
 
     def _ramp_one_sided_dir(self, pattern: GRampPattern) -> int | None:
         """片側で調整する区間の順方向の符号（2026-10-12 段2l-12）。+1 ＝ u を増やす向き
@@ -1950,6 +1992,11 @@ class PatternLoop:
         - Kp ＝ 1 ÷（感度 × T）。感度は今使っているペダルの走行中の実測
           （`sensitivity_kmhs_per_pct`）。感度が無い（None・0 以下）ときは Kp・Ki を使わず、
           e′ の向きへ最小刻み 1 個 / 周期だけ動かす（e′ ＝ 0 なら動かさない）。
+          2026-10-31 段2b（ProblemReport_20261031_停止間際 D1）: ramp_gprop_without_sensitivity が
+          True で実測の加速度があり dt ＞ 0 の周期は、最小刻みの代わりに
+          du_err ＝ coast_accel_rate_gain ×（今の狙いの G − 実測の G）× dt（コーストダウンの加速と
+          同じ G 比例。RAMP_DOWN は g_ref が負なので実測の減速が足りなければ u が減る＝ブレーキを
+          踏む）。上端超えの戻しも同じ式（狙いとの差）。実測が無い周期は最小刻みのまま。
           2026-10-10 段2l-11: 感度は「傾き × 点の開度の幅」が ramp_dev_deadband_kmh ÷
           ramp_settle_time_s 未満の候補を採らない（`min_accel_span_kmhs`。点が近すぎて傾きが 0 に
           近い正の値になり Kp が跳ねるのを防ぐ。不感帯を使わない所でも設定値をそのまま使う）。
@@ -1987,6 +2034,11 @@ class PatternLoop:
         - 発進の寄せの間（2026-10-12 段2l-13。RAMP_UP でアクセルに移った後、寄せ残りがある周期）は
           v_ref ＝ 実車速・e_前 ＝ 0（偏差の項は 0。上端超えの戻しだけ残る）。寄せが終わった周期
           から基準を実車速から進める。寄せが無い（表が引けない・差が 0 以下）段は今までどおり。
+        - 2026-10-31 段2c（ProblemReport_20261031_停止間際 B・ユーザー決定）: stop_approach の本の
+          RAMP_DOWN で実車速が stop_release_start_kmh（7.5）未満の周期は、基準車速を追わず
+          偏差の項・片側調整・上端超えの戻しの代わりに G 比例だけで両方向に合わせる
+          （du ＝ coast_accel_rate_gain ×（g_ref − 実測の G）× dt。実測が無い周期は動かさない）。
+          開度は 0 を超えない（アクセル側へは行かない）。ガバナー・上下限・追いつき待ちは同じ。
         - 感度が無い（最小刻みの）周期は、u を動かしたあと |e| が cap ＝ 狙いの G × T を超えたら
           v_ref を実車速から cap の位置へ引き戻す（基準が車より T 秒ぶんより先に行かない）。
         """
@@ -2029,7 +2081,7 @@ class PatternLoop:
             and not self._rp_blend_decided
         ):
             self._ramp_blend_start(
-                self._ramp_estimate_u(table_speed, pattern.target_g), self._rp_u,
+                self._ramp_estimate_u(table_speed, pattern.up_g), self._rp_u,
                 self._ramp_launch_blend_time_s(pattern), increase_only=True,
             )
         # 発進の寄せの間は基準を実車速に合わせておく（2026-10-12 段2l-13。ユーザー決定）。
@@ -2066,6 +2118,10 @@ class PatternLoop:
             min_accel_span_kmhs=min_span,
         )
         no_sens = not (sens is not None and sens > 0.0)
+        gprop = (
+            no_sens and cfg.ramp_gprop_without_sensitivity
+            and actual_accel_kmhs is not None and dt > 0.0
+        )
         if not no_sens:
             kp = 1.0 / (sens * cfg.ramp_settle_time_s)
             ki = kp / (RAMP_TI_RATIO * cfg.ramp_settle_time_s)
@@ -2080,7 +2136,11 @@ class PatternLoop:
         else:
             kp = ki = 0.0
             step = self._ramp_min_step_pct(on_brake)
-            du_err = 0.0 if e_dead == 0.0 or dt <= 0.0 else math.copysign(step, e_dead)
+            if gprop:
+                # 2026-10-31 段2b（D1）: 効きの強さが無い周期は G 比例（実測の G があるとき）
+                du_err = cfg.coast_accel_rate_gain * (g_ref - actual_accel_kmhs / G_TO_KMHS) * dt
+            else:
+                du_err = 0.0 if e_dead == 0.0 or dt <= 0.0 else math.copysign(step, e_dead)
         if side is not None:
             # 順方向のぶんだけ使う（逆方向は 0）
             du_err = side * max(0.0, side * du_err)
@@ -2093,15 +2153,37 @@ class PatternLoop:
                 # 最小刻み 1 個）
                 if dt <= 0.0:
                     du_err = 0.0
+                elif gprop:
+                    # 2026-10-31 段2b（D1）: G 比例（狙いとの差）で逆へ戻す
+                    du_err = -side * cfg.coast_accel_rate_gain * (
+                        side * actual_accel_kmhs / G_TO_KMHS - self._ramp_phase_g(pattern)
+                    ) * dt
                 elif no_sens:
                     du_err = -side * self._ramp_min_step_pct(on_brake)
                 else:
-                    over = side * actual_accel_kmhs - pattern.target_g * G_TO_KMHS
+                    over = side * actual_accel_kmhs - self._ramp_phase_g(pattern) * G_TO_KMHS
                     du_err = -side * kp * over * dt
+        # 2026-10-31 段2c（ProblemReport_20261031_停止間際 B・ユーザー決定）: stop_approach の本の
+        # RAMP_DOWN で実車速が stop_release_start_kmh 未満なら、基準車速を追わず G だけを見て
+        # G 比例で両方向に合わせる（偏差の項・片側調整・上端超えの戻しの代わり）
+        g_prop_low = (
+            pattern.stop_approach and self._phase is _Phase.RAMP_DOWN
+            and speed < cfg.stop_release_start_kmh
+        )
+        if g_prop_low:
+            # 狙いはその本の減速の G で一定（基準の g_ref は基準が 0 に着くと 0 へ丸まり、車が遅れて
+            # いると狙い 0 G でブレーキを離してしまう。実機 `093747` の 0.15 G の本で 12 → 5.4%）
+            du_err = (
+                0.0 if actual_accel_kmhs is None or dt <= 0.0
+                else cfg.coast_accel_rate_gain
+                * (-pattern.target_g - actual_accel_kmhs / G_TO_KMHS) * dt
+            )
         self._rp_gains[pedal] = (kp, ki)
 
         u = self._rp_u
         new_u = u + du_err + du_blend
+        if g_prop_low:
+            new_u = min(new_u, 0.0)  # アクセル側（発進側）へは行かない
         blocked = False
         # ガバナーで削られている間は、削られているペダルをさらに踏み増す向きへ積まない
         # （ラッチ後は u が減る向きが踏み増し。それ以外は |u| が増える向き）
@@ -2129,7 +2211,7 @@ class PatternLoop:
             # 切り替わったとき、Ki が残った偏差を積む速さは Ki×cap ＝（狙いの G に要る開度）÷(4T)
             # [%/s] になり、車に依らない穏やかな速さに収まる。cap は T（ramp_settle_time_s）と
             # 狙いの G から決まり、車に依存する値ではない
-            cap = pattern.target_g * G_TO_KMHS * cfg.ramp_settle_time_s
+            cap = self._ramp_phase_g(pattern) * G_TO_KMHS * cfg.ramp_settle_time_s
             if abs(e) > cap:
                 self._rp_vref = max(0.0, speed + math.copysign(cap, e))
                 e = self._rp_vref - speed
@@ -2145,7 +2227,7 @@ class PatternLoop:
                 and not self._rp_blend_decided
             ):
                 self._ramp_blend_start(
-                    self._ramp_estimate_u(table_speed, pattern.target_g), self._rp_u,
+                    self._ramp_estimate_u(table_speed, pattern.up_g), self._rp_u,
                     self._ramp_launch_blend_time_s(pattern), increase_only=True,
                 )
             self._rp_accel_reached = True
@@ -2181,7 +2263,7 @@ class PatternLoop:
         cfg = self._config
         if cfg.ramp_launch_g_rate_gps <= 0.0:
             return cfg.ramp_turn_time_s
-        g = pattern.target_g
+        g = pattern.up_g  # 2026-10-31 段2: 発進は上りの G
         g_min = min(max(0.0, cfg.ramp_edge_g), g)
         return max(cfg.ramp_launch_blend_min_s, (g - g_min) / cfg.ramp_launch_g_rate_gps)
 
@@ -2334,7 +2416,8 @@ class PatternLoop:
             self._ramp_record_result(pattern, now)
             self._enter_phase(_Phase.DRIVE_BRAKE, now, overspeed_recovery=True)
             return
-        leg_s = max(pattern.top_kmh, 0.0) / (max(pattern.target_g, 1e-6) * G_TO_KMHS)  # 0 km/h まで
+        leg_g = self._ramp_phase_g(pattern)  # 2026-10-31 段2: 上りは accel_g
+        leg_s = max(pattern.top_kmh, 0.0) / (max(leg_g, 1e-6) * G_TO_KMHS)  # 0 km/h まで
         timeout_s = leg_s * RAMP_LEG_TIMEOUT_FACTOR + RAMP_LEG_TIMEOUT_MARGIN_S
         hist = self._rp_hist
         # 測れていない（履歴が足りない。フェーズを入り直した直後など）ときは None
@@ -2392,7 +2475,7 @@ class PatternLoop:
             # 135.6 km/h で保持に入った直後に「頭打ち − 先読み」を超え 0.3 秒で打ち切られた。
             # 保持は加速度が 0 へ向かう区間で、先読みは加速中（RAMP_UP）の行き過ぎを防ぐためのもの）
             hold_limit = min(
-                pattern.top_kmh + pattern.target_g * G_TO_KMHS * cfg.ramp_turn_time_s / 2.0,
+                pattern.top_kmh + pattern.up_g * G_TO_KMHS * cfg.ramp_turn_time_s / 2.0,
                 self._accel_speed_cap,
             )
             self._rp_hold_over_count = self._rp_hold_over_count + 1 if speed > hold_limit else 0
@@ -2417,7 +2500,9 @@ class PatternLoop:
                         self._ramp_switch_down(now, speed)  # ステップが作れない: 飛ばす
                 return
             if (
-                elapsed >= cfg.ramp_turn_time_s + cfg.ramp_hold_time_s
+                elapsed >= cfg.ramp_turn_time_s + (
+                    cfg.ramp_hold_time_s if pattern.hold_s is None else pattern.hold_s
+                )
                 or self._rp_hold_over_count >= self._skip_required
             ):
                 self._ramp_switch_down(now, speed)
@@ -2473,8 +2558,8 @@ class PatternLoop:
         """
         cfg = self._config
         stations = pattern.stations_kmh
-        if not stations or cfg.ramp_cruise_hold_s <= 0.0:
-            return
+        if pattern.stop_approach or not stations or cfg.ramp_cruise_hold_s <= 0.0:
+            return  # 2026-10-31 段2: 停止の手前の測定は途中の保持に入らない
         accel = 0.0 if accel_kmhs is None else accel_kmhs
         up = self._phase is _Phase.RAMP_UP
         if not up and pattern.stations_up_only:
@@ -2606,7 +2691,7 @@ class PatternLoop:
         if accel_kmhs is None:
             self._rp_hold_g0 = self._ramp_gref(pattern, now)  # RAMP_UP としての値（enter 前に取る）
         else:
-            self._rp_hold_g0 = min(pattern.target_g, max(0.0, accel_kmhs / G_TO_KMHS))
+            self._rp_hold_g0 = min(pattern.up_g, max(0.0, accel_kmhs / G_TO_KMHS))
         self._rp_vref = speed
         self._rp_e_prev = 0.0
         self._rp_down_brake_blend_pending = False
@@ -2633,6 +2718,8 @@ class PatternLoop:
         何もしない。
         """
         cfg = self._config
+        if pattern.stop_approach:  # 2026-10-31 段2: 停止の手前の測定は戻しに入らない
+            return False
         if not cfg.ramp_release_enabled:  # 2026-10-16 段2o-6: 戻しなしの比較（③）
             return False
         stations = pattern.release_stations
@@ -2672,6 +2759,8 @@ class PatternLoop:
         入れない: 設定が off・強い段（目標減速度 ＞ stop_release_max_g）・ブレーキのラッチ前・
         u ≧ 0・実車速が停車以下。"""
         cfg = self._config
+        if pattern.stop_approach:  # 2026-10-31 段2: 一定 G のまま停車まで下りる
+            return False
         if not cfg.stop_release_enabled or self._rp_stop_release_done:
             return False
         if speed >= cfg.stop_release_start_kmh:
@@ -2839,7 +2928,8 @@ class PatternLoop:
         speeds = cfg.ramp_dither_brake_speeds_kmh
         on = cfg.ramp_dither_brake_onset_u_pct
         if (
-            not cfg.ramp_dither_enabled or not speeds or not cfg.ramp_dither_deltas_pct
+            pattern.stop_approach  # 2026-10-31 段2: 停止の手前の測定は dither に入らない
+            or not cfg.ramp_dither_enabled or not speeds or not cfg.ramp_dither_deltas_pct
             or on is None or pattern.target_g > cfg.ramp_dither_max_g
         ):
             return False

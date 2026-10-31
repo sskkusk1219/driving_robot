@@ -81,6 +81,7 @@ from tests.research.hold_scene import (
     lead_in_ff_pct,
     min_scene_length_s,
     predicted_deviation,
+    predicted_deviation_current_g,
     slope_threshold_kmhs,
 )
 from tests.research.launch_hold import LaunchMoveHold, launch_hold_gain
@@ -385,6 +386,9 @@ def forward_map_plan_args(
         low_speed_side_rule=fm.low_speed_side_rule,  # 段5-2
         release_table_min_kmh=fm.release_table_min_kmh,  # 段5-3
         low_speed_release_stop_layer=fm.low_speed_release_stop_layer,  # 段4（2026-10-28）
+        # 2026-10-31 段1（停止間際 A）: 停車へ向かう低速の行は戻しの表で解き直さない
+        # （区間は停C と同じ creep_floor_lead_s）
+        stop_approach_lead_s=fm.creep_floor_lead_s if fm.stop_approach_keep_stop_table else 0.0,
         switch_lead=fm.switch_lead_enabled,  # 段5-5c
         launch_midway_brake_cap=fm.launch_midway_brake_cap,  # 段5-6 追加 A1
         launch_release_ramp=fm.launch_release_ramp,  # 段7-b
@@ -728,6 +732,12 @@ def _prepare_forward_map_plan(
         se_text = make_stop_end(ff, cfg, mode).settings_text()
         say(f"  C15 停C（停車まぎわの P）: "
             f"{'有効' if fm.stop_end_p_enabled else '無効'}・{se_text}")
+        if fm.stop_end_accel_pred_enabled:
+            tp_pred = stop_end_pred_tp_s(cfg, ff)
+            say("  C15 停C の P の偏差の先読み（段3）: "
+                + ("Tp が決まらず先読みなし" if tp_pred is None else
+                   f"先読み Tp ＝ L＋窓÷2 ＝ {tp_pred:g} s・加速度の窓 "
+                   f"{cfg.decel_stop.slope_window_s:g} s"))
     sec = plan.pedal_seconds()
     say(f"  範囲外を引いた秒数 {plan.out_of_range_s():.1f}s・穴埋めを引いた秒数 "
         f"{plan.filled_s():.1f}s")
@@ -1321,6 +1331,18 @@ def make_creep_floor(
     )
 
 
+def stop_end_pred_tp_s(cfg: ResearchConfig, ff: Any) -> float | None:
+    """2026-10-31 段3（ProblemReport_20261031_停止間際 FB）: 停C の先読みの Tp [s]
+    ＝ ブレーキの遅れ（yaml の brake_lag_s、なければ pkl の meta）＋ decel_stop.slope_window_s ÷ 2。
+    遅れが測れない（meta にも無い）ときは None ＝ 先読みしない。"""
+    lag = cfg.forward_map.brake_lag_s
+    if lag is None:
+        lag = ff.table.meta.get("brake_lag_s")
+    if lag is None or not math.isfinite(float(lag)):
+        return None
+    return float(lag) + cfg.decel_stop.slope_window_s / 2.0
+
+
 def make_stop_end(ff: StopEndFeedforward, cfg: ResearchConfig, mode: DrivingMode) -> StopEndP:
     """C15 の停C を作る。区間の上の車速 ＝ meta の stop_max_speed_kmh、τ の下限 ＝ ブレーキの遅れ
     （yaml の上書き、なければ meta の brake_lag_s）、開度の範囲 ＝ ブレーキ min 〜 停車保持。
@@ -1478,6 +1500,8 @@ class _ModeRun:
     stop_lead_stats: StopLeadStats | None = None
     _stop_lead_now: bool | None = None
     _stop_end_tau_s: float | None = None
+    _stop_pred_tp_s: float | None = None  # 段3: 停C の先読みの Tp（None ＝ 使わない）
+    _stop_pred_dev: float | None = None
     # 段8-a・段8-b の既定（__init__ を通らない最小の _ModeRun でも読めるように）
     launch_hold: LaunchMoveHold | None = None
     _launch_hold_pct: float | None = None
@@ -1617,6 +1641,12 @@ class _ModeRun:
         self.stop_lead_stats: StopLeadStats | None = None
         self._stop_lead_now: bool | None = None  # 今の周期が停A の行か（C15 以外は None）
         self._stop_end_tau_s: float | None = None  # 今の周期の停C の τ（区間外は None）
+        # 段3: 停C の P の偏差の先読み（C13 が有効なときは使わない）
+        self._stop_pred_tp_s = None
+        self._stop_pred_dev = None
+        self._stop_speed_win: deque[tuple[float, float, float]] = deque()  # (t, CAN 車速, ref_t)
+        if cfg.forward_map.stop_end_accel_pred_enabled and self.pred is None:
+            self._stop_pred_tp_s = stop_end_pred_tp_s(cfg, self.ff)
         if isinstance(self.ff, StopEndFeedforward):
             self.stop_end = make_stop_end(self.ff, cfg, setup.mode)
             self.stop_lead_stats = StopLeadStats(period_s=self.interval_s)
@@ -1766,6 +1796,13 @@ class _ModeRun:
             self._predictor_step(t, ref_t, speed, ff_effort)
         c10_effort: float | None = None
         self._stop_end_tau_s = None
+        self._stop_pred_dev = None
+        if self._stop_pred_tp_s is not None:
+            # 段3（停止間際 FB）: 直近の窓の CAN 車速（毎周期更新）
+            swin = self._stop_speed_win
+            swin.append((t, speed, ref_t))  # 段3c: 基準 ref_t も同じ時刻で持つ
+            while swin and swin[0][0] < t - self.cfg.decel_stop.slope_window_s - 1e-9:
+                swin.popleft()
         if self.stop_lead_stats is not None:
             # C15 停A: 計画が、停車保持へ遅れ分早く入れた行か
             lead = self.ff.plan.stop_lead
@@ -1997,6 +2034,7 @@ class _ModeRun:
                     hold_scene=hold_scene, hold_pi_effort_pct=hold_pi_pct,
                     hold_ff_pct=hold_ff_pct,
                     hold_accel_kmhs=hold_accel, hold_pred_dev_kmh=hold_pred_dev,
+                    stop_pred_dev_kmh=self._stop_pred_dev,
                 )
             )
         if segment != self._segment:
@@ -2201,6 +2239,22 @@ class _ModeRun:
             else:
                 normal = new
                 kwargs["tau_brake_s"] = tau_end  # p_only（DOB の分けるとき）も同じ τ で出す
+                # 段3（停止間際 FB）: 設定が true なら P の偏差を先読み
+                # （Tp 秒先の基準 −（今の車速 ＋ 実測の加速度 × Tp）。保持の場面の段13 と同じ式）。
+                # 停止の手前は加速度が 0 ではないので banded_accel（帯で 0 に丸める）は使わない。
+                # 窓が 3 点未満・C13 有効は今の偏差のまま
+                swin = self._stop_speed_win if self._stop_pred_tp_s is not None else None
+                if swin is not None and self._stop_pred_tp_s is not None and len(swin) >= 3:
+                    accel_meas = fit_slope([w[0] for w in swin], [w[1] for w in swin])
+                    # 2026-10-31 段3c（ProblemReport_20261031_停止間際 FB・ユーザー決定）:
+                    # 先の G の変わり目は FF に任せ、今の G のずれだけを見る。
+                    # 偏差 ＝ max(0, ref_t(t) ＋ a_ref × Tp) − max(0, 車速 ＋ a_meas × Tp)
+                    # （a_ref ＝ 同じ窓の ref_t の傾き。段3b の「予測車速は 0 で止める」も含む）
+                    accel_ref = fit_slope([w[0] for w in swin], [w[2] for w in swin])
+                    self._stop_pred_dev = predicted_deviation_current_g(
+                        ref, accel_ref, speed, accel_meas, self._stop_pred_tp_s
+                    )
+                    kwargs["dev_kmh"] = self._stop_pred_dev
                 new, clamped = deviation_offset_detail(fb_table, dob_kmhs=d_row, **kwargs)
                 new = self.stop_end.clamp(new, ff_effort)
                 self._stop_end_tau_s = tau_end

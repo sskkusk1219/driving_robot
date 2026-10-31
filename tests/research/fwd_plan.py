@@ -65,6 +65,7 @@ from tests.research.fwd_map import (
     POINT_FILLED,
     POINT_MEASURED,
     POINT_OUT,
+    POINT_WEIGHTED,
     ForwardTable,
 )
 
@@ -811,6 +812,7 @@ def build_plan(
     low_speed_side_rule: str = "legacy",
     release_table_min_kmh: float = 0.0,
     low_speed_release_stop_layer: bool = False,
+    stop_approach_lead_s: float = 0.0,
     switch_lead: bool = False,
     launch_midway_brake_cap: bool = False,
     launch_release_ramp: bool = False,
@@ -952,6 +954,13 @@ def build_plan(
     基準。`ref_at` をぼかした基準にするとき、停車の始まり・終わりがずれないよう元の基準を渡す。
     None なら `ref_at` と同じ（今までと完全に同じ計算）。
 
+    2026-10-31 段1（ProblemReport_20261031_停止間際 A）: `stop_approach_lead_s` が正で dir の規則の
+    とき、停車へ向かう低速の行（v が meta stop_max_speed_kmh 未満で、時刻 t から t + この秒数の
+    どこかで基準（stop_ref_at があればそれ、無ければ ref_at）が停車速度以下になる行）を、本体の
+    戻しの表（本体はクリープを知らない）で解き直さず、停止側の表で解いた開度のままにする
+    （低速の停止側の層の解き直しからも外す。side_brake は SIDE_STOP のまま）。
+    0.0 は今までと完全に同じ。
+
     accel_lag_s・brake_lag_s が None なら表の meta（表を作ったときの L）、それも無ければ既定値。
     preposition_enabled なら、最後に `preposition` で次に踏むペダルを先に置く
     （効き始めは表の meta の accel_onset_u_pct・brake_onset_u_pct。2026-10-16 段2o-6）。
@@ -987,6 +996,7 @@ def build_plan(
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
             "low_speed_release_stop_layer": low_speed_release_stop_layer,
+            "stop_approach_lead_s": stop_approach_lead_s,
             "launch_midway_brake_cap": launch_midway_brake_cap,
             "launch_release_ramp": launch_release_ramp,
             "launch_release_lead_s": launch_release_lead_s,
@@ -1035,6 +1045,7 @@ def build_plan(
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
             "low_speed_release_stop_layer": low_speed_release_stop_layer,
+            "stop_approach_lead_s": stop_approach_lead_s,
             "launch_midway_brake_cap": launch_midway_brake_cap,
             "launch_release_ramp": launch_release_ramp,
             "launch_release_lead_s": launch_release_lead_s,
@@ -1238,6 +1249,10 @@ def build_plan(
     effort[is_accel] = accel_deadband_pct + u_a[is_accel]
     effort[is_brake] = -(brake_deadband_pct + np.abs(u_b[is_brake]))
     flag = np.full(n, FLAG_COAST, dtype=int)
+    # 2026-10-31 段2d: 重みつきの点（POINT_WEIGHTED = 3）は FLAG_COAST と数が重なるので
+    # 実測に読み替える
+    kind_a = np.where(kind_a == POINT_WEIGHTED, FLAG_MEASURED, kind_a)
+    kind_b = np.where(kind_b == POINT_WEIGHTED, FLAG_MEASURED, kind_b)
     flag[is_accel] = kind_a[is_accel]
     flag[is_brake] = kind_b[is_brake]
     need = np.where(want_brake, need_b, need_a)
@@ -1262,11 +1277,20 @@ def build_plan(
         # （stop_side=None）で解き直す。停止側の戻しの層は使わない
         # 2026-10-28 段4: low_speed_release_stop_layer が true で表が停止側の戻しの層を持つとき、
         # 低速（low）の行だけ停止側＋戻し量で解き直す（7.5 km/h 以上は本体のまま）
+        # 2026-10-31 段1（停止間際 A）: 停車へ向かう低速の行は、戻しの表（クリープを知らない）で
+        # 解き直さず停止側の表のまま残す（区間は period_s 刻みで端を含む）
+        approach_keep = np.zeros(n, dtype=bool)
+        if stop_approach_lead_s > 0.0:
+            sref = stop_ref_at if stop_ref_at is not None else ref_at
+            k = int(np.floor(stop_approach_lead_s / period_s + 1e-9))
+            ahead = np.stack([_eval_ref(sref, t + j * period_s) for j in range(k + 1)])
+            ahead = np.vstack([ahead, _eval_ref(sref, t + stop_approach_lead_s)[None, :]])
+            approach_keep = low & np.any(ahead <= STOP_SPEED_KMH, axis=0)
         stop_layer_rows = None
         if low_speed_release_stop_layer and stop_release:
-            stop_layer_rows = low
+            stop_layer_rows = low & ~approach_keep
         if body_release or stop_layer_rows is not None:
-            body_redo = is_brake & ~stop & ~launch_b
+            body_redo = is_brake & ~stop & ~launch_b & ~approach_keep
             if release_table_min_kmh > 0.0:  # 段5-3: 低速は dir が決める
                 body_redo &= (v >= release_table_min_kmh) | low
             if not body_release:  # 本体の戻しが無いときは層の行（低速）だけ

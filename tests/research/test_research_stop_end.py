@@ -136,3 +136,10 @@ def test_c15_is_a_c12_and_config_knows_it() -> None:
     assert cfg.forward_map.stop_lead_enabled is True and cfg.forward_map.stop_end_p_enabled is True
     cfg.feedforward.candidate = "C15"
     assert not any("candidate" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_stop_end_accel_pred_default_false_in_config_and_yaml() -> None:
+    # 2026-10-31 段3: 停C の先読みは既定 false・本体 yaml も false
+    assert cfgmod.ForwardMapSection().stop_end_accel_pred_enabled is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.forward_map.stop_end_accel_pred_enabled is False

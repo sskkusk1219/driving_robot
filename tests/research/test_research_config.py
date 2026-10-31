@@ -918,6 +918,12 @@ def test_ramp_hold_deadband_and_lag_tolerance_are_loaded_and_validated() -> None
     assert cfgmod.validate_config(cfg) == []
 
 
+def test_ramp_gprop_without_sensitivity_default_false_and_yaml_true() -> None:
+    """2026-10-31 段2b（D1）: 既定 false・本体 yaml は true。"""
+    assert cfgmod.LearningSection().ramp_gprop_without_sensitivity is False
+    assert _load_default().learning.ramp_gprop_without_sensitivity is True
+
+
 def test_ramp_one_sided_is_loaded_from_yaml_and_defaults_to_false(tmp_path: Path) -> None:
     """2026-10-12 段2l-12: G ランプの片側調整。yaml は true、キーが無ければ既定の True。"""
     cfg = _load_default()
@@ -1623,3 +1629,70 @@ def test_coast_fill_max_s_default_zero_and_validated() -> None:
     assert cfgmod.validate_config(cfg) == []
     cfg.forward_map.coast_fill_max_s = -0.1
     assert any("coast_fill_max_s" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_stop_approach_keep_stop_table_defaults_false() -> None:
+    """2026-10-31 段1（停止間際 A）: 新キーの既定は false（コード既定・本体 yaml とも）。"""
+    assert cfgmod.ForwardMapSection().stop_approach_keep_stop_table is False
+    cfg = cfgmod.load_config(Path("tests/research/config_testVehicle.yaml"))
+    assert cfg.forward_map.stop_approach_keep_stop_table is False
+
+
+def test_stop_approach_settings_default_yaml_and_validation() -> None:
+    """2026-10-31 段2: 停止の手前の測定の設定。既定は off、本体 yaml は on。範囲外の検証。"""
+    fresh = cfgmod.LearningSection()
+    assert fresh.stop_approach_enabled is False
+    assert list(fresh.stop_approach_g_levels) == [0.045, 0.08, 0.125, 0.15]
+    assert list(fresh.stop_approach_counts) == [1, 1, 1, 2]
+    assert fresh.stop_approach_accel_g == pytest.approx(0.125)
+    assert fresh.stop_approach_hold_s == pytest.approx(5.0)
+    assert fresh.stop_approach_settle_s == pytest.approx(1.0)
+    assert fresh.stop_approach_max_g == pytest.approx(0.15)
+    cfg = _load_default()
+    lr = cfg.learning
+    assert lr.stop_approach_enabled is True
+    assert list(lr.stop_approach_g_levels) == [0.045, 0.08, 0.125, 0.15]
+    assert list(lr.stop_approach_counts) == [1, 1, 1, 2]
+    assert lr.stop_approach_accel_g == pytest.approx(0.125)
+    assert lr.stop_approach_hold_s == pytest.approx(5.0)
+    assert lr.stop_approach_settle_s == pytest.approx(1.0)
+    assert lr.stop_approach_max_g == pytest.approx(0.15)
+    assert cfgmod.validate_config(cfg) == []
+
+    def problems_about(key: str) -> bool:
+        return any(key in p for p in cfgmod.validate_config(cfg))
+
+    for key, bad, good in (
+        # max_g 超え
+        ("stop_approach_g_levels", [0.045, 0.08, 0.125, 0.2], [0.045, 0.08, 0.125, 0.15]),
+        ("stop_approach_g_levels", [0.0, 0.08, 0.125], [0.045, 0.08, 0.125, 0.15]),
+        ("stop_approach_g_levels", [0.045, 0.08], [0.045, 0.08, 0.125, 0.15]),  # counts と長さ違い
+        ("stop_approach_g_levels", [], [0.045, 0.08, 0.125, 0.15]),
+        ("stop_approach_counts", [1, 0, 1, 2], [1, 1, 1, 2]),
+        ("stop_approach_accel_g", 0.2, 0.125),  # max_g 超え
+        ("stop_approach_accel_g", 0.0, 0.125),
+        ("stop_approach_hold_s", -1.0, 5.0),
+        ("stop_approach_settle_s", -0.1, 1.0),
+        ("stop_approach_max_g", 0.0, 0.15),
+    ):
+        setattr(lr, key, bad)
+        assert problems_about(key), (key, bad)
+        setattr(lr, key, good)
+        assert not problems_about(key)
+    # 昇順でなくてよい（max_g 以下なら）
+    lr.stop_approach_g_levels = [0.15, 0.045, 0.08, 0.125]
+    assert cfgmod.validate_config(cfg) == []
+
+
+def test_stop_table_sub_min_weight_defaults_false() -> None:
+    """2026-10-31 段2d（案1）: 停止側のしきい値未満のマスの重み。既定は false、本体 yaml は true
+    （段2d の実機の後、ユーザー決定で採用）。"""
+    assert cfgmod.LearningSection().stop_table_sub_min_weight is False
+    assert _load_default().learning.stop_table_sub_min_weight is True
+
+
+def test_launch_table_sub_min_weight_defaults_false() -> None:
+    """2026-10-31 段4b（案1）: 発進側のしきい値未満のマスの重み。既定も本体 yaml も false
+    （段4b の実機 3 モードの後に決める）。"""
+    assert cfgmod.LearningSection().launch_table_sub_min_weight is False
+    assert _load_default().learning.launch_table_sub_min_weight is False

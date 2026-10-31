@@ -21,6 +21,7 @@ from tests.research.fwd_map import (
     POINT_FILLED,
     POINT_MEASURED,
     POINT_OUT,
+    POINT_WEIGHTED,
     RELEASE_GRID_PCT,
     ForwardTable,
     apply_launch_accel_measured,
@@ -30,6 +31,7 @@ from tests.research.fwd_map import (
     attach_release,
     attach_stop,
     attach_stop_release,
+    blend_sub_min,
     build_table,
     extend_launch_rows_to_stop_max,
     load_forward_map,
@@ -424,6 +426,77 @@ def test_attach_stop_joins_body_beyond_deepest_measurement() -> None:
     assert t2.meta["stop_max_speed_kmh"] == pytest.approx(5.0)
     assert t2.meta["stop_u_step_pct"] == 0.25
     assert np.array_equal(t2.accel_grid, table.accel_grid)
+
+
+# ───────── 2026-10-31 段2d（案1）: min_s 未満のマスも重みで使う ─────────
+
+
+def test_blend_sub_min_weights_by_seconds() -> None:
+    assert blend_sub_min(-1.0, 0.0, -2.0, 0.5) == pytest.approx(-2.0)  # 秒 0 は今の値
+    assert blend_sub_min(-1.0, 0.3, -2.0, 0.5) == pytest.approx((0.3 * -1.0 + 0.5 * -2.0) / 0.8)
+    assert blend_sub_min(-1.0, 0.5, -2.0, 0.5) == pytest.approx(-1.5)  # 秒＝しきい値で半々
+    assert blend_sub_min(-1.0, 1e6, -2.0, 0.5) == pytest.approx(-1.0, abs=1e-5)  # 秒が大きいと実測
+
+
+def _sub_min_rows(sub_a: float = -1.0, sub_n: int = 3):
+    """v = 1.0 の停止側の行: u = −6（10 秒・a −3）と u = −2（10 秒・a −1）が実測、u = −4 は
+    sub_n 行（0.1 秒刻み ＝ 0.3 秒 < 0.5 秒）で a = sub_a。実測 2 点の直線は u = −4 で −2。"""
+    u = np.concatenate([np.full(100, -6.0), np.full(100, -2.0), np.full(sub_n, -4.0)])
+    a = np.concatenate([np.full(100, -3.0), np.full(100, -1.0), np.full(sub_n, sub_a)])
+    return make_rows(np.full(len(u), 1.0), u, a, 0.1)
+
+
+def test_attach_stop_sub_min_weight_default_false_is_unchanged() -> None:
+    table, _ = _launch_setup()
+    rows = _sub_min_rows()
+    base = attach_stop(table, rows, creep_speed_kmh=5.0, accel_window_s=0.5)
+    off = attach_stop(table, rows, creep_speed_kmh=5.0, accel_window_s=0.5, sub_min_weight=False)
+    assert np.array_equal(base.stop_accel, off.stop_accel)
+    assert np.array_equal(base.stop_kind, off.stop_kind)
+    assert base.meta["stop_sub_min_weight"] is False
+    assert not np.any(base.stop_kind == POINT_WEIGHTED)
+    # 実測だけの行（min_s 未満のマスなし）は true でも完全に同じ
+    only = _sub_min_rows(sub_n=0)
+    a0 = attach_stop(table, only, creep_speed_kmh=5.0, accel_window_s=0.5)
+    a1 = attach_stop(table, only, creep_speed_kmh=5.0, accel_window_s=0.5, sub_min_weight=True)
+    assert np.array_equal(a0.stop_accel, a1.stop_accel)
+    assert np.array_equal(a0.stop_kind, a1.stop_kind)
+    assert a1.meta["stop_sub_min_weight"] is True
+
+
+def test_attach_stop_sub_min_weight_pulls_sub_min_cell_toward_blend() -> None:
+    table, _ = _launch_setup()
+    rows = _sub_min_rows(sub_a=-1.0, sub_n=3)
+    off = attach_stop(table, rows, creep_speed_kmh=5.0, accel_window_s=0.5)
+    on = attach_stop(table, rows, creep_speed_kmh=5.0, accel_window_s=0.5, sub_min_weight=True)
+    assert off.stop_accel is not None and on.stop_accel is not None and on.stop_kind is not None
+    g = table.u_grid
+    row = 0  # 代表車速 1.25（v = 1.0 の行）
+    # マスの中心は u = −6 → −5.875、−4 → −3.875、−2 → −1.875（0.25% 幅のマス）
+    c6, c4, c2 = -5.875, -3.875, -1.875
+    j6, j4, j2 = (int(np.argmin(np.abs(g - x))) for x in (c6, c4, c2))
+    f0 = float(np.interp(c4, g, off.stop_accel[row]))  # 重みなし ＝ 実測 2 点の直線（−2.0 付近）
+    assert f0 == pytest.approx(-2.0, abs=0.1)
+    want = blend_sub_min(-1.0, 0.3, f0, 0.5)  # (s·a + min_s·f0) ÷ (s + min_s)
+    got = float(np.interp(c4, g, on.stop_accel[row]))
+    assert got == pytest.approx(want, abs=0.05)
+    assert f0 < got < -1.0  # 実測側へ寄るが届かない
+    assert on.stop_kind[row, j4] == POINT_WEIGHTED
+    # 実測点（秒 ≥ min_s）は同じ値・種類のまま
+    for c, j in ((c6, j6), (c2, j2)):  # 格子点は隣の点の直線で多少動くので、マスの中心の値で比べる
+        assert np.interp(c, g, on.stop_accel[row]) == pytest.approx(
+            np.interp(c, g, off.stop_accel[row]), abs=0.03
+        )
+        assert on.stop_kind[row, j] == POINT_MEASURED
+    # 秒 0 のマス（遠い u）は変わらない
+    far = g < -9.0
+    assert np.allclose(on.stop_accel[row, far], off.stop_accel[row, far])
+    assert np.all(np.diff(on.stop_accel[row]) >= -1e-9)
+    # 実測点が 2 つ未満の行は、重みつきの点があっても置き換えない（今と同じ）
+    one = np.concatenate([np.full(100, -6.0), np.full(3, -4.0), np.full(3, -3.0)])
+    r1 = make_rows(np.full(len(one), 1.0), one, np.full(len(one), -1.0), 0.1)
+    n1 = attach_stop(table, r1, creep_speed_kmh=5.0, accel_window_s=0.5, sub_min_weight=True)
+    assert n1.stop_accel is None or np.array_equal(n1.stop_accel[row], table.accel_grid[row])
 
 
 def test_launch_and_stop_flags_select_tables_and_both_is_error() -> None:
@@ -838,6 +911,72 @@ def test_release_seconds_in_band_counts_braking_release_rows() -> None:
     r = FwdRows(**{**base.__dict__, "release_pct": np.array([1.0, 1.0, 1.0, 1.0, 1.0, 0.1])})
     # 7.5〜20 km/h・u < 0・戻し量 0.3% 以上: 添字 1・2 だけ
     assert release_seconds_in_band(r, 7.5) == pytest.approx(0.2)
+
+
+def test_attach_launch_sub_min_weight_default_false_is_unchanged() -> None:
+    """2026-10-31 段4b: 発進側もしきい値未満のマスを重みで使える。既定 false は今と完全に同じ。"""
+    table, _ = _launch_setup()
+    rows = _sub_min_rows()
+    base = attach_launch(table, rows, creep_speed_kmh=5.0, accel_window_s=0.5)
+    off = attach_launch(table, rows, creep_speed_kmh=5.0, accel_window_s=0.5, sub_min_weight=False)
+    assert np.array_equal(base.launch_accel, off.launch_accel)
+    assert np.array_equal(base.launch_kind, off.launch_kind)
+    assert base.meta["launch_sub_min_weight"] is False
+    assert not np.any(base.launch_kind == POINT_WEIGHTED)
+    only = _sub_min_rows(sub_n=0)  # min_s 未満のマスなし: true でも完全に同じ
+    a0 = attach_launch(table, only, creep_speed_kmh=5.0, accel_window_s=0.5)
+    a1 = attach_launch(table, only, creep_speed_kmh=5.0, accel_window_s=0.5, sub_min_weight=True)
+    assert np.array_equal(a0.launch_accel, a1.launch_accel)
+    assert np.array_equal(a0.launch_kind, a1.launch_kind)
+    assert a1.meta["launch_sub_min_weight"] is True
+
+
+def test_attach_launch_sub_min_weight_pulls_sub_min_cell_toward_blend() -> None:
+    table, _ = _launch_setup()
+    rows = _sub_min_rows(sub_a=-1.0, sub_n=3)
+    off = attach_launch(table, rows, creep_speed_kmh=5.0, accel_window_s=0.5)
+    on = attach_launch(table, rows, creep_speed_kmh=5.0, accel_window_s=0.5, sub_min_weight=True)
+    assert off.launch_accel is not None and on.launch_accel is not None
+    assert on.launch_kind is not None
+    g = table.u_grid
+    c4 = -3.875
+    j4 = int(np.argmin(np.abs(g - c4)))
+    f0 = float(np.interp(c4, g, off.launch_accel[0]))
+    want = blend_sub_min(-1.0, 0.3, f0, 0.5)
+    assert float(np.interp(c4, g, on.launch_accel[0])) == pytest.approx(want, abs=0.05)
+    assert f0 < float(np.interp(c4, g, on.launch_accel[0])) < -1.0
+    assert on.launch_kind[0, j4] == POINT_WEIGHTED
+    assert np.all(np.diff(on.launch_accel[0]) >= -1e-9)
+
+
+def test_measured_launch_accel_sub_min_weight() -> None:
+    table, rows = _launch_setup()
+    t1 = attach_launch(table, rows, creep_speed_kmh=5.0)
+    pat = concat_rows([
+        _accel_rows(3.0, [0.5, 1.5, 2.5], lambda u: 2.0 + 0.2 * u),
+        _accel_rows(3.0, [3.5], lambda u: 5.0 + 0.0 * u, n_each=3),  # 0.3 秒 < 0.5 秒のマス
+    ], "x")
+    off = apply_launch_accel_measured(t1, pat, cell_pct=1.0)
+    off2 = apply_launch_accel_measured(t1, pat, cell_pct=1.0, sub_min_weight=False)
+    assert np.array_equal(off.launch_accel, off2.launch_accel)  # 既定は今と同じ
+    assert off.meta["launch_accel_sub_min_weight"] is False
+    on = apply_launch_accel_measured(t1, pat, cell_pct=1.0, sub_min_weight=True)
+    assert on.meta["launch_accel_sub_min_weight"] is True
+    g = t1.u_grid
+    r = 1
+    f0 = float(np.interp(3.5, g, off.launch_accel[r]))
+    want = blend_sub_min(5.0, 0.3, f0, 0.5)
+    assert float(np.interp(3.5, g, on.launch_accel[r])) == pytest.approx(want, abs=0.15)
+    assert float(np.interp(3.5, g, on.launch_accel[r])) > f0
+    assert np.all(np.diff(on.launch_accel[r]) >= -1e-9)
+    # ブレーキ側・他の行は変えない
+    neg = g <= 0.0
+    assert np.array_equal(on.launch_accel[r, neg], off.launch_accel[r, neg])
+    assert np.array_equal(on.launch_accel[2:], off.launch_accel[2:])
+    # 実測の点が 1 つも無い行は重みつきの点だけでは作らない（今のまま）
+    short = _accel_rows(3.0, [1.0, 3.0], lambda u: 2.0 + 0.2 * u, n_each=3)
+    n = apply_launch_accel_measured(t1, short, sub_min_weight=True)
+    assert np.array_equal(n.launch_accel[1], t1.launch_accel[1])
 
 
 # ───────── 2026-10-22 段5-3: 発進側のアクセル側を実測の点で作る ─────────

@@ -241,6 +241,34 @@ def predicted_deviation(
     return ref_ahead_kmh - (speed_kmh + accel_kmhs * tp_s)
 
 
+def predicted_deviation_floor0(
+    ref_ahead_kmh: float, speed_kmh: float, accel_kmhs: float, tp_s: float
+) -> float:
+    """2026-10-31 段3b（ProblemReport_20261031_停止間際 FB）: 停C の先読みの偏差。予測車速
+    ＝ max(0, 今の車速 ＋ 加速度 × Tp) で止め、Tp 秒先の基準 − 予測車速 [km/h]。
+    実際の車速は 0 未満にならない（停車直前に予測が負になると「遅すぎ」と読んで P が
+    ブレーキを戻していた）。`predicted_deviation` は保持の場面でも使うので変えない。"""
+    return ref_ahead_kmh - max(0.0, speed_kmh + accel_kmhs * tp_s)
+
+
+def predicted_deviation_current_g(
+    ref_now_kmh: float, a_ref_kmhs: float, speed_kmh: float, a_meas_kmhs: float, tp_s: float
+) -> float:
+    """2026-10-31 段3c（ProblemReport_20261031_停止間際 FB・ユーザー決定）: 停C の先読みの偏差。
+    ＝ max(0, 基準(t) ＋ 基準の傾き × Tp) − max(0, 車速 ＋ 実測の加速度 × Tp) [km/h]。
+    先の G の変わり目は FF に任せ、今の G のずれ（基準の傾きと実測の傾きの差）だけを見る。
+    基準の G と実測の G が同じなら 基準(t) − 車速 と同じ。
+    2026-10-31 段3d: 基準か車速のどちらかが Tp 後に 0 以下と予測される（停車の直前）ときは、
+    先読みせず今の偏差 基準(t) − 車速 を返す（両方を 0 で止めると偏差が 0 になり、P が
+    何もしないまま動き出す開度より浅いブレーキでクリープに負けた。
+    実機 `141815` 385.5 s・443.0 s）。"""
+    ref_ahead = ref_now_kmh + a_ref_kmhs * tp_s
+    speed_ahead = speed_kmh + a_meas_kmhs * tp_s
+    if ref_ahead <= 0.0 or speed_ahead <= 0.0:
+        return ref_now_kmh - speed_kmh
+    return ref_ahead - speed_ahead
+
+
 def banded_accel(accel_kmhs: float | None, band_kmhs: float) -> float:
     """段13: 実測の加速度 [km/h/s]。None・|a| ≤ 帯 は 0（段に止まっている）、それ以外は a。"""
     if accel_kmhs is None or abs(accel_kmhs) <= band_kmhs:

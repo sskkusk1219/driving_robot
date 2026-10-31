@@ -439,3 +439,9 @@ async def test_sampler_rows_have_command_actual_and_status(tmp_path: Path) -> No
         assert (r["brake_servo_on"], r["brake_pos_done"], r["brake_alarm_code"]) == ("1", "1", "0")
         assert float(r["cycle_ms"]) >= 0.0
         assert r["accel_ff_pct"] == ""  # FF はモード走行だけ
+
+
+def test_stop_pred_dev_column_is_registered_and_formatted() -> None:
+    # 2026-10-31 段3: 停C の先読みの偏差の列（区間外・off は空欄）
+    assert dlmod.CSV_COLUMNS[-1] == "stop_pred_dev_kmh"
+    assert dlmod.DriveSample.__dataclass_fields__["stop_pred_dev_kmh"].default is None

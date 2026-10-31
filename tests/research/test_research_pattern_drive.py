@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 from tests.research import config as cfgmod
@@ -205,6 +206,7 @@ def test_build_patterns_layout_is_coast_then_ramps_only() -> None:
     """段2l-6: コーストダウン → G ランプ（実行順どおり）だけ。クリープ域ブレーキ保持・
     クリープ発進・格子ステップ・発進停車・G 校正・通し掃引は入らない。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.stop_approach_enabled = False  # 2026-10-31 段2: 先頭の 4 本は別のテストで確かめる
     patterns = pdmod.build_patterns(cfg, _profile(cfg), RAMP_ORDER)
 
     head = patterns[:COAST_DOWN_COUNT]
@@ -223,6 +225,7 @@ def test_build_patterns_layout_is_coast_then_ramps_only() -> None:
 def test_build_patterns_passes_stations_up_only_from_the_fourth_element() -> None:
     """2026-10-14 段2o-4: 4 つ目があれば stations_up_only に渡り、3 要素・2 要素は False。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.stop_approach_enabled = False  # 2026-10-31 段2: 先頭の 4 本は別のテストで確かめる
     order = [(0.08, 60.0, (10.0, 20.0), True), (0.1, 60.0, (10.0,), False),
              (0.125, 60.0, (10.0,)), (0.15, 60.0)]
     ramps = [p for p in pdmod.build_patterns(cfg, _profile(cfg), order)
@@ -243,6 +246,7 @@ def test_build_patterns_matches_ramp_plan_execution_order() -> None:
     plan = RampPlan(levels=levels, skipped=(0.35,), total_est_s=650.0, budget_s=1200.0,
                     over_budget=False, cruise_s=0.0)
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.stop_approach_enabled = False  # 2026-10-31 段2: 先頭の 4 本は別のテストで確かめる
     patterns = pdmod.build_patterns(cfg, _profile(cfg), plan.execution_order())
     ramps = [p for p in patterns if isinstance(p, GRampPattern)]
     assert [(p.target_g, p.top_kmh) for p in ramps] == [(0.02, 100.0), (0.25, 60.0), (0.02, 100.0)]
@@ -256,6 +260,7 @@ def test_build_patterns_passes_release_stations_and_defaults_to_empty() -> None:
     """2026-10-14 段2o-5: execution_order の 5 つ目が release_stations に入る。省略は空。
     loop_config は learning.ramp_release_* と安全網の車速（クリープ＋5）を渡す。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.stop_approach_enabled = False  # 2026-10-31 段2: 先頭の 4 本は別のテストで確かめる
     order = [(0.08, 90.0, (), True, (15.0, 35.0)), (0.125, 60.0), (0.25, 50.0, (20.0,))]
     ramps = [
         p for p in pdmod.build_patterns(cfg, _profile(cfg), order) if isinstance(p, GRampPattern)
@@ -307,6 +312,7 @@ def test_result_table_estimate_includes_hold_and_two_turns() -> None:
 
 def test_build_patterns_coast_down_is_vehicle_independent_and_clamped() -> None:
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.stop_approach_enabled = False  # 2026-10-31 段2: 先頭の 4 本は別のテストで確かめる
     profile = _profile(cfg)
     patterns = pdmod.build_patterns(cfg, profile, RAMP_ORDER)
     for p in patterns[:COAST_DOWN_COUNT]:
@@ -317,6 +323,7 @@ def test_build_patterns_coast_down_is_vehicle_independent_and_clamped() -> None:
 def test_build_patterns_ignores_creep_settings() -> None:
     """クリープ発進・クリープ域ブレーキ保持は列に入らない（段2l-6）。"""
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.stop_approach_enabled = False  # 2026-10-31 段2: 先頭の 4 本は別のテストで確かめる
     patterns = pdmod.build_patterns(cfg, _profile(cfg), RAMP_ORDER)
     assert not any(isinstance(p, CreepLaunchPattern) for p in patterns)
     assert len(patterns) == COAST_DOWN_COUNT + len(RAMP_ORDER)
@@ -767,6 +774,7 @@ def _seed_outlier_setup(
         launch_accel_side_source="extrapolate", side_table_accel_window_s=0.5,
         launch_rows_to_stop_max=False, side_row_speed_rep="grid", stop_approach_exclusion="depth",
         accel_push_input_enabled=False, local_gain_brake_speeds_kmh=None,
+        stop_table_sub_min_weight=False, launch_table_sub_min_weight=False,
     ):
         seeds_seen.append(tuple(seeds))
         path = tmp_path / "results" / "models" / f"fwd_model_fake_{len(seeds_seen)}.pkl"
@@ -1075,6 +1083,7 @@ def test_build_patterns_adds_lag_step_ramps_only_when_asked() -> None:
 
 def test_build_patterns_passes_stations_from_three_element_order() -> None:
     cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.stop_approach_enabled = False  # 2026-10-31 段2: 先頭の 4 本は別のテストで確かめる
     order = [(0.02, 100.0, (15.0, 25.0)), (0.08, 90.0, ())]
     patterns = pdmod.build_patterns(cfg, _profile(cfg), order)
     ramps = [p for p in patterns if isinstance(p, GRampPattern)]
@@ -1279,3 +1288,72 @@ def test_forward_pkl_and_model_default_stamp_is_local_time(tmp_path: Path) -> No
         stamp = "_".join(p.stem.split("_")[2:4])
         t = datetime.strptime(stamp, "%Y%m%d_%H%M%S")  # noqa: DTZ007 - naive比較
         assert abs(t - datetime.now()) < timedelta(minutes=5)  # noqa: DTZ005
+
+
+def test_stop_approach_patterns_counts_gs_tops_and_flags() -> None:
+    """2026-10-31 段2: 停止の手前の測定は 5 本（0.045・0.08・0.125・0.15 ×2）、
+    上端は 15/15/20/20/20。上りは accel_g、保持は hold_s、stop_approach=True。enabled は見ない。"""
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.stop_approach_enabled = False
+    pats = pdmod.stop_approach_patterns(cfg)
+    assert [(p.target_g, p.top_kmh) for p in pats] == [
+        (0.045, 15.0), (0.08, 15.0), (0.125, 20.0), (0.15, 20.0), (0.15, 20.0),
+    ]
+    assert all(isinstance(p, GRampPattern) and p.kind is PatternKind.G_RAMP for p in pats)
+    assert all(p.stop_approach and p.accel_g == 0.125 and p.hold_s == 5.0 for p in pats)
+    assert all(not p.stations_kmh and not p.release_stations and not p.lag_step for p in pats)
+
+
+def test_build_patterns_puts_stop_approach_first_only_when_enabled() -> None:
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    cfg.learning.stop_approach_enabled = False
+    off = pdmod.build_patterns(cfg, _profile(cfg), RAMP_ORDER)
+    assert not any(isinstance(p, GRampPattern) and p.stop_approach for p in off)
+    assert len(off) == COAST_DOWN_COUNT + len(RAMP_ORDER)
+    cfg.learning.stop_approach_enabled = True
+    on = pdmod.build_patterns(cfg, _profile(cfg), RAMP_ORDER)
+    head = on[:5]
+    assert all(isinstance(p, GRampPattern) and p.stop_approach for p in head)
+    gs = [p.target_g for p in head if isinstance(p, GRampPattern)]
+    assert gs == [0.045, 0.08, 0.125, 0.15, 0.15]
+    # コーストダウンより前。残りは off と同じ列
+    assert on[5:] == off
+    assert on[5].kind is PatternKind.COAST_DOWN
+
+
+# ───────── 2026-10-31 段4b: 発進側だけの作り直し（rebuild_launch_side） ─────────
+
+_LW_PKL = Path("tests/research/results/models/fwd_model_20261028_220204_hpi2_hold_stop_w.pkl")
+_LW_CSV = Path("tests/research/results/drive_log_real_20261029_062805.csv")
+
+
+def test_rebuild_launch_side_refuses_unreproducible_tables() -> None:
+    from tests.research.fwd_map import ForwardTable  # noqa: PLC0415
+
+    table = ForwardTable(
+        speed_edges=np.array([0.0, 2.5]), speed_rep=np.array([1.25]),
+        u_grid=np.array([0.0]), accel_grid=np.zeros((1, 1)), seconds=np.zeros((1, 1)),
+        point_kind=np.zeros((1, 1), dtype=int), meas_u_min=np.zeros(1), meas_u_max=np.zeros(1),
+        meta={"side_row_speed_rep": "data"},
+    )
+    with pytest.raises(ValueError, match="発進側だけ"):
+        pdmod.rebuild_launch_side(table, source_csvs=[Path("a.csv")], creep_speed_kmh=5.0)
+    table.meta["side_row_speed_rep"] = "grid"
+    with pytest.raises(ValueError, match="CSV 1 本"):
+        pdmod.rebuild_launch_side(table, source_csvs=[], creep_speed_kmh=5.0)
+
+
+@pytest.mark.skipif(not (_LW_PKL.exists() and _LW_CSV.exists()), reason="実機の pkl・CSV が無い")
+def test_rebuild_launch_side_without_weight_reproduces_the_original() -> None:
+    from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
+
+    old = load_forward_map(_LW_PKL)
+    same = pdmod.rebuild_launch_side(old, source_csvs=[_LW_CSV], creep_speed_kmh=5.0)
+    assert np.array_equal(same.launch_accel, old.launch_accel)
+    assert np.array_equal(same.launch_kind, old.launch_kind)
+    w = pdmod.rebuild_launch_side(
+        old, source_csvs=[_LW_CSV], creep_speed_kmh=5.0, sub_min_weight=True
+    )
+    assert w.meta["launch_sub_min_weight"] is True
+    assert np.array_equal(w.stop_accel, old.stop_accel)  # 停止側は触らない
+    assert np.array_equal(w.accel_grid, old.accel_grid)

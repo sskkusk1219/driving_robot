@@ -95,5 +95,5 @@ def test_config_validates_hold_points_lists() -> None:
 def test_step13_exists_and_pkl_name() -> None:
     step = next(s for s in mainmod.STEPS if s.number == 13)
     assert step.drives and step.prepare is not None
-    assert mainmod.MAX_STEP == 13
+    assert mainmod.MAX_STEP == 14
     assert mainmod.hold_pkl_path("a/b/fwd_model_x_hpi.pkl") == Path("a/b/fwd_model_x_hpi_hold.pkl")

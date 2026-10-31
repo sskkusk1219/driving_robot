@@ -165,6 +165,10 @@ CSV_COLUMNS: tuple[str, ...] = (
     # （場面の外・off は空欄）
     "hold_accel_kmhs",
     "hold_pred_dev_kmh",
+    # 2026-10-31 段3（ProblemReport_20261031_停止間際 FB）:
+    # 停C の先読み（forward_map.stop_end_accel_pred_enabled）。
+    # stop_pred_dev_kmh ＝ 停C の区間で P に使った先読みの偏差（区間外・off は空欄）
+    "stop_pred_dev_kmh",
 )
 
 
@@ -217,6 +221,7 @@ class DriveSample:
     hold_ff_pct: float | None = None  # 段7: 場面で使った保持の FF の開度（置き換えないときは None）
     hold_accel_kmhs: float | None = None  # 段13: 帯で丸めた実測の加速度（場面の外・off は None）
     hold_pred_dev_kmh: float | None = None  # 段13: P に使った先読みの偏差（同上）
+    stop_pred_dev_kmh: float | None = None  # 段3: 停C の区間で P に使った先読みの偏差（同上）
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -314,6 +319,7 @@ class SessionLog:
         hold_ff_pct: float | None = None,
         hold_accel_kmhs: float | None = None,
         hold_pred_dev_kmh: float | None = None,
+        stop_pred_dev_kmh: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -358,6 +364,7 @@ class SessionLog:
             hold_ff_pct=hold_ff_pct,
             hold_accel_kmhs=hold_accel_kmhs,
             hold_pred_dev_kmh=hold_pred_dev_kmh,
+            stop_pred_dev_kmh=stop_pred_dev_kmh,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -559,6 +566,7 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.hold_ff_pct),
                 _fmt(s.hold_accel_kmhs),
                 _fmt(s.hold_pred_dev_kmh),
+                _fmt(s.stop_pred_dev_kmh),
             ])
 
 

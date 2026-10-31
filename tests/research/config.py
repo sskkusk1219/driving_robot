@@ -374,6 +374,9 @@ class LearningSection:
     # （041505 の車速の行間の揺れ 0.02〜0.19 km/h）。
     # 効く先: 車速の細かい揺れで開度を動かさない。次の手順2 実機の後に決め直す
     ramp_dev_deadband_kmh: float = 0.5
+    # 2026-10-31 段2b（ProblemReport_20261031_停止間際 D1）: True で、効きの強さが無い周期は
+    # 最小刻みの代わりに G 比例で動かす（根拠は yaml）
+    ramp_gprop_without_sensitivity: bool = False
     # アクチュエータが指令に追いつかない間は基準を待たせ始める |指令 − 実開度| [%]。仮の値（表の
     # 開度のマス幅 2% に合わせた）。送り方を手順3 と同じにしたので通常はほぼ働かない安全網。
     # 次の手順2 実機の後に決め直す
@@ -504,6 +507,39 @@ class LearningSection:
     # 2026-10-31: 0.2 → 0.35（ramp_g_levels の最強段）。0.25・0.35G も一定 G のまま停車まで行くのは
     # 危険なため、全段で停止前の戻しに入れる（ユーザー判断。ProblemReport_20261031_停止間際）
     stop_release_max_g: float = 0.35
+    # 2026-10-31 段2（ProblemReport_20261031_停止間際 B）: 停止の手前の測定（一定 G で停車まで下りる
+    # G ランプ）。手順2 の G ランプは 7.5 km/h を切ると停止前の戻しに入るため、一定 G のまま停車まで
+    # 減速するデータが無く、停止側の表（fwd_map の stop_accel）は 0〜5 km/h の深いブレーキが
+    # 全部範囲外。
+    # true なら G ランプの 4 本（G ごとに counts 本。パターン列の先頭＝手順2 では 2-0 ペダル探索・
+    # 4 点の保持の後）を足す。上りは accel_g、下りは target_g（停止前の戻し・下りの戻し・dither・
+    # 途中の保持に入らない）、RAMP_DOWN は停車まで一定 G。
+    # g_levels は ramp_g_levels の段から（ユーザー決定 2026-10-31）、counts は各 G の本数
+    # （0.125 G だけ 2 回）、accel_g は上りの G（全部これ。ユーザー案）、hold_s は上端の保持秒
+    # （ユーザー案）。settle_s は上端の車速に使う仮値（ブレーキの遅れの約 6 倍。根拠は薄い）:
+    # top ＝ ceil((stop_release_start_kmh ＋ G × G_TO_KMHS ×
+    # (ramp_turn_time_s ÷ 2 ＋ settle_s)) ÷ 5) × 5
+    # （切り替えで減速が立ち上がる間に進むぶんを見込み、7.5 km/h を切る前に一定 G に着かせる）。
+    # max_g はこれを超える g_levels・accel_g を読み込みエラーにする
+    # （ユーザー決定「0.125 G まで可」。強い G で一定のまま停車まで行くのは危険）。
+    # 手順14 は enabled に関係なくこの本（g_levels × counts）だけ走る
+    # 2026-10-31 ユーザー決定: 上限 0.125 → 0.15 G（W 1794 s の最後の 1 秒が約 0.147 G。
+    # 12〜16% のマスを測るため）。0.125 → 1 回、0.15 → 2 回
+    stop_approach_enabled: bool = False
+    stop_approach_g_levels: list[float] = field(default_factory=lambda: [0.045, 0.08, 0.125, 0.15])
+    stop_approach_counts: list[int] = field(default_factory=lambda: [1, 1, 1, 2])
+    stop_approach_accel_g: float = 0.125
+    stop_approach_hold_s: float = 5.0
+    stop_approach_settle_s: float = 1.0
+    stop_approach_max_g: float = 0.15
+    # 2026-10-31 段2d（ProblemReport_20261031_停止間際 案1・ユーザー決定）: true で、停止側の表の
+    # しきい値（stop_min_s）に届かないマスも捨てず、秒数の重みで今の値（穴埋め／のばした値）と混ぜる
+    # （fwd_map.blend_sub_min）。既定 false ＝ 今と完全に同じ。手順2・手順14 の停止側の表に効く。
+    stop_table_sub_min_weight: bool = False
+    # 2026-10-31 段4b（ProblemReport_20261031_停止間際 案1・ユーザー決定）: 発進側の表にも同じ
+    # 「しきい値に届かないマスを重みで使う」を入れる（launch_min_s・launch_accel_min_s 未満）。
+    # 既定 false ＝ 今と完全に同じ。手順2 の発進側の表に効く。
+    launch_table_sub_min_weight: bool = False
     # 2026-10-23 段5-8: 停車まぎわ除外（C8 系の学習から外す行）の外し方。"depth" ＝ 今まで
     # （fwd_cv.STOP_APPROACH_*: 5 km/h 未満かつ u <= −8% の行）、
     # "none" ＝ 外さない、"window" ＝ 加速度を作る窓
@@ -805,6 +841,15 @@ class ForwardMapSection:
     # 効く先: 停車まぎわの |偏差|>1 の秒数。決める時期: C15 の実機 1〜2 本の後（C12 と比べる）
     stop_lead_enabled: bool = True
     stop_end_p_enabled: bool = True
+    # 2026-10-31 段3（ProblemReport_20261031_停止間際 FB）:
+    # true で、停C の区間（τ を引き直す行）だけ、C10 の P の偏差を先読みの偏差
+    # （Tp 秒先の基準 −（今の車速 ＋ 実測の加速度 × Tp）。保持の場面の段13 と同じ式）にする。
+    # Tp ＝ pkl meta brake_lag_s ＋ decel_stop.slope_window_s ÷ 2、
+    # 加速度は直近 slope_window_s の車速の傾き。実測の加速度が基準どおりなら今と同じ。C13 が有効な
+    # candidate では使わない。根拠: U 1098 s（`202357`）で基準 −2.56 に実測 −3.0 km/h/s が続き、
+    # 偏差が −0.6 まで広がってから P が戻した。効く先: 停車まぎわのブレーキ。
+    # 決める時期: 段3 の実機 3 モード。既定 false ＝ 今と完全に同じ。ログ: stop_pred_dev_kmh
+    stop_end_accel_pred_enabled: bool = False
     # 2026-10-23 段6-2（C15 の停C）: true なら停C の τ ＝ min(普段のブレーキ側の τ, 基準が 0 に
     # なるまでの残り時間)。今の停C は τ を「残り時間（下限 ブレーキの遅れ）」にするので、残り時間が
     # 普段の τ（c × 遅れ）より長いときは普段より弱くなる。それを防ぐ。根拠: 段6 の議論（停車前の
@@ -855,6 +900,14 @@ class ForwardMapSection:
     # いて、本体はクリープを知らない（7.75% で表 −1.1・実測 +0.39 km/h/s）。
     # 既定 false ＝ 今と完全に同じ。効く先: 7.5 km/h 未満の離す向きの指令。決める時期: 段6 の実機
     low_speed_release_stop_layer: bool = False
+    # 2026-10-31 段1（ProblemReport_20261031_停止間際 A）: true で、停車へ向かう低速の行（基準が
+    # stop_max_speed_kmh 未満で、creep_floor_lead_s 以内に基準が停車速度以下になる行。
+    # 停C と同じ定義）を
+    # 本体の戻しの表で解き直さず、停止側の表のまま解く。根拠: W 385 s（`180014`）で停車 1.2 s 前に
+    # 戻しの表へ切り替え 8.44 → 7.54% に浅くし、クリープで 0.95 → 1.41 km/h に上がり直した
+    # （停止側の表は 7.54% で −0.05 km/h/s と実測に近い）。効く先: 停車の直前のブレーキ。
+    # 決める時期: 段1 の実機 3 モード。既定 false ＝ 今と完全に同じ
+    stop_approach_keep_stop_table: bool = False
     # 2026-10-28 段4 (ア): true で、C10（P と DOB の上乗せ）の差を、pkl meta の局所の効きの倍率
     # （local_gain_brake / local_gain_accel。手順2 の dither から。効き始めからの開度 × 車速の表）で
     # 割る。倍率は 1 以上・表の外・7.5 km/h 未満・meta なしは 1（今と同じ）。ペダル別のキー。
@@ -1943,6 +1996,27 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         "learning.stop_release_escape_decel_kmhs は 0 以上",
     )
     need(lr8.stop_release_max_g > 0.0, "learning.stop_release_max_g は正値")
+    # 2026-10-31 段2: 停止の手前の測定（昇順でなくてよい。max_g 以下）
+    sa_lv, sa_n = lr8.stop_approach_g_levels, lr8.stop_approach_counts
+    need(lr8.stop_approach_max_g > 0.0, "learning.stop_approach_max_g は正値")
+    need(
+        len(sa_lv) > 0 and len(sa_lv) == len(sa_n)
+        and all(g > 0.0 for g in sa_lv) and all(n > 0 for n in sa_n),
+        f"learning.stop_approach_g_levels と stop_approach_counts は空でなく同じ長さで、"
+        f"g は正・本数は 1 以上: {sa_lv} / {sa_n}",
+    )
+    need(
+        all(g <= lr8.stop_approach_max_g + 1e-9 for g in sa_lv),
+        f"learning.stop_approach_g_levels は stop_approach_max_g（{lr8.stop_approach_max_g}）"
+        f"以下: {sa_lv}",
+    )
+    need(
+        0.0 < lr8.stop_approach_accel_g <= lr8.stop_approach_max_g + 1e-9,
+        f"learning.stop_approach_accel_g は正で stop_approach_max_g"
+        f"（{lr8.stop_approach_max_g}）以下: {lr8.stop_approach_accel_g}",
+    )
+    need(lr8.stop_approach_hold_s >= 0.0, "learning.stop_approach_hold_s は 0 以上")
+    need(lr8.stop_approach_settle_s >= 0.0, "learning.stop_approach_settle_s は 0 以上")
     need(
         lr8.stop_approach_exclusion in ("depth", "window", "none"),
         "learning.stop_approach_exclusion は depth か window か none",

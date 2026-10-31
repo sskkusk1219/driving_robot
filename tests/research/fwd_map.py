@@ -60,7 +60,13 @@ MODELS_DIR = Path("tests/research/results/models")
 POINT_MEASURED = 0  # 実測（秒数が min_s 以上のマス）
 POINT_FILLED = 1  # 穴埋め（両隣の実測点から直線）
 POINT_OUT = 2  # 範囲外（実測の範囲の外側。端の値で止めた点）
-POINT_LABELS = {POINT_MEASURED: "実測", POINT_FILLED: "穴埋め", POINT_OUT: "範囲外"}
+# 2026-10-31 段2d（ProblemReport_20261031_停止間際 案1・ユーザー決定）: しきい値 min_s に届かない
+# マスを、秒数の重みで今の値と混ぜた点（blend_sub_min）。表示用（表を引く計算は種類を使わない。
+# 計画の flag にはそのまま入るので fwd_plan が FLAG_MEASURED に読み替える）
+POINT_WEIGHTED = 3
+POINT_LABELS = {
+    POINT_MEASURED: "実測", POINT_FILLED: "穴埋め", POINT_OUT: "範囲外", POINT_WEIGHTED: "重みつき",
+}
 
 DEFAULT_U_STEP_PCT = 2.0  # 仮値（段2f の集計で決めた刻み）
 DEFAULT_MIN_S = 1.0  # 仮値: 穴とみなす秒数（少ない行の中央値を信じない）
@@ -775,6 +781,15 @@ def refine_u_grid(table: ForwardTable, u_step_pct: float) -> ForwardTable:
     )
 
 
+def blend_sub_min(a: float, s: float, f0: float, min_s: float) -> float:
+    """しきい値 min_s に届かないマス（秒数 s・実測の中央値 a）を、捨てたときの値 f0（穴埋め／
+    のばした値）と秒数の重みで混ぜた値 ＝ (s·a + min_s·f0) ÷ (s + min_s)
+    （2026-10-31 段2d。ProblemReport_20261031_停止間際 案1・ユーザー決定）。
+    s = 0 なら f0（今と同じ）。s が大きいほど a に寄る。s ≥ min_s のマスは実測をそのまま使うので
+    この関数は通らない。本体の表（build_table）・発進側にも後で使える共通の重み。"""
+    return (s * a + min_s * f0) / (s + min_s)
+
+
 def _side_arrays(
     table: ForwardTable,
     rows: FwdRows,
@@ -786,6 +801,7 @@ def _side_arrays(
     keep_stationary: bool,
     base_accel: np.ndarray | None = None,
     base_kind: np.ndarray | None = None,
+    sub_min_weight: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[int], float] | None:
     """発進側・停止側の配列を作る（2026-10-18 段2o-10）。作れなければ None。
 
@@ -805,6 +821,11 @@ def _side_arrays(
     base_accel・base_kind（2026-10-20 段4-3）: 置き換える前の配列・点の種類。省略は本体
     （table.accel_grid・point_kind）。行が足りずに置き換えない車速の行はこの配列のまま残り、
     実測の外側をつなぐ傾きもこの配列から取る（停止側の戻しの層は一つ下の層を渡す）。
+    sub_min_weight（2026-10-31 段2d。既定 False ＝ 今と同じ）: True で、秒数が 0 より大きく
+    min_s 未満のマスも捨てない。上の手順で行を作ったあと、そのマスの u での今の行の値 f0 と
+    マスの中央値 a・秒数 s から v ＝ blend_sub_min(a, s, f0, min_s) を「重みつきの点」（重み＝s、
+    種類 POINT_WEIGHTED）にし、実測点と合わせて 3.〜5. をやり直す。実測点が 2 つ未満の行の判定は
+    実測点だけで行う（重みつきの点は数えない＝今と同じ行だけ置き換える）。
     """
     edges, grid = table.speed_edges, table.u_grid
     base_accel = table.accel_grid if base_accel is None else base_accel
@@ -831,15 +852,20 @@ def _side_arrays(
         pu: list[float] = []
         pa: list[float] = []
         pw: list[float] = []
+        sub: list[tuple[float, float, float]] = []  # (u, 中央値 a, 秒数 s)。min_s 未満のマス
         if sel.any():
             ks = uc[sel]
             for k in np.unique(ks):
                 m = ks == k
                 sec = float(r_all.dt_row_s[sel][m].sum())
+                cu = float(u_grid_points(int(k), int(k), SIDE_U_STEP_PCT)[0])
+                ca = float(np.median(r_all.accel_kmhs[sel][m]))
                 if sec >= min_s:
-                    pu.append(float(u_grid_points(int(k), int(k), SIDE_U_STEP_PCT)[0]))
-                    pa.append(float(np.median(r_all.accel_kmhs[sel][m])))
+                    pu.append(cu)
+                    pa.append(ca)
                     pw.append(sec)
+                elif sub_min_weight and sec > 0.0:
+                    sub.append((cu, ca, sec))
         meas_u = np.array(pu)
         if zero_deep:
             assert breakaway_u_pct is not None  # noqa: S101
@@ -848,27 +874,50 @@ def _side_arrays(
             pw.append(1.0)
         if len(pu) < 2:
             continue
-        order = np.argsort(pu, kind="stable")
-        xu, xa, xw = np.array(pu)[order], np.array(pa)[order], np.array(pw)[order]
-        iso = IsotonicRegression(increasing=True).fit_transform(xu, xa, sample_weight=xw)
-        lo, hi = float(xu[0]), float(xu[-1])
         body = np.interp(grid, grid, base_accel[r])
-        b_lo, b_hi = float(np.interp(lo, grid, body)), float(np.interp(hi, grid, body))
-        val = np.interp(grid, xu, iso)
+
+        def build_row(
+            xu0: list[float], xa0: list[float], xw0: list[float],
+            *, _body: np.ndarray = body, _zero_deep: bool = zero_deep,
+        ) -> np.ndarray:
+            order = np.argsort(xu0, kind="stable")
+            xu, xa, xw = np.array(xu0)[order], np.array(xa0)[order], np.array(xw0)[order]
+            iso = IsotonicRegression(increasing=True).fit_transform(xu, xa, sample_weight=xw)
+            lo, hi = float(xu[0]), float(xu[-1])
+            b_lo, b_hi = float(np.interp(lo, grid, _body)), float(np.interp(hi, grid, _body))
+            val = np.interp(grid, xu, iso)
+            below, above = grid < lo - _EPS, grid > hi + _EPS
+            if _zero_deep:
+                val[below] = max(float(iso[0]), 0.0)
+            else:
+                val[below] = iso[0] + np.minimum(_body[below] - b_lo, 0.0)
+            val[above] = iso[-1] + np.maximum(_body[above] - b_hi, 0.0)
+            if _zero_deep:
+                val = np.maximum(val, 0.0)
+            return IsotonicRegression(increasing=True).fit_transform(grid, val)
+
+        row = build_row(pu, pa, pw)
+        sub_u = np.array([x[0] for x in sub])
+        if sub:
+            # 重みつきの点: そのマスの u での今の行の値 f0 と実測の中央値を秒数の重みで混ぜる
+            for cu, ca, sec in sub:
+                f0 = float(np.interp(cu, grid, row))
+                pu.append(cu)
+                pa.append(blend_sub_min(ca, sec, f0, min_s))
+                pw.append(sec)
+            row = build_row(pu, pa, pw)
+        out[r] = row
+        xs = np.array(pu)
+        lo, hi = float(xs.min()), float(xs.max())
         below, above = grid < lo - _EPS, grid > hi + _EPS
-        if zero_deep:
-            val[below] = max(float(iso[0]), 0.0)
-        else:
-            val[below] = iso[0] + np.minimum(body[below] - b_lo, 0.0)
-        val[above] = iso[-1] + np.maximum(body[above] - b_hi, 0.0)
-        if zero_deep:
-            val = np.maximum(val, 0.0)
-        out[r] = IsotonicRegression(increasing=True).fit_transform(grid, val)
-        near = (
-            np.min(np.abs(grid[:, None] - (meas_u if len(meas_u) else np.array([np.inf]))[None]),
-                   axis=1)
-            <= SIDE_U_STEP_PCT + _EPS
-        )
+
+        def near_of(us: np.ndarray) -> np.ndarray:
+            if not len(us):
+                return np.zeros(len(grid), dtype=bool)
+            return np.min(np.abs(grid[:, None] - us[None]), axis=1) <= SIDE_U_STEP_PCT + _EPS
+
+        near = near_of(meas_u)
+        near_sub = near_of(sub_u) & ~near
         if zero_deep:
             near |= np.abs(grid - float(breakaway_u_pct or 0.0)) <= SIDE_U_STEP_PCT + _EPS
             near |= grid <= float(breakaway_u_pct or 0.0)
@@ -876,6 +925,7 @@ def _side_arrays(
         kind[~below & ~above] = POINT_FILLED
         if zero_deep:
             kind[below] = POINT_FILLED
+        kind[near_sub & (~below | zero_deep)] = POINT_WEIGHTED
         kind[near & (~below | zero_deep)] = POINT_MEASURED
         kind_out[r] = kind
         used.append(int(r))
@@ -894,6 +944,7 @@ def attach_launch(
     min_s: float = LAUNCH_MIN_S,
     min_total_s: float = LAUNCH_MIN_TOTAL_S,
     accel_window_s: float = math.nan,
+    sub_min_weight: bool = False,
 ) -> ForwardTable:
     """発進側の加速度（launch_accel）を付けた新しい表を返す（2026-10-14 段2o-4、10-18 段2o-10 で
     作り直し）。
@@ -905,6 +956,8 @@ def attach_launch(
     動いている行の合計秒数が min_total_s 未満、または置き換えられる行が無いときも None。
     breakaway（`fwd_data.launch_breakaway`）があれば車速 0 付近の行の深い側を 0 で埋める。
     元の表は書き換えない。accel_window_s は発進側の行を作ったときの加速度の窓で、meta に残すだけ。
+    sub_min_weight（2026-10-31 段4b。停止間際 案1・ユーザー決定。既定 False ＝ 今と同じ）:
+    True で、min_s に届かないマスも秒数の重みで使う（`_side_arrays`。停止側と同じ）。
     """
     moving_s = (
         float(np.sum(launch_rows.dt_row_s[launch_rows.speed_kmh >= STOP_SPEED_KMH]))
@@ -917,6 +970,7 @@ def attach_launch(
         launch_min_s=min_s,
         launch_accel_window_s=accel_window_s,
         launch_u_step_pct=SIDE_U_STEP_PCT,
+        launch_sub_min_weight=bool(sub_min_weight),  # 2026-10-31 段4b: min_s 未満のマスも重みで使う
         low_speed_margin_kmh=margin_kmh,
         launch_breakaway_u_pct=None if breakaway is None else breakaway.u_pct,
         launch_breakaway_source=None if breakaway is None else breakaway.source,
@@ -928,6 +982,7 @@ def attach_launch(
     res = _side_arrays(
         table, launch_rows, creep_speed_kmh=creep_speed_kmh, margin_kmh=margin_kmh, min_s=min_s,
         breakaway_u_pct=None if breakaway is None else breakaway.u_pct, keep_stationary=True,
+        sub_min_weight=sub_min_weight,
     )
     if res is None:
         return none
@@ -954,6 +1009,7 @@ def apply_launch_accel_measured(
     cell_pct: float = LAUNCH_ACCEL_CELL_PCT,
     min_s: float = LAUNCH_ACCEL_MIN_S,
     split_kmh: float = LAUNCH_ACCEL_SPLIT_KMH,
+    sub_min_weight: bool = False,
 ) -> ForwardTable:
     """発進側の表のアクセル側（u > 0 の格子）を作り直した新しい表を返す（2026-10-22 段5-3）。
 
@@ -967,6 +1023,9 @@ def apply_launch_accel_measured(
     - 帯の上端 ≦ split_kmh の行: u > 0 の各格子で max(その行の u = 0 の値, 本体の同じ u の値)。
     - 最後にアクセル側だけ u について単調（非減少）にそろえ、ブレーキ側（u ≦ 0）の最大値（u = 0 に
       いちばん近い格子の値）を下回らないようにする。ブレーキ側は変えない。
+    sub_min_weight（2026-10-31 段4b。既定 False ＝ 今と同じ）: True で、秒数が 0 より大きく
+    min_s 未満のマスも捨てず、そのマスの u での（そのマスを除いた）線の値 f0 と中央値 a・秒数 s から
+    blend_sub_min(a, s, f0, min_s) を点にして線を引き直す（点が 1 つも無い行は今のまま）。
     meta: launch_accel_side_source（"measured"）・launch_accel_measured（行の代表車速 →
     [[u, 加速度, 秒], …]）・launch_accel_cell_pct・launch_accel_min_s・launch_accel_split_kmh。
     """
@@ -977,6 +1036,7 @@ def apply_launch_accel_measured(
         launch_accel_cell_pct=cell_pct,
         launch_accel_min_s=min_s,
         launch_accel_split_kmh=split_kmh,
+        launch_accel_sub_min_weight=bool(sub_min_weight),
     )
     targets = [float(x) for x in meta.get("launch_speed_rows", [])]
     if table.launch_accel is None or not targets:
@@ -1000,6 +1060,7 @@ def apply_launch_accel_measured(
         elif lo_edge >= split_kmh - _EPS:
             sel = (rows.speed_kmh >= lo_edge) & (rows.speed_kmh < hi_edge) & (rows.u_pct > 0.0)
             pts: list[tuple[float, float, float]] = []
+            sub: list[tuple[float, float, float]] = []  # min_s 未満のマス（sub_min_weight 用）
             if sel.any():
                 u_s, a_s, dt_s = rows.u_pct[sel], rows.accel_kmhs[sel], rows.dt_row_s[sel]
                 cells = u_cell(u_s, cell_pct)
@@ -1008,16 +1069,32 @@ def apply_launch_accel_measured(
                     sec = float(dt_s[m].sum())
                     if sec >= min_s:
                         pts.append((float(np.median(u_s[m])), float(np.median(a_s[m])), sec))
+                    elif sub_min_weight and sec > 0.0:
+                        sub.append((float(np.median(u_s[m])), float(np.median(a_s[m])), sec))
             measured[f"{table.speed_rep[r]:g}"] = [[u, a, sec] for u, a, sec in pts]
             if not pts:
                 continue
-            xu = np.array([0.0] + [p[0] for p in pts])
-            xa = np.array([creep] + [p[1] for p in pts])
-            u_last, a_last = xu[-1], xa[-1]
-            b_last = float(np.interp(u_last, grid, body))
-            inside = np.interp(grid, xu, xa)
-            beyond = a_last + (body - b_last)
-            val = np.where(pos, np.where(grid > u_last + _EPS, beyond, inside), row)
+
+            def line(
+                ps: list[tuple[float, float, float]], *, _creep: float = creep,
+                _body: np.ndarray = body, _row: np.ndarray = row,
+            ) -> np.ndarray:
+                xu = np.array([0.0] + [p[0] for p in ps])
+                xa = np.array([_creep] + [p[1] for p in ps])
+                u_last, a_last = xu[-1], xa[-1]
+                b_last = float(np.interp(u_last, grid, _body))
+                inside = np.interp(grid, xu, xa)
+                beyond = a_last + (_body - b_last)
+                return np.where(pos, np.where(grid > u_last + _EPS, beyond, inside), _row)
+
+            val = line(pts)
+            if sub:
+                # 重みつきの点: そのマスの u での今の線の値 f0 と実測の中央値を秒数の重みで混ぜる
+                allp = list(pts)
+                for cu, ca, sec in sub:
+                    allp.append((cu, blend_sub_min(ca, sec, float(np.interp(cu, grid, val)),
+                                                   min_s), sec))
+                val = line(sorted(allp, key=lambda p: p[0]))
         else:
             continue  # 帯が split_kmh をまたぐ行は今のまま
         acc_part = IsotonicRegression(increasing=True).fit_transform(grid[pos], val[pos])
@@ -1041,6 +1118,7 @@ def attach_stop(
     min_s: float = LAUNCH_MIN_S,
     min_total_s: float = LAUNCH_MIN_TOTAL_S,
     accel_window_s: float = math.nan,
+    sub_min_weight: bool = False,
 ) -> ForwardTable:
     """停止側の加速度（stop_accel）を付けた新しい表を返す（2026-10-18 段2o-10）。
 
@@ -1061,6 +1139,7 @@ def attach_stop(
         stop_min_s=min_s,
         stop_accel_window_s=accel_window_s,
         stop_u_step_pct=SIDE_U_STEP_PCT,
+        stop_sub_min_weight=bool(sub_min_weight),  # 2026-10-31 段2d: min_s 未満のマスも重みで使う
         stop_max_speed_kmh=0.0,
         low_speed_margin_kmh=margin_kmh,
     )
@@ -1069,7 +1148,7 @@ def attach_stop(
         return none
     res = _side_arrays(
         table, stop_rows, creep_speed_kmh=creep_speed_kmh, margin_kmh=margin_kmh, min_s=min_s,
-        breakaway_u_pct=None, keep_stationary=False,
+        breakaway_u_pct=None, keep_stationary=False, sub_min_weight=sub_min_weight,
     )
     if res is None:
         return none

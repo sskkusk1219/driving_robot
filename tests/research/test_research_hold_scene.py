@@ -23,6 +23,8 @@ from tests.research.hold_scene import (
     lead_in_ff_pct,
     min_scene_length_s,
     predicted_deviation,
+    predicted_deviation_current_g,
+    predicted_deviation_floor0,
     slope_threshold_kmhs,
 )
 from tests.research.test_research_mode_drive import _c7_cfg, _held_stub, _mode
@@ -337,6 +339,16 @@ def test_pi_deadband_still_uses_dev_with_p_dev() -> None:
     assert pi.integral == pytest.approx(0.14 * 0.5 * 0.05)
 
 
+def test_predicted_deviation_floor0_stops_predicted_speed_at_zero() -> None:
+    # 2026-10-31 段3b: 1.98 + (-4.5)*0.655 < 0 → 予測車速は 0。偏差 ＝ 基準 − 0
+    assert predicted_deviation_floor0(0.0, 1.98, -4.5, 0.655) == pytest.approx(0.0)
+    assert predicted_deviation_floor0(0.3, 1.98, -4.5, 0.655) == pytest.approx(0.3)
+    # 負にならない入力は predicted_deviation と同じ
+    assert predicted_deviation_floor0(1.6, 1.0, 1.5, 0.4) == pytest.approx(
+        predicted_deviation(1.6, 1.0, 1.5, 0.4)
+    )
+
+
 def test_predicted_deviation_formula() -> None:
     assert predicted_deviation(1.6, 1.0, 1.5, 0.4) == pytest.approx(1.6 - (1.0 + 0.6))
     assert predicted_deviation(1.6, 1.6, 0.0, 0.4) == pytest.approx(0.0)
@@ -360,3 +372,13 @@ def test_hold_accel_pred_default_false_and_needs_hold_pi() -> None:
     assert any("hold_accel_pred_enabled" in e for e in cfgmod.validate_config(cfg))
     cfg.forward_map.hold_pi_enabled = True
     assert not any("hold_accel_pred_enabled" in e for e in cfgmod.validate_config(cfg))
+
+
+def test_predicted_deviation_current_g() -> None:
+    # 基準の G と実測の G が同じ: 今の偏差（基準 − 車速）
+    assert predicted_deviation_current_g(10.0, -3.0, 9.0, -3.0, 0.5) == pytest.approx(1.0)
+    # 実測が基準より強い減速: 遅すぎ側（正）
+    assert predicted_deviation_current_g(10.0, -3.0, 9.0, -5.0, 0.5) == pytest.approx(2.0)
+    # 2026-10-31 段3d: 基準か車速が Tp 後に 0 以下と予測されたら今の偏差（基準 − 車速）
+    assert predicted_deviation_current_g(1.0, -4.0, 2.0, -4.0, 0.5) == pytest.approx(-1.0)
+    assert predicted_deviation_current_g(0.3, 0.0, 1.0, -4.0, 0.5) == pytest.approx(-0.7)

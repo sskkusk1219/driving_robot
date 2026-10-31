@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import sys
 import time
 from collections.abc import Awaitable, Callable
@@ -95,11 +96,15 @@ from tests.research.mode_report import RunInfo, rows_from_samples, write_mode_re
 from tests.research.pattern_drive import (
     DriveError,
     build_ff_model,
+    rebuild_stop_side,
     require_forward_candidate,
     run_pattern_drive,
+    stop_approach_patterns,
 )
+from tests.research.pattern_loop import GRampPattern
 from tests.research.pedal_arbiter import enabled_arbiter_features
 from tests.research.pedal_search import (
+    PedalSearchResult,
     hold_breakaway_pct,
     hold_opening_meta,
     run_pedal_search,
@@ -109,13 +114,14 @@ from tests.research.ramp_planner import (
     count_bands_for_modes,
     cruise_kwargs,
     format_plan_table,
+    format_stop_approach,
     plan_ramps,
     top_speed_cap_kmh,
 )
-from tests.research.research_types import DrivingMode
+from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, DrivingMode
 from tests.research.step2_check import Step2CheckError, check_fel_coverage, format_checks
 from tests.research.term import banner, display_width, say
-from tests.research.vehicle import STROKE_LIMIT_PULSE
+from tests.research.vehicle import STROKE_LIMIT_PULSE, feedforward_params, opening_to_pulse
 
 DEFAULT_CONFIG = Path("tests/research/config_testVehicle.yaml")
 
@@ -405,6 +411,9 @@ async def step2_pattern_drive(ctx: RunContext) -> None:
     say(f"G ランプの段（モード: {', '.join(cfg.modes.coverage_mode_names)}、"
         f"最高速 {top_cap:.1f} km/h）:")
     say(format_plan_table(plan))
+    approach_text = format_stop_approach(cfg)  # 2026-10-31 段2: 停止の手前の測定（別行の説明）
+    if approach_text:
+        say(approach_text)
     if not plan.levels:
         say("警告: 走る段が 1 つもありません（ramp_g_levels・ramp_mode_min_s を確認）")
     candidate = cfg.feedforward.candidate
@@ -672,6 +681,179 @@ async def step13_hold_points(ctx: RunContext) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 手順 14: 停止の手前の測定（2026-10-31 段2。ProblemReport_20261031_停止間際 B）
+# ─────────────────────────────────────────────────────────────────────
+
+
+def stop_pkl_path(model_path: str | Path) -> Path:
+    """手順14 の保存先: 元の pkl と同じ場所の `<元の stem>_stop.pkl`。"""
+    src = Path(model_path)
+    return src.with_name(f"{src.stem}_stop{src.suffix}")
+
+
+def _pkl_source_csvs(meta: dict, results_dir: Path) -> list[Path]:
+    """pkl の meta `sources`（学習に使った CSV 名。'+' かカンマ区切りの文字列、または list）を
+    results_dir 内のパスにする。"""
+    raw = meta.get("sources")
+    if isinstance(raw, str):
+        names = [n for part in raw.split("+") for n in part.split(",")]
+    elif raw:
+        names = [str(n) for n in raw]
+    else:
+        names = []
+    return [results_dir / n.strip() for n in names if n.strip()]
+
+
+async def prepare_step14(ctx: RunContext) -> None:
+    """走行前チェックの前に、今の pkl とその学習に使った CSV があり、保存先がまだ無いことを
+    確かめる（ハードを動かす前に止める）。"""
+    cfg = ctx.config
+    model_path = cfg.feedforward.model_path
+    if not Path(model_path).exists():
+        raise ConfigError(f"feedforward.model_path の pkl がありません: {model_path}")
+    meta = load_forward_map(Path(model_path)).meta
+    sources = _pkl_source_csvs(meta, cfg.results_path)
+    if not sources:
+        raise ConfigError(f"pkl の meta に sources（学習に使った CSV）がありません: {model_path}")
+    missing = [p for p in sources if not p.exists()]
+    if missing:
+        raise ConfigError(
+            "pkl の学習に使った CSV が results にありません: " + ", ".join(str(p) for p in missing)
+        )
+    if meta.get("launch_rows_to_stop_max") or meta.get("side_row_speed_rep") == "data":
+        raise ConfigError(
+            "この pkl は launch_rows_to_stop_max か side_row_speed_rep: data で作られていて、"
+            f"停止側だけの作り直しは使えません: {model_path}"
+        )
+    out = stop_pkl_path(model_path)
+    if out.exists():
+        raise ConfigError(f"保存先 {out} が既にあります（上書きしません）")
+
+
+def _stub_like_pedal(cfg: ResearchConfig) -> PedalSearchResult:
+    """ペダル探索をしない手順14 の 2-0 の代わり。クリープ車速・停車保持の開度は yaml の値
+    （手順2 が書いたもの）から作る（`ramp_stub_run._stub_pedal` と同じ形）。"""
+    hold = cfg.stop_brake_opening_pct  # min ＋ feedforward.stop_brake_offset_pct
+    return PedalSearchResult(
+        creep_speed_kmh=feedforward_params(cfg).creep_speed_kmh,
+        stop_confirm_pct=hold - cfg.pedal_search.stop_hold_margin_pct,
+        stop_brake_opening_pct=hold,
+        brake_min_pct=cfg.vehicle.min_brake_opening_pct,
+    )
+
+
+def _down_seconds_in_stop_band(csv_path: Path, n_patterns: int) -> dict[int, float]:
+    """CSV の PATTERN_DRIVE の RAMP_DOWN で、実車速が 0.5〜7.5 km/h だった秒数をパターン番号
+    （1 始まり）ごとに返す。秒数は行の elapsed_s の差（1 秒を超える欠けは数えない）。"""
+    out: dict[int, float] = {}
+    prev: tuple[int, float] | None = None
+    with csv_path.open(encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                t = float(row["elapsed_s"])
+                v = float(row["actual_speed_kmh"])
+                idx = int(row["pattern"].split(":")[0])
+            except (KeyError, ValueError):
+                prev = None
+                continue
+            if row.get("section") == "PATTERN_DRIVE" and row.get("phase") == "RAMP_DOWN":
+                if prev is not None and prev[0] == idx and 0.5 <= v < 7.5:
+                    out[idx] = out.get(idx, 0.0) + min(max(0.0, t - prev[1]), 1.0)
+                prev = (idx, t)
+            else:
+                prev = None
+    return {i: out.get(i, 0.0) for i in range(1, n_patterns + 1)}
+
+
+def _stop_measured_counts(table) -> list[tuple[float, int]]:
+    """停止側の表の「実測」マス数（車速の行ごと、ブレーキ側＝u < 0）。停止側が無ければ空。"""
+    from tests.research.fwd_map import POINT_MEASURED  # noqa: PLC0415
+
+    if table.stop_kind is None:
+        return []
+    neg = table.u_grid < 0.0
+    top = float(table.meta.get("stop_max_speed_kmh", 0.0))
+    return [
+        (float(table.speed_rep[r]), int((table.stop_kind[r][neg] == POINT_MEASURED).sum()))
+        for r in range(len(table.speed_rep))
+        if table.speed_edges[r] < top
+    ]
+
+
+async def step14_stop_approach(ctx: RunContext) -> None:
+    """停止の手前の測定（一定 G で停車まで下りる G ランプ 4 本）だけを走り、今の pkl
+    （yaml の model_path）の停止側の表を作り直して `<元の stem>_stop.pkl` に保存する。
+
+    ペダル探索はしない（クリープ車速・停車保持の開度は yaml から）。停止側の表は
+    「pkl の sources の CSV の停止側の行 ＋ 今回の CSV の停止側の行」で作り直す
+    （`rebuild_stop_side`）。他の表・meta はそのまま（meta `stop_approach_csv` だけ足す）。
+    yaml へは何も書かない。元の pkl も書き換えない。learning.stop_approach_enabled に関係なく走る。
+    """
+    hw = ctx.require_hardware()
+    cfg = ctx.config
+    model_path = Path(cfg.feedforward.model_path)
+    table = load_forward_map(model_path)
+    sources = _pkl_source_csvs(table.meta, cfg.results_path)
+    patterns = stop_approach_patterns(cfg)
+    pedal = _stub_like_pedal(cfg)
+    log = ctx.session_log
+    # 走行前チェックは停車保持の開度まで踏んで止めた状態で終わる。ブレーキを min へ離すと
+    # クリープで動き出すので離さず、アクセルを待機位置・ブレーキを停車保持の開度に置くだけ
+    say("14-0. アクセルを待機位置、ブレーキを停車保持の開度（min ＋ stop_brake_offset_pct）に置く")
+    v = cfg.vehicle
+    await asyncio.gather(
+        hw.accel.move_to_position(opening_to_pulse(v.min_accel_opening_pct)),
+        hw.brake.move_to_position(opening_to_pulse(pedal.stop_brake_opening_pct)),
+    )
+    waited = 0.0
+    while await hw.can.read_speed() >= VEHICLE_STOP_SPEED_KMH:  # 停車を待つ
+        await asyncio.sleep(0.1)
+        waited += 0.1
+        if waited > 60.0:
+            raise DriveError("停車しません（停車保持の開度で止まらない）")
+    say("14-1. 停止の手前の測定（一定 G で停車まで）")
+    try:
+        drive = await run_pattern_drive(hw, cfg, pedal=pedal, log=log, patterns=patterns)
+    finally:
+        if log is not None:
+            await log.close()  # 失敗してもそこまでのログを残す
+    csv_path = drive.csv_path
+    out = stop_pkl_path(model_path)
+    if out.exists():
+        raise DriveError(f"保存先 {out} が既にあります（上書きしません）")
+    say("14-2. 停止側の表の作り直し（pkl の学習に使った CSV の停止側の行 ＋ 今回の CSV）")
+    old = load_forward_map(model_path)  # 走行中に書き換わっていてもよいよう、元を読み直す
+    new = rebuild_stop_side(
+        old, source_csvs=sources, new_csv=csv_path,
+        creep_speed_kmh=feedforward_params(cfg).creep_speed_kmh,
+        default_opening_source=cfg.learning.side_table_opening_source,
+        default_accel_window_s=cfg.learning.side_table_accel_window_s,
+        sub_min_weight=cfg.learning.stop_table_sub_min_weight,  # 2026-10-31 段2d 案1
+    )
+    saved = save_table(new, out)
+    secs = _down_seconds_in_stop_band(csv_path, len(patterns))
+    say()
+    say("停止の手前の測定の結果:")
+    say("  番号  狙い G(下り)  上端 km/h  0.5〜7.5 km/h を RAMP_DOWN で走った秒")
+    for i, pat in enumerate(patterns, start=1):
+        assert isinstance(pat, GRampPattern)
+        say(f"  {i:>4}  {pat.target_g:12g}  {pat.top_kmh:9g}  {secs.get(i, 0.0):12.1f}")
+    before = _stop_measured_counts(old)
+    after = _stop_measured_counts(new)
+    say("停止側の表の「実測」マス数（ブレーキ側。車速の行ごと）:")
+    say("  行の車速 km/h  作り直す前  作り直した後")
+    for (spd, n_after), n_before in zip(
+        after, [n for _, n in before] + [0] * len(after), strict=False
+    ):
+        say(f"  {spd:13.2f}  {n_before:10d}  {n_after:12d}")
+    if not after:
+        say("  （停止側の表が作れませんでした＝行不足）")
+    say(f"保存: {saved}（元の pkl・yaml の model_path は書き換えていません）")
+    say()
+    say("手順 14 完了。使うには yaml の model_path を保存先へ替えます（自動では替えません）。")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 手順 3: FF のみで WLTP モード走行 → CSV / 図 / レポート
 # ─────────────────────────────────────────────────────────────────────
 
@@ -881,6 +1063,14 @@ STEPS: tuple[Step, ...] = (
         step13_hold_points,
         drives=True,
         prepare=prepare_step13,
+    ),
+    Step(
+        14,
+        "停止の手前の測定（一定 G で停車まで 4 本）だけを走り、今の pkl の停止側の表を作り直して"
+        "別名で保存",
+        step14_stop_approach,
+        drives=True,
+        prepare=prepare_step14,
     ),
 )
 _STEP_BY_NUMBER = {step.number: step for step in STEPS}
