@@ -1525,7 +1525,9 @@ def build_plan(
         switch_lead_s=_lead_extra,
         launch_midway=np.asarray(midway, dtype=bool).copy() if dir_rule else None,
         launch_prep=launch_prep, coast_fill_runs=fill_runs, coast_fill_rows=fill_rows,
-        launch_band=launch_band_rows,
+        # 2026-11-01 発進のブレーキの帯（案 B）の修正: すき間の処理・補償の後の最終の effort が
+        # ブレーキの行だけ印を残す（すき間の 0 の行は印なし → 走行中は計画の FF をそのまま使う）
+        launch_band=None if launch_band_rows is None else (launch_band_rows & (effort < 0.0)),
     )
 
 
@@ -1726,6 +1728,7 @@ def apply_launch_shift(
     mid = None if plan.launch_midway is None else plan.launch_midway.copy()
     sa = None if plan.side_accel is None else plan.side_accel.copy()
     sb = None if plan.side_brake is None else plan.side_brake.copy()
+    lband = None if plan.launch_band is None else plan.launch_band.copy()
     trs = [
         replace(
             track,
@@ -1791,10 +1794,14 @@ def apply_launch_shift(
             mid = _shift_back(mid, a, b, d_best)
             sa = _shift_back(sa, a, b, d_best)
             sb = _shift_back(sb, a, b, d_best)
+            lband = _shift_back(lband, a, b, d_best)
             last_b = b
+    if lband is not None:
+        # 2026-11-01 発進のブレーキの帯（案 B）の修正: 印は最終の effort がブレーキの行だけ
+        lband = lband & (eff < 0.0)
     return replace(
         plan, effort_pct=eff, flag=flag, launch_prep=prep, launch_midway=mid, side_accel=sa,
-        side_brake=sb, launch_shift=stats,
+        side_brake=sb, launch_band=lband, launch_shift=stats,
     )
 
 

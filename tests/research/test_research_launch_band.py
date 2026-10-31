@@ -156,7 +156,10 @@ def test_plan_band_rows_are_brake_only_and_accel_follows() -> None:
     # 区間の中にアクセルの行が無い。ブレーキの行は FF そのもの（-8.5）か、後ろのすき間で 0
     band = on.effort_pct[i0:i1]
     assert (band <= 0.0).all() and band[0] == pytest.approx(-8.5)
-    assert on.launch_band is not None and on.launch_band[i0:i1].all()
+    # 2026-11-01 修正: 印は effort がブレーキの行だけ（終わりのすき間の 0 の行は印なし）
+    assert on.launch_band is not None
+    assert np.array_equal(on.launch_band[i0:i1], on.effort_pct[i0:i1] < 0.0)
+    assert on.launch_band[i0]
     assert not on.launch_band[:i0].any() and not on.launch_band[i1:].any()
     assert on.launch_prep[i0:i1].all()
     # 離しの時刻: off は動き出しの前（t0 の前の行）に min へ切るが、on は帯の終わり近くまでブレーキ
@@ -224,6 +227,58 @@ def test_plan_launch_band_needs_release_ramp() -> None:
     spec = LaunchBandSpec(((8.05, 0.5),), lambda t: 8.5)
     with pytest.raises(ValueError, match="launch_release_ramp"):
         plan_for(_weak, 16.0, _tb(), launch_band=spec)
+
+
+def _band_gap_rows(tight: bool):
+    ivs = _bands(_weak, 16.0)
+    spec = LaunchBandSpec(tuple((iv.start_s, iv.length_s) for iv in ivs), lambda t: 8.5)
+    on = _plan(_weak, spec, launch_gap_tight=tight)
+    i1 = int(round(ivs[0].start_s / DT)) + int(round(ivs[0].length_s / DT))
+    return on, i1
+
+
+def test_plan_band_gap_rows_have_no_mark_and_zero_effort() -> None:
+    # 2026-11-01 修正 (a): tight on・off とも、帯の終わりのすき間（ブレーキの後・アクセルの前）は
+    # 印なしで effort 0
+    for tight in (False, True):
+        on, i1 = _band_gap_rows(tight)
+        last_b = int(np.flatnonzero(on.launch_band)[-1])
+        first_a = int(np.flatnonzero(on.effort_pct[last_b:] > 0.0)[0]) + last_b
+        gap = np.arange(last_b + 1, first_a)
+        assert len(gap) >= 1, tight
+        assert (on.effort_pct[gap] == 0.0).all() and not on.launch_band[gap].any()
+
+
+def test_plan_band_mark_is_brake_only_and_survives_shift() -> None:
+    # (b) 最終の計画で 印 かつ effort >= 0 の行は無い。他の発進のずらしを通しても同じ
+    for tight in (False, True):
+        on, _ = _band_gap_rows(tight)
+        assert int(np.count_nonzero(on.launch_band & (on.effort_pct >= 0.0))) == 0
+    ivs = _bands(_weak, 16.0)
+    spec = LaunchBandSpec(tuple((iv.start_s, iv.length_s) for iv in ivs), lambda t: 8.5)
+    kw = {"predict_low_speed_sides": True, "launch_shift_choose": True}
+    for tight in (False, True):
+        p = _plan(_weak, spec, launch_gap_tight=tight, **kw)
+        assert int(np.count_nonzero(p.launch_band & (p.effort_pct >= 0.0))) == 0
+
+
+def test_plan_band_row_lookup_in_mode_drive() -> None:
+    # (c) 区間の中でも計画の印のない行は False（hold_scene 3 にならず計画の FF のまま）
+    from types import SimpleNamespace
+
+    from tests.research.ff_candidate import ForwardMapFeedforward
+
+    on, i1 = _band_gap_rows(True)
+    ff = ForwardMapFeedforward.__new__(ForwardMapFeedforward)
+    ff._plan = on  # noqa: SLF001
+    run = mdmod._ModeRun.__new__(mdmod._ModeRun)  # noqa: SLF001
+    run.ff = ff
+    last_b = int(np.flatnonzero(on.launch_band)[-1])
+    assert run._plan_band_row(last_b * DT) is True  # noqa: SLF001
+    assert run._plan_band_row((last_b + 1) * DT) is False  # noqa: SLF001  すき間の行
+    # 計画を持たない FF は区間の条件だけ
+    run.ff = SimpleNamespace()
+    assert run._plan_band_row(1.0) is True  # noqa: SLF001
 
 
 # ───────── 設定・mode_drive ─────────

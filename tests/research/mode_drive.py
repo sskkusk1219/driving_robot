@@ -1918,6 +1918,18 @@ class _ModeRun:
             kwargs["select_brake_speed_kmh"] = self.ref.at(t + center_b)
         return kwargs
 
+    def _plan_band_row(self, t: float) -> bool:
+        """2026-11-01 発進のブレーキの帯（案 B）の修正: 時刻 t の計画の行が帯の印つきか。
+        計画を持たない FF は区間の条件だけで決める（True）。
+        計画があるのに launch_band が無ければ False。"""
+        if not isinstance(self.ff, ForwardMapFeedforward):
+            return True
+        plan = self.ff.plan
+        lb = getattr(plan, "launch_band", None)
+        if lb is None:
+            return False
+        return bool(lb[plan.index_at(t)])
+
     async def _cycle(self, t: float, now: float) -> None:
         cfg, hw = self.cfg, self.hw
         cycle_started = time.perf_counter()
@@ -1988,6 +2000,7 @@ class _ModeRun:
             if (
                 not hold_scene and h.launch_bands
                 and in_hold_interval(h.launch_bands, t, h.step_s)
+                and self._plan_band_row(t)
             ):
                 hold_scene = 3  # 2026-10-31 案 B: 発進のブレーキの帯（FF・PI は上りと同じ）
             if hold_scene:
