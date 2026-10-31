@@ -1692,7 +1692,7 @@ def test_stop_table_sub_min_weight_defaults_false() -> None:
 
 
 def test_launch_table_sub_min_weight_defaults_false() -> None:
-    """2026-10-31 段4b（案1）: 発進側のしきい値未満のマスの重み。既定も本体 yaml も false
-    （段4b の実機 3 モードの後に決める）。"""
+    """2026-10-31 段4b（案1）: 発進側のしきい値未満のマスの重み。既定は false、本体 yaml は true
+    （段5 の 6 モードの後、ユーザー決定で採用）。"""
     assert cfgmod.LearningSection().launch_table_sub_min_weight is False
-    assert _load_default().learning.launch_table_sub_min_weight is False
+    assert _load_default().learning.launch_table_sub_min_weight is True
