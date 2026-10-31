@@ -684,6 +684,7 @@ def loop_config_from_config(
         # 2026-10-31 段2: ゆっくり戻す測定（RAMP_RELEASE_SWEEP）
         ramp_release_sweep_enabled=lr.ramp_release_sweep_enabled,
         ramp_release_sweep_rate_pct_s=lr.ramp_release_sweep_rate_pct_s,
+        ramp_release_sweep_time_s=lr.ramp_release_sweep_time_s,
         ramp_release_sweep_timeout_s=lr.ramp_release_sweep_timeout_s,
         # 2026-10-23 段5-8: 停止前の戻し B-1
         stop_release_enabled=lr.stop_release_enabled,
@@ -821,7 +822,9 @@ async def run_pattern_drive(
     if any(isinstance(p, GRampPattern) and p.sweep_stations for p in patterns):
         say("ゆっくり戻す（段2 2026-10-31）: 場所に着いたら（ブレーキを踏んでいて、惰行より強い"
             " G の"
-            f"ときだけ）山の開度から {loop_config.ramp_release_sweep_rate_pct_s:g} %/s で戻し、"
+            "ときだけ）山の開度から（山の深さ − 効き始め）÷ "
+            f"{loop_config.ramp_release_sweep_time_s:g} 秒"
+            f"（下限 {loop_config.ramp_release_sweep_rate_pct_s:g} %/s）の速さで戻し、"
             "加速度が惰行に戻ったら止めて、同じ速さで山の開度まで踏み増して出る。"
             f"{loop_config.ramp_release_sweep_timeout_s:g} 秒・"
             f"実車速 {loop_config.ramp_release_min_kmh:g} km/h 以下で打ち切り。制御の項なし")
@@ -2108,6 +2111,13 @@ def build_ff_model(
             pedal=pedal, ramp_results=ramp_results, plan_mode=wltp_mode, real=real,
         )
 
+    # 4 点の保持（手順2 の LOW_HOLD）から PI と保持の開度を、yaml を書く前の pkl に付ける。
+    # チェック（launch_brake_band は meta の hold_pi・hold_opening を要る）より前に付ける
+    # （2026-11-01 段6b。以前は後で、終了コード 2 になった）。学習し直したら付け直す
+    hold_item = (
+        attach_hold_data(cfg, built.model_path, csv_path, pedal)
+        if candidate in _FORWARD_CANDIDATES else None
+    )
     say()
     say("手順2 の学習結果のチェック（手順3 に影響する範囲）:")
     checks = run_checks_now()
@@ -2140,12 +2150,10 @@ def build_ff_model(
             stop_table_sub_min_weight=cfg.learning.stop_table_sub_min_weight,
             launch_table_sub_min_weight=cfg.learning.launch_table_sub_min_weight,
         )
-        checks = run_checks_now()
-    if candidate in _FORWARD_CANDIDATES:
-        # 4 点の保持（手順2 の LOW_HOLD）から PI と保持の開度を、yaml を書く前の pkl に付ける
         hold_item = attach_hold_data(cfg, built.model_path, csv_path, pedal)
-        if hold_item is not None:
-            checks.append(hold_item)
+        checks = run_checks_now()
+    if hold_item is not None:
+        checks.append(hold_item)
     say(step2_check.format_checks(checks))
     ng = step2_check.ng_items(checks)
     model_path, metrics = built.model_path, built.metrics

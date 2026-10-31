@@ -1704,13 +1704,16 @@ def test_ramp_release_sweep_settings_default_off_and_validation() -> None:
     fresh = cfgmod.LearningSection()
     assert fresh.ramp_release_sweep_enabled is False
     assert fresh.ramp_release_sweep_rate_pct_s == pytest.approx(0.25)
+    assert fresh.ramp_release_sweep_time_s == pytest.approx(4.0)
     cfg = _load_default()
     lr = cfg.learning
     assert lr.ramp_release_sweep_enabled is False
     assert lr.ramp_release_sweep_rate_pct_s == pytest.approx(0.25)
+    assert lr.ramp_release_sweep_time_s == pytest.approx(4.0)
     assert cfgmod.validate_config(cfg) == []
     for key, bad, good in (
         ("ramp_release_sweep_rate_pct_s", 0.0, 0.25),
+        ("ramp_release_sweep_time_s", 0.0, 4.0),
         ("ramp_release_sweep_timeout_s", 0.0, 40.0),
         ("ramp_release_sweep_est_s", -1.0, 25.0),
     ):

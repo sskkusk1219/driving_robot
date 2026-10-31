@@ -445,8 +445,10 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
       さらに、その車速の惰行の減速（コーストダウンで測った `glimit.coast_decel_kmhs`）が場所の
       目標減速度以上なら飛ばす（惰行だけで足りるのでブレーキは踏まない。`sweep_skipped`）。
       同じ周期に RAMP_RELEASE の場所にも当たるときは RAMP_RELEASE が先で、sweep の点は次の周期以降。
-    - 戻す: 入った時点の u から一定の速さ `ramp_release_sweep_rate_pct_s` で 0（待機位置 ＝ min）
-      へ戻す。制御の項なし。min より浅くしない。
+    - 戻す: 入った時点の u から一定の速さで 0（待機位置 ＝ min）へ戻す。速さ ＝ max(下限
+      `ramp_release_sweep_rate_pct_s`, (入った時点の深さ −u − ブレーキの効き始め u_on) ÷
+      `ramp_release_sweep_time_s`)（2026-11-01 段6b。u_on が読めない・差が小さいときは下限）。
+      制御の項なし。min より浅くしない。
     - 止める: 実加速度が惰行（≧ −惰行の減速）に戻った状態が `stop_release_escape_s`（0.5 秒。
       停止前の戻しの「逃げ道」と同じ持続）続いたら戻すのをやめる。惰行の減速が無い車速帯は判定できないので、
       u が 0 に着いたところで止める。
@@ -858,6 +860,7 @@ class PatternLoopConfig:
     # 2026-10-31 段2: ゆっくり戻す測定（learning.ramp_release_sweep_* から渡す。false は今と同じ）
     ramp_release_sweep_enabled: bool = field(default=False)
     ramp_release_sweep_rate_pct_s: float = field(default=0.25)
+    ramp_release_sweep_time_s: float = field(default=4.0)
     ramp_release_sweep_timeout_s: float = field(default=40.0)
     # 2026-10-23 段5-8: 停止前の戻し B-1（learning.stop_release_* から渡す。false なら今と同じ走り）
     stop_release_enabled: bool = field(default=False)
@@ -1097,6 +1100,7 @@ class PatternLoop:
         self._rp_sweep_done: set[int] = set()  # 使った（飛ばした分を含む）場所の番号
         self._rp_sweep_t0 = 0.0  # 入った時刻
         self._rp_sweep_u0 = 0.0  # 入った時点の u（負）
+        self._rp_sweep_rate = 0.0  # 戻す・踏み増す速さ [%/s]（入った時に決める。2026-11-01 段6b）
         self._rp_sweep_turn_t = 0.0  # 戻すのをやめて踏み増しへ移った時刻
         self._rp_sweep_u_turn: float | None = None  # 踏み増しへ移った時点の u（戻す間は None）
         self._rp_sweep_coast_s = 0.0  # 加速度が惰行に戻った状態が続いた秒数
@@ -2994,6 +2998,7 @@ class PatternLoop:
         self._rp_down_brake_blend_pending = False
         self._rp_blend_release = False
         self._rp_sweep_u0 = self._rp_u
+        self._rp_sweep_rate = self._sweep_rate(self._rp_u)
         self._rp_release_u_peak = self._rp_u  # 出るとき `_ramp_release_exit` が入った u へ寄せる
         self._rp_sweep_t0 = now
         self._rp_sweep_u_turn = None
@@ -3003,6 +3008,17 @@ class PatternLoop:
         self._phase = _Phase.RAMP_RELEASE_SWEEP  # `_enter_phase` は通さない（`_rp_hist` を残す）
         self._skip_count = 0
         return True
+
+    def _sweep_rate(self, u0: float) -> float:
+        """ゆっくり戻す速さ [%/s]（2026-11-01 段6b）。入った時点の深さ（−u0）と効き始め
+        （`_onset_u`）の差 ÷ `ramp_release_sweep_time_s`。下限は `ramp_release_sweep_rate_pct_s`。
+        効き始めが読めない・差が小さい・時間が 0 以下なら下限の速さ。"""
+        cfg = self._config
+        floor = cfg.ramp_release_sweep_rate_pct_s
+        u_on = self._onset_u(PEDAL_BRAKE)
+        if u_on is None or cfg.ramp_release_sweep_time_s <= 0.0:
+            return floor
+        return max(floor, (-u0 - u_on) / cfg.ramp_release_sweep_time_s)
 
     def _advance_ramp_release_sweep(
         self, speed: float, now: float, measured_g: float | None
@@ -3024,7 +3040,7 @@ class PatternLoop:
         if speed <= max(cfg.ramp_release_min_kmh, STOP_SPEED_KMH):
             self._ramp_release_exit(speed, now)
             return
-        rate = cfg.ramp_release_sweep_rate_pct_s
+        rate = self._rp_sweep_rate
         u0 = self._rp_sweep_u0
         if self._rp_sweep_u_turn is None:
             self._rp_u = min(0.0, u0 + rate * t)

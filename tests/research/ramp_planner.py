@@ -469,6 +469,9 @@ def plan_release_stations(
 def plan_release_sweeps(
     counts: BandCounts, tops: Mapping[int, float], gaps: Mapping[int, float], *,
     mode_min_s: float, fine_max_kmh: float, coarse_step_kmh: float, min_kmh: float,
+    release_by_level: Mapping[int, Sequence[float]] | None = None,
+    levels: Sequence[float] = (),
+    coast_speeds_kmh: Sequence[float] = (), coast_decels_kmhs: Sequence[float] = (),
 ) -> dict[int, tuple[float, ...]]:
     """ゆっくり戻す場所 [km/h]（段の番号 → 昇順の車速）（2026-10-31 段1）。
 
@@ -479,8 +482,15 @@ def plan_release_sweeps(
     （同点は弱い段）。
     割り当てる段は `tops`（段の番号 → 上端の車速。走る段だけ。いちばん弱い段〔番号 0〕は除く）の
     うち、上端までの間隔が `gaps[段]` 以上あるもの。同じ段の中でも間隔が `gaps[段]` 未満の点は
-    外す（低い車速の側を残す）。車速が `min_kmh` 未満の点は外す。その車速の惰行の減速より弱い段か
-    どうかは planner では分からないので、実行時に判定して飛ばす（`RAMP_RELEASE_SWEEP`）。
+    外す（低い車速の側を残す）。車速が `min_kmh` 未満の点は外す。
+    2026-11-01 段6b（実機の手順2 で分かった 2 点の直し）:
+    - 重ならない: `release_by_level`（段の番号 → その段の下りの戻しの車速 `plan_release_stations`）
+      に、その車速と `gaps[段]` 未満しか離れていない点（同じ点を含む）がある段は候補から外し、
+      モードの秒数が次に多い段へ回す。候補が無ければその車速は置かない（同じ段の既存の戻しが先に
+      入ってゆっくり戻すが飛ばされていたため）。
+    - 惰行より強い段だけ: `coast_speeds_kmh`・`coast_decels_kmhs`（yaml の惰行カーブ）が渡された
+      ら、その車速の惰行の減速より 段の G × G_TO_KMHS が大きい段に限る（惰行の方が強いとブレーキを
+      踏まず、戻しても惰行に戻る所が測れない）。渡されなければ判定しない。実行時の飛ばしも残す。
     """
     arr = counts.release_s
     if arr.ndim != 2 or arr.shape[0] == 0:
@@ -497,10 +507,23 @@ def plan_release_sweeps(
         if v < min_kmh - eps or float(sec.sum()) < mode_min_s:
             continue
         best: int | None = None
+        coast_v = (
+            float(np.interp(v, coast_speeds_kmh, coast_decels_kmhs))
+            if len(coast_speeds_kmh) >= 2 and len(coast_speeds_kmh) == len(coast_decels_kmhs)
+            else None
+        )
         for i in sorted(tops):
             if i == 0 or i >= len(sec) or sec[i] <= 0.0:
                 continue
             if tops[i] - v < gaps.get(i, 0.0) - eps:
+                continue
+            if coast_v is not None and i < len(levels) and levels[i] * G_TO_KMHS <= coast_v:
+                continue
+            near = gaps.get(i, 0.0)
+            if any(
+                abs(r - v) < max(near, eps)
+                for r in (release_by_level or {}).get(i, ())
+            ):
                 continue
             if best is None or sec[i] > sec[best]:
                 best = i
@@ -563,6 +586,7 @@ def plan_ramps(
     dither_enabled: bool = False, dither_hold_s: float = 1.5, dither_brake_n: int = 0,
     dither_max_g: float = 0.1, dither_accel_max_n: int = 0,
     sweep_enabled: bool = False, sweep_est_s: float = 0.0,
+    sweep_coast_speeds_kmh: Sequence[float] = (), sweep_coast_decels_kmhs: Sequence[float] = (),
 ) -> RampPlan:
     """段ごとの上端の車速・見込み秒数・周回数を決める。
 
@@ -584,6 +608,8 @@ def plan_ramps(
     2026-10-31 段1: `sweep_enabled` なら、いちばん弱い段以外に、ゆっくり戻す場所
     （`plan_release_sweeps`）を入れ、1 回あたり `sweep_est_s` ＋ 切り替えを見込み秒数に足す
     （周回数の割り当てにも効く）。off なら計画は今と完全に同じ。
+    2026-11-01 段6b: ゆっくり戻す場所は、各段の `plan_release_stations` が決まった後に決める
+    （同じ車速の段は避け、`sweep_coast_*`〔惰行カーブ〕より強い段だけ）。
     """
     def _top_of(i: int, g: float) -> float | None:
         enough = np.flatnonzero(
@@ -597,6 +623,16 @@ def plan_ramps(
         )
         return min(max(mode_top, floor_top), max_speed_kmh)
 
+    def _release_of(i: int, g: float, top: float) -> tuple[float, ...]:
+        if i > 0 and len(release_fracs) > 0 and counts.release_s.size > 0:
+            return plan_release_stations(
+                counts, i, mode_min_s=mode_min_s, fine_max_kmh=cruise_fine_max_kmh,
+                coarse_step_kmh=cruise_coarse_step_kmh, min_kmh=cruise_min_kmh, top_kmh=top,
+                min_gap_kmh=g * G_TO_KMHS * (min_at_g_s + turn_s),
+                drop_kmh=release_drop_kmh(g, release_fracs, release_hold_s, release_move_s),
+            )
+        return ()
+
     sweeps: dict[int, tuple[float, ...]] = {}
     if sweep_enabled and counts.release_s.size > 0:
         tops = {i: t for i, g in enumerate(counts.levels) if (t := _top_of(i, g)) is not None}
@@ -605,6 +641,9 @@ def plan_ramps(
             {i: counts.levels[i] * G_TO_KMHS * (min_at_g_s + turn_s) for i in tops},
             mode_min_s=mode_min_s, fine_max_kmh=cruise_fine_max_kmh,
             coarse_step_kmh=cruise_coarse_step_kmh, min_kmh=cruise_min_kmh,
+            release_by_level={i: _release_of(i, counts.levels[i], t) for i, t in tops.items()},
+            levels=counts.levels,
+            coast_speeds_kmh=sweep_coast_speeds_kmh, coast_decels_kmhs=sweep_coast_decels_kmhs,
         )
     runs: list[RampLevel] = []
     skipped: list[float] = []
@@ -636,14 +675,7 @@ def plan_ramps(
                 min_gap_kmh=g * G_TO_KMHS * (min_at_g_s + turn_s),
             )
             up_only = bool(stations)
-        release: tuple[float, ...] = ()
-        if i > 0 and len(release_fracs) > 0 and counts.release_s.size > 0:
-            release = plan_release_stations(
-                counts, i, mode_min_s=mode_min_s, fine_max_kmh=cruise_fine_max_kmh,
-                coarse_step_kmh=cruise_coarse_step_kmh, min_kmh=cruise_min_kmh, top_kmh=top,
-                min_gap_kmh=g * G_TO_KMHS * (min_at_g_s + turn_s),
-                drop_kmh=release_drop_kmh(g, release_fracs, release_hold_s, release_move_s),
-            )
+        release = _release_of(i, g, top)
         d_brake = dither_brake_n if dither_enabled and g <= dither_max_g else 0
         d_accel = min(dither_accel_max_n, len(stations)) if dither_enabled else 0
         est = estimate_s(g, top, hold_s=hold_s, turn_s=turn_s) + cruise_hold_est_s(
@@ -726,6 +758,9 @@ def cruise_kwargs(cfg: Any) -> dict[str, Any]:
         # 2026-10-31 段1: ゆっくり戻す測定の見込み
         "sweep_enabled": lr.ramp_release_sweep_enabled,
         "sweep_est_s": lr.ramp_release_sweep_est_s,
+        # 2026-11-01 段6b: 惰行より強い段だけに置く（yaml の惰行カーブ。無ければ判定しない）
+        "sweep_coast_speeds_kmh": tuple(cfg.feedforward.coast_decel_speeds_kmh),
+        "sweep_coast_decels_kmhs": tuple(cfg.feedforward.coast_decel_kmhs),
     }
 
 

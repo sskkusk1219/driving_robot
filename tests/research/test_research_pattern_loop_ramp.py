@@ -4498,3 +4498,16 @@ def test_sweep_is_cut_off_by_timeout_and_by_the_creep_range() -> None:
 def test_sweep_phase_is_part_of_the_ramp_phase_set() -> None:
     assert _Phase.RAMP_RELEASE_SWEEP in plmod._RAMP_PHASES
     assert _Phase.RAMP_RELEASE_SWEEP.name == "RAMP_RELEASE_SWEEP"
+
+
+def test_sweep_rate_follows_depth_minus_onset_over_time_with_the_configured_floor() -> None:
+    # 2026-11-01 段6b: 速さ ＝ (入った深さ − 効き始め) ÷ ramp_release_sweep_time_s。下限は
+    # ramp_release_sweep_rate_pct_s。効き始めが読めない・差が小さいときは下限
+    p = _sweep_ramp()
+    loop = _sweep_loop(p, ramp_release_sweep_rate_pct_s=0.25, ramp_release_sweep_time_s=4.0)
+    _, bmin = _deadbands(loop)
+    assert loop._onset_u(PEDAL_BRAKE) is None
+    assert loop._sweep_rate(-5.0) == pytest.approx(0.25)
+    loop._onset_pct[PEDAL_BRAKE] = bmin + 3.0
+    assert loop._sweep_rate(-7.0) == pytest.approx(1.0)  # (7 − 3) ÷ 4
+    assert loop._sweep_rate(-3.4) == pytest.approx(0.25)  # 差 0.4 ÷ 4 = 0.1 → 下限

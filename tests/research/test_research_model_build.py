@@ -350,3 +350,31 @@ def test_side_tables_are_read_with_the_configured_opening_source(
     )
     assert seen and set(seen) == {source}
     assert sources == [source]
+
+
+def test_hold_data_is_attached_before_the_first_step2_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-11-01 段6b: 保持の値（hold_pi・hold_opening）は最初のチェックより前に pkl へ付ける
+    （launch_brake_band の検証が meta の hold_pi・hold_opening を要るため）。H1 は 1 つだけ入る。"""
+    from tests.research import step2_check  # noqa: PLC0415
+
+    order: list[str] = []
+    item = step2_check.CheckItem("H1", "hold_attach", step2_check.STATUS_OK, "x", "y", "")
+
+    def fake_attach(cfg, model_path, csv_path, pedal):
+        order.append("attach")
+        return item
+
+    def fake_checks(**kwargs):
+        order.append("checks")
+        return []
+
+    monkeypatch.setattr(pdmod, "attach_hold_data", fake_attach)
+    monkeypatch.setattr(pdmod, "_run_step2_checks", fake_checks)
+    cfg = _cfg_with(tmp_path, "C8")
+    result = pdmod.build_ff_model(
+        cfg, _csv(tmp_path, cfg), hw_mode=hwmod.HW_STUB, pedal=PEDAL, **SMALL_C8
+    )
+    assert order[:2] == ["attach", "checks"]
+    assert [c.id for c in result.checks] == ["H1"]

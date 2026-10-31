@@ -328,6 +328,7 @@ class LearningSection:
     # ramp_release_sweep_timeout_s は 1 回（戻す＋踏み増す）の打ち切り。既定 off ＝ 今と同じ走り
     ramp_release_sweep_enabled: bool = False
     ramp_release_sweep_rate_pct_s: float = 0.25
+    ramp_release_sweep_time_s: float = 4.0
     ramp_release_sweep_timeout_s: float = 40.0
     ramp_release_sweep_est_s: float = 25.0
     # 2026-10-13 段2o-2: ペダルの遅れの測定。G ランプの後ろに、ramp_lag_speeds_kmh の各車速を
@@ -2063,9 +2064,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(cfg.learning.ramp_release_move_s > 0.0, "learning.ramp_release_move_s は正値")
     need(
         cfg.learning.ramp_release_sweep_rate_pct_s > 0.0
+        and cfg.learning.ramp_release_sweep_time_s > 0.0
         and cfg.learning.ramp_release_sweep_timeout_s > 0.0
         and cfg.learning.ramp_release_sweep_est_s >= 0.0,
-        "learning.ramp_release_sweep_rate_pct_s・_timeout_s は正値、_est_s は 0 以上",
+        "learning.ramp_release_sweep_rate_pct_s・_time_s・_timeout_s は正値、_est_s は 0 以上",
     )
     # 2026-10-23 段5-8: 停止前の戻し B-1・停車まぎわ除外
     lr8 = cfg.learning

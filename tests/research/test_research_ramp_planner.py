@@ -665,3 +665,39 @@ def test_sweep_respects_min_speed_mode_min_s_and_top_gap() -> None:
     # 上端までの間隔が足りない段は割り当てない（段 1 の上端 90 ＋ 間隔 10 → 85 は 5 足りない）
     got = rp.plan_release_sweeps(c, {1: 90.0, 2: 100.0}, {1: 10.0, 2: 10.0}, mode_min_s=2.0, **kw)
     assert got[2] == (35.0, 85.0)
+
+
+def test_sweep_moves_to_the_next_level_when_the_top_level_has_a_release_station_there() -> None:
+    # 2026-11-01 段6b: 85 km/h は段 1 が最大だが、段 1 の下りの戻しが 85 にあれば段 2 へ回す。
+    # 間隔 gaps 未満しか離れていない戻しも「重なり」。段 2 にも戻しがあれば置かない
+    c = _sweep_counts()
+    tops = {1: 100.0, 2: 100.0}
+    gaps = {1: 5.0, 2: 5.0}
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0, "mode_min_s": 2.0}
+    assert rp.plan_release_sweeps(c, tops, gaps, **kw)[1] == (85.0,)
+    got = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (85.0,)}, **kw)
+    assert got[2] == (35.0, 85.0) and 1 not in got
+    near = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (82.0,)}, **kw)
+    assert near[2] == (35.0, 85.0)
+    far = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (75.0,)}, **kw)
+    assert far[1] == (85.0,)
+    none = rp.plan_release_sweeps(
+        c, tops, gaps, release_by_level={1: (85.0,), 2: (85.0,)}, **kw
+    )
+    assert none == {2: (35.0,)}
+
+
+def test_sweep_only_uses_levels_stronger_than_the_coast_decel() -> None:
+    # 惰行の減速が 1.0 km/h/s（G_TO_KMHS 換算で 0.1G 未満の段は弱い）。段 1（0.1G）が惰行以下なら
+    # 85 km/h は段 2（0.2G）へ。渡さなければ判定しない
+    c = _sweep_counts()
+    tops = {1: 100.0, 2: 100.0}
+    gaps = {1: 0.0, 2: 0.0}
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0, "mode_min_s": 2.0,
+          "levels": LEVELS}
+    coast = 0.1 * rp.G_TO_KMHS + 0.01
+    assert rp.plan_release_sweeps(c, tops, gaps, **kw)[1] == (85.0,)
+    got = rp.plan_release_sweeps(
+        c, tops, gaps, coast_speeds_kmh=(0.0, 200.0), coast_decels_kmhs=(coast, coast), **kw
+    )
+    assert 1 not in got and got[2] == (35.0, 85.0)
