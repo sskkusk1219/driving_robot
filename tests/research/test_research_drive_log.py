@@ -443,5 +443,8 @@ async def test_sampler_rows_have_command_actual_and_status(tmp_path: Path) -> No
 
 def test_stop_pred_dev_column_is_registered_and_formatted() -> None:
     # 2026-10-31 段3: 停C の先読みの偏差の列（区間外・off は空欄）
-    assert dlmod.CSV_COLUMNS[-1] == "stop_pred_dev_kmh"
+    assert "stop_pred_dev_kmh" in dlmod.CSV_COLUMNS
+    # 2026-11-01 段6d: その後ろに C10 の積分 I の 2 列（両方 off は空欄）
+    assert dlmod.CSV_COLUMNS[-2:] == ("c10_integral_pct", "c10_integral_kmhs")
+    assert dlmod.DriveSample.__dataclass_fields__["c10_integral_pct"].default is None
     assert dlmod.DriveSample.__dataclass_fields__["stop_pred_dev_kmh"].default is None
