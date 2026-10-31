@@ -627,7 +627,7 @@ def test_sweep_fills_the_grid_up_to_the_highest_release_band_with_the_weakest_le
     # 2026-11-01 段6c: モードの秒数（0 の帯も）によらず、戻しがある最も高い帯（80–90）までの格子の
     # 全部に、番号 0 以外でいちばん G が弱い段（0.1G）を置く。段 2（0.2G）・最弱の段 0 は置かない
     c = _sweep_counts()
-    plan = rp.plan_ramps(c, **_SWEEP_KW, sweep_enabled=True, sweep_est_s=25.0)
+    plan = rp.plan_ramps(c, **_SWEEP_KW, sweep_enabled=True, sweep_est_s=25.0, sweep_levels=1)
     by_g = {lv.g: lv.sweep_stations for lv in plan.levels}
     assert by_g[0.1] == _SWEEP_GRID  # 15・25・45・65・75 は秒数 0 の帯
     assert by_g[0.2] == () and by_g[0.02] == ()
@@ -640,7 +640,7 @@ def test_sweep_adds_estimated_seconds_and_shows_in_the_table() -> None:
     c = _sweep_counts()
     kw = {**_SWEEP_KW, "turn_s": 1.0}
     base = rp.plan_ramps(c, **kw)
-    plan = rp.plan_ramps(c, **kw, sweep_enabled=True, sweep_est_s=25.0)
+    plan = rp.plan_ramps(c, **kw, sweep_enabled=True, sweep_est_s=25.0, sweep_levels=1)
     for b, s in zip(base.levels, plan.levels, strict=True):
         assert s.est_s == pytest.approx(b.est_s + len(s.sweep_stations) * (25.0 + 1.0))
     assert plan.total_est_s > base.total_est_s
@@ -653,7 +653,7 @@ def test_sweep_respects_min_speed_highest_band_and_top_gap() -> None:
     c = _sweep_counts()
     tops = {1: 100.0, 2: 100.0}
     gaps = {1: 0.0, 2: 0.0}
-    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0}
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0, "levels_per_station": 1}
     # 最小の車速（min_kmh）未満は外す
     got = rp.plan_release_sweeps(c, tops, gaps, **{**kw, "min_kmh": 40.0})
     assert got == {1: (45.0, 55.0, 65.0, 75.0, 85.0)}
@@ -676,7 +676,7 @@ def test_sweep_overlapping_a_fast_release_moves_to_the_next_level_or_goes_in_fro
     c = _sweep_counts()
     tops = {1: 100.0, 2: 100.0}
     gaps = {1: 5.0, 2: 5.0}
-    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0}
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0, "levels_per_station": 1}
     assert rp.plan_release_sweeps(c, tops, gaps, **kw)[1] == _SWEEP_GRID
     got = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (85.0,)}, **kw)
     assert got[2] == (85.0,) and got[1] == _SWEEP_GRID[:-1]
@@ -700,7 +700,8 @@ def test_sweep_only_uses_levels_stronger_than_the_coast_decel() -> None:
     c = _sweep_counts()
     tops = {1: 100.0, 2: 100.0}
     gaps = {1: 0.0, 2: 0.0}
-    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0, "levels": LEVELS}
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0, "levels": LEVELS,
+          "levels_per_station": 1}
     coast = 0.1 * rp.G_TO_KMHS + 0.01
     assert rp.plan_release_sweeps(c, tops, gaps, **kw)[1] == _SWEEP_GRID
     got = rp.plan_release_sweeps(
@@ -713,3 +714,34 @@ def test_sweep_only_uses_levels_stronger_than_the_coast_decel() -> None:
         coast_decels_kmhs=(coast, coast, 100.0), **kw
     )
     assert 85.0 not in steep[2] and 15.0 in steep[2] and 1 not in steep
+
+
+def test_sweep_puts_each_station_on_the_two_weakest_levels() -> None:
+    # 2026-11-01 段6c: 既定は G が弱い方から 2 つの段（0.1G と 0.2G）。番号 0 は置かない。
+    # levels_per_station = 1 なら 1 つ（いちばん弱い段だけ）
+    c = _sweep_counts()
+    tops = {1: 100.0, 2: 100.0}
+    gaps = {1: 0.0, 2: 0.0}
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0}
+    two = rp.plan_release_sweeps(c, tops, gaps, **kw)
+    assert two == {1: _SWEEP_GRID, 2: _SWEEP_GRID}
+    one = rp.plan_release_sweeps(c, tops, gaps, levels_per_station=1, **kw)
+    assert one == {1: _SWEEP_GRID}
+    # 段が 1 つしか条件を満たさない車速は 1 つだけ（段 2 の上端 50 → 55 以上は段 1 だけ）
+    short = rp.plan_release_sweeps(c, {1: 100.0, 2: 50.0}, gaps, **kw)
+    assert short[1] == _SWEEP_GRID and short[2] == (15.0, 25.0, 35.0, 45.0)
+
+
+def test_sweep_both_in_a_row_is_decided_per_level() -> None:
+    # 段 1 は 85 に速い戻し（ちょうど 85 ＝ 続けて両方）、段 2 は 82 に速い戻し
+    # （近いだけ ＝ 置けない）。
+    # 85 は段 1 だけ。段 2 の 85 は置かず、他の車速は両方の段
+    c = _sweep_counts()
+    tops = {1: 100.0, 2: 100.0}
+    gaps = {1: 5.0, 2: 5.0}
+    kw = {"fine_max_kmh": 100.0, "coarse_step_kmh": 20.0, "min_kmh": 8.0}
+    got = rp.plan_release_sweeps(c, tops, gaps, release_by_level={1: (85.0,), 2: (82.0,)}, **kw)
+    assert got[1] == _SWEEP_GRID and got[2] == _SWEEP_GRID[:-1]
+    # 段 1 は単独で置け、段 2 は 85 ちょうどに速い戻し（続けて両方）→ 両方の段に置く
+    got = rp.plan_release_sweeps(c, tops, gaps, release_by_level={2: (85.0,)}, **kw)
+    assert got[1] == _SWEEP_GRID and got[2] == _SWEEP_GRID
