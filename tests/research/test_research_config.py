@@ -1696,3 +1696,17 @@ def test_launch_table_sub_min_weight_defaults_false() -> None:
     （段5 の 6 モードの後、ユーザー決定で採用）。"""
     assert cfgmod.LearningSection().launch_table_sub_min_weight is False
     assert _load_default().learning.launch_table_sub_min_weight is True
+
+
+def test_launch_gap_tight_default_false_and_needs_release_ramp() -> None:
+    # 2026-10-31 発進のすき間（案 A）: 既定 off。本体 yaml も false（段2 の実機まで）。
+    # launch_release_ramp が false のまま true にすると検証で弾く
+    assert cfgmod.ForwardMapSection().launch_gap_tight is False
+    cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
+    assert cfg.forward_map.launch_gap_tight is False
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.launch_gap_tight = True
+    assert cfg.forward_map.launch_release_ramp and cfgmod.validate_config(cfg) == []
+    cfg.forward_map.launch_release_ramp = False
+    cfg.forward_map.launch_move_hold = False
+    assert any("launch_gap_tight" in p for p in cfgmod.validate_config(cfg))

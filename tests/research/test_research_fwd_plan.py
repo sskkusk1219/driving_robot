@@ -3428,3 +3428,180 @@ def test_stop_approach_lead_zero_is_identical_and_positive_keeps_stop_table() ->
     far = np.flatnonzero(~approach)
     assert np.array_equal(on.effort_pct[far], base.effort_pct[far])
     assert np.array_equal(on.side_brake[far], base.side_brake[far])
+
+
+# ───────── 2026-10-31 発進のすき間（案 A。launch_gap_tight） ─────────
+
+def _prep_seq(n_brake=8, gap=1, n_accel=6, b=-8.0, a=8.0):
+    """ブレーキ n_brake 行（発進の行の印あり）→ すき間 gap 行 → アクセル n_accel 行。"""
+    e = np.array([b] * n_brake + [0.0] * gap + [a] * n_accel)
+    prep = np.zeros(len(e), dtype=bool)
+    prep[:n_brake] = True
+    return e, prep
+
+
+def _gap_p(e, prep, ret=None):
+    from tests.research.fwd_plan import ensure_return_gap  # noqa: PLC0415
+
+    eff = e.copy()
+    fl = np.full(len(eff), FLAG_COAST, dtype=int)
+    st = ensure_return_gap(eff, fl, ret=ret or _ret(), period_s=DT, launch_prep=prep)
+    return eff, fl, st
+
+
+def test_launch_gap_tight_unit_trims_one_row_less_and_keeps_accel() -> None:
+    from tests.research.fwd_plan import LAUNCH_GAP_TIGHT_ROWS  # noqa: PLC0415
+
+    assert LAUNCH_GAP_TIGHT_ROWS == 1
+    e, prep = _prep_seq()  # 深さ 8 → T = 0.1 + 0.04 + 0.05 → 4 行。すき間 1 行
+    off, _, st0 = _gap_p(e, None)
+    on, _, st1 = _gap_p(e, prep)
+    last_off = int(np.flatnonzero(off[:9] < 0)[-1])
+    last_on = int(np.flatnonzero(on[:9] < 0)[-1])
+    assert last_on == last_off + 1  # ブレーキの最後の行が 1 行後ろ
+    assert st0.n_cut == st1.n_cut == 1 and st1.cut_s == pytest.approx(st0.cut_s - DT)
+    assert np.array_equal(on[9:], off[9:])  # アクセルの行は同じ
+    assert st0.n_violations == 0 and st1.n_violations == 0
+
+
+def test_launch_gap_tight_unit_only_launch_brake_to_accel() -> None:
+    e, prep = _prep_seq()
+    base, _, _ = _gap_p(e, None)
+    # 発進の行の印が無い・最後の行が印でない切り替えは詰めない
+    assert np.array_equal(_gap_p(e, np.zeros(len(e), dtype=bool))[0], base)
+    part = prep.copy()
+    part[7] = False
+    assert np.array_equal(_gap_p(e, part)[0], base)
+    # アクセル → ブレーキは印があっても詰めない
+    e2 = np.array([8.0] * 8 + [0.0] + [-8.0] * 6)
+    off2 = _gap_p(e2, None)[0]
+    assert np.array_equal(_gap_p(e2, np.ones(len(e2), dtype=bool))[0], off2)
+    # 詰めたあとの要る行数の下限は 1 行（0 にはならない）
+    e3, prep3 = _prep_seq(gap=0, b=-4.0)  # 深さ 0 → T = 0.15 → 3 行 → 3 − 1 = 2 行
+    on3 = _gap_p(e3, prep3)[0]
+    assert np.count_nonzero(on3[: len(on3) - 6] == 0.0) == 2 and on3[-6:].tolist() == [8.0] * 6
+
+
+def test_launch_gap_tight_unit_delay_path_is_not_tightened() -> None:
+    # 戻す側が停車保持（FLAG_STOP）のときは前を削れず次のペダルを遅らせる経路。詰めない
+    # （アクセルを今より早めない）ので、印があっても off と同じ
+    from tests.research.fwd_plan import ensure_return_gap  # noqa: PLC0415
+
+    e, prep = _prep_seq(gap=0)
+    res = []
+    for pr in (None, prep):
+        eff = e.copy()
+        fl = np.full(len(eff), FLAG_STOP, dtype=int)
+        ensure_return_gap(eff, fl, ret=_ret(), period_s=DT, launch_prep=pr)
+        res.append(int(np.flatnonzero(eff > 0)[0]))
+    assert res[0] == res[1]
+
+
+def test_launch_gap_tight_violation_counts_ignore_tightened_rows() -> None:
+    from tests.research.fwd_plan import count_gap_violations  # noqa: PLC0415
+
+    e, prep = _prep_seq()
+    on, _, _ = _gap_p(e, prep)  # 詰めた形（すき間 3 行 < 4 行）
+    assert count_gap_violations(on, ret=_ret(), period_s=DT) == 1
+    assert count_gap_violations(on, ret=_ret(), period_s=DT, launch_prep=prep) == 0
+    # 詰めた分より足りないものは数える（すき間 1 行のまま）
+    assert count_gap_violations(e, ret=_ret(), period_s=DT, launch_prep=prep) == 1
+    # 印の行でないブレーキ → アクセルは詰めない
+    assert count_gap_violations(
+        on, ret=_ret(), period_s=DT, launch_prep=np.zeros(len(on), dtype=bool)
+    ) == 1
+
+
+def test_launch_gap_tight_violation_by_position_ignores_tightened_rows() -> None:
+    from tests.research.fwd_plan import (  # noqa: PLC0415
+        GapContext,
+        PedalTrack,
+        count_gap_violations_by_position,
+    )
+
+    e, prep = _prep_seq()
+    on, _, _ = _gap_p(e, prep)
+    n = len(on)
+    ctx = GapContext(
+        table=_table13(), v=np.zeros(n), ref_acc=np.zeros(n), coast_a=np.zeros(n),
+        coast_b=np.zeros(n), track=PedalTrack(), accel_min_pct=AD, brake_min_pct=BD,
+        brake_lag_s=0.4,
+    )
+    plain = count_gap_violations_by_position(on, ctx=ctx, period_s=DT)
+    tight = count_gap_violations_by_position(on, ctx=ctx, period_s=DT, launch_prep=prep)
+    assert tight <= plain
+    # 印が無ければ同じ数
+    none = np.zeros(n, dtype=bool)
+    assert count_gap_violations_by_position(on, ctx=ctx, period_s=DT, launch_prep=none) == plain
+    # 位置で見て 1 行以内の不足なら数えない（PedalTrack の既定では、すき間 2 行は不足・詰めれば
+    # 足りる。1 行は詰めても不足）
+    for gap, want_plain, want_tight in ((2, 1, 0), (1, 1, 1), (3, 0, 0)):
+        seq = np.array([-8.0] * 8 + [0.0] * gap + [8.0] * 6)
+        cx = GapContext(
+            table=_table13(), v=np.zeros(len(seq)), ref_acc=np.zeros(len(seq)),
+            coast_a=np.zeros(len(seq)), coast_b=np.zeros(len(seq)), track=PedalTrack(),
+            accel_min_pct=AD, brake_min_pct=BD, brake_lag_s=0.4,
+        )
+        pr = np.arange(len(seq)) < 8
+        assert count_gap_violations_by_position(seq, ctx=cx, period_s=DT) == want_plain
+        got = count_gap_violations_by_position(seq, ctx=cx, period_s=DT, launch_prep=pr)
+        assert got == want_tight
+
+
+def _tight_plan(tight, ref=None, **kw):
+    ref = ref or _stop_then_go(8.0)
+    return plan_for(ref, 16.0, _table13(), **dict(_K13, **kw), launch_gap_tight=tight)
+
+
+def test_launch_gap_tight_off_is_identical_plan() -> None:
+    ref = _stop_then_go(8.0)
+    for extra in ({}, {"switch_gap_compensate": True}, {"predict_low_speed_sides": True,
+                                                         "launch_shift_choose": True}):
+        a = plan_for(ref, 16.0, _table13(), **dict(_K13, **extra))
+        b = plan_for(ref, 16.0, _table13(), **dict(_K13, **extra), launch_gap_tight=False)
+        assert np.array_equal(a.effort_pct, b.effort_pct) and np.array_equal(a.flag, b.flag)
+        assert np.array_equal(a.launch_prep, b.launch_prep)
+        assert a.return_gap.n_violations == b.return_gap.n_violations
+
+
+def test_launch_gap_tight_on_build_plan_delay_path_and_shift_deltas_unchanged() -> None:
+    # 発進（停車 8 s → 加速）: 戻す側の最後の行が停車保持の延長（FLAG_STOP）で遅らせる経路なので
+    # 詰めない＝off と同じ計画。δ は詰めない計画で選ぶので、選び直しを掛けても δ・計画とも同じ
+    ref = _stop_then_go(8.0)
+    for extra in ({}, {"switch_gap_compensate": True}):
+        off = _tight_plan(False, **extra)
+        on = _tight_plan(True, **extra)
+        assert np.array_equal(off.effort_pct, on.effort_pct)
+        assert on.return_gap.n_violations == 0
+    kw = {"predict_low_speed_sides": True, "launch_shift_choose": True}
+    on_s = _tight_plan(True, ref, **kw)
+    off_s = _tight_plan(False, ref, **kw)
+    assert on_s.launch_shift.deltas == off_s.launch_shift.deltas
+    assert np.array_equal(on_s.effort_pct, off_s.effort_pct)
+
+
+def test_apply_launch_shift_deltas_override_uses_given_deltas() -> None:
+    from tests.research.fwd_plan import PedalTrack, apply_launch_shift  # noqa: PLC0415
+
+    ref = _stop_then_go(8.0)
+    base = plan_for(ref, 16.0, _table13(), **dict(_K13, predict_low_speed_sides=True))
+    res = apply_launch_shift(
+        base, ref, _table13(), stop_ref_at=None, accel_min_pct=AD, brake_min_pct=BD,
+        track=PedalTrack(), deltas=[3],
+    )
+    assert res.launch_shift.deltas == [3]
+    first = lambda x: int(np.flatnonzero(x.effort_pct > 0)[0])  # noqa: E731
+    assert first(res) - first(base) == 3
+
+
+def test_launch_gap_tight_on_build_plan_leaves_other_switches_unchanged() -> None:
+    # 走行中のアクセル → ブレーキ・ブレーキ → アクセルの切り替え（launch_prep の行ではない）は同じ
+    def ref(t: float) -> float:
+        return min(2.0 * t, 20.0) if t <= 14.0 else max(20.0 - 3.0 * (t - 14.0), 0.0)
+
+    kw = dict(low_speed_side_rule="dir", launch_release_ramp=True, return_gap_enabled=True,
+              **_L13)
+    off = plan_for(ref, 24.0, _table13(), launch_gap_tight=False, **kw)
+    on = plan_for(ref, 24.0, _table13(), launch_gap_tight=True, **kw)
+    assert np.array_equal(off.effort_pct, on.effort_pct) and np.array_equal(off.flag, on.flag)
+    assert off.return_gap.n_switches >= 1

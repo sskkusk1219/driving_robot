@@ -814,6 +814,7 @@ class ForwardMapFeedforward:
         accel_release_in_range_only: bool = False,
         predict_low_speed_sides: bool = False,
         launch_shift_choose: bool = False,
+        launch_gap_tight: bool = False,
         predict_creep_curve: bool = False,
         creep_accel_speeds_kmh: Sequence[float] = (),
         creep_accel_kmhs: Sequence[float] = (),
@@ -870,6 +871,7 @@ class ForwardMapFeedforward:
             accel_release_in_range_only=accel_release_in_range_only,
             predict_low_speed_sides=predict_low_speed_sides,
             launch_shift_choose=launch_shift_choose,
+            launch_gap_tight=launch_gap_tight,  # 2026-10-31 発進のすき間（案 A）
             predict_creep_curve=predict_creep_curve,
             creep_accel_speeds_kmh=creep_accel_speeds_kmh,
             creep_accel_kmhs=creep_accel_kmhs,

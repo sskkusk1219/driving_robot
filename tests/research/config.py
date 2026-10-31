@@ -1060,6 +1060,15 @@ class ForwardMapSection:
     # 想定（採点が低速の表で予測する）。
     # 既定 false ＝ 今と完全に同じ。効く先: 発進の計画。決める時期: 段13 の実機
     launch_shift_choose: bool = False
+    # 2026-10-31 発進のすき間（案 A。ProblemReport_20261031_発進でブレーキを離すのが早い 段1）:
+    # true なら、停車からの発進のブレーキ → アクセルの踏み替えだけ、すき間（両ペダルの指令が min の
+    # 行）を ReturnTime.gap_rows から 2 行（戻る時間の余裕 1 周期＋アクセルが動くまでの 1 行。
+    # 形の定数）減らす。アクセルの時刻は変えず、ブレーキを離す時刻が 2 行遅くなる。
+    # launch_release_ramp が必要（発進の行の印 launch_prep をそこで作る）。
+    # 根拠: 発進の踏み替え 74 回でブレーキが min に着いてからアクセルが動くまで 0.15 s 空いていた
+    # （UDDS `202357` ほか）。効く先: 発進でブレーキを離す時刻（fwd_plan.ensure_return_gap）。
+    # 決める時期: 段2 の実機。既定 false ＝ 今と完全に同じ
+    launch_gap_tight: bool = False
     # 2026-10-28 ProblemReport_20261027 段14 L1: true なら、すき間の処理・発進のずらしの予測
     # （fwd_plan.predicted_accel）で、両ペダルが min（位置 − min ≦ 0）かつ車速が
     # feedforward.creep_accel_speeds_kmh の最後（5.0 km/h）未満の行の加速度を、手順2 が測った
@@ -1670,6 +1679,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         not fm.launch_move_hold or fm.launch_release_ramp,
         "forward_map.launch_move_hold は launch_release_ramp が true のときだけ使える",
+    )
+    need(
+        not fm.launch_gap_tight or fm.launch_release_ramp,
+        "forward_map.launch_gap_tight は launch_release_ramp が true のときだけ使える",
     )
     need(
         math.isfinite(fm.hold_ff_offset_pct),

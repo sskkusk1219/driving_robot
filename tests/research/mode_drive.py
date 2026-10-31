@@ -408,6 +408,7 @@ def forward_map_plan_args(
         accel_release_in_range_only=fm.accel_release_in_range_only,  # 段9-c
         predict_low_speed_sides=fm.predict_low_speed_sides,  # 段13
         launch_shift_choose=fm.launch_shift_choose,  # 段13
+        launch_gap_tight=fm.launch_gap_tight,  # 2026-10-31 発進のすき間（案 A）
         predict_creep_curve=fm.predict_creep_curve,  # 段14 L1
         creep_accel_speeds_kmh=tuple(ff_cfg.creep_accel_speeds_kmh),
         creep_accel_kmhs=tuple(ff_cfg.creep_accel_kmhs),
