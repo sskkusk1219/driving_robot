@@ -119,6 +119,8 @@ CSV_COLUMNS: tuple[str, ...] = (
     "c10_effort_pct",
     # 2026-10-18 段2q: C11（DOB）の外乱の推定 d ＝ 実測 − 表の予測 [km/h/s]（ペダル別）と、
     # 開度の上乗せのうち DOB の分 [%]（c10_effort_pct は P＋DOB の合計）。C11 の行だけ、他は空欄
+    # 2026-11-02 から dob_effort_pct は C10 の I を含まない（I は c10_integral_pct）。
+    # それより前の 11-01 以降のログ（I が効いた行）は I を含む
     "dob_accel_kmhs",
     "dob_brake_kmhs",
     "dob_effort_pct",

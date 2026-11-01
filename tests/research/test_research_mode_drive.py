@@ -2308,3 +2308,18 @@ async def test_c10_integral_stop_end_row_uses_normal_tau_and_deep_only(
     t, e = rows[2]
     _c10_int_step(run, t, e, ref=5.0, dev=0.5)  # 浅い向き: 貯めない
     assert run.c10_int.i_brake == v
+
+
+async def test_dob_effort_excludes_c10_integral(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-11-02 ProblemReport_20261101_低速へIを広げる 追記2: I が効く行でも _dob_effort は
+    DOB の分だけ（推定 0 なら 0）。I の分は _ci_pct に出る。"""
+    run, rows = await _c10_int_run(tmp_path, monkeypatch, "off")
+    run.dob = object()  # type: ignore[assignment]  # 推定は下で 0 に固定
+    run.dob_stats = None
+    monkeypatch.setattr(run, "_dob_estimate", lambda *a, **k: 0.0)
+    for t, e in rows[:10]:
+        _c10_int_step(run, t, e, ref=20.0, dev=-0.5)
+    assert run._ci_pct != 0.0  # noqa: SLF001  # I が効いている
+    assert run._dob_effort == pytest.approx(0.0, abs=1e-9)  # noqa: SLF001

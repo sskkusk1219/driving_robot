@@ -2534,6 +2534,10 @@ class _ModeRun:
             kwargs["integral_kmhs"] = 0.0
             without_i, _ = deviation_offset_detail(fb_table, dob_kmhs=d_row, **kwargs)
             self._ci_pct = new - without_i
+            # 2026-11-02 ProblemReport_20261101_低速へIを広げる 追記2
+            # （dob_effort_pct が I を含んでいた）: 下の p_only（DOB の分を出す）は I も入れて引く。
+            # 0 のままだと _dob_effort が DOB ＋ I になる
+            kwargs["integral_kmhs"] = integral_kmhs
         delta = new - ff_effort
         if self.band_cap_pct is not None:
             # 段6 P1: 動き出す開度の帯（低速・FF がブレーキで min〜停車保持）の P は cap まで
