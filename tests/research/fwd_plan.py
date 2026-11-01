@@ -2502,7 +2502,12 @@ def deviation_offset_detail(
     return float(np.clip(new, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)), clamped
 
 
-def coast_assist_effort(
+def coast_assist_effort(table: ForwardTable, **kwargs: Any) -> float:
+    """C12: 惰行の補助の effort [%]（`coast_assist_effort_detail` の開度だけ）。"""
+    return coast_assist_effort_detail(table, **kwargs)[0]
+
+
+def coast_assist_effort_detail(
     table: ForwardTable,
     *,
     is_accel: bool,
@@ -2517,12 +2522,13 @@ def coast_assist_effort(
     dob_kmhs: float = 0.0,
     onset_u_pct: float | None = None,
     side: int | None = None,
-) -> float:
+    integral_kmhs: float = 0.0,
+) -> tuple[float, bool, bool]:
     """C12: 惰行の行で補助に使うペダルの effort [%] を返す（段2r。正＝アクセル・負＝ブレーキ）。
 
     惰行の行は計画が 0 なので、`deviation_offset_detail` のような「列に足す」ことができない。
     代わりに、偏差 dev を τ 秒で 0 に戻す加速度を要る加速度に足して、表を直接逆に引く:
-        u1 ＝ invert(row_kmh, need ＋ dev ÷ τ − dob)
+        u1 ＝ invert(row_kmh, need ＋ dev ÷ τ ＋ a_I − dob)
     アクセル（遅れている側）なら effort ＝ accel_min ＋ max(u1, 0)、ブレーキなら
     effort ＝ −(brake_min ＋ max(−u1, 0))。u1 が反対の符号なら min で止め、反対のペダルには
     移らない。u と effort の関係（effort ＝ ±(min ＋ |u|)）は build_plan と同じ。
@@ -2533,17 +2539,27 @@ def coast_assist_effort(
     None なら下限なし。
     side（2026-10-22 段5-2）: 計画がその行のペダルで引いた表（SIDE_*）。None なら
     `low_speed_sides`。
+    integral_kmhs（2026-11-01 ProblemReport_20261101_低速へIを広げる 段1 案C）: C10 の偏差の積分 I
+    の加速度 a_I [km/h/s]。偏差の項に足す（既定 0 ＝ 今と同じ）。
+    戻り値は (effort, 浅く切られたか, 深く切られたか)。浅く切られた ＝ u が効き始めの下限
+    （floor。floor なしは 0 ＝ 反対の符号で min に止めた）に届かなかった。
+    深く切られた ＝ 上限 100%。
     """
     launch, stop = _side_flags(table, side, need_kmhs, ref_kmh, stops_ahead)
     d_a = dev_kmh / tau_s if tau_s > 0.0 else 0.0
-    u1, _ = table.invert(row_kmh, need_kmhs + d_a - dob_kmhs, launch=launch, stop=stop)
+    u1, _ = table.invert(
+        row_kmh, need_kmhs + d_a + integral_kmhs - dob_kmhs, launch=launch, stop=stop
+    )
     u = float(u1)
     floor = 0.0 if onset_u_pct is None or not np.isfinite(onset_u_pct) else float(onset_u_pct)
     if is_accel:
         effort = accel_min_pct + max(u, floor, 0.0)
     else:
         effort = -(brake_min_pct + max(-u, floor, 0.0))
-    return float(np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT))
+    amount = u if is_accel else -u
+    shallow_cut = amount < floor
+    deep_cut = abs(effort) >= EFFORT_LIMIT_PCT - 1e-9
+    return float(np.clip(effort, -EFFORT_LIMIT_PCT, EFFORT_LIMIT_PCT)), shallow_cut, deep_cut
 
 
 def _pre_opening(

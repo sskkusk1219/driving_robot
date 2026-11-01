@@ -515,6 +515,11 @@ forward_map:
   c10_integral_brake: true
   c10_integral_accel: true
   c10_integral_ti_coef: 4.0
+  # 2026-11-01 ProblemReport_20261101_低速へIを広げる 段1: 7.5 km/h を下へ切る行の I の扱い。決める時期: 段3〜6 の実機比較
+  # off＝今と同じ（境目で 0 に戻す）／hold＝案A 境目で 0 にせず保つ／accumulate＝案B 7.5 km/h 未満でも貯める（停C のブレーキは深い向きだけ）
+  c10_integral_low_speed: "off"  # 引用符が要る（YAML では off が false になる）
+  # 案C 惰行の補助にも I を足す（段5b の実機で決める）
+  c10_integral_coast_assist: false
   # 2026-10-17 段2o-9: 置くまでの待ち（preposition_clear_s: 0.1）は廃止。待ちは「戻す側のペダルが
   # min に戻るまでの時間」（pkl の meta の戻る時間。手順2 で測る）で決める
 

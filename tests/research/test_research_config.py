@@ -1610,8 +1610,20 @@ def test_step4_local_gain_and_release_layer_keys_default_false() -> None:
     assert fm0.c10_release_table is False  # 2026-10-31 段4 案2
     assert fm0.c10_integral_brake is False and fm0.c10_integral_accel is False  # 2026-11-01 段6d
     assert fm0.c10_integral_ti_coef == 4.0
+    # 2026-11-01 低速へIを広げる 段1: 既定値だけ固定（yaml の値は固定しない）
+    assert fm0.c10_integral_low_speed == "off" and fm0.c10_integral_coast_assist is False
     cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
     assert cfgmod.validate_config(cfg) == []  # キーは yaml にある（値は固定しない）
+
+
+def test_c10_integral_low_speed_rejects_unknown_value() -> None:
+    # 2026-11-01 低速へIを広げる 段1: 3 値以外は検証で弾く（yaml の値は固定しない）
+    cfg = _load_default()
+    for good in ("off", "hold", "accumulate"):
+        cfg.forward_map.c10_integral_low_speed = good
+        assert not [p for p in cfgmod.validate_config(cfg) if "c10_integral_low_speed" in p]
+    cfg.forward_map.c10_integral_low_speed = "bogus"
+    assert [p for p in cfgmod.validate_config(cfg) if "c10_integral_low_speed" in p]
 
 
 def test_coast_band_release_at_zero_default_false() -> None:

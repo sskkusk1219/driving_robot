@@ -17,7 +17,10 @@ DT_MAX_S = 0.5  # 周期が途切れたときに 1 回で足し込む上限 [s]
 
 
 class C10Integral:
-    def __init__(self, *, brake_on: bool, accel_on: bool, ti_coef: float) -> None:
+    def __init__(
+        self, *, brake_on: bool, accel_on: bool, ti_coef: float, low_speed: str = "off"
+    ) -> None:
+        self.low_speed = low_speed  # "off" | "hold" | "accumulate"（段1。境目の下の行の扱い）
         self.brake_on = brake_on
         self.accel_on = accel_on
         self.ti_coef = ti_coef
@@ -55,12 +58,15 @@ class C10Integral:
         else:
             self.i_accel = 0.0
 
-    def add(self, is_accel: bool, dev_kmh: float, dt_s: float) -> bool:
-        """I_dev ＋＝ dev × dt。切られた向きにさらに貯まる場合は貯めない。貯めたら True。"""
+    def add(self, is_accel: bool, dev_kmh: float, dt_s: float, skip_shallow: bool = False) -> bool:
+        """I_dev ＋＝ dev × dt。切られた向きにさらに貯まる場合は貯めない。貯めたら True。
+        skip_shallow（段1: 停C の行のブレーキ）が true なら浅い向きは常に貯めない。"""
         if not self.side_on(is_accel) or dt_s <= 0.0:
             return False
         shallow_dir = dev_kmh < 0.0 if is_accel else dev_kmh > 0.0
         deep_dir = dev_kmh > 0.0 if is_accel else dev_kmh < 0.0
+        if skip_shallow and shallow_dir:
+            return False
         if (self.shallow_cut and shallow_dir) or (self.deep_cut and deep_dir):
             return False
         step = dev_kmh * min(dt_s, DT_MAX_S)
@@ -76,13 +82,30 @@ class C10Integral:
         self.deep_cut = deep
 
     def row(
-        self, *, is_accel: bool, eligible: bool, dev_kmh: float, dt_s: float, tau_s: float | None
+        self,
+        *,
+        is_accel: bool,
+        eligible: bool,
+        dev_kmh: float,
+        dt_s: float,
+        tau_s: float | None,
+        low: bool = False,
+        deep_only: bool = False,
     ) -> float:
-        """1 周期の流れ: 貯める行（eligible ＝ 7.5 km/h 以上・FF がこのペダル・停車保持でない）なら
-        反対側を 0 に戻して貯め、a_I を返す。貯めない行は両方 0 に戻して 0 を返す。"""
+        """1 周期の流れ: 貯める行（eligible ＝ 場面の条件: FF がこのペダル・停車保持/停車速度以下
+        でない）なら反対側を 0 に戻して貯め、a_I を返す。貯めない行は両方 0 に戻して 0 を返す。
+        段1: low ＝ 基準・実車速が境目（7.5 km/h）より下の行。low_speed が off なら今と同じく
+        0 に戻す・hold なら貯めずに今の値の a_I を返す・accumulate なら貯める。
+        deep_only ＝ 停C の行。accumulate の low の行のブレーキは深い向き（dev ＜ 0）だけ貯める
+        （アクセルは影響なし）。"""
         if not (eligible and self.side_on(is_accel) and tau_s is not None and tau_s > 0.0):
             self.reset()
             return 0.0
+        if low and self.low_speed not in ("hold", "accumulate"):
+            self.reset()
+            return 0.0
         self.activate(is_accel)
-        self.add(is_accel, dev_kmh, dt_s)
+        if not (low and self.low_speed == "hold"):
+            skip_shallow = low and deep_only and not is_accel and self.low_speed == "accumulate"
+            self.add(is_accel, dev_kmh, dt_s, skip_shallow=skip_shallow)
         return self.accel_kmhs(is_accel, tau_s)

@@ -2196,3 +2196,115 @@ async def test_stop_end_pred_on_changes_only_inside_section(
     on4._c10_offset(t_out, on4.ref.at(t_out), 30.0, eo)  # noqa: SLF001
     assert on4._stop_pred_dev is None  # noqa: SLF001
     assert on4._stop_end_tau_s is None  # noqa: SLF001
+
+
+# ─── C10 の I の 7.5 km/h の境目（2026-11-01 ProblemReport_20261101_低速へIを広げる 段1） ──
+
+
+async def _c10_int_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, low_speed: str
+) -> tuple[mdmod._ModeRun, list[tuple[float, float]]]:
+    """I を持つ最小の _ModeRun と、ブレーキの行（時刻, 計画の開度）の並び。"""
+    from tests.research.c10_integral import C10Integral
+
+    cfg = _c10_cfg(tmp_path)
+    # 合成 pkl に hold_pi が無いため保持の場面・発進のブレーキの帯は使わない（本件と無関係）
+    cfg.forward_map.hold_pi_enabled = False
+    cfg.forward_map.launch_brake_band = False
+    run = await _c10_run_obj(cfg, monkeypatch)
+    run.c10_int = C10Integral(
+        brake_on=True, accel_on=True, ti_coef=4.0, low_speed=low_speed
+    )
+    run._ci_pct = run._ci_kmhs = 0.0  # noqa: SLF001
+    run._ci_prev_t = None  # noqa: SLF001
+    run._ci_clamped = run._ci_deep = False  # noqa: SLF001
+    run._ci_active = False  # noqa: SLF001
+    plan = run.ff.plan
+    rows = [
+        (float(plan.t_s[k]), float(plan.effort_pct[k]))
+        for k in range(len(plan.t_s))
+        if plan.effort_pct[k] < 0.0 and plan.flag[k] not in (1, 2, 3, 4)
+    ]
+    return run, rows
+
+
+def _c10_int_step(run: mdmod._ModeRun, t: float, e: float, ref: float, dev: float) -> float:
+    run._ci_pct = run._ci_kmhs = 0.0  # noqa: SLF001
+    run._ci_active = False  # noqa: SLF001
+    run._c10_offset(t, ref, ref - dev, e)  # noqa: SLF001
+    return float(run._ci_pct or 0.0)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("low_speed", "jumps"), [("off", True), ("hold", False), ("accumulate", False)]
+)
+async def test_c10_integral_boundary_jump(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, low_speed: str, jumps: bool
+) -> None:
+    run, rows = await _c10_int_run(tmp_path, monkeypatch, low_speed)
+    assert len(rows) >= 14
+    # 7.5 km/h 以上で貯め、境目の下へ切る（dev ＜ 0 ＝ ブレーキを深くする向き）
+    pcts = [
+        _c10_int_step(run, t, e, ref=20.0, dev=-0.5) for t, e in rows[:10]
+    ]
+    assert pcts[-1] != 0.0
+    low = [_c10_int_step(run, t, e, ref=5.0, dev=-0.5) for t, e in rows[10:14]]
+    if jumps:
+        assert low == [0.0] * 4  # off は今と同じく 0 へ跳ぶ
+    else:
+        assert abs(low[0]) == pytest.approx(abs(pcts[-1]), rel=0.5)  # 段差なく続く
+        assert all(x != 0.0 for x in low)
+    # 停車速度以下（実車速 0）は 0 に戻す（off は元から 0）
+    t, e = rows[14]
+    run._c10_offset(t, 5.0, 0.0, e)  # noqa: SLF001
+    assert run.c10_int.i_brake == 0.0
+
+
+async def test_c10_integral_hold_does_not_accumulate_and_accumulate_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for low_speed, grows in (("hold", False), ("accumulate", True)):
+        run, rows = await _c10_int_run(tmp_path, monkeypatch, low_speed)
+        for t, e in rows[:6]:
+            _c10_int_step(run, t, e, ref=20.0, dev=-0.5)
+        v = run.c10_int.i_brake
+        for t, e in rows[6:12]:
+            _c10_int_step(run, t, e, ref=5.0, dev=-0.5)
+        assert (run.c10_int.i_brake < v) is grows
+        assert (run.c10_int.i_brake == v) is (not grows)
+
+
+async def test_c10_integral_stop_end_row_uses_normal_tau_and_deep_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """停C の行: a_I の τ は普段の τ（停C の縮めた τ_end は入らない）、tau_s の統計は 1 周期 1 回、
+    accumulate の浅い向き（dev ＞ 0）は貯めない。"""
+
+    class _FakeStopEnd:
+        def __init__(self) -> None:
+            self.stats = type("S", (), {"calls": [], "add": lambda s, *a: s.calls.append(a)})()
+
+        def tau_s(self, t_s: float, ref_kmh: float, is_stop_row: bool) -> float | None:
+            return 0.3  # 普段の τ（5 s）よりずっと短い
+
+        def clamp(self, effort_pct: float, plan_effort_pct: float) -> float:
+            return effort_pct
+
+    run, rows = await _c10_int_run(tmp_path, monkeypatch, "accumulate")
+    run.stop_end = _FakeStopEnd()  # type: ignore[assignment]
+    run.ref = type("_Ref", (), {"at": lambda self, t: 5.0})()  # type: ignore[assignment]
+    tau_normal = run.ff.tau_brake_s
+    cfg = run.cfg
+    cfg.forward_map.stop_end_tau_cap_normal = False
+    t, e = rows[0]
+    _c10_int_step(run, t, e, ref=5.0, dev=-0.5)  # 深い向き: 貯まる
+    t, e = rows[1]
+    _c10_int_step(run, t, e, ref=5.0, dev=-0.5)
+    assert run.c10_int.i_brake < 0.0
+    assert run._ci_kmhs == pytest.approx(run.c10_int.accel_kmhs(False, tau_normal))  # noqa: SLF001
+    assert run._ci_kmhs != pytest.approx(run.c10_int.accel_kmhs(False, 0.3))  # noqa: SLF001
+    assert len(run.stop_end.stats.calls) == 2  # 1 周期 1 回
+    v = run.c10_int.i_brake
+    t, e = rows[2]
+    _c10_int_step(run, t, e, ref=5.0, dev=0.5)  # 浅い向き: 貯めない
+    assert run.c10_int.i_brake == v

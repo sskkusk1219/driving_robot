@@ -1415,7 +1415,11 @@ def c10_integral_text(fm: Any) -> str:
         n for n, on in (("ブレーキ", fm.c10_integral_brake), ("アクセル", fm.c10_integral_accel))
         if on
     )
-    return f"あり（{sides}・Ti ＝ {fm.c10_integral_ti_coef:g} × τ）"
+    return (
+        f"あり（{sides}・Ti ＝ {fm.c10_integral_ti_coef:g} × τ・"
+        f"low_speed ＝ {fm.c10_integral_low_speed}・"
+        f"coast_assist ＝ {'あり' if fm.c10_integral_coast_assist else 'なし'}）"
+    )
 
 
 def dob_low_speed_text(fm: Any) -> str:
@@ -1740,6 +1744,7 @@ class _ModeRun:
             C10Integral(
                 brake_on=fm_ci.c10_integral_brake, accel_on=fm_ci.c10_integral_accel,
                 ti_coef=fm_ci.c10_integral_ti_coef,
+                low_speed=fm_ci.c10_integral_low_speed,
             )
             if self.c10 is not None and (fm_ci.c10_integral_brake or fm_ci.c10_integral_accel)
             else None
@@ -1747,6 +1752,7 @@ class _ModeRun:
         self._ci_pct: float | None = None  # 今の周期の c10_effort のうち I の分 [%]
         self._ci_kmhs: float | None = None  # 今の周期の a_I [km/h/s]
         self._ci_prev_t: float | None = None
+        self._ci_dt_s = 0.0  # 今の周期の I の dt（_c10_offset が決め、_coast_assist も使う）
         self._ci_active = False  # 今の周期が I を貯める行か
         self._ci_clamped = False  # 今の周期に min で浅く切られた
         self._ci_deep = False  # 今の周期に上限で深く切られた
@@ -2424,22 +2430,49 @@ class _ModeRun:
             kwargs["release_peak_u_pct"] = self.dob.recent_peak_brake(t)
         # 段6d: 偏差の積分 I。7.5 km/h 以上の、FF がそのペダルの行だけで貯める。それ以外は 0 に戻す
         # （惰行の行は呼び出し側で補助の有無を見て決める）。P の偏差と同じ dev を足す
+        # 2026-11-01 ProblemReport_20261101_低速へIを広げる 段1: 場面の条件（eligible）と車速の条件
+        # （low ＝ 基準・実車速の小さい方が 7.5 km/h 未満）を分け、low の行は
+        # c10_integral_low_speed に従う。
+        # 停C の行（deep_only）は I より前に分かる必要があるので、τ_end の計算を I の前へ移した
+        # （tau_s は統計を持たない。stats.add は下の元の場所で 1 回だけ）
+        from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+
         ci = self.c10_int
         integral_kmhs = 0.0
+        flag_now = int(plan.flag[i])
+        tau_end: float | None = None
+        if self.stop_end is not None:
+            # C15 停C: 停車まぎわのブレーキの行は、P の τ を「基準が 0 になるまでの残り時間
+            # （ブレーキの遅れより短くしない）」にして引き直し、開度の範囲に収める
+            tau_end = (
+                self.stop_end.tau_s(t, self.ref.at(t), flag_now == FLAG_STOP)
+                if ff_effort < 0.0 and flag_now not in (FLAG_COAST, FLAG_PREPOS)
+                else None
+            )
+            # 2026-10-23 段6-2 (c): 普段の τ より弱くしない（残り時間が長いときは普段のまま）
+            tau_end = cap_stop_end_tau(
+                tau_end, ff.tau_brake_s, self.cfg.forward_map.stop_end_tau_cap_normal
+            )
+        dt_ci = 0.0 if self._ci_prev_t is None else t - self._ci_prev_t
+        self._ci_dt_s = dt_ci  # 惰行の補助（_coast_assist）が同じ周期の dt に使う（二重計上しない）
         if ci is not None and ff_effort != 0.0:
             is_accel_ci = ff_effort > 0.0
             tau_ci = ff.tau_accel_s if is_accel_ci else ff.tau_brake_s
             top_ci = float(ff.table.meta.get("stop_max_speed_kmh") or 7.5)
-            eligible = (
-                int(plan.flag[i]) not in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS)
-                and min(ref, float(kwargs["row_kmh"])) >= top_ci
-            )
-            dt_ci = 0.0 if self._ci_prev_t is None else t - self._ci_prev_t
+            eligible = flag_now not in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS)
+            low_ci = min(ref, float(kwargs["row_kmh"])) < top_ci
+            if ci.low_speed != "off" and speed <= STOP_SPEED_KMH:
+                eligible = False  # 停車速度以下は 0 に戻す（次の発進へ持ち越さない）
+            # 1-3: a_I の τ は普段の τ のまま（停C が kwargs["tau_brake_s"] を縮めても先に計算済み）
             integral_kmhs = ci.row(
                 is_accel=is_accel_ci, eligible=eligible, dev_kmh=float(kwargs["dev_kmh"]),
-                dt_s=dt_ci, tau_s=tau_ci,
+                dt_s=dt_ci, tau_s=tau_ci, low=low_ci,
+                deep_only=tau_end is not None and not is_accel_ci,
             )
-            self._ci_active = eligible and ci.side_on(is_accel_ci) and bool(tau_ci and tau_ci > 0.0)
+            self._ci_active = (
+                eligible and (not low_ci or ci.low_speed != "off")
+                and ci.side_on(is_accel_ci) and bool(tau_ci and tau_ci > 0.0)
+            )
         self._ci_prev_t = t
         kwargs["integral_kmhs"] = integral_kmhs
         fb_table = self._fb_table()  # 段8-b
@@ -2467,17 +2500,6 @@ class _ModeRun:
             kwargs["gain_ratio"] = gain_ratio
             self.c10.add_gain(is_accel=ff_effort > 0.0, cut_pct=undivided - new)
         if self.stop_end is not None:
-            # C15 停C: 停車まぎわのブレーキの行は、P の τ を「基準が 0 になるまでの残り時間
-            # （ブレーキの遅れより短くしない）」にして引き直し、開度の範囲に収める
-            tau_end = (
-                self.stop_end.tau_s(t, self.ref.at(t), int(plan.flag[i]) == FLAG_STOP)
-                if ff_effort < 0.0 and int(plan.flag[i]) not in (FLAG_COAST, FLAG_PREPOS)
-                else None
-            )
-            # 2026-10-23 段6-2 (c): 普段の τ より弱くしない（残り時間が長いときは普段のまま）
-            tau_end = cap_stop_end_tau(
-                tau_end, ff.tau_brake_s, self.cfg.forward_map.stop_end_tau_cap_normal
-            )
             if tau_end is None:
                 self.stop_end.stats.add(False)
             else:
@@ -2567,7 +2589,8 @@ class _ModeRun:
         2026-10-19 段3: 目標（偏差 dev・表の行 ref_kmh）は `ref_t`（ぼかした基準）。入る・離すの
         停車の判定（元の基準が停車速度を超えているか）は `ref`（元の基準）のまま。"""
         # fwd_plan → ff_bias → mode_report → mode_drive の循環を避けるため、ここで読む
-        from tests.research.fwd_plan import coast_assist_effort  # noqa: PLC0415
+        from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+        from tests.research.fwd_plan import coast_assist_effort_detail  # noqa: PLC0415
 
         ff, coast, dob = self.ff, self.coast, self.dob
         assert isinstance(ff, CoastAssistFeedforward) and coast is not None and dob is not None
@@ -2599,10 +2622,45 @@ class _ModeRun:
             kwargs["onset_u_pct"] = None if on is None else float(on)
         d = self._dob_estimate(is_accel, speed, int(plan.flag[i]), ref)
         fb_table = self._fb_table()  # 段8-b
-        with_dob = coast_assist_effort(fb_table, dob_kmhs=d, **kwargs)
-        without = coast_assist_effort(fb_table, **kwargs) if d != 0.0 else with_dob
+        # 2026-11-01 ProblemReport_20261101_低速へIを広げる 段1 案C: 補助のペダルの側で I を
+        # 貯め、a_I を要る加速度に足す（c10_integral_coast_assist が true のとき）。
+        # dt は _c10_offset が決めたこの周期の値（_ci_dt_s）。_c10_offset は ff_effort ＝ 0 の行で
+        # row() を呼ばないので二重計上しない。
+        # 7.5 km/h 未満・停車速度以下の扱いは _c10_offset と同じ（c10_integral_low_speed に従う）
+        ci = self.c10_int
+        integral_kmhs = 0.0
+        ci_on = ci is not None and self.cfg.forward_map.c10_integral_coast_assist
+        if ci is not None and ci_on:
+            top_ci = float(ff.table.meta.get("stop_max_speed_kmh") or 7.5)
+            low_ci = min(ref_t, float(kwargs["row_kmh"])) < top_ci
+            eligible = not (ci.low_speed != "off" and speed <= STOP_SPEED_KMH)
+            integral_kmhs = ci.row(
+                is_accel=is_accel, eligible=eligible, dev_kmh=float(kwargs["dev_kmh"]),
+                dt_s=self._ci_dt_s, tau_s=tau, low=low_ci,
+            )
+            self._ci_active = (
+                eligible and (not low_ci or ci.low_speed != "off") and ci.side_on(is_accel)
+            )
+        with_dob, cut_shallow, cut_deep = coast_assist_effort_detail(
+            fb_table, dob_kmhs=d, integral_kmhs=integral_kmhs, **kwargs
+        )
+        # DOB の分は I を含めた同じ条件で差を取る（I の有無で DOB の分がぶれないように）
+        without = (
+            coast_assist_effort_detail(
+                fb_table, integral_kmhs=integral_kmhs, **kwargs
+            )[0] if d != 0.0 else with_dob
+        )
         self._dob_effort = with_dob - without
         self._coast_effort = with_dob
+        if self._ci_active:
+            # 切られた周期は浅い向きに貯めない（_ci_clamped は note_cut の浅い向きに流れる）
+            self._ci_clamped = cut_shallow
+            self._ci_deep = cut_deep
+            self._ci_kmhs = integral_kmhs
+            without_i = coast_assist_effort_detail(
+                fb_table, dob_kmhs=d, integral_kmhs=0.0, **kwargs
+            )[0]
+            self._ci_pct = with_dob - without_i
         coast.note_effort(with_dob)
         return with_dob
 

@@ -25,6 +25,7 @@ from tests.research.fwd_plan import (
     ForwardPlan,
     build_plan,
     coast_assist_effort,
+    coast_assist_effort_detail,
     deviation_offset,
     deviation_offset_detail,
     low_speed_sides,
@@ -775,6 +776,42 @@ def test_coast_assist_effort_signs_and_amounts() -> None:
     assert _coast(t, is_accel=True, dev=2.0) == pytest.approx(AD + 0.4 / ACCEL_SLOPE)
     # 速すぎ −2 km/h → Δa=−0.4 → ブレーキ −(min ＋ 0.4/0.6)（負）
     assert _coast(t, is_accel=False, dev=-2.0) == pytest.approx(-(BD + 0.4 / BRAKE_SLOPE))
+
+
+def test_coast_assist_effort_integral_kmhs() -> None:
+    # 2026-11-01 低速へIを広げる 段1 案C: a_I は偏差の項に足す。0 は今と同じ
+    t = linear_table()
+    for is_accel, dev in ((True, 2.0), (False, -2.0)):
+        assert _coast(t, is_accel=is_accel, dev=dev, integral_kmhs=0.0) == _coast(
+            t, is_accel=is_accel, dev=dev
+        )
+    # 正の a_I でアクセルが深く、負の a_I でブレーキが深くなる
+    assert _coast(t, is_accel=True, dev=2.0, integral_kmhs=0.3) == pytest.approx(
+        AD + (0.4 + 0.3) / ACCEL_SLOPE
+    )
+    assert _coast(t, is_accel=False, dev=-2.0, integral_kmhs=-0.3) == pytest.approx(
+        -(BD + (0.4 + 0.3) / BRAKE_SLOPE)
+    )
+
+
+def test_coast_assist_effort_detail_reports_cuts() -> None:
+    t = linear_table()
+    eff, shallow, deep = coast_assist_effort_detail(
+        t, is_accel=True, need_kmhs=-2.5, ref_kmh=50.0, row_kmh=50.0, dev_kmh=-20.0,
+        tau_s=5.0, accel_min_pct=AD, brake_min_pct=BD,
+    )
+    assert eff == AD and shallow and not deep  # 反対の符号で min に止めた
+    eff, shallow, deep = coast_assist_effort_detail(
+        t, is_accel=True, need_kmhs=-2.5, ref_kmh=50.0, row_kmh=50.0, dev_kmh=2.0,
+        tau_s=5.0, accel_min_pct=AD, brake_min_pct=BD,
+    )
+    assert not shallow and not deep
+    # 効き始めの下限に切られた
+    _, shallow, _ = coast_assist_effort_detail(
+        t, is_accel=True, need_kmhs=-2.5, ref_kmh=50.0, row_kmh=50.0, dev_kmh=2.0,
+        tau_s=5.0, accel_min_pct=AD, brake_min_pct=BD, onset_u_pct=50.0,
+    )
+    assert shallow
 
 
 def test_coast_assist_effort_stops_at_min_and_never_switches_pedal() -> None:

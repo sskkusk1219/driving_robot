@@ -961,6 +961,16 @@ class ForwardMapSection:
     c10_integral_brake: bool = False
     c10_integral_accel: bool = False
     c10_integral_ti_coef: float = 4.0
+    # 2026-11-01 ProblemReport_20261101_低速へIを広げる 段1: 基準・実車速が 7.5 km/h（meta
+    # stop_max_speed_kmh）を下へ切る行の I の扱い。off ＝ 今と同じ（0 に戻す・境目で段差）／
+    # hold（案A）＝ 貯めずに持っている値を保つ／accumulate（案B）＝ 境目の下でも貯める
+    # （停C の行のブレーキは深い向きだけ）。hold・accumulate は停車速度以下で 0 に戻す。
+    # 根拠: 減速で境目を切る瞬間に I の 0.1〜0.4% が急に抜ける（6 モード 60 回）。
+    # 決める時期: 段3〜6 の実機比較。既定 off ＝ 今と完全に同じ
+    c10_integral_low_speed: str = "off"
+    # 同 案C: true なら惰行の補助にも I を足す（補助のペダルの側で貯め、a_I を要る加速度に足す。
+    # 切られた周期は浅い向きに貯めない）。既定 false ＝ 今と完全に同じ
+    c10_integral_coast_assist: bool = False
     # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
     # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
     # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・
@@ -1811,6 +1821,11 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         fm.c10_integral_ti_coef > 0.0,
         f"forward_map.c10_integral_ti_coef は正値: {fm.c10_integral_ti_coef}",
+    )
+    need(
+        fm.c10_integral_low_speed in ("off", "hold", "accumulate"),
+        "forward_map.c10_integral_low_speed は off / hold / accumulate: "
+        f"{fm.c10_integral_low_speed!r}",
     )
     need(fm.coast_on_kmh > 0.0, f"forward_map.coast_on_kmh は正値: {fm.coast_on_kmh}")
     need(

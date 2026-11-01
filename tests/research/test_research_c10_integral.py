@@ -14,8 +14,10 @@ TAU = 5.0
 DT = 0.1
 
 
-def _ci(brake: bool = True, accel: bool = True, coef: float = 4.0) -> C10Integral:
-    return C10Integral(brake_on=brake, accel_on=accel, ti_coef=coef)
+def _ci(
+    brake: bool = True, accel: bool = True, coef: float = 4.0, low_speed: str = "off"
+) -> C10Integral:
+    return C10Integral(brake_on=brake, accel_on=accel, ti_coef=coef, low_speed=low_speed)
 
 
 def _run(ci: C10Integral, is_accel: bool, dev: float, n: int) -> None:
@@ -32,6 +34,7 @@ def test_config_defaults_off() -> None:
     assert fm.c10_integral_brake is False
     assert fm.c10_integral_accel is False
     assert fm.c10_integral_ti_coef == 4.0
+    assert fm.c10_integral_low_speed == "off"  # 2026-11-01 低速へIを広げる 段1
 
 
 # ── 積分器 ──
@@ -124,6 +127,93 @@ def test_dt_is_capped() -> None:
     ci.add(False, 1.0, 10.0)
     assert ci.i_brake == pytest.approx(DT_MAX_S)
     assert ci.add(False, 1.0, 0.0) is False
+
+
+# ── 7.5 km/h 未満の行（2026-11-01 ProblemReport_20261101_低速へIを広げる 段1） ──
+
+
+def _lrow(ci: C10Integral, *, is_accel: bool = False, dev: float = 0.5, **kw: object) -> float:
+    return ci.row(
+        is_accel=is_accel, eligible=True, dev_kmh=dev, dt_s=DT, tau_s=TAU, **kw  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize("is_accel", [False, True])
+def test_row_off_low_row_resets_and_matches_old_behavior(is_accel: bool) -> None:
+    ci = _ci()
+    for _ in range(10):
+        assert _lrow(ci, is_accel=is_accel) > 0.0 or is_accel  # 貯まる
+    assert ci.value(is_accel) != 0.0
+    assert _lrow(ci, is_accel=is_accel, low=True) == 0.0  # 境目の下は今と同じく 0 へ
+    assert ci.i_brake == ci.i_accel == 0.0
+    # deep_only は off では何も変えない
+    _lrow(ci, is_accel=is_accel)
+    assert _lrow(ci, is_accel=is_accel, low=True, deep_only=True) == 0.0
+
+
+def test_row_default_args_equal_old_row() -> None:
+    ci = _ci()
+    a = _lrow(ci)
+    assert a == pytest.approx(ci.accel_kmhs(False, TAU)) and ci.i_brake == pytest.approx(0.5 * DT)
+    assert ci.row(is_accel=False, eligible=False, dev_kmh=0.5, dt_s=DT, tau_s=TAU) == 0.0
+    assert ci.i_brake == 0.0
+
+
+@pytest.mark.parametrize("is_accel", [False, True])
+def test_row_hold_keeps_value_on_low_rows(is_accel: bool) -> None:
+    ci = _ci(low_speed="hold")
+    for _ in range(10):
+        _lrow(ci, is_accel=is_accel, dev=0.5 if not is_accel else -0.5)
+    v, a = ci.value(is_accel), ci.accel_kmhs(is_accel, TAU)
+    assert a != 0.0
+    for dev in (0.5, -0.5):
+        assert _lrow(ci, is_accel=is_accel, dev=dev, low=True) == a  # 値が変わらず a_I を返す
+        assert ci.value(is_accel) == v
+    # 反対のペダルに替わったら反対側は 0（hold でも activate はする）
+    _lrow(ci, is_accel=not is_accel, low=True)
+    assert ci.value(is_accel) == 0.0
+
+
+@pytest.mark.parametrize("is_accel", [False, True])
+def test_row_accumulate_accumulates_on_low_rows(is_accel: bool) -> None:
+    ci = _ci(low_speed="accumulate")
+    dev = -0.5 if is_accel else 0.5
+    for n in range(1, 4):
+        _lrow(ci, is_accel=is_accel, dev=dev, low=True)
+        assert ci.value(is_accel) == pytest.approx(dev * DT * n)
+
+
+def test_row_deep_only_brake_skips_shallow_direction() -> None:
+    ci = _ci(low_speed="accumulate")
+    _lrow(ci, dev=0.5, low=True, deep_only=True)  # ブレーキの浅い向き（dev ＞ 0）は貯めない
+    assert ci.i_brake == 0.0
+    _lrow(ci, dev=-0.5, low=True, deep_only=True)  # 深い向きは貯める
+    assert ci.i_brake == pytest.approx(-0.5 * DT)
+    before = ci.i_brake
+    _lrow(ci, dev=0.5, low=True, deep_only=True)
+    assert ci.i_brake == before  # 持っている値は保たれる（浅い向きを止めるだけ）
+    _lrow(ci, dev=0.5, low=True)  # deep_only でなければ貯める
+    assert ci.i_brake == pytest.approx(before + 0.5 * DT)
+
+
+@pytest.mark.parametrize("dev", [0.5, -0.5])
+def test_row_deep_only_has_no_effect_on_accel(dev: float) -> None:
+    a = _ci(low_speed="accumulate")
+    b = _ci(low_speed="accumulate")
+    _lrow(a, is_accel=True, dev=dev, low=True, deep_only=True)
+    _lrow(b, is_accel=True, dev=dev, low=True)
+    assert a.i_accel == b.i_accel == pytest.approx(dev * DT)
+
+
+def test_row_not_eligible_resets_in_every_mode() -> None:
+    # 停車速度以下は呼び出し側が eligible ＝ False にして 0 へ戻す
+    for mode in ("off", "hold", "accumulate"):
+        ci = _ci(low_speed=mode)
+        _lrow(ci)
+        assert ci.row(
+            is_accel=False, eligible=False, dev_kmh=0.5, dt_s=DT, tau_s=TAU, low=True
+        ) == 0.0
+        assert ci.i_brake == 0.0
 
 
 # ── 開度への換算（deviation_offset_detail の integral_kmhs） ──
