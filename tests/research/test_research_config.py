@@ -1752,3 +1752,18 @@ def test_launch_gap_tight_default_false_and_needs_release_ramp() -> None:
     cfg.forward_map.launch_release_ramp = False
     cfg.forward_map.launch_move_hold = False
     assert any("launch_gap_tight" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_table_boundary_step_keys_default_off_and_anchor_rejects_unknown() -> None:
+    # 2026-11-02 表の境目の段差 段1: 既定値だけ固定（yaml の値は固定しない）
+    fm0 = cfgmod.ForwardMapSection()
+    assert fm0.side_table_taper is False
+    assert fm0.low_speed_release_anchor == "body"
+    assert fm0.low_speed_switch_ramp is False
+    cfg = _load_default()
+    assert not [p for p in cfgmod.validate_config(cfg) if "low_speed_release_anchor" in p]
+    for good in ("body", "stop"):
+        cfg.forward_map.low_speed_release_anchor = good
+        assert not [p for p in cfgmod.validate_config(cfg) if "low_speed_release_anchor" in p]
+    cfg.forward_map.low_speed_release_anchor = "bogus"
+    assert [p for p in cfgmod.validate_config(cfg) if "low_speed_release_anchor" in p]

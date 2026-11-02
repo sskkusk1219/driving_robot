@@ -833,6 +833,8 @@ def build_plan(
     release_table_min_kmh: float = 0.0,
     low_speed_release_stop_layer: bool = False,
     stop_approach_lead_s: float = 0.0,
+    release_anchor: str = "body",
+    low_speed_switch_ramp: bool = False,
     switch_lead: bool = False,
     launch_midway_brake_cap: bool = False,
     launch_release_ramp: bool = False,
@@ -990,6 +992,19 @@ def build_plan(
     （低速の停止側の層の解き直しからも外す。side_brake は SIDE_STOP のまま）。
     0.0 は今までと完全に同じ。
 
+    2026-11-02 表の境目の段差 段1: `release_anchor`。"body"（既定）は今までと完全に同じ。"stop" は
+    dir の規則で 7.5 km/h 未満の戻しを解き直すとき（`_solve_with_release` の on_stop が False で
+    v が meta stop_max_speed_kmh 未満）、加速度を 停止側の表 ＋ (本体の戻しの表 − 本体) にして、
+    戻し量 0 で停止側の表と一致させる（戻し始めの停止側 → 本体の段差をなくす）。
+    `low_speed_switch_ramp`: True なら、7.5 km/h 未満のブレーキの行で側が停止側 → 戻し
+    （SIDE_STOP・SIDE_STOP_RELEASE → SIDE_RELEASE。戻し → 停止側はならさない。
+    本体の表はクリープを知らず停車直前に最大 2.85% 浅くするため。2026-11-02 段7b）に
+    替わった周期 i の跳び
+    d ＝ effort[i] − effort_alt[i]（行 i が前の行と同じ側の表のままだったときの開度との差
+    ＝ 表の食い違いの分だけ。2026-11-02 段7 の後に、直前の傾きの延長との差から変更。AMA 339 s）を、
+    K ＝ round(meta brake_lag_s ÷ period_s) 行で 0 へならす（`_ramp_low_speed_switch`）。
+    meta が無ければ何もしない。False は今までと同じ。
+
     accel_lag_s・brake_lag_s が None なら表の meta（表を作ったときの L）、それも無ければ既定値。
     preposition_enabled なら、最後に `preposition` で次に踏むペダルを先に置く
     （効き始めは表の meta の accel_onset_u_pct・brake_onset_u_pct。2026-10-16 段2o-6）。
@@ -1038,6 +1053,8 @@ def build_plan(
             "release_table_min_kmh": release_table_min_kmh,
             "low_speed_release_stop_layer": low_speed_release_stop_layer,
             "stop_approach_lead_s": stop_approach_lead_s,
+            "release_anchor": release_anchor,
+            "low_speed_switch_ramp": low_speed_switch_ramp,
             "launch_midway_brake_cap": launch_midway_brake_cap,
             "launch_release_ramp": launch_release_ramp,
             "launch_release_lead_s": launch_release_lead_s,
@@ -1089,6 +1106,8 @@ def build_plan(
             "release_table_min_kmh": release_table_min_kmh,
             "low_speed_release_stop_layer": low_speed_release_stop_layer,
             "stop_approach_lead_s": stop_approach_lead_s,
+            "release_anchor": release_anchor,
+            "low_speed_switch_ramp": low_speed_switch_ramp,
             "launch_midway_brake_cap": launch_midway_brake_cap,
             "launch_release_ramp": launch_release_ramp,
             "launch_release_lead_s": launch_release_lead_s,
@@ -1344,7 +1363,7 @@ def build_plan(
                 body_redo &= low
             released = _resolve_releases(
                 effort, body_redo, u_b, v, need_b, table, brake_deadband_pct, accel_deadband_pct,
-                period_s, stop_side=stop_layer_rows,
+                period_s, stop_side=stop_layer_rows, release_anchor=release_anchor,
             )
     elif body_release or stop_release:
         redo = np.zeros(n, dtype=bool)
@@ -1424,6 +1443,15 @@ def build_plan(
     side_brake = np.where(released & ~stop_b & ~launch_b, SIDE_RELEASE, side_brake)
     if side_brake_dir is not None:
         side_brake = side_brake_dir
+    if low_speed_switch_ramp and dir_rule:
+        # 2026-11-02 表の境目の段差 段1 案 B: 側が替わった周期の開度の跳びを、ブレーキの遅れの行数で
+        # ならす（clip の前。停車保持・先置き・launch_prep・アクセル・別の切り替えで止める）
+        _ramp_low_speed_switch(
+            effort, side_brake, v, stop, launch_prep, top=top, period_s=period_s,
+            brake_lag_s=brake_lag_s if brake_lag_s is not None else table.meta.get("brake_lag_s"),
+            brake_min_pct=brake_deadband_pct, need_b=need_b, table=table,
+            accel_deadband_pct=accel_deadband_pct,
+        )
     # 2026-10-27 段13: predict_low_speed_sides が true で表の側を持つ規則（pedal・dir）のときだけ、
     # すき間の処理の予測（predicted_accel）に低速の行の表の側を渡す。車速は基準車速 v で
     # meta stop_max_speed_kmh（無ければ 7.5）未満の行。legacy は側が決まらないので今までと同じ
@@ -1519,6 +1547,106 @@ def build_plan(
         # ブレーキの行だけ印を残す（すき間の 0 の行は印なし → 走行中は計画の FF をそのまま使う）
         launch_band=None if launch_band_rows is None else (launch_band_rows & (effort < 0.0)),
     )
+
+
+def _switch_alt_effort(
+    i: int,
+    orig: np.ndarray,
+    v: np.ndarray,
+    need_b: np.ndarray,
+    table: ForwardTable,
+    brake_min_pct: float,
+    accel_deadband_pct: float,
+    period_s: float,
+) -> float:
+    """行 i が前の行 i−1 と同じ側の表のままだったときのブレーキの開度 effort_alt[i]（負）。
+    山 m は `_resolve_releases` と同じ（直近 RELEASE_WINDOW_S 秒の計画済みの効く開度 u の最小）。
+    停止側 → 戻しだけが対象: 停止側＋(本体の戻し − 本体) の解（release_anchor="stop"）。
+    解けない（m が無い・None）なら停止側の表の戻し量 0 の解。"""
+    u = np.where(
+        orig < -brake_min_pct,
+        orig + brake_min_pct,
+        np.where(orig > accel_deadband_pct, orig - accel_deadband_pct, 0.0),
+    )
+    w = max(int(round(RELEASE_WINDOW_S / period_s)), 1)
+    m = float(u[max(i - w, 0) : i].min()) if i > 0 else 0.0
+    vi, ni = float(v[i]), float(need_b[i])
+    u_alt = None
+    if m < 0.0:
+        u_alt = _solve_with_release(
+            table, vi, ni, m, on_stop=False, release_anchor="stop"
+        )
+    if u_alt is None:
+        u0, _ = table.invert(vi, ni, stop=True)
+        u_alt = min(float(u0), 0.0)
+    return -(brake_min_pct + abs(u_alt))
+
+
+def _ramp_low_speed_switch(
+    effort: np.ndarray,
+    side_brake: np.ndarray,
+    v: np.ndarray,
+    stop: np.ndarray,
+    launch_prep: np.ndarray | None,
+    *,
+    top: float,
+    period_s: float,
+    brake_lag_s: float | None,
+    brake_min_pct: float,
+    need_b: np.ndarray | None = None,
+    table: ForwardTable | None = None,
+    accel_deadband_pct: float = 0.0,
+) -> int:
+    """2026-11-02 表の境目の段差 段1 案 B（low_speed_switch_ramp）:
+    7.5 km/h（top）未満のブレーキの行で側が 停止側（SIDE_STOP・SIDE_STOP_RELEASE）→
+    戻し（SIDE_RELEASE）に替わった周期 i の跳び d ＝ effort[i] − effort_alt[i] を、
+    K ＝ round(brake_lag_s ÷ period_s) 行かけて effort[i+k] −＝ d·(1 − (k+1)/(K+1))（k ＝ 0〜K−1）
+    でならす。effort_alt[i] は「行 i が前の行 i−1 と同じ側の表のままだったら」の開度
+    （`_switch_alt_effort`。停止側＋(本体の戻し−本体) の解）。
+    戻し→停止側はならさない（代わりの開度を本体の表で解くと、本体はクリープを知らないため
+    停車の直前 0.2〜0.9 km/h でブレーキを最大 2.85% 浅くしてしまう。机上 WLTP 444 s・
+    UDDS 727 s・1186 s・AMA 247 s。測った段差も停止側→戻し −0.93% の方。2026-11-02 段7b）。
+    ただし「別の切り替えの行で止める」の判定には両方向の切り替えを使う。
+    つまり d は表の食い違いの分だけで、計画がもともと大きく戻す分は入らない
+    （2026-11-02 段7 の後に d を直前の傾きの延長との差から表の食い違いに変更。AMA 339 s で
+    計画の戻しまで最大 3.3% 深く残していたため）。
+    止める: 停車保持・launch_prep・ブレーキでない行・top 以上の車速・別の切り替えの行。
+    i と i−1 がブレーキでない／停車保持なら、その切り替えは触らない。brake_lag_s が無い
+    （meta なし）か K < 1、need_b・table が無いときは何もしない。effort をその場で書き換え、
+    ならした切り替えの数を返す。"""
+    if brake_lag_s is None or not np.isfinite(brake_lag_s) or need_b is None or table is None:
+        return 0
+    kk = int(round(float(brake_lag_s) / period_s))
+    n = len(effort)
+    if kk < 1 or n < 2:
+        return 0
+    stoplike = _is_stop_side(side_brake)
+    rel = side_brake == SIDE_RELEASE
+    sw = np.zeros(n, dtype=bool)  # 停止側 → 戻し（ならす対象）
+    sw[1:] = stoplike[:-1] & rel[1:]
+    sw_any = sw.copy()  # 両方向（別の切り替えの行で止める判定用）
+    sw_any[1:] |= rel[:-1] & stoplike[1:]
+    hold = np.asarray(stop, dtype=bool)
+    if launch_prep is not None:
+        hold = hold | np.asarray(launch_prep, dtype=bool)
+    orig = effort.copy()
+    done = 0
+    for i in np.flatnonzero(sw).tolist():
+        if i < 1 or not (v[i] < top):
+            continue
+        if any(orig[j] >= 0.0 or hold[j] for j in (i, i - 1)):
+            continue
+        alt = _switch_alt_effort(
+            i, orig, v, need_b, table, brake_min_pct, accel_deadband_pct, period_s
+        )
+        d = orig[i] - alt
+        for k in range(kk):
+            j = i + k
+            if j >= n or orig[j] >= 0.0 or hold[j] or not (v[j] < top) or (k > 0 and sw_any[j]):
+                break
+            effort[j] = min(effort[j] - d * (1.0 - (k + 1.0) / (kk + 1.0)), -brake_min_pct)
+        done += 1
+    return done
 
 
 def _hold_opening(table: ForwardTable, key: str, min_pct: float) -> float:
@@ -3473,16 +3601,36 @@ def count_gap_violations_by_position(
 
 
 def _solve_with_release(
-    table: ForwardTable, v: float, need: float, m: float, on_stop: bool = False
+    table: ForwardTable,
+    v: float,
+    need: float,
+    m: float,
+    on_stop: bool = False,
+    release_anchor: str = "body",
 ) -> float | None:
     """山 m（< 0。直近の最深の u）からの戻し量つきでブレーキの要る加速度 need になる u ∈ (m, 0]
     を解く（accel(v, u, release = u − m) ≧ need になる最初の u。格子点で評価して交差を直線補間。
     `_resolve_releases` の解き方。2026-10-31 段4 で関数に切り出し、C10 の c10_release_table が
     共用）。
+    release_anchor（2026-11-02 表の境目の段差 段1）: "stop" で on_stop が False かつ v が meta
+    stop_max_speed_kmh 未満のとき、加速度を 戻しの表 − 本体 ＋ 停止側の表 にする（戻し量 0 で停止側
+    の表と一致）。"body"・7.5 km/h 以上・停止側の表なしは今までと同じ。
     完全に離しても届かなければ None。"""
     grid = table.u_grid
     pts = np.concatenate([[m], grid[(grid > m) & (grid < 0.0)], [0.0]])
-    f = np.asarray(table.accel(v, pts, release=pts - m, stop=on_stop), dtype=float) - need
+    a_rel = np.asarray(table.accel(v, pts, release=pts - m, stop=on_stop), dtype=float)
+    if (
+        release_anchor == "stop"
+        and not on_stop
+        and table.stop_accel is not None
+        and v < float(table.meta.get("stop_max_speed_kmh", 0.0))
+    ):
+        a_rel = (
+            a_rel
+            - np.asarray(table.accel(v, pts), dtype=float)
+            + np.asarray(table.accel(v, pts, stop=True), dtype=float)
+        )
+    f = a_rel - need
     hit = np.flatnonzero(f >= 0.0)
     if len(hit) == 0:
         return None
@@ -3508,11 +3656,12 @@ def _resolve_releases(
     period_s: float,
     window_s: float = RELEASE_WINDOW_S,
     stop_side: np.ndarray | None = None,
+    release_anchor: str = "body",
 ) -> np.ndarray:
     """戻しの表があるとき、redo の時刻のブレーキを時刻順に解き直して effort を書き換える
     （2026-10-14 段2o-5。手順はモジュールの docstring）。u_b0 は戻し量 0 で解いた u。
     stop_side（2026-10-20 段4-3）: True の時刻は停止側の表（と停止側の戻しの層）で引く。
-    None なら全部本体（今までと同じ）。
+    None なら全部本体（今までと同じ）。release_anchor は `_solve_with_release` へ（2026-11-02）。
     戻り値（段5-2）: 解き直して effort を書いた行の bool 配列。"""
     changed = np.zeros(len(effort), dtype=bool)
     w = max(int(round(window_s / period_s)), 1)
@@ -3527,7 +3676,9 @@ def _resolve_releases(
         if m >= 0.0 or float(u_b0[i]) <= m:
             continue  # 戻していない（直近の最小が 0 以上）か、戻し量 0 の解がすでに m より深い
         on_stop = stop_side is not None and bool(stop_side[i])
-        u_new = _solve_with_release(table, float(v[i]), float(need_b[i]), m, on_stop)
+        u_new = _solve_with_release(
+            table, float(v[i]), float(need_b[i]), m, on_stop, release_anchor
+        )
         if u_new is None:
             continue  # 完全に離しても要る加速度に届かない: 戻し量 0 の解のまま
         u[i] = u_new

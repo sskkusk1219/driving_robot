@@ -3727,3 +3727,232 @@ def test_launch_gap_tight_on_build_plan_leaves_other_switches_unchanged() -> Non
     on = plan_for(ref, 24.0, _table13(), launch_gap_tight=True, **kw)
     assert np.array_equal(off.effort_pct, on.effort_pct) and np.array_equal(off.flag, on.flag)
     assert off.return_gap.n_switches >= 1
+
+
+# ─── 2026-11-02 表の境目の段差 段1: release_anchor（案 A）・low_speed_switch_ramp（案 B） ───
+
+
+def _anchor_table() -> ForwardTable:
+    """_release_low_table の停止側を本体 + 0.8 にして、停止側と本体の食い違いを作る。"""
+    tb, _ = _release_low_table()
+    tb.stop_accel = tb.accel_grid + 0.8
+    return tb
+
+
+def test_release_anchor_stop_matches_stop_table_at_zero_release() -> None:
+    from tests.research.fwd_plan import _solve_with_release  # noqa: PLC0415
+
+    tb = _anchor_table()
+    m = -4.0
+    for v in (2.0, 5.0, 7.0):
+        need = float(tb.accel(v, m, stop=True))  # 戻し量 0 の停止側の加速度
+        # "stop": r → 0 の解は山 m そのもの（停止側の表の解と一致）
+        assert _solve_with_release(tb, v, need, m, False, "stop") == pytest.approx(m)
+        # "body": 本体の戻しの表で解くので、停止側より浅い所（m より上）になる
+        assert _solve_with_release(tb, v, need, m, False, "body") > m + 0.1
+        # 既定は "body"
+        assert _solve_with_release(tb, v, need, m) == _solve_with_release(
+            tb, v, need, m, False, "body"
+        )
+    # 解は A ＝ R − M + S ＝ need を満たす
+    v, need = 5.0, float(tb.accel(5.0, -4.0, stop=True)) + 0.6
+    u = _solve_with_release(tb, v, need, -4.0, False, "stop")
+    assert u is not None and -4.0 < u <= 0.0
+    a = (
+        float(tb.accel(v, u, release=u + 4.0))
+        - float(tb.accel(v, u))
+        + float(tb.accel(v, u, stop=True))
+    )
+    assert a == pytest.approx(need, abs=0.05)
+
+
+def test_release_anchor_has_no_effect_at_7_5_or_above_and_on_stop_rows() -> None:
+    from tests.research.fwd_plan import _solve_with_release  # noqa: PLC0415
+
+    tb = _anchor_table()
+    for v in (7.5, 9.0, 30.0):
+        need = float(tb.accel(v, -4.0, release=0.0)) + 0.5
+        assert _solve_with_release(tb, v, need, -4.0, False, "stop") == _solve_with_release(
+            tb, v, need, -4.0, False, "body"
+        )
+    need = float(tb.accel(5.0, -4.0, stop=True)) + 0.5
+    assert _solve_with_release(tb, 5.0, need, -4.0, True, "stop") == _solve_with_release(
+        tb, 5.0, need, -4.0, True, "body"
+    )
+
+
+def test_release_anchor_body_is_identical_in_build_plan_and_stop_changes_low_rows_only() -> None:
+    tb = _anchor_table()
+    kw = dict(low_speed_side_rule="dir")
+    base = plan_for(_decel_then_ease, 5.0, tb, **kw)
+    body = plan_for(_decel_then_ease, 5.0, tb, release_anchor="body", **kw)
+    assert np.array_equal(base.effort_pct, body.effort_pct)
+    stop = plan_for(_decel_then_ease, 5.0, tb, release_anchor="stop", **kw)
+    v = np.array([_decel_then_ease(float(x)) for x in base.t_s])
+    diff = np.flatnonzero(~np.isclose(base.effort_pct, stop.effort_pct))
+    assert len(diff) > 0
+    assert np.all(v[diff] < 7.5)  # 7.5 km/h 以上は今と同じ
+    assert np.all(stop.side_brake[diff] == SIDE_RELEASE)
+
+
+def _ramp_args(n: int = 30):
+    """低速（3 km/h）のブレーキ列。effort は −10 で平ら、側は停止側。
+    need_b は 3 km/h で −2.5 km/h/s。"""
+    effort = np.full(n, -10.0)
+    side = np.full(n, SIDE_STOP)
+    v = np.full(n, 3.0)
+    stop = np.zeros(n, dtype=bool)
+    return effort, side, v, stop
+
+
+_RAMP_KW = dict(top=7.5, period_s=0.05, brake_min_pct=BD, accel_deadband_pct=AD)
+
+
+def _ramp_alt(i: int, effort, v, need_b, tb) -> float:
+    from tests.research.fwd_plan import _switch_alt_effort  # noqa: PLC0415
+
+    return _switch_alt_effort(i, effort, v, need_b, tb, BD, AD, 0.05)
+
+
+def _ramp_setup(delta: float, n: int = 30):
+    """i = 10 で停止側 → 戻しに替わる列。行 10 以降の開度は alt ＋ delta
+    （delta ＝ 表の食い違い d）。"""
+    tb = _anchor_table()
+    effort, side, v, stop = _ramp_args(n)
+    need_b = np.full(n, -2.5)
+    side[10:] = SIDE_RELEASE
+    alt = _ramp_alt(10, effort, v, need_b, tb)
+    effort[10:] = alt + delta
+    return tb, effort, side, v, stop, need_b, alt
+
+
+def test_switch_ramp_spreads_the_table_gap_over_k_rows() -> None:
+    from tests.research.fwd_plan import _ramp_low_speed_switch  # noqa: PLC0415
+
+    d = 1.5
+    tb, effort, side, v, stop, need_b, alt = _ramp_setup(d)
+    assert alt + d < -BD  # ブレーキの行のまま
+    orig = effort.copy()
+    n = _ramp_low_speed_switch(
+        effort, side, v, stop, None, brake_lag_s=0.15, need_b=need_b, table=tb, **_RAMP_KW
+    )
+    assert n == 1
+    k = 3  # round(0.15 / 0.05)
+    for j in range(k):
+        assert effort[10 + j] == pytest.approx(orig[10 + j] - d * (1.0 - (j + 1) / (k + 1)))
+    assert np.array_equal(effort[:10], orig[:10])
+    assert np.array_equal(effort[10 + k:], orig[10 + k:])
+    # (2) 切り替えの行には alt との差が d/(K+1) だけ残る
+    assert effort[10] - alt == pytest.approx(d / (k + 1))
+
+
+def test_switch_ramp_does_nothing_when_plan_itself_releases_without_table_gap() -> None:
+    from tests.research.fwd_plan import _ramp_low_speed_switch  # noqa: PLC0415
+
+    # (1) 切り替えの行の開度が alt と同じ（計画がもともと大きく戻す）なら d ＝ 0。
+    # 直前の傾きの延長との差で見る旧定義なら、ここは大きな d になる（行 8・9 は −10 で平ら、
+    # 行 10 は alt なので傾きの延長（−10）との差が出る）
+    tb, effort, side, v, stop, need_b, alt = _ramp_setup(0.0)
+    assert abs(alt - (-10.0)) > 0.3
+    orig = effort.copy()
+    _ramp_low_speed_switch(
+        effort, side, v, stop, None, brake_lag_s=0.15, need_b=need_b, table=tb, **_RAMP_KW
+    )
+    assert np.array_equal(effort, orig)
+
+
+def test_switch_ramp_does_not_smooth_release_to_stop() -> None:
+    from tests.research.fwd_plan import _ramp_low_speed_switch  # noqa: PLC0415
+
+    tb = _anchor_table()
+    effort, side, v, stop = _ramp_args()
+    need_b = np.full(30, -2.5)
+    side[:10] = SIDE_RELEASE  # 行 10 で 戻し → 停止側
+    effort[10:] = -11.2
+    orig = effort.copy()
+    n = _ramp_low_speed_switch(
+        effort, side, v, stop, None, brake_lag_s=0.15, need_b=need_b, table=tb, **_RAMP_KW
+    )
+    assert n == 0
+    assert np.array_equal(effort, orig)
+
+
+def test_switch_ramp_stops_at_hold_accel_other_switch_and_missing_lag() -> None:
+    from tests.research.fwd_plan import _ramp_low_speed_switch  # noqa: PLC0415
+
+    kw = dict(_RAMP_KW)
+    # 停車保持の行で止まる
+    tb, effort, side, v, stop, need_b, _ = _ramp_setup(1.0)
+    stop[12] = True
+    orig = effort.copy()
+    _ramp_low_speed_switch(
+        effort, side, v, stop, None, brake_lag_s=0.15, need_b=need_b, table=tb, **kw
+    )
+    assert effort[10] != orig[10] and effort[11] != orig[11]
+    assert np.array_equal(effort[12:], orig[12:])
+    # 発進の準備（launch_prep）・アクセルの行で止まる
+    tb, effort, side, v, stop, need_b, _ = _ramp_setup(1.0)
+    prep = np.zeros(30, dtype=bool)
+    prep[11] = True
+    effort[12] = 5.0
+    orig = effort.copy()
+    _ramp_low_speed_switch(
+        effort, side, v, stop, prep, brake_lag_s=0.15, need_b=need_b, table=tb, **kw
+    )
+    assert effort[10] != orig[10]
+    assert np.array_equal(effort[11:], orig[11:])
+    # 別の切り替え（2 行後に戻しから停止側へ）で止まる。
+    # その切り替え自身の d は 0 にして 10 のならしだけ見る
+    tb, effort, side, v, stop, need_b, _ = _ramp_setup(1.0)
+    side[12:] = SIDE_STOP
+    effort[12:] = effort[11]
+    orig = effort.copy()
+    _ramp_low_speed_switch(
+        effort, side, v, stop, None, brake_lag_s=0.15, need_b=need_b, table=tb, **kw
+    )
+    assert effort[10] != orig[10] and effort[11] != orig[11]
+    assert np.array_equal(effort[12:], orig[12:])
+    # 7.5 km/h 以上は触らない・遅れ／表が無ければ何もしない
+    tb, effort, side, v, stop, need_b, _ = _ramp_setup(1.0)
+    orig = effort.copy()
+    v[:] = 9.0
+    assert _ramp_low_speed_switch(
+        effort, side, v, stop, None, brake_lag_s=0.15, need_b=need_b, table=tb, **kw
+    ) == 0
+    v[:] = 3.0
+    assert _ramp_low_speed_switch(
+        effort, side, v, stop, None, brake_lag_s=None, need_b=need_b, table=tb, **kw
+    ) == 0
+    assert _ramp_low_speed_switch(effort, side, v, stop, None, brake_lag_s=0.15, **kw) == 0
+    assert np.array_equal(effort, orig)
+
+
+def _decel_to_4_then_ease(t: float) -> float:
+    """14 から −4 km/h/s で 4 km/h まで（停止側）→ −2.5 km/h/s で緩める（戻し）→ 停止側へ戻る。"""
+    return 14.0 - 4.0 * t if t < 2.5 else max(0.0, 4.0 - 2.5 * (t - 2.5))
+
+
+def test_switch_ramp_false_is_identical_and_true_changes_only_rows_after_a_switch() -> None:
+    tb = _anchor_table()
+    kw = dict(low_speed_side_rule="dir", brake_lag_s=0.15)
+    base = plan_for(_decel_to_4_then_ease, 6.0, tb, **kw)
+    off = plan_for(_decel_to_4_then_ease, 6.0, tb, low_speed_switch_ramp=False, **kw)
+    assert np.array_equal(base.effort_pct, off.effort_pct)
+    on = plan_for(_decel_to_4_then_ease, 6.0, tb, low_speed_switch_ramp=True, **kw)
+    assert np.array_equal(on.side_brake, base.side_brake)
+    sb = base.side_brake
+    stoplike = (sb == SIDE_STOP) | (sb == SIDE_STOP_RELEASE)
+    rel = sb == SIDE_RELEASE
+    sw = np.zeros(len(sb), dtype=bool)
+    sw[1:] = stoplike[:-1] & rel[1:]  # 戻し → 停止側はならさない
+    back = np.zeros(len(sb), dtype=bool)
+    back[1:] = rel[:-1] & stoplike[1:]
+    assert sw.any() and back.any()  # この基準には両方向の切り替えがある
+    near = np.zeros(len(sb), dtype=bool)
+    for i in np.flatnonzero(sw):
+        near[i : i + 3] = True  # K ＝ 3 行
+    diff = ~np.isclose(on.effort_pct, base.effort_pct)
+    assert np.any(diff)  # 表の食い違い（停止側 ＝ 本体 ＋ 0.8）があるのでならされる行がある
+    assert np.all(near[diff])
+    # 戻し → 停止側の切り替えの行は変わらない
+    assert not np.any(diff & back)

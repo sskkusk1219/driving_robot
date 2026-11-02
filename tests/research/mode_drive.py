@@ -276,6 +276,8 @@ def load_feedforward(cfg: ResearchConfig) -> CandidateFeedforward | ForwardMapFe
             ff.apply_fel(cfg.fel.method)
         # 段5-6 追加 A2: 発進側の表の動き出す開度の床（既定 false ＝ 今と同じ）
         ff.apply_launch_breakaway_floor(cfg.forward_map.launch_table_breakaway_floor)
+        # 2026-11-02 表の境目の段差 段1: 7.5 km/h の境目で停止側・発進側を本体へ寄せる（既定 false）
+        ff.apply_side_taper(cfg.forward_map.side_table_taper)
         return ff
     ff.set_params(feedforward_params(cfg))
     ff.set_research_params(research_ff_params(cfg))
@@ -394,6 +396,9 @@ def forward_map_plan_args(
         # 2026-10-31 段1（停止間際 A）: 停車へ向かう低速の行は戻しの表で解き直さない
         # （区間は停C と同じ creep_floor_lead_s）
         stop_approach_lead_s=fm.creep_floor_lead_s if fm.stop_approach_keep_stop_table else 0.0,
+        # 2026-11-02 表の境目の段差 段1: 低速の戻しの基準（案 A）・側の替わりの跳びをならす（案 B）
+        release_anchor=fm.low_speed_release_anchor,
+        low_speed_switch_ramp=fm.low_speed_switch_ramp,
         switch_lead=fm.switch_lead_enabled,  # 段5-5c
         launch_midway_brake_cap=fm.launch_midway_brake_cap,  # 段5-6 追加 A1
         launch_release_ramp=fm.launch_release_ramp,  # 段7-b
@@ -437,6 +442,8 @@ def apply_table_options(cfg: ResearchConfig, table: Any) -> Any:
         table = table.with_fel(cfg.fel.method)
     if cfg.forward_map.launch_table_breakaway_floor != table.launch_breakaway_floor:
         table = table.with_launch_breakaway_floor(cfg.forward_map.launch_table_breakaway_floor)
+    if cfg.forward_map.side_table_taper != table.side_taper:  # 2026-11-02 表の境目の段差 段1
+        table = table.with_side_taper(cfg.forward_map.side_table_taper)
     return table
 
 
@@ -797,6 +804,10 @@ def _prepare_forward_map_plan(
     )
     say(f"  戻しの表を使う基準車速の下限（段5-3）: {fm.release_table_min_kmh:g} km/h"
         "（0 ＝ 全部の車速で使う）")
+    say("  表の境目の段差（2026-11-02 段1）: "
+        f"side_table_taper ＝ {'あり' if fm.side_table_taper else 'なし'}・"
+        f"low_speed_release_anchor ＝ {fm.low_speed_release_anchor}・"
+        f"low_speed_switch_ramp ＝ {'あり' if fm.low_speed_switch_ramp else 'なし'}")
     if isinstance(ff, DeviationForwardFeedforward):
         # 2026-10-17 段2p: τ ＝ c × 上の遅れ（yaml の上書き、なければ pkl の meta）。
         # どちらにも無いペダルは None で、fwd_plan の既定値には落とさない（上乗せしない）

@@ -932,6 +932,35 @@ class ForwardMapSection:
     # （停止側の表は 7.54% で −0.05 km/h/s と実測に近い）。効く先: 停車の直前のブレーキ。
     # 決める時期: 段1 の実機 3 モード。既定 false ＝ 今と完全に同じ
     stop_approach_keep_stop_table: bool = False
+    # 2026-11-02 ProblemReport_20261102_表の境目の段差 段1: FF の表の切り替えで開度が跳ぶのを
+    # なくす。
+    # side_table_taper（① 案T）: true で、停止側・発進側の表を引くとき、加速度を
+    # 本体 ＋ w × (その側の表 − 本体) にする。w は 6.25 km/h（置き換えた行の中心の最大）で 1、
+    # 7.5 km/h（meta stop_max_speed_kmh）で 0 の直線。根拠: 表は行の中心を直線でつなぎ、停止側・
+    # 発進側は 6.25 の行だけが違うので、7.5 は食い違いの半分の段差（ブレーキ本体→停止側 +0.21%・
+    # アクセル発進側→本体 +0.20%）になる。範囲は pkl の meta（車ごとに手順2 で決まる）。
+    # 効く先: 6.25〜7.5 km/h の停止側・発進側の値。決める時期: 段6 の実機比較。
+    # 既定 false ＝ 今と同じ
+    side_table_taper: bool = False
+    # low_speed_release_anchor（② 案A）: "stop" で、dir の規則の 7.5 km/h 未満の戻しの解き直しを
+    # 停止側の表 ＋ (本体の戻しの表 − 本体) で引く（戻し量 0 で停止側の表と一致）。
+    # "body" ＝ 今と同じ。
+    # 根拠: 戻し始めに 停止側 → 本体 へ替わり −0.93%（最大 −4.4%）跳ぶ
+    # （低速では本体が 0.2〜2.6% 浅い）。
+    # 効く先: 7.5 km/h 未満のブレーキの踏む↔戻す。決める時期: 段6 の実機比較。引用符つきで書く
+    low_speed_release_anchor: str = "body"
+    # low_speed_switch_ramp（② 案B）: true で、7.5 km/h 未満のブレーキの行の 停止側 → 戻し の
+    # （戻し → 停止側はならさない。代わりの開度を本体の表で解くと本体はクリープを知らず、
+    # 停車直前 0.2〜0.9 km/h でブレーキを最大 2.85% 浅くする。机上 WLTP 444 s・UDDS 727 s・
+    # 1186 s・AMA 247 s。測った段差も停止側→戻し −0.93% の方。2026-11-02 段7b）
+    # 切り替えの跳び d（＝ その行の開度 − 前の行と同じ側の表のままだったときの開度。
+    # 表の食い違いの分だけで、計画がもともと戻す分は入らない。
+    # 2026-11-02 段7 の後に変更・AMA 339 s）を、
+    # meta brake_lag_s ÷ 周期 の行数（今の pkl で 3 行）かけて 0 へならす。
+    # 長さは手順2 で測ったブレーキの遅れ由来だが、何秒が良いかの実測の根拠はない（仮）。
+    # 効く先: 低速の踏む↔戻すの周期の後ろの数行。決める時期: 段6（悪化すれば別の長さを相談）。
+    # 既定 false ＝ 今と同じ
+    low_speed_switch_ramp: bool = False
     # 2026-10-28 段4 (ア): true で、C10（P と DOB の上乗せ）の差を、pkl meta の局所の効きの倍率
     # （local_gain_brake / local_gain_accel。手順2 の dither から。効き始めからの開度 × 車速の表）で
     # 割る。倍率は 1 以上・表の外・7.5 km/h 未満・meta なしは 1（今と同じ）。ペダル別のキー。
@@ -1826,6 +1855,11 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         fm.c10_integral_low_speed in ("off", "hold", "accumulate"),
         "forward_map.c10_integral_low_speed は off / hold / accumulate: "
         f"{fm.c10_integral_low_speed!r}",
+    )
+    need(
+        fm.low_speed_release_anchor in ("body", "stop"),
+        "forward_map.low_speed_release_anchor は body / stop: "
+        f"{fm.low_speed_release_anchor!r}",
     )
     need(fm.coast_on_kmh > 0.0, f"forward_map.coast_on_kmh は正値: {fm.coast_on_kmh}")
     need(

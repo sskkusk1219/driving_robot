@@ -772,6 +772,13 @@ class ForwardMapFeedforward:
         self._table = self.table.with_launch_breakaway_floor(enabled)
         self._plan = None
 
+    def apply_side_taper(self, enabled: bool) -> None:
+        """2026-11-02 表の境目の段差 段1: 表に side_taper を立てる（load_model の後）"""
+        if enabled == self.table.side_taper:
+            return
+        self._table = self.table.with_side_taper(enabled)
+        self._plan = None
+
     def build_plan(
         self,
         ref_at: Callable[[float], float],
@@ -795,6 +802,8 @@ class ForwardMapFeedforward:
         release_table_min_kmh: float = 0.0,
         low_speed_release_stop_layer: bool = False,
         stop_approach_lead_s: float = 0.0,
+        release_anchor: str = "body",
+        low_speed_switch_ramp: bool = False,
         switch_lead: bool = False,
         launch_midway_brake_cap: bool = False,
         launch_release_ramp: bool = False,
@@ -853,6 +862,8 @@ class ForwardMapFeedforward:
             release_table_min_kmh=release_table_min_kmh,
             low_speed_release_stop_layer=low_speed_release_stop_layer,
             stop_approach_lead_s=stop_approach_lead_s,
+            release_anchor=release_anchor,
+            low_speed_switch_ramp=low_speed_switch_ramp,
             switch_lead=switch_lead,
             launch_midway_brake_cap=launch_midway_brake_cap,
             launch_release_ramp=launch_release_ramp,

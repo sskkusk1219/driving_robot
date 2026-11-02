@@ -139,6 +139,12 @@ class ForwardTable:
     # 開度を動き出す開度で頭打ちにする（invert）。pkl は変えず引くときに掛ける。meta が無い／非有限
     # なら何もしない。False ＝ 今と完全に同じ。mode_drive が設定からロード後に立てる
     launch_breakaway_floor: bool = False
+    # 2026-11-02 表の境目の段差 段1（forward_map.side_table_taper）: true なら、発進側・停止側の表を
+    # 引くとき（accel・invert の launch=True／stop=True）、加速度を A ＝ M ＋ w(v)·(S − M)
+    # （M ＝ 本体、S ＝ その側の表、w ＝ clip((top − v)/(top − r_top), 0, 1)、top ＝ meta
+    # stop_max_speed_kmh、r_top ＝ その側の置き換えた行の中心の最大）にして、7.5 km/h の境目で本体へ
+    # 連続につなぐ。v ≤ r_top は今と同じ。meta が欠けたら寄せない。False ＝ 今と完全に同じ
+    side_taper: bool = False
     # 戻しの表（2026-10-14 段2o-5。attach_release）。release_grid ＝ 戻し量 [%] の格子（昇順・正）、
     # release_accel ＝ (戻し量の数, 行, 格子点) 加速度。戻し量 0 は本体 accel_grid。
     # None ＝ 戻しの表なし（今までと完全に同じ）。戻し量は meta["release_max_pct"] で頭打ちにする
@@ -364,6 +370,32 @@ class ForwardTable:
         """A2 のフラグを立てた（下ろした）新しい表を返す。"""
         return replace(self, launch_breakaway_floor=bool(enabled))
 
+    def with_side_taper(self, enabled: bool) -> ForwardTable:
+        """side_taper のフラグを立てた（下ろした）新しい表を返す。"""
+        return replace(self, side_taper=bool(enabled))
+
+    def _taper_weight(self, v: np.ndarray, launch: bool, stop: bool) -> np.ndarray | None:
+        """side_taper が効くとき、その側の表の重み w ＝ clip((top − v)/(top − r_top), 0, 1)
+        （1 ＝ その側の表そのまま、0 ＝ 本体）を車速 v ごとに返す。
+        効かないとき（フラグ off・その側の表なし・meta 欠け・top ≤ r_top）は None。"""
+        if not self.side_taper or launch == stop:
+            return None
+        if launch:
+            if self.launch_accel is None:
+                return None
+            rows = self.meta.get("launch_speed_rows")
+        else:
+            if self.stop_accel is None:
+                return None
+            rows = self.meta.get("stop_speed_rows")
+        top = self.meta.get("stop_max_speed_kmh")
+        if top is None or not rows or not np.isfinite(top):
+            return None
+        r_top = float(max(rows))
+        if float(top) <= r_top:
+            return None
+        return np.clip((float(top) - v) / (float(top) - r_top), 0.0, 1.0)
+
     def accel(
         self,
         v_kmh: np.ndarray | float,
@@ -379,6 +411,17 @@ class ForwardTable:
             v_kmh, u_pct, launch=launch, release=release, stop=stop,
             accel_release=accel_release, accel_push=accel_push,
         )
+        if self._taper_weight(np.zeros(()), launch, stop) is not None:
+            body = self._accel(
+                v_kmh, u_pct, release=release,
+                accel_release=accel_release, accel_push=accel_push,
+            )
+            v_b, o, b = np.broadcast_arrays(
+                np.asarray(v_kmh, dtype=float),
+                np.asarray(out, dtype=float), np.asarray(body, dtype=float),
+            )
+            wt = self._taper_weight(v_b, launch, stop)
+            out = _scalar_or_array(b + wt * (o - b))
         bk = self._breakaway_floor_u(launch)
         if bk is None:
             return out
@@ -488,12 +531,16 @@ class ForwardTable:
         nodes = self._release_nodes(release, launch, v.shape, stop)
         anodes = self._accel_release_nodes(accel_release, launch, v.shape, stop)
         pnodes = self._accel_push_nodes(accel_push, launch, v.shape, stop)
-        if nodes is None and anodes is None and pnodes is None:
+        # 2026-11-02 表の境目の段差 段1: side_taper のとき、本体の列（同じ戻し量）を作る材料と重み
+        taper = self._taper_args(v, release, launch, stop, accel_release, accel_push)
+        if nodes is None and anodes is None and pnodes is None and taper is None:
             return grid_invert(
                 self._rep(launch, stop), self.u_grid, self._grid(launch, stop),
                 self._kind(launch, stop), v_kmh, a_kmhs,
             )
         extra: dict[str, Any] = {}
+        if taper is not None:
+            extra["taper"] = taper
         if anodes is not None:
             extra = {
                 "accel_release_nodes": anodes[0],
@@ -516,6 +563,36 @@ class ForwardTable:
             self._rep(launch, stop), self.u_grid, arrs[0], kind, v, a,
             release_nodes=arrs, release_node_pct=vals, release=r, **extra,
         )
+
+    def _taper_args(
+        self,
+        v: np.ndarray,
+        release: Any,
+        launch: bool,
+        stop: bool,
+        accel_release: Any,
+        accel_push: Any,
+    ) -> dict[str, Any] | None:
+        """invert 用: side_taper が効くとき、本体の列を作る材料（grid_invert の taper）と重み。"""
+        wt = self._taper_weight(v, launch, stop)
+        if wt is None:
+            return None
+        nodes = self._release_nodes(release, False, v.shape, False)
+        anodes = self._accel_release_nodes(accel_release, False, v.shape, False)
+        pnodes = self._accel_push_nodes(accel_push, False, v.shape, False)
+        out: dict[str, Any] = {"speed_rep": self.speed_rep, "accel": self.accel_grid, "w": wt}
+        if nodes is not None:
+            out.update(release_nodes=nodes[0], release_node_pct=nodes[1], release=nodes[2])
+        if anodes is not None:
+            out.update(
+                accel_release_nodes=anodes[0], accel_release_node_pct=anodes[1],
+                accel_release=anodes[2],
+            )
+        if pnodes is not None:
+            out.update(
+                accel_push_nodes=pnodes[0], accel_push_node_pct=pnodes[1], accel_push=pnodes[2],
+            )
+        return out
 
     def coast_accel(
         self, v_kmh: np.ndarray | float, *, launch: bool = False, stop: bool = False
@@ -609,6 +686,63 @@ def _blend_columns(
     return c
 
 
+def _flat_taper(taper: dict[str, Any], shape: tuple[int, ...]) -> tuple[Any, ...]:
+    """grid_invert の taper（本体の列の材料）を _invert_columns の位置引数
+    （rf, release_nodes, release_node_pct, arf, accel_release_nodes, accel_release_node_pct,
+    pf, accel_push_nodes, accel_push_node_pct）に並べる。"""
+
+    def flat(key: str) -> np.ndarray | None:
+        x = taper.get(key)
+        return None if x is None else np.broadcast_to(np.asarray(x, dtype=float), shape).reshape(-1)
+
+    return (
+        flat("release"), taper.get("release_nodes"), taper.get("release_node_pct"),
+        flat("accel_release"), taper.get("accel_release_nodes"),
+        taper.get("accel_release_node_pct"),
+        flat("accel_push"), taper.get("accel_push_nodes"), taper.get("accel_push_node_pct"),
+    )
+
+
+def _invert_columns(
+    speed_rep: np.ndarray,
+    accel: np.ndarray,
+    u_grid: np.ndarray,
+    vv: np.ndarray,
+    sl: slice,
+    rf: np.ndarray | None,
+    release_nodes: Sequence[np.ndarray] | None,
+    release_node_pct: np.ndarray | None,
+    arf: np.ndarray | None,
+    accel_release_nodes: Sequence[np.ndarray] | None,
+    accel_release_node_pct: np.ndarray | None,
+    pf: np.ndarray | None,
+    accel_push_nodes: Sequence[np.ndarray] | None,
+    accel_push_node_pct: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """grid_invert の 1 塊（sl）の、サンプルごとの加速度の列
+    (c, 上の行の番号・下の行の番号・上の行の重み)。
+    （2026-11-02 grid_invert から切り出し。計算は今までと同じ）"""
+    kg = len(u_grid)
+    i0, i1, w = _row_weights(speed_rep, vv)
+    if rf is None:
+        c = (1.0 - w)[:, None] * accel[i0] + w[:, None] * accel[i1]
+    else:
+        c = _blend_columns(release_nodes, release_node_pct, rf[sl], i0, i1, w, kg)
+    if arf is not None or pf is not None:
+        if arf is not None:
+            c_a = _blend_columns(
+                accel_release_nodes, accel_release_node_pct, arf[sl], i0, i1, w, kg
+            )
+        if pf is not None:
+            c_p = _blend_columns(accel_push_nodes, accel_push_node_pct, pf[sl], i0, i1, w, kg)
+            if arf is None:
+                c_a = c_p
+            else:  # 戻し量・踏み増し量の同時: 本体からの差を足す
+                c_a = c_a + c_p - ((1.0 - w)[:, None] * accel[i0] + w[:, None] * accel[i1])
+        c = np.where(u_grid[None, :] > 0.0, c_a, c)
+    return c, i0, i1, w
+
+
 def grid_invert(
     speed_rep: np.ndarray,
     u_grid: np.ndarray,
@@ -626,6 +760,7 @@ def grid_invert(
     accel_push_nodes: Sequence[np.ndarray] | None = None,
     accel_push_node_pct: np.ndarray | None = None,
     accel_push: np.ndarray | None = None,
+    taper: dict[str, Any] | None = None,
 ) -> tuple[Any, Any]:
     """車速 v で加速度 a になる u と点の種類を返す（ベクトル入力可）。
 
@@ -638,6 +773,9 @@ def grid_invert(
     accel_push_nodes・accel_push_node_pct・accel_push は、アクセルの踏み増し量について同じ
     （2026-10-23 段5-7b）。戻し量と同時なら、それぞれの本体からの差を足した列にする。
 
+    taper（2026-11-02 表の境目の段差 段1）は ForwardTable.side_taper 用: 本体の列を作る材料
+    （speed_rep・accel と、あれば release_*・accel_release_*・accel_push_* の引数）と、その側の表の
+    重み w（v ごと）。列を 本体の列 ＋ w·(その側の列 − 本体の列) にする。渡さなければ今までと同じ。
     車速 v の列は、上下 2 行を車速で直線補間した加速度の列（単調）。
     - 平らな区間（同じ加速度が続く）では |u| が小さい側を返す。
     - a が列の最大より大きい／最小より小さいときは、端の u（最大に最初に届く点／最小の最後の点）
@@ -666,25 +804,19 @@ def grid_invert(
     for s in range(0, len(vf), _CHUNK):
         sl = slice(s, s + _CHUNK)
         vv, aa = vf[sl], af[sl]
-        i0, i1, w = _row_weights(speed_rep, vv)
-        if rf is None:
-            c = (1.0 - w)[:, None] * accel[i0] + w[:, None] * accel[i1]
-        else:
-            c = _blend_columns(release_nodes, release_node_pct, rf[sl], i0, i1, w, kg)
-        if arf is not None or pf is not None:
-            if arf is not None:
-                c_a = _blend_columns(
-                    accel_release_nodes, accel_release_node_pct, arf[sl], i0, i1, w, kg
-                )
-            if pf is not None:
-                c_p = _blend_columns(
-                    accel_push_nodes, accel_push_node_pct, pf[sl], i0, i1, w, kg
-                )
-                if arf is None:
-                    c_a = c_p
-                else:  # 戻し量・踏み増し量の同時: 本体からの差を足す
-                    c_a = c_a + c_p - ((1.0 - w)[:, None] * accel[i0] + w[:, None] * accel[i1])
-            c = np.where(u_grid[None, :] > 0.0, c_a, c)
+        c, i0, i1, w = _invert_columns(
+            speed_rep, accel, u_grid, vv, sl, rf, release_nodes, release_node_pct,
+            arf, accel_release_nodes, accel_release_node_pct,
+            pf, accel_push_nodes, accel_push_node_pct,
+        )
+        if taper is not None:
+            # 2026-11-02 表の境目の段差 段1: 本体の列との重み付き平均（単調性は保たれる）
+            c_m, _, _, _ = _invert_columns(
+                taper["speed_rep"], taper["accel"], u_grid, vv, sl,
+                *_flat_taper(taper, shape),
+            )
+            tw = np.broadcast_to(np.asarray(taper["w"], dtype=float), shape).reshape(-1)[sl]
+            c = c_m + tw[:, None] * (c - c_m)
         c = np.maximum.accumulate(c, axis=1)
         kd = np.maximum(
             np.where(w[:, None] < 1.0, point_kind[i0], 0),

@@ -1316,3 +1316,92 @@ def test_attach_accel_release_peak_meta_is_p95_of_rows_with_release() -> None:
     # peak_pct を渡さなければ meta に残さない（今までと同じ）
     none = attach_accel_release(tb, slices, release_pct=rel, dt_row_s=np.full(len(rel), 0.05))
     assert "accel_release_peak_max_pct" not in none.meta
+
+
+# ───────── 2026-11-02 表の境目の段差 段1: side_taper（停止側・発進側を本体へ寄せる） ─────────
+
+
+def _taper_table(taper: bool = False) -> ForwardTable:
+    """release_table（行の代表車速 0・50・100）に、停止側 ＝ 本体 + 1.0・
+    発進側 ＝ 本体 − 1.0 を足す。置き換えた行の中心の最大 r_top ＝ 10、上の車速 top ＝ 50。"""
+    tb = release_table()
+    tb = replace(
+        tb,
+        stop_accel=tb.accel_grid + 1.0,
+        launch_accel=tb.accel_grid - 1.0,
+        meta={
+            **tb.meta, "stop_max_speed_kmh": 50.0,
+            "stop_speed_rows": [0.0, 10.0], "launch_speed_rows": [0.0, 10.0],
+        },
+    )
+    return tb.with_side_taper(taper)
+
+
+def test_side_taper_default_false_is_identical() -> None:
+    off, on = _taper_table(False), _taper_table(True)
+    assert ForwardTable.__dataclass_fields__["side_taper"].default is False
+    v = np.array([0.0, 5.0, 20.0, 49.0, 60.0])
+    u = np.array([-6.0, -3.0, 2.0, -1.0, 4.0])
+    ref = replace(off, side_taper=False)
+    for kw in ({"stop": True}, {"launch": True}, {}):
+        assert np.array_equal(off.accel(v, u, **kw), ref.accel(v, u, **kw))
+    # 本体を引くときは true でも変わらない
+    assert np.array_equal(on.accel(v, u), off.accel(v, u))
+
+
+def test_side_taper_blends_toward_body_between_r_top_and_top() -> None:
+    off, on = _taper_table(False), _taper_table(True)
+    u = -3.0
+    for side, sgn in (({"stop": True}, 1.0), ({"launch": True}, -1.0)):
+        # v ≤ r_top（10）は今と同じ
+        for v in (0.0, 5.0, 10.0):
+            assert on.accel(v, u, **side) == pytest.approx(off.accel(v, u, **side))
+        # 10〜50 は直線で本体へ（w ＝ (50 − v)/40）
+        for v in (20.0, 30.0, 40.0):
+            w = (50.0 - v) / 40.0
+            assert on.accel(v, u, **side) == pytest.approx(off.accel(v, u) + sgn * w)
+        # top の手前は本体と ε 程度の差、top 以上は本体と同じ
+        assert on.accel(49.99, u, **side) == pytest.approx(off.accel(49.99, u), abs=1e-3)
+        assert on.accel(50.0, u, **side) == pytest.approx(off.accel(50.0, u))
+        assert on.accel(70.0, u, **side) == pytest.approx(off.accel(70.0, u))
+    # 配列入力でもスカラーと同じ
+    v = np.array([5.0, 20.0, 45.0, 60.0])
+    arr = on.accel(v, np.full(4, u), stop=True)
+    assert np.allclose(arr, [on.accel(float(x), u, stop=True) for x in v])
+
+
+def test_side_taper_invert_round_trips_accel_with_and_without_release() -> None:
+    on = _taper_table(True)
+    for side in ({"stop": True}, {"launch": True}):
+        for rel in (None, 2.0):
+            for v in (5.0, 15.0, 30.0, 45.0):
+                for u in (-8.0, -3.0, -0.5):
+                    a = on.accel(v, u, release=rel, **side)
+                    u_back, _ = on.invert(v, a, release=rel, **side)
+                    assert u_back == pytest.approx(u, abs=1e-6), (side, rel, v, u)
+    # 配列（サンプルごとに車速が違う）でも同じ
+    v = np.array([5.0, 15.0, 30.0, 45.0])
+    u = np.array([-8.0, -3.0, -1.0, -5.0])
+    a = on.accel(v, u, stop=True)
+    assert np.allclose(on.invert(v, a, stop=True)[0], u, atol=1e-6)
+
+
+def test_side_taper_without_meta_or_side_table_does_nothing() -> None:
+    on = _taper_table(True)
+    off = _taper_table(False)
+    for key in ("stop_max_speed_kmh", "stop_speed_rows", "launch_speed_rows"):
+        meta = {k: x for k, x in on.meta.items() if k != key}
+        cut = replace(on, meta=meta)
+        side = {"stop": True} if key != "launch_speed_rows" else {"launch": True}
+        assert cut.accel(30.0, -3.0, **side) == pytest.approx(off.accel(30.0, -3.0, **side))
+    no_side = replace(on, stop_accel=None, launch_accel=None)
+    assert no_side.accel(30.0, -3.0, stop=True) == pytest.approx(on.accel(30.0, -3.0))
+
+
+def test_side_taper_floor_is_applied_last_for_launch() -> None:
+    tb = _taper_table(True)
+    tb = replace(tb, meta={**tb.meta, "launch_breakaway_u_pct": -2.0})
+    fl = tb.with_launch_breakaway_floor(True)
+    # 深いブレーキ（|u| > 2・低速）の発進側は 0 以下に頭打ち（寄せた値が正でも）
+    assert fl.accel(1.0, -6.0, launch=True) <= 0.0
+    assert fl.invert(1.0, -1.0, launch=True)[0] >= -2.0 - 1e-9
