@@ -1373,6 +1373,9 @@ def test_keys_missing_in_yaml_lists_dataclass_keys_not_written(tmp_path: Path) -
     text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
     base = cfgmod.keys_missing_in_yaml(cfgmod.DEFAULT_CONFIG_PATH)
     assert base == [
+        "forward_map.low_speed_keep_enabled",
+        "forward_map.low_speed_keep_band",
+        "forward_map.low_speed_keep_window_s",
         "learning.stop_brake_floor_start_tol_kmh",
         "learning.stop_brake_floor_min_float_s",
         "learning.stop_brake_floor_opening_tol_pct",

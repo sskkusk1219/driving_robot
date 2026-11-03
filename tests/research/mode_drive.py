@@ -80,6 +80,8 @@ from tests.research.hold_scene import (
     hold_scene_intervals,
     in_hold_interval,
     interp_hold_opening,
+    keep_ff_pct,
+    keep_top_kmh,
     launch_band_intervals,
     lead_in_ff_at,
     min_scene_length_s,
@@ -592,6 +594,11 @@ class HoldSceneSetup:
     accel_band_kmhs: float = 0.0  # この大きさ以下の加速度は 0 とする（ramp_cruise_band_g の換算）
     # 2026-10-31 発進のブレーキの帯（案 B。launch_brake_band。off は空）: 上りと同じ FF で動かす区間
     launch_bands: list[HoldInterval] = field(default_factory=list)
+    # 2026-11-03 案③（効いている開度を保つ。low_speed_keep_enabled。off は False）
+    keep_enabled: bool = False
+    keep_band: bool = False  # 発進のブレーキの帯（hold_scene ＝ 3）も ③ にする
+    keep_window_s: float = 0.3  # 起点の実開度・加速度を平均する窓
+    keep_top_kmh: float = 0.0  # V_top ＝ ③ をかける基準車速の上限（meta hold_pi の used の最大）
 
 
 def make_hold_scene(
@@ -714,6 +721,34 @@ def make_hold_scene(
     if fm.hold_accel_pred_enabled:
         text += (f"\n    P の偏差の先読み（段13）: Tp ＝ L＋窓÷2 ＝ {tp_s:g} s・"
                  f"加速度の窓 {cfg.decel_stop.slope_window_s:g} s・帯 ±{slope:.3f} km/h/s")
+    keep_top = 0.0
+    if fm.low_speed_keep_enabled:
+        try:
+            keep_top = keep_top_kmh(meta)
+        except ValueError as exc:
+            raise ConfigError(f"forward_map.low_speed_keep_enabled: {exc}") from exc
+        if plant_c is None:  # 上り・帯が off のときも ③ に c が要る
+            try:
+                plant_k, plant_t = float(info["K_kmh_per_pct"]), float(info["T_s"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ConfigError(
+                    "forward_map.low_speed_keep_enabled には meta['hold_pi'] の"
+                    f" K_kmh_per_pct・T_s が要ります（{exc}）"
+                ) from exc
+            if not (
+                math.isfinite(plant_k) and math.isfinite(plant_t)
+                and plant_k > 0.0 and plant_t > 0.0
+            ):
+                raise ConfigError(
+                    "meta['hold_pi'] の K_kmh_per_pct・T_s は正の有限の数が要ります"
+                    f"（K {plant_k}・T {plant_t}）"
+                )
+            plant_c = plant_k / plant_t
+        text += (f"\n    低速の開度を保つ（案③）: V_top ＝ {keep_top:.2f} km/h・"
+                 f"c ＝ {plant_c:.3f} km/h/s per %・L ＝ {lag:g} s・"
+                 f"窓 {fm.low_speed_keep_window_s:g} s・"
+                 f"基準の加速度 ≤ +{slope:.3f} km/h/s・発進の帯 "
+                 f"{'あり' if fm.low_speed_keep_band else 'なし'}")
     return HoldSceneSetup(
         pi=pi, lag_s=lag, slope_max_kmhs=slope, stop_kmh=STOP_SPEED_KMH, creep_kmh=creep,
         intervals=intervals, min_length_s=min_len, dropped_intervals=dropped, step_s=step_s,
@@ -721,6 +756,8 @@ def make_hold_scene(
         lead_ins=lead_ins, plant_c=plant_c, launch_bands=launch_bands,
         accel_pred=fm.hold_accel_pred_enabled, tp_s=tp_s,
         accel_window_s=cfg.decel_stop.slope_window_s, accel_band_kmhs=slope,
+        keep_enabled=fm.low_speed_keep_enabled, keep_band=fm.low_speed_keep_band,
+        keep_window_s=fm.low_speed_keep_window_s, keep_top_kmh=keep_top,
     )
 
 
@@ -1710,6 +1747,10 @@ class _ModeRun:
     hold_scene_cycles: int = 0
     hold_lead_in_cycles: int = 0  # 段11: うち上りの周期
     hold_launch_band_cycles: int = 0  # 2026-10-31 案 B: うち発進のブレーキの帯の周期
+    # 2026-11-03 案③（low_speed_keep_enabled。off のまま ＝ 今と同じ）
+    _keep_anchor: tuple[float, float] | None = None  # (u0 [%], a0 [km/h/s])
+    _keep_after_stop: bool = False  # 停車保持の行の後（発進の準備）。基準が V_top を超えたら戻す
+    keep_cycles: int = 0
     # 2026-10-27 段3 P3・段6 P1・段7 P2 の既定（false のまま ＝ 今と同じ）
     fb_ref0_no_deeper: bool = False
     fb_ref0_cut_cycles: int = 0
@@ -1903,6 +1944,11 @@ class _ModeRun:
         self._hold_speed_win: deque[tuple[float, float]] = deque()  # 段13: (t, CAN 車速)
         self._last_accel_actual: float | None = None
         self._last_brake_actual: float | None = None
+        self._keep_anchor = None
+        self._keep_after_stop = False
+        self.keep_cycles = 0
+        self._keep_brake_win: deque[tuple[float, float]] = deque()  # 案③: (t, 実ブレーキ開度)
+        self._keep_speed_win: deque[tuple[float, float]] = deque()  # 案③: (t, CAN 車速)
         self._accel_blocked = False
         self._brake_blocked = False
         self.cycle_ms: list[float] = []  # 全周期の処理時間（A7 の関門: 周期を超えないか）
@@ -2062,6 +2108,7 @@ class _ModeRun:
         hold_add = 0.0
         hold_accel: float | None = None
         hold_pred_dev: float | None = None
+        keep_pct: float | None = None
         if self.hold is not None:
             h = self.hold
             measured_accel: float | None = None
@@ -2083,6 +2130,7 @@ class _ModeRun:
                 and self._plan_band_row(t)
             ):
                 hold_scene = 3  # 2026-10-31 案 B: 発進のブレーキの帯（FF・PI は上りと同じ）
+            keep_pct = self._keep_step(t, speed, ref_t, plan_effort, hold_scene)
             if hold_scene:
                 self.hold_scene_cycles += 1
                 if hold_scene in (2, 3):
@@ -2096,7 +2144,7 @@ class _ModeRun:
                         self.ref.at, t, h.lag_s, h.step_s, h.points, h.plant_c,
                         h.pi.lo_pct, h.pi.hi_pct, h.offset_pct,
                     )
-                    ff_effort = -hold_ff_pct
+                    ff_effort = -hold_ff_pct if keep_pct is None else -keep_pct
                 elif h.points is not None:
                     hold_ff_pct = interp_hold_opening(h.points, ref) + h.offset_pct
                     ff_effort = -hold_ff_pct
@@ -2122,6 +2170,8 @@ class _ModeRun:
                     self._ci_pct = self._ci_kmhs = 0.0
             else:
                 h.pi.reset()
+                if keep_pct is not None:
+                    ff_effort = -keep_pct  # 案③: 保持の場面の外のブレーキの行の FF を替える
         if (
             self.midway_fb_no_deeper and not hold_scene and c10_effort
             and isinstance(self.ff, ForwardMapFeedforward)
@@ -2234,6 +2284,8 @@ class _ModeRun:
             ) from exc
         self._last_accel_actual = pulse_to_opening(monitor_accel.position_pulse)
         self._last_brake_actual = pulse_to_opening(monitor_brake.position_pulse)
+        if self.hold is not None and self.hold.keep_enabled:
+            self._keep_brake_win.append((t, self._last_brake_actual))
         cycle_ms = 1000.0 * (time.perf_counter() - cycle_started)
         self.cycle_ms.append(cycle_ms)
         accel_current, brake_current = monitor_accel.current_ma, monitor_brake.current_ma
@@ -2297,6 +2349,15 @@ class _ModeRun:
                     hold_accel_kmhs=hold_accel, hold_pred_dev_kmh=hold_pred_dev,
                     stop_pred_dev_kmh=self._stop_pred_dev,
                     c10_integral_pct=self._ci_pct, c10_integral_kmhs=self._ci_kmhs,
+                    keep_active=(
+                        None if self.hold is None or not self.hold.keep_enabled
+                        else int(keep_pct is not None)
+                    ),
+                    keep_anchor_pct=None if self._keep_anchor is None else self._keep_anchor[0],
+                    keep_anchor_accel_kmhs=(
+                        None if self._keep_anchor is None else self._keep_anchor[1]
+                    ),
+                    keep_ff_pct=keep_pct,
                 )
             )
         if segment != self._segment:
@@ -2315,6 +2376,75 @@ class _ModeRun:
                        f"max|偏差|={self.max_abs_dev:.2f} "
                        f"{100.0 * t / self.duration_s:4.1f}%{gov}"),
             ))
+
+    def _keep_step(
+        self, t: float, speed: float, ref_t: float, plan_effort: float, hold_scene: int
+    ) -> float | None:
+        """案③（効いている開度を保つ。ProblemReport_20261103）: 時刻 t が範囲なら ③ の FF
+        （ブレーキ開度。正 [%]）を返し、範囲外・起点がまだ取れないときは None（通常の FF）。
+        範囲 ＝ 計画の行がブレーキで停車保持の行でない・保持の場面でない
+        （band のときは帯 ＝ 3 も可）・目標側の基準 < V_top・
+        L 先の目標側の基準の加速度 ≤ + 定速の帯（帯 ＝ 3 には掛けない）。
+        範囲外の周期は起点を捨てる。
+        起点（範囲に入った最初の周期 t0 に 1 回。履歴が窓を覆わなければ覆うまで取らない）:
+        u0 ＝ 実ブレーキ開度の平均（窓 [t0−L−w, t0−L]）、
+        a0 ＝ CAN 車速の最小二乗の傾き（窓 [t0−w, t0]）。
+        帯（band）のときの起点は、車が停車速度を超えた最初の周期。
+        停車保持の行の後（発進の準備でブレーキを離す行）は、基準が V_top を超えるまで
+        場面の外（hold_scene 0）でも範囲外（③ は停車の手前だけ。スタブ 20261103_074358 で
+        W 10.65 s の離しを 9.3 → 10.6% に踏み戻していた）。"""
+        h = self.hold
+        if h is None or not h.keep_enabled:
+            return None
+        from tests.research.fwd_plan import FLAG_STOP  # noqa: PLC0415
+
+        w, lag = h.keep_window_s, h.lag_s
+        sw = self._keep_speed_win  # 範囲の外でも更新して窓を満たす
+        sw.append((t, speed))
+        while sw and sw[0][0] < t - w - 1e-9:
+            sw.popleft()
+        bw = self._keep_brake_win
+        while bw and bw[0][0] < t - lag - w - 2.0 * h.step_s:
+            bw.popleft()
+        in_scene = (hold_scene == 0 and not self._keep_after_stop) or (
+            h.keep_band and hold_scene == 3
+        )
+        plan_stop = False
+        if isinstance(self.ff, ForwardMapFeedforward):
+            plan = self.ff.plan
+            plan_stop = bool(plan.flag[plan.index_at(t)] == FLAG_STOP)
+        if plan_stop:
+            self._keep_after_stop = True
+        elif ref_t >= h.keep_top_kmh:
+            self._keep_after_stop = False
+        a_ref = (
+            self.ref_t.at(t + lag + h.step_s) - self.ref_t.at(t + lag)
+        ) / h.step_s
+        if not (
+            in_scene and plan_effort < 0.0 and not plan_stop
+            and ref_t < h.keep_top_kmh
+            # 帯（3）はもともと発進へ向かう区間なので加速度では外さない（帯の終わりで外れる）
+            and (hold_scene == 3 or a_ref <= h.accel_band_kmhs)
+        ):
+            self._keep_anchor = None
+            return None
+        if self._keep_anchor is None:
+            if hold_scene == 3 and speed <= h.stop_kmh:
+                return None  # 帯は車が動き出すまで通常の帯の FF
+            tol = 1.5 * h.step_s  # 周期のゆらぎの許容
+            u_win = [u for tu, u in bw if t - lag - w - 1e-9 <= tu <= t - lag + 1e-9]
+            covered = (
+                len(sw) >= 3 and sw[0][0] <= t - w + tol
+                and bool(bw) and bw[0][0] <= t - lag - w + tol and bool(u_win)
+            )
+            if not covered:
+                return None  # 履歴が窓を覆わない（走り始め等）→ 通常の FF
+            a0 = fit_slope([x[0] for x in sw], [x[1] for x in sw])
+            self._keep_anchor = (sum(u_win) / len(u_win), a0)
+        assert h.plant_c is not None
+        u0, a0 = self._keep_anchor
+        self.keep_cycles += 1
+        return keep_ff_pct(u0, a0, a_ref, h.plant_c, h.pi.lo_pct, h.pi.hi_pct)
 
     def _launch_hold_step(self, t: float, speed: float, ff_effort: float) -> float:
         """段8-a: 発進のブレーキに足す effort [%]（≦ 0。ブレーキを深くする向き）。off は 0。
@@ -3049,6 +3179,9 @@ async def run_mode_drive(
             f"{run.hold_scene_cycles} 周期（{run.hold_scene_cycles * run.interval_s:.1f}s）"
             f"（うち上り {run.hold_lead_in_cycles} 周期・"
             f"発進のブレーキの帯 {run.hold_launch_band_cycles} 周期）")
+        if run.hold.keep_enabled:
+            say("  低速の開度を保つ（案③）: "
+                f"{run.keep_cycles} 周期（{run.keep_cycles * run.interval_s:.1f}s）")
     if run.stop_end_monotone:
         say("  停C の区間のブレーキを浅くしない（段7 P2）: "
             f"{run.stop_end_monotone_cycles} 周期"

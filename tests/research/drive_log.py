@@ -181,6 +181,14 @@ CSV_COLUMNS: tuple[str, ...] = (
     # どちらかの側が on の走行だけ（I を使わない周期は 0。両方 off は空欄）
     "c10_integral_pct",
     "c10_integral_kmhs",
+    # 2026-11-03 ProblemReport_20261103 段1（案③。forward_map.low_speed_keep_enabled）:
+    # keep_active ＝ その周期の FF を ③ に替えたら 1・替えなければ 0（機能 off は空欄）、
+    # keep_anchor_pct / keep_anchor_accel_kmhs ＝ 起点の実ブレーキ開度 [%]・実車の加速度 [km/h/s]
+    # （起点を持つ周期だけ）、keep_ff_pct ＝ ③ の FF のブレーキ開度 [%]（替えた周期だけ）
+    "keep_active",
+    "keep_anchor_pct",
+    "keep_anchor_accel_kmhs",
+    "keep_ff_pct",
 )
 
 
@@ -238,6 +246,10 @@ class DriveSample:
     stop_pred_dev_kmh: float | None = None  # 段3: 停C の区間で P に使った先読みの偏差（同上）
     c10_integral_pct: float | None = None  # 段6d: c10_effort_pct のうち I の分
     c10_integral_kmhs: float | None = None  # 段6d: I が出す加速度 a_I
+    keep_active: int | None = None  # 案③: FF を替えた周期なら 1・替えなければ 0（機能 off は None）
+    keep_anchor_pct: float | None = None  # 案③: 起点の実ブレーキ開度（起点なしは None）
+    keep_anchor_accel_kmhs: float | None = None  # 案③: 起点の実車の加速度（同上）
+    keep_ff_pct: float | None = None  # 案③: ③ の FF のブレーキ開度（替えない周期は None）
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -340,6 +352,10 @@ class SessionLog:
         stop_pred_dev_kmh: float | None = None,
         c10_integral_pct: float | None = None,
         c10_integral_kmhs: float | None = None,
+        keep_active: int | None = None,
+        keep_anchor_pct: float | None = None,
+        keep_anchor_accel_kmhs: float | None = None,
+        keep_ff_pct: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -389,6 +405,10 @@ class SessionLog:
             stop_pred_dev_kmh=stop_pred_dev_kmh,
             c10_integral_pct=c10_integral_pct,
             c10_integral_kmhs=c10_integral_kmhs,
+            keep_active=keep_active,
+            keep_anchor_pct=keep_anchor_pct,
+            keep_anchor_accel_kmhs=keep_anchor_accel_kmhs,
+            keep_ff_pct=keep_ff_pct,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -595,6 +615,10 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.stop_pred_dev_kmh),
                 _fmt(s.c10_integral_pct),
                 _fmt(s.c10_integral_kmhs),
+                "" if s.keep_active is None else str(s.keep_active),
+                _fmt(s.keep_anchor_pct),
+                _fmt(s.keep_anchor_accel_kmhs),
+                _fmt(s.keep_ff_pct),
             ])
 
 

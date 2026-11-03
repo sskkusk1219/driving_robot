@@ -1293,6 +1293,21 @@ class ForwardMapSection:
     # ±ramp_cruise_band_g の帯の中は 0（段に止まっている）。積分は今の偏差のまま（不感帯も同じ）。
     # hold_pi_enabled が要る。既定 false ＝ 今と完全に同じ。ログ: hold_accel_kmhs・hold_pred_dev_kmh
     hold_accel_pred_enabled: bool = False
+    # 2026-11-03 ProblemReport_20261103 段1（案③）: true なら、基準が低速（meta hold_pi の c を
+    # 測った車速 V_top 未満）でブレーキの行（停車保持の行・保持の場面を除く）の FF を、
+    # 範囲に入った最初の周期の実開度 u0・実車の加速度 a0 を起点に、
+    # u0 −（L 先の基準の加速度 − a0）÷ c に替える
+    # （計画の表の答えを使わない。FB の C10・DOB・停C はそのまま上に足す）。
+    # c ＝ meta hold_pi の K ÷ T、L ＝ ブレーキの遅れ。hold_pi_enabled が要る。
+    # 既定 false ＝ 今と完全に同じ。
+    # ログ: keep_active・keep_anchor_pct・keep_anchor_accel_kmhs・keep_ff_pct
+    low_speed_keep_enabled: bool = False
+    # true なら発進のブレーキの帯（hold_scene ＝ 3）の FF も ③ に替える（段4）。
+    # 起点は車が停車速度を超えた最初の周期。low_speed_keep_enabled が要る。既定 false
+    low_speed_keep_band: bool = False
+    # 起点の実開度・加速度を平均する窓 [s]。仮の値（根拠なし。11-02 の机上で使った窓）。
+    # 効く先: 起点のばらつき（短い）と停車の手前に間に合うか（長い）。決める時期: 段3 の実機
+    low_speed_keep_window_s: float = 0.3
 
 
 @dataclass
@@ -1850,6 +1865,18 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         not fm.hold_accel_pred_enabled or fm.hold_pi_enabled,
         "forward_map.hold_accel_pred_enabled は hold_pi_enabled が true のときだけ使える",
+    )
+    need(
+        not fm.low_speed_keep_enabled or fm.hold_pi_enabled,
+        "forward_map.low_speed_keep_enabled は hold_pi_enabled が true のときだけ使える",
+    )
+    need(
+        not fm.low_speed_keep_band or fm.low_speed_keep_enabled,
+        "forward_map.low_speed_keep_band は low_speed_keep_enabled が true のときだけ使える",
+    )
+    need(
+        math.isfinite(fm.low_speed_keep_window_s) and fm.low_speed_keep_window_s > 0.0,
+        f"forward_map.low_speed_keep_window_s は正の有限の数: {fm.low_speed_keep_window_s}",
     )
     for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")

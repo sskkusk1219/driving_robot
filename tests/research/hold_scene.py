@@ -410,3 +410,30 @@ class HoldScenePI:
             self.integral += step_i
         effort = min(max(ff_effort + self.kp * p_dev + self.integral, lo), hi)
         return effort, effort - ff_effort
+
+
+def keep_top_kmh(meta: Any) -> float:
+    """案③（効いている開度を保つ）をかける車速の上限 V_top [km/h] ＝ meta["hold_pi"]["per_step"] の
+    うち used が真の段の v_mean_kmh の最大（c を測った車速の範囲）。段が無ければ ValueError。"""
+    info = meta.get("hold_pi") if hasattr(meta, "get") else None
+    try:
+        speeds = [float(s["v_mean_kmh"]) for s in info["per_step"] if s.get("used")]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"meta['hold_pi']['per_step'] が読めません（{exc}）") from exc
+    speeds = [v for v in speeds if math.isfinite(v)]
+    if not speeds:
+        raise ValueError("meta['hold_pi']['per_step'] に used の段がありません")
+    return max(speeds)
+
+
+def keep_ff_pct(
+    u0_pct: float, a0_kmhs: float, a_ref_ahead_kmhs: float, c_kmhs_per_pct: float,
+    lo_pct: float, hi_pct: float,
+) -> float:
+    """案③の FF（ブレーキ開度。正 [%]）＝ clip(u0 −（L 先の基準の加速度 − a0）÷ c, lo, hi)。
+    起点（u0・a0）で釣り合っていた開度から、基準の加速度が変わった分だけ動かす。
+    基準が上がる（加速度が a0 より大きい）ほどブレーキを浅くする。
+    c ≤ 0・有限でなければ ValueError。"""
+    if not (math.isfinite(c_kmhs_per_pct) and c_kmhs_per_pct > 0.0):
+        raise ValueError(f"c は正の有限の数が要ります: {c_kmhs_per_pct}")
+    return min(max(u0_pct - (a_ref_ahead_kmhs - a0_kmhs) / c_kmhs_per_pct, lo_pct), hi_pct)
