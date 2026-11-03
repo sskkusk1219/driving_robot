@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import re
 import shutil
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -52,6 +52,16 @@ class VehicleSection:
     max_brake_opening_pct: float = 80.0
     stop_deviation_threshold_kmh: float = 2.0
     stop_deviation_duration_s: float = 4.0
+    # 2026-11-03: 運転指標（drive_index.py）の ER・EER だけに使う。車ごとの値をコードに書かない
+    # ため既定は None（未設定なら ER・EER は出さない）。値は対象車の諸元が分かったら yaml に書く
+    test_mass_kg: float | None = None  # 試験質量（慣性）[kg]
+    road_load_a0_n: float | None = None  # 走行抵抗の定数項 [N]
+    road_load_a1_n_per_kmh: float | None = None  # 1 次の係数 [N/(km/h)]
+    road_load_a2_n_per_kmh2: float | None = None  # 2 次の係数 [N/(km/h)^2]
+    road_load_source: str = ""  # 上の値の出どころ（レポートに表示する）
+    # 上の 5 つを上書きする yaml（git 管理外。公開しない車の値を置く）。無ければ上の値のまま。
+    # 相対パスはリポジトリの直下から
+    road_load_file: str | None = None
 
 
 #: KAIZEN 5.8 節で比べる候補（V1 案スイッチ）。ff_candidate.CANDIDATE_CLASSES のキーと同じ
@@ -202,6 +212,11 @@ class ModesSection:
     # 走る直前に元のモードの基準車速を区間ごとに切り出して時刻をつなぐ（mode_drive.compose_mode）。
     # wltp_mode_name などに name を書くと、DB より先にここを見る
     composed_modes: list[dict[str, Any]] = field(default_factory=list)
+    # 2026-11-03: segment_bounds_s（区間の境目）を当てるモード。ここにないモードは、レポートの
+    # 区間別の表・図2の区間の境目・フェーズ別の運転指標を出さない
+    segmented_mode_names: list[str] = field(
+        default_factory=lambda: ["01_WLTP_Low,Mid,Hi,ExHi"]
+    )
 
     def segment_at(self, t_s: float) -> str:
         """モード経過時間 [s] が属する区間名。"""
@@ -643,6 +658,11 @@ class KpiSection:
     pedal_reversal_min_window_s: float = 15.0  # 対象時間がこれ未満の窓は除く [s]
     # 同時踏みと数える実開度の余裕。待機位置＋これを両ペダルが超えた行 [%]
     pedal_overlap_margin_pct: float = 0.0
+    # 運転指標（参考。総合判定に含めない）の判定の範囲。UN R154（WLTP）の許容範囲として記憶している
+    # 値で、原文は未確認（原文で確かめたら直す）
+    drive_index_iwr_min_pct: float = -2.0
+    drive_index_iwr_max_pct: float = 4.0
+    drive_index_rmsse_max_kmh: float = 1.3
 
 
 @dataclass
@@ -1437,7 +1457,39 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> ResearchConfig:
     kwargs: dict[str, Any] = {"source_path": path}
     for name, section_type in _SECTION_TYPES.items():
         kwargs[name] = _build_section(section_type, raw.get(name) or {}, name, path)
+    kwargs["vehicle"] = _apply_road_load_file(kwargs["vehicle"], path)
     return ResearchConfig(**kwargs)
+
+
+_ROAD_LOAD_KEYS = (
+    "test_mass_kg", "road_load_a0_n", "road_load_a1_n_per_kmh", "road_load_a2_n_per_kmh2",
+    "road_load_source",
+)
+
+
+def _apply_road_load_file(vehicle: VehicleSection, path: Path) -> VehicleSection:
+    """vehicle.road_load_file があれば、その yaml の質量・走行抵抗で上書きする（2026-11-03）。"""
+    if not vehicle.road_load_file:
+        return vehicle
+    file = Path(vehicle.road_load_file)
+    if not file.is_absolute():
+        file = Path(__file__).resolve().parents[2] / file
+    if not file.exists():
+        return vehicle
+    try:
+        raw = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"YAML の構文エラー: {file}\n{exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError(f"走行抵抗のファイルの最上位がマッピングではありません: {file}")
+    unknown = sorted(set(raw) - set(_ROAD_LOAD_KEYS))
+    if unknown:
+        raise ConfigError(f"走行抵抗のファイルに未知のキー: {', '.join(unknown)}（{file}）")
+    merged = _build_section(
+        VehicleSection, {**{k: getattr(vehicle, k) for k in _ROAD_LOAD_KEYS}, **raw},
+        "vehicle", path,
+    )
+    return replace(vehicle, **{k: getattr(merged, k) for k in _ROAD_LOAD_KEYS})
 
 
 def keys_missing_in_yaml(path: Path) -> list[str]:

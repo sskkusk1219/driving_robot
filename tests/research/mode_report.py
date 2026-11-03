@@ -3,23 +3,29 @@
 走行 CSV の MODE_DRIVE の行（0.1s 刻み）だけから作るので、走行後に CSV から作り直せる:
 
     .venv/bin/python -m tests.research.mode_report \
-        tests/research/results/drive_log_real_XXXX.csv --label FF
+        tests/research/results/drive_log_real_XXXX.csv
 
 中身:
-    1. 結論（プライマリー KPI の判定表）
-    2. 実施条件
+    1. 結論（プライマリー KPI の判定表・運転指標）
+    2. 実施条件（走行時の設定 yaml・コードの版を含む）
     3. 走行全体の図（本番の自動走行画面と同じ 2 段）と偏差の図
-    4. どこで外れたか（WLTP 区間別・走行状態別・速度帯別・1.0 km/h 超えの区間・
+    4. どこで外れたか（WLTP 区間別（WLTP のみ）・走行状態別・速度帯別・1.0 km/h 超えの区間・
        最大逸脱付近の拡大図）
     5. ペダル指令の特徴（不感帯の中に落ちた指令など）
     6. 所見（データから機械的に抜き出した事実）
     7. 考察・次の手順（走行後に追記する欄）
+    付録 A. 走行時の設定（yaml 全文）
+
+ファイル名のラベルはモード名から作る（mode_label）。CSV の隣に走行時の yaml
+（drive_log_<hw>_<日時>.yaml）があれば、作り直しはそれを使う。
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import re
+import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,6 +35,7 @@ from typing import Any
 import numpy as np
 
 from tests.research.config import ResearchConfig, load_config
+from tests.research.drive_index import DriveIndexResult, DriveIndexRow, compute_drive_index
 from tests.research.drive_log import (
     SECTION_MODE_DRIVE,
     DriveSample,
@@ -61,7 +68,7 @@ from tests.research.live_plot import (
     PlotSample,
     save_drive_figure,
 )
-from tests.research.mode_drive import ref_smooth_text, standby_label
+from tests.research.mode_drive import controller_text, ref_smooth_text, standby_label
 from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, FeedforwardParams, coast_decel_at
 from tests.research.term import say
 from tests.research.vehicle import feedforward_params
@@ -116,9 +123,9 @@ class ModeRow:
 class RunInfo:
     """レポートの「実施条件」。CSV から作り直すときは分からない項目が None のまま。"""
 
-    label: str  # ファイル名のラベル（FF / FF&Kp …）
-    title: str  # 見出し（手順 3: FF のみでモード走行 など）
-    controller: str  # 制御構成の説明
+    label: str  # ファイル名のラベル（モード名から作る。mode_label）
+    title: str  # 見出し（手順 3: モード走行 など）
+    controller: str  # 制御構成の説明（mode_drive.controller_text）
     csv_path: Path
     hw_mode: str
     mode_name: str
@@ -165,7 +172,88 @@ class RunInfo:
     # 2026-10-19 段2s-2b: FEL の 1 行（mode_drive.fel_text）。None は不明（CSV からの作り直し）か
     # FF が表の候補でない
     fel_text: str | None = None
+    # 2026-11-03: 走行時の設定（yaml）の保存先・全文（先頭に git の版のコメント付き）・コードの版。
+    # None は不明（保存した yaml が無い CSV からの作り直し）
+    config_snapshot_path: Path | None = None
+    config_text: str | None = None
+    code_version: str | None = None
     notes: list[str] = field(default_factory=list)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ラベル・走行時の設定とコードの版
+# ─────────────────────────────────────────────────────────────────────
+
+SNAPSHOT_YAML_MARK = "# ---- 走行時の yaml ここから ----"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def mode_label(mode_name: str) -> str:
+    """ファイル名のラベル。先頭の「数字＋_」を取り、英数字・_・- 以外は - にする。
+
+    例: 01_WLTP_Low,Mid,Hi,ExHi → WLTP_Low-Mid-Hi-ExHi
+    """
+    name = re.sub(r"^\d+_", "", mode_name)
+    label = re.sub(r"[^A-Za-z0-9_-]", "-", name)
+    return label or "Mode"
+
+
+def is_segmented_mode(cfg: ResearchConfig, mode_name: str) -> bool:
+    """区間の境目（modes.segment_bounds_s）を当てるモードか。"""
+    return mode_name in cfg.modes.segmented_mode_names
+
+
+def _git(args: Sequence[str]) -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", *args], cwd=_REPO_ROOT, capture_output=True, text=True, timeout=10, check=True
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout
+
+
+def git_snapshot_header() -> tuple[list[str], str]:
+    """(yaml の先頭に書くコメント行, コードの版の 1 行)。git が使えなければ「不明」。"""
+    head = _git(["rev-parse", "--short", "HEAD"])
+    status = _git(["status", "--porcelain"])
+    if head is None or status is None:
+        return ["# git: 不明（git が使えなかった）"], "不明（git が使えなかった）"
+    commit = head.strip()
+    changed = [ln for ln in status.splitlines() if ln.strip()]
+    if changed:
+        lines = [f"# git: {commit}", f"# 未コミットの変更あり（{len(changed)} ファイル）:"]
+        lines += [f"#   {ln}" for ln in changed]
+        return lines, f"{commit}（未コミットの変更あり {len(changed)} ファイル）"
+    return [f"# git: {commit}", "# 未コミットの変更なし"], f"{commit}（未コミットの変更なし）"
+
+
+def save_config_snapshot(source_path: Path, csv_path: Path) -> tuple[Path, str, str]:
+    """走ったときの yaml を CSV の隣へコピーし、(保存先, 全文, コードの版) を返す。
+
+    先頭にコメントで git の版と未コミットの変更を書き足す（研究系の設定は走行ログに残らない
+    ので、どの設定・どのコードで走ったかを後から確かめるため）。
+    """
+    header, version = git_snapshot_header()
+    body = source_path.read_text(encoding="utf-8")
+    text = "\n".join([*header, SNAPSHOT_YAML_MARK, ""]) + body
+    dest = csv_path.with_suffix(".yaml")
+    dest.write_text(text, encoding="utf-8")
+    return dest, text, version
+
+
+def code_version_from_snapshot(text: str) -> str | None:
+    """保存した yaml の先頭コメントからコードの版の 1 行を読み戻す。"""
+    lines = text.splitlines()
+    if not lines or not lines[0].startswith("# git:"):
+        return None
+    commit = lines[0].removeprefix("# git:").strip()
+    if len(lines) > 1 and lines[1].startswith("# 未コミットの変更あり"):
+        m = re.search(r"（(\d+) ファイル）", lines[1])
+        return f"{commit}（未コミットの変更あり {m.group(1)} ファイル）" if m else commit
+    if len(lines) > 1 and lines[1].startswith("# 未コミットの変更なし"):
+        return f"{commit}（未コミットの変更なし）"
+    return commit
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -468,7 +556,8 @@ def plot_overview(rows: Sequence[ModeRow], cfg: ResearchConfig, path: Path, titl
 
 
 def plot_deviation(
-    rows: Sequence[ModeRow], cfg: ResearchConfig, kpi: KpiResult, path: Path
+    rows: Sequence[ModeRow], cfg: ResearchConfig, kpi: KpiResult, path: Path,
+    *, segmented: bool = True,
 ) -> Path:
     t = [r.t_s for r in rows]
     dev = [r.deviation_kmh for r in rows]
@@ -483,7 +572,8 @@ def plot_deviation(
         ax.axhline(-y, color=color, linestyle="--", linewidth=1.0)
     for ep in kpi.episodes:
         ax.axvspan(ep.start_s, ep.end_s + 0.1, color=COLOR_LIMIT, alpha=0.15, linewidth=0)
-    _segment_lines(ax, cfg, t[-1] if t else 0.0)
+    if segmented:
+        _segment_lines(ax, cfg, t[-1] if t else 0.0)
     lim = max(2.0, min(10.0, kpi.max_abs_kmh * 1.1))
     ax.set_ylim(-lim, lim)
     ax.set_xlim(t[0] if t else 0.0, t[-1] if t else 1.0)
@@ -588,6 +678,97 @@ def _stats_table(stats: Sequence[GroupStats], first: str) -> list[str]:
     )
 
 
+def _fmt_pct(v: float | None) -> str:
+    return "—" if v is None else f"{v:+.2f}"
+
+
+def drive_index_lines(
+    rows: Sequence[ModeRow], cfg: ResearchConfig, segmented: bool
+) -> tuple[list[str], DriveIndexResult]:
+    """1 章の運転指標の節（Markdown の行）と計算結果。"""
+    v = cfg.vehicle
+    k = cfg.kpi
+    result = compute_drive_index(
+        [r.t_s for r in rows], [r.ref_kmh for r in rows], [r.actual_kmh for r in rows],
+        segments=[r.segment for r in rows] if segmented else None,
+        mass_kg=v.test_mass_kg,
+        road_load_a0_n=v.road_load_a0_n,
+        road_load_a1_n_per_kmh=v.road_load_a1_n_per_kmh,
+        road_load_a2_n_per_kmh2=v.road_load_a2_n_per_kmh2,
+    )
+    cols: list[DriveIndexRow] = [*result.phases, result.total]
+    road_known = all(
+        x is not None
+        for x in (v.test_mass_kg, v.road_load_a0_n, v.road_load_a1_n_per_kmh,
+                  v.road_load_a2_n_per_kmh2)
+    )
+    if road_known:
+        src = v.road_load_source.strip() or "出どころの記載なし"
+        er_note = f"（質量・走行抵抗: {src}）"
+    else:
+        er_note = "（—: 質量・走行抵抗が未設定）"
+
+    def iwr_ok(r: DriveIndexRow) -> str:
+        if r.iwr_pct is None:
+            return "—"
+        return "範囲内" if k.drive_index_iwr_min_pct <= r.iwr_pct <= k.drive_index_iwr_max_pct \
+            else "範囲外"
+
+    def rmsse_ok(r: DriveIndexRow) -> str:
+        if r.rmsse_kmh is None:
+            return "—"
+        return "範囲内" if r.rmsse_kmh <= k.drive_index_rmsse_max_kmh else "範囲外"
+
+    if road_known:
+        road_text = (
+            f"{v.test_mass_kg:g} kg・A0 {v.road_load_a0_n:g} N・"
+            f"A1 {v.road_load_a1_n_per_kmh:g} N/(km/h)・"
+            f"A2 {v.road_load_a2_n_per_kmh2:g} N/(km/h)²"
+            f"（{v.road_load_source or '出どころ不明'}）"
+        )
+    else:
+        road_text = "未設定のため ER・EER は出さない。"
+    header = ("指標", *[c.label for c in cols])
+    body: list[tuple[object, ...]] = [
+        ("距離 基準 / 実 [km]", *[f"{c.distance_ref_km:.2f} / {c.distance_act_km:.2f}"
+                                  for c in cols]),
+        ("DR [%]", *[_fmt_pct(c.dr_pct) for c in cols]),
+        (f"ER [%] {er_note}", *[_fmt_pct(c.er_pct) for c in cols]),
+        (f"EER [%] {er_note}", *[_fmt_pct(c.eer_pct) for c in cols]),
+        ("IWR [%]", *[_fmt_pct(c.iwr_pct) for c in cols]),
+        ("ASCR [%]", *[_fmt_pct(c.ascr_pct) for c in cols]),
+        ("RMSSE [km/h]", *["—" if c.rmsse_kmh is None else f"{c.rmsse_kmh:.2f}" for c in cols]),
+        (f"参考の判定: IWR（{k.drive_index_iwr_min_pct:g}〜{k.drive_index_iwr_max_pct:g}%）",
+         *[iwr_ok(c) for c in cols]),
+        (f"参考の判定: RMSSE（≤ {k.drive_index_rmsse_max_kmh:g} km/h）",
+         *[rmsse_ok(c) for c in cols]),
+    ]
+    lines = [
+        "### 運転指標（参考・総合判定に含めない）",
+        "",
+        "SAE J2951 ／ WLTP の運転指標。基準車速と実車速の 2 本に同じ計算をして比べる"
+        + ("（フェーズ別は、そのフェーズの行だけで足す）。" if segmented
+           else "（WLTP 以外のモードは合計だけ）。"),
+        "",
+        *_table(header, body),
+        "",
+        "- 計算: 車速を 5 点の中心移動平均（端は手前までの点だけで平均）で平滑化 → 加速度 a → "
+        "慣性の力 F_I ＝ 質量 × a、走行抵抗 F_R ＝ A0 ＋ A1·V ＋ A2·V²（V [km/h]）。",
+        "- DR ＝ 実の走行距離 ÷ 基準の走行距離 − 1。",
+        "- ER ＝ 実の CE ÷ 基準の CE − 1。CE ＝ Σ v·(F_I ＋ F_R)·dt（正の行だけ）。",
+        "- EER ＝ 1 − (ER ＋ 1) ÷ (DR ＋ 1)（距離のずれを除いたエネルギーのずれ）。",
+        "- IWR ＝ 実の IWE ÷ 基準の IWE − 1。IWE ＝ Σ v·F_I·dt（F_I が正の行だけ）。"
+        "質量は割り算で消える。",
+        "- ASCR ＝ 実の ASC ÷ 基準の ASC − 1。ASC ＝ Σ|a|·dt。",
+        "- RMSSE ＝ √平均((平滑化した実車速 − 平滑化した基準車速)²)。",
+        "- ER・EER の質量・走行抵抗: " + road_text,
+        f"- 参考の判定の範囲は IWR {k.drive_index_iwr_min_pct:g}〜{k.drive_index_iwr_max_pct:g}%・"
+        f"RMSSE ≤ {k.drive_index_rmsse_max_kmh:g} km/h（UN R154 の許容範囲として記憶している値。"
+        "原文は未確認）。",
+    ]
+    return lines, result
+
+
 def unique_report_path(results_dir: Path, label: str, started_at: datetime) -> Path:
     """reportYYYYMMDD_Run<label>.md。同じ日に 2 本目以降は _2, _3 … を付けて上書きしない。"""
     base = f"report{started_at:%Y%m%d}_Run{label}"
@@ -607,12 +788,14 @@ def _observations(
     rows: Sequence[ModeRow],
     state_of: Callable[[float], str],
     cfg: ResearchConfig,
+    segmented: bool = True,
 ) -> list[str]:
     lines = []
     worst = next(r for r in rows if r.t_s == kpi.max_abs_t_s)
+    seg_text = f"区間 {worst.segment}・" if segmented else ""
     lines.append(
         f"最大逸脱 {kpi.max_abs_kmh:.2f} km/h は t={kpi.max_abs_t_s:.1f}s"
-        f"（区間 {worst.segment}・基準 {worst.ref_kmh:.1f} km/h・{state_of(worst.t_s)}中、"
+        f"（{seg_text}基準 {worst.ref_kmh:.1f} km/h・{state_of(worst.t_s)}中、"
         f"実車速が基準より{'速い' if worst.deviation_kmh > 0 else '遅い'}）。"
     )
     for s in states:
@@ -676,8 +859,12 @@ def write_mode_report(
     kpi = compute_kpi(t, [r.deviation_kmh for r in rows], k)
     state_keys = driving_states(rows)
     states = group_stats(rows, state_keys, STATES, k.max_abs_deviation_kmh)
-    segments = group_stats(
-        rows, [r.segment for r in rows], cfg.modes.segment_names, k.max_abs_deviation_kmh
+    segmented = is_segmented_mode(cfg, info.mode_name)
+    segments = (
+        group_stats(
+            rows, [r.segment for r in rows], cfg.modes.segment_names, k.max_abs_deviation_kmh
+        )
+        if segmented else []
     )
     bands = group_stats(
         rows, [speed_band_label(r.ref_kmh) for r in rows], speed_band_order(),
@@ -704,7 +891,8 @@ def write_mode_report(
         figs = {
             "overview": plot_overview(rows, cfg, fig_dir / "overview.png",
                                       f"{info.title}（{info.mode_name}）"),
-            "deviation": plot_deviation(rows, cfg, kpi, fig_dir / "deviation.png"),
+            "deviation": plot_deviation(rows, cfg, kpi, fig_dir / "deviation.png",
+                                       segmented=segmented),
             "zoom": plot_zoom(rows, cfg, kpi.max_abs_t_s, fig_dir / "worst_zoom.png"),
             "distribution": plot_distribution(rows, cfg, bands, fig_dir / "distribution.png"),
         }
@@ -745,10 +933,27 @@ def write_mode_report(
         else f"待機位置 ＋ {k.pedal_overlap_margin_pct:g}%"
     )
 
+    index_lines, _ = drive_index_lines(rows, cfg, segmented)
+    if info.config_text is not None:
+        appendix_text = info.config_text
+        appendix_note = (
+            f"走ったときの yaml を保存したもの（`{info.config_snapshot_path}`）。"
+            "先頭のコメントは git の版と未コミットの変更。"
+        )
+        config_cell = f"`{info.config_snapshot_path}`（全文は[付録 A](#appendix-a)）"
+    else:
+        appendix_text = (
+            cfg.source_path.read_text(encoding="utf-8") if cfg.source_path is not None else ""
+        )
+        appendix_note = (
+            "**走行時の設定は不明**（保存した yaml が無いので、作り直した時点の yaml"
+            f"（`{cfg.source_path}`）を貼った。走ったときと違う可能性がある）。"
+        )
+        config_cell = "不明（作り直した時点の yaml を[付録 A](#appendix-a)に貼った）"
+
     md: list[str] = [
         f"# {info.title} — {info.started_at:%Y-%m-%d %H:%M}",
         "",
-        "`docs/Problem/ProblemReport_20260910.md` の手順に沿った走行結果。"
         f"制御構成: **{info.controller}**。",
         "",
         "## 1. 結論（プライマリー KPI）",
@@ -787,6 +992,8 @@ def write_mode_report(
         f"- 判定は MODE_DRIVE の 0.1s 刻みの行（{kpi.n_samples} 行、CSV と同じ）で計算"
         "（`tests/research/kpi.py`、定義は本番 `kpi_monitor.py` と同じ）。",
         "",
+        *index_lines,
+        "",
         "## 2. 実施条件",
         "",
         *_table(
@@ -798,6 +1005,8 @@ def write_mode_report(
                 ("走行時間", f"{run_s:.1f}s（{status}）"
                  + (f"・予定 {info.mode_duration_s:.0f}s" if info.mode_duration_s else "")),
                 ("制御構成", info.controller),
+                ("走行時の設定", config_cell),
+                ("コードの版", info.code_version or "不明（CSV からの作り直し）"),
                 ("FF モデル", f"`{ff.model_path}`"),
                 ("触れた位置 min（アクセル / ブレーキ）",
                  f"{cfg.vehicle.min_accel_opening_pct:.2f}% / "
@@ -832,13 +1041,13 @@ def write_mode_report(
         "",
         f"図2: 偏差（実車速 − 基準車速）。赤破線 = ±{k.max_abs_deviation_kmh:g} km/h、"
         f"橙破線 = ±{k.p95_deviation_kmh:g} km/h、赤帯 = ±{k.max_abs_deviation_kmh:g} km/h を"
-        "超えていた区間、点線 = WLTP の区間境界。",
+        "超えていた区間" + ("、点線 = WLTP の区間境界。" if segmented else "。"),
         "",
         "## 4. どこで外れたか",
         "",
         "### 4.1 WLTP 区間別",
         "",
-        *_stats_table(segments, "区間"),
+        *(_stats_table(segments, "区間") if segmented else ["区間なし（WLTP 以外）。"]),
         "",
         "### 4.2 走行状態別",
         "",
@@ -971,13 +1180,23 @@ def write_mode_report(
         "## 6. 所見（データから抜き出した事実）",
         "",
         *[f"- {line}" for line in _observations(
-            kpi, states, segments, pedal, rows, lambda x: state_at[x], cfg
+            kpi, states, segments, pedal, rows, lambda x: state_at[x], cfg, segmented
         )],
         "",
         "## 7. 考察・次の手順",
         "",
         "- 考察: （走行結果を見て追記する）",
         "- 次の手順と比べるときは、1 章の KPI 表と 4 章の表を基準にする。",
+        "",
+        '<a id="appendix-a"></a>',
+        "",
+        "## 付録 A. 走行時の設定（yaml 全文）",
+        "",
+        appendix_note,
+        "",
+        "```yaml",
+        appendix_text.rstrip("\n"),
+        "```",
         "",
     ]
     report_path.write_text("\n".join(md), encoding="utf-8")
@@ -993,16 +1212,36 @@ def write_mode_report(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m tests.research.mode_report",
-        description="モード走行の CSV（section=MODE_DRIVE の行）からレポートを作り直す",
+        description="モード走行の CSV（section=MODE_DRIVE の行）からレポートを作り直す。"
+        "CSV の隣に走行時の yaml（<CSV 名>.yaml）があればそれを使う",
     )
     parser.add_argument("csv", type=Path, help="走行ログ CSV（drive_log_<hw>_<日時>.csv）")
-    parser.add_argument("--label", default="FF", help="ファイル名のラベル（FF / FF&Kp …）")
-    parser.add_argument("--title", default="手順 3: FF のみでモード走行", help="見出し")
     parser.add_argument(
-        "--config", type=Path, default=Path("tests/research/config_testVehicle.yaml")
+        "--label", default=None, help="ファイル名のラベル（既定: モード名から作る）"
+    )
+    parser.add_argument("--title", default="手順 3: モード走行", help="見出し")
+    parser.add_argument(
+        "--mode-name", default=None,
+        help="走行モード名（既定: 設定の modes.wltp_mode_name。保存した yaml が無い古い CSV の"
+        "ときは、走ったモードをここで指定する）",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=Path("tests/research/config_testVehicle.yaml"),
+        help="保存した yaml が無いときに使う設定",
+    )
+    parser.add_argument(
+        "--out-dir", type=Path, default=None, help="レポートの出力先（既定: CSV と同じ場所）"
     )
     args = parser.parse_args(argv)
-    cfg = load_config(args.config)
+    snapshot = args.csv.with_suffix(".yaml")
+    if snapshot.exists():
+        cfg = load_config(snapshot)
+        config_text: str | None = snapshot.read_text(encoding="utf-8")
+        code_version = code_version_from_snapshot(config_text)
+        snapshot_path: Path | None = snapshot
+    else:
+        cfg = load_config(args.config)
+        config_text, code_version, snapshot_path = None, None, None
     rows = rows_from_csv(args.csv)
     stem = args.csv.stem  # drive_log_<hw>_<YYYYmmdd>_<HHMMSS>
     parts = stem.split("_")
@@ -1011,16 +1250,21 @@ def main(argv: list[str] | None = None) -> int:
         hw_mode = parts[-3]
     except (ValueError, IndexError):
         started, hw_mode = datetime.now(), "?"
+    mode_name = args.mode_name or cfg.modes.wltp_mode_name
     info = RunInfo(
-        label=args.label,
+        label=args.label or mode_label(mode_name),
         title=args.title,
-        controller="CSV から作り直し（制御構成は元の走行のレポートを参照）",
+        controller="CSV から作り直し（制御構成は元の走行のレポートを参照）"
+        if snapshot_path is None else controller_text(cfg),
         csv_path=args.csv,
         hw_mode=hw_mode,
-        mode_name=cfg.modes.wltp_mode_name,
+        mode_name=mode_name,
         started_at=started,
+        config_snapshot_path=snapshot_path,
+        config_text=config_text,
+        code_version=code_version,
     )
-    write_mode_report(rows, cfg, info, args.csv.parent)
+    write_mode_report(rows, cfg, info, args.out_dir or args.csv.parent)
     return 0
 
 

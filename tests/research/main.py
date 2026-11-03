@@ -86,13 +86,20 @@ from tests.research.hardware import (
 from tests.research.learning_patterns import LearningDataError
 from tests.research.mode_drive import (
     ModeDriveSetup,
+    controller_text,
     fel_text,
     load_mode,
     prepare_mode_drive,
     prepare_mode_drive_from,
     run_mode_drive,
 )
-from tests.research.mode_report import RunInfo, rows_from_samples, write_mode_report
+from tests.research.mode_report import (
+    RunInfo,
+    mode_label,
+    rows_from_samples,
+    save_config_snapshot,
+    write_mode_report,
+)
 from tests.research.pattern_drive import (
     DriveError,
     build_ff_model,
@@ -887,7 +894,7 @@ def _fel_text_of(cfg: ResearchConfig, setup: ModeDriveSetup) -> str | None:
 
 
 async def step3_mode_drive_ff(ctx: RunContext) -> None:
-    """停車保持の状態から WLTP を FF だけで走り、CSV（0.1s 刻み）とレポートを残す。"""
+    """停車保持の状態からモードを走り、CSV（0.1s 刻み）・走行時の設定・レポートを残す。"""
     hw = ctx.require_hardware()
     setup = ctx.mode_setup
     if setup is None:  # prepare_step3 が走行前チェックの前に作る
@@ -905,10 +912,20 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
         notes.append(
             f"--limit-s でモードの先頭 {result.mode_duration_s:.0f}s だけ走った（KPI は参考値）。"
         )
+    # 走ったときの yaml と git の版を CSV の隣へ保存する（研究系の設定は走行ログに残らない）
+    snapshot_path = snapshot_text = code_version = None
+    if ctx.config.source_path is not None:
+        try:
+            snapshot_path, snapshot_text, code_version = save_config_snapshot(
+                ctx.config.source_path, log.csv_path
+            )
+            say(f"走行時の設定を保存しました: {snapshot_path}（コードの版: {code_version}）")
+        except OSError as exc:
+            say(f"警告: 走行時の設定を保存できませんでした（{exc}）")
     info = RunInfo(
-        label="FF",
-        title="手順 3: FF のみでモード走行",
-        controller=f"FF のみ（Kp=Ki=Kd=0）→ 調停: {_arbiter_summary(ctx.config)}",
+        label=mode_label(result.mode_name),
+        title="手順 3: モード走行",
+        controller=controller_text(ctx.config),
         csv_path=log.csv_path,
         hw_mode=hw.hw_mode,
         mode_name=result.mode_name,
@@ -949,6 +966,9 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
         low_speed_side_rule=ctx.config.forward_map.low_speed_side_rule,
         switch_lead_enabled=ctx.config.forward_map.switch_lead_enabled,
         fel_text=_fel_text_of(ctx.config, setup),
+        config_snapshot_path=snapshot_path,
+        config_text=snapshot_text,
+        code_version=code_version,
         notes=notes,
     )
     rows = rows_from_samples(result.samples)
@@ -960,7 +980,7 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
             )
         except Exception as exc:  # 走行ログは保存済み。レポートは CSV から作り直せる
             say(f"警告: レポートを作れませんでした（{type(exc).__name__}: {exc}）。作り直し:")
-            say(f"  .venv/bin/python -m tests.research.mode_report {log.csv_path} --label FF")
+            say(f"  .venv/bin/python -m tests.research.mode_report {log.csv_path}")
     else:
         say("モード走行の行が無いため、レポートは作りません")
     if not result.completed:

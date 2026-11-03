@@ -34,6 +34,15 @@ vehicle:
   max_brake_opening_pct: 47.3     # ブレーキ開度上限 [%]（機構保護）
   stop_deviation_threshold_kmh: 2.0  # 異常停止判定の偏差しきい値 [km/h]
   stop_deviation_duration_s: 9999     # 上記が続いたら停止 [s]
+  # 2026-11-03: 運転指標（レポートの ER・EER）だけに使う。DR・IWR・ASCR・RMSSE は質量・抵抗に依らない。
+  # 車ごとの値。公開リポジトリに載せない値は road_load_file（git 管理外の yaml。同じキーを書く）に置く。
+  # ファイルがあれば下の値をその値で上書きする。どちらも null なら ER・EER は出さない
+  test_mass_kg: null                   # 試験質量（慣性）[kg]
+  road_load_a0_n: null                 # 走行抵抗の定数項 A0 [N]
+  road_load_a1_n_per_kmh: null         # 1 次の係数 A1 [N/(km/h)]
+  road_load_a2_n_per_kmh2: null        # 2 次の係数 A2 [N/(km/h)^2]
+  road_load_source: ""                 # 上の値の出どころ（レポートに表示する）
+  road_load_file: "tests/research/private/road_load.yaml"
 
 # ── Feedforward（手順 2 で同定して自動保存される） ───────────────────
 feedforward:
@@ -631,6 +640,9 @@ modes:
   # モード走行レポートの区間別集計（WLTP の区間名と境界 [s]。境界は区間名より 1 つ少ない）
   segment_names: [Low, Mid, High, ExHi]
   segment_bounds_s: [589.0, 1022.0, 1477.0]
+  # 2026-11-03: 上の区間の境目を当てるモード。ここにないモードは、レポートの区間別の表・図2の
+  # 区間の境目・フェーズ別の運転指標を出さない
+  segmented_mode_names: ["01_WLTP_Low,Mid,Hi,ExHi"]
   # 2026-10-19 段3b: 研究コード側の合成モード（DB は変えない）。走る直前に source の基準車速を
   # windows_s の各区間 [開始秒, 終了秒] で切り出し、時刻をつないで 1 本にする。wltp_mode_name に
   # name を書くと手順3 がそれを走る（DB より先にここを見る）。区間の端は停車の途中（0 km/h）で切る
@@ -1165,6 +1177,11 @@ kpi:
   pedal_reversal_min_window_s: 15.0     # 対象（ACCEL・基準5km/h以上）が これ未満の窓は除く [s]
   # 同時踏み: アクセル・ブレーキの実開度が両方とも 待機位置 ＋ この値 を超えた行（ProblemReport_20261001 段2o-3）
   pedal_overlap_margin_pct: 0.0          # 0 = 待機位置を少しでも両方超えたら数える [%]
+  # 運転指標（レポートの参考判定。総合判定に含めない）。UN R154（WLTP）の許容範囲として記憶している値。
+  # 原文は未確認なので、原文で確かめたら直す
+  drive_index_iwr_min_pct: -2.0          # IWR の下限 [%]
+  drive_index_iwr_max_pct: 4.0           # IWR の上限 [%]
+  drive_index_rmsse_max_kmh: 1.3         # RMSSE の上限 [km/h]
 
 # ── 手順 1（初期化）と走行前チェックの実施項目（false でスキップ） ─────────
 #   false にした項目は実行も判定もせず [SKIP] と表示する。安全装置を外すことになるので注意。

@@ -1767,3 +1767,29 @@ def test_table_boundary_step_keys_default_off_and_anchor_rejects_unknown() -> No
         assert not [p for p in cfgmod.validate_config(cfg) if "low_speed_release_anchor" in p]
     cfg.forward_map.low_speed_release_anchor = "bogus"
     assert [p for p in cfgmod.validate_config(cfg) if "low_speed_release_anchor" in p]
+
+
+def test_drive_index_settings_defaults() -> None:
+    """運転指標の設定の既定値（コードの既定は車ごとの値を持たない。yaml の値は固定しない）。"""
+    v = cfgmod.VehicleSection()
+    assert v.test_mass_kg is None and v.road_load_a0_n is None
+    assert v.road_load_a1_n_per_kmh is None and v.road_load_a2_n_per_kmh2 is None
+    assert v.road_load_source == ""
+    k = cfgmod.KpiSection()
+    assert (k.drive_index_iwr_min_pct, k.drive_index_iwr_max_pct) == (-2.0, 4.0)
+    assert k.drive_index_rmsse_max_kmh == 1.3
+    assert cfgmod.ModesSection().segmented_mode_names == ["01_WLTP_Low,Mid,Hi,ExHi"]
+
+
+def test_road_load_file_overrides_vehicle_values(tmp_path: Path) -> None:
+    """vehicle.road_load_file があれば質量・走行抵抗をその値で上書きする（無ければそのまま）。"""
+    private = tmp_path / "road_load.yaml"
+    yaml_path = tmp_path / "c.yaml"
+    yaml_path.write_text(f"vehicle:\n  road_load_file: \"{private}\"\n", encoding="utf-8")
+    assert cfgmod.load_config(yaml_path).vehicle.test_mass_kg is None
+    private.write_text("test_mass_kg: 1500.0\nroad_load_a0_n: 100.0\n", encoding="utf-8")
+    v = cfgmod.load_config(yaml_path).vehicle
+    assert (v.test_mass_kg, v.road_load_a0_n, v.road_load_a1_n_per_kmh) == (1500.0, 100.0, None)
+    private.write_text("max_speed_kmh: 1.0\n", encoding="utf-8")
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.load_config(yaml_path)

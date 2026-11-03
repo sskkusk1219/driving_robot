@@ -58,6 +58,7 @@ from tests.research.drive_log import (
     SessionLog,
 )
 from tests.research.ff_candidate import (
+    CANDIDATE_CLASSES,
     CandidateFeedforward,
     CoastAssistFeedforward,
     CreepFloorFeedforward,
@@ -1103,6 +1104,35 @@ def standby_label(cfg: ResearchConfig) -> str:
         return "なし（0%）"
     accel, brake = standby_openings(cfg)
     return f"{accel:.2f}% / {brake:.2f}%（触れた位置 min）"
+
+
+def controller_text(cfg: ResearchConfig) -> str:
+    """表示・レポート用の制御構成の説明（設定から作る。2026-11-03）。
+
+    FF の候補（feedforward.candidate）が持つ FB（C10 の P・I、DOB、惰行の補助、予測器 …）を、
+    走行中に実際に作られる条件（isinstance。run_mode_drive が c10_settings などを None にする
+    のと同じ）で並べる。
+    """
+    cand = cfg.feedforward.candidate
+    cls = CANDIDATE_CLASSES.get(cand)
+    parts: list[str] = []
+    if cls is not None:
+        if issubclass(cls, DeviationForwardFeedforward):
+            parts.append("C10（偏差の P・I）")
+        if issubclass(cls, DisturbanceObserverFeedforward):
+            parts.append("DOB")
+        if issubclass(cls, CoastAssistFeedforward):
+            parts.append("惰行の補助")
+        if issubclass(cls, PredictorFeedforward) and cfg.forward_map.predictor_enabled:
+            parts.append("予測器・車速のフィルタ")
+        if issubclass(cls, CreepFloorFeedforward):
+            parts.append("停車の最後のブレーキの下限")
+        if issubclass(cls, StopEndFeedforward):
+            parts.append("停A・停C")
+    fb = " ＋ ".join(parts) if parts else "なし（FF のみ）"
+    arb_features = enabled_arbiter_features(cfg.arbiter)
+    arb = " + ".join(arb_features) if arb_features else "符号で振り分けのみ"
+    return f"FF（{cand}）＋ FB: {fb} → 調停: {arb}"
 
 
 def split_effort(effort: float, max_accel_pct: float, max_brake_pct: float) -> tuple[float, float]:
@@ -2946,9 +2976,7 @@ async def run_mode_drive(
     limited = duration < mode.total_duration
     say(f"モード走行: {mode.name}（{duration:.0f}s"
         f"{f' ／ 動作確認のため先頭 {duration:.0f}s で打ち切り' if limited else ''}）")
-    arb_features = enabled_arbiter_features(cfg.arbiter)
-    say("制御構成: FF のみ（Kp=Ki=Kd=0）→ 調停は "
-        + (" + ".join(arb_features) if arb_features else "符号で振り分けのみ"))
+    say(f"制御構成: {controller_text(cfg)}")
     gov = cfg.mode_drive
     say(f"減速G ガバナー（安全網）: {'有効' if gov.decel_governor else '無効'}"
         f"（{cfg.vehicle.max_decel_g:g}G × {GOVERNOR_LIMIT_FRAC:g} 以上で頭打ち）")

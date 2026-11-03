@@ -1,4 +1,4 @@
-"""研究開発用ハーネス 手順 3（FF のみでモード走行 → CSV/レポート）のユニットテスト。
+"""研究開発用ハーネス 手順 3（モード走行 → CSV/レポート）のユニットテスト。
 
 スタブ HW（StubVehicle 付き）で数秒の合成モードを走らせ、ループ・安全停止・CSV・レポートを確認する。
 FF は手順 2 のモデルに依存しないよう、同じインターフェースの簡単な偽物を使う。
@@ -828,23 +828,65 @@ def _synthetic_rows(n: int = 1200) -> list[mrmod.ModeRow]:
 def test_write_mode_report_creates_markdown_and_figures(tmp_path: Path) -> None:
     cfg = _tmp_cfg(tmp_path)
     info = mrmod.RunInfo(
-        label="FF", title="手順 3: FF のみでモード走行", controller="FF のみ",
-        csv_path=tmp_path / "x.csv", hw_mode="stub", mode_name="test_mode",
+        label="WLTP_Low-Mid-Hi-ExHi", title="手順 3: モード走行", controller="FF ＋ FB",
+        csv_path=tmp_path / "x.csv", hw_mode="stub", mode_name="01_WLTP_Low,Mid,Hi,ExHi",
         started_at=datetime(2026, 9, 11, 10, 0), completed=True, cycles=2400, overruns=0,
+        config_snapshot_path=tmp_path / "x.yaml", config_text="# git: abc1234\nvehicle: {}\n",
+        code_version="abc1234（未コミットの変更なし）",
     )
     rows = _synthetic_rows()
     path = mrmod.write_mode_report(rows, cfg, info, tmp_path)
-    assert path.name == "report20260911_RunFF.md"
+    stem = "report20260911_RunWLTP_Low-Mid-Hi-ExHi"
+    assert path.name == f"{stem}.md"
     text = path.read_text(encoding="utf-8")
     assert "## 1. 結論（プライマリー KPI）" in text
+    assert "FF のみ" not in text and "ProblemReport_20260910" not in text
     assert "最大逸脱 1.40 km/h" in text
     assert "| Mid |" in text and "| 加速 |" in text
+    # 運転指標: WLTP はフェーズ別 ＋ 合計
+    assert "### 運転指標（参考・総合判定に含めない）" in text
+    assert "| 指標 | Low | Mid | 合計 |" in text
+    assert "| コードの版 | abc1234（未コミットの変更なし） |" in text
+    assert "## 付録 A. 走行時の設定（yaml 全文）" in text and "# git: abc1234" in text
     for name in ("overview", "deviation", "worst_zoom", "distribution"):
-        fig = tmp_path / "report20260911_RunFF" / f"{name}.png"
+        fig = tmp_path / stem / f"{name}.png"
         assert fig.stat().st_size > 1000
-        assert f"report20260911_RunFF/{name}.png" in text
+        assert f"{stem}/{name}.png" in text
     # 同じ日の 2 本目は上書きしない
-    assert mrmod.write_mode_report(rows, cfg, info, tmp_path).name == "report20260911_RunFF_2.md"
+    assert mrmod.write_mode_report(rows, cfg, info, tmp_path).name == f"{stem}_2.md"
+
+
+def test_write_mode_report_non_wltp_has_no_segments(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    info = mrmod.RunInfo(
+        label=mrmod.mode_label("08_UDDS"), title="手順 3: モード走行", controller="c",
+        csv_path=tmp_path / "x.csv", hw_mode="stub", mode_name="08_UDDS",
+        started_at=datetime(2026, 9, 11, 10, 0),
+    )
+    path = mrmod.write_mode_report(_synthetic_rows(), cfg, info, tmp_path)
+    assert path.name == "report20260911_RunUDDS.md"
+    text = path.read_text(encoding="utf-8")
+    assert "区間なし（WLTP 以外）" in text
+    assert "点線 = WLTP の区間境界" not in text
+    assert "| 指標 | 合計 |" in text
+    assert "走行時の設定は不明" in text
+
+
+def test_mode_label() -> None:
+    assert mrmod.mode_label("01_WLTP_Low,Mid,Hi,ExHi") == "WLTP_Low-Mid-Hi-ExHi"
+    assert mrmod.mode_label("09_US06") == "US06"
+    assert mrmod.mode_label("12 AMA/short") == "12-AMA-short"
+
+
+def test_code_version_roundtrip_through_snapshot(tmp_path: Path) -> None:
+    src = tmp_path / "cfg.yaml"
+    src.write_text("vehicle:\n  name: t\n", encoding="utf-8")
+    csv_path = tmp_path / "drive_log_stub_20260911_120000.csv"
+    dest, text, version = mrmod.save_config_snapshot(src, csv_path)
+    assert dest == tmp_path / "drive_log_stub_20260911_120000.yaml"
+    assert text.startswith("# git:") and mrmod.SNAPSHOT_YAML_MARK in text
+    assert mrmod.code_version_from_snapshot(text) == version
+    assert text.endswith("vehicle:\n  name: t\n")
 
 
 def test_driving_states_classify_by_reference_slope() -> None:
@@ -879,8 +921,18 @@ def test_report_can_be_rebuilt_from_csv(tmp_path: Path) -> None:
     ]
     csv_path = tmp_path / "drive_log_stub_20260911_120000.csv"
     dlmod.write_csv(samples, csv_path)
-    assert mrmod.main([str(csv_path), "--label", "FF", "--config", str(cfg.source_path)]) == 0
-    assert (tmp_path / "report20260911_RunFF.md").exists()
+    # 保存した yaml が無い: --config を使い、付録と 2 章に「不明」と書く
+    assert mrmod.main([
+        str(csv_path), "--mode-name", "test_mode", "--config", str(cfg.source_path),
+    ]) == 0
+    first = tmp_path / "report20260911_Runtest_mode.md"
+    assert first.exists() and "走行時の設定は不明" in first.read_text(encoding="utf-8")
+    # 保存した yaml がある: それを読む（コードの版・付録に出る）
+    dest, _, version = mrmod.save_config_snapshot(cfg.source_path, csv_path)
+    assert mrmod.main([str(csv_path), "--config", str(cfg.source_path)]) == 0
+    reports = sorted(tmp_path.glob("report20260911_Run*.md"))
+    text = next(p for p in reports if p != first).read_text(encoding="utf-8")
+    assert version in text and "走行時の設定は不明" not in text and f"`{dest}`" in text
 
 
 # ── CLI 経由 ─────────────────────────────────────────────────────────
@@ -938,8 +990,9 @@ def test_step3_end_to_end_with_stub(
     out = capsys.readouterr().out
     assert "手順 3 完了" in out
     results = tmp_path / "results"
-    reports = list(results.glob("report*_RunFF.md"))
+    reports = list(results.glob("report*_Run*.md"))
     assert len(reports) == 1
+    assert len(list(results.glob("drive_log_stub_*.yaml"))) == 1  # 走行時の設定
     csvs = list(results.glob("drive_log_stub_*.csv"))
     assert len(csvs) == 1
     assert len(mrmod.rows_from_csv(csvs[0])) >= 30
@@ -975,7 +1028,7 @@ def test_step3_abort_writes_report_and_returns_5(
     out = capsys.readouterr().out
     assert "CAN 車速を読めません" in out
     assert "終了処理: 完了" in out
-    report = next((tmp_path / "results").glob("report*_RunFF.md"))
+    report = next((tmp_path / "results").glob("report*_Run*.md"))
     assert "中断: CAN 車速を読めません" in report.read_text(encoding="utf-8")
 
 

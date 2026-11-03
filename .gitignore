@@ -47,3 +47,7 @@ Thumbs.db
 
 # tests/research の解析出力（png/csv/pkl、容量大・再生成可能）
 tests/research/results/
+
+# 公開しない車の値（質量・走行抵抗など）とユーザー提供のノート
+tests/research/private/
+docs/ideas/sim_ver6.ipynb
