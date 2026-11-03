@@ -189,6 +189,9 @@ CSV_COLUMNS: tuple[str, ...] = (
     "keep_anchor_pct",
     "keep_anchor_accel_kmhs",
     "keep_ff_pct",
+    # 2026-11-03 ProblemReport_20261103_停車前の這う基準 段1（forward_map.stop_tail_ramp_enabled）:
+    # stop_tail_active ＝ 停車前の踏み増しの行なら 1・そうでなければ 0（機能 off は空欄）
+    "stop_tail_active",
 )
 
 
@@ -250,6 +253,7 @@ class DriveSample:
     keep_anchor_pct: float | None = None  # 案③: 起点の実ブレーキ開度（起点なしは None）
     keep_anchor_accel_kmhs: float | None = None  # 案③: 起点の実車の加速度（同上）
     keep_ff_pct: float | None = None  # 案③: ③ の FF のブレーキ開度（替えない周期は None）
+    stop_tail_active: int | None = None  # 停車前の踏み増しの行なら 1・他は 0（機能 off は None）
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -356,6 +360,7 @@ class SessionLog:
         keep_anchor_pct: float | None = None,
         keep_anchor_accel_kmhs: float | None = None,
         keep_ff_pct: float | None = None,
+        stop_tail_active: int | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -409,6 +414,7 @@ class SessionLog:
             keep_anchor_pct=keep_anchor_pct,
             keep_anchor_accel_kmhs=keep_anchor_accel_kmhs,
             keep_ff_pct=keep_ff_pct,
+            stop_tail_active=stop_tail_active,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -619,6 +625,7 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.keep_anchor_pct),
                 _fmt(s.keep_anchor_accel_kmhs),
                 _fmt(s.keep_ff_pct),
+                "" if s.stop_tail_active is None else str(s.stop_tail_active),
             ])
 
 

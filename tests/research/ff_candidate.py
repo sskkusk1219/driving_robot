@@ -825,6 +825,7 @@ class ForwardMapFeedforward:
         launch_shift_choose: bool = False,
         launch_gap_tight: bool = False,
         launch_band: LaunchBandSpec | None = None,
+        stop_tail_kmh: float | None = None,
         predict_creep_curve: bool = False,
         creep_accel_speeds_kmh: Sequence[float] = (),
         creep_accel_kmhs: Sequence[float] = (),
@@ -885,6 +886,7 @@ class ForwardMapFeedforward:
             launch_shift_choose=launch_shift_choose,
             launch_gap_tight=launch_gap_tight,  # 2026-10-31 発進のすき間（案 A）
             launch_band=launch_band,  # 2026-10-31 発進のブレーキの帯（案 B）
+            stop_tail_kmh=stop_tail_kmh,  # 2026-11-03 停車前の踏み増し
             predict_creep_curve=predict_creep_curve,
             creep_accel_speeds_kmh=creep_accel_speeds_kmh,
             creep_accel_kmhs=creep_accel_kmhs,

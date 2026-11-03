@@ -408,6 +408,8 @@ def forward_map_plan_args(
         launch_release_lead_s=fm.launch_release_lead_s,
         launch_release_pre_pct=fm.launch_release_pre_pct,
         launch_short_stop_s=fm.launch_short_stop_s,
+        # 2026-11-03 停車前の踏み増し（off は None ＝ 今と完全に同じ。机上と本体で同じ計画）
+        stop_tail_kmh=fm.stop_tail_kmh if fm.stop_tail_ramp_enabled else None,
         switch_gap_compensate=fm.switch_gap_compensate,  # 段7-c
         switch_gap_min_loss=fm.switch_gap_min_loss,  # 段9-b
         switch_gap_rule=fm.switch_gap_rule,  # 段10-2
@@ -431,6 +433,12 @@ def forward_map_plan_args(
         band = launch_band_for(cfg, mode, table)
         kwargs["launch_band"] = None if band is None else band[0]
     return target_ref.at, mode.total_duration, kwargs
+
+
+def clip_stop_tail_delta(delta_pct: float) -> float:
+    """停車前の踏み増しの行の C10 の上乗せ（上乗せ後 − FF。ブレーキの行では負が深い）は、
+    ブレーキを深くする向き（負）だけ残す。浅くする向き（正）は 0。"""
+    return min(delta_pct, 0.0)
 
 
 def candidate_is_stop_end(candidate: str) -> bool:
@@ -802,6 +810,18 @@ def _prepare_forward_map_plan(
     say(f"  切り替えの先読み（段5-5c）: {'あり' if fm.switch_lead_enabled else 'なし'}")
     say(f"  発進のブレーキを基準の動き出しに合わせて離す（段7-b）: "
         f"{'あり' if fm.launch_release_ramp else 'なし'}")
+    if fm.stop_tail_ramp_enabled:
+        tail = plan.stop_tail_stats
+        bk_tail = cfg.vehicle.min_brake_opening_pct + abs(
+            float(meta.get("launch_breakaway_u_pct") or 0.0)
+        )
+        say(f"  停車前の踏み増し（2026-11-03）: しきい値 {fm.stop_tail_kmh:g} km/h・"
+            f"L ＝ ブレーキの遅れ {lag_b:.3f}s・停車の長さの境目 {fm.launch_short_stop_s:g}s・"
+            f"停車保持 {cfg.stop_brake_opening_pct:.2f}%・動き出す開度 bk ＝ min ＋ "
+            f"|meta launch_breakaway_u_pct| ＝ {bk_tail:.3f}%・"
+            f"{'統計なし' if tail is None else tail.summary()}")
+    else:
+        say("  停車前の踏み増し（2026-11-03）: なし")
     if isinstance(ff, ForwardMapFeedforward):
         say(f"  動き出したら離しを止めて待つ（段8-a）: {make_launch_hold(cfg, ff, plan)[1]}")
     say("  P・惰行の補助の表から A2 を外す（段8-b）: "
@@ -1751,6 +1771,9 @@ class _ModeRun:
     _keep_anchor: tuple[float, float] | None = None  # (u0 [%], a0 [km/h/s])
     _keep_after_stop: bool = False  # 停車保持の行の後（発進の準備）。基準が V_top を超えたら戻す
     keep_cycles: int = 0
+    # 2026-11-03 停車前の踏み増し（stop_tail_ramp_enabled。off のまま ＝ 今と同じ）
+    stop_tail_cycles: int = 0  # 計画の stop_tail の行の周期
+    stop_tail_clipped_cycles: int = 0  # うち C10 の P の浅くする向きを 0 にした周期
     # 2026-10-27 段3 P3・段6 P1・段7 P2 の既定（false のまま ＝ 今と同じ）
     fb_ref0_no_deeper: bool = False
     fb_ref0_cut_cycles: int = 0
@@ -1947,6 +1970,8 @@ class _ModeRun:
         self._keep_anchor = None
         self._keep_after_stop = False
         self.keep_cycles = 0
+        self.stop_tail_cycles = 0
+        self.stop_tail_clipped_cycles = 0
         self._keep_brake_win: deque[tuple[float, float]] = deque()  # 案③: (t, 実ブレーキ開度)
         self._keep_speed_win: deque[tuple[float, float]] = deque()  # 案③: (t, CAN 車速)
         self._accel_blocked = False
@@ -2039,6 +2064,16 @@ class _ModeRun:
             kwargs["select_brake_accel_kmhs"] = window_slope_kmhs(self.ref.at, t, center_b, width)
             kwargs["select_brake_speed_kmh"] = self.ref.at(t + center_b)
         return kwargs
+
+    def _stop_tail_now(self, t: float) -> int | None:
+        """時刻 t が計画の停車前の踏み増しの行なら 1・違えば 0。off は None。"""
+        if not isinstance(self.ff, ForwardMapFeedforward):
+            return None
+        plan = self.ff.plan
+        st = getattr(plan, "stop_tail", None)
+        if st is None:
+            return None
+        return int(bool(st[plan.index_at(t)]))
 
     def _plan_band_row(self, t: float) -> bool:
         """2026-11-01 発進のブレーキの帯（案 B）の修正: 時刻 t の計画の行が帯の印つきか。
@@ -2358,6 +2393,7 @@ class _ModeRun:
                         None if self._keep_anchor is None else self._keep_anchor[1]
                     ),
                     keep_ff_pct=keep_pct,
+                    stop_tail_active=self._stop_tail_now(t),
                 )
             )
         if segment != self._segment:
@@ -2721,6 +2757,13 @@ class _ModeRun:
                 self.band_cap_cycles += 1
                 self.band_cap_pct_sum += abs(delta - capped)
                 delta = capped
+        if plan.stop_tail is not None and plan.stop_tail[i]:
+            # 2026-11-03 停車前の踏み増し: 区間の P はブレーキを深くする向きだけ残す
+            self.stop_tail_cycles += 1
+            clipped_tail = clip_stop_tail_delta(delta)
+            if clipped_tail != delta:
+                self.stop_tail_clipped_cycles += 1
+                delta = clipped_tail
         if dob is not None:
             p_only, _ = deviation_offset_detail(fb_table, **kwargs)
             self._dob_effort = (new - p_only) if ff_effort != 0.0 else 0.0
@@ -3182,6 +3225,10 @@ async def run_mode_drive(
         if run.hold.keep_enabled:
             say("  低速の開度を保つ（案③）: "
                 f"{run.keep_cycles} 周期（{run.keep_cycles * run.interval_s:.1f}s）")
+    if run.cfg.forward_map.stop_tail_ramp_enabled:
+        say("  停車前の踏み増し（2026-11-03）: "
+            f"{run.stop_tail_cycles} 周期（{run.stop_tail_cycles * run.interval_s:.1f}s）・"
+            f"うち P の浅くする向きを 0 にした {run.stop_tail_clipped_cycles} 周期")
     if run.stop_end_monotone:
         say("  停C の区間のブレーキを浅くしない（段7 P2）: "
             f"{run.stop_end_monotone_cycles} 周期"

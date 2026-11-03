@@ -1308,6 +1308,17 @@ class ForwardMapSection:
     # 起点の実開度・加速度を平均する窓 [s]。仮の値（根拠なし。11-02 の机上で使った窓）。
     # 効く先: 起点のばらつき（短い）と停車の手前に間に合うか（長い）。決める時期: 段3 の実機
     low_speed_keep_window_s: float = 0.3
+    # 2026-11-03 ProblemReport_20261103_停車前の這う基準 段1: true なら、L（ブレーキの遅れ）先の基準
+    # （停車判定の基準）が stop_tail_kmh 未満になった行から、その停車の最初の停車保持の行の手前まで
+    # 止まったものとして停車の長さで決まる開度へ直線で踏み増す（停車が launch_short_stop_s より
+    # 長ければ stop_brake_opening_pct・以下なら bk（min ＋ 動き出す開度）。
+    # 計画の方が深い行はそのまま・アクセル/惰行の行もブレーキ＋FB あり）。区間の C10 の上乗せは
+    # ブレーキを深くする向きだけ残す。launch_release_ramp が要る（bk・停車の長さの判定を共有）。
+    # 既定 false ＝ 今と完全に同じ。ログ: stop_tail_active
+    stop_tail_ramp_enabled: bool = False
+    # 「這う基準」のしきい値 [km/h]。根拠: 手順3 の KPI の偏差の幅 0.5 km/h（基準がこれ未満なら
+    # 偏差の幅の中で止まっているのと同じ。車に依存しない）。効く先: 区間の始まり（小さいと遅い）
+    stop_tail_kmh: float = 0.5
 
 
 @dataclass
@@ -1877,6 +1888,14 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         math.isfinite(fm.low_speed_keep_window_s) and fm.low_speed_keep_window_s > 0.0,
         f"forward_map.low_speed_keep_window_s は正の有限の数: {fm.low_speed_keep_window_s}",
+    )
+    need(
+        math.isfinite(fm.stop_tail_kmh) and fm.stop_tail_kmh > 0.0,
+        f"forward_map.stop_tail_kmh は正の有限の数: {fm.stop_tail_kmh}",
+    )
+    need(
+        not fm.stop_tail_ramp_enabled or fm.launch_release_ramp,
+        "forward_map.stop_tail_ramp_enabled は launch_release_ramp が true のときだけ使える",
     )
     for label, lag in (("accel_lag_s", fm.accel_lag_s), ("brake_lag_s", fm.brake_lag_s)):
         need(lag is None or lag >= 0.0, f"forward_map.{label} は 0 以上か null: {lag}")

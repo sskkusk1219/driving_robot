@@ -320,6 +320,14 @@ forward_map:
   launch_release_ramp: true
   launch_release_lead_s: 2.0
   launch_release_pre_pct: 2.0
+  # 2026-11-03 ProblemReport_20261103_停車前の這う基準（Claude 判定で採用）: true なら、L 先の停車判定の基準が
+  # stop_tail_kmh 未満になった行から停車保持の行（停A を含む）の手前まで、停車の長さで決まる開度（長い停車 ＝
+  # 停車保持・launch_short_stop_s 以下 ＝ 動き出す開度）へ直線で踏み増す。区間の C10 は深くする向きだけ。
+  # 実機 off/on（204629/211904・215147/221722・224139/225255）で W 444 +0.70→+0.28・U |偏差|>0.5
+  # 3.40→1.45 s、遅すぎの悪化なし。launch_release_ramp が要る。ログ: stop_tail_active
+  # stop_tail_kmh: 半分データ由来（KPI の偏差の幅 ±0.5。止まれば偏差 ＝ −基準なので KPI に収まる。車に依存しない）
+  stop_tail_ramp_enabled: true
+  stop_tail_kmh: 0.5
   launch_short_stop_s: 5.0
   # 2026-10-24 段8-a: true なら launch_prep の行（発進前の離し・短い停車の bk の行）で実車速が
   # 0.05 km/h を超えたとき、その周期の FF で離しを止め、深くする向きだけの積分 I を足して待つ

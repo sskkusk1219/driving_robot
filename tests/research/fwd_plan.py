@@ -734,6 +734,10 @@ class ForwardPlan:
     # 2026-10-31 発進のブレーキの帯（案 B）: 帯の行（アクセルを使わずブレーキの FF で動かす行）。
     # launch_band を渡さなければ None。launch_shift_choose はこの発進を対象から外す
     launch_band: np.ndarray | None = None
+    # 2026-11-03 ProblemReport_20261103_停車前の這う基準 段1: 停車前の踏み増しの行（最終の effort が
+    # ブレーキの行だけ）と区間の統計。stop_tail_kmh を渡さなければ None
+    stop_tail: np.ndarray | None = None
+    stop_tail_stats: StopTailStats | None = None
 
     def coast_fill_s(self) -> float:
         """案 D で埋めた惰行の秒数。"""
@@ -856,6 +860,7 @@ def build_plan(
     launch_shift_choose: bool = False,
     launch_gap_tight: bool = False,
     launch_band: LaunchBandSpec | None = None,
+    stop_tail_kmh: float | None = None,
     predict_creep_curve: bool = False,
     creep_accel_speeds_kmh: Sequence[float] = (),
     creep_accel_kmhs: Sequence[float] = (),
@@ -1062,6 +1067,7 @@ def build_plan(
             "launch_short_stop_s": launch_short_stop_s,
             "launch_gap_tight": launch_gap_tight,
             "launch_band": launch_band,
+            "stop_tail_kmh": stop_tail_kmh,
             "switch_gap_compensate": switch_gap_compensate,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1115,6 +1121,7 @@ def build_plan(
             "launch_short_stop_s": launch_short_stop_s,
             "launch_gap_tight": launch_gap_tight,
             "launch_band": launch_band,
+            "stop_tail_kmh": stop_tail_kmh,
             "switch_lead": switch_lead, "_lead_extra": _lead_extra,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1409,6 +1416,23 @@ def build_plan(
         _no_deeper_brake_in_midway(effort, flag, side_brake_dir, midway)
         if launch_midway_brake_cap:  # 段5-6 追加 A1: (ロ) の後。浅くする向きだけ
             _cap_midway_brake(effort, flag, midway, brake_deadband_pct, table.meta)
+    stop_tail_rows = None
+    stop_tail_stats = None
+    if stop_tail_kmh is not None:
+        # 2026-11-03 停車前の踏み増し: _launch_release_ramp の前（bk・停車の長さの判定を共有する）
+        bkm_t = table.meta.get("launch_breakaway_u_pct")
+        if not launch_release_ramp or bkm_t is None or not np.isfinite(bkm_t):
+            raise ValueError(
+                "stop_tail_kmh には launch_release_ramp と meta launch_breakaway_u_pct が要ります"
+            )
+        stop_tail_stats = StopTailStats()
+        stop_tail_rows = _stop_tail_ramp(
+            effort, flag, stop_now,
+            _eval_ref(stop_ref_at if stop_ref_at is not None else ref_at, t + lb),
+            period_s=period_s, bk_pct=brake_deadband_pct + abs(float(bkm_t)),
+            hold_pct=stop_brake_opening_pct, short_stop_s=launch_short_stop_s,
+            tail_kmh=stop_tail_kmh, brake_min_pct=brake_deadband_pct, stats=stop_tail_stats,
+        )
     launch_prep = None
     if launch_release_ramp:  # 段7-b: A1 の後・clip の前
         launch_prep = np.zeros(n, dtype=bool)
@@ -1546,6 +1570,9 @@ def build_plan(
         # 2026-11-01 発進のブレーキの帯（案 B）の修正: すき間の処理・補償の後の最終の effort が
         # ブレーキの行だけ印を残す（すき間の 0 の行は印なし → 走行中は計画の FF をそのまま使う）
         launch_band=None if launch_band_rows is None else (launch_band_rows & (effort < 0.0)),
+        # 2026-11-03 停車前の踏み増し: 最終の effort がブレーキの行だけ印を残す（同じ考え）
+        stop_tail=None if stop_tail_rows is None else (stop_tail_rows & (effort < 0.0)),
+        stop_tail_stats=stop_tail_stats,
     )
 
 
@@ -1965,6 +1992,108 @@ def _launch_dev_peak(
         )
         v = max(v + float(a[0]) * period_s, 0.0)
     return worst
+
+
+@dataclass
+class StopTailStats:
+    """停車前の踏み増し（`_stop_tail_ramp`）の統計: 区間の数・行数・計画から深くした量 [%]。"""
+
+    intervals: int = 0
+    rows: int = 0
+    period_s: float = DEFAULT_CONTROL_PERIOD_S
+    deepen_sum_pct: float = 0.0
+    deepen_max_pct: float = 0.0
+
+    @property
+    def mean_length_s(self) -> float:
+        return self.rows * self.period_s / self.intervals if self.intervals else 0.0
+
+    @property
+    def mean_deepen_pct(self) -> float:
+        return self.deepen_sum_pct / self.rows if self.rows else 0.0
+
+    def summary(self) -> str:
+        return (
+            f"区間 {self.intervals} 本・平均 {self.mean_length_s:.2f} s"
+            f"・計画から深くした量 平均 {self.mean_deepen_pct:.2f}% 最大 {self.deepen_max_pct:.2f}%"
+        )
+
+
+def _stop_tail_ramp(
+    effort: np.ndarray,
+    flag: np.ndarray,
+    stop_now: np.ndarray,
+    stop_ref_lead: np.ndarray,
+    *,
+    period_s: float,
+    bk_pct: float,
+    hold_pct: float,
+    short_stop_s: float,
+    tail_kmh: float,
+    brake_min_pct: float,
+    stats: StopTailStats | None = None,
+) -> np.ndarray:
+    """2026-11-03 停車前の踏み増し（ProblemReport_20261103_停車前の這う基準 段1）: L 先の基準
+    （stop_ref_lead ＝ t + L の停車判定の基準）が tail_kmh 未満になった行から、その停車の最初の
+    停車保持の行（i1。停A の早めた行を含む）の手前まで、停車の長さで決まる開度へ直線で踏み増す
+    （effort・flag をその場で書き換え、書き換えた行の bool 配列を返す）。
+
+    停車 ＝ stop_now が停車速度以下の連なり（`_launch_release_ramp` と同じ切り方）。狙い ＝ 停車が
+    short_stop_s 秒より長ければ hold_pct、以下なら bk_pct。区間 [i0, i1) は i1 − 1 から前へ、
+    stop_ref_lead < tail_kmh かつ stop_ref_lead ≤ stop_now（発進へ向かう所ではない）かつ
+    FLAG_STOP でない行が続く間。前の停車の終わりより前へは行かない。系列の先頭の停車は対象外。
+    各行は max(計画のブレーキ開度, u0 ＋ (狙い − u0) × (r − i0 + 1) / (i1 − i0))
+    （u0 ＝ 行 i0 の計画のブレーキ開度。アクセル・惰行なら brake_min_pct）。アクセル・惰行の行も
+    ブレーキにし、flag は FLAG_MEASURED（FB が掛かる）。
+    """
+    n = len(effort)
+    rows = np.zeros(n, dtype=bool)
+    low = stop_now <= STOP_SPEED_KMH
+    prev_end = 0
+    i = 0
+    while i < n:
+        if not low[i]:
+            i += 1
+            continue
+        s = i
+        while i < n and low[i]:
+            i += 1
+        t0 = i
+        floor_i = prev_end
+        prev_end = t0
+        if s == 0:
+            continue  # 系列の先頭の停車は対象外
+        length_s = (t0 - s) * period_s
+        target = hold_pct if length_s > short_stop_s + 1e-9 else bk_pct
+        i1 = s
+        while i1 - 1 >= floor_i and flag[i1 - 1] == FLAG_STOP:
+            i1 -= 1
+        j = i1 - 1
+        while (
+            j >= floor_i and stop_ref_lead[j] < tail_kmh
+            and stop_ref_lead[j] <= stop_now[j] and flag[j] != FLAG_STOP
+        ):
+            j -= 1
+        i0 = j + 1
+        if i0 >= i1:
+            continue
+        u0 = -float(effort[i0]) if effort[i0] < 0.0 else brake_min_pct
+        span = i1 - i0
+        if stats is not None:
+            stats.intervals += 1
+            stats.period_s = period_s
+        for r in range(i0, i1):
+            val = u0 + (target - u0) * (r - i0 + 1) / span
+            cur = -float(effort[r]) if effort[r] < 0.0 else 0.0
+            new = max(cur, val)
+            effort[r] = -new
+            flag[r] = FLAG_MEASURED
+            rows[r] = True
+            if stats is not None:
+                stats.rows += 1
+                stats.deepen_sum_pct += new - cur
+                stats.deepen_max_pct = max(stats.deepen_max_pct, new - cur)
+    return rows
 
 
 def _launch_release_ramp(
