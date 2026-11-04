@@ -738,6 +738,11 @@ class ForwardPlan:
     # ブレーキの行だけ）と区間の統計。stop_tail_kmh を渡さなければ None
     stop_tail: np.ndarray | None = None
     stop_tail_stats: StopTailStats | None = None
+    # 2026-11-04 ProblemReport_20261103_停車前の這う基準 段5: 停車へ向かう 1 km/h 以下で
+    # FF のブレーキを浅くしない区間の行（最終の effort がブレーキの行だけ）と統計。
+    # stop_keep_kmh を渡さなければ None
+    stop_keep: np.ndarray | None = None
+    stop_keep_stats: StopTailStats | None = None
 
     def coast_fill_s(self) -> float:
         """案 D で埋めた惰行の秒数。"""
@@ -861,6 +866,7 @@ def build_plan(
     launch_gap_tight: bool = False,
     launch_band: LaunchBandSpec | None = None,
     stop_tail_kmh: float | None = None,
+    stop_keep_kmh: float | None = None,
     predict_creep_curve: bool = False,
     creep_accel_speeds_kmh: Sequence[float] = (),
     creep_accel_kmhs: Sequence[float] = (),
@@ -1068,6 +1074,7 @@ def build_plan(
             "launch_gap_tight": launch_gap_tight,
             "launch_band": launch_band,
             "stop_tail_kmh": stop_tail_kmh,
+            "stop_keep_kmh": stop_keep_kmh,
             "switch_gap_compensate": switch_gap_compensate,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1122,6 +1129,7 @@ def build_plan(
             "launch_gap_tight": launch_gap_tight,
             "launch_band": launch_band,
             "stop_tail_kmh": stop_tail_kmh,
+            "stop_keep_kmh": stop_keep_kmh,
             "switch_lead": switch_lead, "_lead_extra": _lead_extra,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1418,6 +1426,19 @@ def build_plan(
             _cap_midway_brake(effort, flag, midway, brake_deadband_pct, table.meta)
     stop_tail_rows = None
     stop_tail_stats = None
+    stop_keep_rows = None
+    stop_keep_stats = None
+    if stop_keep_kmh is not None:
+        # 2026-11-04 停車へ向かう所の FF のブレーキを浅くしない: 踏み増し（stop_tail）の前
+        if stop_tail_kmh is None:
+            raise ValueError("stop_keep_kmh には stop_tail_kmh が要ります（停車の切り方を共有）")
+        stop_keep_stats = StopTailStats()
+        stop_keep_rows = _stop_approach_keep(
+            effort, flag, stop_now,
+            _eval_ref(stop_ref_at if stop_ref_at is not None else ref_at, t + lb),
+            period_s=period_s, keep_kmh=stop_keep_kmh, brake_min_pct=brake_deadband_pct,
+            stats=stop_keep_stats,
+        )
     if stop_tail_kmh is not None:
         # 2026-11-03 停車前の踏み増し: _launch_release_ramp の前（bk・停車の長さの判定を共有する）
         bkm_t = table.meta.get("launch_breakaway_u_pct")
@@ -1573,6 +1594,9 @@ def build_plan(
         # 2026-11-03 停車前の踏み増し: 最終の effort がブレーキの行だけ印を残す（同じ考え）
         stop_tail=None if stop_tail_rows is None else (stop_tail_rows & (effort < 0.0)),
         stop_tail_stats=stop_tail_stats,
+        # 2026-11-04 停車へ向かう所のブレーキを浅くしない: 最終の effort がブレーキの行だけ印を残す
+        stop_keep=None if stop_keep_rows is None else (stop_keep_rows & (effort < 0.0)),
+        stop_keep_stats=stop_keep_stats,
     )
 
 
@@ -2017,6 +2041,73 @@ class StopTailStats:
             f"区間 {self.intervals} 本・平均 {self.mean_length_s:.2f} s"
             f"・計画から深くした量 平均 {self.mean_deepen_pct:.2f}% 最大 {self.deepen_max_pct:.2f}%"
         )
+
+
+def _stop_approach_keep(
+    effort: np.ndarray,
+    flag: np.ndarray,
+    stop_now: np.ndarray,
+    stop_ref_lead: np.ndarray,
+    *,
+    period_s: float,
+    keep_kmh: float,
+    brake_min_pct: float,
+    stats: StopTailStats | None = None,
+) -> np.ndarray:
+    """2026-11-04 停車へ向かう所でブレーキを戻さない（ProblemReport_20261103_停車前の這う基準 段5）:
+    停車の切り方・i1（最初の停車保持の行。停A を含む）・前の停車より前へ行かない・系列の先頭の
+    停車は対象外は `_stop_tail_ramp` と同じ。区間 [k0, i1) は i1 − 1 から前へ、
+    stop_ref_lead ≤ keep_kmh かつ stop_ref_lead ≤ stop_now（発進へ向かう所ではない）かつ
+    FLAG_STOP でない行が続く間。各行のブレーキ b(r)（effort < 0 なら −effort・他は brake_min_pct）を
+    max(b(r), 1 つ前の行の値) にする（k0 の 1 つ前は区間の外の行: ブレーキならその値・アクセル・
+    惰行・k0 == 0 なら brake_min_pct）。アクセル・惰行の行もブレーキにし、flag は FLAG_MEASURED。
+    effort・flag をその場で書き換え、書き換えた行の bool 配列を返す。
+    """
+    n = len(effort)
+    rows = np.zeros(n, dtype=bool)
+    low = stop_now <= STOP_SPEED_KMH
+    prev_end = 0
+    i = 0
+    while i < n:
+        if not low[i]:
+            i += 1
+            continue
+        s = i
+        while i < n and low[i]:
+            i += 1
+        floor_i = prev_end
+        prev_end = i
+        if s == 0:
+            continue  # 系列の先頭の停車は対象外
+        i1 = s
+        while i1 - 1 >= floor_i and flag[i1 - 1] == FLAG_STOP:
+            i1 -= 1
+        j = i1 - 1
+        while (
+            j >= floor_i and stop_ref_lead[j] <= keep_kmh
+            and stop_ref_lead[j] <= stop_now[j] and flag[j] != FLAG_STOP
+        ):
+            j -= 1
+        k0 = j + 1
+        if k0 >= i1:
+            continue
+        if stats is not None:
+            stats.intervals += 1
+            stats.period_s = period_s
+        prev = -float(effort[k0 - 1]) if k0 >= 1 and effort[k0 - 1] < 0.0 else brake_min_pct
+        for r in range(k0, i1):
+            plan_b = -float(effort[r]) if effort[r] < 0.0 else 0.0
+            new = max(plan_b if plan_b > 0.0 else brake_min_pct, prev)
+            effort[r] = -new
+            flag[r] = FLAG_MEASURED
+            rows[r] = True
+            prev = new
+            if stats is not None:
+                stats.rows += 1
+                # 深くした量: 計画のブレーキ（アクセル・惰行の行は 0）からの差（tail と同じ）
+                stats.deepen_sum_pct += new - plan_b
+                stats.deepen_max_pct = max(stats.deepen_max_pct, new - plan_b)
+    return rows
 
 
 def _stop_tail_ramp(

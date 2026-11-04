@@ -1319,6 +1319,23 @@ class ForwardMapSection:
     # 「這う基準」のしきい値 [km/h]。根拠: 手順3 の KPI の偏差の幅 0.5 km/h（基準がこれ未満なら
     # 偏差の幅の中で止まっているのと同じ。車に依存しない）。効く先: 区間の始まり（小さいと遅い）
     stop_tail_kmh: float = 0.5
+    # 2026-11-04 ProblemReport_20261103_停車前の這う基準 段5: true なら、停車へ向かう所で L 先の基準
+    # （停車判定の基準）が stop_approach_no_release_kmh 以下になった行から、その停車の最初の
+    # 停車保持の行の手前まで、ブレーキを戻さない。計画では FF のブレーキを前の行より浅くしない
+    # （アクセル・
+    # 惰行の行もブレーキにする）。走行中は FB・DOB などを足した最終のブレーキ指令を前の周期より
+    # 浅くしない（区間の最初の周期は前の値を使わない）。戻してよいのは (実車速 − 基準) が
+    # −stop_approach_release_dev_kmh より遅すぎで、かつ実車速が停車速度より上のときだけ。
+    # 踏み増し（stop_tail）の前に掛かる。stop_tail_ramp_enabled が要る（停車の切り方を共有）。
+    # 既定 false ＝ 今と完全に同じ。ログ: stop_keep_active・stop_keep_held
+    stop_approach_no_release: bool = False
+    # 戻しを止め始める L 先の基準の車速 [km/h]。根拠: ユーザー決定（W 386 の戻しが基準 1.1 km/h で
+    # 始まる。2026-11-04）。stop_tail_kmh 以上。効く先: 区間の始まり（大きいと早い）。
+    # 決める時期: 段7 の実機
+    stop_approach_no_release_kmh: float = 1.0
+    # 遅すぎで戻してよい境目 [km/h]。根拠: 手順3 の KPI の偏差の幅 0.5（車に依存しない）。
+    # 効く先: これより遅く動いているときだけブレーキを戻せる。変えない
+    stop_approach_release_dev_kmh: float = 0.5
 
 
 @dataclass
@@ -1892,6 +1909,26 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         math.isfinite(fm.stop_tail_kmh) and fm.stop_tail_kmh > 0.0,
         f"forward_map.stop_tail_kmh は正の有限の数: {fm.stop_tail_kmh}",
+    )
+    need(
+        math.isfinite(fm.stop_approach_no_release_kmh) and fm.stop_approach_no_release_kmh > 0.0,
+        "forward_map.stop_approach_no_release_kmh は正の有限の数: "
+        f"{fm.stop_approach_no_release_kmh}",
+    )
+    need(
+        math.isfinite(fm.stop_approach_release_dev_kmh) and fm.stop_approach_release_dev_kmh > 0.0,
+        "forward_map.stop_approach_release_dev_kmh は正の有限の数: "
+        f"{fm.stop_approach_release_dev_kmh}",
+    )
+    need(
+        not (math.isfinite(fm.stop_approach_no_release_kmh) and math.isfinite(fm.stop_tail_kmh))
+        or fm.stop_approach_no_release_kmh >= fm.stop_tail_kmh,
+        "forward_map.stop_approach_no_release_kmh は stop_tail_kmh 以上: "
+        f"{fm.stop_approach_no_release_kmh} < {fm.stop_tail_kmh}",
+    )
+    need(
+        not fm.stop_approach_no_release or fm.stop_tail_ramp_enabled,
+        "forward_map.stop_approach_no_release は stop_tail_ramp_enabled が true のときだけ使える",
     )
     need(
         not fm.stop_tail_ramp_enabled or fm.launch_release_ramp,

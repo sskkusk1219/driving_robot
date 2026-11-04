@@ -410,6 +410,8 @@ def forward_map_plan_args(
         launch_short_stop_s=fm.launch_short_stop_s,
         # 2026-11-03 停車前の踏み増し（off は None ＝ 今と完全に同じ。机上と本体で同じ計画）
         stop_tail_kmh=fm.stop_tail_kmh if fm.stop_tail_ramp_enabled else None,
+        # 2026-11-04 停車へ向かう所のブレーキを戻さない（off は None ＝ 今と完全に同じ）
+        stop_keep_kmh=fm.stop_approach_no_release_kmh if fm.stop_approach_no_release else None,
         switch_gap_compensate=fm.switch_gap_compensate,  # 段7-c
         switch_gap_min_loss=fm.switch_gap_min_loss,  # 段9-b
         switch_gap_rule=fm.switch_gap_rule,  # 段10-2
@@ -439,6 +441,30 @@ def clip_stop_tail_delta(delta_pct: float) -> float:
     """停車前の踏み増しの行の C10 の上乗せ（上乗せ後 − FF。ブレーキの行では負が深い）は、
     ブレーキを深くする向き（負）だけ残す。浅くする向き（正）は 0。"""
     return min(delta_pct, 0.0)
+
+
+def hold_stop_keep_brake(
+    prev_pct: float | None,
+    new_pct: float,
+    *,
+    in_zone: bool,
+    first: bool,
+    speed_kmh: float,
+    ref_kmh: float,
+    release_dev_kmh: float,
+) -> tuple[float, bool, bool]:
+    """2026-11-04 停車へ向かう所でブレーキを戻さない（段5）の走行中の判定。ブレーキ開度は正 [%]。
+    戻り値 (出す開度, 保った, 遅すぎで戻した)。区間の外・区間の最初の周期（first）・前の値なしは
+    new_pct のまま。区間では new_pct が prev_pct より浅ければ prev_pct にする（保った）。
+    例外: (実車速 − 基準) < −release_dev_kmh かつ 実車速 > 停車速度 なら
+    new_pct のまま（戻した）。"""
+    from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+
+    if not in_zone or first or prev_pct is None or new_pct >= prev_pct:
+        return new_pct, False, False
+    if (speed_kmh - ref_kmh) < -release_dev_kmh and speed_kmh > STOP_SPEED_KMH:
+        return new_pct, False, True
+    return prev_pct, True, False
 
 
 def candidate_is_stop_end(candidate: str) -> bool:
@@ -822,6 +848,14 @@ def _prepare_forward_map_plan(
             f"{'統計なし' if tail is None else tail.summary()}")
     else:
         say("  停車前の踏み増し（2026-11-03）: なし")
+    if fm.stop_approach_no_release:
+        keep = plan.stop_keep_stats
+        say(f"  停車へ向かう所のブレーキを戻さない（2026-11-04）: L 先の基準 ≤ "
+            f"{fm.stop_approach_no_release_kmh:g} km/h・遅すぎで戻す境目 "
+            f"−{fm.stop_approach_release_dev_kmh:g} km/h・"
+            f"{'統計なし' if keep is None else keep.summary()}")
+    else:
+        say("  停車へ向かう所のブレーキを戻さない（2026-11-04）: なし")
     if isinstance(ff, ForwardMapFeedforward):
         say(f"  動き出したら離しを止めて待つ（段8-a）: {make_launch_hold(cfg, ff, plan)[1]}")
     say("  P・惰行の補助の表から A2 を外す（段8-b）: "
@@ -1774,6 +1808,11 @@ class _ModeRun:
     # 2026-11-03 停車前の踏み増し（stop_tail_ramp_enabled。off のまま ＝ 今と同じ）
     stop_tail_cycles: int = 0  # 計画の stop_tail の行の周期
     stop_tail_clipped_cycles: int = 0  # うち C10 の P の浅くする向きを 0 にした周期
+    # 2026-11-04 停車へ向かう所のブレーキを戻さない（stop_approach_no_release。off ＝ 今と同じ）
+    stop_keep_prev_pct: float | None = None  # 前の周期の最終のブレーキ指令（区間の外は None）
+    stop_keep_zone_cycles: int = 0
+    stop_keep_held_cycles: int = 0
+    stop_keep_released_cycles: int = 0
     # 2026-10-27 段3 P3・段6 P1・段7 P2 の既定（false のまま ＝ 今と同じ）
     fb_ref0_no_deeper: bool = False
     fb_ref0_cut_cycles: int = 0
@@ -1972,6 +2011,10 @@ class _ModeRun:
         self.keep_cycles = 0
         self.stop_tail_cycles = 0
         self.stop_tail_clipped_cycles = 0
+        self.stop_keep_prev_pct = None
+        self.stop_keep_zone_cycles = 0
+        self.stop_keep_held_cycles = 0
+        self.stop_keep_released_cycles = 0
         self._keep_brake_win: deque[tuple[float, float]] = deque()  # 案③: (t, 実ブレーキ開度)
         self._keep_speed_win: deque[tuple[float, float]] = deque()  # 案③: (t, CAN 車速)
         self._accel_blocked = False
@@ -2074,6 +2117,24 @@ class _ModeRun:
         if st is None:
             return None
         return int(bool(st[plan.index_at(t)]))
+
+    def _stop_keep_now(self, t: float) -> int | None:
+        """時刻 t が計画の停車へ向かうブレーキを戻さない区間（stop_keep か stop_tail の行）なら 1・
+        違えば 0。機能 off（計画に stop_keep なし）は None。"""
+        if not isinstance(self.ff, ForwardMapFeedforward):
+            return None
+        plan = self.ff.plan
+        sk = getattr(plan, "stop_keep", None)
+        if sk is None:
+            return None
+        return int(self._in_stop_keep_zone(t))
+
+    def _in_stop_keep_zone(self, t: float) -> bool:
+        plan = self.ff.plan  # type: ignore[attr-defined]
+        i = plan.index_at(t)
+        sk = getattr(plan, "stop_keep", None)
+        st = getattr(plan, "stop_tail", None)
+        return bool((sk is not None and sk[i]) or (st is not None and st[i]))
 
     def _plan_band_row(self, t: float) -> bool:
         """2026-11-01 発進のブレーキの帯（案 B）の修正: 時刻 t の計画の行が帯の印つきか。
@@ -2263,6 +2324,32 @@ class _ModeRun:
                     self.stop_end_monotone_pct_sum += effort - held
                 effort = held
             self.stop_end_prev_effort = effort if in_end else None
+        stop_keep_held_code: int | None = self._stop_keep_now(t)
+        if stop_keep_held_code is not None:
+            # 2026-11-04 停車へ向かう所のブレーキを戻さない: 最終の指令（FB・DOB・C10・惰行の補助・
+            # C14 の下限まで足した後）を前の周期より浅くしない。調停・ガバナー・片足ルール（安全網）
+            # の前に掛ける（安全網は後ろでそのまま働く）。区間のアクセル側の指令は触らない
+            zone = bool(stop_keep_held_code) and effort <= 0.0
+            first = self.stop_keep_prev_pct is None
+            pct, held_k, released_k = hold_stop_keep_brake(
+                self.stop_keep_prev_pct, -effort, in_zone=zone, first=first,
+                speed_kmh=speed, ref_kmh=ref,
+                release_dev_kmh=cfg.forward_map.stop_approach_release_dev_kmh,
+            )
+            if zone:
+                self.stop_keep_zone_cycles += 1
+                if held_k:
+                    self.stop_keep_held_cycles += 1
+                    effort = -pct
+                if released_k:
+                    self.stop_keep_released_cycles += 1
+                self.stop_keep_prev_pct = pct
+            else:
+                self.stop_keep_prev_pct = None
+            stop_keep_held_code = (1 if held_k else 2 if released_k else 0)
+            stop_keep_active_code: int | None = int(bool(zone))
+        else:
+            stop_keep_active_code = None
         # ログの「指示開度 FF」列（FF の出力をペダル別に分けた値。ガバナー・待機位置の前）
         accel_ff, brake_ff = split_effort(
             ff_shown, cfg.vehicle.max_accel_opening_pct, cfg.vehicle.max_brake_opening_pct
@@ -2394,6 +2481,8 @@ class _ModeRun:
                     ),
                     keep_ff_pct=keep_pct,
                     stop_tail_active=self._stop_tail_now(t),
+                    stop_keep_active=stop_keep_active_code,
+                    stop_keep_held=stop_keep_held_code,
                 )
             )
         if segment != self._segment:
@@ -3229,6 +3318,10 @@ async def run_mode_drive(
         say("  停車前の踏み増し（2026-11-03）: "
             f"{run.stop_tail_cycles} 周期（{run.stop_tail_cycles * run.interval_s:.1f}s）・"
             f"うち P の浅くする向きを 0 にした {run.stop_tail_clipped_cycles} 周期")
+    if run.cfg.forward_map.stop_approach_no_release:
+        say("  停車へ向かう所のブレーキを戻さない（2026-11-04）: "
+            f"区間 {run.stop_keep_zone_cycles} 周期・保った {run.stop_keep_held_cycles} 周期・"
+            f"遅すぎで戻した {run.stop_keep_released_cycles} 周期")
     if run.stop_end_monotone:
         say("  停C の区間のブレーキを浅くしない（段7 P2）: "
             f"{run.stop_end_monotone_cycles} 周期"
