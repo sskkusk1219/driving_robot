@@ -1336,6 +1336,12 @@ class ForwardMapSection:
     # 遅すぎで戻してよい境目 [km/h]。根拠: 手順3 の KPI の偏差の幅 0.5（車に依存しない）。
     # 効く先: これより遅く動いているときだけブレーキを戻せる。変えない
     stop_approach_release_dev_kmh: float = 0.5
+    # 2026-11-04 ProblemReport_20261103_停車前の這う基準 段9: true なら、戻し禁止を「要る減速度
+    # （基準の減速度）が、L 先の基準の車速でのクリープの加速度より弱い行」だけにする（強い行は
+    # 計画のまま）。クリープの加速度は feedforward.creep_accel_*（手順2 が自動保存する車ごとの値）。
+    # 根拠: U 957 型（速い減速）で戻し禁止が深い開度を保ったまま早止まりしたため。
+    # stop_approach_no_release が要る。既定 false ＝ 段5 と同じ。決める時期: 段11 の実機
+    stop_approach_creep_gate: bool = False
 
 
 @dataclass
@@ -1925,6 +1931,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         or fm.stop_approach_no_release_kmh >= fm.stop_tail_kmh,
         "forward_map.stop_approach_no_release_kmh は stop_tail_kmh 以上: "
         f"{fm.stop_approach_no_release_kmh} < {fm.stop_tail_kmh}",
+    )
+    need(
+        not fm.stop_approach_creep_gate or fm.stop_approach_no_release,
+        "forward_map.stop_approach_creep_gate は stop_approach_no_release が true のときだけ使える",
     )
     need(
         not fm.stop_approach_no_release or fm.stop_tail_ramp_enabled,

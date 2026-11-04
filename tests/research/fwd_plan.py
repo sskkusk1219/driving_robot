@@ -867,6 +867,7 @@ def build_plan(
     launch_band: LaunchBandSpec | None = None,
     stop_tail_kmh: float | None = None,
     stop_keep_kmh: float | None = None,
+    stop_keep_creep: tuple[tuple[float, ...], tuple[float, ...]] | None = None,
     predict_creep_curve: bool = False,
     creep_accel_speeds_kmh: Sequence[float] = (),
     creep_accel_kmhs: Sequence[float] = (),
@@ -1075,6 +1076,7 @@ def build_plan(
             "launch_band": launch_band,
             "stop_tail_kmh": stop_tail_kmh,
             "stop_keep_kmh": stop_keep_kmh,
+            "stop_keep_creep": stop_keep_creep,
             "switch_gap_compensate": switch_gap_compensate,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1130,6 +1132,7 @@ def build_plan(
             "launch_band": launch_band,
             "stop_tail_kmh": stop_tail_kmh,
             "stop_keep_kmh": stop_keep_kmh,
+            "stop_keep_creep": stop_keep_creep,
             "switch_lead": switch_lead, "_lead_extra": _lead_extra,
             "switch_gap_min_loss": switch_gap_min_loss,
             "switch_gap_rule": switch_gap_rule, "pedal_track": pedal_track,
@@ -1437,7 +1440,7 @@ def build_plan(
             effort, flag, stop_now,
             _eval_ref(stop_ref_at if stop_ref_at is not None else ref_at, t + lb),
             period_s=period_s, keep_kmh=stop_keep_kmh, brake_min_pct=brake_deadband_pct,
-            stats=stop_keep_stats,
+            stats=stop_keep_stats, need=need, creep=stop_keep_creep,
         )
     if stop_tail_kmh is not None:
         # 2026-11-03 停車前の踏み増し: _launch_release_ramp の前（bk・停車の長さの判定を共有する）
@@ -2027,6 +2030,9 @@ class StopTailStats:
     period_s: float = DEFAULT_CONTROL_PERIOD_S
     deepen_sum_pct: float = 0.0
     deepen_max_pct: float = 0.0
+    # 2026-11-04 段9: 減速度の条件（クリープと比べる）を使ったか・その条件で外した行数
+    gate_used: bool = False
+    gated_out_rows: int = 0
 
     @property
     def mean_length_s(self) -> float:
@@ -2040,6 +2046,7 @@ class StopTailStats:
         return (
             f"区間 {self.intervals} 本・平均 {self.mean_length_s:.2f} s"
             f"・計画から深くした量 平均 {self.mean_deepen_pct:.2f}% 最大 {self.deepen_max_pct:.2f}%"
+            + (f"・クリープと比べて外した行 {self.gated_out_rows}" if self.gate_used else "")
         )
 
 
@@ -2053,6 +2060,8 @@ def _stop_approach_keep(
     keep_kmh: float,
     brake_min_pct: float,
     stats: StopTailStats | None = None,
+    need: np.ndarray | None = None,
+    creep: tuple[Sequence[float], Sequence[float]] | None = None,
 ) -> np.ndarray:
     """2026-11-04 停車へ向かう所でブレーキを戻さない（ProblemReport_20261103_停車前の這う基準 段5）:
     停車の切り方・i1（最初の停車保持の行。停A を含む）・前の停車より前へ行かない・系列の先頭の
@@ -2062,9 +2071,24 @@ def _stop_approach_keep(
     max(b(r), 1 つ前の行の値) にする（k0 の 1 つ前は区間の外の行: ブレーキならその値・アクセル・
     惰行・k0 == 0 なら brake_min_pct）。アクセル・惰行の行もブレーキにし、flag は FLAG_MEASURED。
     effort・flag をその場で書き換え、書き換えた行の bool 配列を返す。
+    段9（減速度の条件）: creep（(速度グリッド, クリープの加速度)）と need（行ごとの要る加速度。
+    負が減速）を渡すと、区間の行のうち (−need[r]) < interp(stop_ref_lead[r]) の行（要る減速度が
+    クリープより弱い）だけ上の処理をする。それ以外の行は計画のまま（flag・印も触らない）で、
+    次の行の「前の行」の値はその行の計画のブレーキ（アクセル・惰行は brake_min_pct）。
+    creep が None なら全部の行を処理する（段5 と同じ）。
     """
     n = len(effort)
     rows = np.zeros(n, dtype=bool)
+    gate_creep = None
+    if creep is not None:
+        if need is None:
+            raise ValueError("creep を渡すときは need が要ります")
+        gate_creep = np.interp(
+            np.asarray(stop_ref_lead, dtype=float),
+            np.asarray(creep[0], dtype=float), np.asarray(creep[1], dtype=float),
+        )
+        if stats is not None:
+            stats.gate_used = True
     low = stop_now <= STOP_SPEED_KMH
     prev_end = 0
     i = 0
@@ -2097,6 +2121,12 @@ def _stop_approach_keep(
         prev = -float(effort[k0 - 1]) if k0 >= 1 and effort[k0 - 1] < 0.0 else brake_min_pct
         for r in range(k0, i1):
             plan_b = -float(effort[r]) if effort[r] < 0.0 else 0.0
+            if gate_creep is not None and not (-float(need[r]) < float(gate_creep[r])):
+                # 要る減速度がクリープ以上に強い行は計画のまま（保たない）
+                prev = plan_b if plan_b > 0.0 else brake_min_pct
+                if stats is not None:
+                    stats.gated_out_rows += 1
+                continue
             new = max(plan_b if plan_b > 0.0 else brake_min_pct, prev)
             effort[r] = -new
             flag[r] = FLAG_MEASURED

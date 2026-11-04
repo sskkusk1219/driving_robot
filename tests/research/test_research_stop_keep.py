@@ -212,3 +212,149 @@ def test_config_defaults_and_validate() -> None:
     cfg.forward_map.stop_tail_kmh = 0.5
     cfg.forward_map.stop_approach_no_release_kmh = 0.4  # stop_tail_kmh 未満は NG
     assert any("stop_tail_kmh 以上" in p for p in cfgmod.validate_config(cfg))
+
+
+# ---- 段9: 減速度の条件（クリープと比べる） ----
+
+CREEP = ((0.0, 2.0), (1.0, 3.0))  # 車速 0 で 1・2 で 3 km/h/s（正値。手順2 の保存と同じ）
+
+
+def _need(value: float = -2.0) -> np.ndarray:
+    return np.full(N, value)
+
+
+def test_gate_skips_rows_with_stronger_decel_than_creep() -> None:
+    effort, flag, now, lead = _series()
+    effort[80:100] = np.linspace(-8.69, -7.62, 20)
+    plan = effort.copy()
+    lead[80:100] = 1.0  # クリープ 2 km/h/s
+    need = _need(-2.5)  # 要る減速度の方が強い
+    rows = _stop_approach_keep(effort, flag, now, lead, need=need, creep=CREEP, **KW)
+    assert not rows.any()
+    assert np.array_equal(effort, plan) and np.all(flag[80:100] == FLAG_MEASURED)
+
+
+def test_gate_keeps_rows_with_weaker_decel_than_creep() -> None:
+    effort, flag, now, lead = _series()
+    effort[80:100] = np.linspace(-8.69, -7.62, 20)
+    lead[80:100] = 1.0
+    rows = _stop_approach_keep(effort, flag, now, lead, need=_need(-1.5), creep=CREEP, **KW)
+    assert rows[80:100].all() and np.all(effort[80:100] == pytest.approx(-8.69))
+
+
+def test_gate_boundary_and_creep_is_interpolated_at_lead_ref() -> None:
+    # lead = 1.0 のクリープは −2.0。同じ値は保たない（厳密な <）・わずかに弱ければ保つ
+    for need_v, expect in ((-2.0, False), (-1.99, True), (-2.01, False)):
+        effort, flag, now, lead = _series()
+        lead[80:100] = 1.0
+        rows = _stop_approach_keep(effort, flag, now, lead, need=_need(need_v), creep=CREEP, **KW)
+        assert bool(rows[80:100].all()) is expect, need_v
+    # 車速が違えばクリープも違う: lead 0.5 -> 1.5。need −1.7 は強いので外れる（lead 1.0 なら保つ）
+    effort, flag, now, lead = _series()
+    lead[80:100] = 0.5
+    rows = _stop_approach_keep(effort, flag, now, lead, need=_need(-1.7), creep=CREEP, **KW)
+    assert not rows.any()
+    # 範囲の外は端の値（lead 0 -> 1.0）
+    effort, flag, now, lead = _series()
+    lead[80:100] = 0.0
+    rows = _stop_approach_keep(effort, flag, now, lead, need=_need(-0.9), creep=CREEP, **KW)
+    assert rows[80:100].all()
+
+
+def test_gate_row_after_skipped_row_keeps_from_skipped_plan_value() -> None:
+    effort, flag, now, lead = _series()
+    effort[80:100] = -6.0
+    effort[80:90] = -9.0  # 外れる行（計画 9）
+    effort[90:100] = -6.0  # 保つ行（計画 6）
+    lead[80:100] = 1.0
+    need = _need(-1.0)
+    need[80:90] = -3.0  # 強い -> 外す
+    rows = _stop_approach_keep(effort, flag, now, lead, need=need, creep=CREEP, **KW)
+    assert not rows[80:90].any() and rows[90:100].all()
+    assert np.all(effort[80:90] == -9.0)
+    assert np.all(effort[90:100] == pytest.approx(-9.0))  # 外れた行の計画 9 から保つ
+
+
+def test_gate_row_after_skipped_accel_row_starts_from_brake_min() -> None:
+    effort, flag, now, lead = _series()
+    effort[80:90] = 5.0  # アクセル（外れる）
+    flag[80:90] = FLAG_MEASURED
+    effort[90:100] = -2.0
+    lead[80:100] = 1.0
+    need = _need(-1.0)
+    need[80:90] = -3.0
+    stats = StopTailStats()
+    rows = _stop_approach_keep(
+        effort, flag, now, lead, need=need, creep=CREEP, stats=stats, **KW
+    )
+    assert np.all(effort[80:90] == 5.0) and not rows[80:90].any()
+    assert np.all(effort[90:100] == pytest.approx(-3.0))  # brake_min 3.0 を下限に
+    assert stats.gate_used and stats.gated_out_rows == 10 and stats.rows == 10
+    assert "外した行 10" in stats.summary()
+
+
+def test_creep_none_is_identical_to_stage5() -> None:
+    a = _series()
+    b = _series()
+    for e in (a[0], b[0]):
+        e[80:100] = np.linspace(-8.69, -7.62, 20)
+    ra = _stop_approach_keep(a[0], a[1], a[2], a[3], **KW)
+    rb = _stop_approach_keep(b[0], b[1], b[2], b[3], need=_need(-9.0), creep=None, **KW)
+    assert np.array_equal(ra, rb) and np.array_equal(a[0], b[0])
+    stats = StopTailStats()
+    _stop_approach_keep(*_series(), stats=stats, **KW)
+    assert not stats.gate_used and "外した" not in stats.summary()
+
+
+def test_creep_without_need_is_an_error() -> None:
+    with pytest.raises(ValueError):
+        _stop_approach_keep(*_series(), creep=CREEP, **KW)
+
+
+def test_build_plan_gate_uses_plan_need_and_strong_creep_skips_all() -> None:
+    ref = _ref_decel_stop(12.0)
+    base = plan_for(ref, 24.0, _bk_table(), stop_tail_kmh=0.5, stop_keep_kmh=1.0, **_kw())
+    weak = plan_for(
+        ref, 24.0, _bk_table(), stop_tail_kmh=0.5, stop_keep_kmh=1.0,
+        stop_keep_creep=((0.0, 50.0), (100.0, 100.0)), **_kw(),
+    )  # クリープが十分強い -> 要る減速度は全て弱い -> 段5 と同じ
+    assert np.array_equal(base.effort_pct, weak.effort_pct)
+    strong = plan_for(
+        ref, 24.0, _bk_table(), stop_tail_kmh=0.5, stop_keep_kmh=1.0,
+        stop_keep_creep=((0.0, 50.0), (0.0, 0.0)), **_kw(),
+    )  # クリープ 0 -> 減速している行は全部外れる
+    assert strong.stop_keep_stats is not None and strong.stop_keep_stats.gate_used
+    assert strong.stop_keep_stats.gated_out_rows > 0
+    assert strong.stop_keep_stats.rows < base.stop_keep_stats.rows
+
+
+def test_plan_args_pass_creep_only_when_gate_enabled(tmp_path: Path) -> None:
+    cfg = _band_cfg(tmp_path)
+    cfg.forward_map.launch_brake_band = False
+    cfg.forward_map.stop_tail_ramp_enabled = True
+    cfg.forward_map.stop_approach_no_release = True
+    cfg.forward_map.stop_approach_creep_gate = False
+    mode = _mode_weak()
+    ff = mdmod.load_feedforward(cfg)
+    _, _, kw = mdmod.forward_map_plan_args(cfg, mode, stop_end=False, table=ff.table)
+    assert kw["stop_keep_creep"] is None
+    cfg.forward_map.stop_approach_creep_gate = True
+    cfg.feedforward.creep_accel_speeds_kmh = [0.0, 2.0]
+    cfg.feedforward.creep_accel_kmhs = [1.0, 3.0]
+    _, _, kw = mdmod.forward_map_plan_args(cfg, mode, stop_end=False, table=ff.table)
+    assert kw["stop_keep_creep"] == ((0.0, 2.0), (1.0, 3.0))
+    cfg.forward_map.stop_approach_no_release = False  # no_release off なら gate on でも渡さない
+    _, _, kw = mdmod.forward_map_plan_args(cfg, mode, stop_end=False, table=ff.table)
+    assert kw["stop_keep_creep"] is None
+
+
+def test_config_creep_gate_default_and_validate() -> None:
+    assert cfgmod.ForwardMapSection().stop_approach_creep_gate is False
+    cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
+    cfg.forward_map.stop_tail_ramp_enabled = True
+    cfg.forward_map.launch_release_ramp = True
+    cfg.forward_map.stop_approach_no_release = True
+    cfg.forward_map.stop_approach_creep_gate = True
+    assert not any("creep_gate" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.stop_approach_no_release = False
+    assert any("stop_approach_creep_gate" in p for p in cfgmod.validate_config(cfg))

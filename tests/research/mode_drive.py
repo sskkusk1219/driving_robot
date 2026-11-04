@@ -412,6 +412,11 @@ def forward_map_plan_args(
         stop_tail_kmh=fm.stop_tail_kmh if fm.stop_tail_ramp_enabled else None,
         # 2026-11-04 停車へ向かう所のブレーキを戻さない（off は None ＝ 今と完全に同じ）
         stop_keep_kmh=fm.stop_approach_no_release_kmh if fm.stop_approach_no_release else None,
+        # 2026-11-04 段9: 減速度の条件（クリープの加速度と比べる。off は None ＝ 段5 と同じ）
+        stop_keep_creep=(
+            (tuple(ff_cfg.creep_accel_speeds_kmh), tuple(ff_cfg.creep_accel_kmhs))
+            if (fm.stop_approach_no_release and fm.stop_approach_creep_gate) else None
+        ),
         switch_gap_compensate=fm.switch_gap_compensate,  # 段7-c
         switch_gap_min_loss=fm.switch_gap_min_loss,  # 段9-b
         switch_gap_rule=fm.switch_gap_rule,  # 段10-2
@@ -853,7 +858,10 @@ def _prepare_forward_map_plan(
         say(f"  停車へ向かう所のブレーキを戻さない（2026-11-04）: L 先の基準 ≤ "
             f"{fm.stop_approach_no_release_kmh:g} km/h・遅すぎで戻す境目 "
             f"−{fm.stop_approach_release_dev_kmh:g} km/h・"
-            f"{'統計なし' if keep is None else keep.summary()}")
+            f"{'統計なし' if keep is None else keep.summary()}・"
+            f"クリープと比べる: {'あり' if fm.stop_approach_creep_gate else 'なし'}"
+            + (f"・外した行数 {keep.gated_out_rows}"
+               if keep is not None and fm.stop_approach_creep_gate else ""))
     else:
         say("  停車へ向かう所のブレーキを戻さない（2026-11-04）: なし")
     if isinstance(ff, ForwardMapFeedforward):
