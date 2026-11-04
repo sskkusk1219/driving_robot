@@ -327,7 +327,21 @@ forward_map:
   # 3.40→1.45 s、遅すぎの悪化なし。launch_release_ramp が要る。ログ: stop_tail_active
   # stop_tail_kmh: 半分データ由来（KPI の偏差の幅 ±0.5。止まれば偏差 ＝ −基準なので KPI に収まる。車に依存しない）
   stop_tail_ramp_enabled: true
-  stop_tail_kmh: 0.5
+  # 2026-11-04 段12: 0.5 → 0.3（ユーザー決定）。0.3 ＝ 符号反転のしきい値で、基準 0.3 未満で止めれば偏差は −0.3 より
+  # 浅い（0.5 では基準 0.3〜0.5 で止まって符号反転が増えた。11-03 W 985）
+  stop_tail_kmh: 0.3
+  # 2026-11-04 ProblemReport_20261103_停車前の這う基準 段5・段9（段12 で採用）: 停車へ向かう減速で、L 先の基準 ≤
+  # stop_approach_no_release_kmh かつ 要る減速度 ＜ その車速のクリープの加速度（feedforward.creep_accel_*、手順2 が
+  # 自動保存する車ごとの値）の行は、計画の FF・走行中の指令とも前より浅くしない。実車速 − 基準 <
+  # −stop_approach_release_dev_kmh で動いているときだけ戻す。1 km/h 付近の FF の戻しでクリープが勝つ速すぎ（W 386 型）を止める。
+  # 実機（今日の本体 113945/124503/133450 → 154227/161503/163917）で W 386 +0.64→+0.22・U |偏差|>0.5 4.10→1.55 s・
+  # US06 最大逸脱 1.04→0.99、区間の中の悪化なし。クリープの条件が無いと速い減速（U 957）で −0.61 の早止まり（段7）。
+  # stop_approach_no_release_kmh: ユーザー決定（W 386 の FF の戻しは基準 1.1 km/h から）。
+  # stop_approach_release_dev_kmh: 半分データ由来（KPI の偏差の幅。車に依存しない）
+  stop_approach_no_release: true
+  stop_approach_no_release_kmh: 1.0
+  stop_approach_release_dev_kmh: 0.5
+  stop_approach_creep_gate: true
   launch_short_stop_s: 5.0
   # 2026-10-24 段8-a: true なら launch_prep の行（発進前の離し・短い停車の bk の行）で実車速が
   # 0.05 km/h を超えたとき、その周期の FF で離しを止め、深くする向きだけの積分 I を足して待つ
