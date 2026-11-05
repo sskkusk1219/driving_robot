@@ -61,7 +61,7 @@ feedforward:
   # ファイル名の日時はローカル時刻（JST）。2026-09-20 以前の pkl は UTC 命名（JST−9h）
   # 2026-10-27 ProblemReport_20261027 段1: ペダルを 225/190 mm/s・0.6G にしたので、表は同じまま meta の
   # ペダルの動き方・効くまでの遅れだけを手順2 `215040` から測り直した pkl（140 %/s・1700 %/s^2・遅れ アクセル 0.175 s・ブレーキ 0.125 s）
-  model_path: tests/research/results/models/fwd_model_20261028_220204_hpi2_hold_stop_w_lw.pkl  # 2026-10-31 ProblemReport_20261031_停止間際 段4b（ユーザー決定で採用）: 段2d の _stop_w.pkl（手順14 `094235` で停止側の表を作り直し、しきい値未満のマスも秒数の重み）に、発進側の表にも秒数の重みを入れた pkl。6 モード `162454`〜`180640` で最大逸脱 ≤1・p95 ≤0.4。前は _stop_w.pkl（段2d）・_stop.pkl（段2c）・_stop_070118.pkl（段2b）、元は _hpi2_hold.pkl
+  model_path: tests/research/results/models/fwd_model_20261028_220204_hpi2_hold_stop_w_lw_srg.pkl  # 2026-11-05 段14: _lw.pkl に戻す側の効き（meta stop_release_gain_kmhs_pct 4.43）を付けた pkl（表は同じ）。2026-10-31 ProblemReport_20261031_停止間際 段4b（ユーザー決定で採用）: 段2d の _stop_w.pkl（手順14 `094235` で停止側の表を作り直し、しきい値未満のマスも秒数の重み）に、発進側の表にも秒数の重みを入れた pkl。6 モード `162454`〜`180640` で最大逸脱 ≤1・p95 ≤0.4。前は _stop_w.pkl（段2d）・_stop.pkl（段2c）・_stop_070118.pkl（段2b）、元は _hpi2_hold.pkl
   # 停車〜クリープ域（滑らかなモデルで表現できないため定数で補う）
   creep_speed_kmh: 5.0  # クリープで到達する車速 [km/h]
   creep_rate_kmhs: 1.44  # クリープ加速率 [km/h/s]
@@ -337,10 +337,15 @@ forward_map:
   # 実機（今日の本体 113945/124503/133450 → 154227/161503/163917）で W 386 +0.64→+0.22・U |偏差|>0.5 4.10→1.55 s・
   # US06 最大逸脱 1.04→0.99、区間の中の悪化なし。クリープの条件が無いと速い減速（U 957）で −0.61 の早止まり（段7）。
   # stop_approach_no_release_kmh: ユーザー決定（W 386 の FF の戻しは基準 1.1 km/h から）。
-  # stop_approach_release_dev_kmh: 半分データ由来（KPI の偏差の幅。車に依存しない）
+  # stop_approach_release_dev_kmh: 2026-11-05 段21 で 0.5→0.3（少しずつ戻す案の L 先の見込みの境目。ユーザー決定）
+  # stop_approach_step_release: 2026-11-05 ProblemReport_20261103_停車前の這う基準 段19〜22（ユーザー決定で採用）。
+  # 区間の中で遅すぎのとき、FF ＋ FB へ飛ぶ戻しの代わりに、pkl の meta の戻す側の効き（stop_release_gain_kmhs_pct）で
+  # 決めた量を 1 回戻して (L＋0.1) 秒待つ。動き出す開度（min ＋ |launch_breakaway_u_pct|）より浅くは戻さない
+  # （段17 で浅い所からの戻しがクリープで再加速した）。実機 W `140418`・U `143701`・US06 `151245` で区間の中の再加速 0 回。
   stop_approach_no_release: true
   stop_approach_no_release_kmh: 1.0
-  stop_approach_release_dev_kmh: 0.5
+  stop_approach_release_dev_kmh: 0.3
+  stop_approach_step_release: true
   stop_approach_creep_gate: true
   launch_short_stop_s: 5.0
   # 2026-10-24 段8-a: true なら launch_prep の行（発進前の離し・短い停車の bk の行）で実車速が
