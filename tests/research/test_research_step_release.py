@@ -16,6 +16,7 @@ from tests.research.config import ConfigError
 GAIN = 4.0  # km/h/s per %
 LAG = 0.15
 MIN_PCT = 4.0
+FLOOR = 7.0  # 戻す下限（動き出す開度）。_step_release_cycle の流れのテスト用
 WAIT = 5
 KW = dict(
     in_zone=True, first=False, speed_kmh=0.8, dev_kmh=-0.1, slope_kmhs=-2.0, lag_s=LAG,
@@ -81,6 +82,31 @@ def test_never_shallower_than_min() -> None:
     assert (pct, code, wait) == (MIN_PCT, mdmod.STEP_CODE_HELD, 0)
 
 
+def test_stops_at_floor_when_released_from_deeper() -> None:
+    # 前 9.2・量 2.0÷4.0=0.5 → 8.7 だが下限 8.905 で止まる
+    pct, code, wait = _step(9.2, 9.2, min_pct=8.905)
+    assert code == mdmod.STEP_CODE_STEPPED and pct == pytest.approx(8.905)
+    assert wait == WAIT
+
+
+def test_prev_at_or_below_floor_is_not_released() -> None:
+    pct, code, wait = _step(8.5, 7.0, min_pct=8.905)  # 新しい指令が浅い → 保つ（印 1）
+    assert (pct, code, wait) == (8.5, mdmod.STEP_CODE_HELD, 0)
+    pct, code, wait = _step(8.5, 9.5, min_pct=8.905)  # 深くするのは良い
+    assert (pct, code, wait) == (9.5, mdmod.STEP_CODE_NONE, 0)
+
+
+def test_step_release_due() -> None:
+    kw = dict(speed_kmh=0.8, dev_kmh=-0.1, slope_kmhs=-2.0, lag_s=LAG,
+              release_dev_kmh=0.3, gain_kmhs_pct=GAIN)
+    assert mdmod.step_release_due(**kw) is True
+    assert mdmod.step_release_due(**{**kw, "slope_kmhs": None}) is False
+    assert mdmod.step_release_due(**{**kw, "slope_kmhs": 0.0}) is False
+    assert mdmod.step_release_due(**{**kw, "speed_kmh": 0.0}) is False
+    assert mdmod.step_release_due(**{**kw, "gain_kmhs_pct": 0.0}) is False
+    assert mdmod.step_release_due(**{**kw, "dev_kmh": 0.2}) is False  # 見込み −0.1 > −0.3
+
+
 def test_outside_zone_first_or_no_prev_pass_through_and_drop_wait() -> None:
     assert _step(9.0, 5.0, in_zone=False, wait_left=3) == (5.0, mdmod.STEP_CODE_NONE, 0)
     assert _step(9.0, 5.0, first=True, wait_left=3) == (5.0, mdmod.STEP_CODE_NONE, 0)
@@ -93,14 +119,32 @@ def _cfg(tmp_path: Path):
 
 def test_setup_off_is_none_and_on_reads_meta(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
-    table = SimpleNamespace(meta={"stop_release_gain_kmhs_pct": 4.4, "brake_lag_s": 0.155})
+    table = SimpleNamespace(meta={
+        "stop_release_gain_kmhs_pct": 4.4, "brake_lag_s": 0.155, "launch_breakaway_u_pct": -4.705,
+    })
     cfg.forward_map.stop_approach_step_release = False
     assert mdmod.step_release_setup(cfg, table) is None
     cfg.forward_map.stop_approach_step_release = True
     cfg.forward_map.brake_lag_s = None
-    gain, lag, wait = mdmod.step_release_setup(cfg, table)
+    cfg.vehicle.min_brake_opening_pct = 4.2
+    cfg.feedforward.stop_brake_offset_pct = 20.0  # 停車保持は十分深い
+    gain, lag, wait, floor = mdmod.step_release_setup(cfg, table)
     assert (gain, lag) == (4.4, 0.155)
     assert wait == round((0.155 + 0.1) / cfg.control.loop_interval_s)
+    assert floor == pytest.approx(8.905)  # min 4.2 ＋ |−4.705|
+    # 停車保持より深くしない
+    cfg.feedforward.stop_brake_offset_pct = 2.0
+    assert mdmod.step_release_setup(cfg, table)[3] == pytest.approx(cfg.stop_brake_opening_pct)
+    assert cfg.stop_brake_opening_pct == pytest.approx(6.2)
+
+
+def test_setup_without_breakaway_meta_raises() -> None:
+    cfg = _cfg(None)
+    cfg.forward_map.stop_approach_step_release = True
+    cfg.forward_map.brake_lag_s = None
+    table = SimpleNamespace(meta={"stop_release_gain_kmhs_pct": 4.4, "brake_lag_s": 0.155})
+    with pytest.raises(ConfigError, match="launch_breakaway_u_pct"):
+        mdmod.step_release_setup(cfg, table)
 
 
 def test_setup_without_gain_meta_raises(tmp_path: Path) -> None:
@@ -133,7 +177,7 @@ def _run_step():
         vehicle=SimpleNamespace(min_brake_opening_pct=MIN_PCT),
     )
     run.interval_s = 0.05
-    run._step_setup = (GAIN, LAG, WAIT)  # noqa: SLF001
+    run._step_setup = (GAIN, LAG, WAIT, FLOOR)  # noqa: SLF001
     run._step_dev_hist = deque(maxlen=5)  # noqa: SLF001
     run._step_wait_left = 0  # noqa: SLF001
     run._step_episode_count = 0  # noqa: SLF001
@@ -142,6 +186,7 @@ def _run_step():
     run.step_release_again = 0
     run.step_release_amount_sum = 0.0
     run.step_release_amount_max = 0.0
+    run.step_release_floor_blocked = 0
     run.stop_keep_prev_pct = None
     return run
 
@@ -209,3 +254,28 @@ def test_step_release_cycle_full_sequence() -> None:
     _tick(run, dev, -9.0, zone=False)
     assert run._step_episode_count == 0  # noqa: SLF001
     assert run.stop_keep_prev_pct is None
+
+
+def test_step_release_cycle_floor_blocked_counts() -> None:
+    run = _run_step()
+    run._step_setup = (GAIN, LAG, WAIT, 8.905)  # noqa: SLF001
+    dev = 0.3
+    for _ in range(3):  # 区間の外（傾き −2.0 を作る）
+        _tick(run, dev, -8.5, zone=False)
+        dev -= 0.1
+    _tick(run, dev, -8.5, zone=True)  # first
+    dev -= 0.1
+    # 前の指令 8.5 ≦ 下限 8.905 → 戻せず保つ（印 1）・数える
+    for k in range(1, 4):
+        eff, held, code = _tick(run, dev, -8.0, zone=True)
+        assert (code, held) == (mdmod.STEP_CODE_HELD, True)
+        assert eff == pytest.approx(-8.5)
+        assert run.step_release_floor_blocked == k
+        dev -= 0.1
+    assert run.step_release_stepped_cycles == 0
+    # 傾きが 0 なら条件を満たさず数えない
+    run2 = _run_step()
+    run2._step_setup = (GAIN, LAG, WAIT, 8.905)  # noqa: SLF001
+    for _ in range(6):
+        _tick(run2, 0.0, -8.5, zone=True)
+    assert run2.step_release_floor_blocked == 0

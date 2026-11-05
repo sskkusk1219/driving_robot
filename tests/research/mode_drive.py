@@ -479,6 +479,26 @@ STEP_CODE_STEPPED = 3
 STEP_CODE_WAIT = 4
 
 
+def step_release_due(
+    *,
+    speed_kmh: float,
+    dev_kmh: float,
+    slope_kmhs: float | None,
+    lag_s: float,
+    release_dev_kmh: float,
+    gain_kmhs_pct: float,
+) -> bool:
+    """段15・19: 少し戻す条件（傾きあり・傾き < 0・実車速 > 停車速度・効き > 0・
+    偏差 ＋ 傾き × L < −release_dev_kmh）を満たすか。step_release_brake と下限で戻さなかった
+    回数の集計が同じ判定を使う。"""
+    from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+
+    return bool(
+        slope_kmhs is not None and slope_kmhs < 0.0 and speed_kmh > STOP_SPEED_KMH
+        and gain_kmhs_pct > 0.0 and (dev_kmh + slope_kmhs * lag_s) < -release_dev_kmh
+    )
+
+
 def step_release_brake(
     prev_pct: float | None,
     new_pct: float,
@@ -504,16 +524,15 @@ def step_release_brake(
     出す開度 ＝ 前の周期の指令 − （−傾き ÷ 効き）。min_pct より浅くしない。戻したら
     wait_cycles 周期待つ。傾きが無い（None）・上のどれかが外れるときは今の保持（新しい指令が
     前の周期より浅ければ前の周期のまま・深ければ新しい指令）。"""
-    from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
-
     if not in_zone or first or prev_pct is None:
         return new_pct, STEP_CODE_NONE, 0
     if wait_left > 0:
         return prev_pct, STEP_CODE_WAIT, wait_left - 1
-    if (
-        slope_kmhs is not None and slope_kmhs < 0.0 and speed_kmh > STOP_SPEED_KMH
-        and gain_kmhs_pct > 0.0 and (dev_kmh + slope_kmhs * lag_s) < -release_dev_kmh
+    if step_release_due(
+        speed_kmh=speed_kmh, dev_kmh=dev_kmh, slope_kmhs=slope_kmhs, lag_s=lag_s,
+        release_dev_kmh=release_dev_kmh, gain_kmhs_pct=gain_kmhs_pct,
     ):
+        assert slope_kmhs is not None
         pct = max(prev_pct - (-slope_kmhs) / gain_kmhs_pct, min_pct)
         if pct < prev_pct:
             return pct, STEP_CODE_STEPPED, wait_cycles
@@ -522,11 +541,16 @@ def step_release_brake(
     return new_pct, STEP_CODE_NONE, 0
 
 
-def step_release_setup(cfg: ResearchConfig, table: Any) -> tuple[float, float, int] | None:
-    """段15: (戻す側の効き [km/h/s per %], 遅れ L [s], 待つ周期数)。off は None。
-    on で pkl の meta に効き（stop_release_gain_kmhs_pct）か遅れ L が無ければ ConfigError
-    （走る前に止める）。L は yaml の brake_lag_s、なければ pkl の meta。待ち ＝ round((L ＋ 0.1) ÷
-    周期)（ユーザー決定 2026-11-05）。"""
+def step_release_setup(
+    cfg: ResearchConfig, table: Any
+) -> tuple[float, float, int, float] | None:
+    """段15: (戻す側の効き [km/h/s per %], 遅れ L [s], 待つ周期数, 戻す下限の開度 [%])。
+    off は None。
+    on で pkl の meta に効き（stop_release_gain_kmhs_pct）か遅れ L か動き出す開度
+    （launch_breakaway_u_pct）が無ければ ConfigError（走る前に止める）。L は yaml の
+    brake_lag_s、なければ pkl の meta。待ち ＝ round((L ＋ 0.1) ÷ 周期)（ユーザー決定 2026-11-05）。
+    2026-11-05 段19: 戻す下限 ＝ 動き出す開度（min ＋ |meta launch_breakaway_u_pct|、停車保持より
+    深くしない）。段17 で動き出す開度より浅い所から戻すとクリープで再加速した。"""
     fm = cfg.forward_map
     if not fm.stop_approach_step_release:
         return None
@@ -544,7 +568,15 @@ def step_release_setup(cfg: ResearchConfig, table: Any) -> tuple[float, float, i
             "要ります"
         )
     wait = max(1, round((float(lag) + 0.1) / cfg.control.loop_interval_s))
-    return float(gain), float(lag), wait
+    floor_pct = creep_floor_opening_pct(
+        meta, cfg.vehicle.min_brake_opening_pct, cfg.stop_brake_opening_pct
+    )
+    if floor_pct is None:
+        raise ConfigError(
+            "forward_map.stop_approach_step_release には pkl の meta launch_breakaway_u_pct"
+            "（動き出す開度）が要ります"
+        )
+    return float(gain), float(lag), wait, float(floor_pct)
 
 
 def candidate_is_stop_end(candidate: str) -> bool:
@@ -943,6 +975,7 @@ def _prepare_forward_map_plan(
         else:
             say(f"  遅すぎのとき少しずつ戻す（2026-11-05）: 戻す側の効き {step[0]:.2f} km/h/s/%・"
                 f"L {step[1]:.3f}s・待つ {step[2]} 周期・"
+                f"戻す下限（動き出す開度）{step[3]:.2f}%・"
                 f"戻す境目 −{fm.stop_approach_release_dev_kmh:g} km/h（L 先の見込み）・"
                 "傾きは 0.2 s の差分")
     else:
@@ -1910,6 +1943,7 @@ class _ModeRun:
     step_release_again: int = 0  # うち、同じ区間で待ちの後にもう一度戻した回数
     step_release_amount_sum: float = 0.0
     step_release_amount_max: float = 0.0
+    step_release_floor_blocked: int = 0  # 戻す条件は満たしたが前の指令が下限以下で戻せなかった周期
     # 2026-10-27 段3 P3・段6 P1・段7 P2 の既定（false のまま ＝ 今と同じ）
     fb_ref0_no_deeper: bool = False
     fb_ref0_cut_cycles: int = 0
@@ -2124,6 +2158,7 @@ class _ModeRun:
         self.step_release_again = 0
         self.step_release_amount_sum = 0.0
         self.step_release_amount_max = 0.0
+        self.step_release_floor_blocked = 0
         self._keep_brake_win: deque[tuple[float, float]] = deque()  # 案③: (t, 実ブレーキ開度)
         self._keep_speed_win: deque[tuple[float, float]] = deque()  # 案③: (t, CAN 車速)
         self._accel_blocked = False
@@ -2266,7 +2301,7 @@ class _ModeRun:
         保った周期（印 1）の effort は入力のまま返す（`_cycle` の共通部分が前の指令にする）。
         `_cycle` が stop_keep_prev_pct を更新する前に呼ぶ（前の周期の指令は
         stop_keep_prev_pct）。"""
-        gain, lag_s, wait_cycles = self._step_setup  # type: ignore[misc]
+        gain, lag_s, wait_cycles, floor_pct = self._step_setup  # type: ignore[misc]
         dev = speed - ref
         self._step_dev_hist.append(dev)  # 区間の外から続けて持つ
         hist = self._step_dev_hist
@@ -2275,11 +2310,21 @@ class _ModeRun:
             if len(hist) == hist.maxlen else None
         )
         prev_pct = self.stop_keep_prev_pct
+        release_dev = self.cfg.forward_map.stop_approach_release_dev_kmh
+        if (
+            zone and not first and prev_pct is not None and self._step_wait_left == 0
+            and prev_pct <= floor_pct
+            and step_release_due(
+                speed_kmh=speed, dev_kmh=dev, slope_kmhs=slope, lag_s=lag_s,
+                release_dev_kmh=release_dev, gain_kmhs_pct=gain,
+            )
+        ):
+            self.step_release_floor_blocked += 1  # 戻したい周期だが下限以下で戻せない
         pct, step_code, self._step_wait_left = step_release_brake(
             prev_pct, -effort, in_zone=zone, first=first, speed_kmh=speed,
             dev_kmh=dev, slope_kmhs=slope, lag_s=lag_s,
-            release_dev_kmh=self.cfg.forward_map.stop_approach_release_dev_kmh,
-            gain_kmhs_pct=gain, min_pct=self.cfg.vehicle.min_brake_opening_pct,
+            release_dev_kmh=release_dev,
+            gain_kmhs_pct=gain, min_pct=floor_pct,
             wait_left=self._step_wait_left, wait_cycles=wait_cycles,
         )
         held_k = step_code in (STEP_CODE_HELD, STEP_CODE_WAIT)
@@ -3490,7 +3535,8 @@ async def run_mode_drive(
                 f"{run.step_release_amount_sum / n_step if n_step else 0.0:.2f}%・"
                 f"最大 {run.step_release_amount_max:.2f}%・"
                 f"待ち {run.step_release_wait_cycles} 周期・"
-                f"待ちの後にもう一度戻した {run.step_release_again} 回")
+                f"待ちの後にもう一度戻した {run.step_release_again} 回・"
+                f"下限で戻さなかった {run.step_release_floor_blocked} 周期")
     if run.stop_end_monotone:
         say("  停C の区間のブレーキを浅くしない（段7 P2）: "
             f"{run.stop_end_monotone_cycles} 周期"
