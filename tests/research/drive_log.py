@@ -198,6 +198,10 @@ CSV_COLUMNS: tuple[str, ...] = (
     # （stop_approach_step_release）: 少し戻した周期 3・戻した後に待っている周期 4
     "stop_keep_active",
     "stop_keep_held",
+    # 2026-11-06 発進のブレーキの帯の FB（forward_map.launch_band_step_fb）の印: 0 何もしない・
+    # 1 保った・2 踏み増した・3 FF へ離した・4 待ち・5 FF より浅く離した・6 帯の終わりで min へ
+    # 離すのを待った（機能 off は空欄）
+    "launch_step_code",
 )
 
 
@@ -263,6 +267,7 @@ class DriveSample:
     stop_keep_active: int | None = None  # 区間なら 1・他は 0（off は None）
     # 保った周期 1・戻した周期 2・少し戻した 3・待ち 4・他は 0（off は None）
     stop_keep_held: int | None = None
+    launch_step_code: int | None = None  # 発進の帯の FB の印 0〜6（off は None）
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -372,6 +377,7 @@ class SessionLog:
         stop_tail_active: int | None = None,
         stop_keep_active: int | None = None,
         stop_keep_held: int | None = None,
+        launch_step_code: int | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -428,6 +434,7 @@ class SessionLog:
             stop_tail_active=stop_tail_active,
             stop_keep_active=stop_keep_active,
             stop_keep_held=stop_keep_held,
+            launch_step_code=launch_step_code,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -641,6 +648,7 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 "" if s.stop_tail_active is None else str(s.stop_tail_active),
                 "" if s.stop_keep_active is None else str(s.stop_keep_active),
                 "" if s.stop_keep_held is None else str(s.stop_keep_held),
+                "" if s.launch_step_code is None else str(s.launch_step_code),
             ])
 
 

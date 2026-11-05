@@ -448,3 +448,10 @@ def test_stop_pred_dev_column_is_registered_and_formatted() -> None:
     assert dlmod.CSV_COLUMNS[-2:] == ("c10_integral_pct", "c10_integral_kmhs")
     assert dlmod.DriveSample.__dataclass_fields__["c10_integral_pct"].default is None
     assert dlmod.DriveSample.__dataclass_fields__["stop_pred_dev_kmh"].default is None
+
+
+def test_launch_step_code_column_is_registered_and_blank_when_off() -> None:
+    # 2026-11-06 発進の帯の FB: 印の列（off は空欄）
+    assert "launch_step_code" in dlmod.CSV_COLUMNS
+    assert dlmod.DriveSample.__dataclass_fields__["launch_step_code"].default is None
+    assert dlmod.CSV_COLUMNS[-1] == "launch_step_code"

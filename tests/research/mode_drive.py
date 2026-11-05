@@ -89,6 +89,16 @@ from tests.research.hold_scene import (
     predicted_deviation_current_g,
     slope_threshold_kmhs,
 )
+from tests.research.launch_band_step import (
+    DEV_BAND_KMH,
+    LBS_CODE_END_WAIT,
+    LBS_CODE_NONE,
+    LBS_CODE_RAISED,
+    launch_band_forecast,
+    launch_band_raise_wanted,
+    launch_band_step,
+    launch_band_step_setup,
+)
 from tests.research.launch_hold import LaunchMoveHold, launch_hold_gain
 from tests.research.pattern_drive import _overcurrent_limit_ma, _release_pedals
 from tests.research.pattern_loop import fit_slope
@@ -980,6 +990,12 @@ def _prepare_forward_map_plan(
                 "傾きは 0.2 s の差分")
     else:
         say("  停車へ向かう所のブレーキを戻さない（2026-11-04）: なし")
+    lbs = launch_band_step_setup(cfg, ff.table) if isinstance(ff, ForwardMapFeedforward) else None
+    if lbs is None:
+        say("  発進の帯の FB（2026-11-06）: なし")
+    else:
+        say(f"  発進の帯の FB（2026-11-06）: 効き {lbs[0]:.2f} km/h/s/%・"
+            f"上限 {lbs[3]:.3f}%・待ち {lbs[2]} 周期・境目 ±{DEV_BAND_KMH:g}")
     if isinstance(ff, ForwardMapFeedforward):
         say(f"  動き出したら離しを止めて待つ（段8-a）: {make_launch_hold(cfg, ff, plan)[1]}")
     say("  P・惰行の補助の表から A2 を外す（段8-b）: "
@@ -2159,6 +2175,20 @@ class _ModeRun:
         self.step_release_amount_sum = 0.0
         self.step_release_amount_max = 0.0
         self.step_release_floor_blocked = 0
+        # 2026-11-06 発進の帯の FB（launch_band_step_fb。off は None）。効き・L・待ち・上限・下限
+        self._lbs_setup = launch_band_step_setup(
+            cfg, getattr(self.ff, "table", None)
+        ) if isinstance(self.ff, ForwardMapFeedforward) else None
+        self._lbs_dev_hist: deque[float] = deque(maxlen=5)  # 偏差（毎周期。0.2 s の差分用）
+        self._lbs_prev_pct: float | None = None  # 前の周期にこの機能で出したブレーキ開度
+        self._lbs_wait_left = 0
+        self._lbs_ext_armed = False  # 帯の直後から、見込み > 0 の間ブレーキを保つ（型 B）
+        self._lbs_ext_run = 0  # 今の延長の連続周期数
+        self.lbs_code_cycles: dict[int, int] = {}
+        self.lbs_raise_count = 0
+        self.lbs_raise_max = 0.0
+        self.lbs_cap_hits = 0
+        self.lbs_ext_max_cycles = 0
         self._keep_brake_win: deque[tuple[float, float]] = deque()  # 案③: (t, 実ブレーキ開度)
         self._keep_speed_win: deque[tuple[float, float]] = deque()  # 案③: (t, CAN 車速)
         self._accel_blocked = False
@@ -2344,6 +2374,70 @@ class _ModeRun:
             effort = -pct
         return effort, held_k, False, step_code
 
+    def _lbs_observe(self, speed: float, ref: float) -> tuple[float, float | None]:
+        """2026-11-06 発進の帯の FB: 偏差（実車速 − 基準）の履歴を毎周期更新し、(偏差, 傾き) を
+        返す。傾き ＝ 5 周期（0.2 s）の差分（履歴が満ちるまで None。停止側と同じ）。"""
+        dev = speed - ref
+        hist = self._lbs_dev_hist
+        hist.append(dev)
+        slope = (
+            (dev - hist[0]) / ((len(hist) - 1) * self.interval_s)
+            if len(hist) == hist.maxlen else None
+        )
+        return dev, slope
+
+    def _lbs_band_cycle(
+        self, ff_pct: float, dev: float, slope: float | None
+    ) -> tuple[float, int]:
+        """帯（hold_scene 3）の 1 周期。戻り値 (出すブレーキ開度 [%], 印)。帯の最初の周期
+        （前の周期が帯でない）は prev ＝ FF で印 0。集計も持つ。"""
+        gain, lag_s, wait_cycles, cap_pct, min_pct = self._lbs_setup  # type: ignore[misc]
+        prev = self._lbs_prev_pct
+        if prev is None:
+            self._lbs_wait_left = 0
+            pct, code = ff_pct, LBS_CODE_NONE
+        else:
+            wanted = launch_band_raise_wanted(dev_kmh=dev, slope_kmhs=slope, lag_s=lag_s)
+            pct, code, self._lbs_wait_left = launch_band_step(
+                prev, ff_pct, dev_kmh=dev, slope_kmhs=slope, lag_s=lag_s,
+                gain_kmhs_pct=gain, cap_pct=cap_pct, min_pct=min_pct,
+                wait_left=self._lbs_wait_left, wait_cycles=wait_cycles,
+            )
+            if code == LBS_CODE_RAISED:
+                self.lbs_raise_count += 1
+                self.lbs_raise_max = max(self.lbs_raise_max, pct - prev)
+            if wanted and self._lbs_wait_left == 0 and pct >= cap_pct - 1e-9:
+                self.lbs_cap_hits += 1  # 踏み増したい周期だが上限で頭打ち
+        self._lbs_prev_pct = pct
+        self._lbs_ext_armed = True
+        self._lbs_ext_run = 0
+        self.lbs_code_cycles[code] = self.lbs_code_cycles.get(code, 0) + 1
+        return pct, code
+
+    def _lbs_extension(self, t: float, dev: float, slope: float | None) -> float | None:
+        """帯の終わり（型 B）: 帯の直後から、L 先の見込み > 0 の間はブレーキを前の周期の値で保つ。
+        戻り値 ＝ 保つブレーキ開度 [%]（None なら延長しない ＝ 計画のまま）。見込み ≤ 0・L 先の
+        基準 ≥ creep_speed_kmh になったら延長を終える（次の帯まで再び延長しない）。"""
+        _gain, lag_s, _w, _cap, _min = self._lbs_setup  # type: ignore[misc]
+        prev = self._lbs_prev_pct
+        if not self._lbs_ext_armed or prev is None:
+            return None
+        done = (
+            launch_band_forecast(dev, slope, lag_s) <= 0.0
+            or self.ref.at(t + lag_s) >= self.cfg.feedforward.creep_speed_kmh
+        )
+        if done:
+            self._lbs_ext_armed = False
+            self._lbs_prev_pct = None
+            self._lbs_wait_left = 0
+            return None
+        self._lbs_ext_run += 1
+        self.lbs_ext_max_cycles = max(self.lbs_ext_max_cycles, self._lbs_ext_run)
+        self.lbs_code_cycles[LBS_CODE_END_WAIT] = (
+            self.lbs_code_cycles.get(LBS_CODE_END_WAIT, 0) + 1
+        )
+        return prev
+
     async def _cycle(self, t: float, now: float) -> None:
         cfg, hw = self.cfg, self.hw
         cycle_started = time.perf_counter()
@@ -2401,6 +2495,11 @@ class _ModeRun:
         hold_accel: float | None = None
         hold_pred_dev: float | None = None
         keep_pct: float | None = None
+        lbs_dev, lbs_slope = (
+            self._lbs_observe(speed, ref) if self._lbs_setup is not None else (0.0, None)
+        )
+        lbs_code: int | None = None if self._lbs_setup is None else LBS_CODE_NONE
+        lbs_ext = False
         if self.hold is not None:
             h = self.hold
             measured_accel: float | None = None
@@ -2437,6 +2536,12 @@ class _ModeRun:
                         h.pi.lo_pct, h.pi.hi_pct, h.offset_pct,
                     )
                     ff_effort = -hold_ff_pct if keep_pct is None else -keep_pct
+                    if hold_scene == 3 and self._lbs_setup is not None:
+                        # 2026-11-06 発進の帯の FB: 帯の中は保持の PI でなく L 先の見込みの規則
+                        lbs_pct, lbs_code = self._lbs_band_cycle(
+                            hold_ff_pct if keep_pct is None else keep_pct, lbs_dev, lbs_slope
+                        )
+                        ff_effort = -lbs_pct
                 elif h.points is not None:
                     hold_ff_pct = interp_hold_opening(h.points, ref) + h.offset_pct
                     ff_effort = -hold_ff_pct
@@ -2448,8 +2553,11 @@ class _ModeRun:
                         self.ref_t.at(t + h.tp_s), speed, hold_accel, h.tp_s
                     )
                     hold_pred_dev = p_dev
-                _, hold_pi_pct = h.pi.step(ref_t - speed, ff_effort, p_dev)
-                hold_add = hold_pi_pct
+                if hold_scene == 3 and self._lbs_setup is not None:
+                    h.pi.reset()  # 帯の中は PI を使わない（hold_add ＝ 0・ログの PI 列は空欄）
+                else:
+                    _, hold_pi_pct = h.pi.step(ref_t - speed, ff_effort, p_dev)
+                    hold_add = hold_pi_pct
                 c10_effort = None if c10_effort is None else 0.0
                 coast_active = False
                 self._coast_effort = 0.0
@@ -2464,6 +2572,26 @@ class _ModeRun:
                 h.pi.reset()
                 if keep_pct is not None:
                     ff_effort = -keep_pct  # 案③: 保持の場面の外のブレーキの行の FF を替える
+        if self._lbs_setup is not None and hold_scene != 3:
+            if hold_scene:
+                self._lbs_ext_armed = False  # 上り・保持の場面は延長しない
+                self._lbs_prev_pct = None
+            else:
+                ext_pct = self._lbs_extension(t, lbs_dev, lbs_slope)
+                if ext_pct is not None:
+                    # 型 B: 計画がアクセル・惰行・min でもブレーキを保つ。P・DOB・I・惰行の補助は 0
+                    lbs_ext, lbs_code = True, LBS_CODE_END_WAIT
+                    ff_effort = -ext_pct
+                    c10_effort = None if c10_effort is None else 0.0
+                    coast_active = False
+                    self._coast_effort = 0.0
+                    self._stop_end_tau_s = None
+                    if self.dob is not None:
+                        self._dob_effort = 0.0
+                    if self.c10_int is not None:
+                        self.c10_int.reset()
+                        self._ci_active = False
+                        self._ci_pct = self._ci_kmhs = 0.0
         if (
             self.midway_fb_no_deeper and not hold_scene and c10_effort
             and isinstance(self.ff, ForwardMapFeedforward)
@@ -2488,7 +2616,7 @@ class _ModeRun:
                 self.fb_ref0_cut_pct_sum += -c10_effort
                 c10_effort = cut
         pid_effort = 0.0  # 手順 5 以降でここに PID の出力を足す
-        if hold_scene:
+        if hold_scene or lbs_ext:
             hold_delta = 0.0
             if self.launch_hold is not None:
                 self._launch_hold_pct = 0.0
@@ -2689,6 +2817,7 @@ class _ModeRun:
                     stop_tail_active=self._stop_tail_now(t),
                     stop_keep_active=stop_keep_active_code,
                     stop_keep_held=stop_keep_held_code,
+                    launch_step_code=lbs_code,
                 )
             )
         if segment != self._segment:
@@ -3537,6 +3666,16 @@ async def run_mode_drive(
                 f"待ち {run.step_release_wait_cycles} 周期・"
                 f"待ちの後にもう一度戻した {run.step_release_again} 回・"
                 f"下限で戻さなかった {run.step_release_floor_blocked} 周期")
+    if run._lbs_setup is not None:  # noqa: SLF001
+        codes = " ".join(
+            f"{k}:{run.lbs_code_cycles.get(k, 0)}" for k in range(7)
+        )
+        say("  発進の帯の FB（2026-11-06）: 印ごとの周期数 "
+            f"[{codes}]（0 何もしない・1 保った・2 踏み増し・3 FF へ離した・4 待ち・"
+            "5 FF より浅く離した・6 帯の終わりで待った）・"
+            f"踏み増し {run.lbs_raise_count} 回（最大 {run.lbs_raise_max:.2f}%）・"
+            f"上限で頭打ち {run.lbs_cap_hits} 周期・"
+            f"帯の終わりで待った最大 {run.lbs_ext_max_cycles * run.interval_s:.2f}s")
     if run.stop_end_monotone:
         say("  停C の区間のブレーキを浅くしない（段7 P2）: "
             f"{run.stop_end_monotone_cycles} 周期"
