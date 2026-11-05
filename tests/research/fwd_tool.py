@@ -1554,6 +1554,28 @@ def run_attach_local_gain(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_attach_release_gain(args: argparse.Namespace) -> int:
+    """既存の pkl に、手順2・手順14 の CSV（複数可）の「減速中の戻し」から測った戻す側の効き
+    （stop_release_gain_*）を meta として付けて、新しい pkl に保存する
+    （2026-11-05 段14。表は変わらず meta だけ増える。元の pkl は書き換えない）。"""
+    from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
+    from tests.research.pattern_drive import _attach_release_gain  # noqa: PLC0415
+
+    src, out = Path(args.pkl), Path(args.out)
+    if out.exists():
+        print(f"保存先 {out} が既にある。上書きしない")
+        return 2
+    if out.resolve() == src.resolve():
+        print("保存先が元の pkl と同じ。別の名前にする")
+        return 2
+    table = load_forward_map(src)
+    if not _attach_release_gain(table, [Path(c) for c in args.csv]):
+        print("測れなかったので保存しない")
+        return 1
+    print(f"保存: {save_table(table, out)}")
+    return 0
+
+
 def run_attach_hold_pi(args: argparse.Namespace) -> int:
     """既存の pkl に、手順2 の BRAKE_SEARCH から求めた低速の保持用 PI の値（meta["hold_pi"]）を
     付けて、新しい pkl に保存する（2026-10-30。元の pkl は書き換えない）。"""
@@ -1644,6 +1666,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="ブレーキの車速の行の代表（省略: learning.ramp_dither_brake_speeds_kmh）",
     )
     lg.set_defaults(func=run_attach_local_gain)
+
+    rg = sub.add_parser(
+        "attach-release-gain",
+        help="pkl に戻す側の効き（手順2・手順14 の減速中の戻しから測る）を付けて別名で保存",
+    )
+    rg.add_argument("--pkl", required=True, help="元の表の pkl（書き換えない）")
+    rg.add_argument("--csv", required=True, nargs="+", help="走行 CSV（複数可）")
+    rg.add_argument("--out", required=True, help="保存先 pkl（既にあれば失敗）")
+    rg.set_defaults(func=run_attach_release_gain)
 
     hp = sub.add_parser(
         "attach-hold-pi",

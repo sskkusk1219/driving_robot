@@ -90,7 +90,7 @@ from typing import Any
 
 import numpy as np
 
-from tests.research import local_gain, pedal_lag
+from tests.research import local_gain, pedal_lag, release_gain
 from tests.research.app_settings import SafetySettings
 from tests.research.axis_monitor import AxisMonitor
 from tests.research.coast_curve import estimate_coast_decel_curve
@@ -1190,6 +1190,43 @@ def _attach_local_gain(
     return local_gain.attach_to_meta(table.meta, brake, accel, csv_path.name)
 
 
+def _attach_release_gain(table: Any, csv_paths: Sequence[Path]) -> bool:
+    """表の meta に、戻す側の効き（ブレーキを 1% 戻したとき L 後に加速度が何 km/h/s 変わるか）を
+    入れる（2026-11-05 段14。ProblemReport_20261103_停車前の這う基準 段14〜）。
+
+    手順2・手順14 の CSV の「減速中の戻し」の山から `release_gain.measure_stop_release_gain` で
+    測る。山が少なく測れないときは meta に何も入れず False（表示で知らせる）。戻し量 0.3% の効きを
+    meta に入れ、0.5% の効きと、減速中とみる加速度のしきい値 −1.0 と −0.5・−2.0 の山の数を
+    並べて表示する（しきい値・量の妥当さを見るため）。
+    """
+    bmin = float(table.meta.get("brake_deadband_pct", math.nan))
+    onset = table.meta.get("brake_onset_u_pct")
+    lag = table.meta.get("brake_lag_s")
+    if not (math.isfinite(bmin) and onset is not None and lag is not None):
+        say("  戻す側の効き: 表の meta に min・効き始め・遅れ L が無く測れず。meta に入れない")
+        return False
+    kw = {"brake_min_pct": bmin, "onset_u_pct": float(onset), "lag_s": float(lag)}
+    paths = [Path(p) for p in csv_paths]
+    res = release_gain.measure_stop_release_gain(paths, **kw)
+    if res.gain_kmhs_pct is None:
+        say(f"  戻す側の効き: 測れず（{res.reason}）。meta に入れない")
+        return False
+    for name, vals in res.per_csv.items():
+        say(f"  戻す側の効き[{name}]: 中央値 {float(np.median(vals)):.2f} km/h/s/%・山 {len(vals)}")
+    say(f"  戻す側の効き: 中央値 {res.gain_kmhs_pct:.2f} km/h/s/%（山 {res.n_peaks}・"
+        f"戻し量 {res.amount_pct:g}%・減速中 ≤ {release_gain.ACCEL_MAX_KMHS:g} km/h/s）")
+    alt = release_gain.measure_stop_release_gain(paths, amount_pct=0.5, **kw)
+    if alt.gain_kmhs_pct is not None:
+        say(f"  　戻し量 0.5% で測ると {alt.gain_kmhs_pct:.2f} km/h/s/%（山 {alt.n_peaks}）")
+    else:
+        say(f"  　戻し量 0.5% で測ると測れず（{alt.reason}）")
+    for thr in (-0.5, -2.0):
+        o = release_gain.measure_stop_release_gain(paths, accel_max_kmhs=thr, **kw)
+        eff = "測れず" if o.gain_kmhs_pct is None else f"{o.gain_kmhs_pct:.2f} km/h/s/%"
+        say(f"  　減速中を {thr:g} km/h/s 以下とすると 山 {o.n_peaks}・{eff}")
+    return release_gain.attach_to_meta(table.meta, res)
+
+
 def _build_table_model(
     profile: VehicleProfile,
     csv_path: Path,
@@ -1217,6 +1254,7 @@ def _build_table_model(
     _attach_returns(table, csv_path)
     _attach_pedal_track(table, csv_path)
     _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh)
+    _attach_release_gain(table, [csv_path])
     path = save_table(table, _forward_pkl_path(models_dir, "fwd_table", hw_mode))
     say(f"  u の原点（min）: アクセル {st.accel_deadband_pct:g}・"
         f"ブレーキ {st.brake_deadband_pct:g} %（vehicle.min_*_opening_pct）、"
@@ -1368,6 +1406,9 @@ def rebuild_stop_side(
         sub_min_weight=sub_min_weight,
     )
     out.meta["stop_approach_csv"] = Path(new_csv).name
+    # 戻す側の効きも「作ったときの CSV ＋ new_csv」で測り直す（2026-11-05 段14。
+    # 測れなければ meta はそのまま）
+    _attach_release_gain(out, [*source_csvs, new_csv])
     return out
 
 
@@ -1795,6 +1836,7 @@ def _build_forward_model(
     _attach_returns(table, csv_path)
     _attach_pedal_track(table, csv_path)
     _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh)
+    _attach_release_gain(table, [csv_path])
     path = save_table(table, _forward_pkl_path(models_dir, "fwd_model", hw_mode))
     say(f"モデル保存: {path}")
     return _BuiltModel(model_path=str(path), metrics={}, c7_path=like.model_path)

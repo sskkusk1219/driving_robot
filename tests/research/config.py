@@ -1342,6 +1342,15 @@ class ForwardMapSection:
     # 根拠: U 957 型（速い減速）で戻し禁止が深い開度を保ったまま早止まりしたため。
     # stop_approach_no_release が要る。既定 false ＝ 段5 と同じ。決める時期: 段11 の実機
     stop_approach_creep_gate: bool = False
+    # 2026-11-05 ProblemReport_20261103_停車前の這う基準 段15: true なら、戻し禁止の区間の中で
+    # 「遅すぎのとき少しずつ戻す」。L 先の偏差の見込み（偏差 ＋ 偏差の傾き × L）が
+    # −stop_approach_release_dev_kmh より遅すぎで、傾きが負、動いているとき、前の周期の指令から
+    # 「−傾き ÷ 戻す側の効き（pkl meta stop_release_gain_kmhs_pct）」だけ 1 回戻し、L ＋ 0.1 s
+    # 待つ（その間は指令を保つ）。待ちの後は今の保持。今の「戻してよい周期は計画の FF ＋ FB へ
+    # 飛ぶ」は使わない。stop_approach_no_release が要る。pkl の meta に効きが無ければ
+    # 走る前に止める。
+    # 既定 false ＝ 今と完全に同じ。ログ: stop_keep_held 3（戻した）・4（待ち）
+    stop_approach_step_release: bool = False
 
 
 @dataclass
@@ -1935,6 +1944,11 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         not fm.stop_approach_creep_gate or fm.stop_approach_no_release,
         "forward_map.stop_approach_creep_gate は stop_approach_no_release が true のときだけ使える",
+    )
+    need(
+        not fm.stop_approach_step_release or fm.stop_approach_no_release,
+        "forward_map.stop_approach_step_release は stop_approach_no_release が true のときだけ"
+        "使える",
     )
     need(
         not fm.stop_approach_no_release or fm.stop_tail_ramp_enabled,

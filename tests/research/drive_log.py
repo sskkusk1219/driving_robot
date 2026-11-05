@@ -194,7 +194,8 @@ CSV_COLUMNS: tuple[str, ...] = (
     "stop_tail_active",
     # 2026-11-04 段5（forward_map.stop_approach_no_release）: stop_keep_active ＝ 停車へ向かう所の
     # ブレーキを戻さない区間の行なら 1・他は 0／stop_keep_held ＝ 前の周期より浅くするのを止めた
-    # 周期 1・遅すぎで戻した周期 2・それ以外 0（機能 off は空欄）
+    # 周期 1・遅すぎで戻した周期 2・それ以外 0（機能 off は空欄）。2026-11-05 段15
+    # （stop_approach_step_release）: 少し戻した周期 3・戻した後に待っている周期 4
     "stop_keep_active",
     "stop_keep_held",
 )
@@ -260,7 +261,8 @@ class DriveSample:
     keep_ff_pct: float | None = None  # 案③: ③ の FF のブレーキ開度（替えない周期は None）
     stop_tail_active: int | None = None  # 停車前の踏み増しの行なら 1・他は 0（機能 off は None）
     stop_keep_active: int | None = None  # 区間なら 1・他は 0（off は None）
-    stop_keep_held: int | None = None  # 保った周期 1・戻した周期 2・他は 0（off は None）
+    # 保った周期 1・戻した周期 2・少し戻した 3・待ち 4・他は 0（off は None）
+    stop_keep_held: int | None = None
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 

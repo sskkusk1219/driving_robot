@@ -472,6 +472,81 @@ def hold_stop_keep_brake(
     return prev_pct, True, False
 
 
+# step_release_brake が返す印（ログ stop_keep_held の 3・4。1 は保った・0 は何もしない）
+STEP_CODE_NONE = 0
+STEP_CODE_HELD = 1
+STEP_CODE_STEPPED = 3
+STEP_CODE_WAIT = 4
+
+
+def step_release_brake(
+    prev_pct: float | None,
+    new_pct: float,
+    *,
+    in_zone: bool,
+    first: bool,
+    speed_kmh: float,
+    dev_kmh: float,
+    slope_kmhs: float | None,
+    lag_s: float,
+    release_dev_kmh: float,
+    gain_kmhs_pct: float,
+    min_pct: float,
+    wait_left: int,
+    wait_cycles: int,
+) -> tuple[float, int, int]:
+    """2026-11-05 段15（stop_approach_step_release）: 戻し禁止の区間の中で、遅すぎのときブレーキを
+    少しずつ戻す走行中の判定。ブレーキ開度は正 [%]。戻り値 (出す開度, 印, 残りの待ち周期)。
+    印: 0 何もしない（new_pct のまま）・1 保った（浅くしなかった）・3 少し戻した・4 待ち。
+    区間の外・区間の最初の周期（first）・前の値なしは new_pct のまま（待ちも捨てる）。
+    待ちの間（wait_left > 0）は前の周期の指令のまま（深くも浅くもしない）。待ちでなければ、
+    実車速 > 停車速度 かつ 偏差 ＋ 傾き × L < −release_dev_kmh かつ 傾き < 0 のとき 1 回戻す:
+    出す開度 ＝ 前の周期の指令 − （−傾き ÷ 効き）。min_pct より浅くしない。戻したら
+    wait_cycles 周期待つ。傾きが無い（None）・上のどれかが外れるときは今の保持（新しい指令が
+    前の周期より浅ければ前の周期のまま・深ければ新しい指令）。"""
+    from tests.research.ff_model import STOP_SPEED_KMH  # noqa: PLC0415
+
+    if not in_zone or first or prev_pct is None:
+        return new_pct, STEP_CODE_NONE, 0
+    if wait_left > 0:
+        return prev_pct, STEP_CODE_WAIT, wait_left - 1
+    if (
+        slope_kmhs is not None and slope_kmhs < 0.0 and speed_kmh > STOP_SPEED_KMH
+        and gain_kmhs_pct > 0.0 and (dev_kmh + slope_kmhs * lag_s) < -release_dev_kmh
+    ):
+        pct = max(prev_pct - (-slope_kmhs) / gain_kmhs_pct, min_pct)
+        if pct < prev_pct:
+            return pct, STEP_CODE_STEPPED, wait_cycles
+    if new_pct < prev_pct:
+        return prev_pct, STEP_CODE_HELD, 0
+    return new_pct, STEP_CODE_NONE, 0
+
+
+def step_release_setup(cfg: ResearchConfig, table: Any) -> tuple[float, float, int] | None:
+    """段15: (戻す側の効き [km/h/s per %], 遅れ L [s], 待つ周期数)。off は None。
+    on で pkl の meta に効き（stop_release_gain_kmhs_pct）か遅れ L が無ければ ConfigError
+    （走る前に止める）。L は yaml の brake_lag_s、なければ pkl の meta。待ち ＝ round((L ＋ 0.1) ÷
+    周期)（ユーザー決定 2026-11-05）。"""
+    fm = cfg.forward_map
+    if not fm.stop_approach_step_release:
+        return None
+    meta = getattr(table, "meta", None) or {}
+    gain = meta.get("stop_release_gain_kmhs_pct")
+    if gain is None or not math.isfinite(float(gain)) or float(gain) <= 0.0:
+        raise ConfigError(
+            "forward_map.stop_approach_step_release には pkl の meta stop_release_gain_kmhs_pct"
+            "（正の戻す側の効き）が要ります。fwd_tool attach-release-gain で付けてください"
+        )
+    lag = fm.brake_lag_s if fm.brake_lag_s is not None else meta.get("brake_lag_s")
+    if lag is None or not math.isfinite(float(lag)):
+        raise ConfigError(
+            "forward_map.stop_approach_step_release には brake_lag_s（yaml か pkl の meta）が"
+            "要ります"
+        )
+    wait = max(1, round((float(lag) + 0.1) / cfg.control.loop_interval_s))
+    return float(gain), float(lag), wait
+
+
 def candidate_is_stop_end(candidate: str) -> bool:
     """FF 候補の名前が StopEndFeedforward（C15）か"""
     return isinstance(make_candidate(candidate), StopEndFeedforward)
@@ -862,6 +937,14 @@ def _prepare_forward_map_plan(
             f"クリープと比べる: {'あり' if fm.stop_approach_creep_gate else 'なし'}"
             + (f"・外した行数 {keep.gated_out_rows}"
                if keep is not None and fm.stop_approach_creep_gate else ""))
+        step = step_release_setup(cfg, ff.table)  # on で meta に効きが無ければ ConfigError
+        if step is None:
+            say("  遅すぎのとき少しずつ戻す（2026-11-05）: なし")
+        else:
+            say(f"  遅すぎのとき少しずつ戻す（2026-11-05）: 戻す側の効き {step[0]:.2f} km/h/s/%・"
+                f"L {step[1]:.3f}s・待つ {step[2]} 周期・"
+                f"戻す境目 −{fm.stop_approach_release_dev_kmh:g} km/h（L 先の見込み）・"
+                "傾きは 0.2 s の差分")
     else:
         say("  停車へ向かう所のブレーキを戻さない（2026-11-04）: なし")
     if isinstance(ff, ForwardMapFeedforward):
@@ -1821,6 +1904,12 @@ class _ModeRun:
     stop_keep_zone_cycles: int = 0
     stop_keep_held_cycles: int = 0
     stop_keep_released_cycles: int = 0
+    # 2026-11-05 段15 遅すぎのとき少しずつ戻す（stop_approach_step_release。off ＝ 今と同じ）
+    step_release_stepped_cycles: int = 0  # 少し戻した回数
+    step_release_wait_cycles: int = 0
+    step_release_again: int = 0  # うち、同じ区間で待ちの後にもう一度戻した回数
+    step_release_amount_sum: float = 0.0
+    step_release_amount_max: float = 0.0
     # 2026-10-27 段3 P3・段6 P1・段7 P2 の既定（false のまま ＝ 今と同じ）
     fb_ref0_no_deeper: bool = False
     fb_ref0_cut_cycles: int = 0
@@ -2023,6 +2112,18 @@ class _ModeRun:
         self.stop_keep_zone_cycles = 0
         self.stop_keep_held_cycles = 0
         self.stop_keep_released_cycles = 0
+        # 段15: 少しずつ戻す（off は None）。効き・L・待つ周期数は pkl の meta から
+        self._step_setup = step_release_setup(
+            cfg, getattr(self.ff, "table", None)
+        ) if isinstance(self.ff, ForwardMapFeedforward) else None
+        self._step_dev_hist: deque[float] = deque(maxlen=5)  # 偏差（4 周期 ＝ 0.2 s の差分用）
+        self._step_wait_left = 0
+        self._step_episode_count = 0  # 今の区間で戻した回数（区間を出たら 0）
+        self.step_release_stepped_cycles = 0
+        self.step_release_wait_cycles = 0
+        self.step_release_again = 0
+        self.step_release_amount_sum = 0.0
+        self.step_release_amount_max = 0.0
         self._keep_brake_win: deque[tuple[float, float]] = deque()  # 案③: (t, 実ブレーキ開度)
         self._keep_speed_win: deque[tuple[float, float]] = deque()  # 案③: (t, CAN 車速)
         self._accel_blocked = False
@@ -2155,6 +2256,48 @@ class _ModeRun:
         if lb is None:
             return False
         return bool(lb[plan.index_at(t)])
+
+    def _step_release_cycle(
+        self, effort: float, *, zone: bool, first: bool, speed: float, ref: float
+    ) -> tuple[float, bool, bool, int]:
+        """2026-11-05 段15: 遅すぎのとき少しずつ戻す（今の「FF ＋ FB へ飛ぶ戻し」は使わない）の
+        1 周期分。偏差の履歴・傾き・判定・集計を持つ。戻り値 (effort, 保った, 遅すぎで戻した
+        ［常に False］, 印)。effort はブレーキが負。印は step_release_brake と同じ（0・1・3・4）。
+        保った周期（印 1）の effort は入力のまま返す（`_cycle` の共通部分が前の指令にする）。
+        `_cycle` が stop_keep_prev_pct を更新する前に呼ぶ（前の周期の指令は
+        stop_keep_prev_pct）。"""
+        gain, lag_s, wait_cycles = self._step_setup  # type: ignore[misc]
+        dev = speed - ref
+        self._step_dev_hist.append(dev)  # 区間の外から続けて持つ
+        hist = self._step_dev_hist
+        slope = (
+            (dev - hist[0]) / ((len(hist) - 1) * self.interval_s)
+            if len(hist) == hist.maxlen else None
+        )
+        prev_pct = self.stop_keep_prev_pct
+        pct, step_code, self._step_wait_left = step_release_brake(
+            prev_pct, -effort, in_zone=zone, first=first, speed_kmh=speed,
+            dev_kmh=dev, slope_kmhs=slope, lag_s=lag_s,
+            release_dev_kmh=self.cfg.forward_map.stop_approach_release_dev_kmh,
+            gain_kmhs_pct=gain, min_pct=self.cfg.vehicle.min_brake_opening_pct,
+            wait_left=self._step_wait_left, wait_cycles=wait_cycles,
+        )
+        held_k = step_code in (STEP_CODE_HELD, STEP_CODE_WAIT)
+        if zone and step_code == STEP_CODE_STEPPED and prev_pct is not None:
+            amount = prev_pct - pct
+            self.step_release_stepped_cycles += 1
+            self.step_release_amount_sum += amount
+            self.step_release_amount_max = max(self.step_release_amount_max, amount)
+            if self._step_episode_count >= 1:
+                self.step_release_again += 1
+            self._step_episode_count += 1
+        elif zone and step_code == STEP_CODE_WAIT:
+            self.step_release_wait_cycles += 1
+        if not zone:
+            self._step_episode_count = 0
+        if step_code in (STEP_CODE_STEPPED, STEP_CODE_WAIT):
+            effort = -pct
+        return effort, held_k, False, step_code
 
     async def _cycle(self, t: float, now: float) -> None:
         cfg, hw = self.cfg, self.hw
@@ -2339,11 +2482,18 @@ class _ModeRun:
             # の前に掛ける（安全網は後ろでそのまま働く）。区間のアクセル側の指令は触らない
             zone = bool(stop_keep_held_code) and effort <= 0.0
             first = self.stop_keep_prev_pct is None
-            pct, held_k, released_k = hold_stop_keep_brake(
-                self.stop_keep_prev_pct, -effort, in_zone=zone, first=first,
-                speed_kmh=speed, ref_kmh=ref,
-                release_dev_kmh=cfg.forward_map.stop_approach_release_dev_kmh,
-            )
+            if self._step_setup is None:
+                pct, held_k, released_k = hold_stop_keep_brake(
+                    self.stop_keep_prev_pct, -effort, in_zone=zone, first=first,
+                    speed_kmh=speed, ref_kmh=ref,
+                    release_dev_kmh=cfg.forward_map.stop_approach_release_dev_kmh,
+                )
+                step_code = 0
+            else:
+                effort, held_k, released_k, step_code = self._step_release_cycle(
+                    effort, zone=zone, first=first, speed=speed, ref=ref
+                )
+                pct = -effort  # 出す開度（何もしない周期は new_pct のまま ＝ -effort）
             if zone:
                 self.stop_keep_zone_cycles += 1
                 if held_k:
@@ -2354,7 +2504,10 @@ class _ModeRun:
                 self.stop_keep_prev_pct = pct
             else:
                 self.stop_keep_prev_pct = None
-            stop_keep_held_code = (1 if held_k else 2 if released_k else 0)
+            stop_keep_held_code = (
+                step_code if step_code in (STEP_CODE_STEPPED, STEP_CODE_WAIT)
+                else (1 if held_k else 2 if released_k else 0)
+            )
             stop_keep_active_code: int | None = int(bool(zone))
         else:
             stop_keep_active_code = None
@@ -3330,6 +3483,14 @@ async def run_mode_drive(
         say("  停車へ向かう所のブレーキを戻さない（2026-11-04）: "
             f"区間 {run.stop_keep_zone_cycles} 周期・保った {run.stop_keep_held_cycles} 周期・"
             f"遅すぎで戻した {run.stop_keep_released_cycles} 周期")
+        if run.cfg.forward_map.stop_approach_step_release:
+            n_step = run.step_release_stepped_cycles
+            say("  遅すぎのとき少しずつ戻す（2026-11-05）: "
+                f"戻した {n_step} 回・1 回の量の平均 "
+                f"{run.step_release_amount_sum / n_step if n_step else 0.0:.2f}%・"
+                f"最大 {run.step_release_amount_max:.2f}%・"
+                f"待ち {run.step_release_wait_cycles} 周期・"
+                f"待ちの後にもう一度戻した {run.step_release_again} 回")
     if run.stop_end_monotone:
         say("  停C の区間のブレーキを浅くしない（段7 P2）: "
             f"{run.stop_end_monotone_cycles} 周期"
