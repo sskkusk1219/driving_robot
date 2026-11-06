@@ -1376,6 +1376,22 @@ class ForwardMapSection:
     # でも上乗せを保つだけで 8.88 → 8.52% と下がり最大 +0.41（ユーザー指摘・決定 2026-11-06）。
     # ログ: launch_step_code（印 1〜5）
     launch_band_step_fb: bool = False
+    # 2026-11-07 ProblemReport_20261106_発進で速すぎでもブレーキを戻す 段16（型 A。ユーザー決定
+    # 2026-11-07）: true なら、帯のある発進ごとに「その場で動き出す開度」を測る。基準が停車速度以下
+    # のまま CAN 車速が 0.01 km/h（launch_band_step.LAUNCH_OBS_MOVE_KMH）を超えた最初の周期の、前の
+    # 周期のブレーキ実開度を u_obs とする（測れなければ今のまま）。測れたら ① 発進前の離しの行の
+    # ブレーキ指令を u_obs より浅くしない ② 帯の踏み増しの上限を pkl の動き出す開度でなく u_obs に
+    # し、測れた後の最初の帯の周期は前の出す開度を max(前, u_obs) にして段12 の規則へ通す。
+    # 根拠: 段15 の調べで、帯の発進はどれも基準より 0.15〜0.40 s 先にブレーキ実開度 9.0〜9.2% で
+    # 動き出し、上限 8.905% では止まらなかった。launch_release_ramp・launch_band_step_fb が要る。
+    # ログ: launch_obs_pct。既定 false ＝ 今と完全に同じ。決める時期: 段18 の実機（3 モード）
+    launch_breakaway_observed: bool = False
+    # 2026-11-07 同 段16（B-2。ユーザー決定 2026-11-07）: true なら、帯の発進にも発進のずらしの δ
+    # （0〜8 行）を使う。帯の終わりの行から後ろ（アクセルを含む並び）だけを δ 行後ろへ移し、
+    # 帯の最後のブレーキの値で埋めて帯を伸ばす（帯の始まりは動かさない）。予測は帯の終わりの行から
+    # 車速 ＝ 基準で積む。launch_shift_choose・launch_brake_band が要る。実行中の帯の区間も δ 行
+    # 伸ばす。既定 false ＝ 今と完全に同じ（帯の発進は δ ＝ 0）。決める時期: 段18 の実機
+    launch_band_shift: bool = False
 
 
 @dataclass
@@ -1905,6 +1921,17 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         not fm.launch_shift_center_lag or fm.launch_shift_choose,
         "forward_map.launch_shift_center_lag は launch_shift_choose が true のときだけ使える",
+    )
+    need(
+        not fm.launch_breakaway_observed
+        or (fm.launch_release_ramp and fm.launch_band_step_fb),
+        "forward_map.launch_breakaway_observed は launch_release_ramp・launch_band_step_fb が"
+        " true のときだけ使える",
+    )
+    need(
+        not fm.launch_band_shift or (fm.launch_shift_choose and fm.launch_brake_band),
+        "forward_map.launch_band_shift は launch_shift_choose・launch_brake_band が true のときだけ"
+        "使える",
     )
     need(
         not fm.launch_gap_tight or fm.launch_release_ramp,

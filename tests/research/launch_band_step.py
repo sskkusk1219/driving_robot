@@ -14,8 +14,11 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
+
 from tests.research.config import ConfigError, ResearchConfig
 from tests.research.creep_floor import creep_floor_opening_pct
+from tests.research.hold_scene import HoldInterval
 
 # launch_band_step が返す印（ログ launch_step_code）
 LBS_CODE_NONE = 0  # 何もしない（上乗せ 0 ＝ FF のまま）
@@ -24,6 +27,12 @@ LBS_CODE_RAISED = 2  # 踏み増した
 LBS_CODE_RELEASED_TO_FF = 3  # 上乗せを 0 へ向けて減らした
 LBS_CODE_WAIT = 4  # 動かした後の待ち
 LBS_CODE_RELEASED_BELOW_FF = 5  # 上乗せを 0 より下（FF より浅く）へ減らした
+
+# 2026-11-07 ProblemReport_20261106_発進で速すぎでもブレーキを戻す 段16（型 A。
+# forward_map.launch_breakaway_observed）: 「動き出した」とみなす CAN 車速 [km/h]。
+# ユーザー決定 2026-11-07。半分データ由来（シミュレータは停車で 0.000・今日の発進は
+# 0.001〜0.004 から動き出しが見える）。実車ではノイズを見て決め直す
+LAUNCH_OBS_MOVE_KMH = 0.01
 
 DEV_BAND_KMH = 0.3  # 踏み増す・FF より浅く離す境目（ユーザー決定 2026-11-06。停止側と同じ幅）
 
@@ -154,3 +163,148 @@ def launch_band_step_setup(
             "（動き出す開度）が要ります"
         )
     return float(gain), float(lag), wait, float(cap), float(cfg.vehicle.min_brake_opening_pct)
+
+
+def launch_band_seq_rows(prep: np.ndarray | None, band: np.ndarray | None) -> np.ndarray | None:
+    """2026-11-07 段16: 帯のある発進の並びの行。launch_prep の連なり（帯の行も launch_prep）のうち、
+    帯の行を 1 つでも含むものの全行を True にする（帯の無い発進＝型 C は対象外）。どちらかが
+    None なら None。"""
+    if prep is None or band is None:
+        return None
+    n = len(prep)
+    out = np.zeros(n, dtype=bool)
+    i = 0
+    while i < n:
+        if not prep[i]:
+            i += 1
+            continue
+        s = i
+        while i < n and prep[i]:
+            i += 1
+        if bool(band[s:i].any()):
+            out[s:i] = True
+    return out
+
+
+class LaunchBreakawayObserver:
+    """2026-11-07 段16（型 A）: 帯のある発進ごとに「その場で動き出す開度」u_obs を 1 回測る。
+
+    発進の並び（帯のある launch_prep の連なり）の中で、元の基準が停車速度以下のまま CAN 車速が
+    LAUNCH_OBS_MOVE_KMH を超えた最初の周期の、前の周期のブレーキ実開度（絶対の開度 [%]）を
+    u_obs とする。基準が停車速度を超えた後は測らない（先に動かなかった発進は None のまま）。
+    並びが新しく始まった周期で u_obs を捨てて測り直す。並びを出たら u_obs も捨てる。
+    pending_first は「測れた後の最初の帯の周期」に前の出す開度を u_obs へ持ち上げる印
+    （take_first で 1 回だけ True を返す）。"""
+
+    def __init__(self, move_kmh: float = LAUNCH_OBS_MOVE_KMH) -> None:
+        self.move_kmh = move_kmh
+        self.u_obs: float | None = None
+        self.seen_band = False  # 並びの中で帯の行を通ったか（前の離しの行の床は帯の前だけ）
+        self._in_seq = False
+        self._done = False  # 基準が動いた後（もう測らない）
+        self._pending_first = False
+        self.measured: list[float] = []  # 測れた発進の u_obs（集計用）
+        self.n_sequences = 0
+        self.floor_cycles = 0  # 前の離しの行で u_obs より浅くしないのを掛けた周期数
+
+    def update(
+        self, *, active: bool, ref_kmh: float, speed_kmh: float,
+        prev_brake_actual_pct: float | None, stop_speed_kmh: float,
+        band_row: bool = False,
+    ) -> float | None:
+        """1 周期の更新。active ＝ 帯のある発進の並びの行。戻り値は今の u_obs。"""
+        if not active:
+            self._in_seq = False
+            self.u_obs = None
+            self.seen_band = False
+            self._pending_first = False
+            return None
+        if not self._in_seq:
+            self._in_seq = True
+            self.n_sequences += 1
+            self.u_obs = None
+            self.seen_band = False
+            self._done = False
+            self._pending_first = False
+        if band_row:
+            self.seen_band = True
+        if self.u_obs is None and not self._done:
+            if ref_kmh > stop_speed_kmh:
+                self._done = True
+            elif speed_kmh > self.move_kmh and prev_brake_actual_pct is not None:
+                self.u_obs = float(prev_brake_actual_pct)
+                self._pending_first = True
+                self.measured.append(self.u_obs)
+        return self.u_obs
+
+    def take_first(self) -> bool:
+        """測れた後の最初の帯の周期か（1 回だけ True）。"""
+        first, self._pending_first = self._pending_first, False
+        return first
+
+    def summary(self) -> str:
+        if not self.measured:
+            return f"測れた発進 0 / {self.n_sequences} 回"
+        return (
+            f"測れた発進 {len(self.measured)} / {self.n_sequences} 回・u_obs "
+            f"{min(self.measured):.2f}〜{max(self.measured):.2f}%・"
+            f"発進前に保った {self.floor_cycles} 周期"
+        )
+
+
+def launch_band_obs_inputs(
+    u_obs_pct: float | None,
+    *,
+    first: bool,
+    cap_pct: float,
+    prev_out_pct: float | None,
+    last_cmd_pct: float | None,
+    ff_pct: float,
+) -> tuple[float, float | None, float | None]:
+    """2026-11-07 段16（型 A）: 帯の 1 周期の launch_band_step へ渡す (上限 cap, 前の出す開度,
+    前の FF) を決める。u_obs が無ければ入力のまま（今と完全に同じ）。u_obs があれば cap ＝ u_obs。
+    first（測れた後の最初の帯の周期）なら前の出す開度 ＝ max(前の出す開度［帯の最初の周期で None
+    なら前の周期の最終のブレーキ指令の深さ last_cmd］, u_obs)・前の FF ＝ この周期の FF
+    （保っていた開度を、段12 の規則［見込み > +0.3 なら保つ・0〜+0.3 なら上乗せ ＝ u_obs − FF を
+    引き継ぐ］へ通す）。前の FF は first のときだけ値を返す（他は None ＝ 入力のまま）。"""
+    if u_obs_pct is None:
+        return cap_pct, prev_out_pct, None
+    if not first:
+        return u_obs_pct, prev_out_pct, None
+    base = prev_out_pct if prev_out_pct is not None else (last_cmd_pct or 0.0)
+    return u_obs_pct, max(base, u_obs_pct), ff_pct
+
+
+def stretch_launch_bands(
+    bands: list[HoldInterval], events: list[tuple[int, int]], step_s: float
+) -> tuple[list[HoldInterval], list[tuple[float, float]]]:
+    """2026-11-07 段16 B-2: 計画が選んだ帯の発進の δ（events ＝ (帯の終わりの行 a, δ)）だけ、
+    実行中の帯の区間（終わり ≈ a × 周期）を後ろへ伸ばす。戻り値 (伸ばした区間の一覧,
+    伸ばした区間ごとの (元の最後の周期の時刻, 伸ばした後の最後の周期の時刻))。
+    δ ＝ 0 の発進・合う区間が無い発進はそのまま。伸ばした行の帯の FF は元の最後の周期の値のまま
+    （band_ff_time で時刻を差し替える）。"""
+    out = list(bands)
+    ext: list[tuple[float, float]] = []
+    for a, d in events:
+        if d <= 0:
+            continue
+        end_s = a * step_s
+        best = min(
+            range(len(out)), key=lambda k: abs(out[k].end_s - end_s), default=None
+        )
+        if best is None or abs(out[best].end_s - end_s) > 2.0 * step_s + 1e-9:
+            continue
+        iv = out[best]
+        out[best] = HoldInterval(iv.start_s, iv.length_s + d * step_s, iv.mean_kmh)
+        ext.append((iv.end_s - step_s, iv.end_s - step_s + d * step_s))
+    return out, ext
+
+
+def band_ff_time(t_s: float, ext: list[tuple[float, float]], step_s: float) -> float:
+    """帯の FF を引く時刻。B-2 で伸ばした行（元の最後の周期の後〜伸ばした最後の周期）は元の最後の
+    周期の時刻（FF は元の帯の終わりの値のまま）、それ以外は t_s のまま。"""
+    tol = 0.5 * step_s
+    for t_orig, t_new in ext:
+        if t_orig + tol < t_s <= t_new + tol:
+            return t_orig
+    return t_s

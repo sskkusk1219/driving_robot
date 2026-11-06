@@ -444,3 +444,68 @@ def test_plan_strong_launch_gap_still_tightened() -> None:
     assert on.return_gap.n_violations == 0
     ref = plan_for(strong, 16.0, _tb(), **dict(_PLAN_KW, launch_gap_tight=True))
     assert np.array_equal(ref.effort_pct, on.effort_pct)
+
+
+# ───────── 2026-11-07 段16 B-2: 帯の発進のずらし（band_shift） ─────────
+
+
+def _band_base_plan():
+    ivs = _bands(_weak, 16.0)
+    spec = LaunchBandSpec(tuple((iv.start_s, iv.length_s) for iv in ivs), lambda t: 8.5)
+    return _plan(_weak, spec, predict_low_speed_sides=True), ivs
+
+
+def _shift(base, **kw):
+    return apply_launch_shift(
+        base, _weak, _tb(), stop_ref_at=None, accel_min_pct=AD, brake_min_pct=BD,
+        track=PedalTrack(), **kw,
+    )
+
+
+def test_band_shift_false_is_identical_to_default() -> None:
+    base, _ = _band_base_plan()
+    a = _shift(base)
+    b = _shift(base, band_shift=False)
+    assert a.launch_shift.deltas == b.launch_shift.deltas == [0]
+    assert a.launch_shift.band_events == []
+    assert np.array_equal(a.effort_pct, b.effort_pct)
+    assert a.launch_shift.summary() == b.launch_shift.summary()
+
+
+def test_band_shift_true_moves_only_rows_after_band_end() -> None:
+    base, ivs = _band_base_plan()
+    band_rows = np.flatnonzero(base.launch_band)
+    a = int(band_rows[-1]) + 1  # 帯の終わり（印の最後の行の次）
+    res = _shift(base, band_shift=True, deltas=[3])
+    assert res.launch_shift.deltas == [3]
+    assert res.launch_shift.band_events == [(a, 3)]
+    assert "帯の発進 1 回・δ 3 行×1" in res.launch_shift.summary()
+    # 帯の始まり〜帯の最後の行までは動かない
+    assert np.array_equal(res.effort_pct[:a], base.effort_pct[:a])
+    # 空いた 3 行は帯の最後のブレーキの値・帯の印も 3 行伸びる
+    assert np.all(res.effort_pct[a : a + 3] == base.effort_pct[a - 1])
+    assert int(res.launch_band.sum()) == int(base.launch_band.sum()) + 3
+    assert np.array_equal(np.flatnonzero(res.launch_band)[: len(band_rows)], band_rows)
+    # アクセルの始まりが 3 行後ろへずれる
+    first = lambda x: int(np.flatnonzero(x.effort_pct > 0)[0])  # noqa: E731
+    assert first(res) - first(base) == 3
+
+
+def test_band_shift_chosen_delta_is_in_range_and_band_events_match_deltas() -> None:
+    base, _ = _band_base_plan()
+    res = _shift(base, band_shift=True)
+    (a, d) = res.launch_shift.band_events[0]
+    assert res.launch_shift.deltas == [d] and 0 <= d <= 8 and a > 0
+
+
+def test_launch_dev_peak_v0_starts_integration_at_reference() -> None:
+    from tests.research import fwd_plan as fp  # noqa: PLC0415
+
+    n = 30
+    ref = np.full(n, 5.0)
+    pa = np.full(n, AD)
+    pb = np.full(n, BD)
+    args = (_tb(), ref, pa, pb, PedalTrack(), AD, BD, DT, None, None, 7.5, 0, 0, 5)
+    zero = fp._launch_dev_peak(*args)
+    from_ref = fp._launch_dev_peak(*args, v0=5.0)
+    assert zero >= 5.0 - 1e-9 and from_ref < 5.0  # 既定 v0 ＝ 0 は今と同じ

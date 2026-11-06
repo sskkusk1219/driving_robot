@@ -252,6 +252,8 @@ def _run():
     run.lbs_hold_open_cycles = 0
     run.lbs_offset_max = 0.0
     run.lbs_offset_min = 0.0
+    run._obs = None  # noqa: SLF001  # 2026-11-07 段16 型 A（off）
+    run._last_brake_cmd = 0.0  # noqa: SLF001
     return run
 
 
@@ -349,3 +351,170 @@ def test_hold_open_cycles_counted() -> None:
     dev, slope = run._lbs_observe(0.0, 0.0)  # noqa: SLF001
     run._lbs_band_cycle(5.0, dev, slope)  # noqa: SLF001
     assert run.lbs_hold_open_cycles == 1  # p ≤ band の周期は数えない
+
+
+# ───────── 2026-11-07 段16 型 A: その場で測る動き出す開度 ─────────
+
+STOP = 0.02
+
+
+def _obs_run(rows, obs=None):
+    """rows ＝ (active, ref, speed, 前の周期の実ブレーキ開度) の列。各周期の u_obs を返す。"""
+    obs = obs or lbs.LaunchBreakawayObserver()
+    out = []
+    for active, ref, speed, prev in rows:
+        out.append(obs.update(
+            active=active, ref_kmh=ref, speed_kmh=speed, prev_brake_actual_pct=prev,
+            stop_speed_kmh=STOP,
+        ))
+    return obs, out
+
+
+def test_observer_measures_only_first_cycle_over_move_threshold() -> None:
+    rows = [
+        (True, 0.0, 0.000, 9.5),
+        (True, 0.0, 0.010, 9.4),  # ちょうど 0.01 は動いていない（> のみ）
+        (True, 0.0, 0.011, 9.1),  # 最初に超えた周期: 前の周期の実開度 9.1
+        (True, 0.0, 0.200, 8.0),  # 以降は測り直さない
+    ]
+    obs, out = _obs_run(rows)
+    assert out == [None, None, 9.1, 9.1]
+    assert obs.measured == [9.1] and obs.take_first() is True and obs.take_first() is False
+
+
+def test_observer_does_not_measure_after_reference_started_moving() -> None:
+    rows = [
+        (True, 0.0, 0.0, 9.0),
+        (True, 0.5, 0.0, 9.0),  # 基準が停車速度を超えた: もう測らない
+        (True, 0.6, 0.3, 8.9),  # 車が後から動いても None のまま
+    ]
+    obs, out = _obs_run(rows)
+    assert out == [None, None, None] and obs.measured == []
+    assert "測れた発進 0 / 1" in obs.summary()
+
+
+def test_observer_remeasures_for_each_new_launch() -> None:
+    rows = [
+        (True, 0.0, 0.05, 9.2),  # 1 本目: 9.2（同じ周期で動いている）
+        (False, 0.0, 0.0, 9.2),  # 並びを出ると捨てる
+        (True, 0.0, 0.0, 9.0),
+        (True, 0.0, 0.02, 8.8),  # 2 本目: 8.8
+    ]
+    obs, out = _obs_run(rows)
+    assert out == [9.2, None, None, 8.8]
+    assert obs.measured == [9.2, 8.8] and obs.n_sequences == 2
+    assert "8.80〜9.20%" in obs.summary()
+
+
+def test_observer_none_when_prev_actual_missing() -> None:
+    obs, out = _obs_run([(True, 0.0, 0.5, None), (True, 0.0, 0.5, 9.0)])
+    assert out == [None, 9.0]  # 前の周期の実開度が無い周期は測れず、次の周期で測る
+
+
+def test_observer_seen_band_flag() -> None:
+    obs = lbs.LaunchBreakawayObserver()
+    obs.update(active=True, ref_kmh=0.0, speed_kmh=0.0, prev_brake_actual_pct=9.0,
+               stop_speed_kmh=STOP)
+    assert obs.seen_band is False
+    obs.update(active=True, ref_kmh=0.0, speed_kmh=0.0, prev_brake_actual_pct=9.0,
+               stop_speed_kmh=STOP, band_row=True)
+    assert obs.seen_band is True
+    obs.update(active=False, ref_kmh=0.0, speed_kmh=0.0, prev_brake_actual_pct=9.0,
+               stop_speed_kmh=STOP)
+    assert obs.seen_band is False
+
+
+def test_launch_band_seq_rows_only_runs_with_band_rows() -> None:
+    import numpy as np  # noqa: PLC0415
+
+    prep = np.array([0, 1, 1, 1, 0, 1, 1, 0, 0], dtype=bool)
+    band = np.array([0, 0, 0, 1, 0, 0, 0, 0, 0], dtype=bool)
+    got = lbs.launch_band_seq_rows(prep, band)
+    assert got.tolist() == [False, True, True, True, False, False, False, False, False]
+    assert lbs.launch_band_seq_rows(None, band) is None
+    assert lbs.launch_band_seq_rows(prep, None) is None
+
+
+def test_obs_inputs_without_u_obs_is_unchanged() -> None:
+    assert lbs.launch_band_obs_inputs(
+        None, first=True, cap_pct=CAP, prev_out_pct=7.0, last_cmd_pct=9.0, ff_pct=8.0
+    ) == (CAP, 7.0, None)
+
+
+def test_obs_inputs_cap_and_first_cycle_prev_out_become_u_obs() -> None:
+    # 帯の最初の周期（prev_out が None）: 前の周期の最終指令 8.0 と u_obs 9.1 の深い方
+    cap, prev_out, prev_ff = lbs.launch_band_obs_inputs(
+        9.1, first=True, cap_pct=CAP, prev_out_pct=None, last_cmd_pct=8.0, ff_pct=7.5
+    )
+    assert (cap, prev_out, prev_ff) == (9.1, 9.1, 7.5)
+    # 帯の中で測れた周期: 前の出す開度 9.5 のほうが深ければそれを保つ
+    cap, prev_out, prev_ff = lbs.launch_band_obs_inputs(
+        9.1, first=True, cap_pct=CAP, prev_out_pct=9.5, last_cmd_pct=8.0, ff_pct=7.5
+    )
+    assert (cap, prev_out, prev_ff) == (9.1, 9.5, 7.5)
+    # 2 周期目以降は上限だけ u_obs
+    assert lbs.launch_band_obs_inputs(
+        9.1, first=False, cap_pct=CAP, prev_out_pct=8.7, last_cmd_pct=8.7, ff_pct=7.5
+    ) == (9.1, 8.7, None)
+
+
+def test_obs_first_cycle_holds_opening_when_forecast_is_fast_and_carries_offset_otherwise() -> None:
+    cap, prev_out, prev_ff = lbs.launch_band_obs_inputs(
+        9.1, first=True, cap_pct=CAP, prev_out_pct=None, last_cmd_pct=0.0, ff_pct=7.5
+    )
+    kw = dict(KW, cap_pct=cap)
+    # 見込み > +0.3: 開度そのものを保つ（FF が 7.5 でも 9.1）
+    off, out, code, _ = lbs.launch_band_step(
+        prev_out, prev_ff, 7.5, **dict(kw, dev_kmh=0.5, slope_kmhs=0.0)
+    )
+    assert out == pytest.approx(9.1) and code == lbs.LBS_CODE_HELD
+    # 0〜+0.3: 上乗せ ＝ u_obs − FF を引き継ぐ
+    off, out, code, _ = lbs.launch_band_step(
+        prev_out, prev_ff, 7.5, **dict(kw, dev_kmh=0.1, slope_kmhs=0.0)
+    )
+    assert out == pytest.approx(9.1) and off == pytest.approx(1.6)
+
+
+def test_stretch_launch_bands_extends_matching_interval_by_delta() -> None:
+    from tests.research.hold_scene import HoldInterval  # noqa: PLC0415
+
+    dt = 0.05
+    bands = [HoldInterval(3.0, 0.60, 1.0), HoldInterval(20.0, 0.50, 1.0)]
+    new, ext = lbs.stretch_launch_bands(bands, [(72, 3), (400, 0)], dt)  # a ＝ 72 → 3.6 s
+    assert new[0].start_s == 3.0 and new[0].length_s == pytest.approx(0.75)
+    assert new[1] == bands[1]  # δ ＝ 0 は触らない
+    assert ext == [(pytest.approx(3.55), pytest.approx(3.70))]
+    # 合う区間が無い（遠い）ものは何もしない
+    assert lbs.stretch_launch_bands(bands, [(200, 4)], dt) == (bands, [])
+
+
+def test_band_ff_time_replaces_only_extended_rows() -> None:
+    ext = [(3.55, 3.70)]
+    dt = 0.05
+    assert lbs.band_ff_time(3.50, ext, dt) == 3.50
+    assert lbs.band_ff_time(3.55, ext, dt) == 3.55  # 元の最後の周期
+    assert lbs.band_ff_time(3.60, ext, dt) == 3.55
+    assert lbs.band_ff_time(3.70, ext, dt) == 3.55
+    assert lbs.band_ff_time(3.75, ext, dt) == 3.75
+    assert lbs.band_ff_time(5.0, [], dt) == 5.0
+
+
+def test_mode_run_band_cycle_with_u_obs_caps_and_carries_opening() -> None:
+    run = _run()
+    run._obs = lbs.LaunchBreakawayObserver()  # noqa: SLF001
+    run._obs.update(  # noqa: SLF001
+        active=True, ref_kmh=0.0, speed_kmh=0.5, prev_brake_actual_pct=9.1, stop_speed_kmh=STOP
+    )
+    assert run._obs.u_obs == 9.1  # noqa: SLF001
+    # 帯の最初の周期（前の周期が帯でない）でも規則を通す: 見込み > +0.3 なら u_obs を保つ
+    pct, code = run._lbs_band_cycle(7.5, 0.5, 0.0)  # noqa: SLF001
+    assert pct == pytest.approx(9.1) and code == lbs.LBS_CODE_HELD
+    # 次の周期の上限は u_obs（pkl の 8.905 ではない）。上げたい状態でも 9.1 を超えない
+    pct2, _ = run._lbs_band_cycle(7.5, 0.5, 2.0)  # noqa: SLF001
+    assert pct2 <= 9.1 + 1e-9
+
+
+def test_mode_run_band_cycle_without_obs_keeps_first_cycle_behavior() -> None:
+    run = _run()
+    pct, code = run._lbs_band_cycle(7.5, 0.5, 0.0)  # noqa: SLF001
+    assert pct == 7.5 and code == lbs.LBS_CODE_NONE  # 上乗せ 0・出す開度 ＝ FF（今と同じ）

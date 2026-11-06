@@ -677,6 +677,19 @@ class LaunchShiftStats:
     deltas: list = field(default_factory=list)  # 発進ごとに選んだ δ [行]
     scores: list = field(default_factory=list)  # (δ=0 の最悪点, 選んだ δ の最悪点) [km/h]
     n_rejected: int = 0  # 同時踏みが増えるため候補から外した (発進, δ) の数
+    # 2026-11-07 段16 B-2（launch_band_shift）: 帯の発進の (帯の終わりの行 a, 選んだ δ)。
+    # 走行時に実行中の帯の区間を δ 行伸ばすのに使う。使わなければ空
+    band_events: list = field(default_factory=list)
+
+    def band_summary(self) -> str:
+        """帯の発進の δ の表示（無ければ空文字）。例: 「帯の発進 3 回・δ 0 行×1・2 行×2」"""
+        if not self.band_events:
+            return ""
+        counts: dict[int, int] = {}
+        for _a, d in self.band_events:
+            counts[d] = counts.get(d, 0) + 1
+        parts = "・".join(f"{d} 行×{counts[d]}" for d in sorted(counts))
+        return f"帯の発進 {len(self.band_events)} 回・δ {parts}"
 
     def summary(self) -> str:
         """走行前の表示用。例: 「あり・発進 3 回・δ 0 行×1・2 行×2」"""
@@ -688,7 +701,9 @@ class LaunchShiftStats:
         parts = "・".join(f"{d} 行×{counts[d]}" for d in sorted(counts))
         shifted = sum(1 for d in self.deltas if d > 0)
         head = "あり" if shifted else "なし"
-        return f"{head}・発進 {self.n_launch} 回・δ {parts}"
+        text = f"{head}・発進 {self.n_launch} 回・δ {parts}"
+        band = self.band_summary()
+        return f"{text}・{band}" if band else text
 
 
 @dataclass
@@ -864,6 +879,7 @@ def build_plan(
     predict_low_speed_sides: bool = False,
     launch_shift_choose: bool = False,
     launch_shift_center_lag: bool = False,  # 2026-11-06 段4
+    launch_band_shift: bool = False,  # 2026-11-07 段16 B-2
     launch_gap_tight: bool = False,
     launch_band: LaunchBandSpec | None = None,
     stop_tail_kmh: float | None = None,
@@ -1035,6 +1051,7 @@ def build_plan(
             brake_min_pct=brake_deadband_pct, track=pedal_track or PedalTrack(),
             creep=_creep_of(predict_creep_curve, creep_accel_speeds_kmh, creep_accel_kmhs),
             center_lag_only=launch_shift_center_lag,  # 2026-11-06 段4
+            band_shift=launch_band_shift,  # 2026-11-07 段16 B-2
         )
         if launch_gap_tight:
             # 2026-10-31 発進のすき間（案 A）: δ は詰めない計画（今の本体と同じ）で選び、その δ を
@@ -1870,6 +1887,7 @@ def apply_launch_shift(
     creep: tuple[np.ndarray, np.ndarray] | None = None,
     deltas: Sequence[int] | None = None,
     center_lag_only: bool = False,
+    band_shift: bool = False,
 ) -> ForwardPlan:
     """停車からの各発進で、発進の並びを δ 行（0〜LAUNCH_SHIFT_MAX_ROWS）後ろへずらす
     （2026-10-27 段13。すき間の処理まで済んだ計画に掛ける）。
@@ -1891,7 +1909,15 @@ def apply_launch_shift(
     None は今までと同じ。
 
     2026-11-06 段4: center_lag_only が True なら、採点を遅れの 3 通りの最悪でなく中の遅れ（dr=0）
-    だけにする。False は今までと同じ。"""
+    だけにする。False は今までと同じ。
+
+    2026-11-07 段16 B-2: band_shift が True なら、帯の発進（今は δ ＝ 0 で飛ばす）にも δ を使う。
+    a ＝ 帯の印の最後の行の次（帯の終わり）、b ＝ a ＋ LAUNCH_SHIFT_AFTER_GO_S。行 a〜b を δ 行
+    後ろへ移し（空いた行は行 a−1 ＝ 帯の最後のブレーキの値。帯の印も伸びる）、帯の始まりは
+    動かさない。
+    採点は行 a から車速 ＝ 基準（v0 ＝ ref[a]。帯の終わりの偏差は 0 とする）で積み、a〜
+    a ＋ LAUNCH_SHIFT_SCORE_TO_S の |偏差| の最大で比べる。帯の発進の (a, δ) は
+    stats.band_events へ。False は今までと完全に同じ。"""
     n = len(plan.effort_pct)
     dt = plan.period_s
     t = plan.t_s
@@ -1924,10 +1950,28 @@ def apply_launch_shift(
         k_sc0 = max(t0 - round(LAUNCH_SHIFT_SCORE_FROM_S / dt), 0)
         k_end = min(t0 + round(LAUNCH_SHIFT_SCORE_TO_S / dt), n - 1)
         band_launch = plan.launch_band is not None and bool(plan.launch_band[t0 : t0 + 2].any())
+        v0 = 0.0
+        if band_launch and band_shift:
+            # 2026-11-07 段16 B-2: 帯の発進は、帯の終わり（印の最後の行の次）から後ろをずらす
+            j = t0 + int(np.argmax(plan.launch_band[t0 : t0 + 2]))
+            while j + 1 < n and plan.launch_band[j + 1]:
+                j += 1
+            a = max(j + 1, last_b + 1, 1)
+            b = min(a + round(LAUNCH_SHIFT_AFTER_GO_S / dt), n - 1)
+            r_a = a
+            k_sc0 = a
+            k_end = min(a + round(LAUNCH_SHIFT_SCORE_TO_S / dt), n - 1)
+            v0 = float(ref[a]) if a < n else 0.0
+            band_launch = False
+            is_band_ev = True
+        else:
+            is_band_ev = False
         if band_launch or a + LAUNCH_SHIFT_MAX_ROWS >= b or k_end <= k_sc0:
             # 2026-10-31 発進のブレーキの帯（案 B）: 帯の発進はずらさない（δ ＝ 0）
             stats.deltas.append(0)
             stats.scores.append((0.0, 0.0))
+            if is_band_ev:
+                stats.band_events.append((a, 0))
             continue
         st = max(min(a, r_a) - 40, 0)
         en = max(b, k_end) + 1
@@ -1951,7 +1995,7 @@ def apply_launch_shift(
             worst = max(
                 _launch_dev_peak(
                     table, ref[st:en], pa, pb, trv, accel_min_pct, brake_min_pct, dt, sa_c, sb_c,
-                    top, r_a - st, k_sc0 - st, k_end - st, creep,
+                    top, r_a - st, k_sc0 - st, k_end - st, creep, v0,
                 )
                 for trv in trs
             )
@@ -1965,6 +2009,8 @@ def apply_launch_shift(
             d_best = int(deltas[ev_k]) if ev_k < len(deltas) else 0
         stats.deltas.append(d_best)
         stats.scores.append((score0, best[0]))
+        if is_band_ev:
+            stats.band_events.append((a, d_best))
         if d_best > 0:
             eff = _shift_back(eff, a, b, d_best)
             flag = _shift_back(flag, a, b, d_best)
@@ -1999,12 +2045,14 @@ def _launch_dev_peak(
     k_sc0: int,
     k_end: int,
     creep: tuple[np.ndarray, np.ndarray] | None = None,
+    v0: float = 0.0,
 ) -> float:
-    """行 k_from から v=0 で車速を積み（v[k+1] = max(v[k] + 予測した加速度[k] × 周期, 0)）、行
-    k_sc0〜k_end の |v − 基準| の最大 [km/h]。位置 pa・pb は遅れ trv を入れて引く。"""
+    """行 k_from から v=v0（既定 0。2026-11-07 段16 B-2 の帯の終わりは v0 ＝ 基準）で車速を積み
+    （v[k+1] = max(v[k] + 予測した加速度[k] × 周期, 0)）、行 k_sc0〜k_end の |v − 基準| の最大
+    [km/h]。位置 pa・pb は遅れ trv を入れて引く。"""
     qa = _shift_pos(pa, trv.accel_effect_lag_s / period_s)
     qb = _shift_pos(pb, trv.brake_effect_lag_s / period_s)
-    v = 0.0
+    v = v0
     worst = 0.0
     for k in range(k_from, k_end + 1):
         if k >= k_sc0:

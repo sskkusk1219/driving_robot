@@ -202,6 +202,9 @@ CSV_COLUMNS: tuple[str, ...] = (
     # 1 保った・2 踏み増した・3 FF へ離した・4 待ち・5 FF より浅く離した・6 帯の終わりで min へ
     # 離すのを待った（機能 off は空欄）
     "launch_step_code",
+    # 2026-11-07 段16 型 A（forward_map.launch_breakaway_observed）: 帯のある発進の並びで、
+    # その周期に有効な「その場で測った動き出す開度」u_obs [%]（ブレーキ実開度。off・未測定は空欄）
+    "launch_obs_pct",
 )
 
 
@@ -268,6 +271,7 @@ class DriveSample:
     # 保った周期 1・戻した周期 2・少し戻した 3・待ち 4・他は 0（off は None）
     stop_keep_held: int | None = None
     launch_step_code: int | None = None  # 発進の帯の FB の印 0〜6（off は None）
+    launch_obs_pct: float | None = None  # 段16 型 A: 測った動き出す開度 [%]（off・未測定は None）
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -378,6 +382,7 @@ class SessionLog:
         stop_keep_active: int | None = None,
         stop_keep_held: int | None = None,
         launch_step_code: int | None = None,
+        launch_obs_pct: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -435,6 +440,7 @@ class SessionLog:
             stop_keep_active=stop_keep_active,
             stop_keep_held=stop_keep_held,
             launch_step_code=launch_step_code,
+            launch_obs_pct=launch_obs_pct,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -649,6 +655,7 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 "" if s.stop_keep_active is None else str(s.stop_keep_active),
                 "" if s.stop_keep_held is None else str(s.stop_keep_held),
                 "" if s.launch_step_code is None else str(s.launch_step_code),
+                _fmt(s.launch_obs_pct),
             ])
 
 

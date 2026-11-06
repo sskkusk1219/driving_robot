@@ -454,4 +454,10 @@ def test_launch_step_code_column_is_registered_and_blank_when_off() -> None:
     # 2026-11-06 発進の帯の FB: 印の列（off は空欄）
     assert "launch_step_code" in dlmod.CSV_COLUMNS
     assert dlmod.DriveSample.__dataclass_fields__["launch_step_code"].default is None
-    assert dlmod.CSV_COLUMNS[-1] == "launch_step_code"
+    assert "launch_step_code" in dlmod.CSV_COLUMNS
+
+
+def test_launch_obs_pct_column_is_last_and_blank_when_off() -> None:
+    # 2026-11-07 段16 型 A: 測った動き出す開度の列（off・未測定は空欄）
+    assert dlmod.CSV_COLUMNS[-1] == "launch_obs_pct"
+    assert dlmod.DriveSample.__dataclass_fields__["launch_obs_pct"].default is None

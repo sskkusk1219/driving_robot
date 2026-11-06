@@ -824,6 +824,7 @@ class ForwardMapFeedforward:
         predict_low_speed_sides: bool = False,
         launch_shift_choose: bool = False,
         launch_shift_center_lag: bool = False,  # 2026-11-06 段4
+        launch_band_shift: bool = False,  # 2026-11-07 段16 B-2
         launch_gap_tight: bool = False,
         launch_band: LaunchBandSpec | None = None,
         stop_tail_kmh: float | None = None,
@@ -888,6 +889,7 @@ class ForwardMapFeedforward:
             predict_low_speed_sides=predict_low_speed_sides,
             launch_shift_choose=launch_shift_choose,
             launch_shift_center_lag=launch_shift_center_lag,  # 2026-11-06 段4
+            launch_band_shift=launch_band_shift,  # 2026-11-07 段16 B-2
             launch_gap_tight=launch_gap_tight,  # 2026-10-31 発進のすき間（案 A）
             launch_band=launch_band,  # 2026-10-31 発進のブレーキの帯（案 B）
             stop_tail_kmh=stop_tail_kmh,  # 2026-11-03 停車前の踏み増し
