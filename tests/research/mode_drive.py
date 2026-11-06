@@ -440,6 +440,7 @@ def forward_map_plan_args(
         accel_release_in_range_only=fm.accel_release_in_range_only,  # 段9-c
         predict_low_speed_sides=fm.predict_low_speed_sides,  # 段13
         launch_shift_choose=fm.launch_shift_choose,  # 段13
+        launch_shift_center_lag=fm.launch_shift_center_lag,  # 2026-11-06 段4
         launch_gap_tight=fm.launch_gap_tight,  # 2026-10-31 発進のすき間（案 A）
         predict_creep_curve=fm.predict_creep_curve,  # 段14 L1
         creep_accel_speeds_kmh=tuple(ff_cfg.creep_accel_speeds_kmh),
@@ -1030,6 +1031,8 @@ def _prepare_forward_map_plan(
     say("  発進の並びを予測した偏差が最小になるよう後ろへずらす（段13）: "
         f"{'あり' if fm.launch_shift_choose else 'なし'}"
         + (f"（発進のずらし: {ls.summary()}）" if ls is not None else ""))
+    say("  発進のずらしの δ の選び方（2026-11-06 段4）: "
+        f"{'中の遅れだけ' if fm.launch_shift_center_lag else '遅れ ±1 行の最悪'}")
     say(
         "  アクセルの戻しの層を学習の範囲の中だけで使う（段9-c）: "
         f"{'あり' if fm.accel_release_in_range_only else 'なし'}"

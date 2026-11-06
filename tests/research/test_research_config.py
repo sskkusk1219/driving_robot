@@ -1373,6 +1373,7 @@ def test_keys_missing_in_yaml_lists_dataclass_keys_not_written(tmp_path: Path) -
     text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
     base = cfgmod.keys_missing_in_yaml(cfgmod.DEFAULT_CONFIG_PATH)
     assert base == [
+        "forward_map.launch_shift_center_lag",
         "forward_map.low_speed_keep_enabled",
         "forward_map.low_speed_keep_band",
         "forward_map.low_speed_keep_window_s",
@@ -1797,3 +1798,15 @@ def test_road_load_file_overrides_vehicle_values(tmp_path: Path) -> None:
     private.write_text("max_speed_kmh: 1.0\n", encoding="utf-8")
     with pytest.raises(cfgmod.ConfigError):
         cfgmod.load_config(yaml_path)
+
+
+def test_launch_shift_center_lag_default_false_and_needs_launch_shift_choose() -> None:
+    # 2026-11-06 段4: 既定 off。launch_shift_choose が false のまま true にすると検証で弾く
+    assert cfgmod.ForwardMapSection().launch_shift_center_lag is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.forward_map.launch_shift_center_lag is False
+    cfg.forward_map.launch_shift_choose = True
+    cfg.forward_map.launch_shift_center_lag = True
+    assert not any("launch_shift_center_lag" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.launch_shift_choose = False
+    assert any("launch_shift_center_lag" in p for p in cfgmod.validate_config(cfg))

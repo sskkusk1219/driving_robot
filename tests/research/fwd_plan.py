@@ -863,6 +863,7 @@ def build_plan(
     accel_release_in_range_only: bool = False,
     predict_low_speed_sides: bool = False,
     launch_shift_choose: bool = False,
+    launch_shift_center_lag: bool = False,  # 2026-11-06 段4
     launch_gap_tight: bool = False,
     launch_band: LaunchBandSpec | None = None,
     stop_tail_kmh: float | None = None,
@@ -1033,6 +1034,7 @@ def build_plan(
             stop_ref_at=stop_ref_at, accel_min_pct=accel_deadband_pct,
             brake_min_pct=brake_deadband_pct, track=pedal_track or PedalTrack(),
             creep=_creep_of(predict_creep_curve, creep_accel_speeds_kmh, creep_accel_kmhs),
+            center_lag_only=launch_shift_center_lag,  # 2026-11-06 段4
         )
         if launch_gap_tight:
             # 2026-10-31 発進のすき間（案 A）: δ は詰めない計画（今の本体と同じ）で選び、その δ を
@@ -1867,6 +1869,7 @@ def apply_launch_shift(
     track: PedalTrack,
     creep: tuple[np.ndarray, np.ndarray] | None = None,
     deltas: Sequence[int] | None = None,
+    center_lag_only: bool = False,
 ) -> ForwardPlan:
     """停車からの各発進で、発進の並びを δ 行（0〜LAUNCH_SHIFT_MAX_ROWS）後ろへずらす
     （2026-10-27 段13。すき間の処理まで済んだ計画に掛ける）。
@@ -1885,7 +1888,10 @@ def apply_launch_shift(
 
     2026-10-31 発進のすき間（案 A）: deltas を渡すと、選び直さずに発進ごとにその δ（発進の順）を
     掛ける（launch_gap_tight の計画に、詰めない計画で選んだ δ を当てるため）。
-    None は今までと同じ。"""
+    None は今までと同じ。
+
+    2026-11-06 段4: center_lag_only が True なら、採点を遅れの 3 通りの最悪でなく中の遅れ（dr=0）
+    だけにする。False は今までと同じ。"""
     n = len(plan.effort_pct)
     dt = plan.period_s
     t = plan.t_s
@@ -1907,7 +1913,7 @@ def apply_launch_shift(
             accel_effect_lag_s=max(track.accel_effect_lag_s + dr * dt, 0.0),
             brake_effect_lag_s=max(track.brake_effect_lag_s + dr * dt, 0.0),
         )
-        for dr in (-PEAK_ROBUST_LAG_ROWS, 0, PEAK_ROBUST_LAG_ROWS)
+        for dr in ((0,) if center_lag_only else (-PEAK_ROBUST_LAG_ROWS, 0, PEAK_ROBUST_LAG_ROWS))
     ]
     tol = POSITION_RETURN_TOL_PCT
     last_b = 0

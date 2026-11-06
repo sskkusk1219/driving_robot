@@ -1151,6 +1151,13 @@ class ForwardMapSection:
     # 想定（採点が低速の表で予測する）。
     # 既定 false ＝ 今と完全に同じ。効く先: 発進の計画。決める時期: 段13 の実機
     launch_shift_choose: bool = False
+    # 2026-11-06 ProblemReport_20261106 段4: true なら、発進のずらし（launch_shift_choose）の δ を
+    # 「効くまでの遅れ ±1 行の 3 通りの最悪」でなく「中の遅れ（ずらさない）だけ」の予測で選ぶ。
+    # 根拠: 段3 の机上で予測は実機とほぼ合い（U 20 予測 +0.45・実機 +0.48）、3 通りの最悪で選ぶと
+    # δ がほぼ 1 行に寄り先に出る。中の遅れで選ぶと U 20 +0.34/−0.32 の見込み
+    # （遅れが 1 行ずれると −0.4〜−0.7 の恐れ）。launch_shift_choose が true のときだけ使える。
+    # 効く先: 帯の無い停車からの発進の δ。決める時期: 段6 の実機。既定 false ＝ 今と完全に同じ
+    launch_shift_center_lag: bool = False
     # 2026-10-31 発進のすき間（案 A。ProblemReport_20261031_発進でブレーキを離すのが早い 段1）:
     # true なら、停車からの発進のブレーキ → アクセルの踏み替えだけ、すき間（両ペダルの指令が min の
     # 行）を ReturnTime.gap_rows から 2 行（戻る時間の余裕 1 周期＋アクセルが動くまでの 1 行。
@@ -1887,6 +1894,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         not fm.launch_move_hold or fm.launch_release_ramp,
         "forward_map.launch_move_hold は launch_release_ramp が true のときだけ使える",
+    )
+    need(
+        not fm.launch_shift_center_lag or fm.launch_shift_choose,
+        "forward_map.launch_shift_center_lag は launch_shift_choose が true のときだけ使える",
     )
     need(
         not fm.launch_gap_tight or fm.launch_release_ramp,

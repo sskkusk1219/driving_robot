@@ -3956,3 +3956,32 @@ def test_switch_ramp_false_is_identical_and_true_changes_only_rows_after_a_switc
     assert np.all(near[diff])
     # 戻し → 停止側の切り替えの行は変わらない
     assert not np.any(diff & back)
+
+
+def test_launch_shift_center_lag_scores_only_middle_lag(monkeypatch) -> None:
+    """2026-11-06 段4: launch_shift_center_lag が off なら遅れ ±1 行の 3 通りで採点し（今と同じ）、
+    on なら中の遅れ 1 通りだけで採点する。δ は範囲内。"""
+    from tests.research import fwd_plan as fp  # noqa: PLC0415
+
+    calls: list[float] = []
+    orig = fp._launch_dev_peak
+
+    def spy(table, ref, pa, pb, trv, *a, **k):
+        calls.append(trv.accel_effect_lag_s)
+        return orig(table, ref, pa, pb, trv, *a, **k)
+
+    monkeypatch.setattr(fp, "_launch_dev_peak", spy)
+    ref = _stop_then_go(8.0)
+    kw = dict(_K13, predict_low_speed_sides=True, launch_shift_choose=True)
+    off = plan_for(ref, 16.0, _table13(), **kw)
+    n_off = len(calls)
+    calls.clear()
+    on = plan_for(ref, 16.0, _table13(), launch_shift_center_lag=True, **kw)
+    n_on = len(calls)
+    assert n_off > 0 and n_on > 0 and n_off == 3 * n_on
+    assert len(set(calls)) == 1  # 中の遅れだけ
+    assert all(0 <= d <= fp.LAUNCH_SHIFT_MAX_ROWS for d in on.launch_shift.deltas)
+    # off の既定指定（False）は渡さないときと同じ計画
+    same = plan_for(ref, 16.0, _table13(), launch_shift_center_lag=False, **kw)
+    assert np.array_equal(off.effort_pct, same.effort_pct)
+    assert off.launch_shift.deltas == same.launch_shift.deltas
