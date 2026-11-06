@@ -1377,7 +1377,6 @@ def test_keys_missing_in_yaml_lists_dataclass_keys_not_written(tmp_path: Path) -
         "forward_map.low_speed_keep_enabled",
         "forward_map.low_speed_keep_band",
         "forward_map.low_speed_keep_window_s",
-        "forward_map.launch_band_step_fb",
         "learning.stop_brake_floor_start_tol_kmh",
         "learning.stop_brake_floor_min_float_s",
         "learning.stop_brake_floor_opening_tol_pct",
