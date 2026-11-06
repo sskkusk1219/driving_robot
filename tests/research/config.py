@@ -1358,16 +1358,19 @@ class ForwardMapSection:
     # 走る前に止める。
     # 既定 false ＝ 今と完全に同じ。ログ: stop_keep_held 3（戻した）・4（待ち）
     stop_approach_step_release: bool = False
-    # 2026-11-06 ProblemReport_20261106_発進で速すぎでもブレーキを戻す 段1: true なら、発進の
-    # ブレーキの帯（launch_brake_band。hold_scene 3）の中の保持の PI を使わず、「L 先の偏差の
-    # 見込み（偏差 ＋ 偏差の傾き × L）」で踏み増す・保つ・FF へ少しずつ離すを決める
-    # （launch_band_step.py）。見込み > +0.3 → 傾き ÷ 効き だけ踏み増して待つ（上限 ＝ 動き出す
-    # 開度）・0 〜 +0.3 → 浅くしない・≤ 0 → FF まで少しずつ離す・< −0.3 → FF より浅くてよい。
-    # 帯の終わりも、見込み > 0 の間はブレーキを前の周期の値で保つ（L 先の基準 ≥ creep_speed_kmh
-    # で打ち切り）。根拠: 発進で FF が基準だけを見て浅くなり車がクリープで先に出た
-    # （+0.3〜+0.95 km/h）。効きは停止側と同じ pkl meta stop_release_gain_kmhs_pct。
-    # launch_brake_band・hold_pi_enabled が要る。pkl の meta に効き・動き出す開度が無ければ走る前に
-    # 止める。既定 false ＝ 今と完全に同じ。ログ: launch_step_code（印 1〜6）
+    # 2026-11-06 ProblemReport_20261106_発進で速すぎでもブレーキを戻す 段1→段8: true なら、発進の
+    # ブレーキの帯（launch_brake_band。hold_scene 3）の中の保持の PI を使わず、「FF からの上乗せ
+    # （＝ 出す開度 − FF）」を L 先の偏差の見込み（偏差 ＋ 偏差の傾き × L）で増やす・保つ・減らす
+    # （launch_band_step.py）。出す開度 ＝ FF ＋ 上乗せ（min〜動き出す開度に収める。FF が動けば
+    # 出す開度も同じだけ動く）。上乗せは帯の最初の周期で 0。見込み > +0.3 かつ傾き > 0 → 傾き ÷ 効き
+    # だけ増やして待つ（上限で増えなければ保つ）・0 〜 +0.3 → 保つ・≤ 0 かつ傾き < 0 → 0 まで同じ量
+    # だけ減らして待つ・< −0.3 かつ傾き < 0 → 0 より下（FF より浅く）へも減らして待つ。FF が上限
+    # より深いときは FF をそのまま出す。帯の終わりの延長は無い（帯の直後は計画のまま）。
+    # 根拠: 段6 実機で開度そのものを保つ形は遅すぎが増えた（−0.53〜−3.39 km/h。FF の先読みを
+    # 止めていた）。上乗せにすると FF の先読みが通る（ユーザー決定 2026-11-06）。効きは停止側と同じ
+    # pkl meta stop_release_gain_kmhs_pct。launch_brake_band・hold_pi_enabled が要る。pkl の meta に
+    # 効き・動き出す開度が無ければ走る前に止める。既定 false ＝ 今と完全に同じ。
+    # ログ: launch_step_code（印 1〜5）
     launch_band_step_fb: bool = False
 
 
