@@ -5,7 +5,8 @@
 偏差 ＝ 実車速 − 基準、＋が速すぎ）」で 踏み増す・保つ・FF へ少しずつ離す を決める純粋な関数と、
 走る前の設定の読み出し。停止側の mode_drive.step_release_brake・step_release_setup と同じ形。
 2026-11-06 段8: 帯の中は開度そのものでなく「FF からの上乗せ（出す開度 − FF）」を保つ・増やす・
-減らす形（FF の先読みが通る）。帯の終わりの延長は無い。ブレーキ開度は正 [%]。
+減らす形（FF の先読みが通る）。帯の終わりの延長は無い。段12: 見込み > +band の間だけは開度
+そのものを保つ。ブレーキ開度は正 [%]。
 tests は src を import しない（自己完結）。"""
 
 from __future__ import annotations
@@ -45,7 +46,8 @@ def _finalize(
 
 
 def launch_band_step(
-    prev_offset_pct: float,
+    prev_out_pct: float,
+    prev_ff_pct: float,
     ff_pct: float,
     *,
     dev_kmh: float,
@@ -58,34 +60,37 @@ def launch_band_step(
     wait_left: int,
     wait_cycles: int,
 ) -> tuple[float, float, int, int]:
-    """帯の中の 1 周期の判定（2026-11-06 段8。FF からの上乗せの形）。戻り値
-    (新しい上乗せ [%], 出すブレーキ開度 [%], 印, 残りの待ち周期)。上乗せ ＝ 出す開度 − FF。
-    出す開度 ＝ FF ＋ 上乗せ（[min, cap] に収める）なので、FF が動けば出す開度も同じだけ動く。
-    待ちの間（wait_left > 0）は上乗せそのまま（印 4）。傾きが無い（履歴不足）ときは保つ。
-    見込み p ＝ dev ＋ slope × L。
-    - p > +band かつ slope > 0: 上乗せ ＋ slope ÷ 効き（印 2）。上限で増えなければ待たずに保つ
-    - 0 < p ≤ +band: 保つ
-    - p < −band かつ slope < 0: 上乗せ − (−slope) ÷ 効き。0 より下（FF より浅い）へ行ってよい
-      （下限 min_pct。印 5）
-    - p ≤ 0 かつ slope < 0（上以外）: 上乗せが正なら 0 まで同じ量だけ減らす（印 3）
-    - 上のどれでもない: 保つ
-    保つ ＝ 上乗せそのまま。上乗せが 0 なら印 0、そうでなければ印 1。
-    動かしたら wait_cycles 周期待つ。"""
+    """帯の中の 1 周期の判定（2026-11-06 段12。速すぎが大きいときは開度そのものを保つ）。戻り値
+    (新しい上乗せ [%] ＝ 出す開度 − FF, 出すブレーキ開度 [%], 印, 残りの待ち周期)。
+    前の周期の出す開度 prev_out・FF prev_ff を受け取る（段8 の上乗せ ＝ prev_out − prev_ff）。
+    見込み p ＝ dev ＋ slope × L（傾きが無ければ p ＝ dev。増減はしない）。
+    - p > +band: 開度そのものを保つ（out ＝ max(prev_out, FF)。FF が下がっても浅くしない・
+      FF の方が深ければ FF）。待ちでなく slope > 0 なら prev_out ＋ slope ÷ 効き（上限 cap、
+      FF 未満にしない）を試し、増えたら印 2・待ち。増えなければ印 1。待ち中は印 4。
+      FF が cap より深いときは out ＝ FF（印 0）
+    - p ≤ +band（待ち中も含む）: 段8 と同じ FF ＋ 上乗せ。待ち中は上乗せを動かさない（印 4）。
+      0 〜 +band は保つ・p ≤ 0 かつ slope < 0 は 0 まで減らす（印 3）・p < −band かつ slope < 0 は
+      0 より下（FF より浅く。下限 min）へ減らす（印 5）。動かしたら wait_cycles 待つ。
+      保つ ＝ 上乗せそのまま（上乗せ 0 なら印 0、そうでなければ印 1）。"""
     eps = 1e-9
-    if wait_left > 0:
-        off, out = _finalize(ff_pct, prev_offset_pct, cap_pct, min_pct)
-        return off, out, LBS_CODE_WAIT, wait_left - 1
+    p = launch_band_forecast(dev_kmh, slope_kmhs, lag_s)
+    if p > dev_band_kmh:
+        if ff_pct > cap_pct:  # FF は削らない・増やさない
+            return 0.0, ff_pct, LBS_CODE_NONE, max(wait_left - 1, 0)
+        hold_out = max(prev_out_pct, ff_pct)
+        if wait_left > 0:
+            return hold_out - ff_pct, hold_out, LBS_CODE_WAIT, wait_left - 1
+        if slope_kmhs is not None and slope_kmhs > 0.0 and gain_kmhs_pct > 0.0:
+            cand = max(min(prev_out_pct + slope_kmhs / gain_kmhs_pct, cap_pct), ff_pct)
+            if cand > prev_out_pct + eps:
+                return cand - ff_pct, cand, LBS_CODE_RAISED, wait_cycles
+        return hold_out - ff_pct, hold_out, LBS_CODE_HELD, 0
+    prev_offset_pct = prev_out_pct - prev_ff_pct
     off, out = _finalize(ff_pct, prev_offset_pct, cap_pct, min_pct)
+    if wait_left > 0:
+        return off, out, LBS_CODE_WAIT, wait_left - 1
     hold = (off, out, LBS_CODE_NONE if abs(off) <= eps else LBS_CODE_HELD, 0)
     if slope_kmhs is None or gain_kmhs_pct <= 0.0:
-        return hold
-    p = launch_band_forecast(dev_kmh, slope_kmhs, lag_s)
-    if p > dev_band_kmh and slope_kmhs > 0.0:
-        new, new_out = _finalize(
-            ff_pct, prev_offset_pct + slope_kmhs / gain_kmhs_pct, cap_pct, min_pct
-        )
-        if new > prev_offset_pct + eps and ff_pct <= cap_pct:  # FF が上限超なら増やさない
-            return new, new_out, LBS_CODE_RAISED, wait_cycles
         return hold
     if p > 0.0:
         return hold

@@ -27,8 +27,15 @@ KW = dict(
 )
 
 
-def _step(prev_off: float, ff: float, **over):
-    return lbs.launch_band_step(prev_off, ff, **{**KW, **over})
+def _step(prev_off: float, ff: float, *, prev_ff: float | None = None, **over):
+    """上乗せ prev_off（前の周期の FF は prev_ff。既定は今の FF）から呼ぶ。"""
+    pf = ff if prev_ff is None else prev_ff
+    return lbs.launch_band_step(pf + prev_off, pf, ff, **{**KW, **over})
+
+
+def _open(prev_out: float, prev_ff: float, ff: float, **over):
+    """前の周期の出す開度・FF を直接渡す。"""
+    return lbs.launch_band_step(prev_out, prev_ff, ff, **{**KW, **over})
 
 
 def test_raise_when_forecast_fast_and_slope_positive() -> None:
@@ -102,16 +109,65 @@ def test_wait_keeps_offset_and_counts_down() -> None:
 
 
 def test_slope_none_holds() -> None:
+    # p ＝ dev。p > band なら開度を保つ・それ以外は上乗せを保つ（増減しない）
     assert _step(1.0, 6.0, slope_kmhs=None, dev_kmh=2.0) == (1.0, 7.0, lbs.LBS_CODE_HELD, 0)
+    assert _step(1.0, 6.0, slope_kmhs=None, dev_kmh=0.1) == (1.0, 7.0, lbs.LBS_CODE_HELD, 0)
+    assert _open(7.0, 6.0, 5.0, slope_kmhs=None, dev_kmh=2.0)[:2] == (2.0, 7.0)
 
 
 def test_ff_moves_output_moves_by_same_amount() -> None:
-    # 保つ間、FF が動けば出す開度も同じだけ動く（FF の先読みが通る）
-    _, out1, _, _ = _step(1.0, 5.0, dev_kmh=0.1, slope_kmhs=0.4)
-    _, out2, _, _ = _step(1.0, 4.2, dev_kmh=0.1, slope_kmhs=0.4)
+    # p ≤ +band で保つ間、FF が動けば出す開度も同じだけ動く（FF の先読みが通る）
+    _, out1, _, _ = _open(6.0, 5.0, 5.0, dev_kmh=0.1, slope_kmhs=0.4)
+    _, out2, _, _ = _open(6.0, 5.0, 4.2, dev_kmh=0.1, slope_kmhs=0.4)
     assert out1 == pytest.approx(6.0) and out2 == pytest.approx(5.2)
     # 待ちの間も同じ
-    assert _step(1.0, 4.2, wait_left=2)[1] == pytest.approx(5.2)
+    assert _open(6.0, 5.0, 4.2, wait_left=2)[1] == pytest.approx(5.2)
+
+
+def test_over_band_keeps_opening_when_ff_drops() -> None:
+    # p = 0.5 + 0 > 0.3 → FF が下がっても出す開度は下がらない（上乗せが増える）
+    off, out, code, wait = _open(7.0, 6.0, 5.0, dev_kmh=0.5, slope_kmhs=0.0)
+    assert (off, out, code, wait) == (pytest.approx(2.0), pytest.approx(7.0),
+                                      lbs.LBS_CODE_HELD, 0)
+    # 傾きが負でも p > band なら同じ
+    assert _open(7.0, 6.0, 5.0, dev_kmh=1.0, slope_kmhs=-0.5)[1] == pytest.approx(7.0)
+
+
+def test_over_band_ff_deeper_is_ff() -> None:
+    off, out, code, _ = _open(7.0, 6.0, 7.5, dev_kmh=0.5, slope_kmhs=0.0)
+    assert (off, out, code) == (0.0, pytest.approx(7.5), lbs.LBS_CODE_HELD)
+
+
+def test_return_to_band_no_step() -> None:
+    # p が +0.3 以下に戻った周期は FF ＋（前の出す開度 − 前の FF）＝ 段差なし
+    off, out, code, _ = _open(7.0, 6.0, 5.0, dev_kmh=0.1, slope_kmhs=0.0)
+    assert out == pytest.approx(5.0 + (7.0 - 6.0))
+    assert (off, code) == (pytest.approx(1.0), lbs.LBS_CODE_HELD)
+
+
+def test_wait_over_band_keeps_opening_else_offset() -> None:
+    # 待ちの間も p > +0.3 なら開度を保つ
+    off, out, code, wait = _open(7.0, 6.0, 5.0, wait_left=3, dev_kmh=0.5, slope_kmhs=0.0)
+    assert (out, code, wait) == (pytest.approx(7.0), lbs.LBS_CODE_WAIT, 2)
+    # p ≤ +0.3 なら上乗せを保つ
+    off, out, code, wait = _open(7.0, 6.0, 5.0, wait_left=3, dev_kmh=0.1, slope_kmhs=0.0)
+    assert (off, out, code, wait) == (pytest.approx(1.0), pytest.approx(6.0),
+                                      lbs.LBS_CODE_WAIT, 2)
+
+
+def test_over_band_raise_from_open_and_cap() -> None:
+    # 開度 7.0 から slope 2.0 ÷ 4.0 = 0.5 増やす
+    off, out, code, wait = _open(7.0, 6.0, 5.0, dev_kmh=0.5, slope_kmhs=2.0)
+    assert (out, code, wait) == (pytest.approx(7.5), lbs.LBS_CODE_RAISED, WAIT)
+    assert off == pytest.approx(2.5)
+    # 上限で頭打ち、すでに上限なら保つ（印 1・待ちなし）
+    assert _open(8.8, 6.0, 6.0, dev_kmh=0.5, slope_kmhs=2.0)[1] == pytest.approx(CAP)
+    off, out, code, wait = _open(CAP, 6.0, 6.0, dev_kmh=0.5, slope_kmhs=2.0)
+    assert (out, code, wait) == (pytest.approx(CAP), lbs.LBS_CODE_HELD, 0)
+
+
+def test_over_band_ff_over_cap_is_ff_code_none() -> None:
+    assert _open(8.0, 7.0, 9.5, dev_kmh=0.5, slope_kmhs=2.0) == (0.0, 9.5, lbs.LBS_CODE_NONE, 0)
 
 
 def test_ff_deeper_than_cap_is_output_as_is() -> None:
@@ -186,12 +242,14 @@ def _run():
     run.interval_s = 0.05
     run._lbs_setup = (GAIN, LAG, WAIT, CAP, MIN_PCT)  # noqa: SLF001
     run._lbs_dev_hist = deque(maxlen=5)  # noqa: SLF001
-    run._lbs_prev_offset = None  # noqa: SLF001
+    run._lbs_prev_out = None  # noqa: SLF001
+    run._lbs_prev_ff = None  # noqa: SLF001
     run._lbs_wait_left = 0  # noqa: SLF001
     run.lbs_code_cycles = {}
     run.lbs_raise_count = 0
     run.lbs_raise_max = 0.0
     run.lbs_cap_hits = 0
+    run.lbs_hold_open_cycles = 0
     run.lbs_offset_max = 0.0
     run.lbs_offset_min = 0.0
     return run
@@ -204,21 +262,21 @@ def test_band_first_cycle_offset_zero_code_zero_then_raises() -> None:
     assert slope == pytest.approx(2.0)
     pct, code = run._lbs_band_cycle(6.0, dev, slope)  # noqa: SLF001
     assert (pct, code) == (6.0, 0)  # 帯の最初の周期（上乗せ 0 ＝ FF）
-    assert run._lbs_prev_offset == 0.0  # noqa: SLF001
+    assert (run._lbs_prev_out, run._lbs_prev_ff) == (6.0, 6.0)  # noqa: SLF001
     dev, slope = run._lbs_observe(0.8, 0.0)  # noqa: SLF001
     pct, code = run._lbs_band_cycle(6.0, dev, slope)  # noqa: SLF001
     assert code == lbs.LBS_CODE_RAISED and pct > 6.0
     assert run.lbs_raise_count == 1 and run.lbs_raise_max == pytest.approx(pct - 6.0)
     assert run.lbs_offset_max == pytest.approx(pct - 6.0)
-    # 待ち中は FF が動けば出す開度も動く
+    # 待ち中も見込み > +0.3 なら FF が下がっても出す開度は下がらない
     dev, slope = run._lbs_observe(0.9, 0.0)  # noqa: SLF001
     pct2, code2 = run._lbs_band_cycle(5.0, dev, slope)  # noqa: SLF001
-    assert code2 == lbs.LBS_CODE_WAIT and pct2 == pytest.approx(pct - 1.0)
+    assert code2 == lbs.LBS_CODE_WAIT and pct2 == pytest.approx(pct)
 
 
 def test_cap_hits_counted_when_wanted_but_at_cap() -> None:
     run = _run()
-    run._lbs_prev_offset = CAP - 6.0  # noqa: SLF001
+    run._lbs_prev_out, run._lbs_prev_ff = CAP, 6.0  # noqa: SLF001
     for k in range(5):
         dev, slope = run._lbs_observe(0.3 + 0.1 * k, 0.0)  # noqa: SLF001
     pct, code = run._lbs_band_cycle(6.0, dev, slope)  # noqa: SLF001
@@ -228,7 +286,7 @@ def test_cap_hits_counted_when_wanted_but_at_cap() -> None:
 
 def test_offset_min_recorded_below_zero() -> None:
     run = _run()
-    run._lbs_prev_offset = 0.0  # noqa: SLF001
+    run._lbs_prev_out, run._lbs_prev_ff = 6.0, 6.0  # noqa: SLF001
     for k in range(5):  # 偏差が −0.1/周期 ＝ 傾き −2.0、偏差 −0.4 → 見込み −0.7
         dev, slope = run._lbs_observe(-0.1 * k, 0.0)  # noqa: SLF001
     pct, code = run._lbs_band_cycle(6.0, dev, slope)  # noqa: SLF001
@@ -252,14 +310,14 @@ def _cycle_src() -> str:
 def test_cycle_drops_offset_outside_band_and_has_no_extension() -> None:
     src = _cycle_src()
     # 帯でない周期（hold_scene != 3）では上乗せを捨て、延長の分岐は無い
-    assert "self._lbs_prev_offset = None" in src
+    assert "self._lbs_prev_out = None" in src and "self._lbs_prev_ff = None" in src
     assert "lbs_ext" not in src and "_lbs_extension" not in src
     # 帯の外での捨て方そのもの（待ちも 0 に戻る）
     run = _run()
-    run._lbs_prev_offset = 1.0  # noqa: SLF001
+    run._lbs_prev_out, run._lbs_prev_ff = 7.0, 6.0  # noqa: SLF001
     run._lbs_wait_left = 3  # noqa: SLF001
     # 帯の最初の周期と同じ入口: None なら 0 から始まり印 0
-    run._lbs_prev_offset = None  # noqa: SLF001
+    run._lbs_prev_out = run._lbs_prev_ff = None  # noqa: SLF001
     dev, slope = run._lbs_observe(0.0, 0.0)  # noqa: SLF001
     assert run._lbs_band_cycle(6.0, dev, slope) == (6.0, 0)  # noqa: SLF001
     assert run._lbs_wait_left == 0  # noqa: SLF001
@@ -278,3 +336,16 @@ def test_launch_step_code_column() -> None:
     import inspect
 
     assert "launch_step_code" in inspect.signature(dlmod.SessionLog.record).parameters
+
+
+def test_hold_open_cycles_counted() -> None:
+    run = _run()
+    run._lbs_prev_out, run._lbs_prev_ff = 7.0, 6.0  # noqa: SLF001
+    for _ in range(5):  # 偏差 0.5 一定 ＝ 傾き 0、見込み 0.5 > 0.3
+        dev, slope = run._lbs_observe(0.5, 0.0)  # noqa: SLF001
+    pct, code = run._lbs_band_cycle(5.0, dev, slope)  # noqa: SLF001
+    assert code == lbs.LBS_CODE_HELD and pct == pytest.approx(7.0)
+    assert run.lbs_hold_open_cycles == 1
+    dev, slope = run._lbs_observe(0.0, 0.0)  # noqa: SLF001
+    run._lbs_band_cycle(5.0, dev, slope)  # noqa: SLF001
+    assert run.lbs_hold_open_cycles == 1  # p ≤ band の周期は数えない

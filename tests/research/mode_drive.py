@@ -91,8 +91,11 @@ from tests.research.hold_scene import (
 )
 from tests.research.launch_band_step import (
     DEV_BAND_KMH,
+    LBS_CODE_HELD,
     LBS_CODE_NONE,
     LBS_CODE_RAISED,
+    LBS_CODE_WAIT,
+    launch_band_forecast,
     launch_band_raise_wanted,
     launch_band_step,
     launch_band_step_setup,
@@ -2182,12 +2185,14 @@ class _ModeRun:
         ) if isinstance(self.ff, ForwardMapFeedforward) else None
         self._lbs_dev_hist: deque[float] = deque(maxlen=5)  # 偏差（毎周期。0.2 s の差分用）
         # 前の周期の FF からの上乗せ（出す開度 − FF。帯の外は None ＝ 帯の最初の周期で 0）
-        self._lbs_prev_offset: float | None = None
+        self._lbs_prev_out: float | None = None  # 前の周期の出す開度・FF（帯の外は None）
+        self._lbs_prev_ff: float | None = None
         self._lbs_wait_left = 0
         self.lbs_code_cycles: dict[int, int] = {}
         self.lbs_raise_count = 0
         self.lbs_raise_max = 0.0
         self.lbs_cap_hits = 0
+        self.lbs_hold_open_cycles = 0  # 見込み > +band で開度そのものを保った周期（段12）
         self.lbs_offset_max = 0.0  # 上乗せの最大・最小
         self.lbs_offset_min = 0.0
         self._keep_brake_win: deque[tuple[float, float]] = deque()  # 案③: (t, 実ブレーキ開度)
@@ -2393,24 +2398,28 @@ class _ModeRun:
         """帯（hold_scene 3）の 1 周期。戻り値 (出すブレーキ開度 [%], 印)。帯の最初の周期
         （前の周期が帯でない）は上乗せ 0・印 0・出す開度 ＝ FF。集計も持つ。"""
         gain, lag_s, wait_cycles, cap_pct, min_pct = self._lbs_setup  # type: ignore[misc]
-        prev = self._lbs_prev_offset
-        if prev is None:
+        prev_out, prev_ff = self._lbs_prev_out, self._lbs_prev_ff
+        if prev_out is None or prev_ff is None:
             self._lbs_wait_left = 0
             offset, pct, code = 0.0, ff_pct, LBS_CODE_NONE
         else:
             wanted = launch_band_raise_wanted(dev_kmh=dev, slope_kmhs=slope, lag_s=lag_s)
             offset, pct, code, self._lbs_wait_left = launch_band_step(
-                prev, ff_pct, dev_kmh=dev, slope_kmhs=slope, lag_s=lag_s,
+                prev_out, prev_ff, ff_pct, dev_kmh=dev, slope_kmhs=slope, lag_s=lag_s,
                 gain_kmhs_pct=gain, cap_pct=cap_pct, min_pct=min_pct,
                 wait_left=self._lbs_wait_left, wait_cycles=wait_cycles,
             )
             if code == LBS_CODE_RAISED:
                 self.lbs_raise_count += 1
-                self.lbs_raise_max = max(self.lbs_raise_max, offset - prev)
+                self.lbs_raise_max = max(self.lbs_raise_max, pct - prev_out)
             if wanted and code != LBS_CODE_RAISED and self._lbs_wait_left == 0 \
                     and pct >= cap_pct - 1e-9:
                 self.lbs_cap_hits += 1  # 増やしたい周期だが上限で頭打ち
-        self._lbs_prev_offset = offset
+            if code in (LBS_CODE_HELD, LBS_CODE_RAISED, LBS_CODE_WAIT) \
+                    and launch_band_forecast(dev, slope, lag_s) > DEV_BAND_KMH:
+                self.lbs_hold_open_cycles += 1
+        self._lbs_prev_out = pct
+        self._lbs_prev_ff = ff_pct
         self.lbs_offset_max = max(self.lbs_offset_max, offset)
         self.lbs_offset_min = min(self.lbs_offset_min, offset)
         self.lbs_code_cycles[code] = self.lbs_code_cycles.get(code, 0) + 1
@@ -2550,7 +2559,8 @@ class _ModeRun:
                 if keep_pct is not None:
                     ff_effort = -keep_pct  # 案③: 保持の場面の外のブレーキの行の FF を替える
         if self._lbs_setup is not None and hold_scene != 3:
-            self._lbs_prev_offset = None  # 帯の外は上乗せを捨てる（帯の直後は計画のまま）
+            self._lbs_prev_out = None  # 帯の外は前の周期の開度・FF を捨てる（帯の直後は計画のまま）
+            self._lbs_prev_ff = None
             self._lbs_wait_left = 0
         if (
             self.midway_fb_no_deeper and not hold_scene and c10_effort
@@ -3635,7 +3645,8 @@ async def run_mode_drive(
             "5 0 より下へ減らした。上乗せ ＝ FF からの上乗せ）・"
             f"増やした {run.lbs_raise_count} 回（1 回の最大 {run.lbs_raise_max:.2f}%）・"
             f"上乗せの最大 {run.lbs_offset_max:.2f}%・最小 {run.lbs_offset_min:.2f}%・"
-            f"上限で頭打ち {run.lbs_cap_hits} 周期")
+            f"上限で頭打ち {run.lbs_cap_hits} 周期・"
+            f"開度を保った（見込み > +0.3） {run.lbs_hold_open_cycles} 周期")
     if run.stop_end_monotone:
         say("  停C の区間のブレーキを浅くしない（段7 P2）: "
             f"{run.stop_end_monotone_cycles} 周期"
