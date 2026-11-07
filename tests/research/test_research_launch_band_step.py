@@ -564,6 +564,8 @@ def test_extend_launch_band_and_ff_time_for_b1() -> None:
     bands = [HoldInterval(3.0, 0.60, 1.0)]  # 最後の周期 3.55
     new, k = lbs.extend_launch_band(bands, 3.55, 1, dt)
     assert k == 0 and new[0].length_s == pytest.approx(0.65) and bands[0].length_s == 0.60
+    new, k = lbs.extend_launch_band(bands, 3.45, 1, dt)  # 3.50 は区間の中 → そのまま
+    assert k == 0 and new == bands
     assert lbs.extend_launch_band(bands, 3.55, 0, dt) == (bands, None)
     assert lbs.extend_launch_band(bands, 9.0, 1, dt) == (bands, None)
     ext = lbs.extend_band_ext([], 3.55, 1, dt)
@@ -577,7 +579,7 @@ def test_extend_launch_band_and_ff_time_for_b1() -> None:
 
 
 def _b1_run(r_max_rows, gap):
-    """B-1 の判定用の _ModeRun 風。帯 3.0〜3.55・計画は帯の後 gap 行が 0・その次がアクセル。"""
+    """B-1 の判定用の _ModeRun 風。区間 3.0〜3.55・印は 3.45 まで・印の後 gap 行が 0。"""
     import numpy as np  # noqa: PLC0415
 
     from tests.research.hold_scene import HoldInterval  # noqa: PLC0415
@@ -586,8 +588,9 @@ def _b1_run(r_max_rows, gap):
     dt = 0.05
     n = 100
     eff = np.zeros(n)
-    eff[60:72] = -8.0  # 行 60〜71 ＝ 帯（t 3.0〜3.55）
-    eff[72 + gap] = 3.0
+    eff[60:70] = -8.0  # 行 60〜69 ＝ 計画の帯の印（t 3.0〜3.45）。区間は 3.55 まで（すき間の整理で
+    # 印の最後の 2 行が 0 に削られた形）
+    eff[70 + gap] = 3.0
     run.interval_s = dt
     run.hold = SimpleNamespace(launch_bands=[HoldInterval(3.0, 0.60, 1.0)], step_s=dt)
     run.ff = SimpleNamespace(plan=SimpleNamespace(
@@ -603,22 +606,36 @@ def _b1_run(r_max_rows, gap):
 
 def test_b1_extends_running_band_by_gap_minus_r_plus_one() -> None:
     run = _b1_run([3], gap=5)
-    run._b1_extend_if_last(3.50)  # noqa: SLF001  最後の周期ではない
+    run._b1_extend_if_last(3.40)  # noqa: SLF001  印の最後の周期ではない
     assert run.b1_launches == 0 and run.b1_extended == []
-    run._b1_extend_if_last(3.55)  # noqa: SLF001
+    run._b1_extend_if_last(3.45)  # noqa: SLF001  計画の印の最後（区間の終わりの手前）
     assert run.b1_launches == 1 and run.b1_extended == [1]
-    assert run.hold.launch_bands[0].length_s == pytest.approx(0.65)
-    assert run._band_ext == [(3.55, pytest.approx(3.60))]  # noqa: SLF001
-    assert run._b1_rows_at(3.60) == 1 and run._b1_rows_at(3.55) is None  # noqa: SLF001
-    # 伸ばした後の最後の周期では再判定しない（数えない・もう伸ばさない）
-    run._b1_extend_if_last(3.60)  # noqa: SLF001
+    # 区間は既に 3.55 まで覆っている（伸ばした周期 3.50 は区間の中）→ そのまま
+    assert run.hold.launch_bands[0].length_s == pytest.approx(0.60)
+    assert run._band_ext == [(3.45, pytest.approx(3.50))]  # noqa: SLF001
+    assert run._b1_rows_at(3.50) == 1 and run._b1_rows_at(3.45) is None  # noqa: SLF001
+    assert run._b1_rows_at(3.55) is None  # noqa: SLF001  ちょうど 1 周期だけ
+    # 伸ばした周期では再判定しない（数えない・もう伸ばさない）
+    run._b1_extend_if_last(3.50)  # noqa: SLF001
     assert run.b1_launches == 1 and run.b1_extended == [1]
+
+
+def test_b1_extends_interval_when_it_ends_at_plan_mark() -> None:
+    # 区間が計画の印の最後の周期で終わっている（3.45 まで）→ 伸ばした周期を覆うよう区間も伸ばす
+    from tests.research.hold_scene import HoldInterval  # noqa: PLC0415
+
+    run = _b1_run([3], gap=5)
+    run.hold.launch_bands = [HoldInterval(3.0, 0.50, 1.0)]  # 最後の周期 3.45
+    run._b1_extend_if_last(3.45)  # noqa: SLF001
+    assert run.b1_extended == [1]
+    assert run.hold.launch_bands[0].end_s == pytest.approx(3.55)  # 3.50 を含む
+    assert lbs.band_ff_time(3.50, run._band_ext, 0.05) == 3.45  # noqa: SLF001
 
 
 def test_b1_no_extension_without_r_or_without_slack() -> None:
     for r, gap in (([], 5), ([3], 4), ([3], 3)):
         run = _b1_run(r, gap)
-        run._b1_extend_if_last(3.55)  # noqa: SLF001
+        run._b1_extend_if_last(3.45)  # noqa: SLF001
         assert run.b1_launches == 1 and run.b1_extended == []
         assert run.hold.launch_bands[0].length_s == pytest.approx(0.60)
         assert run._band_ext == []  # noqa: SLF001

@@ -313,14 +313,20 @@ def plan_gap_rows(effort_pct: np.ndarray, last_band_idx: int) -> int:
 def extend_launch_band(
     bands: list[HoldInterval], last_cycle_s: float, s: int, step_s: float
 ) -> tuple[list[HoldInterval], int | None]:
-    """最後の周期の時刻が last_cycle_s の帯の区間を s 周期だけ後ろへ伸ばす。戻り値 (区間の一覧,
-    伸ばした区間の番号［合うものが無い・s ≦ 0 は None で一覧はそのまま］)。"""
+    """計画の帯の最後の周期（時刻 last_cycle_s）を含む帯の区間を、伸ばした周期
+    （last_cycle_s ＋ 1〜s 周期）まで覆うように後ろへ伸ばす。区間が既に覆っていれば
+    そのまま（計画の整理で帯の印が区間の終わりより手前で終わる場合）。戻り値 (区間の一覧,
+    該当した区間の番号［合うものが無い・s ≦ 0 は None で一覧はそのまま］)。"""
     if s <= 0:
         return bands, None
+    tol = 0.5 * step_s
     for k, iv in enumerate(bands):
-        if abs((iv.end_s - step_s) - last_cycle_s) <= 0.5 * step_s:
+        if iv.start_s - tol <= last_cycle_s <= iv.end_s - step_s + tol:
+            need_end = last_cycle_s + (s + 1) * step_s
+            if iv.end_s >= need_end - tol:
+                return bands, k
             out = list(bands)
-            out[k] = HoldInterval(iv.start_s, iv.length_s + s * step_s, iv.mean_kmh)
+            out[k] = HoldInterval(iv.start_s, need_end - iv.start_s, iv.mean_kmh)
             return out, k
     return bands, None
 

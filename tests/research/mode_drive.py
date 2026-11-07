@@ -2416,7 +2416,7 @@ class _ModeRun:
         return any(a - tol <= t <= b + tol for a, b, _ in self._b1_rows)
 
     def _b1_extend_if_last(self, t: float) -> None:
-        """2026-11-08 段20 B-1: t が帯の区間の最後の周期なら、帯の終わり（次の周期）から計画の
+        """2026-11-08 段20 B-1: t が計画の帯の印の最後の周期なら、帯の終わり（次の周期）から計画の
         アクセルの最初の行までの周期数 G を数え、s ＝ max(G − (R_max ＋ 1), 0) 周期だけ実行中の帯の
         区間を伸ばす。伸ばした周期の帯の FF は今までの最後の周期の値のまま（_band_ext）。
         計画のアクセルの行は動かさない。測った R が無い（最初の帯の発進）は s ＝ 0。"""
@@ -2426,10 +2426,14 @@ class _ModeRun:
         if self._b1_pending_end is not None and abs(self._b1_pending_end - t) <= tol:
             self._b1_pending_end = None  # 伸ばした後の最後の周期（同じ発進。再判定しない）
             return
-        if not any(abs((iv.end_s - step) - t) <= tol for iv in self.hold.launch_bands):
-            return
         plan = self.ff.plan  # type: ignore[attr-defined]
-        gap = plan_gap_rows(plan.effort_pct, plan.index_at(t))
+        i = plan.index_at(t)
+        lb = plan.launch_band
+        # 帯の最後の周期は計画の印で決める（計画のすき間の整理で、印は区間の終わりより手前で
+        # 終わることがある）。伸ばした周期（印なし）は対象外
+        if self._b1_in_extension(t) or not lb[i] or (i + 1 < len(lb) and lb[i + 1]):
+            return
+        gap = plan_gap_rows(plan.effort_pct, i)
         s = late_release_rows(gap, self._ret_obs.r_max)
         self.b1_launches += 1
         if s <= 0:
