@@ -193,86 +193,152 @@ class LaunchBreakawayObserver:
     LAUNCH_OBS_MOVE_KMH を超えた最初の周期の、前の周期のブレーキ実開度（絶対の開度 [%]）を
     u_obs とする。基準が停車速度を超えた後は測らない（先に動かなかった発進は None のまま）。
     並びが新しく始まった周期で u_obs を捨てて測り直す。並びを出たら u_obs も捨てる。
-    pending_first は「測れた後の最初の帯の周期」に前の出す開度を u_obs へ持ち上げる印
-    （take_first で 1 回だけ True を返す）。"""
+    2026-11-08 段20: u_obs は帯の中の踏み増しの上限にだけ使う（前の離しの行の床・帯の最初の
+    周期の持ち上げは無くした。深くすると US06 48・U 346 で遅すぎが出たため）。"""
 
     def __init__(self, move_kmh: float = LAUNCH_OBS_MOVE_KMH) -> None:
         self.move_kmh = move_kmh
         self.u_obs: float | None = None
-        self.seen_band = False  # 並びの中で帯の行を通ったか（前の離しの行の床は帯の前だけ）
         self._in_seq = False
         self._done = False  # 基準が動いた後（もう測らない）
-        self._pending_first = False
         self.measured: list[float] = []  # 測れた発進の u_obs（集計用）
         self.n_sequences = 0
-        self.floor_cycles = 0  # 前の離しの行で u_obs より浅くしないのを掛けた周期数
 
     def update(
         self, *, active: bool, ref_kmh: float, speed_kmh: float,
         prev_brake_actual_pct: float | None, stop_speed_kmh: float,
-        band_row: bool = False,
     ) -> float | None:
         """1 周期の更新。active ＝ 帯のある発進の並びの行。戻り値は今の u_obs。"""
         if not active:
             self._in_seq = False
             self.u_obs = None
-            self.seen_band = False
-            self._pending_first = False
             return None
         if not self._in_seq:
             self._in_seq = True
             self.n_sequences += 1
             self.u_obs = None
-            self.seen_band = False
             self._done = False
-            self._pending_first = False
-        if band_row:
-            self.seen_band = True
         if self.u_obs is None and not self._done:
             if ref_kmh > stop_speed_kmh:
                 self._done = True
             elif speed_kmh > self.move_kmh and prev_brake_actual_pct is not None:
                 self.u_obs = float(prev_brake_actual_pct)
-                self._pending_first = True
                 self.measured.append(self.u_obs)
         return self.u_obs
-
-    def take_first(self) -> bool:
-        """測れた後の最初の帯の周期か（1 回だけ True）。"""
-        first, self._pending_first = self._pending_first, False
-        return first
 
     def summary(self) -> str:
         if not self.measured:
             return f"測れた発進 0 / {self.n_sequences} 回"
         return (
             f"測れた発進 {len(self.measured)} / {self.n_sequences} 回・u_obs "
-            f"{min(self.measured):.2f}〜{max(self.measured):.2f}%・"
-            f"発進前に保った {self.floor_cycles} 周期"
+            f"{min(self.measured):.2f}〜{max(self.measured):.2f}%"
         )
 
 
-def launch_band_obs_inputs(
-    u_obs_pct: float | None,
-    *,
-    first: bool,
-    cap_pct: float,
-    prev_out_pct: float | None,
-    last_cmd_pct: float | None,
-    ff_pct: float,
-) -> tuple[float, float | None, float | None]:
-    """2026-11-07 段16（型 A）: 帯の 1 周期の launch_band_step へ渡す (上限 cap, 前の出す開度,
-    前の FF) を決める。u_obs が無ければ入力のまま（今と完全に同じ）。u_obs があれば cap ＝ u_obs。
-    first（測れた後の最初の帯の周期）なら前の出す開度 ＝ max(前の出す開度［帯の最初の周期で None
-    なら前の周期の最終のブレーキ指令の深さ last_cmd］, u_obs)・前の FF ＝ この周期の FF
-    （保っていた開度を、段12 の規則［見込み > +0.3 なら保つ・0〜+0.3 なら上乗せ ＝ u_obs − FF を
-    引き継ぐ］へ通す）。前の FF は first のときだけ値を返す（他は None ＝ 入力のまま）。"""
-    if u_obs_pct is None:
-        return cap_pct, prev_out_pct, None
-    if not first:
-        return u_obs_pct, prev_out_pct, None
-    base = prev_out_pct if prev_out_pct is not None else (last_cmd_pct or 0.0)
-    return u_obs_pct, max(base, u_obs_pct), ff_pct
+def launch_band_obs_inputs(u_obs_pct: float | None, *, cap_pct: float) -> float:
+    """2026-11-08 段20（型 A の直し）: 帯の 1 周期の launch_band_step へ渡す踏み増しの上限 cap を
+    決める。u_obs が無ければ入力のまま（pkl の動き出す開度）。u_obs があれば cap ＝ u_obs
+    （pkl の値との深い方にはしない）。前の出す開度・前の FF は触らない（測った開度まで
+    持ち上げない・FF を上書きしない。段16 の持ち上げは US06 48 で車を止め直し、U 346 で上乗せを
+    帯へ持ち込んで遅すぎにした）。"""
+    return cap_pct if u_obs_pct is None else u_obs_pct
+
+
+class BandReturnObserver:
+    """2026-11-08 段20（B-1）: 帯の発進ごとに「ブレーキが min へ戻る周期数 R」を測る。
+
+    帯の終わり ＝ 帯の最後の周期の次の周期を 0 番とし、周期 k（0 番から数える）の指令を出した
+    直後のブレーキ実開度（mode_drive では周期の終わりに読む _last_brake_actual。次の周期の頭で
+    安全網が見る値）が min ＋ tol 以下になった最初の k を R とする。帯の終わりの周期で min へ
+    離す指令を出すので、11-07 の実機では 0 番の指令 → 3 番の直後の読みが ≤ 4.25% で R ＝ 3。
+    発進ごとに 1 回測り、走行の中の最大 r_max を持つ。B-1 で帯を伸ばした発進も、伸ばした後の
+    帯の終わりから測る（in_band が伸ばした周期も True だから）。帯に入り直したら測りかけを
+    捨てる。max_wait 周期たっても戻らなければ捨てる（測れなかった扱い）。"""
+
+    def __init__(self, tol_pct: float, min_pct: float, max_wait: int = 40) -> None:
+        self.thr = min_pct + tol_pct
+        self.max_wait = max_wait
+        self.measured: list[int] = []
+        self._was_band = False
+        self._k: int | None = None  # 帯の終わりからの周期数（測っている間）
+
+    @property
+    def r_max(self) -> int | None:
+        return max(self.measured) if self.measured else None
+
+    def update(self, *, in_band: bool, brake_actual_pct: float | None) -> None:
+        """周期の終わりに 1 回呼ぶ。in_band ＝ この周期が帯（B-1 で伸ばした周期を含む）。
+        brake_actual_pct ＝ この周期の指令を出した直後のブレーキ実開度。"""
+        if in_band:
+            self._was_band = True
+            self._k = None
+            return
+        if self._was_band:
+            self._was_band = False
+            self._k = 0
+        if self._k is None:
+            return
+        if brake_actual_pct is not None and brake_actual_pct <= self.thr:
+            self.measured.append(self._k)
+            self._k = None
+        else:
+            self._k += 1
+            if self._k > self.max_wait:
+                self._k = None
+
+
+def late_release_rows(gap_rows: int, r_max: int | None) -> int:
+    """2026-11-08 段20（B-1）: 帯を伸ばす周期数 s ＝ max(G − (R_max ＋ 1), 0)。G ＝ 帯の終わり
+    （0 番）から計画のアクセルの最初の行までの周期数。＋1 は、安全網が見る「前の周期の直後の
+    実開度」の分（0 番で離すと R 番の直後に min に着き、アクセルは R ＋ 1 番以降なら止まらない）。
+    測った R が無ければ 0（最初の帯の発進は今のまま）。"""
+    if r_max is None:
+        return 0
+    return max(int(gap_rows) - (int(r_max) + 1), 0)
+
+
+def plan_gap_rows(effort_pct: np.ndarray, last_band_idx: int) -> int:
+    """帯の最後の行 last_band_idx の次の行（0 番）から、計画のアクセルの最初の行（effort > 0）
+    までの行数 G。間に 0 でない行（ブレーキの行など）があるか、アクセルの行が無ければ 0
+    （伸ばさない）。"""
+    n = len(effort_pct)
+    j = last_band_idx + 1
+    while j < n and effort_pct[j] == 0.0:
+        j += 1
+    if j >= n or effort_pct[j] <= 0.0:
+        return 0
+    return j - (last_band_idx + 1)
+
+
+def extend_launch_band(
+    bands: list[HoldInterval], last_cycle_s: float, s: int, step_s: float
+) -> tuple[list[HoldInterval], int | None]:
+    """最後の周期の時刻が last_cycle_s の帯の区間を s 周期だけ後ろへ伸ばす。戻り値 (区間の一覧,
+    伸ばした区間の番号［合うものが無い・s ≦ 0 は None で一覧はそのまま］)。"""
+    if s <= 0:
+        return bands, None
+    for k, iv in enumerate(bands):
+        if abs((iv.end_s - step_s) - last_cycle_s) <= 0.5 * step_s:
+            out = list(bands)
+            out[k] = HoldInterval(iv.start_s, iv.length_s + s * step_s, iv.mean_kmh)
+            return out, k
+    return bands, None
+
+
+def extend_band_ext(
+    ext: list[tuple[float, float]], last_cycle_s: float, s: int, step_s: float
+) -> list[tuple[float, float]]:
+    """帯の FF の時刻の差し替え表 ext（B-2 と同じ band_ff_time）へ、B-1 で伸ばした s 周期を足す。
+    last_cycle_s が B-2 で伸ばした区間の最後の周期なら、その項を伸ばす（FF は元の最後の周期の値
+    のまま）。無ければ (last_cycle_s, last_cycle_s ＋ s × 周期) を足す（伸ばした周期の FF は
+    今までの最後の周期の値）。"""
+    out = list(ext)
+    for k, (t_o, t_n) in enumerate(out):
+        if abs(t_n - last_cycle_s) <= 0.5 * step_s:
+            out[k] = (t_o, t_n + s * step_s)
+            return out
+    out.append((last_cycle_s, last_cycle_s + s * step_s))
+    return out
 
 
 def stretch_launch_bands(

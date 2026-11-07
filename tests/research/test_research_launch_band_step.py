@@ -4,6 +4,7 @@ _ModeRun の帯の周期・ログ列。段8: 上乗せの形・延長なし。""
 
 from __future__ import annotations
 
+import inspect
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -253,7 +254,11 @@ def _run():
     run.lbs_offset_max = 0.0
     run.lbs_offset_min = 0.0
     run._obs = None  # noqa: SLF001  # 2026-11-07 段16 型 A（off）
-    run._last_brake_cmd = 0.0  # noqa: SLF001
+    run._ret_obs = None  # noqa: SLF001  # 2026-11-08 段20 B-1（off）
+    run._b1_rows = []  # noqa: SLF001
+    run._b1_pending_end = None  # noqa: SLF001
+    run.b1_launches = 0
+    run.b1_extended = []
     return run
 
 
@@ -379,7 +384,7 @@ def test_observer_measures_only_first_cycle_over_move_threshold() -> None:
     ]
     obs, out = _obs_run(rows)
     assert out == [None, None, 9.1, 9.1]
-    assert obs.measured == [9.1] and obs.take_first() is True and obs.take_first() is False
+    assert obs.measured == [9.1]
 
 
 def test_observer_does_not_measure_after_reference_started_moving() -> None:
@@ -411,19 +416,6 @@ def test_observer_none_when_prev_actual_missing() -> None:
     assert out == [None, 9.0]  # 前の周期の実開度が無い周期は測れず、次の周期で測る
 
 
-def test_observer_seen_band_flag() -> None:
-    obs = lbs.LaunchBreakawayObserver()
-    obs.update(active=True, ref_kmh=0.0, speed_kmh=0.0, prev_brake_actual_pct=9.0,
-               stop_speed_kmh=STOP)
-    assert obs.seen_band is False
-    obs.update(active=True, ref_kmh=0.0, speed_kmh=0.0, prev_brake_actual_pct=9.0,
-               stop_speed_kmh=STOP, band_row=True)
-    assert obs.seen_band is True
-    obs.update(active=False, ref_kmh=0.0, speed_kmh=0.0, prev_brake_actual_pct=9.0,
-               stop_speed_kmh=STOP)
-    assert obs.seen_band is False
-
-
 def test_launch_band_seq_rows_only_runs_with_band_rows() -> None:
     import numpy as np  # noqa: PLC0415
 
@@ -436,43 +428,28 @@ def test_launch_band_seq_rows_only_runs_with_band_rows() -> None:
 
 
 def test_obs_inputs_without_u_obs_is_unchanged() -> None:
-    assert lbs.launch_band_obs_inputs(
-        None, first=True, cap_pct=CAP, prev_out_pct=7.0, last_cmd_pct=9.0, ff_pct=8.0
-    ) == (CAP, 7.0, None)
+    assert lbs.launch_band_obs_inputs(None, cap_pct=CAP) == CAP
 
 
-def test_obs_inputs_cap_and_first_cycle_prev_out_become_u_obs() -> None:
-    # 帯の最初の周期（prev_out が None）: 前の周期の最終指令 8.0 と u_obs 9.1 の深い方
-    cap, prev_out, prev_ff = lbs.launch_band_obs_inputs(
-        9.1, first=True, cap_pct=CAP, prev_out_pct=None, last_cmd_pct=8.0, ff_pct=7.5
-    )
-    assert (cap, prev_out, prev_ff) == (9.1, 9.1, 7.5)
-    # 帯の中で測れた周期: 前の出す開度 9.5 のほうが深ければそれを保つ
-    cap, prev_out, prev_ff = lbs.launch_band_obs_inputs(
-        9.1, first=True, cap_pct=CAP, prev_out_pct=9.5, last_cmd_pct=8.0, ff_pct=7.5
-    )
-    assert (cap, prev_out, prev_ff) == (9.1, 9.5, 7.5)
-    # 2 周期目以降は上限だけ u_obs
-    assert lbs.launch_band_obs_inputs(
-        9.1, first=False, cap_pct=CAP, prev_out_pct=8.7, last_cmd_pct=8.7, ff_pct=7.5
-    ) == (9.1, 8.7, None)
+def test_obs_inputs_with_u_obs_only_caps() -> None:
+    # 2026-11-08 段20: u_obs があれば上限 ＝ u_obs だけ（pkl の値との深い方にはしない）
+    assert lbs.launch_band_obs_inputs(9.1, cap_pct=CAP) == 9.1
+    assert lbs.launch_band_obs_inputs(8.5, cap_pct=CAP) == 8.5
+    import inspect  # noqa: PLC0415
+
+    # 前の出す開度・前の FF は入力に無い（触れない）
+    assert set(inspect.signature(lbs.launch_band_obs_inputs).parameters) == {"u_obs_pct", "cap_pct"}
 
 
-def test_obs_first_cycle_holds_opening_when_forecast_is_fast_and_carries_offset_otherwise() -> None:
-    cap, prev_out, prev_ff = lbs.launch_band_obs_inputs(
-        9.1, first=True, cap_pct=CAP, prev_out_pct=None, last_cmd_pct=0.0, ff_pct=7.5
+def test_obs_does_not_lift_prev_out_or_override_ff_in_step() -> None:
+    # 帯の最初の周期でも持ち上げない: 前の出す開度が無ければ出す開度 ＝ FF（深くしない）
+    run = _run()
+    run._obs = lbs.LaunchBreakawayObserver()  # noqa: SLF001
+    run._obs.update(  # noqa: SLF001
+        active=True, ref_kmh=0.0, speed_kmh=0.5, prev_brake_actual_pct=9.1, stop_speed_kmh=STOP
     )
-    kw = dict(KW, cap_pct=cap)
-    # 見込み > +0.3: 開度そのものを保つ（FF が 7.5 でも 9.1）
-    off, out, code, _ = lbs.launch_band_step(
-        prev_out, prev_ff, 7.5, **dict(kw, dev_kmh=0.5, slope_kmhs=0.0)
-    )
-    assert out == pytest.approx(9.1) and code == lbs.LBS_CODE_HELD
-    # 0〜+0.3: 上乗せ ＝ u_obs − FF を引き継ぐ
-    off, out, code, _ = lbs.launch_band_step(
-        prev_out, prev_ff, 7.5, **dict(kw, dev_kmh=0.1, slope_kmhs=0.0)
-    )
-    assert out == pytest.approx(9.1) and off == pytest.approx(1.6)
+    pct, code = run._lbs_band_cycle(7.5, 0.5, 0.0)  # noqa: SLF001
+    assert pct == pytest.approx(7.5) and code == lbs.LBS_CODE_NONE
 
 
 def test_stretch_launch_bands_extends_matching_interval_by_delta() -> None:
@@ -499,22 +476,168 @@ def test_band_ff_time_replaces_only_extended_rows() -> None:
     assert lbs.band_ff_time(5.0, [], dt) == 5.0
 
 
-def test_mode_run_band_cycle_with_u_obs_caps_and_carries_opening() -> None:
+def test_mode_run_band_cycle_with_u_obs_caps_raise_at_u_obs() -> None:
     run = _run()
     run._obs = lbs.LaunchBreakawayObserver()  # noqa: SLF001
     run._obs.update(  # noqa: SLF001
-        active=True, ref_kmh=0.0, speed_kmh=0.5, prev_brake_actual_pct=9.1, stop_speed_kmh=STOP
+        active=True, ref_kmh=0.0, speed_kmh=0.5, prev_brake_actual_pct=8.0, stop_speed_kmh=STOP
     )
-    assert run._obs.u_obs == 9.1  # noqa: SLF001
-    # 帯の最初の周期（前の周期が帯でない）でも規則を通す: 見込み > +0.3 なら u_obs を保つ
-    pct, code = run._lbs_band_cycle(7.5, 0.5, 0.0)  # noqa: SLF001
-    assert pct == pytest.approx(9.1) and code == lbs.LBS_CODE_HELD
-    # 次の周期の上限は u_obs（pkl の 8.905 ではない）。上げたい状態でも 9.1 を超えない
+    assert run._obs.u_obs == 8.0  # noqa: SLF001
+    run._lbs_band_cycle(7.5, 0.5, 0.0)  # noqa: SLF001
+    # 次の周期の上限は u_obs（pkl の 8.905 ではない）。上げたい状態でも 8.0 を超えない
     pct2, _ = run._lbs_band_cycle(7.5, 0.5, 2.0)  # noqa: SLF001
-    assert pct2 <= 9.1 + 1e-9
+    assert pct2 <= 8.0 + 1e-9
 
 
 def test_mode_run_band_cycle_without_obs_keeps_first_cycle_behavior() -> None:
     run = _run()
     pct, code = run._lbs_band_cycle(7.5, 0.5, 0.0)  # noqa: SLF001
     assert pct == 7.5 and code == lbs.LBS_CODE_NONE  # 上乗せ 0・出す開度 ＝ FF（今と同じ）
+
+
+# ───────── 2026-11-08 段20 B-1: 帯の終わりの離しを空きの分だけ遅くする ─────────
+
+TOL = 0.05
+
+
+def _ret(rows, obs=None):
+    """rows ＝ (in_band, その周期の指令直後のブレーキ実開度) の列。"""
+    obs = obs or lbs.BandReturnObserver(TOL, MIN_PCT)
+    for in_band, act in rows:
+        obs.update(in_band=in_band, brake_actual_pct=act)
+    return obs
+
+
+def test_return_observer_decides_r_at_first_cycle_within_min_tol() -> None:
+    # 11-07 の実機: 帯の終わり 0 番の指令 → 3 番の直後に ≦ 4.25 で R ＝ 3
+    obs = _ret([(True, 8.9), (True, 8.9), (False, 7.0), (False, 5.5), (False, 4.6),
+                (False, 4.25), (False, 4.2)])
+    assert obs.measured == [3] and obs.r_max == 3
+    # 0 番ですでに着いていれば R ＝ 0
+    assert _ret([(True, 8.9), (False, 4.2)]).measured == [0]
+
+
+def test_return_observer_measures_per_launch_and_keeps_max() -> None:
+    rows = [(True, 8.9), (False, 6.0), (False, 4.2),  # R ＝ 1
+            (False, 4.2), (True, 8.9), (True, 8.9), (False, 7.0), (False, 5.0),
+            (False, 4.5), (False, 4.2)]  # R ＝ 3
+    obs = _ret(rows)
+    assert obs.measured == [1, 3] and obs.r_max == 3
+    assert lbs.BandReturnObserver(TOL, MIN_PCT).r_max is None
+
+
+def test_return_observer_rejoining_band_discards_and_gives_up_after_max_wait() -> None:
+    obs = _ret([(True, 8.9), (False, 7.0), (True, 8.9), (False, 4.2)])
+    assert obs.measured == [0]  # 途中で帯に入り直したら測りかけを捨て、新しい帯の終わりから
+    obs = lbs.BandReturnObserver(TOL, MIN_PCT, max_wait=3)
+    _ret([(True, 8.9)] + [(False, 9.0)] * 6 + [(False, 4.2)], obs)
+    assert obs.measured == []  # 戻らないまま max_wait を超えたら測れなかった扱い
+    # 実開度が読めない周期は戻ったとみなさない
+    assert _ret([(True, 8.9), (False, None), (False, 4.2)]).measured == [1]
+
+
+def test_late_release_rows() -> None:
+    assert lbs.late_release_rows(5, 3) == 1
+    assert lbs.late_release_rows(4, 3) == 0
+    assert lbs.late_release_rows(5, None) == 0
+    assert lbs.late_release_rows(0, 3) == 0
+    assert lbs.late_release_rows(2, 5) == 0  # 負にならない
+    assert lbs.late_release_rows(8, 3) == 4
+
+
+def test_plan_gap_rows_counts_rows_from_band_end_to_first_accel() -> None:
+    import numpy as np  # noqa: PLC0415
+
+    # 帯の最後の行 2。0 番 ＝ 行 3。アクセルの最初の行 8 → G ＝ 5
+    eff = np.array([0, -8, -8, 0, 0, 0, 0, 0, 3.0, 4.0])
+    assert lbs.plan_gap_rows(eff, 2) == 5
+    # すぐアクセル → 0・間にブレーキの行がある → 0・アクセルが無い → 0
+    assert lbs.plan_gap_rows(np.array([-8, 2.0]), 0) == 0
+    assert lbs.plan_gap_rows(np.array([-8, 0, -3.0, 2.0]), 0) == 0
+    assert lbs.plan_gap_rows(np.array([-8, 0, 0, 0.0]), 0) == 0
+
+
+def test_extend_launch_band_and_ff_time_for_b1() -> None:
+    from tests.research.hold_scene import HoldInterval  # noqa: PLC0415
+
+    dt = 0.05
+    bands = [HoldInterval(3.0, 0.60, 1.0)]  # 最後の周期 3.55
+    new, k = lbs.extend_launch_band(bands, 3.55, 1, dt)
+    assert k == 0 and new[0].length_s == pytest.approx(0.65) and bands[0].length_s == 0.60
+    assert lbs.extend_launch_band(bands, 3.55, 0, dt) == (bands, None)
+    assert lbs.extend_launch_band(bands, 9.0, 1, dt) == (bands, None)
+    ext = lbs.extend_band_ext([], 3.55, 1, dt)
+    assert ext == [(3.55, pytest.approx(3.60))]
+    assert lbs.band_ff_time(3.60, ext, dt) == 3.55  # 伸ばした周期の FF は元の最後の周期の値
+    assert lbs.band_ff_time(3.65, ext, dt) == 3.65
+    # B-2 で伸ばした区間の最後の周期から更に伸ばすと、その項がつながる
+    ext2 = lbs.extend_band_ext([(3.55, 3.70)], 3.70, 2, dt)
+    assert ext2 == [(3.55, pytest.approx(3.80))]
+    assert lbs.band_ff_time(3.80, ext2, dt) == 3.55
+
+
+def _b1_run(r_max_rows, gap):
+    """B-1 の判定用の _ModeRun 風。帯 3.0〜3.55・計画は帯の後 gap 行が 0・その次がアクセル。"""
+    import numpy as np  # noqa: PLC0415
+
+    from tests.research.hold_scene import HoldInterval  # noqa: PLC0415
+
+    run = _run()
+    dt = 0.05
+    n = 100
+    eff = np.zeros(n)
+    eff[60:72] = -8.0  # 行 60〜71 ＝ 帯（t 3.0〜3.55）
+    eff[72 + gap] = 3.0
+    run.interval_s = dt
+    run.hold = SimpleNamespace(launch_bands=[HoldInterval(3.0, 0.60, 1.0)], step_s=dt)
+    run.ff = SimpleNamespace(plan=SimpleNamespace(
+        effort_pct=eff, index_at=lambda t: int(round(t / dt)),
+        launch_band=eff < 0.0,
+    ))
+    run._band_ext = []  # noqa: SLF001
+    run._ret_obs = lbs.BandReturnObserver(TOL, MIN_PCT)  # noqa: SLF001
+    run._ret_obs.measured = list(r_max_rows)  # noqa: SLF001
+    run._plan_band_row = lambda t: True  # noqa: SLF001
+    return run
+
+
+def test_b1_extends_running_band_by_gap_minus_r_plus_one() -> None:
+    run = _b1_run([3], gap=5)
+    run._b1_extend_if_last(3.50)  # noqa: SLF001  最後の周期ではない
+    assert run.b1_launches == 0 and run.b1_extended == []
+    run._b1_extend_if_last(3.55)  # noqa: SLF001
+    assert run.b1_launches == 1 and run.b1_extended == [1]
+    assert run.hold.launch_bands[0].length_s == pytest.approx(0.65)
+    assert run._band_ext == [(3.55, pytest.approx(3.60))]  # noqa: SLF001
+    assert run._b1_rows_at(3.60) == 1 and run._b1_rows_at(3.55) is None  # noqa: SLF001
+    # 伸ばした後の最後の周期では再判定しない（数えない・もう伸ばさない）
+    run._b1_extend_if_last(3.60)  # noqa: SLF001
+    assert run.b1_launches == 1 and run.b1_extended == [1]
+
+
+def test_b1_no_extension_without_r_or_without_slack() -> None:
+    for r, gap in (([], 5), ([3], 4), ([3], 3)):
+        run = _b1_run(r, gap)
+        run._b1_extend_if_last(3.55)  # noqa: SLF001
+        assert run.b1_launches == 1 and run.b1_extended == []
+        assert run.hold.launch_bands[0].length_s == pytest.approx(0.60)
+        assert run._band_ext == []  # noqa: SLF001
+
+
+def test_plan_band_row_counts_b1_extended_rows() -> None:
+    run = _b1_run([3], gap=5)
+    del run._plan_band_row  # noqa: SLF001  インスタンスの差し替えを外してクラスのものを使う
+    run.ff = mdmod.ForwardMapFeedforward.__new__(mdmod.ForwardMapFeedforward)
+    run.ff._plan = SimpleNamespace(  # noqa: SLF001
+        launch_band=[False] * 100, index_at=lambda t: int(round(t / 0.05))
+    )
+    assert run._plan_band_row(3.60) is False  # noqa: SLF001
+    run._b1_rows = [(3.60, 3.60, 1)]  # noqa: SLF001
+    assert run._plan_band_row(3.60) is True  # noqa: SLF001
+    assert run._plan_band_row(3.65) is False  # noqa: SLF001
+
+
+def test_b1_log_column_exists_and_defaults_none() -> None:
+    assert "band_late_rows" in dlmod.CSV_COLUMNS
+    assert dlmod.DriveSample.__dataclass_fields__["band_late_rows"].default is None
+    assert "band_late_rows" in inspect.signature(dlmod.SessionLog.record).parameters

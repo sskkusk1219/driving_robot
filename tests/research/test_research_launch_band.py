@@ -276,6 +276,7 @@ def test_plan_band_row_lookup_in_mode_drive() -> None:
     ff._plan = on  # noqa: SLF001
     run = mdmod._ModeRun.__new__(mdmod._ModeRun)  # noqa: SLF001
     run.ff = ff
+    run._b1_rows = []  # noqa: SLF001  2026-11-08 段20 B-1: 伸ばした周期（無し）
     last_b = int(np.flatnonzero(on.launch_band)[-1])
     assert run._plan_band_row(last_b * DT) is True  # noqa: SLF001
     assert run._plan_band_row((last_b + 1) * DT) is False  # noqa: SLF001  すき間の行

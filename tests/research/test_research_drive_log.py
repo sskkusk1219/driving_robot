@@ -459,5 +459,11 @@ def test_launch_step_code_column_is_registered_and_blank_when_off() -> None:
 
 def test_launch_obs_pct_column_is_last_and_blank_when_off() -> None:
     # 2026-11-07 段16 型 A: 測った動き出す開度の列（off・未測定は空欄）
-    assert dlmod.CSV_COLUMNS[-1] == "launch_obs_pct"
+    assert "launch_obs_pct" in dlmod.CSV_COLUMNS
     assert dlmod.DriveSample.__dataclass_fields__["launch_obs_pct"].default is None
+
+
+def test_band_late_rows_column_is_last_and_blank_when_off() -> None:
+    # 2026-11-08 段20 B-1: 伸ばした周期にだけ s を入れる列（off・伸ばさない周期は空欄）
+    assert dlmod.CSV_COLUMNS[-1] == "band_late_rows"
+    assert dlmod.DriveSample.__dataclass_fields__["band_late_rows"].default is None

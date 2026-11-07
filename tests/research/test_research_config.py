@@ -1379,6 +1379,7 @@ def test_keys_missing_in_yaml_lists_dataclass_keys_not_written(tmp_path: Path) -
         "forward_map.low_speed_keep_window_s",
         "forward_map.launch_breakaway_observed",
         "forward_map.launch_band_shift",
+        "forward_map.launch_band_late_release",
         "learning.stop_brake_floor_start_tol_kmh",
         "learning.stop_brake_floor_min_float_s",
         "learning.stop_brake_floor_opening_tol_pct",
@@ -1843,3 +1844,19 @@ def test_launch_band_shift_default_false_and_needs_shift_choose_and_band() -> No
     cfg.forward_map.launch_shift_choose = True
     cfg.forward_map.launch_brake_band = False
     assert any("launch_band_shift" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_launch_band_late_release_default_false_and_needs_band_and_step_fb() -> None:
+    # 2026-11-08 段20（B-1）: 既定 off。launch_brake_band・launch_band_step_fb が無ければ弾く
+    assert cfgmod.ForwardMapSection().launch_band_late_release is False
+    cfg = cfgmod.load_config(cfgmod.DEFAULT_CONFIG_PATH)
+    assert cfg.forward_map.launch_band_late_release is False
+    cfg.forward_map.launch_band_late_release = True
+    cfg.forward_map.launch_brake_band = True
+    cfg.forward_map.launch_band_step_fb = True
+    assert not any("launch_band_late_release" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.launch_band_step_fb = False
+    assert any("launch_band_late_release" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.launch_band_step_fb = True
+    cfg.forward_map.launch_brake_band = False
+    assert any("launch_band_late_release" in p for p in cfgmod.validate_config(cfg))

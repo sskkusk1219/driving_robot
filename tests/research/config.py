@@ -1379,12 +1379,12 @@ class ForwardMapSection:
     # 2026-11-07 ProblemReport_20261106_発進で速すぎでもブレーキを戻す 段16（型 A。ユーザー決定
     # 2026-11-07）: true なら、帯のある発進ごとに「その場で動き出す開度」を測る。基準が停車速度以下
     # のまま CAN 車速が 0.01 km/h（launch_band_step.LAUNCH_OBS_MOVE_KMH）を超えた最初の周期の、前の
-    # 周期のブレーキ実開度を u_obs とする（測れなければ今のまま）。測れたら ① 発進前の離しの行の
-    # ブレーキ指令を u_obs より浅くしない ② 帯の踏み増しの上限を pkl の動き出す開度でなく u_obs に
-    # し、測れた後の最初の帯の周期は前の出す開度を max(前, u_obs) にして段12 の規則へ通す。
-    # 根拠: 段15 の調べで、帯の発進はどれも基準より 0.15〜0.40 s 先にブレーキ実開度 9.0〜9.2% で
-    # 動き出し、上限 8.905% では止まらなかった。launch_release_ramp・launch_band_step_fb が要る。
-    # ログ: launch_obs_pct。既定 false ＝ 今と完全に同じ。決める時期: 段18 の実機（3 モード）
+    # 周期のブレーキ実開度を u_obs とする（測れなければ今のまま）。
+    # 2026-11-08 段20（ユーザー決定）で意味を直した: 測れた u_obs は帯の中の踏み増しの上限にだけ使う
+    # （上限 ＝ u_obs。pkl の値との深い方にはしない）。測った開度までブレーキを深くはしない
+    # （発進前の離しの行の床・帯の最初の周期の持ち上げは廃止。段18 実機で US06 48 が止まり直し・
+    # U 346 が遅すぎになった原因だった）。launch_release_ramp・launch_band_step_fb が要る。
+    # ログ: launch_obs_pct。既定 false ＝ 今と完全に同じ。決める時期: 段22 の実機（3 モード）
     launch_breakaway_observed: bool = False
     # 2026-11-07 同 段16（B-2。ユーザー決定 2026-11-07）: true なら、帯の発進にも発進のずらしの δ
     # （0〜8 行）を使う。帯の終わりの行から後ろ（アクセルを含む並び）だけを δ 行後ろへ移し、
@@ -1392,6 +1392,16 @@ class ForwardMapSection:
     # 車速 ＝ 基準で積む。launch_shift_choose・launch_brake_band が要る。実行中の帯の区間も δ 行
     # 伸ばす。既定 false ＝ 今と完全に同じ（帯の発進は δ ＝ 0）。決める時期: 段18 の実機
     launch_band_shift: bool = False
+    # 2026-11-08 同 段20（B-1。ユーザー決定 2026-11-08）: true なら、帯の終わりでブレーキを
+    # min へ離す時刻を、計画のアクセルまでの空きの分だけ遅くする（アクセルは遅らせない）。
+    # 帯の発進ごとに、
+    # 帯の終わりから実開度が min ＋ 0.05% 以下になるまでの周期数 R を走行中に測り（最大 R_max）、
+    # 帯の最後の周期で、帯の終わりから計画のアクセルの最初の行までの周期数 G を数えて
+    # s ＝ max(G − (R_max ＋ 1), 0) 周期だけ実行中の帯の区間を伸ばす（伸ばした周期の FF は元の
+    # 最後の周期の値・帯の FB の規則はそのまま）。最初の帯の発進（まだ R が無い）は s ＝ 0。
+    # ログ: band_late_rows。launch_brake_band・launch_band_step_fb が要る。既定 false ＝ 今と
+    # 完全に同じ。決める時期: 段22 の実機
+    launch_band_late_release: bool = False
 
 
 @dataclass
@@ -1932,6 +1942,12 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         not fm.launch_band_shift or (fm.launch_shift_choose and fm.launch_brake_band),
         "forward_map.launch_band_shift は launch_shift_choose・launch_brake_band が true のときだけ"
         "使える",
+    )
+    need(
+        not fm.launch_band_late_release
+        or (fm.launch_brake_band and fm.launch_band_step_fb),
+        "forward_map.launch_band_late_release は launch_brake_band・launch_band_step_fb が true の"
+        "ときだけ使える",
     )
     need(
         not fm.launch_gap_tight or fm.launch_release_ramp,

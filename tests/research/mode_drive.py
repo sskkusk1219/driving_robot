@@ -96,14 +96,19 @@ from tests.research.launch_band_step import (
     LBS_CODE_NONE,
     LBS_CODE_RAISED,
     LBS_CODE_WAIT,
+    BandReturnObserver,
     LaunchBreakawayObserver,
     band_ff_time,
+    extend_band_ext,
+    extend_launch_band,
+    late_release_rows,
     launch_band_forecast,
     launch_band_obs_inputs,
     launch_band_raise_wanted,
     launch_band_seq_rows,
     launch_band_step,
     launch_band_step_setup,
+    plan_gap_rows,
     stretch_launch_bands,
 )
 from tests.research.launch_hold import LaunchMoveHold, launch_hold_gain
@@ -1008,9 +1013,16 @@ def _prepare_forward_map_plan(
     if fm.launch_breakaway_observed:
         say("  発進ごとにその場で動き出す開度を測って保つ（2026-11-07 段16 型 A）: あり・"
             f"動いたとみなす車速 > {LAUNCH_OBS_MOVE_KMH:g} km/h（基準が停車速度以下のまま）・"
-            "測れた発進は前の離しを u_obs より浅くせず、帯の上限も u_obs。測れなければ pkl の上限")
+            "測れた発進は帯の踏み増しの上限だけ u_obs（2026-11-08 段20。深くはしない）。"
+            "測れなければ pkl の上限")
     else:
         say("  発進ごとにその場で動き出す開度を測って保つ（2026-11-07 段16 型 A）: なし")
+    if fm.launch_band_late_release:
+        say("  帯の終わりの離しをアクセルまでの空きの分だけ遅くする（2026-11-08 段20 B-1）: "
+            f"あり・戻る周期 R は走行中に測る（実開度 ≦ min ＋ {INTERLOCK_TOL_PCT:g}%）・"
+            "伸ばす周期 s ＝ max(G − (R_max ＋ 1), 0)・最初の帯の発進は s ＝ 0")
+    else:
+        say("  帯の終わりの離しをアクセルまでの空きの分だけ遅くする（2026-11-08 段20 B-1）: なし")
     if isinstance(ff, ForwardMapFeedforward):
         say(f"  動き出したら離しを止めて待つ（段8-a）: {make_launch_hold(cfg, ff, plan)[1]}")
     say("  P・惰行の補助の表から A2 を外す（段8-b）: "
@@ -2227,7 +2239,6 @@ class _ModeRun:
             self._obs_seq = launch_band_seq_rows(
                 self.ff.plan.launch_prep, self.ff.plan.launch_band
             )
-        self._last_brake_cmd = 0.0  # 前の周期の最終のブレーキ指令の深さ [%]（正）
         # 2026-11-07 段16 B-2（launch_band_shift）: 計画が選んだ δ だけ実行中の帯の区間を伸ばす。
         # 伸ばした行の帯の FF は元の最後の周期の値のまま（_band_ext で時刻を差し替える）
         self._band_ext: list[tuple[float, float]] = []
@@ -2240,6 +2251,20 @@ class _ModeRun:
                 self.hold.launch_bands, self._band_ext = stretch_launch_bands(
                     self.hold.launch_bands, ls.band_events, self.interval_s
                 )
+        # 2026-11-08 段20 B-1（launch_band_late_release。off は None）: 帯の発進ごとに
+        # 戻る周期数 R を測り、帯の最後の周期で、アクセルまでの空きの分だけ実行中の帯の区間を伸ばす
+        self._ret_obs: BandReturnObserver | None = None
+        self._b1_rows: list[tuple[float, float, int]] = []  # 伸ばした周期（最初の・最後の時刻, s）
+        self._b1_pending_end: float | None = None  # 伸ばした帯の新しい最後の周期（再判定しない）
+        self.b1_launches = 0  # 判定した帯の発進の数
+        self.b1_extended: list[int] = []  # 伸ばした発進の s
+        if (
+            cfg.forward_map.launch_band_late_release and self._lbs_setup is not None
+            and self.hold is not None and isinstance(self.ff, ForwardMapFeedforward)
+        ):
+            self._ret_obs = BandReturnObserver(
+                INTERLOCK_TOL_PCT, cfg.vehicle.min_brake_opening_pct
+            )
         self._keep_brake_win: deque[tuple[float, float]] = deque()  # 案③: (t, 実ブレーキ開度)
         self._keep_speed_win: deque[tuple[float, float]] = deque()  # 案③: (t, CAN 車速)
         self._accel_blocked = False
@@ -2371,7 +2396,49 @@ class _ModeRun:
         lb = getattr(plan, "launch_band", None)
         if lb is None:
             return False
+        if self._b1_in_extension(t):
+            return True  # 2026-11-08 段20 B-1: 伸ばした周期も帯として扱う
         return bool(lb[plan.index_at(t)])
+
+    def _b1_rows_at(self, t: float) -> int | None:
+        """ログ band_late_rows: 伸ばした周期ならその発進の s・他は None（B-1 off も None）。"""
+        tol = 0.5 * self.interval_s
+        for a, b, s in self._b1_rows:
+            if a - tol <= t <= b + tol:
+                return s
+        return None
+
+    def _b1_in_extension(self, t: float) -> bool:
+        """B-1 で伸ばした周期（計画の印は付いていない）か。"""
+        if not self._b1_rows:
+            return False
+        tol = 0.5 * self.interval_s
+        return any(a - tol <= t <= b + tol for a, b, _ in self._b1_rows)
+
+    def _b1_extend_if_last(self, t: float) -> None:
+        """2026-11-08 段20 B-1: t が帯の区間の最後の周期なら、帯の終わり（次の周期）から計画の
+        アクセルの最初の行までの周期数 G を数え、s ＝ max(G − (R_max ＋ 1), 0) 周期だけ実行中の帯の
+        区間を伸ばす。伸ばした周期の帯の FF は今までの最後の周期の値のまま（_band_ext）。
+        計画のアクセルの行は動かさない。測った R が無い（最初の帯の発進）は s ＝ 0。"""
+        assert self.hold is not None and self._ret_obs is not None
+        step = self.hold.step_s
+        tol = 0.5 * step
+        if self._b1_pending_end is not None and abs(self._b1_pending_end - t) <= tol:
+            self._b1_pending_end = None  # 伸ばした後の最後の周期（同じ発進。再判定しない）
+            return
+        if not any(abs((iv.end_s - step) - t) <= tol for iv in self.hold.launch_bands):
+            return
+        plan = self.ff.plan  # type: ignore[attr-defined]
+        gap = plan_gap_rows(plan.effort_pct, plan.index_at(t))
+        s = late_release_rows(gap, self._ret_obs.r_max)
+        self.b1_launches += 1
+        if s <= 0:
+            return
+        self.hold.launch_bands, _ = extend_launch_band(self.hold.launch_bands, t, s, step)
+        self._band_ext = extend_band_ext(self._band_ext, t, s, step)
+        self._b1_rows.append((t + step, t + s * step, s))
+        self._b1_pending_end = t + s * step
+        self.b1_extended.append(s)
 
     def _step_release_cycle(
         self, effort: float, *, zone: bool, first: bool, speed: float, ref: float
@@ -2442,20 +2509,12 @@ class _ModeRun:
     ) -> tuple[float, int]:
         """帯（hold_scene 3）の 1 周期。戻り値 (出すブレーキ開度 [%], 印)。帯の最初の周期
         （前の周期が帯でない）は上乗せ 0・印 0・出す開度 ＝ FF。集計も持つ。
-        2026-11-07 段16 型 A: 動き出す開度 u_obs が測れていれば、上限 ＝ u_obs。測れた後の最初の帯の
-        周期（帯の最初の周期を含む）は前の出す開度 ＝ max(前の出す開度［無ければ前の周期の最終の
-        ブレーキ指令］, u_obs)・前の FF ＝ この周期の FF で規則を通す（測れなければ今と同じ）。"""
+        2026-11-08 段20 型 A: 動き出す開度 u_obs が測れていれば、踏み増しの上限 ＝ u_obs だけ
+        （前の出す開度・前の FF は触らない。深くしない。測れなければ今と同じ）。"""
         gain, lag_s, wait_cycles, cap_pct, min_pct = self._lbs_setup  # type: ignore[misc]
         prev_out, prev_ff = self._lbs_prev_out, self._lbs_prev_ff
         u_obs = None if self._obs is None else self._obs.u_obs
-        if u_obs is not None:
-            first = self._obs.take_first()  # type: ignore[union-attr]
-            cap_pct, prev_out, ff_over = launch_band_obs_inputs(
-                u_obs, first=first, cap_pct=cap_pct, prev_out_pct=prev_out,
-                last_cmd_pct=self._last_brake_cmd, ff_pct=ff_pct,
-            )
-            if ff_over is not None:
-                prev_ff = ff_over
+        cap_pct = launch_band_obs_inputs(u_obs, cap_pct=cap_pct)
         if prev_out is None or prev_ff is None:
             self._lbs_wait_left = 0
             offset, pct, code = 0.0, ff_pct, LBS_CODE_NONE
@@ -2556,7 +2615,6 @@ class _ModeRun:
             self._obs.update(
                 active=obs_prep_row, ref_kmh=ref, speed_kmh=speed,
                 prev_brake_actual_pct=self._last_brake_actual, stop_speed_kmh=_STOP,
-                band_row=bool(plan_o.launch_band[i_o]),
             )
             obs_pct = self._obs.u_obs
         if self.hold is not None:
@@ -2604,6 +2662,8 @@ class _ModeRun:
                             hold_ff_pct if keep_pct is None else keep_pct, lbs_dev, lbs_slope
                         )
                         ff_effort = -lbs_pct
+                        if self._ret_obs is not None:
+                            self._b1_extend_if_last(t)  # 2026-11-08 段20 B-1
                 elif h.points is not None:
                     hold_ff_pct = interp_hold_opening(h.points, ref) + h.offset_pct
                     ff_effort = -hold_ff_pct
@@ -2671,15 +2731,6 @@ class _ModeRun:
         # C10 の上乗せは FF の列（accel_ff・brake_ff・plan_effort）には入れない（作ったずれが
         # 今までと同じ意味で比べられるように）。実際に出す effort にだけ足す
         effort = ff_effort + (c10_effort or 0.0) + pid_effort + hold_delta + hold_add
-        if (
-            self._obs is not None and self._obs.u_obs is not None and obs_prep_row
-            and not hold_scene and not self._obs.seen_band and effort < 0.0
-            and effort > -self._obs.u_obs
-        ):
-            # 2026-11-07 段16 型 A: 帯の前の離しの行は、測った動き出す開度 u_obs より浅くしない
-            # （launch_move_hold の足しの後・C14 の前。止まっていないと動き出した所へ戻れない）
-            effort = -self._obs.u_obs
-            self._obs.floor_cycles += 1
         ff_shown = ff_effort  # ログの FF 列に出す値（C14 の下限を掛けたもの）
         floor_raise: float | None = None
         if self.cfloor is not None:
@@ -2763,7 +2814,6 @@ class _ModeRun:
         if governed:
             self.governor_cycles += 1
         accel, brake = self._apply_interlock(accel, brake)
-        self._last_brake_cmd = brake  # 2026-11-07 段16 型 A: 前の周期の最終のブレーキ指令
         if self.c10_int is not None and self._ci_active:
             # 段6d: 指令が片足ルール・ガバナーなどで浅く切られたか（min・上限の分は _c10_offset で）
             if effort < 0.0:
@@ -2796,6 +2846,11 @@ class _ModeRun:
             ) from exc
         self._last_accel_actual = pulse_to_opening(monitor_accel.position_pulse)
         self._last_brake_actual = pulse_to_opening(monitor_brake.position_pulse)
+        if self._ret_obs is not None:
+            # 2026-11-08 段20 B-1: この周期の指令を出した直後のブレーキ実開度で R を測る
+            self._ret_obs.update(
+                in_band=hold_scene == 3, brake_actual_pct=self._last_brake_actual
+            )
         if self.hold is not None and self.hold.keep_enabled:
             self._keep_brake_win.append((t, self._last_brake_actual))
         cycle_ms = 1000.0 * (time.perf_counter() - cycle_started)
@@ -2875,6 +2930,7 @@ class _ModeRun:
                     stop_keep_held=stop_keep_held_code,
                     launch_step_code=lbs_code,
                     launch_obs_pct=obs_pct,
+                    band_late_rows=self._b1_rows_at(t),
                 )
             )
         if segment != self._segment:
@@ -3734,6 +3790,14 @@ async def run_mode_drive(
             f"上乗せの最大 {run.lbs_offset_max:.2f}%・最小 {run.lbs_offset_min:.2f}%・"
             f"上限で頭打ち {run.lbs_cap_hits} 周期・"
             f"開度を保った（見込み > +0.3） {run.lbs_hold_open_cycles} 周期")
+    if run._ret_obs is not None:  # noqa: SLF001
+        ext = run.b1_extended
+        say("  帯の終わりの離しを遅くした（2026-11-08 段20 B-1）: "
+            f"帯の発進 {run.b1_launches} 回・伸ばした {len(ext)} 回"
+            f"（周期 {ext}・計 {sum(ext)} 周期）・測った戻る周期 R "
+            f"{run._ret_obs.measured}（最大 {run._ret_obs.r_max}）・"  # noqa: SLF001
+            + (f"安全網 {run.interlock.summary()}" if run.interlock is not None
+               else "安全網 off"))
     if run._obs is not None:  # noqa: SLF001
         say("  発進で測った動き出す開度（2026-11-07 段16 型 A）: "
             f"{run._obs.summary()}")  # noqa: SLF001
