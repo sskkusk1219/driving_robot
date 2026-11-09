@@ -219,6 +219,13 @@ CSV_COLUMNS: tuple[str, ...] = (
     # [km/h]（惰行の区間の外・off は空欄）
     "coast_handover",
     "coast_pred_dev_kmh",
+    # 2026-11-09 ProblemReport_20261109 段2・4（forward_map.c10_small_dev_band / c10_d_term）:
+    # small_dev_p_kmh ＝ 帯の f を掛けた後の P の偏差 [km/h]／d_term_kmh ＝ D の分
+    # Td ×（need − a_meas）[km/h]／d_accel_meas_kmhs ＝ D に使った実測の加速度 [km/h/s]
+    # （掛けない行・off は空欄。D は窓に 3 点未満の周期も空欄）
+    "small_dev_p_kmh",
+    "d_term_kmh",
+    "d_accel_meas_kmhs",
 )
 
 
@@ -291,6 +298,9 @@ class DriveSample:
     play_floor_active: int | None = None  # 同: 下限で止めた周期 +1 アクセル・−1 ブレーキ・他 0
     coast_handover: int | None = None  # 同 段2: handover の周期 1・他 0（off は None）
     coast_pred_dev_kmh: float | None = None  # 同 段2: 先読みの偏差 p [km/h]
+    small_dev_p_kmh: float | None = None  # 20261109 段2: 帯の f を掛けた後の P の偏差
+    d_term_kmh: float | None = None  # 同 段4: D の分 Td ×（need − a_meas）
+    d_accel_meas_kmhs: float | None = None  # 同 段4: D に使った実測の加速度
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -407,6 +417,9 @@ class SessionLog:
         play_floor_active: int | None = None,
         coast_handover: int | None = None,
         coast_pred_dev_kmh: float | None = None,
+        small_dev_p_kmh: float | None = None,
+        d_term_kmh: float | None = None,
+        d_accel_meas_kmhs: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -470,6 +483,9 @@ class SessionLog:
             play_floor_active=play_floor_active,
             coast_handover=coast_handover,
             coast_pred_dev_kmh=coast_pred_dev_kmh,
+            small_dev_p_kmh=small_dev_p_kmh,
+            d_term_kmh=d_term_kmh,
+            d_accel_meas_kmhs=d_accel_meas_kmhs,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -690,6 +706,9 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 "" if s.play_floor_active is None else str(s.play_floor_active),
                 "" if s.coast_handover is None else str(s.coast_handover),
                 _fmt(s.coast_pred_dev_kmh),
+                _fmt(s.small_dev_p_kmh),
+                _fmt(s.d_term_kmh),
+                _fmt(s.d_accel_meas_kmhs),
             ])
 
 

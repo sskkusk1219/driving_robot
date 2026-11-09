@@ -256,3 +256,40 @@ def test_pedal_overlap_margin_removes_shallow_overlap() -> None:
 
 def test_pedal_overlap_returns_none_when_actual_missing() -> None:
     assert _overlap([4.0, None, 5.0], [4.0, 4.0, 5.0]) is None
+
+
+# ---- IWR（SAE J2951、ProblemReport_20261109 段1） ----------------------------------------
+
+
+def _ref_with_cruise() -> tuple[np.ndarray, np.ndarray]:
+    """加速 → 定速 → 減速 → 定速の基準（0.1 s 刻み）。"""
+    t = np.arange(0.0, 60.0, 0.1)
+    v = np.interp(t, [0, 10, 20, 40, 50, 60], [20, 60, 60, 60, 30, 30])
+    return t, v
+
+
+def test_iwr_is_zero_when_actual_equals_ref() -> None:
+    t, v = _ref_with_cruise()
+    r = kpi.iwr_j2951(t, v, v)
+    assert r is not None
+    assert r.iwr_pct == pytest.approx(0.0, abs=1e-9)
+    assert r.parts_sum_pct == pytest.approx(0.0, abs=1e-9)
+
+
+def test_iwr_positive_when_sine_ripple_on_cruise() -> None:
+    """定速に正弦の揺れを足すと、± が打ち消さず加速側だけ積み上がって IWR が正になる。
+    増えた分は定速の内訳に出る。"""
+    t, v = _ref_with_cruise()
+    act = v + 0.1 * np.sin(2 * np.pi * 0.8 * t)
+    r = kpi.iwr_j2951(t, v, act)
+    assert r is not None
+    assert r.iwr_pct > 0.0
+    assert r.cruise_pct > 0.0
+    assert r.cruise_pct > abs(r.accel_pct) and r.cruise_pct > abs(r.decel_pct)
+
+
+def test_iwr_none_when_too_few_points_or_no_acceleration() -> None:
+    assert kpi.iwr_j2951([0.0, 0.1], [10.0, 10.0], [10.0, 10.0]) is None
+    t = np.arange(0.0, 10.0, 0.1)
+    flat = np.full_like(t, 50.0)
+    assert kpi.iwr_j2951(t, flat, flat) is None  # 基準の IWD が 0

@@ -54,6 +54,7 @@ from tests.research.kpi import (
     KpiResult,
     chatter_metrics,
     compute_kpi,
+    iwr_j2951,
     pedal_overlap,
     sample_interval_s,
     speed_band_label,
@@ -933,6 +934,23 @@ def write_mode_report(
         else f"待機位置 ＋ {k.pedal_overlap_margin_pct:g}%"
     )
 
+    # IWR（SAE J2951、ProblemReport_20261109 段1）。目標の判定は WLTP・UDDS だけ。
+    # 他は値と法規の目安の参考表示
+    iwr = iwr_j2951([r.t_s for r in rows], [r.ref_kmh for r in rows], [r.actual_kmh for r in rows])
+    iwr_judged = any(w in info.mode_name.upper() for w in ("WLTP", "UDDS"))
+    if iwr is None:
+        iwr_target, iwr_text, iwr_judge = "—", "計算できない（行が少ない）", "—"
+    else:
+        iwr_text = (
+            f"{iwr.iwr_pct:+.2f} %（内訳: 定速 {iwr.cruise_pct:+.2f}・加速 {iwr.accel_pct:+.2f}・"
+            f"減速 {iwr.decel_pct:+.2f} %）"
+        )
+        if iwr_judged:
+            iwr_target = f"{k.iwr_min_pct:+g}〜{k.iwr_max_pct:+g} %"
+            iwr_judge = _ok(k.iwr_min_pct <= iwr.iwr_pct <= k.iwr_max_pct)
+        else:
+            iwr_target, iwr_judge = "法規の目安 ±2 %（参考）", "—"
+
     index_lines, _ = drive_index_lines(rows, cfg, segmented)
     if info.config_text is not None:
         appendix_text = info.config_text
@@ -984,9 +1002,13 @@ def write_mode_report(
                  f"{chatter.pedal_reversal_window_max_per_s:.2f} 回/s", _ok(pedal_ok)),
                 (f"同時踏み（アクセル・ブレーキの実開度が両方とも{overlap_base}を超えた時間）",
                  "0 s", overlap_text, overlap_ok),
+                ("IWR（SAE J2951。加速側の慣性仕事が基準より何 % 多いか）",
+                 iwr_target, iwr_text, iwr_judge),
             ],
         ),
         "",
+        "- IWR は 10 Hz・フィルタなし・中心差分で計算し、判定は WLTP と UDDS だけ（他は参考）。"
+        "内訳の定速は基準の |加速度| < 0.3 km/h/s、各値は基準の IWD 全体に対する %。",
         "- ペダル操作の滑らかさと同時踏みは上の 3 項目の総合判定・満たした項目数には含めず、"
         "別枠で判定する（ProblemReport_20260921 手順3、同時踏みは ProblemReport_20261001）。",
         f"- 判定は MODE_DRIVE の 0.1s 刻みの行（{kpi.n_samples} 行、CSV と同じ）で計算"

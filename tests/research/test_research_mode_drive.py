@@ -2376,3 +2376,87 @@ async def test_dob_effort_excludes_c10_integral(
         _c10_int_step(run, t, e, ref=20.0, dev=-0.5)
     assert run._ci_pct != 0.0  # noqa: SLF001  # I が効いている
     assert run._dob_effort == pytest.approx(0.0, abs=1e-9)  # noqa: SLF001
+
+
+# ─── 小さい偏差の帯・D（2026-11-09 ProblemReport_20261109 段2・4） ─────────────
+
+
+def test_small_dev_band_is_continuous_and_keeps_outer_slope() -> None:
+    f = mdmod.small_dev_band
+    assert f(0.05, 0.1, 0.5) == pytest.approx(0.025)
+    assert f(-0.05, 0.1, 0.5) == pytest.approx(-0.025)
+    assert f(0.1, 0.1, 0.5) == pytest.approx(0.05)  # 境で連続
+    assert f(0.1 + 1e-9, 0.1, 0.5) == pytest.approx(0.05, abs=1e-6)
+    assert f(0.3, 0.1, 0.5) == pytest.approx(0.25)  # 外の傾きは 1
+    assert f(-1.0, 0.1, 0.5) == pytest.approx(-0.95)
+    assert f(0.0, 0.1, 0.5) == 0.0
+    assert f(0.7, 0.2, 1.0) == pytest.approx(0.7)  # r ＝ 1 は今と同じ
+
+
+def test_d_term_dev_sign_matches_dev() -> None:
+    # 要る加速度より実加速度が小さい（遅れていく）なら正
+    assert mdmod.d_term_dev(0.2, 1.0, 0.5) == pytest.approx(0.1)
+    assert mdmod.d_term_dev(0.2, 1.0, 1.5) == pytest.approx(-0.1)
+    assert mdmod.d_term_dev(0.2, 0.0, 0.0) == 0.0
+
+
+async def test_c10_small_dev_band_and_d_term_only_change_normal_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """off は今と同じ。on は 7.5 km/h 以上の通常の行の P の偏差だけが変わり、低速・先読み・
+    handover の行は変わらない。D は窓に 3 点未満なら 0。"""
+    cfg = _c10_cfg(tmp_path)
+    # 本体 yaml の発進の帯・踏み増しなどは合成 pkl の meta に無いので、既定の設定に戻して使う
+    cfg.forward_map = cfgmod.ForwardMapSection()
+    cfg.forward_map.deviation_c = 100.0
+    cfg.forward_map.deviation_row = "reference"
+    cfg.forward_map.dob_tq_coef = 40.0
+    run = await _c10_run_obj(cfg, monkeypatch)
+    run._d_win = mdmod.deque()  # noqa: SLF001
+    run.c10_int = None  # 最小の _ModeRun には I が無い（このテストでは使わない）
+    run._ci_prev_t = None  # noqa: SLF001
+    run._b1_rows = []  # noqa: SLF001
+    plan = run.ff.plan
+    ia = int(np.flatnonzero(plan.effort_pct > 4.0 + 1.0)[0])
+    t, e = float(plan.t_s[ia]), float(plan.effort_pct[ia])
+    ref = 40.0
+    fm = cfg.forward_map
+    off = run._c10_offset(t, ref, ref - 0.05, e)  # noqa: SLF001
+    assert off != 0.0 and run._sdb_p_kmh is None  # noqa: SLF001
+    # 帯 on（e 0.1・r 0.5）: 小さい偏差の P が半分（min でも上限でも切られない小さな量）
+    fm.c10_small_dev_band = True
+    on = run._c10_offset(t, ref, ref - 0.05, e)  # noqa: SLF001
+    assert on == pytest.approx(off / 2.0, rel=1e-6)
+    assert run._sdb_p_kmh == pytest.approx(0.025)  # noqa: SLF001
+    # 偏差が帯の外なら外の傾きは今と同じ（値は r × e だけ小さい偏差と同じ）
+    big_off = run._c10_offset(t, ref, ref - 0.4, e)  # noqa: SLF001
+    fm.c10_small_dev_band = False
+    assert big_off != run._c10_offset(t, ref, ref - 0.4, e)  # noqa: SLF001
+    fm.c10_small_dev_band = True
+    # 7.5 km/h 未満の行・先読み（p_dev）の行・handover（flag_override）の行は変わらない
+    for kw in ({"p_dev": 0.3}, {"flag_override": 0}):
+        run._sdb_p_kmh = None  # noqa: SLF001  周期の頭のリセット（_cycle がする）の代わり
+        fm.c10_small_dev_band = False
+        base = run._c10_offset(t, ref, ref - 0.05, e, **kw)  # noqa: SLF001
+        fm.c10_small_dev_band = True
+        assert run._c10_offset(t, ref, ref - 0.05, e, **kw) == base  # noqa: SLF001
+        assert run._sdb_p_kmh is None  # noqa: SLF001
+    run._sdb_p_kmh = None  # noqa: SLF001
+    fm.c10_small_dev_band = False
+    low_off = run._c10_offset(t, 5.0, 4.95, e)  # noqa: SLF001
+    fm.c10_small_dev_band = True
+    assert run._c10_offset(t, 5.0, 4.95, e) == low_off  # noqa: SLF001
+    assert run._sdb_p_kmh is None  # noqa: SLF001
+    # D: 窓 3 点未満は 0（帯だけと同じ）
+    fm.c10_small_dev_band = False
+    fm.c10_d_term = True
+    run._d_term_kmh = None  # noqa: SLF001
+    assert run._c10_offset(t, ref, ref - 0.05, e) == pytest.approx(off)  # noqa: SLF001
+    assert run._d_term_kmh is None  # noqa: SLF001
+    # 窓に 3 点 ＝ 傾き 0 → D ＝ Td × need。Td ＝ τ ÷ c ＝ 遅れ L
+    run._d_win.extend([(t - 0.2, 40.0), (t - 0.1, 40.0), (t, 40.0)])  # noqa: SLF001
+    run._c10_offset(t, ref, ref - 0.05, e)  # noqa: SLF001
+    need = float(plan.need_accel_kmhs[plan.index_at(t)])
+    td = run.ff.tau_accel_s / run.ff.deviation_c
+    assert run._d_accel_kmhs == pytest.approx(0.0)  # noqa: SLF001
+    assert run._d_term_kmh == pytest.approx(td * need)  # noqa: SLF001

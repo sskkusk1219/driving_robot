@@ -658,6 +658,10 @@ class KpiSection:
     pedal_reversal_min_window_s: float = 15.0  # 対象時間がこれ未満の窓は除く [s]
     # 同時踏みと数える実開度の余裕。待機位置＋これを両ペダルが超えた行 [%]
     pedal_overlap_margin_pct: float = 0.0
+    # IWR（SAE J2951 の Inertial Work Rating、kpi.iwr_j2951）の目標 [%]。WLTP・UDDS だけ判定する
+    # （ProblemReport_20261109 段1、ユーザー決定 2026-11-09。法規の目安 ±2% より厳しい）
+    iwr_min_pct: float = -0.2
+    iwr_max_pct: float = 0.4
     # 運転指標（参考。総合判定に含めない）の判定の範囲。UN R154（WLTP）の許容範囲として記憶している
     # 値で、原文は未確認（原文で確かめたら直す）
     drive_index_iwr_min_pct: float = -2.0
@@ -1025,6 +1029,29 @@ class ForwardMapSection:
     # 同 案C: true なら惰行の補助にも I を足す（補助のペダルの側で貯め、a_I を要る加速度に足す。
     # 切られた周期は浅い向きに貯めない）。既定 false ＝ 今と完全に同じ
     c10_integral_coast_assist: bool = False
+    # 2026-11-09 ProblemReport_20261109_定速の小さな揺れ 段2: true で C10 の P に渡る偏差だけを
+    # f(dev) に置き換える（I・DOB は今の dev のまま）。|dev| ≤ e: f ＝ r × dev、|dev| > e:
+    # f ＝ 符号 × (r × e ＋ (|dev| − e))（値が連続・外の傾きは今と同じ）。小さい偏差だけ P を弱めて
+    # 定速・ゆるい坂の ± の行き来（0.8 Hz）を抑える。掛けるのは 7.5 km/h 以上（meta
+    # stop_max_speed_kmh）の通常の C10 の行だけ（低速・先読み・停C・保持の場面・惰行の補助・埋め・
+    # handover・停車前の踏み増し・発進の帯には掛けない）。
+    # r の根拠: Ti ＝ 4τ（今の I）なら帯の中の PI の減衰 ζ ＝ r。ζ 0.5 から決める。
+    # r ＝ 0 は帯の中が I だけで減衰のない揺れになるので不可。e は仮の値（符号反転のしきい値 0.3 の
+    # 1/3）。効く先: 定速の揺れ・IWR。決める時期: 段3 の実機（e 0.1 と 0.2 を比べる）。
+    # 既定 false ＝ 今と完全に同じ
+    c10_small_dev_band: bool = False
+    c10_small_dev_e_kmh: float = 0.1
+    c10_small_dev_r: float = 0.5
+    # 同 段4: true で P の偏差に D を足す。dev_P ＝ f(dev)（段2 off なら dev）＋ Td ×
+    # （need − a_meas）。Td ＝ そのペダルの遅れ L（accel_lag_s / brake_lag_s。τ ÷ deviation_c）、
+    # need ＝ FF の要る加速度、a_meas ＝ 直近 c10_d_window_s 秒の車速の直線の傾き
+    # （3 点未満は D ＝ 0）。
+    # 帯（段2）の f は D に掛けない。掛ける行は段2 と同じ。
+    # 根拠: 位相を進めて揺れを減衰させる。Td ＝ L はデータ由来（手順2 で車ごとに測る）。窓 0.3 s は
+    # 仮の値（遅れ 0.14 s・ノイズ 0.020 km/h/s。シミュレータ。他車は車速信号のノイズで決め直す）。
+    # 効く先: 定速の揺れ・IWR。決める時期: 段5 の実機。既定 false ＝ 今と完全に同じ
+    c10_d_term: bool = False
+    c10_d_window_s: float = 0.3
     # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
     # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
     # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・
@@ -2178,6 +2205,18 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         fm.c10_integral_ti_coef > 0.0,
         f"forward_map.c10_integral_ti_coef は正値: {fm.c10_integral_ti_coef}",
+    )
+    need(
+        fm.c10_small_dev_e_kmh > 0.0,
+        f"forward_map.c10_small_dev_e_kmh は正値: {fm.c10_small_dev_e_kmh}",
+    )
+    need(
+        0.0 < fm.c10_small_dev_r <= 1.0,
+        f"forward_map.c10_small_dev_r は 0 より大きく 1 以下: {fm.c10_small_dev_r}",
+    )
+    need(
+        fm.c10_d_window_s > 0.0,
+        f"forward_map.c10_d_window_s は正値: {fm.c10_d_window_s}",
     )
     need(
         fm.c10_integral_low_speed in ("off", "hold", "accumulate"),

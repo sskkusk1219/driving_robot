@@ -474,6 +474,21 @@ def clip_stop_tail_delta(delta_pct: float) -> float:
     return min(delta_pct, 0.0)
 
 
+def small_dev_band(dev_kmh: float, e_kmh: float, r: float) -> float:
+    """2026-11-09 段2（c10_small_dev_band）: P に渡す偏差 f(dev)。|dev| ≤ e は r × dev、
+    それより外は 符号 × (r × e ＋ (|dev| − e))（値が連続・外の傾きは今と同じ）。"""
+    mag = abs(dev_kmh)
+    if mag <= e_kmh:
+        return r * dev_kmh
+    return math.copysign(r * e_kmh + (mag - e_kmh), dev_kmh)
+
+
+def d_term_dev(td_s: float, need_kmhs: float, accel_meas_kmhs: float) -> float:
+    """2026-11-09 段4（c10_d_term）: P の偏差に足す D ＝ Td ×（要る加速度 − 実測の加速度）[km/h]。
+    要る加速度より実加速度が小さい（遅れていく）なら正（dev ＝ 基準 − 実車速 と同じ向き）。"""
+    return td_s * (need_kmhs - accel_meas_kmhs)
+
+
 def hold_stop_keep_brake(
     prev_pct: float | None,
     new_pct: float,
@@ -1100,6 +1115,7 @@ def _prepare_forward_map_plan(
         say(f"  C11（DOB）: {dob_settings_text(ff)}")
         say(f"  低速の DOB・停C の τ（段6-2）: {dob_low_speed_text(fm)}")
         say(f"  C10 の偏差の積分 I（段6d）: {c10_integral_text(fm)}")
+        say(f"  C10 の P（20261109 段2・4）: {c10_small_dev_text(fm)}")
     if isinstance(ff, CoastAssistFeedforward):
         # 2026-10-18 段2r: 惰行の補助。保持時間 ＝ 係数 × (遅れ ＋ 効き始めまでの戻り時間)
         ff.set_coast(
@@ -1771,6 +1787,16 @@ def c10_integral_text(fm: Any) -> str:
     )
 
 
+def c10_small_dev_text(fm: Any) -> str:
+    """2026-11-09 段2・4（小さい偏差の帯・D）の設定の表示（走行前）。"""
+    band = (
+        f"あり（e ＝ {fm.c10_small_dev_e_kmh:g} km/h・r ＝ {fm.c10_small_dev_r:g}）"
+        if fm.c10_small_dev_band else "なし"
+    )
+    d = f"あり（窓 {fm.c10_d_window_s:g}s・Td ＝ 遅れ L）" if fm.c10_d_term else "なし"
+    return f"小さい偏差の帯 {band}・D {d}"
+
+
 def dob_low_speed_text(fm: Any) -> str:
     """段6-2 の設定の表示（走行前）。"""
     return (
@@ -2011,6 +2037,10 @@ class _ModeRun:
     _stop_end_tau_s: float | None = None
     _stop_pred_tp_s: float | None = None  # 段3: 停C の先読みの Tp（None ＝ 使わない）
     _stop_pred_dev: float | None = None
+    # 2026-11-09 段2・4（帯・D）の今の周期のログ値の既定（最小の _ModeRun でも動くように）
+    _sdb_p_kmh: float | None = None
+    _d_term_kmh: float | None = None
+    _d_accel_kmhs: float | None = None
     # 2026-11-08 ProblemReport_20261108 段1・2 の既定（C10 だけの最小の _ModeRun でも動くように）
     _ho_on = False
     # 段6e: coast_assist_accel_no_play で min に置いている最中か／今の周期の _handover_p の結果
@@ -2200,6 +2230,12 @@ class _ModeRun:
         self._stop_pred_tp_s = None
         self._stop_pred_dev = None
         self._stop_speed_win: deque[tuple[float, float, float]] = deque()  # (t, CAN 車速, ref_t)
+        # 2026-11-09 段2・4: 小さい偏差の帯と D。今の周期のログ値（掛けない行・off は None）と、
+        # D の実測の加速度の窓（毎周期更新。c10_d_term が on のときだけ）
+        self._sdb_p_kmh: float | None = None
+        self._d_term_kmh: float | None = None
+        self._d_accel_kmhs: float | None = None
+        self._d_win: deque[tuple[float, float]] = deque()  # (t, 制御に使っている車速)
         if cfg.forward_map.stop_end_accel_pred_enabled and self.pred is None:
             self._stop_pred_tp_s = stop_end_pred_tp_s(cfg, self.ff)
         if isinstance(self.ff, StopEndFeedforward):
@@ -2657,6 +2693,13 @@ class _ModeRun:
         self._ci_pct = self._ci_kmhs = None if self.c10_int is None else 0.0
         self._stop_end_tau_s = None
         self._stop_pred_dev = None
+        self._sdb_p_kmh = self._d_term_kmh = self._d_accel_kmhs = None
+        if self.cfg.forward_map.c10_d_term:
+            # 段4: D の実測の加速度の窓。行の種類に関係なく毎周期進める
+            dwin = self._d_win
+            dwin.append((t, speed))
+            while dwin and dwin[0][0] < t - self.cfg.forward_map.c10_d_window_s - 1e-9:
+                dwin.popleft()
         self._pf_row = None
         self._ho_now = 0 if self._ho_on else None
         self._ho_p_now = None
@@ -2782,6 +2825,7 @@ class _ModeRun:
                     hold_add = hold_pi_pct
                 c10_effort = None if c10_effort is None else 0.0
                 coast_active = False
+                self._sdb_p_kmh = self._d_term_kmh = self._d_accel_kmhs = None  # 段2・4
                 self._coast_effort = 0.0
                 self._pf_row = None  # 保持の場面は下限を掛けない（20261108 段1）
                 self._ho_now = 0 if self._ho_on else None
@@ -3051,6 +3095,9 @@ class _ModeRun:
                     ),
                     coast_handover=self._ho_now,
                     coast_pred_dev_kmh=self._ho_p_now,
+                    small_dev_p_kmh=self._sdb_p_kmh,
+                    d_term_kmh=self._d_term_kmh,
+                    d_accel_meas_kmhs=self._d_accel_kmhs,
                 )
             )
         if segment != self._segment:
@@ -3357,6 +3404,29 @@ class _ModeRun:
         self._ci_prev_t = t
         if p_dev is not None:
             kwargs["dev_kmh"] = p_dev  # 段3: P だけ先読みの偏差（I は上で今の偏差を使った）
+        fm_sd = self.cfg.forward_map
+        if (fm_sd.c10_small_dev_band or fm_sd.c10_d_term) and self._small_dev_row(
+            t, i, plan, ff_effort, flag_now,
+            flag_override=flag_override, p_dev=p_dev, tau_end=tau_end,
+            low=min(ref, float(kwargs["row_kmh"]))
+            < float(ff.table.meta.get("stop_max_speed_kmh") or 7.5),
+        ):
+            # 2026-11-09 段2・4: P に渡る偏差だけを置き換える（I・DOB は今の dev のまま）。
+            # dev_P ＝ f(dev) ＋ Td ×（need − a_meas）。帯の f は D に掛けない
+            dev_p = float(kwargs["dev_kmh"])
+            if fm_sd.c10_small_dev_band:
+                dev_p = small_dev_band(dev_p, fm_sd.c10_small_dev_e_kmh, fm_sd.c10_small_dev_r)
+                self._sdb_p_kmh = dev_p
+            if fm_sd.c10_d_term:
+                tau_d = ff.tau_accel_s if ff_effort > 0.0 else ff.tau_brake_s
+                dwin = self._d_win
+                if tau_d is not None and ff.deviation_c > 0.0 and len(dwin) >= 3:
+                    a_meas = fit_slope([w[0] for w in dwin], [w[1] for w in dwin])
+                    # Td ＝ τ ÷ deviation_c ＝ そのペダルの遅れ L（τ を作るのに使った遅れと同じ）
+                    d_dev = d_term_dev(tau_d / ff.deviation_c, float(kwargs["need_kmhs"]), a_meas)
+                    dev_p += d_dev
+                    self._d_term_kmh, self._d_accel_kmhs = d_dev, a_meas
+            kwargs["dev_kmh"] = dev_p
         kwargs["integral_kmhs"] = integral_kmhs
         fb_table = self._fb_table()  # 段8-b
         # 段4 (ア): 局所の効きの倍率で、P と DOB の上乗せの差を割る（deviation_offset_detail の
@@ -3536,6 +3606,37 @@ class _ModeRun:
             )
         self._c10_prev_clamped = clamped
         return delta
+
+    def _small_dev_row(
+        self, t: float, i: int, plan: Any, ff_effort: float,
+        flag_now: int, *, flag_override: int | None, p_dev: float | None,
+        tau_end: float | None, low: bool,
+    ) -> bool:
+        """2026-11-09 段2・4: 帯（c10_small_dev_band）と D（c10_d_term）を掛ける行か。通常の C10 の
+        行（FF がアクセルかブレーキ）で、7.5 km/h 以上のものだけ。掛けない行（迷ったら掛けない）:
+        低速（基準・実車速の小さい方が meta stop_max_speed_kmh 未満。I と同じ判定）・
+        先読みの偏差を使う行（p_dev・C13 の予測）・停C（tau_end）・handover の行（flag_override）・
+        惰行・停車保持・先置き・惰行の埋めの行（計画の印）・停車前の踏み増し（plan.stop_tail）・
+        発進のブレーキの帯（plan.launch_band と B-1 の伸ばした周期）。保持の場面
+        （hold_scene）は _cycle で C10 の上乗せごと捨てられ、ログの列も空に戻す。"""
+        from tests.research.fwd_plan import (  # noqa: PLC0415
+            FLAG_COAST,
+            FLAG_COAST_FILL,
+            FLAG_PREPOS,
+            FLAG_STOP,
+        )
+
+        if ff_effort == 0.0 or low or flag_override is not None or p_dev is not None:
+            return False
+        if tau_end is not None or self._pred_dev is not None:
+            return False
+        if flag_now in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS, FLAG_COAST_FILL):
+            return False
+        st = getattr(plan, "stop_tail", None)
+        if st is not None and bool(st[i]):
+            return False
+        lb = getattr(plan, "launch_band", None)
+        return not ((lb is not None and bool(lb[i])) or self._b1_in_extension(t))
 
     def _pf_brake_exempt(self, t: float, i: int, plan: Any, ref_t: float, speed: float) -> bool:
         """遊びの下限をブレーキの行に掛けない行か（2026-11-08 段1）: 7.5 km/h（meta の

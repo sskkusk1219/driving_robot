@@ -443,6 +443,74 @@ def hold_durations_s(values: Floats, *, dt: float, tol: float) -> list[float]:
 
 
 @dataclass(frozen=True)
+class IwrResult:
+    """SAE J2951 の IWR（Inertial Work Rating）。ProblemReport_20261109 段1。"""
+
+    iwr_pct: float  # (IWD実測 − IWD基準) ÷ IWD基準 × 100
+    iwd_ref: float  # 基準の IWD [m²/s²]（Σ 加速度 × 車速 × 0.1 s。質量は掛けない）
+    iwd_act: float  # 実測の IWD [m²/s²]
+    cruise_pct: float  # 基準の |加速度| < 境 の行の寄与（IWD基準 全体に対する %）
+    accel_pct: float  # 基準の加速度 ≥ 境
+    decel_pct: float  # 基準の加速度 ≤ −境
+
+    @property
+    def parts_sum_pct(self) -> float:
+        return self.cruise_pct + self.accel_pct + self.decel_pct
+
+
+def iwr_j2951(
+    t_s: Sequence[float],
+    ref_kmh: Sequence[float],
+    act_kmh: Sequence[float],
+    *,
+    cruise_band_kmhs: float = 0.3,
+) -> IwrResult | None:
+    """IWR を 10 Hz・フィルタなし・中心差分（np.gradient）で計算する。基準が無い行は除いて渡すこと。
+
+    ceil(t0)〜floor(t1) の 0.1 s 刻みへ線形補間 → m/s → 加速度 →
+    IWD ＝ Σ(加速度 > 0 の行の 加速度 × 車速 × 0.1)。内訳は 基準の加速度（km/h/s）で
+    定速（|a| < cruise_band_kmhs）・加速（≥）・減速（≤ −）に分け、
+    (実測の部分 − 基準の部分) ÷ IWD基準 全体 × 100。cruise_band_kmhs は内訳の分け方だけの仮の値。
+    計算できない（点が少ない・IWD基準が 0）ときは None。
+    """
+    dt = 0.1
+    t = np.asarray(t_s, dtype=float)
+    if len(t) < 3:
+        return None
+    n0 = int(np.ceil(t[0] - 1e-9))
+    n1 = int(np.floor(t[-1] + 1e-9))
+    if n1 - n0 < 2:
+        return None
+    grid = np.arange(int(n0 * 10), int(n1 * 10) + 1) * dt
+    vr = np.interp(grid, t, np.asarray(ref_kmh, dtype=float)) / 3.6
+    va = np.interp(grid, t, np.asarray(act_kmh, dtype=float)) / 3.6
+    ar = np.gradient(vr, dt)
+    aa = np.gradient(va, dt)
+    wr = np.where(ar > 0.0, ar * vr * dt, 0.0)
+    wa = np.where(aa > 0.0, aa * va * dt, 0.0)
+    iwd_ref = float(wr.sum())
+    if iwd_ref <= 0.0:
+        return None
+    iwd_act = float(wa.sum())
+    ar_kmhs = ar * 3.6
+    cruise = np.abs(ar_kmhs) < cruise_band_kmhs
+    accel = ar_kmhs >= cruise_band_kmhs
+    decel = ar_kmhs <= -cruise_band_kmhs
+
+    def part(mask: np.ndarray) -> float:
+        return float((wa[mask].sum() - wr[mask].sum()) / iwd_ref * 100.0)
+
+    return IwrResult(
+        iwr_pct=(iwd_act - iwd_ref) / iwd_ref * 100.0,
+        iwd_ref=iwd_ref,
+        iwd_act=iwd_act,
+        cruise_pct=part(cruise),
+        accel_pct=part(accel),
+        decel_pct=part(decel),
+    )
+
+
+@dataclass(frozen=True)
 class PedalOverlap:
     """アクセルとブレーキの実開度が両方とも待機位置を超えた（同時踏み）の集計。"""
 

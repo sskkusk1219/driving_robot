@@ -1616,6 +1616,9 @@ def test_step4_local_gain_and_release_layer_keys_default_false() -> None:
     assert fm0.c10_integral_ti_coef == 4.0
     # 2026-11-01 低速へIを広げる 段1: 既定値だけ固定（yaml の値は固定しない）
     assert fm0.c10_integral_low_speed == "off" and fm0.c10_integral_coast_assist is False
+    assert fm0.c10_small_dev_band is False
+    assert (fm0.c10_small_dev_e_kmh, fm0.c10_small_dev_r) == (0.1, 0.5)
+    assert fm0.c10_d_term is False and fm0.c10_d_window_s == 0.3
     cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
     assert cfgmod.validate_config(cfg) == []  # キーは yaml にある（値は固定しない）
 
@@ -1804,6 +1807,7 @@ def test_drive_index_settings_defaults() -> None:
     k = cfgmod.KpiSection()
     assert (k.drive_index_iwr_min_pct, k.drive_index_iwr_max_pct) == (-2.0, 4.0)
     assert k.drive_index_rmsse_max_kmh == 1.3
+    assert (k.iwr_min_pct, k.iwr_max_pct) == (-0.2, 0.4)
     assert cfgmod.ModesSection().segmented_mode_names == ["01_WLTP_Low,Mid,Hi,ExHi"]
 
 
@@ -1879,3 +1883,16 @@ def test_launch_band_late_release_default_false_and_needs_band_and_step_fb() -> 
     cfg.forward_map.launch_band_step_fb = True
     cfg.forward_map.launch_brake_band = False
     assert any("launch_band_late_release" in p for p in cfgmod.validate_config(cfg))
+
+
+def test_c10_small_dev_and_d_term_validation() -> None:
+    """2026-11-09 段2・4: e > 0・0 < r ≤ 1・窓 > 0（yaml の値は固定しない）。"""
+    cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
+    for key, bad in (
+        ("c10_small_dev_e_kmh", 0.0), ("c10_small_dev_r", 0.0), ("c10_small_dev_r", 1.5),
+        ("c10_d_window_s", 0.0),
+    ):
+        old = getattr(cfg.forward_map, key)
+        setattr(cfg.forward_map, key, bad)
+        assert any(key in p for p in cfgmod.validate_config(cfg)), key
+        setattr(cfg.forward_map, key, old)
