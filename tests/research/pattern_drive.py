@@ -1147,6 +1147,62 @@ def _attach_pedal_track(table: Any, csv_path: Path) -> None:
 def _attach_local_gain(
     table: Any, csv_path: Path, brake_speeds_kmh: Sequence[float] | None = None
 ) -> bool:
+    """表の meta に、局所の効きの倍率の表を入れる。dither（ブレーキ・アクセル。
+    `_attach_dither_gain`）と、定速の保持（アクセル。`_attach_cruise_gain`。2026-11-10 段7）の
+    両方を試し、どちらかが入れば True。"""
+    ok_dither = _attach_dither_gain(table, csv_path, brake_speeds_kmh)
+    ok_cruise = _attach_cruise_gain(table, csv_path)
+    return ok_dither or ok_cruise
+
+
+def _attach_cruise_gain(table: Any, csv_path: Path) -> bool:
+    """表の meta に、アクセルの定速の保持（RAMP_CRUISE・RAMP_HOLD）から測った局所の効きの倍率の表
+    `local_gain_accel_cruise` を入れる（2026-11-10 ProblemReport_20261109 段7）。
+
+    dither の `local_gain_accel` は書き換えない（別のキー）。実開度は表の遅れ `accel_lag_s` だけ
+    ずらす（meta に無ければ `local_gain.CRUISE_LAG_FALLBACK_S`）。HOLD_STEP のアクセルの
+    ステップ（開ループ）の倍率を検算として表示する。何も測れなければ False（meta は変えない）。
+    """
+    amin = float(table.meta.get("accel_deadband_pct", math.nan))
+    bmin = float(table.meta.get("brake_deadband_pct", math.nan))
+    if not (math.isfinite(amin) and math.isfinite(bmin)):
+        say("  定速の局所の効き: 表の meta に min が無く測れず。meta に入れない")
+        return False
+    segs = local_gain.read_cruise_segments(csv_path, accel_min_pct=amin, brake_min_pct=bmin)
+    lag = table.meta.get("accel_lag_s")
+    fit = local_gain.fit_cruise(
+        segs, table, accel_min_pct=amin, onset_u_pct=table.meta.get("accel_onset_u_pct"),
+        lag_s=float(lag) if lag is not None else None,
+    )
+    if fit.entry is None:
+        say(f"  定速の局所の効き[アクセル]: 倍率の表なし（{fit.reason}）")
+    else:
+        rows = "・".join(
+            f"{rep:g}km/h {float(np.median(vals)):.2f}倍(n={len(vals)})"
+            for rep, vals in sorted(fit.by_speed.items())
+        )
+        say(f"  定速の局所の効き[アクセル]: 区間 {fit.n_segments}・倍率が出た区間 {fit.n_used}"
+            f"・マス {fit.n_cells}・R² 中央値 {float(np.median(fit.r2)):.2f}"
+            f"・遅れ {fit.lag_s:.3f}s（捨てた理由 {fit.reject}）")
+        say(f"    車速の行ごとの中央値（clip 前）: {rows}")
+    hs = local_gain.hold_step_ratios(csv_path, table, accel_min_pct=amin, brake_min_pct=bmin)
+    if hs:
+        by_v: dict[float, list[float]] = {}
+        for v, ratio in hs:
+            by_v.setdefault(local_gain.accel_speed_rep(v), []).append(ratio)
+        txt = "・".join(
+            f"{rep:g}km/h {float(np.median(vals)):.2f}倍(n={len(vals)})"
+            for rep, vals in sorted(by_v.items())
+        )
+        say(f"    検算（HOLD_STEP の開ループのステップ）: {txt}")
+    else:
+        say("    検算（HOLD_STEP の開ループのステップ）: 測れず")
+    return local_gain.attach_cruise_to_meta(table.meta, fit, csv_path.name)
+
+
+def _attach_dither_gain(
+    table: Any, csv_path: Path, brake_speeds_kmh: Sequence[float] | None = None
+) -> bool:
     """表の meta に、局所の効きの倍率の表（ブレーキ・アクセル）と効くまでの遅れを入れる
     （2026-10-28 段3。ProblemReport_20261028）。
 

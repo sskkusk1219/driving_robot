@@ -4005,3 +4005,25 @@ def test_launch_shift_center_lag_scores_only_middle_lag(monkeypatch) -> None:
     same = plan_for(ref, 16.0, _table13(), launch_shift_center_lag=False, **kw)
     assert np.array_equal(off.effort_pct, same.effort_pct)
     assert off.launch_shift.deltas == same.launch_shift.deltas
+
+
+def test_deviation_offset_p_gain_div_divides_only_the_p_part() -> None:
+    # 2026-11-10 ProblemReport_20261109 段9: P の加速度 dev ÷ τ だけを割る。I・DOB は今のまま
+    t = linear_table()
+    kw = dict(
+        effort=12.0, flag=FLAG_MEASURED, need_kmhs=0.0, ref_kmh=50.0, row_kmh=50.0,
+        dev_kmh=2.0, tau_accel_s=5.0, tau_brake_s=5.0, accel_min_pct=AD, brake_min_pct=BD,
+        integral_kmhs=0.1, dob_kmhs=0.2,
+    )
+    base, _ = deviation_offset_detail(t, **kw)
+    same, _ = deviation_offset_detail(t, p_gain_div=1.0, **kw)
+    assert same == base  # 既定 1.0 は同じ出力
+    # P ＝ 2 ÷ 5 ＝ 0.4・I ＝ 0.1・DOB ＝ 0.2（表の傾き 0.3 は一定）
+    assert base == pytest.approx(12.0 + (0.4 + 0.1 - 0.2) / ACCEL_SLOPE)
+    div, _ = deviation_offset_detail(t, p_gain_div=4.0, **kw)
+    assert div == pytest.approx(12.0 + (0.4 / 4.0 + 0.1 - 0.2) / ACCEL_SLOPE)
+    # I だけ・DOB だけの行は割る量に依らない
+    only = dict(kw, dev_kmh=0.0)
+    a, _ = deviation_offset_detail(t, **only)
+    b, _ = deviation_offset_detail(t, p_gain_div=4.0, **only)
+    assert a == b

@@ -1010,7 +1010,7 @@ def test_ramp_cruise_and_lag_settings_are_loaded_and_validated() -> None:
     cfg = _load_default()
     lr = cfg.learning
     assert lr.ramp_cruise_band_g == pytest.approx(0.005)
-    assert lr.ramp_cruise_hold_s == pytest.approx(5.0)  # 2026-10-19 段2s-2 短縮 7 → 5
+    assert lr.ramp_cruise_hold_s == pytest.approx(10.0)  # 2026-11-10 段8 5 → 10（局所の効きを測る）
     assert lr.ramp_cruise_timeout_s == pytest.approx(15.0)
     assert lr.ramp_cruise_fine_max_kmh == pytest.approx(100.0)
     assert lr.ramp_cruise_coarse_step_kmh == pytest.approx(20.0)
@@ -1895,4 +1895,21 @@ def test_c10_small_dev_and_d_term_validation() -> None:
         old = getattr(cfg.forward_map, key)
         setattr(cfg.forward_map, key, bad)
         assert any(key in p for p in cfgmod.validate_config(cfg)), key
+        setattr(cfg.forward_map, key, old)
+
+
+def test_c10_p_local_gain_defaults_and_validation() -> None:
+    """2026-11-10 段9: 既定 off（今と同じ）・値の検証（yaml の値は固定しない）。"""
+    fm0 = cfgmod.ForwardMapSection()
+    assert fm0.c10_p_local_gain == "off" and fm0.c10_p_local_gain_c == 6.0
+    assert fm0.c10_p_local_gain_cruise_kmhs == 0.3 and fm0.c10_p_local_gain_taper_kmhs == 0.6
+    cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
+    assert cfg.forward_map.c10_p_local_gain == "off"  # 引用符つきの "off" が文字列で読める
+    for key, bad in (
+        ("c10_p_local_gain", "on"), ("c10_p_local_gain_c", 0.0),
+        ("c10_p_local_gain_cruise_kmhs", 0.0), ("c10_p_local_gain_cruise_kmhs", 0.7),
+    ):
+        old = getattr(cfg.forward_map, key)
+        setattr(cfg.forward_map, key, bad)
+        assert any(key in p for p in cfgmod.validate_config(cfg)), (key, bad)
         setattr(cfg.forward_map, key, old)

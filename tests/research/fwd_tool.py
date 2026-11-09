@@ -1533,7 +1533,8 @@ def run_attach_pedal_track(args: argparse.Namespace) -> int:
 
 def run_attach_local_gain(args: argparse.Namespace) -> int:
     """既存の pkl に、手順2 の CSV の dither から測った局所の効きの倍率の表と効くまでの遅れ
-    （local_gain_brake・local_gain_accel・dither_*_lag_s）を meta として付けて、新しい pkl に
+    （local_gain_brake・local_gain_accel・dither_*_lag_s）と定速の保持（RAMP_CRUISE・RAMP_HOLD）から
+    測った局所の効き（local_gain_accel_cruise。2026-11-10 段7）を meta として付けて、新しい pkl に
     保存する
     （2026-10-28 段3。倍率はその pkl の表の傾きで割る。元の pkl は書き換えない）。"""
     from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
@@ -1656,7 +1657,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     lg = sub.add_parser(
         "attach-local-gain",
-        help="pkl に局所の効きの倍率の表と遅れ（手順2 の dither から測る）を付けて別名で保存",
+        help="pkl に局所の効きの倍率の表と遅れ（手順2 の dither・定速の保持）を付けて別名で保存",
     )
     lg.add_argument("--pkl", required=True, help="元の表の pkl（書き換えない）")
     lg.add_argument("--csv", required=True, help="手順2 の走行 CSV")

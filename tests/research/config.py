@@ -1052,6 +1052,24 @@ class ForwardMapSection:
     # 効く先: 定速の揺れ・IWR。決める時期: 段5 の実機。既定 false ＝ 今と完全に同じ
     c10_d_term: bool = False
     c10_d_window_s: float = 0.3
+    # 2026-11-10 ProblemReport_20261109 段9: C10 の P の加速度 dev ÷ τ だけを、
+    # 手順2 の定速の保持から測った局所の効きの倍率（pkl meta local_gain_accel_cruise）で割る
+    # （I・DOB は今のまま ＝ P ÷ Ti を保つのと同じ。`gain_ratio` は P＋I＋DOB 全部を割るので別）。
+    # "off" ＝ 今と完全に同じ／
+    # "cruise" ＝ 要る加速度の大きさ ＜ c10_p_local_gain_cruise_kmhs の行（taper まで直線で戻す）／
+    # "all" ＝ 7.5 km/h 以上のアクセルの C10 の行すべて。掛ける行の範囲は段2 の帯・D と同じ
+    # （`_small_dev_row`）で、アクセルの行だけ（ブレーキは対象外）。yaml では "off" を引用符で書く
+    # （引用符なしだと false になる）。
+    # 割る量 k ＝ max(1, 倍率 × c ÷ deviation_c)。実際の τ（＝ 設計の τ ÷ 倍率）を c × L にする。
+    # c ＝ 6（B1）: 倍率で全部割る（deviation_c と同じ）。c ＝ 3（B2）: 今の約 1/2（半分データ由来:
+    # 今の実際の τ ≒ 6 × L ÷ 3.5 ≒ 1.7 × L を限界とみなし、限界感度法の 0.45 Ku に当てた推定）。
+    # cruise_kmhs 0.3・taper_kmhs 0.6 は仮の値（IWR の内訳の定速と同じ・境目で P の強さが段に
+    # ならないための戻す幅）。効く先: 定速の揺れ（約 1 Hz）・IWR。決める時期: 段11（B1 ↔ B2）・段12
+    # （定速 ↔ 加速中も）の実機。表が meta に無いと倍率 1（今と同じ）。既定 off ＝ 今と完全に同じ
+    c10_p_local_gain: str = "off"
+    c10_p_local_gain_c: float = 6.0
+    c10_p_local_gain_cruise_kmhs: float = 0.3
+    c10_p_local_gain_taper_kmhs: float = 0.6
     # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
     # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
     # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・
@@ -2213,6 +2231,19 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         0.0 < fm.c10_small_dev_r <= 1.0,
         f"forward_map.c10_small_dev_r は 0 より大きく 1 以下: {fm.c10_small_dev_r}",
+    )
+    need(
+        fm.c10_p_local_gain in ("off", "cruise", "all"),
+        f"forward_map.c10_p_local_gain は off / cruise / all: {fm.c10_p_local_gain!r}",
+    )
+    need(
+        fm.c10_p_local_gain_c > 0.0,
+        f"forward_map.c10_p_local_gain_c は正値: {fm.c10_p_local_gain_c}",
+    )
+    need(
+        0.0 < fm.c10_p_local_gain_cruise_kmhs < fm.c10_p_local_gain_taper_kmhs,
+        "forward_map.c10_p_local_gain_cruise_kmhs は正値で c10_p_local_gain_taper_kmhs 未満: "
+        f"{fm.c10_p_local_gain_cruise_kmhs}（taper {fm.c10_p_local_gain_taper_kmhs}）",
     )
     need(
         fm.c10_d_window_s > 0.0,

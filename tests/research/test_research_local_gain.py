@@ -317,3 +317,143 @@ def test_fwd_tool_attach_local_gain_refuses_overwrite_and_empty(tmp_path: Path) 
     assert fwd_tool.main(["attach-local-gain", "--pkl", str(src), "--csv", str(nod),
                           "--out", str(tmp_path / "o2.pkl")]) == 1
     assert not (tmp_path / "o2.pkl").exists()
+
+
+# ── 段7（2026-11-10 ProblemReport_20261109）: 定速の保持からの局所の効き ──────
+
+
+def _cruise_rows(
+    scale: float, *, v0: float = 60.0, base_u: float | None = None, amp: float = 0.4,
+    lag_s: float = 0.14,
+    t0: float = 0.0, dur_s: float = 8.0, phase: str = "RAMP_CRUISE", table_slope: float = 0.3,
+    freq_hz: float = 0.4,
+) -> list[dict[str, float | str]]:
+    """加速度 = −2 + scale·table_slope·(遅れ lag_s 前の u)。開度 = AMIN + base_u + 正弦のゆらぎ
+    （保持の PI が動かす開度の代わり）。車速は加速度を積分。"""
+    rows = []
+    v = v0
+    n = int(dur_s / DT)
+    if base_u is None:
+        base_u = 2.0 / (scale * table_slope)  # 加速度 0（定速）になる開度
+    op = [AMIN + base_u + amp * np.sin(2 * np.pi * freq_hz * k * DT) for k in range(n)]
+    for k in range(n):
+        eff = op[max(0, k - int(round(lag_s / DT)))]
+        a = -2.0 + scale * table_slope * (eff - AMIN)
+        rows.append({
+            "elapsed_s": t0 + k * DT, "actual_speed_kmh": v, "accel_actual_pct": op[k],
+            "brake_actual_pct": BMIN, "phase": phase,
+        })
+        v += a * DT
+    return rows
+
+
+def _write_rows(path: Path, rows: list[dict[str, float | str]]) -> None:
+    cols = ["elapsed_s", "actual_speed_kmh", "accel_actual_pct", "brake_actual_pct", "phase"]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _cruise_fit(rows, tmp_path: Path, table=None) -> local_gain.CruiseFit:
+    table = table or _flat_table(accel_onset_u_pct=2.0, accel_lag_s=0.14)
+    p = tmp_path / "c.csv"
+    _write_rows(p, rows)
+    segs = local_gain.read_cruise_segments(p, accel_min_pct=AMIN, brake_min_pct=BMIN)
+    return local_gain.fit_cruise(
+        segs, table, accel_min_pct=AMIN, onset_u_pct=2.0, lag_s=0.14
+    )
+
+
+@pytest.mark.parametrize("k", [1.5, 3.0, 3.7])
+def test_cruise_ratio_is_k_times_table_slope(tmp_path: Path, k: float) -> None:
+    fit = _cruise_fit(_cruise_rows(k), tmp_path)
+    assert fit.entry is not None and fit.n_used == 1
+    assert fit.ratios[0] == pytest.approx(k, rel=0.05)
+    # 行 = 60 km/h、列 = (u − 効き始め) = 約 0〜2.4 → 5% 刻みで 0 列目
+    assert fit.entry["speed_rep_kmh"] == [60.0]
+    assert fit.entry["u_from_onset_pct"] == [0.0]
+    assert fit.entry["ratio"][0][0] == pytest.approx(min(4.0, k), rel=0.05)
+    assert fit.entry["n"] == [[1]]
+
+
+def test_cruise_rejects_small_span_low_r2_and_few_rows(tmp_path: Path) -> None:
+    assert _cruise_fit(_cruise_rows(3.0, amp=0.02), tmp_path).reject == {"span": 1}
+    assert _cruise_fit(_cruise_rows(3.0, dur_s=0.8), tmp_path).reject == {"rows": 1}
+    noisy = _cruise_rows(3.0)
+    rng = np.random.default_rng(0)
+    v = np.array([r["actual_speed_kmh"] for r in noisy]) + rng.normal(0, 0.3, len(noisy))
+    for r, vv in zip(noisy, v, strict=True):
+        r["actual_speed_kmh"] = vv
+    assert _cruise_fit(noisy, tmp_path).reject == {"r2": 1}
+
+
+def test_cruise_ignores_brake_slow_and_other_phases(tmp_path: Path) -> None:
+    rows = _cruise_rows(3.0, v0=2.0, dur_s=2.0)  # 7.5 km/h 未満
+    assert _cruise_fit(rows, tmp_path).n_segments == 0
+    rows = _cruise_rows(3.0)
+    for r in rows:
+        r["phase"] = "RAMP_UP"
+    assert _cruise_fit(rows, tmp_path).n_segments == 0
+    rows = _cruise_rows(3.0)
+    for r in rows:
+        r["brake_actual_pct"] = BMIN + 2.0
+    assert _cruise_fit(rows, tmp_path).n_segments == 0
+    rows = _cruise_rows(3.0)
+    for r in rows:
+        r["accel_actual_pct"] = AMIN  # アクセルが min
+    assert _cruise_fit(rows, tmp_path).n_segments == 0
+
+
+def test_cruise_splits_segments_on_gap_and_phase_and_both_phases_count(tmp_path: Path) -> None:
+    a = _cruise_rows(3.0, phase="RAMP_CRUISE")
+    b = _cruise_rows(3.0, phase="RAMP_HOLD", t0=100.0, v0=100.0)
+    fit = _cruise_fit(a + b, tmp_path)
+    assert fit.n_segments == 2 and fit.n_used == 2
+    assert fit.entry["speed_rep_kmh"] == [60.0, 100.0]
+
+
+def test_cruise_attach_keeps_dither_key_and_cli_writes_new_pkl(tmp_path: Path) -> None:
+    src = tmp_path / "in.pkl"
+    save_table(
+        _flat_table(accel_onset_u_pct=2.0, accel_lag_s=0.14, local_gain_accel={"sentinel": 1}), src
+    )
+    csvp = tmp_path / "c.csv"
+    _write_rows(csvp, _cruise_rows(3.0))
+    out = tmp_path / "out.pkl"
+    assert fwd_tool.main(
+        ["attach-local-gain", "--pkl", str(src), "--csv", str(csvp), "--out", str(out)]
+    ) == 0
+    meta = load_forward_map(out).meta
+    assert meta["local_gain_accel"] == {"sentinel": 1}  # dither のキーは触らない
+    assert meta["local_gain_accel_cruise"]["ratio"][0][0] == pytest.approx(3.0, rel=0.05)
+    assert meta["local_gain_accel_cruise_source"] == "c.csv"
+    assert meta["local_gain_accel_cruise_n_used"] == 1
+    assert "local_gain_accel_cruise" not in load_forward_map(src).meta
+
+
+def test_local_gain_at_edge_hold_extends_measured_columns() -> None:
+    entry = {"speed_rep_kmh": [60.0], "u_from_onset_pct": [5.0], "ratio": [[3.0]], "n": [[1]]}
+    assert local_gain.local_gain_at(entry, 60.0, 6.5) == 1.0  # 既定は範囲の外 → 1
+    assert local_gain.local_gain_at(entry, 60.0, 6.5, edge_hold_pct=2.5) == pytest.approx(3.0)
+    assert local_gain.local_gain_at(entry, 60.0, 8.0, edge_hold_pct=2.5) == 1.0
+
+
+def test_hold_step_ratio_open_loop_check(tmp_path: Path) -> None:
+    # 開度 AMIN+6 → AMIN+9 の階段。加速度 = −2 + 3·0.3·u（遅れ 0.14 s）→ 倍率 3
+    rows = []
+    v, t = 60.0, 0.0
+    for k in range(int(8.0 / DT)):
+        op = AMIN + (6.0 if t < 3.0 else 9.0)
+        a = -2.0 + 0.9 * ((AMIN + (6.0 if t - 0.14 < 3.0 else 9.0)) - AMIN)
+        rows.append({
+            "elapsed_s": t, "actual_speed_kmh": v, "accel_actual_pct": op,
+            "brake_actual_pct": BMIN, "phase": "HOLD_STEP",
+        })
+        v += a * DT
+        t += DT
+    p = tmp_path / "h.csv"
+    _write_rows(p, rows)
+    got = local_gain.hold_step_ratios(p, _flat_table(), accel_min_pct=AMIN, brake_min_pct=BMIN)
+    assert len(got) == 1
+    assert got[0][1] == pytest.approx(3.0, rel=0.1)

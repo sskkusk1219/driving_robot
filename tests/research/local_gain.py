@@ -23,6 +23,15 @@
   6. 遅れ: 段の切り替えで「指令の切り替え時刻 → 加速度の変化が 50% に届く時刻」（pedal_lag の
      HOLD_STEP と同じ考え方）。ペダル別の中央値と回数。
 
+2026-11-10 ProblemReport_20261109 段7: アクセルの定速の保持（G ランプの RAMP_CRUISE・
+RAMP_HOLD）からも測る（`fit_cruise`）。dither は手順2 では off で、
+定速の開度（例 128 km/h で 34 %）の局所の効きは測れていなかった。
+保持の PI が開度を少しずつ動かすので、その区間の「実開度 → 加速度」の傾き
+（実開度は遅れ L だけずらす）を表の傾きで割って倍率にする。結果は別のキー
+`local_gain_accel_cruise` に残す（dither の `local_gain_accel` は書き換えない。形は同じなので
+`local_gain_at` がそのまま引ける）。閉ループの中からの推定なので、手順2 の遅れの測定の
+HOLD_STEP（開度固定 ＝ 開ループ）のアクセルのステップで同じ倍率を検算できる（`hold_step_ratios`）。
+
 純関数が中心（config・ハードウェアには触らない）。src/ は import しない。
 """
 
@@ -80,6 +89,63 @@ LAG_MIN_ACCEL_CHANGE_KMHS = 0.1
 LAG_MIN_CMD_CHANGE_PCT = 0.2
 # 遅れの有効範囲 (0, これ] [s]。pedal_lag.MAX_LAG_S と同じ
 LAG_MAX_S = pedal_lag.MAX_LAG_S
+
+
+# ── 段7: 定速の保持からの測定（2026-11-10 ProblemReport_20261109）──────────
+PHASE_RAMP_CRUISE = "RAMP_CRUISE"
+PHASE_RAMP_HOLD = "RAMP_HOLD"
+PHASE_HOLD_STEP = "HOLD_STEP"
+# 加速度の窓 [s]（その時刻を中心とする直線の傾き）。仮値・半分データ由来（W 1690〜1720 s の
+# 実機で遅れ 0.14 s・残差 0.020 km/h/s）。効く先: 倍率のばらつき。
+# いつ決めるか: 段10 の実機の手順2 の後。
+CRUISE_ACCEL_WINDOW_S = 0.3
+# 窓に必要な点数の下限（50 ms 周期で窓 0.3 s なら 7 点前後）
+CRUISE_WINDOW_MIN_POINTS = 4
+# 当てはまりの下限 R²。仮値（10-28 のブレーキの局所の傾きの机上と同じ）。効く先: 捨てる区間の数。
+# いつ決めるか: 段10 の実機の手順2 の後、R² の分布を見て。
+CRUISE_MIN_R2 = 0.6
+# 区間の実開度（遅れをずらした後）の幅の下限 [%]。仮値。
+# 保持の PI の動きが小さすぎる区間は傾きがノイズで決まる。
+CRUISE_MIN_SPAN_PCT = 0.1
+# 区間の行数の下限（遅れをずらした後。50 ms 周期で 1 秒）。仮値
+CRUISE_MIN_ROWS = 20
+# 遅れが meta に無いときの代わり [s]（半分データ由来: W 1690〜1720 s の 0.14 s）
+CRUISE_LAG_FALLBACK_S = 0.14
+# 表の傾きを引く開度の幅 [%]（u ± これの差分。表の局所の傾き。仮値）
+CRUISE_TABLE_H_PCT = 0.25
+# 列の刻み [%]（粗い表。仮値。保持の開度は車速ごとに 1 点なので細かく切ると点が散る）
+CRUISE_COL_STEP_PCT = 5.0
+# ブレーキが min とみなす幅 [%]（actual のゆれ。pedal_lag.AT_MIN_TOL_PCT と同じ値）
+CRUISE_BRAKE_AT_MIN_TOL_PCT = 0.2
+# 検算（HOLD_STEP）: 前後の窓 [s]・実開度の変化の下限 [%]（pedal_lag と同じ考え方。仮値）
+HOLD_STEP_PRE_S = 1.0
+HOLD_STEP_POST_START_S = 1.2
+HOLD_STEP_MIN_OPENING_CHANGE_PCT = 1.0
+
+
+@dataclass(frozen=True)
+class CruiseSegment:
+    """定速の保持の区間 1 回分（アクセルだけの連続行）。開度は actual（読めない行は cmd）。"""
+
+    t_s: np.ndarray
+    speed_kmh: np.ndarray
+    accel_pct: np.ndarray
+
+
+@dataclass
+class CruiseFit:
+    """定速の保持からの測定結果。entry は meta に入れる dict（採れなければ None）。"""
+
+    entry: dict[str, Any] | None
+    n_segments: int = 0  # 読めた区間の数
+    n_used: int = 0  # 倍率が出た区間の数
+    n_cells: int = 0
+    reason: str = ""
+    lag_s: float = CRUISE_LAG_FALLBACK_S
+    ratios: list[float] = field(default_factory=list)  # 区間ごとの倍率（clip 前）
+    r2: list[float] = field(default_factory=list)  # 採った区間の R²
+    by_speed: dict[float, list[float]] = field(default_factory=dict)  # 行の車速 → 倍率（clip 前）
+    reject: dict[str, int] = field(default_factory=dict)  # 捨てた理由 → 数
 
 
 @dataclass(frozen=True)
@@ -351,7 +417,7 @@ def fit_pedal(
 
 def local_gain_at(
     entry: Mapping[str, Any] | None, v_kmh: float, u_from_onset_pct: float,
-    *, min_speed_kmh: float = MIN_SPEED_KMH,
+    *, min_speed_kmh: float = MIN_SPEED_KMH, edge_hold_pct: float = 0.0,
 ) -> float:
     """倍率を引く。各行は測ったマス（n>0）だけで開度を直線補間し、その行の測った開度の範囲の外なら
     その行は使わない。使える行どうしを車速で直線補間し、車速の範囲外は端の行の値のまま
@@ -360,7 +426,11 @@ def local_gain_at(
     2026-10-28 段5b: 測っていないマスを 1.0 として補間すると、u0 を 0.5・1.5・2.5% に巡回させて測る
     （1.0・2.0% の列は測らない）ため、倍率が測った列の上だけの細い山になる（`111335`）。そのため
     測っていないマスは補間に入れない。
-    entry なし・min_speed_kmh 未満・どの行も開度の範囲外は 1.0。"""
+    entry なし・min_speed_kmh 未満・どの行も開度の範囲外は 1.0。
+    2026-11-10 段9: edge_hold_pct > 0 なら、
+    測った開度の範囲の両端から edge_hold_pct までは端の値のまま
+    使う（定速の保持の表は列が 5% 刻みで 1 行に 1〜2 列しか無く、範囲の中だけでは引けないため。
+    既定 0 は今までと同じ）。"""
     if not entry or v_kmh < min_speed_kmh:
         return 1.0
     reps = np.asarray(entry["speed_rep_kmh"], dtype=float)
@@ -376,7 +446,7 @@ def local_gain_at(
         if not m.any():
             continue
         c = cols[m]
-        if c[0] <= u_from_onset_pct <= c[-1]:
+        if c[0] - edge_hold_pct <= u_from_onset_pct <= c[-1] + edge_hold_pct:
             use_v.append(float(rep))
             use_g.append(float(np.interp(u_from_onset_pct, c, ratio[i][m])))
     if not use_v:
@@ -402,3 +472,257 @@ def attach_to_meta(
     if any_put:
         meta["local_gain_source"] = source
     return any_put
+
+
+# ── 段7: 定速の保持（RAMP_CRUISE・RAMP_HOLD）からの局所の効き ──────────────
+
+
+def _read_rows(csv_path: Path) -> list[dict[str, Any]]:
+    """CSV の行（時刻・実車速・アクセル/ブレーキの実開度（読めなければ指令）・phase）。"""
+    rows: list[dict[str, Any]] = []
+    with Path(csv_path).open(newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            t = _num(r.get("elapsed_s"))
+            v = _num(r.get("actual_speed_kmh"))
+            if v is None:
+                v = _num(r.get("speed_kmh"))
+            if t is None or v is None:
+                continue
+            acc = _num(r.get("accel_actual_pct"))
+            if acc is None:
+                acc = _num(r.get("accel_cmd_pct"))
+            if acc is None:
+                acc = _num(r.get("accel_opening"))
+            brk = _num(r.get("brake_actual_pct"))
+            if brk is None:
+                brk = _num(r.get("brake_cmd_pct"))
+            if brk is None:
+                brk = _num(r.get("brake_opening"))
+            if acc is None or brk is None:
+                continue
+            rows.append({"t": t, "v": v, "acc": acc, "brk": brk, "phase": r.get("phase", "") or ""})
+    return rows
+
+
+def read_cruise_segments(
+    csv_path: Path, *, accel_min_pct: float, brake_min_pct: float,
+    min_speed_kmh: float = MIN_SPEED_KMH,
+) -> list[CruiseSegment]:
+    """CSV から定速の保持の区間を読む（phase が RAMP_CRUISE か RAMP_HOLD で、行間が GAP_S 未満・
+    phase が同じ連続区間 1 つ = 1 回）。アクセルだけの行（アクセルの実開度 > min・ブレーキの実開度が
+    min 付近）で車速が min_speed_kmh 以上の行だけ。条件を外れた行で区間を切る。"""
+    segs: list[CruiseSegment] = []
+    cur: list[tuple[float, float, float]] = []
+    prev_t = math.nan
+    prev_phase = ""
+
+    def flush() -> None:
+        nonlocal cur
+        if len(cur) >= 3:
+            a = np.array(cur, dtype=float)
+            segs.append(CruiseSegment(a[:, 0], a[:, 1], a[:, 2]))
+        cur = []
+
+    for r in _read_rows(csv_path):
+        ok = (
+            r["phase"] in (PHASE_RAMP_CRUISE, PHASE_RAMP_HOLD)
+            and r["acc"] > accel_min_pct
+            and r["brk"] <= brake_min_pct + CRUISE_BRAKE_AT_MIN_TOL_PCT
+            and r["v"] >= min_speed_kmh
+        )
+        if not ok:
+            flush()
+            prev_t = math.nan
+            continue
+        if cur and (r["phase"] != prev_phase or not (0.0 < r["t"] - prev_t < GAP_S)):
+            flush()
+        prev_t, prev_phase = r["t"], r["phase"]
+        cur.append((r["t"], r["v"], r["acc"]))
+    flush()
+    return segs
+
+
+def windowed_accel(
+    t_s: np.ndarray, v_kmh: np.ndarray, window_s: float = CRUISE_ACCEL_WINDOW_S
+) -> np.ndarray:
+    """各行を中心とする窓 window_s（±半分）の車速の直線の傾き [km/h/s]。点が足りない行は nan。"""
+    out = np.full(len(t_s), math.nan)
+    half = window_s / 2.0
+    for k in range(len(t_s)):
+        m = (t_s >= t_s[k] - half - 1e-9) & (t_s <= t_s[k] + half + 1e-9)
+        if int(m.sum()) >= CRUISE_WINDOW_MIN_POINTS:
+            out[k] = pedal_lag._slope(t_s[m], v_kmh[m])  # noqa: SLF001
+    return out
+
+
+def table_slope_at(
+    table: Any, v_kmh: float, u_pct: float, h_pct: float = CRUISE_TABLE_H_PCT
+) -> float:
+    """表の加速度の開度方向の傾き [km/h/s per %]（(v, u) のまわり ±h の差分。u の下は 0）。"""
+    lo = max(0.0, u_pct - h_pct)
+    hi = u_pct + h_pct
+    a_lo = float(np.asarray(table.accel(float(v_kmh), float(lo))))
+    a_hi = float(np.asarray(table.accel(float(v_kmh), float(hi))))
+    return (a_hi - a_lo) / (hi - lo)
+
+
+def cruise_segment_ratio(
+    seg: CruiseSegment, table: Any, accel_min_pct: float, lag_s: float,
+    *, min_r2: float = CRUISE_MIN_R2, min_span_pct: float = CRUISE_MIN_SPAN_PCT,
+    min_rows: int = CRUISE_MIN_ROWS, min_table_slope: float = MIN_TABLE_SLOPE,
+) -> tuple[float | None, float, float, float, str]:
+    """区間 1 回の倍率。(倍率, 平均車速, 平均の u, R², 捨てた理由) を返す。
+    倍率 None のときは理由が入る（"rows"・"span"・"r2"・"table_slope"）。
+    加速度（窓の中心）を、遅れ L だけ前の実開度（直線補間）に直線で当てた傾き ÷ 表の傾き。"""
+    t, v = seg.t_s, seg.speed_kmh
+    acc = windowed_accel(t, v)
+    t_shift = t - lag_s
+    ok = np.isfinite(acc) & (t_shift >= t[0])
+    v_mean = float(np.mean(v))
+    if int(ok.sum()) < min_rows:
+        return None, v_mean, math.nan, math.nan, "rows"
+    op = np.interp(t_shift[ok], t, seg.accel_pct)
+    a = acc[ok]
+    u_mean = float(np.mean(op)) - accel_min_pct
+    if float(op.max() - op.min()) < min_span_pct:
+        return None, v_mean, u_mean, math.nan, "span"
+    slope, intercept = np.polyfit(op, a, 1)
+    resid = a - (slope * op + intercept)
+    ss_tot = float(np.sum((a - np.mean(a)) ** 2))
+    r2 = 1.0 - float(np.sum(resid**2)) / ss_tot if ss_tot > 0 else 0.0
+    if r2 < min_r2:
+        return None, v_mean, u_mean, r2, "r2"
+    k_tab = table_slope_at(table, v_mean, u_mean)
+    if not math.isfinite(k_tab) or abs(k_tab) < min_table_slope:
+        return None, v_mean, u_mean, r2, "table_slope"
+    return float(slope) / k_tab, v_mean, u_mean, r2, ""
+
+
+def fit_cruise(
+    segments: Sequence[CruiseSegment], table: Any, *, accel_min_pct: float,
+    onset_u_pct: float | None, lag_s: float | None,
+) -> CruiseFit:
+    """アクセルの定速の保持の区間から倍率の表を作る。行 = accel_speed_rep（20 km/h 刻み）、
+    列 = (u − 効き始め) の CRUISE_COL_STEP_PCT 刻み。マスは中央値（[GAIN_MIN, GAIN_MAX] に clip）。
+    形は dither の entry と同じ（`local_gain_at` がそのまま引ける）。"""
+    fit = CruiseFit(entry=None, n_segments=len(segments))
+    if lag_s is not None and math.isfinite(lag_s) and lag_s > 0:
+        fit.lag_s = float(lag_s)
+    if onset_u_pct is None:
+        fit.reason = "効き始めが meta に無い"
+        return fit
+    cells: list[tuple[float, int, float]] = []
+    for seg in segments:
+        ratio, v_mean, u_mean, r2, why = cruise_segment_ratio(
+            seg, table, accel_min_pct, fit.lag_s
+        )
+        if ratio is None:
+            fit.reject[why] = fit.reject.get(why, 0) + 1
+            continue
+        rep = accel_speed_rep(v_mean)
+        cells.append((rep, int(round((u_mean - onset_u_pct) / CRUISE_COL_STEP_PCT)), ratio))
+        fit.ratios.append(ratio)
+        fit.r2.append(r2)
+        fit.by_speed.setdefault(rep, []).append(ratio)
+        fit.n_used += 1
+    if not cells:
+        fit.reason = f"倍率が出た区間なし（区間 {fit.n_segments}・捨てた理由 {fit.reject}）"
+        return fit
+    reps = sorted({c[0] for c in cells})
+    k_lo, k_hi = min(c[1] for c in cells), max(c[1] for c in cells)
+    cols = [k * CRUISE_COL_STEP_PCT for k in range(k_lo, k_hi + 1)]
+    ratio_m = [[1.0] * len(cols) for _ in reps]
+    n_m = [[0] * len(cols) for _ in reps]
+    for ri, rep in enumerate(reps):
+        for ci, k in enumerate(range(k_lo, k_hi + 1)):
+            vals = [c[2] for c in cells if c[0] == rep and c[1] == k]
+            if vals:
+                ratio_m[ri][ci] = float(min(GAIN_MAX, max(GAIN_MIN, float(np.median(vals)))))
+                n_m[ri][ci] = len(vals)
+                fit.n_cells += 1
+    fit.entry = {
+        "speed_rep_kmh": [float(r) for r in reps],
+        "u_from_onset_pct": [float(c) for c in cols],
+        "ratio": ratio_m,
+        "n": n_m,
+    }
+    return fit
+
+
+def attach_cruise_to_meta(meta: dict[str, Any], fit: CruiseFit, source: str) -> bool:
+    """meta に local_gain_accel_cruise（と _source・_n_segments・_n_used）を入れる。
+    dither の local_gain_accel は書き換えない。倍率の表が無ければ False（meta は変えない）。"""
+    if fit.entry is None:
+        return False
+    meta["local_gain_accel_cruise"] = fit.entry
+    meta["local_gain_accel_cruise_source"] = source
+    meta["local_gain_accel_cruise_n_segments"] = int(fit.n_segments)
+    meta["local_gain_accel_cruise_n_used"] = int(fit.n_used)
+    return True
+
+
+def hold_step_ratios(
+    csv_path: Path, table: Any, *, accel_min_pct: float, brake_min_pct: float,
+) -> list[tuple[float, float]]:
+    """検算: 手順2 の遅れの測定（HOLD_STEP。開度固定 ＝ 開ループ）のアクセルのステップの倍率。
+    ステップの前の窓（直前 HOLD_STEP_PRE_S 秒）と後の窓（始まり + HOLD_STEP_POST_START_S 〜
+    終わり）の
+    加速度・実開度の平均の差から (Δ加速度 ÷ Δ開度) ÷ 表の同じ 2 点の傾き。[(車速の平均, 倍率), …]。
+    実開度の変化が HOLD_STEP_MIN_OPENING_CHANGE_PCT 未満・ブレーキが min 以外・
+    車速が MIN_SPEED_KMH 未満のステップは捨てる。ステップは phase が HOLD_STEP の連続区間を、
+    アクセルの実開度の 1 周期の飛びが 1.0% 以上の所で切ったもの。"""
+    rows = _read_rows(csv_path)
+    if not rows:
+        return []
+    t = np.array([r["t"] for r in rows])
+    v = np.array([r["v"] for r in rows])
+    acc = np.array([r["acc"] for r in rows])
+    brk = np.array([r["brk"] for r in rows])
+    hold = np.array([r["phase"] == PHASE_HOLD_STEP for r in rows])
+    out: list[tuple[float, float]] = []
+    n = len(rows)
+    i = 0
+    while i < n:
+        if not hold[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and hold[j] and (j == i or 0.0 < t[j] - t[j - 1] < GAP_S):
+            j += 1
+        start = i
+        for k in range(i + 1, j + 1):
+            if k == j or abs(acc[k] - acc[k - 1]) >= 1.0:
+                if k - start >= 2 and start >= 1:
+                    _hold_step_one(
+                        t, v, acc, brk, start, k, table, accel_min_pct, brake_min_pct, out
+                    )
+                start = k
+        i = max(j, i + 1)
+    return out
+
+
+def _hold_step_one(
+    t: np.ndarray, v: np.ndarray, acc: np.ndarray, brk: np.ndarray, i0: int, i1: int,
+    table: Any, accel_min_pct: float, brake_min_pct: float, out: list[tuple[float, float]],
+) -> None:
+    pre = (t >= t[i0] - HOLD_STEP_PRE_S) & (t < t[i0])
+    post = (t >= t[i0] + HOLD_STEP_POST_START_S) & (t <= t[i1 - 1])
+    if pre.sum() < 3 or post.sum() < 3:
+        return
+    if (brk[pre | post] > brake_min_pct + CRUISE_BRAKE_AT_MIN_TOL_PCT).any():
+        return
+    a0 = pedal_lag._slope(t[pre], v[pre])  # noqa: SLF001
+    a1 = pedal_lag._slope(t[post], v[post])  # noqa: SLF001
+    o0, o1 = float(np.mean(acc[pre])), float(np.mean(acc[post]))
+    v_mean = float(np.mean(v[pre | post]))
+    if not (math.isfinite(a0) and math.isfinite(a1)) or v_mean < MIN_SPEED_KMH:
+        return
+    if abs(o1 - o0) < HOLD_STEP_MIN_OPENING_CHANGE_PCT or min(o0, o1) <= accel_min_pct:
+        return
+    u0, u1 = o0 - accel_min_pct, o1 - accel_min_pct
+    k_tab = (
+        float(np.asarray(table.accel(v_mean, u1))) - float(np.asarray(table.accel(v_mean, u0)))
+    ) / (u1 - u0)
+    if not math.isfinite(k_tab) or abs(k_tab) < MIN_TABLE_SLOPE:
+        return
+    out.append((v_mean, ((a1 - a0) / (o1 - o0)) / k_tab))

@@ -2864,6 +2864,7 @@ def deviation_offset_detail(
     gain_ratio: float = 1.0,
     release_peak_u_pct: float | None = None,
     integral_kmhs: float = 0.0,
+    p_gain_div: float = 1.0,
 ) -> tuple[float, bool]:
     """C10: 開度の列の 1 行（effort）に、偏差の分だけ上乗せした effort [%] を返す（段2p）。
 
@@ -2906,6 +2907,11 @@ def deviation_offset_detail(
     - integral_kmhs（2026-11-01 段6d。`forward_map.c10_integral_brake` / `c10_integral_accel`）:
       偏差の積分 I が出す加速度 a_I [km/h/s]（`c10_integral.C10Integral.accel_kmhs`）。
       P の加速度 dev ÷ τ に足してから表を引く（DOB と同じ入口）。既定 0 は今までと同じ出力。
+    - p_gain_div（2026-11-10 ProblemReport_20261109 段9。`forward_map.c10_p_local_gain`）:
+      P の加速度
+      dev ÷ τ だけをこれで割る（≧ 1。局所の効きの倍率で P を弱める）。I（integral_kmhs）・DOB
+      （dob_kmhs）は今のまま。`gain_ratio` は P＋I＋DOB の全部を割るので別。既定 1.0 は
+      今までと同じ出力。
     """
     if flag in (FLAG_COAST, FLAG_STOP, FLAG_PREPOS) or effort == 0.0:
         return effort, False
@@ -2914,7 +2920,7 @@ def deviation_offset_detail(
     if tau is None or (tau <= 0.0 and dob_kmhs == 0.0):
         return effort, False
     launch, stop = _side_flags(table, side, need_kmhs, ref_kmh, stops_ahead)
-    d_a = (dev_kmh / tau if tau > 0.0 else 0.0) + integral_kmhs
+    d_a = (dev_kmh / tau / p_gain_div if tau > 0.0 else 0.0) + integral_kmhs
     u0, _ = table.invert(ref_kmh, need_kmhs, launch=launch, stop=stop)
     u1, _ = table.invert(row_kmh, need_kmhs + d_a - dob_kmhs, launch=launch, stop=stop)
     u0, u1 = float(u0), float(u1)

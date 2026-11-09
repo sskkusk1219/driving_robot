@@ -474,6 +474,33 @@ def clip_stop_tail_delta(delta_pct: float) -> float:
     return min(delta_pct, 0.0)
 
 
+def p_local_gain_k(ratio: float, c: float, deviation_c: float) -> float:
+    """2026-11-10 段9: P の加速度を割る量 k ＝ max(1, 倍率 × c ÷ deviation_c)。
+    実際の τ（＝ 設計の τ ÷ 倍率）を c × L にする。c ＝ deviation_c なら倍率そのまま（B1）、
+    c ＝ 3（deviation_c 6）なら半分（B2）。
+    1 未満にはしない（今より P を強くしない）。deviation_c が 0 以下（P なし）は 1。"""
+    if deviation_c <= 0.0:
+        return 1.0
+    return max(1.0, ratio * c / deviation_c)
+
+
+def p_local_gain_weight(
+    mode: str, need_abs_kmhs: float, cruise_kmhs: float, taper_kmhs: float
+) -> float:
+    """2026-11-10 段9: 局所の効きで割る重み w。"all" は 1。"cruise" は
+    要る加速度の大きさ ≦ cruise_kmhs で 1、taper_kmhs で 0 へ直線に戻し、それより上は 0
+    （定速の境目で P の強さが段にならない）。"off" は 0。"""
+    if mode == "all":
+        return 1.0
+    if mode != "cruise":
+        return 0.0
+    if need_abs_kmhs <= cruise_kmhs:
+        return 1.0
+    if need_abs_kmhs >= taper_kmhs:
+        return 0.0
+    return (taper_kmhs - need_abs_kmhs) / (taper_kmhs - cruise_kmhs)
+
+
 def small_dev_band(dev_kmh: float, e_kmh: float, r: float) -> float:
     """2026-11-09 段2（c10_small_dev_band）: P に渡す偏差 f(dev)。|dev| ≤ e は r × dev、
     それより外は 符号 × (r × e ＋ (|dev| − e))（値が連続・外の傾きは今と同じ）。"""
@@ -1116,6 +1143,7 @@ def _prepare_forward_map_plan(
         say(f"  低速の DOB・停C の τ（段6-2）: {dob_low_speed_text(fm)}")
         say(f"  C10 の偏差の積分 I（段6d）: {c10_integral_text(fm)}")
         say(f"  C10 の P（20261109 段2・4）: {c10_small_dev_text(fm)}")
+        say(f"  C10 の P の局所の効き（20261109 段9）: {c10_p_local_gain_text(fm, ff.table.meta)}")
     if isinstance(ff, CoastAssistFeedforward):
         # 2026-10-18 段2r: 惰行の補助。保持時間 ＝ 係数 × (遅れ ＋ 効き始めまでの戻り時間)
         ff.set_coast(
@@ -1787,6 +1815,26 @@ def c10_integral_text(fm: Any) -> str:
     )
 
 
+def c10_p_local_gain_text(fm: Any, meta: Any) -> str:
+    """2026-11-10 段9（c10_p_local_gain）の設定の表示（走行前）。表（pkl meta の
+    local_gain_accel_cruise）が無いときは倍率 1 のまま（今と同じ）なので、その旨も出す。"""
+    if fm.c10_p_local_gain == "off":
+        return "なし"
+    scope = "定速だけ" if fm.c10_p_local_gain == "cruise" else "加速中も"
+    entry = meta.get("local_gain_accel_cruise")
+    if entry is None:
+        table = "なし（pkl の meta に local_gain_accel_cruise が無い → 倍率 1 ＝ 今のまま。警告）"
+    else:
+        cells = int(sum(1 for row in entry["n"] for n in row if n > 0))
+        table = f"あり（マス {cells}）"
+    taper = (
+        f"・定速 ＜ {fm.c10_p_local_gain_cruise_kmhs:g}〜"
+        f"{fm.c10_p_local_gain_taper_kmhs:g} km/h/s でなめらかに戻す"
+        if fm.c10_p_local_gain == "cruise" else ""
+    )
+    return f"{scope}・c ＝ {fm.c10_p_local_gain_c:g}・倍率の表 {table}{taper}"
+
+
 def c10_small_dev_text(fm: Any) -> str:
     """2026-11-09 段2・4（小さい偏差の帯・D）の設定の表示（走行前）。"""
     band = (
@@ -2041,6 +2089,9 @@ class _ModeRun:
     _sdb_p_kmh: float | None = None
     _d_term_kmh: float | None = None
     _d_accel_kmhs: float | None = None
+    # 2026-11-10 段9（C10 の P の局所の効き）の今の周期のログ値の既定
+    _p_local_ratio: float | None = None
+    _p_gain_div: float | None = None
     # 2026-11-08 ProblemReport_20261108 段1・2 の既定（C10 だけの最小の _ModeRun でも動くように）
     _ho_on = False
     # 段6e: coast_assist_accel_no_play で min に置いている最中か／今の周期の _handover_p の結果
@@ -2235,6 +2286,8 @@ class _ModeRun:
         self._sdb_p_kmh: float | None = None
         self._d_term_kmh: float | None = None
         self._d_accel_kmhs: float | None = None
+        self._p_local_ratio: float | None = None  # 段9: C10 の P の局所の効き（掛けない行は None）
+        self._p_gain_div: float | None = None
         self._d_win: deque[tuple[float, float]] = deque()  # (t, 制御に使っている車速)
         if cfg.forward_map.stop_end_accel_pred_enabled and self.pred is None:
             self._stop_pred_tp_s = stop_end_pred_tp_s(cfg, self.ff)
@@ -2694,6 +2747,7 @@ class _ModeRun:
         self._stop_end_tau_s = None
         self._stop_pred_dev = None
         self._sdb_p_kmh = self._d_term_kmh = self._d_accel_kmhs = None
+        self._p_local_ratio = self._p_gain_div = None
         if self.cfg.forward_map.c10_d_term:
             # 段4: D の実測の加速度の窓。行の種類に関係なく毎周期進める
             dwin = self._d_win
@@ -2826,6 +2880,7 @@ class _ModeRun:
                 c10_effort = None if c10_effort is None else 0.0
                 coast_active = False
                 self._sdb_p_kmh = self._d_term_kmh = self._d_accel_kmhs = None  # 段2・4
+                self._p_local_ratio = self._p_gain_div = None  # 段9
                 self._coast_effort = 0.0
                 self._pf_row = None  # 保持の場面は下限を掛けない（20261108 段1）
                 self._ho_now = 0 if self._ho_on else None
@@ -3098,6 +3153,8 @@ class _ModeRun:
                     small_dev_p_kmh=self._sdb_p_kmh,
                     d_term_kmh=self._d_term_kmh,
                     d_accel_meas_kmhs=self._d_accel_kmhs,
+                    p_local_ratio=self._p_local_ratio,
+                    p_gain_div=self._p_gain_div,
                 )
             )
         if segment != self._segment:
@@ -3405,12 +3462,23 @@ class _ModeRun:
         if p_dev is not None:
             kwargs["dev_kmh"] = p_dev  # 段3: P だけ先読みの偏差（I は上で今の偏差を使った）
         fm_sd = self.cfg.forward_map
-        if (fm_sd.c10_small_dev_band or fm_sd.c10_d_term) and self._small_dev_row(
+        plg_on = fm_sd.c10_p_local_gain != "off"
+        sd_row = (
+            fm_sd.c10_small_dev_band or fm_sd.c10_d_term or plg_on
+        ) and self._small_dev_row(
             t, i, plan, ff_effort, flag_now,
             flag_override=flag_override, p_dev=p_dev, tau_end=tau_end,
             low=min(ref, float(kwargs["row_kmh"]))
             < float(ff.table.meta.get("stop_max_speed_kmh") or 7.5),
-        ):
+        )
+        if sd_row and plg_on and ff_effort > 0.0:
+            # 2026-11-10 段9（c10_p_local_gain）: P の加速度 dev ÷ τ だけを局所の効きの倍率で割る
+            # （I・DOB は今のまま）。帯・D は dev に畳まれるので一緒に割られる（意図どおり）
+            ratio, k_eff = self._p_local_gain_div(float(kwargs["row_kmh"]), ff_effort,
+                                                  float(kwargs["need_kmhs"]))
+            self._p_local_ratio, self._p_gain_div = ratio, k_eff
+            kwargs["p_gain_div"] = k_eff
+        if sd_row and (fm_sd.c10_small_dev_band or fm_sd.c10_d_term):
             # 2026-11-09 段2・4: P に渡る偏差だけを置き換える（I・DOB は今の dev のまま）。
             # dev_P ＝ f(dev) ＋ Td ×（need − a_meas）。帯の f は D に掛けない
             dev_p = float(kwargs["dev_kmh"])
@@ -3890,6 +3958,38 @@ class _ModeRun:
                 total = ff_effort
             return total - ff_effort, True  # _cycle は ff_effort ＋ c10_effort を出す
         return total, True
+
+    def _p_local_gain_div(
+        self, row_kmh: float, ff_effort: float, need_kmhs: float
+    ) -> tuple[float, float]:
+        """2026-11-10 段9: C10 の P の加速度を割る量 (局所の効きの倍率, k_eff)。
+
+        倍率 ＝ meta `local_gain_accel_cruise`（手順2 の定速の保持から測った表）を
+        (車速の行, FF の開度 − min − 効き始め) で引いた値
+        （`local_gain.local_gain_at`。列は 5 % 刻みなのでその半分まで端の値のまま使う）。
+        k ＝ max(1, 倍率 × c ÷ deviation_c)
+        （c ＝ c10_p_local_gain_c。c ＝ 6 ＝ deviation_c なら倍率そのまま・c ＝ 3 なら半分）。
+        重み w: "cruise" は 要る加速度の大きさ ≦ cruise_kmhs で 1・taper_kmhs で 0 へ直線・
+        それより上は 0、"all" は 1。k_eff ＝ 1 ＋ w ×（k − 1）。
+        meta に表が無い・引けない（範囲外）なら倍率 1 ＝ k_eff 1。
+        """
+        fm = self.cfg.forward_map
+        meta = self.ff.table.meta  # type: ignore[attr-defined]
+        onset = meta.get("accel_onset_u_pct")
+        entry = meta.get("local_gain_accel_cruise")
+        if entry is None or onset is None or not np.isfinite(onset):
+            return 1.0, 1.0
+        pmin = self.cfg.vehicle.min_accel_opening_pct
+        u_from_onset = abs(ff_effort) - pmin - float(onset)
+        ratio = local_gain.local_gain_at(
+            entry, row_kmh, u_from_onset, edge_hold_pct=local_gain.CRUISE_COL_STEP_PCT / 2.0
+        )
+        k = p_local_gain_k(ratio, fm.c10_p_local_gain_c, self.ff.deviation_c)  # type: ignore[attr-defined]
+        w = p_local_gain_weight(
+            fm.c10_p_local_gain, abs(need_kmhs), fm.c10_p_local_gain_cruise_kmhs,
+            fm.c10_p_local_gain_taper_kmhs,
+        )
+        return ratio, 1.0 + w * (k - 1.0)
 
     def _local_gain_ratio(self, row_kmh: float, ff_effort: float) -> float:
         """段4 (ア): 今の FF の開度（そのペダルの min からの量 − 効き始め）と車速の行での局所の

@@ -2460,3 +2460,98 @@ async def test_c10_small_dev_band_and_d_term_only_change_normal_rows(
     td = run.ff.tau_accel_s / run.ff.deviation_c
     assert run._d_accel_kmhs == pytest.approx(0.0)  # noqa: SLF001
     assert run._d_term_kmh == pytest.approx(td * need)  # noqa: SLF001
+
+
+def test_p_local_gain_k_and_weight() -> None:
+    # 2026-11-10 段9: k ＝ max(1, 倍率 × c ÷ deviation_c)・定速の重みのなめらかな戻し
+    k = mdmod.p_local_gain_k
+    assert k(3.5, 6.0, 6.0) == pytest.approx(3.5)  # B1: 倍率そのまま
+    assert k(3.5, 3.0, 6.0) == pytest.approx(1.75)  # B2: 半分
+    assert k(2.0, 3.0, 6.0) == 1.0  # 倍率 2 以下は今のまま（P を強くしない）
+    assert k(3.0, 6.0, 0.0) == 1.0  # P なし
+    w = mdmod.p_local_gain_weight
+    assert w("all", 5.0, 0.3, 0.6) == 1.0
+    assert w("off", 0.0, 0.3, 0.6) == 0.0
+    assert w("cruise", 0.0, 0.3, 0.6) == 1.0
+    assert w("cruise", 0.3, 0.3, 0.6) == 1.0
+    assert w("cruise", 0.45, 0.3, 0.6) == pytest.approx(0.5)
+    assert w("cruise", 0.6, 0.3, 0.6) == 0.0
+    assert w("cruise", 2.0, 0.3, 0.6) == 0.0
+
+
+async def test_c10_p_local_gain_divides_p_only_on_accel_rows_in_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """off は今と同じ。on は 7.5 km/h 以上のアクセルの通常の行の P だけが k_eff で割られ、低速・
+    ブレーキの行・表が meta に無いときは変わらない。ログ値は p_local_ratio・p_gain_div。"""
+    cfg = _c10_cfg(tmp_path)
+    cfg.forward_map = cfgmod.ForwardMapSection()
+    cfg.forward_map.deviation_c = 100.0
+    cfg.forward_map.deviation_row = "reference"
+    cfg.forward_map.dob_tq_coef = 40.0
+    run = await _c10_run_obj(cfg, monkeypatch)
+    run._d_win = mdmod.deque()  # noqa: SLF001
+    run.c10_int = None
+    run._ci_prev_t = None  # noqa: SLF001
+    run._b1_rows = []  # noqa: SLF001
+    plan = run.ff.plan
+    ia = int(np.flatnonzero(plan.effort_pct > 4.0 + 1.0)[0])
+    t, e = float(plan.t_s[ia]), float(plan.effort_pct[ia])
+    ref = 40.0
+    fm = cfg.forward_map
+    meta = run.ff.table.meta
+    onset = 1.0
+    meta["accel_onset_u_pct"] = onset
+    u_col = abs(e) - cfg.vehicle.min_accel_opening_pct - onset
+    # 倍率 3.0 の表: 行 20〜60 km/h・列は FF の開度の列を挟む
+    meta["local_gain_accel_cruise"] = {
+        "speed_rep_kmh": [20.0, 60.0], "u_from_onset_pct": [u_col - 5.0, u_col + 5.0],
+        "ratio": [[3.0, 3.0], [3.0, 3.0]], "n": [[1, 1], [1, 1]],
+    }
+    off = run._c10_offset(t, ref, ref - 0.05, e)  # noqa: SLF001
+    assert run._p_gain_div is None  # noqa: SLF001
+    # all・c ＝ 2 × deviation_c（k ＝ 3 × 2 ＝ 6）→ P が 1/6
+    fm.c10_p_local_gain = "all"
+    fm.c10_p_local_gain_c = 200.0
+    on = run._c10_offset(t, ref, ref - 0.05, e)  # noqa: SLF001
+    assert run._p_local_ratio == pytest.approx(3.0)  # noqa: SLF001
+    assert run._p_gain_div == pytest.approx(6.0)  # noqa: SLF001
+    assert on == pytest.approx(off / 6.0, rel=1e-3)
+    # cruise: 要る加速度が taper 以上なら割らない（k_eff ＝ 1）・定速以下なら全部
+    fm.c10_p_local_gain = "cruise"
+    need = abs(float(plan.need_accel_kmhs[plan.index_at(t)]))
+    fm.c10_p_local_gain_cruise_kmhs = need + 0.2
+    fm.c10_p_local_gain_taper_kmhs = need + 0.4
+    run._c10_offset(t, ref, ref - 0.05, e)  # noqa: SLF001
+    assert run._p_gain_div == pytest.approx(6.0)  # noqa: SLF001
+    fm.c10_p_local_gain_cruise_kmhs = max(need - 0.4, 0.01)
+    fm.c10_p_local_gain_taper_kmhs = max(need - 0.2, 0.02)
+    if need - 0.2 > 0.02:
+        run._c10_offset(t, ref, ref - 0.05, e)  # noqa: SLF001
+        assert run._p_gain_div == pytest.approx(1.0)  # noqa: SLF001
+    fm.c10_p_local_gain = "all"
+    # 低速の行・先読みの行・ブレーキの行は掛けない（ログ値は None のまま）
+    for kw, args in (
+        ({}, (t, 5.0, 4.95, e)),
+        ({"p_dev": 0.3}, (t, ref, ref - 0.05, e)),
+        ({}, (t, ref, ref - 0.05, -e)),
+    ):
+        run._p_local_ratio = run._p_gain_div = None  # noqa: SLF001  _cycle の頭のリセットの代わり
+        run._c10_offset(*args, **kw)  # noqa: SLF001
+        assert run._p_gain_div is None  # noqa: SLF001
+    # 表が meta に無い → 倍率 1（今のまま）
+    del meta["local_gain_accel_cruise"]
+    assert run._c10_offset(t, ref, ref - 0.05, e) == pytest.approx(off)  # noqa: SLF001
+    assert run._p_gain_div == 1.0  # noqa: SLF001
+
+
+def test_c10_p_local_gain_text_and_validation() -> None:
+    fm = cfgmod.ForwardMapSection()
+    assert mdmod.c10_p_local_gain_text(fm, {}) == "なし"
+    fm.c10_p_local_gain = "cruise"
+    fm.c10_p_local_gain_c = 3.0
+    txt = mdmod.c10_p_local_gain_text(fm, {})
+    assert "定速だけ" in txt and "c ＝ 3" in txt and "警告" in txt
+    entry = {"n": [[1, 0], [2, 3]]}
+    txt = mdmod.c10_p_local_gain_text(fm, {"local_gain_accel_cruise": entry})
+    assert "マス 3" in txt and "警告" not in txt

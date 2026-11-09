@@ -653,6 +653,16 @@ forward_map:
   # 帯の f は D に掛けない。効く先: 定速の揺れ・IWR。決める時期: 段5 の実機
   c10_d_term: false
   c10_d_window_s: 0.3
+  # 2026-11-10 ProblemReport_20261109 段9: C10 の P の加速度 dev ÷ τ だけを、手順2 の定速の保持から測った局所の効きの倍率
+  # （pkl meta local_gain_accel_cruise）で割る（I・DOB は今のまま）。"off"（引用符が要る）／"cruise"＝要る加速度 ＜ cruise_kmhs の
+  # アクセルの行（taper_kmhs まで直線で戻す）／"all"＝7.5 km/h 以上のアクセルの行すべて。割る量 k ＝ max(1, 倍率 × c ÷ 6)。
+  # c ＝ 6（B1）倍率で全部割る・c ＝ 3（B2）今の約 1/2（半分データ由来: 今の実際の τ ≒ 1.7 × L を限界とみなした 0.45 Ku の推定）。
+  # cruise_kmhs 0.3・taper_kmhs 0.6 は仮の値（IWR の内訳の定速と同じ・境目を段にしないため）。
+  # 効く先: 定速の揺れ（約 1 Hz）・IWR。決める時期: 段11（B1 ↔ B2）・段12（定速 ↔ 加速中も）。表が meta に無いと倍率 1（今と同じ）
+  c10_p_local_gain: "off"
+  c10_p_local_gain_c: 6.0
+  c10_p_local_gain_cruise_kmhs: 0.3
+  c10_p_local_gain_taper_kmhs: 0.6
   # 2026-10-17 段2o-9: 置くまでの待ち（preposition_clear_s: 0.1）は廃止。待ちは「戻す側のペダルが
   # min に戻るまでの時間」（pkl の meta の戻る時間。手順2 で測る）で決める
 
@@ -898,7 +908,11 @@ learning:
   # 2026-10-19 段2s-2 短縮 7.0 → 5.0。机上（075823 の定速の保持を 5 秒で切った CSV で作り直した表）で
   # 表はほぼ不変（|r| +0.002）、手順2 が約 122 秒短くなる。効く先: 定速付近の表の点の数。
   # 決める時期: 2s-3 の実機の手順2 のチェックで定速の点が足りなければ戻す
-  ramp_cruise_hold_s: 5.0
+  # 2026-11-10 段8 ProblemReport_20261109 5.0 → 10.0（ユーザー決定）。手順2 の定速の保持から局所の効き
+  # （local_gain_accel_cruise。段7）を測るため、保持の PI が開度を動かす区間を長く取る（5 秒だと窓
+  # 0.3 s・遅れ 0.14 s の当てはめに使える行が少ない）。手順2 の段は増やさない。
+  # 効く先: 手順2 の所要時間（保持の段 × 5 秒）・定速付近の表の点の数。決める時期: 段10 の実機の手順2 の後
+  ramp_cruise_hold_s: 10.0
   ramp_cruise_timeout_s: 15.0
   ramp_cruise_fine_max_kmh: 100.0
   ramp_cruise_coarse_step_kmh: 20.0

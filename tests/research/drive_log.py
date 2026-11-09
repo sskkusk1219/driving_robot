@@ -226,6 +226,12 @@ CSV_COLUMNS: tuple[str, ...] = (
     "small_dev_p_kmh",
     "d_term_kmh",
     "d_accel_meas_kmhs",
+    # 2026-11-10 ProblemReport_20261109 段9（forward_map.c10_p_local_gain）:
+    # p_local_ratio ＝ 手順2 の
+    # 定速の保持から測った局所の効きの倍率（表から引いた値）／p_gain_div ＝ P の加速度を割った量
+    # k_eff（1 ＝ 割っていない）。掛けた行（7.5 km/h 以上のアクセルの C10 の行）だけ・off は空欄
+    "p_local_ratio",
+    "p_gain_div",
 )
 
 
@@ -301,6 +307,8 @@ class DriveSample:
     small_dev_p_kmh: float | None = None  # 20261109 段2: 帯の f を掛けた後の P の偏差
     d_term_kmh: float | None = None  # 同 段4: D の分 Td ×（need − a_meas）
     d_accel_meas_kmhs: float | None = None  # 同 段4: D に使った実測の加速度
+    p_local_ratio: float | None = None  # 20261109 段9: 定速の保持から測った局所の効きの倍率
+    p_gain_div: float | None = None  # 同 段9: P の加速度を割った量 k_eff
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -420,6 +428,8 @@ class SessionLog:
         small_dev_p_kmh: float | None = None,
         d_term_kmh: float | None = None,
         d_accel_meas_kmhs: float | None = None,
+        p_local_ratio: float | None = None,
+        p_gain_div: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -486,6 +496,8 @@ class SessionLog:
             small_dev_p_kmh=small_dev_p_kmh,
             d_term_kmh=d_term_kmh,
             d_accel_meas_kmhs=d_accel_meas_kmhs,
+            p_local_ratio=p_local_ratio,
+            p_gain_div=p_gain_div,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -709,6 +721,8 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 _fmt(s.small_dev_p_kmh),
                 _fmt(s.d_term_kmh),
                 _fmt(s.d_accel_meas_kmhs),
+                _fmt(s.p_local_ratio),
+                _fmt(s.p_gain_div),
             ])
 
 
