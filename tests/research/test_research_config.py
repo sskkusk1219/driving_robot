@@ -1639,12 +1639,34 @@ def test_coast_band_release_at_zero_default_false() -> None:
     assert cfgmod.validate_config(cfg) == []
 
 
+def test_coast_fill_same_pedal_and_handover_options_default_off_and_validated() -> None:
+    fm = cfgmod.ForwardMapSection()
+    assert fm.coast_fill_same_pedal is False
+    assert fm.coast_assist_accel_no_floor is False
+    assert fm.coast_assist_brake_wait_floor is False
+    assert fm.coast_assist_accel_no_play is False  # 段6e
+    assert fm.coast_assist_accel_unpark_pct == 0.5
+    assert fm.coast_fill_brake_wait_floor is False
+    cfg = cfgmod.load_config()
+    # 本体 yaml は on（ProblemReport_20261108 段6h ユーザー決定 2026-11-09）
+    assert cfg.forward_map.coast_assist_accel_no_play is True
+    assert cfg.forward_map.coast_fill_brake_wait_floor is True
+    assert cfg.forward_map.coast_fill_same_pedal is True
+    assert cfg.forward_map.coast_assist_accel_no_floor is True
+    assert cfg.forward_map.coast_assist_brake_wait_floor is True
+    assert cfgmod.validate_config(cfg) == []
+    cfg.forward_map.coast_assist_handover = False  # brake_wait_floor などが handover を要る
+    assert any("coast_assist_handover" in p for p in cfgmod.validate_config(cfg))
+    cfg.forward_map.coast_assist_handover = True
+    cfg.forward_map.coast_fill_max_s = 0.0  # coast_fill_same_pedal が coast_fill_max_s > 0 を要る
+    assert any("coast_fill_same_pedal" in p for p in cfgmod.validate_config(cfg))
+
+
 def test_coast_fill_max_s_default_zero_and_validated() -> None:
     # 2026-10-30 ProblemReport_20261030_惰行 段2: 短い惰行を埋める案 D は既定 0（無効）
     assert cfgmod.ForwardMapSection().coast_fill_max_s == 0.0
     cfg = _load_default()
-    assert cfg.forward_map.coast_fill_max_s == 0.0
-    cfg.forward_map.coast_fill_max_s = 2.0
+    assert cfg.forward_map.coast_fill_max_s == 2.0  # 11-09 本体 on（20261108 段6h）
     assert cfgmod.validate_config(cfg) == []
     cfg.forward_map.coast_fill_max_s = -0.1
     assert any("coast_fill_max_s" in p for p in cfgmod.validate_config(cfg))

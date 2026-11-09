@@ -147,7 +147,13 @@ forward_map:
   # 切りのいい値で根拠は弱い。長くすると惰行が消えてペダルの往復が増えやすい。決める時期: 段5
   # 2026-10-31 不採用・オフのまま（段5）: 効き始めで保つ埋めの行で C10 の上乗せが −9% 跳ねる不具合
   # （u0 が表のアクセル側になり、ブレーキ側の u1 との差が大きい。US06 `210949` 477 s で −2.65 km/h）。使うなら先に直す
-  coast_fill_max_s: 0.0
+  # 2026-11-09 段6h: 2.0 で本体 on（coast_fill_same_pedal と組。前後が同じペダルの区間だけ埋める）
+  coast_fill_max_s: 2.0
+  # 2026-11-09 ProblemReport_20261108_アクセルを効き始めで待つ 段6a。既定オフ。true なら上の埋めを前後が同じペダルの
+  # 区間だけにし、埋めた行の C10 は表を 1 回で直接引く（そのペダルの側だけ・下限つき）。coast_fill_max_s > 0 が要る。
+  # 効く先: 埋めの行の C10 の −9% 跳ね（10-31 不採用の原因）。決める時期: 段6d
+  # → 本体 on（ProblemReport_20261108 段6h ユーザー決定 2026-11-09。W `130454`・U `133740`・US06 `140206`）
+  coast_fill_same_pedal: true
   # 要る加速度を測る窓の幅 [s]。仮値（表を作るときの加速度の窓 1.0 秒にそろえた）。
   # FF のなめらかさに効く。実機後に見直す
   need_window_s: 0.25  # 段9-a' で採った（2026-10-25 `103655`・`110800`・`113137`。7-c' 0.5・段5 まで 1.0）
@@ -495,6 +501,47 @@ forward_map:
   # 根拠: 段22 実機（上と同じ 6 本）で R ＝ 3 全部・伸ばしたのは W 511・U 1196・US06 500・567（各 1 周期）で
   # 上り代 −0.05〜−0.13・US06 最大 0.75 → 0.64・同時踏み 0 → 本体 on（ユーザー決定 2026-11-08）
   launch_band_late_release: true
+  # 2026-11-08 ProblemReport_20261108_アクセルを効き始めで待つ 段1: true なら C10 の行（FF がアクセル・ブレーキ）の
+  # 開度を、車速ごとの遊びの端（表の効き始め − preposition_margin_pct）より浅くしない（遊びの中は min でも減速が
+  # 同じなので、P が min まで戻る往復を止める）。FF が下限より浅い行は触らない。ブレーキは 7.5 km/h 未満・保持の
+  # 場面・発進のブレーキの帯・停車前の踏み増し・停C の行に掛けない。ログ: play_floor_pct・play_floor_active
+  # play_floor_rise_kmhs 0.05: 効き始めとみなす「惰行との加速度の差」[km/h/s]（仮の値。19 本の min 付近のばらつき
+  # ±0.01 の 5 倍。段5 の実機で見直す）
+  # → 本体 on（ProblemReport_20261108 段6h ユーザー決定 2026-11-09。W `130454`・U `133740`・US06 `140206`）
+  c10_play_floor: true
+  play_floor_rise_kmhs: 0.05
+  # 2026-11-08 同 段2: true なら C12 を作り変える。入る＝先読みの偏差 p（偏差＋傾き×Tp）≧ coast_on_kmh、
+  # 入ったら惰行の区間の終わりまで保ち、離すのは (a) 次の反対のペダルまで戻る時間しかない (b) 下限にいて p が
+  # 反対向きに coast_off_kmh を超えた、だけ。入っている間は FF＝表の開度に C10 の P・DOB・I と下限を掛ける
+  # （I は c10_integral_coast_assist に関係なく貯める）。区間の終わりで次がアクセルなら I を続ける。
+  # ログ: coast_handover・coast_pred_dev_kmh
+  # → 本体 on（ProblemReport_20261108 段6h ユーザー決定 2026-11-09。W `130454`・U `133740`・US06 `140206`）
+  coast_assist_handover: true
+  # 同 段3: true なら handover の行の P の偏差を先読みの偏差 p にする（I・DOB は今の偏差）。
+  # coast_assist_handover が要る。実機で on/off を比べ、ダメなら使わない（ユーザー決定）
+  # → 段6 で off に決定（ユーザー 2026-11-09。W 1749〜1752 s で区間の頭のブレーキを保ちすぎた）
+  coast_assist_pred_p: false
+  # 2026-11-09 同 段6a。既定オフ。true なら handover のアクセルに遊びの下限を掛けない（表の答えが効き始めより浅ければ
+  # min ＝ 惰行の行で回生を切らない）。coast_assist_handover が要る。決める時期: 段6d
+  # → 本体 on（ProblemReport_20261108 段6h ユーザー決定 2026-11-09。W `130454`・U `133740`・US06 `140206`）
+  coast_assist_accel_no_floor: true
+  # 2026-11-09 同 段6a。既定オフ。true なら handover のブレーキは p_brake ＞ coast_off_kmh（遅れの見込み）の間は
+  # 合計を下限までに切り（I はその向きへ貯めない）、(b) で min へ離さず下限で待ち、p_accel ≥ coast_on_kmh で
+  # 離してアクセルへ。coast_assist_handover が要る。決める時期: 段6d
+  # → 本体 on（ProblemReport_20261108 段6h ユーザー決定 2026-11-09。W `130454`・U `133740`・US06 `140206`）
+  coast_assist_brake_wait_floor: true
+  # 2026-11-09 同 段6e。既定オフ。true なら handover のアクセルは、出す開度が効き始め（min ＋ 表の効き始め。
+  # 余白は引かない）より浅いとき min にする。いったん min にしたら答えが効き始め ＋ 下の幅以上になるまで
+  # min のまま。coast_assist_accel_no_floor が要る。決める時期: 段6h
+  # → 本体 on（ProblemReport_20261108 段6h ユーザー決定 2026-11-09。W `130454`・U `133740`・US06 `140206`）
+  coast_assist_accel_no_play: true
+  # 同 段6e。仮の値（下限の余白と同じ幅）。効き始めの上下で毎周期 min と行き来するのを止める。段6h でこのまま（ユーザー 2026-11-09）
+  coast_assist_accel_unpark_pct: 0.5
+  # 同 段6e。既定オフ。true なら coast_fill_same_pedal の埋めの行のブレーキも、p_brake ＞ coast_off_kmh の間は
+  # 合計を下限までに切る（I はその向きへ貯めない）。coast_fill_same_pedal と coast_assist_handover が要る。
+  # 決める時期: 段6h
+  # → 本体 on（ProblemReport_20261108 段6h ユーザー決定 2026-11-09。W `130454`・U `133740`・US06 `140206`）
+  coast_fill_brake_wait_floor: true
   # 2026-10-28 段14 L1: true なら予測（案 R・C・発進のずらし）で、両ペダル min・車速 5.0 km/h 未満の行の
   # 加速度を手順2 が測ったクリープの曲線（feedforward.creep_accel_*）にする。発進側の表は +1.51 km/h/s、
   # 実測は約 2.2。predict_low_speed_sides が true のときだけ使える。決める時期: 段14 の実機（既定 off）
