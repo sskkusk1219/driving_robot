@@ -25,7 +25,7 @@ import numpy as np
 
 from tests.research.dob import PEDAL_ACCEL, PEDAL_BRAKE
 from tests.research.ff_model import STOP_SPEED_KMH
-from tests.research.fwd_plan import FLAG_COAST, ReturnTime
+from tests.research.fwd_plan import FLAG_COAST, FLAG_PREPOS, ReturnTime
 
 
 @dataclass
@@ -46,6 +46,17 @@ class CoastStats:
     released_next: int = 0  # (a) 次の反対のペダルに間に合うよう、保持の途中で離した回数
     # 2026-10-28 段14 K: 偏差の符号が補助の向きと逆になり、保持の途中で離した回数
     released_cross: int = 0
+    # 2026-11-08 ProblemReport_20261108 段2（handover）: 入った回数は accel_entries・
+    # brake_entries に数える。ここは handover だけの集計
+    handover_section_max: int = 0  # 1 つの惰行の区間での入りの回数の最大
+    handover_released_a: int = 0  # (a) 次の反対のペダルまで戻る時間しかなく離した回数
+    handover_released_b: int = 0  # (b) 下限にいて先読みの偏差が反対向きに off を超え離した回数
+    # 2026-11-09 段6a（handover_brake_wait）: 下限で待っていたブレーキを p_accel ≥ on で離した回数
+    handover_switched: int = 0
+    # 2026-11-09 段6e: アクセルを min にした周期数（coast_assist_accel_no_play）・
+    # 埋めの行のブレーキを下限で止めた周期数（coast_fill_brake_wait_floor）
+    handover_parked: int = 0
+    fill_wait_capped: int = 0
 
     def add_active(self, pedal: str) -> None:
         if pedal == PEDAL_ACCEL:
@@ -65,6 +76,25 @@ class CoastStats:
             f"次の戻り待ち {self.blocked_next_return * p:.1f}s・"
             f"次のペダルのため保持の途中で離した {self.released_next} 回・"
             f"符号が逆になり保持の途中で離した {self.released_cross} 回"
+        )
+
+
+    def handover_summary(self) -> str:
+        """handover（coast_assist_handover）の集計の表示。入った回数は ペダル別。"""
+        n = self.accel_entries + self.brake_entries
+        return (
+            f"入った {n} 回（アクセル {self.accel_entries}・ブレーキ {self.brake_entries}。"
+            f"1 区間の最大 {self.handover_section_max} 回）・"
+            f"保った秒数 アクセル {self.accel_s:.1f}s／ブレーキ {self.brake_s:.1f}s・"
+            f"離した (a) 次の反対のペダルのため {self.handover_released_a} 回・"
+            f"(b) 下限で反対向き {self.handover_released_b} 回・"
+            f"ブレーキの待ちからアクセルへ {self.handover_switched} 回・"
+            f"アクセルを min にした {self.handover_parked * self.period_s:.1f}s・"
+            f"埋めの行のブレーキを下限で止めた {self.fill_wait_capped * self.period_s:.1f}s・"
+            f"入れなかった（周期）区間の反対ペダル {self.blocked_section * self.period_s:.1f}s・"
+            f"反対ペダルへ替える待ち {self.blocked_switch_wait * self.period_s:.1f}s・"
+            f"前の戻り待ち {self.blocked_prev_return * self.period_s:.1f}s・"
+            f"次の戻り待ち {self.blocked_next_return * self.period_s:.1f}s"
         )
 
 
@@ -107,11 +137,16 @@ class CoastAssist:
         brake_onset_effort: float,
         one_pedal_per_section: bool = True,
         release_on_cross: bool = False,
+        handover_brake_wait: bool = False,
     ) -> None:
         self.one_pedal_per_section = one_pedal_per_section
         # 2026-10-28 段14 K: True なら偏差の符号が補助の向きと逆になった時点で保持の途中でも離す
         self.release_on_cross = release_on_cross
+        # 2026-11-09 段6a: True なら handover のブレーキは (b) で min へ離さず下限で待ち、
+        # p_accel ≥ on_kmh になったときだけ離す（アクセルのほうは今のまま）
+        self.handover_brake_wait = handover_brake_wait
         self.flag = np.asarray(plan_flag)
+        self._plan_effort = np.asarray(plan_effort, dtype=float)
         self.on_kmh = on_kmh
         self.off_kmh = off_kmh
         self.hold_s = {PEDAL_ACCEL: hold_accel_s, PEDAL_BRAKE: hold_brake_s}
@@ -145,6 +180,9 @@ class CoastAssist:
         self.section_pedal: str | None = None  # この惰行の区間で使ったペダル
         self._effort = 0.0  # 今の補助の effort（mode_drive が note_effort で渡す）
         self.last_effort = 0.0  # 最後に補助で出した effort（離すときに覚える）
+        # handover 用の状態（step では使わない）
+        self._section_entries = 0  # この惰行の区間で入った回数
+        self._section_closed = False  # この区間は (a) で離したので、もう入らない
 
     def note_effort(self, effort: float) -> None:
         """今の周期で出した補助の effort（(a) の戻り時間の計算に使う）。"""
@@ -231,6 +269,118 @@ class CoastAssist:
             return None
         self.pedal, self.t_on, self.section_pedal = pedal, t, pedal
         self._effort = 0.0
+        if pedal == PEDAL_ACCEL:
+            st.accel_entries += 1
+        else:
+            st.brake_entries += 1
+        st.add_active(pedal)
+        return pedal
+
+    def step_handover(
+        self,
+        *,
+        t: float,
+        i: int,
+        p_accel: float | None,
+        p_brake: float | None,
+        speed_kmh: float,
+        ref_kmh: float,
+        at_floor: bool,
+    ) -> str | None:
+        """handover（forward_map.coast_assist_handover）の入る・離す。今の周期で補助に使うペダルか
+        None を返す。`step` と違い、保持時間は使わない。
+
+        p_accel・p_brake ＝ 先読みの偏差（偏差 ＋ 傾き × Tp。Tp はペダルの遅れ ＋ 窓 ÷ 2。正＝遅れて
+        いる → アクセル、負＝速すぎる → ブレーキ）。そのペダルの遅れが測れていなければ None
+        （そのペダルには入らない）。at_floor ＝ 前の周期の開度が下限にいたか（(b) の条件）。
+        - 入る: |p| ≥ on_kmh（アクセルは p_accel ≥ on、ブレーキは p_brake ≤ −on）。1 つの区間で
+          使うペダルは（one_pedal_per_section なら）1 つだけ。前の反対のペダルの戻り待ち・次の
+          反対のペダルまでの時間は step と同じ規則。
+        - 入ったら惰行の区間の終わりまで保つ。離すのは (a) 次の反対のペダルまで戻る時間しかない、
+          (b) 下限にいて p が反対向きに off_kmh を超えた、だけ。(a) で離した区間は終わりまで
+          入り直さない（戻り待ちとの往復を防ぐ）。(b) の後は、同じ区間で再び |p| ≥ on_kmh なら
+          入ってよい。
+        - 惰行の区間が終わったら（惰行でない行）何も返さず状態を捨てる（数えない）。
+        """
+        is_coast = int(self.flag[i]) == FLAG_COAST
+        # 先置きの行（区間の最後の 0.2 s）のペダルが handover 中のペダルと同じなら続ける
+        # （間で浅くしない。反対のペダルなら今どおり離す）
+        e_pre = float(self._plan_effort[i])
+        cont = (
+            not is_coast and int(self.flag[i]) == FLAG_PREPOS and self.pedal is not None
+            and e_pre != 0.0 and (e_pre > 0.0) == (self.pedal == PEDAL_ACCEL)
+        )
+        if not is_coast and not cont:
+            self.section_pedal = None  # 惰行の区間が終わった
+            self._section_entries = 0
+            self._section_closed = False
+            if self.pedal is not None:
+                self._release(t)
+            return None
+        if not (ref_kmh > STOP_SPEED_KMH and speed_kmh > STOP_SPEED_KMH):
+            if self.pedal is not None:
+                self._release(t)
+            return None
+        st = self.stats
+
+        if self.pedal is not None:
+            pedal = self.pedal
+            # (a) 次の反対のペダルまでに戻れる時間しか残っていない
+            if self._next_opposite(i, pedal):
+                effort = self._effort if self._effort != 0.0 else self.onset_effort[pedal]
+                if self.next_start[i] - t <= self.ret.seconds(effort, self.period_s):
+                    st.handover_released_a += 1
+                    self._section_closed = True
+                    self._release(t)
+                    return None
+            # (b) 下限にいて、先読みの偏差が反対向き（行き過ぎ）に off を超えた
+            p = p_accel if pedal == PEDAL_ACCEL else p_brake
+            if at_floor and p is not None:
+                wrong = (p < -self.off_kmh) if pedal == PEDAL_ACCEL else (p > self.off_kmh)
+                if wrong and pedal == PEDAL_BRAKE and self.handover_brake_wait:
+                    # 段6a: ブレーキは下限で待つ。アクセルが要る見込み（p_accel ≥ on）で初めて離す
+                    if p_accel is not None and p_accel >= self.on_kmh:
+                        st.handover_switched += 1
+                        self._release(t)
+                        return None
+                elif wrong:
+                    st.handover_released_b += 1
+                    self._release(t)
+                    return None
+            st.add_active(pedal)
+            return pedal
+
+        if self._section_closed:
+            return None
+        cands: list[tuple[float, str]] = []
+        if p_accel is not None and p_accel >= self.on_kmh:
+            cands.append((p_accel, PEDAL_ACCEL))
+        if p_brake is not None and p_brake <= -self.on_kmh:
+            cands.append((-p_brake, PEDAL_BRAKE))
+        if not cands:
+            return None
+        pedal = max(cands)[1]
+        if self.section_pedal is not None and self.section_pedal != pedal:
+            if self.one_pedal_per_section:
+                st.blocked_section += 1
+                return None
+            if t - self.t_off < self.ret.seconds(self.last_effort, self.period_s):
+                st.blocked_switch_wait += 1
+                return None
+        if self._prev_opposite(i, pedal) and (
+            t - self.prev_end[i] < self.ret.seconds(float(self.prev_effort[i]), self.period_s)
+        ):
+            st.blocked_prev_return += 1
+            return None
+        if self._next_opposite(i, pedal) and (
+            self.next_start[i] - t < self.ret.seconds(self.onset_effort[pedal], self.period_s)
+        ):
+            st.blocked_next_return += 1
+            return None
+        self.pedal, self.t_on, self.section_pedal = pedal, t, pedal
+        self._effort = 0.0
+        self._section_entries += 1
+        st.handover_section_max = max(st.handover_section_max, self._section_entries)
         if pedal == PEDAL_ACCEL:
             st.accel_entries += 1
         else:

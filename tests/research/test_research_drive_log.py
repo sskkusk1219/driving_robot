@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import inspect
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -445,7 +446,8 @@ def test_stop_pred_dev_column_is_registered_and_formatted() -> None:
     # 2026-10-31 段3: 停C の先読みの偏差の列（区間外・off は空欄）
     assert "stop_pred_dev_kmh" in dlmod.CSV_COLUMNS
     # 2026-11-01 段6d: その後ろに C10 の積分 I の 2 列（両方 off は空欄）
-    assert dlmod.CSV_COLUMNS[-2:] == ("c10_integral_pct", "c10_integral_kmhs")
+    i = dlmod.CSV_COLUMNS.index("c10_integral_pct")
+    assert dlmod.CSV_COLUMNS[i : i + 2] == ("c10_integral_pct", "c10_integral_kmhs")
     assert dlmod.DriveSample.__dataclass_fields__["c10_integral_pct"].default is None
     assert dlmod.DriveSample.__dataclass_fields__["stop_pred_dev_kmh"].default is None
 
@@ -465,5 +467,16 @@ def test_launch_obs_pct_column_is_last_and_blank_when_off() -> None:
 
 def test_band_late_rows_column_is_last_and_blank_when_off() -> None:
     # 2026-11-08 段20 B-1: 伸ばした周期にだけ s を入れる列（off・伸ばさない周期は空欄）
-    assert dlmod.CSV_COLUMNS[-1] == "band_late_rows"
+    # （20261108 段1・2 でこの後ろに 4 列が付いた。band_late_rows の位置は変わらない）
+    assert "band_late_rows" in dlmod.CSV_COLUMNS
     assert dlmod.DriveSample.__dataclass_fields__["band_late_rows"].default is None
+
+
+def test_play_floor_and_coast_handover_columns_are_last_and_blank_when_off() -> None:
+    # 2026-11-08 ProblemReport_20261108 段1・2: 下限と handover の列（off は空欄）
+    assert dlmod.CSV_COLUMNS[-4:] == (
+        "play_floor_pct", "play_floor_active", "coast_handover", "coast_pred_dev_kmh",
+    )
+    for name in dlmod.CSV_COLUMNS[-4:]:
+        assert dlmod.DriveSample.__dataclass_fields__[name].default is None
+        assert name in inspect.signature(dlmod.SessionLog.record).parameters

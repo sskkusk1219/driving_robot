@@ -847,6 +847,7 @@ def build_plan(
     coast_band_kmhs: float = DEFAULT_COAST_BAND_KMHS,
     coast_band_release_at_zero: bool = False,
     coast_fill_max_s: float = 0.0,
+    coast_fill_same_pedal: bool = False,
     preposition_enabled: bool = False,
     preposition_margin_pct: float = 0.5,
     preposition_lead_s: float = 0.2,
@@ -1079,6 +1080,7 @@ def build_plan(
             "need_window_s": need_window_s, "coast_band_kmhs": coast_band_kmhs,
             "coast_band_release_at_zero": coast_band_release_at_zero,
             "coast_fill_max_s": coast_fill_max_s,
+            "coast_fill_same_pedal": coast_fill_same_pedal,
             "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
@@ -1135,6 +1137,7 @@ def build_plan(
             "need_window_s": need_window_s, "coast_band_kmhs": coast_band_kmhs,
             "coast_band_release_at_zero": coast_band_release_at_zero,
             "coast_fill_max_s": coast_fill_max_s,
+            "coast_fill_same_pedal": coast_fill_same_pedal,
             "stop_ref_at": stop_ref_at, "stop_lead": stop_lead,
             "low_speed_side_rule": low_speed_side_rule,
             "release_table_min_kmh": release_table_min_kmh,
@@ -1540,7 +1543,7 @@ def build_plan(
             effort, flag,
             np.broadcast_to(need_a - coast_a, (n,)), np.broadcast_to(need_b - coast_b, (n,)),
             u_a, u_b,
-            max_s=coast_fill_max_s, period_s=period_s,
+            max_s=coast_fill_max_s, period_s=period_s, same_pedal_only=coast_fill_same_pedal,
             accel_min_pct=accel_deadband_pct, brake_min_pct=brake_deadband_pct,
             accel_hold_pct=_hold_opening(table, "accel_onset_u_pct", accel_deadband_pct),
             brake_hold_pct=_hold_opening(table, "brake_onset_u_pct", brake_deadband_pct),
@@ -1744,6 +1747,7 @@ def _fill_short_coasts(
     brake_min_pct: float,
     accel_hold_pct: float,
     brake_hold_pct: float,
+    same_pedal_only: bool = False,
 ) -> tuple[int, int]:
     """短い惰行を前後のペダルで埋める（2026-10-30 段2 案 D。effort・flag をその場で書き換える）。
 
@@ -1753,6 +1757,8 @@ def _fill_short_coasts(
     ペダル）で選ぶ。開度は、差が選んだペダルの向きで u が踏める向きの行は表を逆に引いた値
     （min ＋ |u|）、そうでない行は効き始めの開度（accel_hold_pct・brake_hold_pct）で保つ。
     埋めた行の flag は FLAG_COAST_FILL。戻り値は (埋めた本数, 埋めた行数)。
+    2026-11-09 段6a: same_pedal_only が True なら、前後が違うペダルの区間は埋めない
+    （アクセル−惰行−アクセル・ブレーキ−惰行−ブレーキだけ）。False は今までと完全に同じ。
     """
     n = len(effort)
     runs = rows = 0
@@ -1774,6 +1780,8 @@ def _fill_short_coasts(
             continue
         prev_accel = before > 0.0
         same = prev_accel == (after > 0.0)
+        if same_pedal_only and not same:
+            continue
         for r in range(s, e):
             if same:
                 use_accel = prev_accel

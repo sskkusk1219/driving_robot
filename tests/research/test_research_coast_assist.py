@@ -268,3 +268,62 @@ def test_make_candidate_c12_and_set_coast() -> None:
     assert ff.candidate == "C12" and ff.expected_kind == "model"
     ff.set_coast(on_kmh=0.5, off_kmh=0.2, hold_coef=4.0)
     assert (ff.coast_on_kmh, ff.coast_off_kmh, ff.coast_hold_coef) == (0.5, 0.2, 4.0)
+
+
+# ─── 2026-11-09 段6a: handover のブレーキは下限で待つ（handover_brake_wait） ───────────
+
+
+def _ho_brake(wait: bool) -> CoastAssist:
+    n = 100
+    ca = CoastAssist(
+        np.zeros(n), np.array([FLAG_COAST] * n), np.arange(n) * DT,
+        on_kmh=ON, off_kmh=OFF, hold_accel_s=HOLD, hold_brake_s=HOLD, ret=RET, period_s=DT,
+        accel_onset_effort=ACCEL_ONSET, brake_onset_effort=BRAKE_ONSET,
+        handover_brake_wait=wait,
+    )
+    got = ca.step_handover(
+        t=0.0, i=0, p_accel=None, p_brake=-0.6, speed_kmh=30.0, ref_kmh=30.0, at_floor=False
+    )
+    assert got == PEDAL_BRAKE
+    return ca
+
+
+def _ho_step(ca: CoastAssist, i: int, p_accel: float | None, p_brake: float | None) -> str | None:
+    return ca.step_handover(
+        t=i * DT, i=i, p_accel=p_accel, p_brake=p_brake, speed_kmh=30.0, ref_kmh=30.0,
+        at_floor=True,
+    )
+
+
+def test_handover_brake_wait_keeps_brake_until_accel_needed() -> None:
+    ca = _ho_brake(True)
+    # 下限にいて遅れの見込み（p_brake ＞ off）だがアクセルが要るほどではない → 待つ
+    assert _ho_step(ca, 1, 0.1, 0.3) == PEDAL_BRAKE
+    assert _ho_step(ca, 2, None, 0.3) == PEDAL_BRAKE  # アクセルの遅れが測れない → 離さない
+    assert ca.stats.handover_released_b == 0 and ca.stats.handover_switched == 0
+    # p_accel ≥ on で離す（(b) ではなく switched に数える）
+    assert _ho_step(ca, 3, ON, 0.3) is None
+    assert ca.stats.handover_switched == 1 and ca.stats.handover_released_b == 0
+    assert ca.pedal is None
+    assert "ブレーキの待ちからアクセルへ 1 回" in ca.stats.handover_summary()
+
+
+def test_handover_brake_wait_off_is_the_old_release_b() -> None:
+    ca = _ho_brake(False)
+    assert _ho_step(ca, 1, 0.1, 0.3) is None  # 今までは p_brake ＞ off で min へ離す
+    assert ca.stats.handover_released_b == 1 and ca.stats.handover_switched == 0
+
+
+def test_handover_brake_wait_does_not_change_accel_release_b() -> None:
+    n = 100
+    ca = CoastAssist(
+        np.zeros(n), np.array([FLAG_COAST] * n), np.arange(n) * DT,
+        on_kmh=ON, off_kmh=OFF, hold_accel_s=HOLD, hold_brake_s=HOLD, ret=RET, period_s=DT,
+        accel_onset_effort=ACCEL_ONSET, brake_onset_effort=BRAKE_ONSET,
+        handover_brake_wait=True,
+    )
+    assert ca.step_handover(
+        t=0.0, i=0, p_accel=0.6, p_brake=None, speed_kmh=30.0, ref_kmh=30.0, at_floor=False
+    ) == PEDAL_ACCEL
+    assert _ho_step(ca, 1, -0.3, None) is None  # アクセルの (b) は今のまま
+    assert ca.stats.handover_released_b == 1 and ca.stats.handover_switched == 0

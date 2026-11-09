@@ -208,6 +208,17 @@ CSV_COLUMNS: tuple[str, ...] = (
     # 2026-11-08 段20 B-1（forward_map.launch_band_late_release）: 帯を伸ばした周期にだけ、伸ばした
     # 周期数 s を入れる（ほかは空欄）
     "band_late_rows",
+    # 2026-11-08 ProblemReport_20261108 段1（forward_map.c10_play_floor）:
+    # play_floor_pct ＝ その行のペダルの車速ごとの下限の開度 [%]（符号つき・アクセル正・
+    # ブレーキ負。下限を掛けない行・off は空欄）／play_floor_active ＝ 下限で止めた周期
+    # +1（アクセル）・−1（ブレーキ）・掛けたが止めなかった 0（off・掛けない行は空欄）
+    "play_floor_pct",
+    "play_floor_active",
+    # 同 段2（forward_map.coast_assist_handover）: coast_handover ＝ 惰行の補助を新しい形で
+    # 続けている周期 1・他は 0（off は空欄）／coast_pred_dev_kmh ＝ 入る・離すに使った先読みの偏差 p
+    # [km/h]（惰行の区間の外・off は空欄）
+    "coast_handover",
+    "coast_pred_dev_kmh",
 )
 
 
@@ -276,6 +287,10 @@ class DriveSample:
     launch_step_code: int | None = None  # 発進の帯の FB の印 0〜6（off は None）
     launch_obs_pct: float | None = None  # 段16 型 A: 測った動き出す開度 [%]（off・未測定は None）
     band_late_rows: int | None = None  # 段20 B-1: 伸ばした周期にだけ s（ほかは None）
+    play_floor_pct: float | None = None  # 20261108 段1: 車速ごとの下限の開度（符号つき）
+    play_floor_active: int | None = None  # 同: 下限で止めた周期 +1 アクセル・−1 ブレーキ・他 0
+    coast_handover: int | None = None  # 同 段2: handover の周期 1・他 0（off は None）
+    coast_pred_dev_kmh: float | None = None  # 同 段2: 先読みの偏差 p [km/h]
     ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
 
 
@@ -388,6 +403,10 @@ class SessionLog:
         launch_step_code: int | None = None,
         launch_obs_pct: float | None = None,
         band_late_rows: int | None = None,
+        play_floor_pct: float | None = None,
+        play_floor_active: int | None = None,
+        coast_handover: int | None = None,
+        coast_pred_dev_kmh: float | None = None,
     ) -> DriveSample:
         elapsed = self.elapsed_s()
         sample = DriveSample(
@@ -447,6 +466,10 @@ class SessionLog:
             launch_step_code=launch_step_code,
             launch_obs_pct=launch_obs_pct,
             band_late_rows=band_late_rows,
+            play_floor_pct=play_floor_pct,
+            play_floor_active=play_floor_active,
+            coast_handover=coast_handover,
+            coast_pred_dev_kmh=coast_pred_dev_kmh,
         )
         self.samples.append(sample)
         self._plot.push(_plot_sample(sample))
@@ -663,6 +686,10 @@ def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
                 "" if s.launch_step_code is None else str(s.launch_step_code),
                 _fmt(s.launch_obs_pct),
                 "" if s.band_late_rows is None else str(s.band_late_rows),
+                _fmt(s.play_floor_pct),
+                "" if s.play_floor_active is None else str(s.play_floor_active),
+                "" if s.coast_handover is None else str(s.coast_handover),
+                _fmt(s.coast_pred_dev_kmh),
             ])
 
 

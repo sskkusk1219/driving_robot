@@ -791,6 +791,11 @@ class ForwardMapSection:
     # 2026-10-30 ProblemReport_20261030_惰行 段2 案 D: > 0 なら、この秒数より短い惰行
     # （前後がペダル）を前後のペダルで埋める（FB が効く）。0 ＝ 無効 ＝ 今と完全に同じ
     coast_fill_max_s: float = 0.0
+    # 2026-11-09 ProblemReport_20261108 段6a: true なら coast_fill_max_s の埋めを前後が同じペダルの
+    # 区間（アクセル−惰行−アクセル・ブレーキ−惰行−ブレーキ）だけにし、埋めた行の C10 は表を 1 回で
+    # 直接引く（そのペダルの側だけ・下限つき。10-31 の −9% 跳ねを直す）。
+    # 既定 false ＝ 今と完全に同じ
+    coast_fill_same_pedal: bool = False
     # 要る加速度を測る窓の幅 [s]
     need_window_s: float = 1.0
     # None なら pkl の meta の値（表を作ったときの遅れ）を使う
@@ -1402,6 +1407,60 @@ class ForwardMapSection:
     # ログ: band_late_rows。launch_brake_band・launch_band_step_fb が要る。既定 false ＝ 今と
     # 完全に同じ。決める時期: 段22 の実機
     launch_band_late_release: bool = False
+    # 2026-11-08 ProblemReport_20261108 段1: true なら C10 の行（FF がアクセルまたはブレーキの行）の
+    # 開度を、車速ごとの遊びの端（表の効き始め − preposition_margin_pct）より浅くしない。
+    # 減速の場面で C10 の P が遊びを飛び越えて min まで戻る往復を止める（遊びの中では min でも
+    # 減速は同じ）。FF そのものが下限より浅い行は触らない。ブレーキは 7.5 km/h 未満・保持の場面・
+    # 発進のブレーキの帯・停車前の踏み増し・停C の行には掛けない。
+    # 効き始めは表から「|加速度(v, u) − 加速度(v, 0)| が play_floor_rise_kmhs を超える最小の |u|」
+    # （求まらなければ pkl の accel_onset_u_pct / brake_onset_u_pct）。
+    # play_floor_rise_kmhs 0.05: 仮の値（11-06・11-07 の 19 本で min 付近の加速度のばらつき ±0.01 の
+    # 5 倍。半分データ由来。車が変わったら決め直し）。効く先: 下限の位置（小さいほど浅い）。
+    # 決める時期: 段5 の実機の結果で見直す。
+    # ログ: play_floor_pct・play_floor_active。既定 false ＝ 今と完全に同じ
+    c10_play_floor: bool = False
+    play_floor_rise_kmhs: float = 0.05
+    # 同 段2: true なら C12（惰行の補助）の入る・離すを作り変える。入る判断は先読みの偏差
+    # p ＝ 偏差 ＋ 偏差の傾き × Tp が coast_on_kmh 以上
+    # （Tp ＝ ペダルの遅れ ＋ decel_stop.slope_window_s ÷ 2）。
+    # 入ったら惰行の区間の終わりまで保ち、離すのは (a) 次の反対のペダルまで戻る時間しかない・
+    # (b) 下限にいて p が反対向きに coast_off_kmh を超えた、のどちらかだけ。入っている間の開度は
+    # 「FF ＝ 表から要る加速度で引いた開度」に C10 の P・DOB・I と下限を掛けたもの（I は
+    # c10_integral_coast_assist に関係なく貯める）。区間の終わりで次がアクセルの行なら I を
+    # 捨てずに続ける。
+    # coast_hold_coef は使わない。C10・C11・C12 の候補と c10_integral_accel/brake が要る
+    # （I が無いペダルは I なしで動く）。ログ: coast_handover・coast_pred_dev_kmh。
+    # 既定 false ＝ 今と完全に同じ
+    coast_assist_handover: bool = False
+    # 同 段3: true なら coast_assist_handover の行の P に使う偏差を先読みの偏差 p にする
+    # （I・DOB は今の偏差のまま。保持の場面の段13・停C の段3 と同じ扱い）。
+    # coast_assist_handover が要る。実機で on/off を比べて決める（ユーザー決定: ダメなら使わない）。
+    # 既定 false ＝ P は今の偏差のまま
+    coast_assist_pred_p: bool = False
+    # 2026-11-09 ProblemReport_20261108 段6a: true なら handover のアクセルに下限を渡さない
+    # （表を直接引いた答えが効き始めより浅ければ min。惰行の行で回生を切らない）。
+    # coast_assist_handover が要る。既定 false ＝ 今と完全に同じ
+    coast_assist_accel_no_floor: bool = False
+    # 同 段6a: true なら handover のブレーキで、p_brake ＞ coast_off_kmh（遅れの見込み）の間は合計
+    # （P・DOB・I）を下限までに切り（I はその向きへ貯めない）、(b) で min へ離さず下限で待ち、
+    # p_accel ≥ coast_on_kmh になったら離してアクセルへ替える。coast_assist_handover が要る
+    # （下限は handover が持つ）。既定 false ＝ 今と完全に同じ
+    coast_assist_brake_wait_floor: bool = False
+    # 2026-11-09 同 段6e: true なら handover のアクセルで、出す開度（P・DOB・I の合計）が効き始め
+    # （min ＋ その車速での表の効き始め。余白を引かない）より浅いとき min にする（遊びの中で
+    # 効き始めの手前へ半端に踏まない）。いったん min にしたら答えが効き始め ＋
+    # coast_assist_accel_unpark_pct 以上になるまで min のまま。coast_assist_accel_no_floor が要る。
+    # 既定 false ＝ 今と完全に同じ
+    coast_assist_accel_no_play: bool = False
+    # 同 段6e: coast_assist_accel_no_play で min に置いたあと戻す幅 [%]（効き始めに足す）。
+    # 仮の値（下限の余白 preposition_margin_pct と同じ幅）。効き始めの上下で毎周期 min と
+    # 行き来するのを止める。決める時期: 段6h
+    coast_assist_accel_unpark_pct: float = 0.5
+    # 同 段6e: true なら coast_fill_same_pedal の埋めの行のブレーキも、p_brake ＞ coast_off_kmh
+    # （遅れの見込み）の間は合計（P・DOB・I）を下限までに切る（I はその向きへ貯めない）。
+    # coast_fill_same_pedal と coast_assist_handover（p_brake を出す）が要る。
+    # 既定 false ＝ 今と完全に同じ
+    coast_fill_brake_wait_floor: bool = False
 
 
 @dataclass
@@ -1948,6 +2007,39 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         or (fm.launch_brake_band and fm.launch_band_step_fb),
         "forward_map.launch_band_late_release は launch_brake_band・launch_band_step_fb が true の"
         "ときだけ使える",
+    )
+    need(
+        fm.play_floor_rise_kmhs > 0.0,
+        f"forward_map.play_floor_rise_kmhs は正値: {fm.play_floor_rise_kmhs}",
+    )
+    need(
+        not (fm.coast_assist_accel_no_floor or fm.coast_assist_brake_wait_floor)
+        or fm.coast_assist_handover,
+        "forward_map.coast_assist_accel_no_floor・coast_assist_brake_wait_floor は "
+        "coast_assist_handover が true のときだけ使える",
+    )
+    need(
+        not fm.coast_assist_accel_no_play or fm.coast_assist_accel_no_floor,
+        "forward_map.coast_assist_accel_no_play は coast_assist_accel_no_floor が true の"
+        "ときだけ使える",
+    )
+    need(
+        fm.coast_assist_accel_unpark_pct > 0.0,
+        f"forward_map.coast_assist_accel_unpark_pct は正値: {fm.coast_assist_accel_unpark_pct}",
+    )
+    need(
+        not fm.coast_fill_brake_wait_floor
+        or (fm.coast_fill_same_pedal and fm.coast_assist_handover),
+        "forward_map.coast_fill_brake_wait_floor は coast_fill_same_pedal と "
+        "coast_assist_handover が true のときだけ使える",
+    )
+    need(
+        not fm.coast_fill_same_pedal or fm.coast_fill_max_s > 0.0,
+        "forward_map.coast_fill_same_pedal は coast_fill_max_s が正のときだけ使える",
+    )
+    need(
+        not fm.coast_assist_pred_p or fm.coast_assist_handover,
+        "forward_map.coast_assist_pred_p は coast_assist_handover が true のときだけ使える",
     )
     need(
         not fm.launch_gap_tight or fm.launch_release_ramp,

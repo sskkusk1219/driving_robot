@@ -3390,6 +3390,26 @@ def test_coast_fill_different_pedals_split_by_sign_of_difference() -> None:
     assert p.effort_pct[ib] == pytest.approx(-(BD + 0.2 / BRAKE_SLOPE))
 
 
+def test_coast_fill_same_pedal_only_skips_mixed_sections() -> None:
+    from tests.research.fwd_plan import FLAG_COAST_FILL
+
+    # 前後がアクセル・ブレーキの混在（上のテストと同じ）: キー on は埋めない、off は埋める
+    mixed = [(3.0, 0.5), (3.5, -1.8), (4.0, -2.2), (7.0, -3.0)]
+    on = _fill_plan(mixed, coast_fill_max_s=2.0, coast_fill_same_pedal=True)
+    off = _fill_plan(mixed, coast_fill_max_s=2.0)
+    assert on.coast_fill_runs == 0 and on.flag[idx(on, 3.25)] == FLAG_COAST
+    assert off.coast_fill_runs == 1 and off.flag[idx(off, 3.25)] == FLAG_COAST_FILL
+    # 前後が同じペダル（アクセル−惰行−アクセル）は on でも埋める。値は off と同じ
+    same = [(3.0, 0.5), (4.0, -1.8), (6.0, 0.5), (7.0, -2.1), (9.0, 0.5)]
+    a = _fill_plan(same, coast_fill_max_s=2.0, coast_fill_same_pedal=True)
+    b = _fill_plan(same, coast_fill_max_s=2.0)
+    assert a.coast_fill_runs == 2
+    assert np.array_equal(a.effort_pct, b.effort_pct) and np.array_equal(a.flag, b.flag)
+    # キーを渡しても coast_fill_max_s ＝ 0 なら何も変わらない
+    c = _fill_plan(same, coast_fill_same_pedal=True)
+    assert c.coast_fill_runs == 0
+
+
 def test_coast_fill_long_gap_is_not_filled() -> None:
     knots = [(3.0, 0.5), (4.0, -1.8), (7.0, 0.5)]
     p = _fill_plan(knots, coast_fill_max_s=0.5)  # 区間は約 1 s ≥ 0.5 s
