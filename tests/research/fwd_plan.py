@@ -893,6 +893,7 @@ def build_plan(
     ff_hf_div: str = "off",  # 2026-11-10 PDCA-2
     ff_hf_sigma_s: float = 1.0,
     ff_hf_div_coef: float = 1.0,
+    ff_hf_fast_max_pct: float = 1.0,
     ff_hf_cruise_kmhs: float = 0.3,
     ff_hf_taper_kmhs: float = 0.6,
     _lead_extra: np.ndarray | None = None,
@@ -1176,7 +1177,8 @@ def build_plan(
             "creep_accel_speeds_kmh": creep_accel_speeds_kmh,
             "creep_accel_kmhs": creep_accel_kmhs,
             "ff_hf_div": ff_hf_div, "ff_hf_sigma_s": ff_hf_sigma_s,  # 2026-11-10 PDCA-2
-            "ff_hf_div_coef": ff_hf_div_coef, "ff_hf_cruise_kmhs": ff_hf_cruise_kmhs,
+            "ff_hf_div_coef": ff_hf_div_coef, "ff_hf_fast_max_pct": ff_hf_fast_max_pct,
+            "ff_hf_cruise_kmhs": ff_hf_cruise_kmhs,
             "ff_hf_taper_kmhs": ff_hf_taper_kmhs,
             "preposition_enabled": False, "return_gap_enabled": False,
         }
@@ -1464,6 +1466,7 @@ def build_plan(
         effort = hf_divide_accel(
             effort, np.broadcast_to(np.asarray(v, dtype=float), (n,)), div_hf, w_hf,
             accel_min_pct=accel_deadband_pct, sigma_s=ff_hf_sigma_s, period_s=period_s,
+            fast_max_pct=ff_hf_fast_max_pct,
         )
     side_brake_dir = None
     if dir_rule:
@@ -1688,13 +1691,14 @@ def hf_divide_accel(
     accel_min_pct: float,
     sigma_s: float,
     period_s: float,
+    fast_max_pct: float = float("inf"),
     min_speed_kmh: float = _local_gain.MIN_SPEED_KMH,
 ) -> np.ndarray:
     """2026-11-10 PDCA-2: アクセル開度の速い成分だけを割った開度の列を返す（元は変えない）。
     開度 ＞ accel_min かつ基準 ≧ min_speed_kmh の連続区間ごとに、遅い成分 ＝ 区間内のガウス平滑
     （σ ＝ sigma_s ÷ period_s 行・端は最近傍で埋める）、速い成分 ＝ 開度 − 遅い成分。
     開度' ＝ 開度 − 重み × 速い成分 × (1 − 1 ÷ 割る量)、accel_min 未満にはしない。区間の外・
-    ブレーキの行は変えない。"""
+    ブレーキの行は変えない。速い成分は ±fast_max_pct に切ってから割る（大きな段は今のまま）。"""
     out = np.array(effort, dtype=float)
     ok = (out > accel_min_pct) & (np.asarray(ref_kmh, dtype=float) >= min_speed_kmh)
     sigma_rows = sigma_s / period_s
@@ -1709,6 +1713,7 @@ def hf_divide_accel(
             j += 1
         seg = out[i:j].copy()
         fast = seg - _gauss_smooth(seg, sigma_rows)
+        fast = np.clip(fast, -fast_max_pct, fast_max_pct)  # 大きな段は割らない
         new = seg - weight[i:j] * fast * (1.0 - 1.0 / divisor[i:j])
         out[i:j] = np.maximum(new, accel_min_pct)
         i = j

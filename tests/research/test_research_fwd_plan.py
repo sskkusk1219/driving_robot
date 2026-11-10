@@ -4060,3 +4060,18 @@ def test_hf_divide_accel_splits_fast_and_slow() -> None:
     assert hf_cruise_weight(0.2, 0.3, 0.6) == 1.0
     assert hf_cruise_weight(0.45, 0.3, 0.6) == pytest.approx(0.5)
     assert hf_cruise_weight(0.9, 0.3, 0.6) == 0.0
+
+
+def test_hf_divide_accel_fast_cap_limits_step() -> None:
+    """2026-11-10 PDCA-2: 大きな段の変化は cap × (1 − 1/割る量) 以下。"""
+    from tests.research.fwd_plan import hf_divide_accel
+
+    t = np.arange(0, 20.0, 0.05)
+    effort = np.where(t < 10.0, 15.0, 30.0)  # 15 % の段
+    ref = np.full_like(t, 50.0)
+    div = np.full_like(t, 3.0)
+    kw = dict(accel_min_pct=4.2, sigma_s=1.0, period_s=0.05)
+    out = hf_divide_accel(effort, ref, div, np.ones_like(t), fast_max_pct=1.0, **kw)
+    assert np.abs(out - effort).max() <= 1.0 * (1 - 1 / 3) + 1e-9
+    free = hf_divide_accel(effort, ref, div, np.ones_like(t), **kw)
+    assert np.abs(free - effort).max() > 3.0  # 上限なしなら段が大きく変わる

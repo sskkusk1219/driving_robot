@@ -1112,6 +1112,9 @@ class ForwardMapSection:
     ff_hf_div: str = "off"
     ff_hf_sigma_s: float = 1.0
     ff_hf_div_coef: float = 1.0
+    # ff_hf_fast_max_pct: 割る速い成分の大きさの上限 [%]（±）。r は小さい振れの効き（手順2 の
+    # 正弦波 ±0.6 %）なので、速い成分の ±この値 までだけ割る。大きな段は今のまま。仮の値
+    ff_hf_fast_max_pct: float = 1.0
     # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
     # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
     # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・
@@ -2306,6 +2309,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         0.0 < fm.ff_hf_div_coef <= 2.0,
         f"forward_map.ff_hf_div_coef は 0 より大きく 2 以下: {fm.ff_hf_div_coef}",
+    )
+    need(
+        0.0 < fm.ff_hf_fast_max_pct <= 5.0,
+        f"forward_map.ff_hf_fast_max_pct は 0 より大きく 5 以下: {fm.ff_hf_fast_max_pct}",
     )
     need(
         fm.c10_d_window_s > 0.0,

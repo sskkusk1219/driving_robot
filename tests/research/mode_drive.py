@@ -465,7 +465,7 @@ def forward_map_plan_args(
         # 2026-11-10 PDCA-2: off のときは kwargs に入れない（今と完全に同じ）
         kwargs.update(
             ff_hf_div=fm.ff_hf_div, ff_hf_sigma_s=fm.ff_hf_sigma_s,
-            ff_hf_div_coef=fm.ff_hf_div_coef,
+            ff_hf_div_coef=fm.ff_hf_div_coef, ff_hf_fast_max_pct=fm.ff_hf_fast_max_pct,
             ff_hf_cruise_kmhs=fm.c10_p_local_gain_cruise_kmhs,
             ff_hf_taper_kmhs=fm.c10_p_local_gain_taper_kmhs,
         )
@@ -1919,6 +1919,7 @@ def ff_hf_div_text(fm: Any, meta: Any) -> str:
     if not entry or not entry.get("ratio"):
         return (
             f"{fm.ff_hf_div}・σ ＝ {fm.ff_hf_sigma_s:g} s・β ＝ {fm.ff_hf_div_coef:g}"
+            f"・速い成分 ±{fm.ff_hf_fast_max_pct:g} % まで"
             "・倍率の表なし（pkl の meta に local_gain_accel_hf が無い → 割る量 1 ＝ 今のまま）"
         )
     divs = [max(1.0 + fm.ff_hf_div_coef * (float(r) - 1.0), 1.0) for r in entry["ratio"]]
@@ -1928,6 +1929,7 @@ def ff_hf_div_text(fm: Any, meta: Any) -> str:
     )
     return (
         f"{fm.ff_hf_div}・σ ＝ {fm.ff_hf_sigma_s:g} s・β ＝ {fm.ff_hf_div_coef:g}"
+        f"・速い成分 ±{fm.ff_hf_fast_max_pct:g} % まで"
         f"・割る量 {min(divs):.2f}〜{max(divs):.2f}{taper}"
     )
 

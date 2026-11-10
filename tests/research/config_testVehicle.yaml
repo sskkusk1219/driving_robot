@@ -688,6 +688,8 @@ forward_map:
   ff_hf_div: "off"
   ff_hf_sigma_s: 1.0
   ff_hf_div_coef: 1.0
+  # 仮の値。r は小さい振れの効き（手順2 の正弦波 ±0.6 %）なので、速い成分の ±1 % までだけ割る。大きな段（発進・切り替え・区間の端）は今のまま
+  ff_hf_fast_max_pct: 1.0
   # 2026-10-17 段2o-9: 置くまでの待ち（preposition_clear_s: 0.1）は廃止。待ちは「戻す側のペダルが
   # min に戻るまでの時間」（pkl の meta の戻る時間。手順2 で測る）で決める
 
