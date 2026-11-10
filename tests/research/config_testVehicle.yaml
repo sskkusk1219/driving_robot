@@ -61,7 +61,7 @@ feedforward:
   # ファイル名の日時はローカル時刻（JST）。2026-09-20 以前の pkl は UTC 命名（JST−9h）
   # 2026-10-27 ProblemReport_20261027 段1: ペダルを 225/190 mm/s・0.6G にしたので、表は同じまま meta の
   # ペダルの動き方・効くまでの遅れだけを手順2 `215040` から測り直した pkl（140 %/s・1700 %/s^2・遅れ アクセル 0.175 s・ブレーキ 0.125 s）
-  model_path: tests/research/results/models/fwd_model_20261028_220204_hpi2_hold_stop_w_lw_srg.pkl  # 2026-11-05 段14: _lw.pkl に戻す側の効き（meta stop_release_gain_kmhs_pct 4.43）を付けた pkl（表は同じ）。2026-10-31 ProblemReport_20261031_停止間際 段4b（ユーザー決定で採用）: 段2d の _stop_w.pkl（手順14 `094235` で停止側の表を作り直し、しきい値未満のマスも秒数の重み）に、発進側の表にも秒数の重みを入れた pkl。6 モード `162454`〜`180640` で最大逸脱 ≤1・p95 ≤0.4。前は _stop_w.pkl（段2d）・_stop.pkl（段2c）・_stop_070118.pkl（段2b）、元は _hpi2_hold.pkl
+  model_path: tests/research/results/models/fwd_model_20261028_220204_hpi2_hold_stop_w_lw_srg_hf.pkl  # 2026-11-11 ProblemReport_20261109 段13: _srg.pkl に手順2 の定速の保持の正弦波（段10e）の局所の効き meta local_gain_accel_hf を付けた pkl（表は同じ）。2026-11-05 段14: _lw.pkl に戻す側の効き（meta stop_release_gain_kmhs_pct 4.43）を付けた pkl（表は同じ）。2026-10-31 ProblemReport_20261031_停止間際 段4b（ユーザー決定で採用）: 段2d の _stop_w.pkl（手順14 `094235` で停止側の表を作り直し、しきい値未満のマスも秒数の重み）に、発進側の表にも秒数の重みを入れた pkl。6 モード `162454`〜`180640` で最大逸脱 ≤1・p95 ≤0.4。前は _stop_w.pkl（段2d）・_stop.pkl（段2c）・_stop_070118.pkl（段2b）、元は _hpi2_hold.pkl
   # 停車〜クリープ域（滑らかなモデルで表現できないため定数で補う）
   creep_speed_kmh: 5.0  # クリープで到達する車速 [km/h]
   creep_rate_kmhs: 1.44  # クリープ加速率 [km/h/s]
@@ -658,6 +658,7 @@ forward_map:
   # filter_s 0.05 s は仮の値・意見の文書の値。定速区間の差分のノイズ（>3 Hz の振れ 0.03 km/h/s、段11 `200019`）では 0.05 で足りる。
   # td_coef 1.0: Td ＝ coef × L。段11 の勝ちの揺れの周期 Tu 1.6 s（0.62 Hz）÷ 8 ＝ 0.20 s ≈ 1.1 L で同じ程度。
   # 全車共通の固定値で、車ごとの値は手順2 で測る L だけ。効く先: 定速の揺れ・IWR。決める時期: 段12c の実機
+  # 2026-11-11 段12c 実機（filter・13 dB cruise）: 往復 1.4→3.2 回/s・p95 +0.05・IWR 悪化（1.5〜3 Hz の振れが倍）→ c10_d_term は off のまま
   c10_d_accel_source: "window"
   c10_d_filter_s: 0.05
   c10_d_td_coef: 1.0
@@ -667,7 +668,8 @@ forward_map:
   # c ＝ 6（B1）倍率で全部割る・c ＝ 3（B2）今の約 1/2（半分データ由来: 今の実際の τ ≒ 1.7 × L を限界とみなした 0.45 Ku の推定）。
   # cruise_kmhs 0.3・taper_kmhs 0.6 は仮の値（IWR の内訳の定速と同じ・境目を段にしないため）。
   # 効く先: 定速の揺れ（約 1 Hz）・IWR。決める時期: 段11（B1 ↔ B2）・段12（定速 ↔ 加速中も）。表が meta に無いと倍率 1（今と同じ）
-  c10_p_local_gain: "off"
+  # 2026-11-11 段13: 段11（実機 W・U・US06）で "cruise"・hf・13 dB を採用（IWR W 1.80→1.37・U 2.29→2.04、最大は同等）。段12 の "all" は US06 の p95・IWR が悪く不採用
+  c10_p_local_gain: "cruise"
   c10_p_local_gain_c: 6.0
   c10_p_local_gain_cruise_kmhs: 0.3
   c10_p_local_gain_taper_kmhs: 0.6
@@ -676,8 +678,8 @@ forward_map:
   # 「P だけのループの f_hf での大きさ」を目標のゲイン余裕 G [dB] まで下げる量で、車ごとに r と L が手順2 で決まる。
   # gm_db 10: 半分データ由来（一般の目安は 6〜12 dB。段10b で P だけの余裕は DOB・I を足すと約 2 dB 減るので、
   # DOB 込みで約 8 dB）。段11 の実機で 10 と 13 dB（DOB 込み約 11 dB）を比べて決める。meta が無ければ k ＝ 1
-  c10_p_local_gain_source: "cruise"
-  c10_p_local_gain_gm_db: 10.0
+  c10_p_local_gain_source: "hf"
+  c10_p_local_gain_gm_db: 13.0
   # 2026-11-10 ProblemReport_20261109 PDCA-2: FF の計画のアクセル開度の速い成分だけを、手順2 の保持の正弦波の倍率 r
   # （meta local_gain_accel_hf）で割る。根拠: 車は約 0.3 Hz 以上の小さな開度の動きに表の傾きの 2.4〜3.4 倍効き、基準の 1 秒刻みの
   # 折れ目からできる FF の細かい動きが踏みすぎて、車速が基準の揺れを 0.8〜0.95 Hz で 1.3〜1.5 倍にする。

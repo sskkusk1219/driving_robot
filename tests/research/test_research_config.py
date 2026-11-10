@@ -1927,10 +1927,11 @@ def test_c10_p_local_gain_defaults_and_validation() -> None:
     assert fm0.c10_p_local_gain == "off" and fm0.c10_p_local_gain_c == 6.0
     assert fm0.c10_p_local_gain_cruise_kmhs == 0.3 and fm0.c10_p_local_gain_taper_kmhs == 0.6
     cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
-    assert cfg.forward_map.c10_p_local_gain == "off"  # 引用符つきの "off" が文字列で読める
+    assert cfg.forward_map.c10_p_local_gain == "cruise"  # 2026-11-11 段13 で本体 on
     # 2026-11-10 段10c: 出どころの既定は今まで（cruise）・G の既定 10 dB
     assert fm0.c10_p_local_gain_source == "cruise" and fm0.c10_p_local_gain_gm_db == 10.0
-    assert cfg.forward_map.c10_p_local_gain_source == "cruise"
+    fm = cfg.forward_map
+    assert fm.c10_p_local_gain_source == "hf" and fm.c10_p_local_gain_gm_db == 13.0
     for key, bad in (
         ("c10_p_local_gain", "on"), ("c10_p_local_gain_c", 0.0),
         ("c10_p_local_gain_cruise_kmhs", 0.0), ("c10_p_local_gain_cruise_kmhs", 0.7),
