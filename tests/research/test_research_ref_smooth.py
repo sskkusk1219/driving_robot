@@ -117,6 +117,45 @@ def test_max_offset_caps_the_gap_and_keeps_small_offsets() -> None:
     assert "±" not in mdmod.ref_smooth_text(0.5)
 
 
+def test_brake_weight_keeps_original_where_decel_is_steep() -> None:
+    # 緩い減速（1 km/h/s）の後に急な減速（-3 km/h/s）の角がある
+    mode = _mode([(0, 0), (5, 0), (15, 30), (20, 30), (30, 20), (35, 20),
+                  (45, 20), (55, 0), (60, 0)])
+    orig = mdmod.ReferenceSpeed(mode)
+    capped = mdmod.make_target_reference(mode, 0.5, 0.1)
+    both = mdmod.make_target_reference(mode, 0.5, 0.1, 0.3, 0.6)
+    ts = np.arange(5.5, 59.0, 0.01)
+    # 同じ σ でぼかした元の基準の加速度（テスト側で独立に計算）
+    grid = np.arange(0.0, 60.0, 0.01)
+    base = np.array([orig.at(t) for t in grid])
+    x = np.arange(-200, 201) * 0.01
+    k = np.exp(-0.5 * (x / 0.5) ** 2)
+    k /= k.sum()
+    acc = np.convolve(np.pad(np.gradient(base, 0.01), 200, mode="edge"), k, mode="valid")
+    n_steep = n_flat = n_mid = 0
+    for t in ts:
+        a = acc[int(round(t / 0.01))]
+        if orig.at(t) <= 1e-6:
+            continue
+        if a <= -0.6 - 0.02:
+            n_steep += 1
+            assert both.at(t) == pytest.approx(orig.at(t), abs=1e-6)
+        elif a >= -0.3 + 0.02:
+            n_flat += 1
+            assert both.at(t) == pytest.approx(capped.at(t), abs=1e-6)
+        else:
+            n_mid += 1
+            lo, hi = sorted((orig.at(t), capped.at(t)))
+            assert lo - 1e-9 <= both.at(t) <= hi + 1e-9
+    assert n_steep > 100 and n_flat > 100 and n_mid > 0
+    # from 0 は今まで通り（ビット同一）
+    off = mdmod.make_target_reference(mode, 0.5, 0.1, 0.0, 0.0)
+    assert all(off.at(t) == capped.at(t) for t in ts[::37])
+    text = mdmod.ref_smooth_text(0.5, 0.1, 0.3, 0.6)
+    assert "減速 0.3〜0.6 km/h/s より強い所はぼかさない" in text
+    assert "減速" not in mdmod.ref_smooth_text(0.5, 0.1)
+
+
 def test_csv_has_ref_smooth_column_at_the_end() -> None:
     # 後から列が末尾に足されるので、並び（pred_dev_kmh の直後）だけを見る（2026-11-11）
     cols = dlmod.CSV_COLUMNS
@@ -220,6 +259,14 @@ def test_composed_modes_and_sigma_are_validated(tmp_path: Path) -> None:
     cfg.feedforward.ref_smooth_max_kmh = 0.1
     assert not any("ref_smooth_max_kmh" in p for p in cfgmod.validate_config(cfg))
     cfg.feedforward.ref_smooth_max_kmh = 0.0
+    ff = cfg.feedforward
+    assert ff.ref_smooth_brake_from_kmhs == 0.0 and ff.ref_smooth_brake_to_kmhs == 0.0
+    for fr, to in ((0.6, 0.3), (0.3, 0.3), (-0.1, 0.5), (0.3, 11.0), (0.0, 0.5)):
+        ff.ref_smooth_brake_from_kmhs, ff.ref_smooth_brake_to_kmhs = fr, to
+        assert any("ref_smooth_brake" in p for p in cfgmod.validate_config(cfg)), (fr, to)
+    ff.ref_smooth_brake_from_kmhs, ff.ref_smooth_brake_to_kmhs = 0.3, 0.6
+    assert not any("ref_smooth_brake" in p for p in cfgmod.validate_config(cfg))
+    ff.ref_smooth_brake_from_kmhs = ff.ref_smooth_brake_to_kmhs = 0.0
     for sigma in (-0.1, 2.5):
         cfg.feedforward.ref_smooth_sigma_s = sigma
         assert any("ref_smooth_sigma_s" in p for p in cfgmod.validate_config(cfg))

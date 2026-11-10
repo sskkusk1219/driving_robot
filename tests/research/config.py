@@ -99,6 +99,10 @@ class FeedforwardSection:
     ref_smooth_sigma_s: float = 0.0
     # 2026-11-11 PDCA-3: ぼかした基準と元の基準の差の上限 [km/h]（0.0 ＝ 上限なし。今と完全に同じ）
     ref_smooth_max_kmh: float = 0.0
+    # 2026-11-11 PDCA-4: 基準の減速が強い所はぼかさない [km/h/s]（from〜to で直線。
+    # from 0 ＝ 全部ぼかす。今と完全に同じ）
+    ref_smooth_brake_from_kmhs: float = 0.0
+    ref_smooth_brake_to_kmhs: float = 0.0
     engine_brake_decel_kmhs: float = 1.6
     coast_decel_speeds_kmh: list[float] = field(default_factory=list)
     coast_decel_kmhs: list[float] = field(default_factory=list)
@@ -2429,6 +2433,18 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         0.0 <= ff.ref_smooth_max_kmh <= 5.0,
         f"feedforward.ref_smooth_max_kmh は 0〜5 km/h（0 ＝ 上限なし）: {ff.ref_smooth_max_kmh}",
+    )
+    need(
+        ff.ref_smooth_brake_from_kmhs == 0.0
+        or 0.0 < ff.ref_smooth_brake_from_kmhs < ff.ref_smooth_brake_to_kmhs <= 10.0,
+        "feedforward.ref_smooth_brake_from_kmhs / _to_kmhs は 0 ＜ from ＜ to ≦ 10 km/h/s"
+        f"（from が 0 なら使わない）: {ff.ref_smooth_brake_from_kmhs}, "
+        f"{ff.ref_smooth_brake_to_kmhs}",
+    )
+    need(
+        ff.ref_smooth_brake_from_kmhs > 0.0 or ff.ref_smooth_brake_to_kmhs == 0.0,
+        "feedforward.ref_smooth_brake_to_kmhs は from が 0 のとき 0 にしてください: "
+        f"{ff.ref_smooth_brake_from_kmhs}, {ff.ref_smooth_brake_to_kmhs}",
     )
     _check_composed_modes(cfg.modes.composed_modes, problems)
     names = cfg.modes.coverage_mode_names
