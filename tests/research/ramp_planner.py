@@ -766,7 +766,14 @@ def cruise_kwargs(cfg: Any) -> dict[str, Any]:
         "release_fracs": tuple(lr.ramp_release_fracs),
         "release_move_s": lr.ramp_release_move_s,
         "release_hold_s": tuple(lr.ramp_release_hold_s),
-        "cruise_hold_s": lr.ramp_cruise_hold_s,
+        # 2026-11-10 段10c: 保持の正弦波（periods ÷ f 秒）
+        # も保持の時間に足す（全部の保持に入る見込み。
+        # ブレーキ側などで飛ばす分は余る）
+        "cruise_hold_s": lr.ramp_cruise_hold_s
+        + (
+            lr.ramp_cruise_sine_periods / lr.ramp_cruise_sine_hz
+            if lr.ramp_cruise_sine_enabled else 0.0
+        ),
         "cruise_fine_max_kmh": lr.ramp_cruise_fine_max_kmh,
         "cruise_coarse_step_kmh": lr.ramp_cruise_coarse_step_kmh,
         "cruise_min_kmh": cfg.feedforward.creep_speed_kmh + CRUISE_MIN_MARGIN_KMH,

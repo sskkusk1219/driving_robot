@@ -521,7 +521,7 @@ def _fake_table_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
     def fake(  # type: ignore[no-untyped-def]
         profile, csv_path, models_dir, hw_mode, *, announce=True, lags=None,
-        local_gain_brake_speeds_kmh=None,
+        local_gain_brake_speeds_kmh=None, local_gain_sine_hz=None,
     ):
         path = tmp_path / "results" / "models" / f"fwd_table_fake_{hw_mode}.pkl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -773,7 +773,7 @@ def _seed_outlier_setup(
         stop_release_layer_enabled=False, accel_release_input_enabled=False,
         launch_accel_side_source="extrapolate", side_table_accel_window_s=0.5,
         launch_rows_to_stop_max=False, side_row_speed_rep="grid", stop_approach_exclusion="depth",
-        accel_push_input_enabled=False, local_gain_brake_speeds_kmh=None,
+        accel_push_input_enabled=False, local_gain_brake_speeds_kmh=None, local_gain_sine_hz=None,
         stop_table_sub_min_weight=False, launch_table_sub_min_weight=False,
     ):
         seeds_seen.append(tuple(seeds))

@@ -54,7 +54,8 @@ OTHER_MIN_TOL_PCT = 0.2
 # ようにする。
 # CSV の phase 名（pattern_loop の _Phase の名前と同じ。tests 内で独立に持つ）
 EXCLUDED_PHASES = frozenset(
-    {"HOLD_STEP", "RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER", "RAMP_RELEASE_SWEEP"}
+    {"HOLD_STEP", "RAMP_BRAKE_DITHER", "RAMP_ACCEL_DITHER", "RAMP_RELEASE_SWEEP",
+     "RAMP_CRUISE_SINE"}  # 2026-11-10 段10c: 保持の正弦波（1 Hz の動き）も除く
 )
 # これ以下は停車とみなして捨てる [km/h]。fwd_data.STOP_SPEED_KMH と同じ値。
 STOP_SPEED_KMH = 0.5

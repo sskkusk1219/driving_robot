@@ -484,6 +484,21 @@ def p_local_gain_k(ratio: float, c: float, deviation_c: float) -> float:
     return max(1.0, ratio * c / deviation_c)
 
 
+def p_local_gain_k_hf(
+    ratio: float, gm_db: float, deviation_c: float, lag_s: float, hz: float
+) -> float:
+    """2026-11-10 段10c: P の加速度を割る量 k ＝ max(1, r × 10^(G/20) ÷ (c × L × 2πf))。
+    r ＝ 手順2 の保持の正弦波から測った 1 Hz 付近の倍率（|P|·2πf ÷ 表の感度）、
+    G ＝ 目標のゲイン余裕 [dB]（P だけのループ）、c ＝ deviation_c、
+    L ＝ アクセルの遅れ（τ ＝ c × L）、f ＝ 正弦波の周波数。
+    「P だけのループの f での大きさ r ÷ (τ·2πf)」を 10^(−G/20) まで下げる量。1 未満にはしない
+    （今より P を強くしない）。deviation_c・L・f が 0 以下・非有限は 1。"""
+    den = deviation_c * lag_s * 2.0 * math.pi * hz
+    if not (den > 0.0 and math.isfinite(den) and math.isfinite(ratio)):
+        return 1.0
+    return max(1.0, ratio * 10.0 ** (gm_db / 20.0) / den)
+
+
 def p_local_gain_weight(
     mode: str, need_abs_kmhs: float, cruise_kmhs: float, taper_kmhs: float
 ) -> float:
@@ -1143,7 +1158,12 @@ def _prepare_forward_map_plan(
         say(f"  低速の DOB・停C の τ（段6-2）: {dob_low_speed_text(fm)}")
         say(f"  C10 の偏差の積分 I（段6d）: {c10_integral_text(fm)}")
         say(f"  C10 の P（20261109 段2・4）: {c10_small_dev_text(fm)}")
-        say(f"  C10 の P の局所の効き（20261109 段9）: {c10_p_local_gain_text(fm, ff.table.meta)}")
+        _lag_a = (
+            ff.tau_accel_s / ff.deviation_c
+            if ff.tau_accel_s is not None and ff.deviation_c > 0.0 else None
+        )
+        say("  C10 の P の局所の効き（20261109 段9・段10c）: "
+            f"{c10_p_local_gain_text(fm, ff.table.meta, _lag_a, ff.deviation_c)}")
     if isinstance(ff, CoastAssistFeedforward):
         # 2026-10-18 段2r: 惰行の補助。保持時間 ＝ 係数 × (遅れ ＋ 効き始めまでの戻り時間)
         ff.set_coast(
@@ -1815,23 +1835,57 @@ def c10_integral_text(fm: Any) -> str:
     )
 
 
-def c10_p_local_gain_text(fm: Any, meta: Any) -> str:
+def c10_p_local_gain_text(
+    fm: Any, meta: Any, lag_s: float | None = None, dev_c: float = 6.0
+) -> str:
     """2026-11-10 段9（c10_p_local_gain）の設定の表示（走行前）。表（pkl meta の
-    local_gain_accel_cruise）が無いときは倍率 1 のまま（今と同じ）なので、その旨も出す。"""
+    local_gain_accel_cruise。source が hf のときは local_gain_accel_hf）が無いときは倍率 1 のまま
+    （今と同じ）なので、その旨も出す。段10c: hf のときは出どころ・G・周波数・k の範囲も出す
+    （lag_s ＝ アクセルの遅れ L・dev_c ＝ deviation_c から k を計算する。
+    測れなければ範囲は出さない）。"""
     if fm.c10_p_local_gain == "off":
         return "なし"
     scope = "定速だけ" if fm.c10_p_local_gain == "cruise" else "加速中も"
+    taper = (
+        f"・定速 ＜ {fm.c10_p_local_gain_cruise_kmhs:g}〜"
+        f"{fm.c10_p_local_gain_taper_kmhs:g} km/h/s でなめらかに戻す"
+        if fm.c10_p_local_gain == "cruise" else ""
+    )
+    if fm.c10_p_local_gain_source == "hf":
+        entry = meta.get("local_gain_accel_hf")
+        hz = meta.get("local_gain_accel_hf_hz")
+        if entry is None or hz is None:
+            table = (
+                "なし（pkl の meta に local_gain_accel_hf が無い → k ＝ 1 ＝ 今のまま。警告）"
+            )
+            return (
+                f"{scope}・出どころ hf・G ＝ {fm.c10_p_local_gain_gm_db:g} dB・倍率の表 "
+                f"{table}{taper}"
+            )
+        ratios = [float(x) for x in entry["ratio"]]
+        speeds = [float(x) for x in entry["speed_rep_kmh"]]
+        ks = (
+            [
+                p_local_gain_k_hf(r, fm.c10_p_local_gain_gm_db, dev_c, lag_s, float(hz))
+                for r in ratios
+            ]
+            if lag_s is not None and lag_s > 0.0 else []
+        )
+        k_txt = (
+            f"・k ＝ {min(ks):.2f}〜{max(ks):.2f}（"
+            + "・".join(f"{v:g}km/h {k:.2f}" for v, k in zip(speeds, ks, strict=True)) + "）"
+            if ks else "・k は遅れが測れず出せない（k ＝ 1）"
+        )
+        return (
+            f"{scope}・出どころ hf（{float(hz):g} Hz・r {min(ratios):.2f}〜{max(ratios):.2f}"
+            f"・{len(ratios)} 行）・G ＝ {fm.c10_p_local_gain_gm_db:g} dB{k_txt}{taper}"
+        )
     entry = meta.get("local_gain_accel_cruise")
     if entry is None:
         table = "なし（pkl の meta に local_gain_accel_cruise が無い → 倍率 1 ＝ 今のまま。警告）"
     else:
         cells = int(sum(1 for row in entry["n"] for n in row if n > 0))
         table = f"あり（マス {cells}）"
-    taper = (
-        f"・定速 ＜ {fm.c10_p_local_gain_cruise_kmhs:g}〜"
-        f"{fm.c10_p_local_gain_taper_kmhs:g} km/h/s でなめらかに戻す"
-        if fm.c10_p_local_gain == "cruise" else ""
-    )
     return f"{scope}・c ＝ {fm.c10_p_local_gain_c:g}・倍率の表 {table}{taper}"
 
 
@@ -3975,6 +4029,28 @@ class _ModeRun:
         """
         fm = self.cfg.forward_map
         meta = self.ff.table.meta  # type: ignore[attr-defined]
+        if fm.c10_p_local_gain_source == "hf":
+            # 2026-11-10 段10c: 手順2 の保持の正弦波（meta local_gain_accel_hf・周波数 _hz）
+            # の倍率 r(v)
+            # から k ＝ max(1, r × 10^(G/20) ÷ (c × L × 2πf))。車速で直線補間（範囲の外は端の値）。
+            # meta が無い・遅れ（τ）が無い・7.5 km/h 未満は 1（今のまま）
+            hz = meta.get("local_gain_accel_hf_hz")
+            tau = self.ff.tau_accel_s  # type: ignore[attr-defined]
+            ratio_hf = (
+                local_gain.hf_ratio_at(meta.get("local_gain_accel_hf"), row_kmh)
+                if row_kmh >= local_gain.MIN_SPEED_KMH else None
+            )
+            if ratio_hf is None or hz is None or tau is None or tau <= 0.0:
+                return 1.0, 1.0
+            dev_c = self.ff.deviation_c  # type: ignore[attr-defined]
+            k = p_local_gain_k_hf(
+                ratio_hf, fm.c10_p_local_gain_gm_db, dev_c, tau / dev_c, float(hz)
+            ) if dev_c > 0.0 else 1.0
+            w = p_local_gain_weight(
+                fm.c10_p_local_gain, abs(need_kmhs), fm.c10_p_local_gain_cruise_kmhs,
+                fm.c10_p_local_gain_taper_kmhs,
+            )
+            return ratio_hf, 1.0 + w * (k - 1.0)
         onset = meta.get("accel_onset_u_pct")
         entry = meta.get("local_gain_accel_cruise")
         if entry is None or onset is None or not np.isfinite(onset):

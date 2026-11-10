@@ -12,6 +12,8 @@
     .venv/bin/python -m tests.research.fwd_tool attach-pedal-track --pkl IN --csv CSV --out OUT
     .venv/bin/python -m tests.research.fwd_tool attach-local-gain --pkl IN --csv CSV --out OUT
     .venv/bin/python -m tests.research.fwd_tool attach-hold-pi --pkl IN --csv CSV --out OUT
+    .venv/bin/python -m tests.research.fwd_tool cruise-sine-check --csv EXCITE_CSV --pkl PKL --hz
+    1.2
 """
 
 from __future__ import annotations
@@ -1548,10 +1550,76 @@ def run_attach_local_gain(args: argparse.Namespace) -> int:
         print("保存先が元の pkl と同じ。別の名前にする")
         return 2
     table = load_forward_map(src)
-    if not _attach_local_gain(table, Path(args.csv), args.brake_speeds):
+    sine_hz = (
+        args.sine_hz if args.sine_hz is not None
+        else load_config(Path(args.config)).learning.ramp_cruise_sine_hz
+    )
+    if not _attach_local_gain(table, Path(args.csv), args.brake_speeds, sine_hz):
         print("測れなかったので保存しない")
         return 1
     print(f"保存: {save_table(table, out)}")
+    return 0
+
+
+def run_cruise_sine_check(args: argparse.Namespace) -> int:
+    """加振 CSV（excite.py。section EXCITE のブロック `<車速>kmh_<周波数>Hz`）の
+    指定の周波数のブロックに、
+    手順2 の保持の正弦波と同じ解析（local_gain.sine_response・sine_ratio）を当てて、ブロックごとの
+    |P|・位相・SNR・表の感度 S・倍率 r を表にする（机上の検算。2026-11-10 段10d）。
+    開度は実開度と指令の
+    両方で出す（段10b の値は指令。実開度は手順2 の正弦波が使う列）。S は 2 通り:
+    そのブロックの平均の
+    開度での中心差分（手順2 の解析と同じ）と、loop_margin の運転点（惰行 ＋ 0.1 km/h/s）。"""
+    from tests.research import local_gain  # noqa: PLC0415
+    from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
+    from tests.research.loop_margin import PEDAL_ACCEL, operating_point  # noqa: PLC0415
+
+    table = load_forward_map(Path(args.pkl))
+    amin = float(table.meta.get("accel_deadband_pct", math.nan))
+    if not math.isfinite(amin):
+        print("pkl の meta に accel_deadband_pct が無い")
+        return 2
+    lag = float(table.meta.get("accel_lag_s", 0.14) or 0.14)
+    blocks = local_gain.read_excite_blocks(Path(args.csv), args.hz)
+    if not blocks:
+        print(f"{args.hz:g} Hz のアクセルのブロックが無い")
+        return 1
+    head = [
+        "ブロック", "平均 km/h", "平均 u %", "行数", "abs(P) 実開度", "abs(P) 指令", "位相 °",
+        "SNR",
+        "S 平均開度", "r 実開度", "r 指令", "S 運転点", "r 運転点",
+    ]
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for b in blocks:
+        ra = local_gain.sine_response(
+            b.t_s, b.speed_kmh, b.accel_actual_pct, args.hz, skip_s=args.skip_s
+        )
+        rc = local_gain.sine_response(
+            b.t_s, b.speed_kmh, b.accel_cmd_pct, args.hz, skip_s=args.skip_s
+        )
+        if ra is None or rc is None:
+            lines.append(f"| {b.pattern} | 行数不足 |" + " |" * (len(head) - 2))
+            continue
+        r_act, s_mean = local_gain.sine_ratio(ra, table, amin, args.hz)
+        r_cmd, _ = local_gain.sine_ratio(rc, table, amin, args.hz)
+        try:
+            s_op = operating_point(
+                table, PEDAL_ACCEL, b.v_star_kmh, lag, brake_extra_kmhs=0.0
+            ).sens
+            r_op = rc.abs_p_kmh_per_pct * 2.0 * math.pi * args.hz / s_op
+        except ValueError:
+            s_op, r_op = math.nan, math.nan
+
+        def f(x: float | None, d: int = 3) -> str:
+            return "-" if x is None or not math.isfinite(x) else f"{x:.{d}f}"
+
+        lines.append(
+            f"| {b.pattern} | {ra.v_mean_kmh:.1f} | {ra.u_mean_pct - amin:.2f} | {ra.n_rows} "
+            f"| {f(ra.abs_p_kmh_per_pct, 4)} | {f(rc.abs_p_kmh_per_pct, 4)} | {f(ra.phase_deg, 1)} "
+            f"| {f(ra.snr, 1)} | {f(s_mean)} | {f(r_act, 2)} | {f(r_cmd, 2)} | {f(s_op)} "
+            f"| {f(r_op, 2)} |"
+        )
+    print("\n".join(lines))
     return 0
 
 
@@ -1666,7 +1734,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--brake-speeds", nargs="+", type=float, default=None, metavar="KMH",
         help="ブレーキの車速の行の代表（省略: learning.ramp_dither_brake_speeds_kmh）",
     )
+    lg.add_argument(
+        "--sine-hz", type=float, default=None,
+        help="保持の正弦波の周波数 [Hz]（省略: --config の learning.ramp_cruise_sine_hz）",
+    )
+    lg.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="sine-hz の既定を読む設定")
     lg.set_defaults(func=run_attach_local_gain)
+
+    cs = sub.add_parser(
+        "cruise-sine-check",
+        help="加振 CSV の指定の周波数のブロックに、保持の正弦波と同じ解析を当てる（机上の検算）",
+    )
+    cs.add_argument("--csv", required=True, help="加振走行 CSV（section EXCITE）")
+    cs.add_argument("--pkl", required=True, help="表の pkl（S を引く）")
+    cs.add_argument("--hz", type=float, default=1.2, help="見る周波数 [Hz]")
+    cs.add_argument(
+        "--skip-s", type=float, default=2.0,
+        help="ブロックの先頭の捨てる秒数（excite.analyze と同じ）",
+    )
+    cs.set_defaults(func=run_cruise_sine_check)
 
     rg = sub.add_parser(
         "attach-release-gain",

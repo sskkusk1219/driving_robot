@@ -326,6 +326,15 @@ class LearningSection:
     ramp_cruise_timeout_s: float = 15.0
     ramp_cruise_fine_max_kmh: float = 100.0
     ramp_cruise_coarse_step_kmh: float = 20.0
+    # 2026-11-10 ProblemReport_20261109 段10c: 途中の定速の保持（RAMP_CRUISE）が帯の時間で完了した
+    # とき、保持の PI の出力に正弦波 A·sin(2πft) を足して periods 周期だけ続け（RAMP_CRUISE_SINE）、
+    # 1 Hz 付近の効き（|P|）を測る。アクセルで保持していて u − A ≥ 0 のときだけ。既定 false ＝
+    # 今と完全に同じ。
+    # 根拠は yaml の learning: を参照（f・A はデータ由来、周期数は仮の値）
+    ramp_cruise_sine_enabled: bool = False
+    ramp_cruise_sine_hz: float = 1.2
+    ramp_cruise_sine_amplitude_pct: float = 0.6
+    ramp_cruise_sine_periods: int = 6
     # 2026-10-14 段2o-5: 下り（減速）の途中の「戻し」。ブレーキを踏んだまま、山の開度 u_peak を
     # ramp_release_fracs の各割合 f へ ramp_release_move_s かけて直線に離し、対応する
     # ramp_release_hold_s 秒だけ保持する（最後の 0 は待機位置）。空リストなら戻しを入れない
@@ -1070,6 +1079,16 @@ class ForwardMapSection:
     c10_p_local_gain_c: float = 6.0
     c10_p_local_gain_cruise_kmhs: float = 0.3
     c10_p_local_gain_taper_kmhs: float = 0.6
+    # 2026-11-10 ProblemReport_20261109 段10c: 割る量 k の出どころ。"cruise" ＝ 今まで（段9: 倍率
+    # × c ÷ deviation_c。
+    # 倍率は meta local_gain_accel_cruise）／"hf" ＝ 手順2 の定速の保持の正弦波（meta
+    # local_gain_accel_hf・
+    # 周波数 f_hf）から、k ＝ max(1, r(v) × 10^(G/20) ÷ (deviation_c × L_accel × 2π f_hf))。
+    # G（c10_p_local_gain_gm_db）は P だけのループの f_hf での大きさを下げる目標のゲイン余裕 [dB]。
+    # r が無い車速は両端の値・meta が無ければ k ＝ 1。範囲・なめらかに戻す幅は段9 と同じ。既定
+    # "cruise"
+    c10_p_local_gain_source: str = "cruise"
+    c10_p_local_gain_gm_db: float = 10.0
     # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
     # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
     # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・
@@ -2241,6 +2260,14 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         f"forward_map.c10_p_local_gain_c は正値: {fm.c10_p_local_gain_c}",
     )
     need(
+        fm.c10_p_local_gain_source in ("cruise", "hf"),
+        f"forward_map.c10_p_local_gain_source は cruise / hf: {fm.c10_p_local_gain_source!r}",
+    )
+    need(
+        fm.c10_p_local_gain_gm_db >= 0.0,
+        f"forward_map.c10_p_local_gain_gm_db は 0 以上: {fm.c10_p_local_gain_gm_db}",
+    )
+    need(
         0.0 < fm.c10_p_local_gain_cruise_kmhs < fm.c10_p_local_gain_taper_kmhs,
         "forward_map.c10_p_local_gain_cruise_kmhs は正値で c10_p_local_gain_taper_kmhs 未満: "
         f"{fm.c10_p_local_gain_cruise_kmhs}（taper {fm.c10_p_local_gain_taper_kmhs}）",
@@ -2499,6 +2526,15 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(cfg.learning.ramp_hold_time_s >= 0.0, "learning.ramp_hold_time_s は 0 以上")
     need(cfg.learning.ramp_cruise_band_g > 0.0, "learning.ramp_cruise_band_g は正値")
     need(cfg.learning.ramp_cruise_hold_s >= 0.0, "learning.ramp_cruise_hold_s は 0 以上")
+    need(cfg.learning.ramp_cruise_sine_hz > 0.0, "learning.ramp_cruise_sine_hz は正値")
+    need(
+        cfg.learning.ramp_cruise_sine_amplitude_pct > 0.0,
+        "learning.ramp_cruise_sine_amplitude_pct は正値",
+    )
+    need(
+        cfg.learning.ramp_cruise_sine_periods >= 2,
+        "learning.ramp_cruise_sine_periods は 2 以上（最初の 1 周期は過渡として捨てる）",
+    )
     need(
         all(v > 0.0 for v in cfg.learning.ramp_lag_speeds_kmh),
         f"learning.ramp_lag_speeds_kmh はすべて正（空なら遅れの測定をしない）: "

@@ -457,3 +457,148 @@ def test_hold_step_ratio_open_loop_check(tmp_path: Path) -> None:
     got = local_gain.hold_step_ratios(p, _flat_table(), accel_min_pct=AMIN, brake_min_pct=BMIN)
     assert len(got) == 1
     assert got[0][1] == pytest.approx(3.0, rel=0.1)
+
+
+# ── 段10c（2026-11-10 ProblemReport_20261109）: 保持の正弦波（RAMP_CRUISE_SINE）からの 1 Hz
+# 付近の効き ──
+
+SINE_HZ = 1.2
+
+
+def _sine_rows(
+    scale: float, *, v0: float = 60.0, amp: float = 0.6, hz: float = SINE_HZ, periods: int = 6,
+    lag_s: float = 0.14, t0: float = 0.0, table_slope: float = 0.3, first_period_junk: float = 0.0,
+    noise: float = 0.0, seed: int = 0,
+) -> list[dict[str, float | str]]:
+    """開度 = AMIN + 定速の開度 + A·sin(2πft)。加速度 = −2 + scale·table_slope·(遅れ lag_s 前の u)。
+    車速は積分。理論: |P| ＝ scale·table_slope ÷ (2πf) → 倍率 r ＝ scale。"""
+    rng = np.random.default_rng(seed)
+    n = int(round(periods / hz / DT))
+    base_u = 2.0 / (scale * table_slope)
+    op = [AMIN + base_u + amp * np.sin(2 * np.pi * hz * k * DT) for k in range(n)]
+    rows = []
+    v = v0
+    for k in range(n):
+        eff = op[max(0, k - int(round(lag_s / DT)))]
+        a = -2.0 + scale * table_slope * (eff - AMIN)
+        if first_period_junk and k * DT < 1.0 / hz:
+            a += first_period_junk
+        rows.append({
+            "elapsed_s": t0 + k * DT, "actual_speed_kmh": v + float(rng.normal(0, noise)),
+            "accel_actual_pct": op[k], "brake_actual_pct": BMIN, "phase": "RAMP_CRUISE_SINE",
+        })
+        v += a * DT
+    return rows
+
+
+def _sine_fit(rows, tmp_path: Path, table=None, **kw) -> local_gain.SineFit:
+    table = table or _flat_table(accel_onset_u_pct=2.0, accel_lag_s=0.14)
+    p = tmp_path / "s.csv"
+    _write_rows(p, rows)
+    segs = local_gain.read_sine_segments(p)
+    return local_gain.fit_cruise_sine(segs, table, accel_min_pct=AMIN, hz=SINE_HZ, **kw)
+
+
+@pytest.mark.parametrize("k", [1.0, 2.7, 3.65])
+def test_sine_ratio_recovers_known_gain_and_phase(tmp_path: Path, k: float) -> None:
+    fit = _sine_fit(_sine_rows(k), tmp_path)
+    assert fit.entry is not None and fit.n_used == 1
+    seg = fit.per_segment[0]
+    assert seg["ratio"] == pytest.approx(k, rel=0.05)
+    # |P| ＝ k·0.3 ÷ (2π·1.2)・位相 ＝ −90° − 360·f·(実効の遅れ 0.15 s（0.14 を DT 刻みに丸めた）
+    # ＋ 離散の積分の DT/2)
+    assert seg["abs_p"] == pytest.approx(k * 0.3 / (2 * np.pi * SINE_HZ), rel=0.05)
+    assert seg["phase_deg"] == pytest.approx(-90.0 - 360.0 * SINE_HZ * (0.15 + DT / 2), abs=6.0)
+    assert seg["snr"] > 10.0
+    assert fit.entry["speed_rep_kmh"] == [60.0]
+    assert fit.entry["ratio"][0] == pytest.approx(k, rel=0.05) and fit.entry["n"] == [1]
+    assert local_gain.hf_ratio_at(fit.entry, 60.0) == pytest.approx(k, rel=0.05)
+    assert local_gain.hf_ratio_at(fit.entry, 120.0) == pytest.approx(k, rel=0.05)  # 端の値
+    assert local_gain.hf_ratio_at(None, 60.0) is None
+
+
+def test_sine_fit_drops_first_period_and_rejects_low_snr(tmp_path: Path) -> None:
+    # 最初の 1 周期に大きな過渡があっても、捨てるので倍率は変わらない
+    fit = _sine_fit(_sine_rows(3.0, first_period_junk=4.0), tmp_path)
+    assert fit.n_used == 1 and fit.per_segment[0]["ratio"] == pytest.approx(3.0, rel=0.08)
+    # 車速のノイズが大きい → SNR 3 未満で捨てる
+    noisy = _sine_fit(_sine_rows(3.0, noise=0.6), tmp_path)
+    assert noisy.entry is None and noisy.reject == {"snr": 1}
+    # 6 周期より短い（1 周期だけ）は行が足りない
+    short = _sine_fit(_sine_rows(3.0, periods=1), tmp_path)
+    assert short.entry is None and short.reject == {"rows": 1}
+
+
+def test_sine_fit_rejects_invalid_table_sensitivity_and_splits_segments(tmp_path: Path) -> None:
+    flat = _flat_table(slope_accel=0.0, accel_onset_u_pct=2.0)
+    assert _sine_fit(_sine_rows(3.0), tmp_path, table=flat).reject == {"sens": 1}
+    a = _sine_rows(3.0)
+    b = _sine_rows(2.0, v0=100.0, t0=100.0)
+    fit = _sine_fit(a + b, tmp_path)
+    assert fit.n_segments == 2 and fit.n_used == 2
+    assert fit.entry["speed_rep_kmh"] == [60.0, 100.0]
+    assert fit.entry["ratio"] == pytest.approx([3.0, 2.0], rel=0.08)
+    # RAMP_CRUISE の行は正弦波の区間に数えない
+    for r in a:
+        r["phase"] = "RAMP_CRUISE"
+    p = tmp_path / "c.csv"
+    _write_rows(p, a)
+    assert local_gain.read_sine_segments(p) == []
+
+
+def test_sine_attach_cli_and_meta_keys(tmp_path: Path) -> None:
+    from tests.research.pattern_drive import _attach_cruise_sine_gain  # noqa: PLC0415
+
+    table = _flat_table(accel_onset_u_pct=2.0, accel_lag_s=0.14)
+    p = tmp_path / "s.csv"
+    _write_rows(p, _sine_rows(3.0))
+    assert _attach_cruise_sine_gain(table, p, SINE_HZ)
+    m = table.meta
+    assert m["local_gain_accel_hf_hz"] == SINE_HZ and m["local_gain_accel_hf_source"] == "s.csv"
+    assert m["local_gain_accel_hf_n_segments"] == 1 and m["local_gain_accel_hf_n_used"] == 1
+    assert m["local_gain_accel_hf"]["ratio"][0] == pytest.approx(3.0, rel=0.05)
+    # 正弦波の区間が無い CSV（正弦波 off の手順2）は何も入れない
+    q = tmp_path / "n.csv"
+    _write_rows(q, _cruise_rows(3.0))
+    t2 = _flat_table(accel_onset_u_pct=2.0)
+    assert not _attach_cruise_sine_gain(t2, q, SINE_HZ) and "local_gain_accel_hf" not in t2.meta
+    # attach-local-gain（CLI）は dither が無くても正弦波があれば pkl を作る
+    src = tmp_path / "in.pkl"
+    save_table(_flat_table(accel_onset_u_pct=2.0, accel_lag_s=0.14), src)
+    out = tmp_path / "out.pkl"
+    rc = fwd_tool.main(
+        ["attach-local-gain", "--pkl", str(src), "--csv", str(p), "--out", str(out),
+         "--sine-hz", str(SINE_HZ)]
+    )
+    assert rc == 0
+    assert load_forward_map(out).meta["local_gain_accel_hf"]["ratio"][0] == pytest.approx(
+        3.0, rel=0.05
+    )
+
+
+def test_cruise_sine_check_on_excite_blocks(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """加振 CSV の `<車速>kmh_<周波数>Hz` のブロック（EXCITE）に同じ解析を当てる。"""
+    src = tmp_path / "in.pkl"
+    save_table(_flat_table(accel_onset_u_pct=2.0, accel_lag_s=0.14), src)
+    rows = []
+    for r in _sine_rows(3.0, periods=10):
+        rows.append({
+            "section": "EXCITE", "pattern": "60kmh_1.20Hz", "mode_time_s": r["elapsed_s"],
+            "actual_speed_kmh": r["actual_speed_kmh"], "accel_cmd_pct": r["accel_actual_pct"],
+            "accel_actual_pct": r["accel_actual_pct"],
+        })
+    for r in _sine_rows(3.0, periods=10):  # 別の周波数のブロックは読まない
+        rows.append({
+            "section": "EXCITE", "pattern": "60kmh_1.00Hz", "mode_time_s": r["elapsed_s"],
+            "actual_speed_kmh": r["actual_speed_kmh"], "accel_cmd_pct": r["accel_actual_pct"],
+            "accel_actual_pct": r["accel_actual_pct"],
+        })
+    csvp = tmp_path / "ex.csv"
+    with csvp.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    assert len(local_gain.read_excite_blocks(csvp, 1.2)) == 1
+    rc = fwd_tool.main(["cruise-sine-check", "--csv", str(csvp), "--pkl", str(src), "--hz", "1.2"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "60kmh_1.20Hz" in out and "1.00Hz" not in out

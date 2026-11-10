@@ -8,6 +8,7 @@ KPI の数え方は本番 KPIMonitor と突き合わせる。
 from __future__ import annotations
 
 import csv
+import math
 import random
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2543,6 +2544,73 @@ async def test_c10_p_local_gain_divides_p_only_on_accel_rows_in_scope(
     del meta["local_gain_accel_cruise"]
     assert run._c10_offset(t, ref, ref - 0.05, e) == pytest.approx(off)  # noqa: SLF001
     assert run._p_gain_div == 1.0  # noqa: SLF001
+
+
+def test_p_local_gain_k_hf_formula() -> None:
+    """2026-11-10 段10c: k ＝ max(1, r × 10^(G/20) ÷ (c × L × 2πf))。段10d の見込み（c 6・L 0.179・
+    1.2 Hz・r 2.7/3.0/3.65 → G 10 dB で 1.05/1.2/1.4・13 dB で 1.5/1.7/2.0）と合う。"""
+    k = mdmod.p_local_gain_k_hf
+    for r, k10, k13 in ((2.7, 1.05, 1.5), (3.0, 1.2, 1.7), (3.65, 1.4, 2.0)):
+        assert k(r, 10.0, 6.0, 0.179, 1.2) == pytest.approx(k10, abs=0.06)
+        assert k(r, 13.0, 6.0, 0.179, 1.2) == pytest.approx(k13, abs=0.06)
+    assert k(1.0, 10.0, 6.0, 0.179, 1.2) == 1.0  # 1 未満にはしない
+    assert k(3.0, 10.0, 0.0, 0.179, 1.2) == 1.0 and k(3.0, 10.0, 6.0, 0.0, 1.2) == 1.0
+    assert k(3.0, 10.0, 6.0, 0.179, 0.0) == 1.0 and k(math.nan, 10.0, 6.0, 0.179, 1.2) == 1.0
+
+
+async def test_c10_p_local_gain_hf_source_uses_hf_table_and_defaults_to_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """source が hf のとき、meta local_gain_accel_hf の r(v) と周波数から k を作り P だけ割る。
+    meta が無ければ k ＝ 1（今のまま）。source ＝ cruise（既定）は段9 のまま。"""
+    cfg = _c10_cfg(tmp_path)
+    cfg.forward_map = cfgmod.ForwardMapSection()
+    cfg.forward_map.deviation_c = 100.0
+    cfg.forward_map.deviation_row = "reference"
+    cfg.forward_map.dob_tq_coef = 40.0
+    run = await _c10_run_obj(cfg, monkeypatch)
+    run._d_win = mdmod.deque()  # noqa: SLF001
+    run.c10_int = None
+    run._ci_prev_t = None  # noqa: SLF001
+    run._b1_rows = []  # noqa: SLF001
+    plan = run.ff.plan
+    ia = int(np.flatnonzero(plan.effort_pct > 4.0 + 1.0)[0])
+    t, e = float(plan.t_s[ia]), float(plan.effort_pct[ia])
+    ref = 40.0
+    fm = cfg.forward_map
+    meta = run.ff.table.meta
+    off = run._c10_offset(t, ref, ref - 0.05, e)  # noqa: SLF001
+    fm.c10_p_local_gain = "all"
+    fm.c10_p_local_gain_source = "hf"
+    fm.c10_p_local_gain_gm_db = 10.0
+    # meta なし → k ＝ 1・出力は今と同じ
+    assert run._c10_offset(t, ref, ref - 0.05, e) == pytest.approx(off)  # noqa: SLF001
+    assert run._p_gain_div == 1.0  # noqa: SLF001
+    hz, ratio = 1.2, 3.0
+    meta["local_gain_accel_hf"] = {
+        "speed_rep_kmh": [20.0, 60.0], "ratio": [ratio, ratio], "n": [1, 1],
+    }
+    meta["local_gain_accel_hf_hz"] = hz
+    tau = run.ff.tau_accel_s
+    k_exp = mdmod.p_local_gain_k_hf(
+        ratio, 10.0, run.ff.deviation_c, tau / run.ff.deviation_c, hz
+    )
+    on = run._c10_offset(t, ref, ref - 0.05, e)  # noqa: SLF001
+    assert run._p_local_ratio == pytest.approx(ratio)  # noqa: SLF001
+    assert run._p_gain_div == pytest.approx(k_exp)  # noqa: SLF001
+    if k_exp > 1.0:
+        assert abs(on) < abs(off)
+    # 7.5 km/h 未満の行は掛けない・source ＝ cruise に戻せば hf の表は使われない
+    run._p_local_ratio = run._p_gain_div = None  # noqa: SLF001
+    run._c10_offset(t, 5.0, 4.95, e)  # noqa: SLF001
+    assert run._p_gain_div is None  # noqa: SLF001
+    fm.c10_p_local_gain_source = "cruise"
+    assert run._c10_offset(t, ref, ref - 0.05, e) == pytest.approx(off)  # noqa: SLF001
+    # 設定の行: hf は出どころ・G・k の範囲を出す。meta なしは警告
+    fm.c10_p_local_gain_source = "hf"
+    txt = mdmod.c10_p_local_gain_text(fm, meta, 0.179, 6.0)
+    assert "hf" in txt and "10 dB" in txt and "k ＝" in txt and "警告" not in txt
+    assert "警告" in mdmod.c10_p_local_gain_text(fm, {}, 0.179, 6.0)
 
 
 def test_c10_p_local_gain_text_and_validation() -> None:

@@ -663,6 +663,13 @@ forward_map:
   c10_p_local_gain_c: 6.0
   c10_p_local_gain_cruise_kmhs: 0.3
   c10_p_local_gain_taper_kmhs: 0.6
+  # 2026-11-10 段10c: 割る量 k の出どころ。"cruise" ＝ 今まで（倍率 × c ÷ 6）／"hf" ＝ 手順2 の定速の保持の正弦波
+  # （meta local_gain_accel_hf・周波数 f_hf）から k ＝ max(1, r(v) × 10^(G/20) ÷ (6 × L × 2π f_hf))。
+  # 「P だけのループの f_hf での大きさ」を目標のゲイン余裕 G [dB] まで下げる量で、車ごとに r と L が手順2 で決まる。
+  # gm_db 10: 半分データ由来（一般の目安は 6〜12 dB。段10b で P だけの余裕は DOB・I を足すと約 2 dB 減るので、
+  # DOB 込みで約 8 dB）。段11 の実機で 10 と 13 dB（DOB 込み約 11 dB）を比べて決める。meta が無ければ k ＝ 1
+  c10_p_local_gain_source: "cruise"
+  c10_p_local_gain_gm_db: 10.0
   # 2026-10-17 段2o-9: 置くまでの待ち（preposition_clear_s: 0.1）は廃止。待ちは「戻す側のペダルが
   # min に戻るまでの時間」（pkl の meta の戻る時間。手順2 で測る）で決める
 
@@ -912,10 +919,29 @@ learning:
   # （local_gain_accel_cruise。段7）を測るため、保持の PI が開度を動かす区間を長く取る（5 秒だと窓
   # 0.3 s・遅れ 0.14 s の当てはめに使える行が少ない）。手順2 の段は増やさない。
   # 効く先: 手順2 の所要時間（保持の段 × 5 秒）・定速付近の表の点の数。決める時期: 段10 の実機の手順2 の後
-  ramp_cruise_hold_s: 10.0
+  # 2026-11-10 段10c 10.0 → 5.0。10 秒は段9 のゆっくりした倍率（local_gain_accel_cruise）を測るためだったが、
+  # その倍率は使わない（段10b: 効きは周波数で違い、使うのは 1 Hz 付近の値）。保持 5 秒 ＋ 下の正弦波 5 秒で
+  # 手順2 の時間は 10 秒のときと同じ（正弦波を off にすると 5 秒ぶん短くなる）
+  ramp_cruise_hold_s: 5.0
   ramp_cruise_timeout_s: 15.0
   ramp_cruise_fine_max_kmh: 100.0
   ramp_cruise_coarse_step_kmh: 20.0
+  # 2026-11-10 ProblemReport_20261109 段10c: 途中の定速の保持が帯の時間（ramp_cruise_hold_s）で完了したとき、
+  # 保持の PI の出力に A·sin(2πft) を足して periods 周期続け（phase RAMP_CRUISE_SINE）、1 Hz 付近の効き |P| を
+  # 測る（local_gain.fit_cruise_sine → meta local_gain_accel_hf。C10 の P を目標のゲイン余裕で割る入力）。
+  # アクセルで保持していて u − A ≥ 0 のときだけ入る。上端の保持・HOLD_STEP・dither には入れない。
+  # RAMP_CRUISE_SINE の行は表（本体・発進側・停止側）の学習に使わない（1 Hz では効きが約 3 倍に見えるため）。
+  # 既定 false ＝ 今と完全に同じ。
+  # hz 1.2: データ由来（段10b の加振で位相が −180° になる所＝アクセル 1.17〜1.6 Hz・高速ほど低い、と
+  #   揺れの 1.0 Hz の間）。効く先: どの周波数の効きを測るか。決める時期: 段10e の照合
+  # amplitude_pct 0.6: データ由来（段10b の加振で 1 Hz 以上の SNR 4〜8 が取れた振幅）。効く先: SNR と保持の乱れ。
+  #   決める時期: 段10e（SNR が 3 未満なら上げる）
+  # periods 6（5 秒）: 仮の値（手順2 の時間を増やさない長さ ＝ 保持 10 秒 → 5 秒 ＋ 5 秒）。最初の 1 周期は
+  #   過渡として捨てる。効く先: 測定のばらつき。決める時期: 段10e（保持ごとのばらつきで決め直す）
+  ramp_cruise_sine_enabled: false
+  ramp_cruise_sine_hz: 1.2
+  ramp_cruise_sine_amplitude_pct: 0.6
+  ramp_cruise_sine_periods: 6
   # 2026-10-14 段2o-5: 下り（減速）の途中の「戻し」（いちばん弱い段以外）。ブレーキを踏んでいる山から
   # 離して惰行まで戻し、−G へ踏み直す（モードの減速の 3 割強は走行中のブレーキの戻し。手順2 にそれが
   # 無く、戻し中の効きが表より弱かった）。山の開度 u_peak を ramp_release_fracs の割合へ

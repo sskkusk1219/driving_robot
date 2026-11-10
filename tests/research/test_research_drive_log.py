@@ -171,6 +171,22 @@ def test_read_drive_logs_uses_only_pattern_drive_rows(tmp_path: Path) -> None:
     assert [log.id for log in logs] == [0, 1]
 
 
+def test_read_drive_logs_excludes_cruise_sine_rows(tmp_path: Path) -> None:
+    """2026-11-10 段10c: 保持の正弦波（RAMP_CRUISE_SINE）の行は学習の行に入らない。"""
+    samples = [
+        dlmod.DriveSample(elapsed_s=i * 0.1, timestamp=datetime.now(tz=UTC),
+                          data=_data(float(i)), section=dlmod.SECTION_PATTERN_DRIVE, phase=ph)
+        for i, ph in enumerate(["RAMP_CRUISE", "RAMP_CRUISE_SINE", "RAMP_CRUISE_SINE", "RAMP_UP"])
+    ]
+    path = tmp_path / "log.csv"
+    dlmod.write_csv(samples, path)
+    assert [log.actual_speed_kmh for log in dlmod.read_drive_logs(path)] == [0.0, 3.0]
+    from tests.research import model_analysis  # noqa: PLC0415
+
+    logs, _pat, phases = model_analysis.load_training_rows(path)
+    assert len(logs) == 2 and list(phases) == ["RAMP_CRUISE", "RAMP_UP"]
+
+
 def test_read_drive_logs_label_actual_uses_pnow_and_skips_unread_rows(tmp_path: Path) -> None:
     """D1: label="actual" は実開度（PNOW 由来）をラベルにし、読めなかった行は除外する。"""
     from tests.research.vehicle import opening_to_pulse

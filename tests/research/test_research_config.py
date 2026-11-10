@@ -1010,7 +1010,12 @@ def test_ramp_cruise_and_lag_settings_are_loaded_and_validated() -> None:
     cfg = _load_default()
     lr = cfg.learning
     assert lr.ramp_cruise_band_g == pytest.approx(0.005)
-    assert lr.ramp_cruise_hold_s == pytest.approx(10.0)  # 2026-11-10 段8 5 → 10（局所の効きを測る）
+    assert lr.ramp_cruise_hold_s == pytest.approx(5.0)  # 2026-11-10 段10c 10 → 5（正弦波が 5 秒）
+    # 段10c: 正弦波は既定 off
+    assert lr.ramp_cruise_sine_enabled is False
+    assert lr.ramp_cruise_sine_hz == pytest.approx(1.2)
+    assert lr.ramp_cruise_sine_amplitude_pct == pytest.approx(0.6)
+    assert lr.ramp_cruise_sine_periods == 6
     assert lr.ramp_cruise_timeout_s == pytest.approx(15.0)
     assert lr.ramp_cruise_fine_max_kmh == pytest.approx(100.0)
     assert lr.ramp_cruise_coarse_step_kmh == pytest.approx(20.0)
@@ -1034,6 +1039,14 @@ def test_ramp_cruise_and_lag_settings_are_loaded_and_validated() -> None:
     lr.ramp_cruise_hold_s = -1.0
     assert problems_about("ramp_cruise_hold_s")
     lr.ramp_cruise_hold_s = 5.0
+    for key, bad in (
+        ("ramp_cruise_sine_hz", 0.0), ("ramp_cruise_sine_amplitude_pct", 0.0),
+        ("ramp_cruise_sine_periods", 1),
+    ):
+        good = getattr(lr, key)
+        setattr(lr, key, bad)
+        assert problems_about(key), key
+        setattr(lr, key, good)
     lr.ramp_lag_speeds_kmh = [30.0, -5.0]
     assert problems_about("ramp_lag_speeds_kmh")
     lr.ramp_lag_speeds_kmh = []  # 空は「測らない」で合格
@@ -1905,9 +1918,13 @@ def test_c10_p_local_gain_defaults_and_validation() -> None:
     assert fm0.c10_p_local_gain_cruise_kmhs == 0.3 and fm0.c10_p_local_gain_taper_kmhs == 0.6
     cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
     assert cfg.forward_map.c10_p_local_gain == "off"  # 引用符つきの "off" が文字列で読める
+    # 2026-11-10 段10c: 出どころの既定は今まで（cruise）・G の既定 10 dB
+    assert fm0.c10_p_local_gain_source == "cruise" and fm0.c10_p_local_gain_gm_db == 10.0
+    assert cfg.forward_map.c10_p_local_gain_source == "cruise"
     for key, bad in (
         ("c10_p_local_gain", "on"), ("c10_p_local_gain_c", 0.0),
         ("c10_p_local_gain_cruise_kmhs", 0.0), ("c10_p_local_gain_cruise_kmhs", 0.7),
+        ("c10_p_local_gain_source", "lf"), ("c10_p_local_gain_gm_db", -1.0),
     ):
         old = getattr(cfg.forward_map, key)
         setattr(cfg.forward_map, key, bad)

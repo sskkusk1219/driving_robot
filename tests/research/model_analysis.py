@@ -39,7 +39,12 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GroupKFold
 
 from tests.research.config import DEFAULT_CONFIG_PATH, ResearchConfig, load_config
-from tests.research.drive_log import SECTION_PATTERN_DRIVE, actual_opening, read_drive_logs
+from tests.research.drive_log import (
+    SECTION_PATTERN_DRIVE,
+    TRAINING_EXCLUDED_PHASES,
+    actual_opening,
+    read_drive_logs,
+)
 from tests.research.ff_explain import (
     BRANCHES,
     DT_S,
@@ -118,6 +123,8 @@ def load_training_rows(
         for row in csv.DictReader(f):
             if "section" in row and row["section"] != SECTION_PATTERN_DRIVE:
                 continue
+            if (row.get("phase") or "") in TRAINING_EXCLUDED_PHASES:
+                continue  # read_drive_logs と同じ行（2026-11-10 段10c）
             if label == "actual" and (
                 actual_opening(row, "accel") is None or actual_opening(row, "brake") is None
             ):

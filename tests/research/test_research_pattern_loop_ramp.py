@@ -11,6 +11,7 @@ u は「基準車速への追従」（基準車速 v_ref と実車速の偏差 e
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Callable
 from pathlib import Path
 
@@ -4590,3 +4591,125 @@ def test_sweep_skipped_in_a_shared_cycle_lets_the_fast_release_run() -> None:
         t += 0.1
     r = loop.ramp_results[0]
     assert (r.sweep_n, r.sweep_skipped, r.release_n, r.release_skipped) == (0, 1, 0, 1)
+
+
+# ── 段10c（2026-11-10 ProblemReport_20261109）: 保持の正弦波（RAMP_CRUISE_SINE）──────
+
+
+def _sine_config(**kw: object) -> PatternLoopConfig:
+    base = PatternLoopConfig(
+        ramp_cruise_sine_enabled=True, ramp_cruise_sine_hz=1.0,
+        ramp_cruise_sine_amplitude_pct=0.6, ramp_cruise_sine_periods=3,
+    )
+    return dataclasses.replace(base, **kw)  # type: ignore[arg-type]
+
+
+def _run_sine_up(
+    loop: PatternLoop, p: plmod.GRampPattern, *, u_hold: float | None = 3.0,
+    t_max: float = 200.0,
+) -> list[tuple[float, str, float, float, float, float]]:
+    """保持（RAMP_CRUISE）と正弦波の間は u を u_hold に保つ（保持の PI の代わり）。
+    [(t, phase 名, 車速, u, アクセル指令, ブレーキ指令)]。結果が記録されたら止める。"""
+    kine = _Kine(loop, p.target_g, v0=5.0)
+    rows: list[tuple[float, str, float, float, float, float]] = []
+    t = 0.0
+    while t < t_max and not loop.ramp_results:
+        if u_hold is not None and loop._phase in (_Phase.RAMP_CRUISE, _Phase.RAMP_CRUISE_SINE):
+            loop._rp_u = u_hold
+        u_cmd = loop._rp_u  # 指令を作った時点の u（制御で動く前）
+        a, b = _cycle(loop, p, kine.v, t)
+        rows.append((t, loop._phase.name, kine.v, u_cmd, a, b))
+        kine.step()
+        t += 0.1
+    return rows
+
+
+def test_cruise_sine_default_off_is_the_old_behaviour() -> None:
+    """既定（ramp_cruise_sine_enabled false）は RAMP_CRUISE_SINE に入らず、数えもしない。"""
+    p = _cruise_ramp(g=0.1, top_kmh=40.0, stations=(20.0,), up_only=True)
+    loop = _loop([p])
+    assert loop._config.ramp_cruise_sine_enabled is False
+    rows = _run_sine_up(loop, p)
+    assert not any(r[1] == "RAMP_CRUISE_SINE" for r in rows)
+    r0 = loop.ramp_results[0]
+    assert (r0.cruise_sine_s, r0.cruise_sine_n, r0.cruise_sine_skipped) == (0.0, 0, 0)
+    assert r0.cruise_done == 1
+
+
+def test_cruise_sine_follows_ramp_cruise_adds_sine_and_resumes_up() -> None:
+    """保持が帯の時間で完了したら RAMP_CRUISE → RAMP_CRUISE_SINE → RAMP_UP。周期数 ÷ f 秒続き、
+    指令は u ＋ A·sin(2πft)（ブレーキ 0・u 自体は変えない）。結果の秒数は保持に含まれない。"""
+    p = _cruise_ramp(g=0.1, top_kmh=40.0, stations=(20.0,), up_only=True)
+    loop = _loop([p], config=_sine_config())
+    rows = _run_sine_up(loop, p, u_hold=3.0)
+    names = [r[1] for r in rows]
+    i = names.index("RAMP_CRUISE_SINE")
+    assert names[i - 1] == "RAMP_CRUISE"
+    j = max(k for k, n in enumerate(names) if n == "RAMP_CRUISE_SINE")
+    assert names[j + 1] == "RAMP_UP"
+    seg = [r for r in rows if r[1] == "RAMP_CRUISE_SINE"]
+    assert (seg[-1][0] - seg[0][0]) == pytest.approx(3.0, abs=0.2)  # 3 周期 ÷ 1 Hz
+    t0, a0 = seg[0][0], seg[0][4]  # 入った周期の指令は正弦波の前（sin 0）＝ 待機位置 ＋ u
+    for t, _ph, _v, u, a, b in seg:
+        assert u == 3.0 and b == 0.0
+        assert a - a0 == pytest.approx(0.6 * math.sin(2.0 * math.pi * 1.0 * (t - t0)), abs=1e-6)
+    assert max(r[4] for r in seg) - a0 == pytest.approx(0.6, abs=0.05)
+    r0 = loop.ramp_results[0]
+    assert (r0.cruise_sine_n, r0.cruise_sine_skipped, r0.cruise_done) == (1, 0, 1)
+    assert r0.cruise_sine_s == pytest.approx(3.0, abs=0.2)
+    t_end = rows[-1][0]
+    assert r0.up_s + r0.hold_s + r0.down_s + r0.cruise_s + r0.cruise_sine_s == pytest.approx(
+        t_end, abs=0.3
+    )
+
+
+def test_cruise_sine_never_commands_below_min() -> None:
+    """u − A が min（u ＝ 0）未満になる保持には入らない（skipped に数える）。ブレーキ側（u ＜ 0）も
+    入らない。入れる最小の u（A 以上）では指令が 0 未満にならない。"""
+    p = _cruise_ramp(g=0.1, top_kmh=40.0, stations=(20.0,), up_only=True)
+    for u in (0.3, -0.5):
+        loop = _loop([p], config=_sine_config())
+        rows = _run_sine_up(loop, p, u_hold=u)
+        assert not any(r[1] == "RAMP_CRUISE_SINE" for r in rows), u
+        r0 = loop.ramp_results[0]
+        assert r0.cruise_sine_n == 0 and r0.cruise_sine_skipped >= 1 and r0.cruise_done == 1
+    loop = _loop([p], config=_sine_config())
+    rows = _run_sine_up(loop, p, u_hold=0.6)
+    seg = [r for r in rows if r[1] == "RAMP_CRUISE_SINE"]
+    amin = seg[0][4] - 0.6  # 待機位置（min）＝ 指令 − u
+    assert seg and min(r[4] for r in seg) >= amin - 1e-9
+
+
+def test_cruise_sine_is_not_entered_when_the_cruise_times_out() -> None:
+    """保持が帯に入れず時間切れで出るとき（完了ではない）は正弦波に入らない・数えない。"""
+    p = _cruise_ramp(stations=(15.0,))
+    loop = _loop([p], config=_sine_config())
+    _, rows = _run_kine(loop, p, _Kine(loop, 0.1, drift=1.0))
+    assert not any(ph == "RAMP_CRUISE_SINE" for _, ph, _ in rows)
+    r = loop.ramp_results[0]
+    assert (r.cruise_sine_n, r.cruise_sine_skipped) == (0, 0) and r.cruise_done == 0
+
+
+def test_cruise_sine_safety_exit_on_overspeed_and_not_used_for_hold_or_step() -> None:
+    """正弦波の間に実車速が最高速の頭打ちを超えたら、周期数を待たず保持を出る。"""
+    p = _cruise_ramp(g=0.1, top_kmh=40.0, stations=(20.0,), up_only=True)
+    loop = _loop([p], config=_sine_config(ramp_cruise_sine_periods=30))
+    kine = _Kine(loop, p.target_g, v0=5.0)
+    t = 0.0
+    entered = None
+    while t < 200.0 and not loop.ramp_results:
+        if loop._phase in (_Phase.RAMP_CRUISE, _Phase.RAMP_CRUISE_SINE):
+            loop._rp_u = 3.0
+        if loop._phase is _Phase.RAMP_CRUISE_SINE:
+            if entered is None:
+                entered = t
+            elif t - entered > 1.0:
+                kine.v = loop._accel_speed_cap + 5.0  # 頭打ちを超える
+        _cycle(loop, p, kine.v, t)
+        kine.step()
+        t += 0.1
+        if entered is not None and loop._phase is not _Phase.RAMP_CRUISE_SINE:
+            break
+    assert entered is not None and t - entered < 5.0  # 30 周期（30 秒）を待たずに出た
+    # 上端の保持（RAMP_HOLD）・HOLD_STEP には入らない（フェーズ名が別）
+    assert loop._phase is not _Phase.RAMP_CRUISE_SINE

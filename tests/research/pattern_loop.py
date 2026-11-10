@@ -351,6 +351,19 @@ ProblemReport_20260910 の遵守事項「`/src` の本番環境のコードを�
       （途中の保持の合計）・`cruise_n`（入った回数）・`cruise_done`（合計が hold_s に達した回数）
       を足した。
 
+2026-11-10 ProblemReport_20261109 段10c（保持の正弦波）:
+    `ramp_cruise_sine_enabled` が True のとき、途中の保持（RAMP_CRUISE。上り・下り）が帯の時間
+    （ramp_cruise_hold_s）で完了したら、そのまま `_Phase.RAMP_CRUISE_SINE`（CSV の phase 名）
+    へ入る。
+    アクセルで保持していて（u ＞ 0）u − A ≥ 0 のときだけ（入れなければ `cruise_sine_skipped`・保持は
+    今のまま出る）。保持の PI は RAMP_CRUISE と同じに回し、指令だけ u ＋ A·sin(2πf(t −
+    入った時刻)) にする
+    （u 自体は PI の出力のまま。下限は u ＝ 0）。帯の判定はせず、周期数 ÷ f
+    秒で出る（`_ramp_cruise_exit`
+    と同じ出方・安全網と時間切れは保持と同じ）。上端の保持・HOLD_STEP・dither には入れない。
+    この間の点は上限 G マップに貯めない。`RampResult` の cruise_sine_s・cruise_sine_n・
+    cruise_sine_skipped。
+
 2026-10-14 段2o-4: 途中の保持を上りだけにできる（`GRampPattern.stations_up_only`。
     `ramp_planner` の `execution_order()` の 4 つ目）。True の段は RAMP_DOWN で保持に入らない
     （上りの入り方・出方は段2o-2 のまま）。
@@ -636,6 +649,14 @@ class RampResult:
     sweep_n: int = 0
     sweep_skipped: int = 0
     sweep_timeout_n: int = 0
+    # 2026-11-10 ProblemReport_20261109 段10c: 途中の定速の保持の正弦波（RAMP_CRUISE_SINE）
+    # の合計秒数・
+    # 入った回数・飛ばした回数（保持が帯の時間で完了したが、ブレーキ側・u − A が min
+    # 未満で入れなかった）。
+    # cruise_s は正弦波の時間を含まない
+    cruise_sine_s: float = 0.0
+    cruise_sine_n: int = 0
+    cruise_sine_skipped: int = 0
 
 
 @dataclass(frozen=True)
@@ -663,6 +684,9 @@ class _Phase(Enum):
     RAMP_DOWN = auto()  # G ランプ走行（段2k 段B）: 同じ G で減速してクリープ域まで下りる
     # G ランプ走行（段2o-2）: 上り・下りの途中で決めた車速の定速を保持する（RAMP_UP/DOWN の途中）
     RAMP_CRUISE = auto()
+    # G ランプ走行（段10c 2026-11-10）: 途中の定速保持が帯の時間で完了したとき、保持の PI の出力に
+    # 正弦波を足して 1 Hz 付近の効きを測る（RAMP_CRUISE の続き）
+    RAMP_CRUISE_SINE = auto()
     # G ランプ走行（段2o-2）: 遅れの測定。上端の保持の後、開度を固定で 5 つステップさせる
     # （CSV の phase 名 `HOLD_STEP` は pedal_lag.py が読む名前と同じ）
     HOLD_STEP = auto()
@@ -691,8 +715,9 @@ STOP_RELEASE_TIMEOUT_S = 30.0
 
 # G ランプの区間（順に RAMP_UP → RAMP_HOLD → RAMP_DOWN。2026-10-10 段2l-10 で RAMP_HOLD を追加）
 _RAMP_PHASES = (
-    _Phase.RAMP_UP, _Phase.RAMP_CRUISE, _Phase.RAMP_HOLD, _Phase.HOLD_STEP, _Phase.RAMP_DOWN,
-    _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER, _Phase.RAMP_ACCEL_DITHER,
+    _Phase.RAMP_UP, _Phase.RAMP_CRUISE, _Phase.RAMP_CRUISE_SINE, _Phase.RAMP_HOLD,
+    _Phase.HOLD_STEP, _Phase.RAMP_DOWN, _Phase.RAMP_RELEASE, _Phase.RAMP_BRAKE_DITHER,
+    _Phase.RAMP_ACCEL_DITHER,
     _Phase.RAMP_RELEASE_SWEEP,
 )
 
@@ -843,6 +868,12 @@ class PatternLoopConfig:
     ramp_cruise_band_g: float = field(default=0.005)
     ramp_cruise_hold_s: float = field(default=7.0)
     ramp_cruise_timeout_s: float = field(default=15.0)
+    # 2026-11-10 段10c: 保持の完了時に正弦波を足す（learning.ramp_cruise_sine_* から渡す。根拠は
+    # config_testVehicle.yaml のコメント）。既定 False ＝ 今と完全に同じ
+    ramp_cruise_sine_enabled: bool = field(default=False)
+    ramp_cruise_sine_hz: float = field(default=1.2)
+    ramp_cruise_sine_amplitude_pct: float = field(default=0.6)
+    ramp_cruise_sine_periods: int = field(default=6)
     # 2026-10-13 段2o-2: 遅れの測定のステップ（`GRampPattern.lag_step`）。learning.ramp_lag_step_g /
     # ramp_lag_step_hold_s から渡す。1 つの開度を ramp_lag_step_hold_s 秒保持し、踏み増しの大きさは
     # ramp_lag_step_g の加速度が出る開度の差
@@ -1081,6 +1112,10 @@ class PatternLoop:
         self._rp_down_prior_s = 0.0  # 下りの区間の保持の前までに走った時間（時間切れに足す）
         self._rp_cruise_n = 0
         self._rp_cruise_done_n = 0
+        self._rp_sine_n = 0  # 段10c: 保持の正弦波（RAMP_CRUISE_SINE）に入った回数・飛ばした回数
+        self._rp_sine_skipped = 0
+        self._rp_sine_t0 = 0.0  # 正弦波に入った時刻
+        self._rp_cmd_now = 0.0  # 指令を作った周期の時刻（正弦波の位相用）
         # 遅れの測定のステップ（HOLD_STEP）: 開度 u の列・今のステップの番号・始めた時刻
         self._rp_step_targets: list[float] = []
         self._rp_step_idx = 0
@@ -1088,7 +1123,7 @@ class PatternLoop:
         # 結果用の積算（区間を切り替えるたびに足す）。キーは up / cruise / hold / down
         self._rp_acc: dict[str, float] = {
             "up": 0.0, "cruise": 0.0, "hold": 0.0, "down": 0.0, "release": 0.0,
-            "dither_brake": 0.0, "dither_accel": 0.0, "sweep": 0.0,
+            "dither_brake": 0.0, "dither_accel": 0.0, "sweep": 0.0, "cruise_sine": 0.0,
         }
         # 下りの戻し（RAMP_RELEASE。2026-10-14 段2o-5）。RAMP_UP の頭で作り直す
         self._rp_release_done: set[int] = set()  # 戻し済み（飛ばした分を含む）の点の番号
@@ -1357,6 +1392,7 @@ class PatternLoop:
         assert self._phase_started_at is not None
         elapsed = max(0.0, now - self._phase_started_at)
         if self._phase in _RAMP_PHASES:
+            self._rp_cmd_now = now  # 2026-11-10 段10c: 正弦波の位相用
             return self._ramp_command()
         if self._phase is _Phase.DRIVE_ACCEL:
             ramped = self._coast_accel_opening(pattern, now)
@@ -1611,7 +1647,9 @@ class PatternLoop:
             # 2026-10-10 段2l-10: RAMP_HOLD も RAMP_UP と同じ（アクセルに入った後は下限 0。
             # 発進が終わらないまま来たときは今の u から離す向きだけ）
             lo = 0.0 if self._rp_accel_reached else min(0.0, self._rp_u)
-        elif self._phase in (_Phase.RAMP_CRUISE, _Phase.RAMP_ACCEL_DITHER):
+        elif self._phase in (
+            _Phase.RAMP_CRUISE, _Phase.RAMP_CRUISE_SINE, _Phase.RAMP_ACCEL_DITHER
+        ):
             # 2026-10-13 段2o-2: 保持の下限は、ブレーキ側（u ＜ 0）で入ったときは今の u
             # （離す向きだけ）、
             # 0 以上なら 0。下りのラッチ（上限 0）は外してアクセルで保つ。`_rp_accel_reached` を
@@ -1682,6 +1720,10 @@ class PatternLoop:
             accel = 0.0
             brake = ff.brake_deadband_pct - u
         else:
+            if self._phase is _Phase.RAMP_CRUISE_SINE:
+                # 2026-11-10 段10c: 保持の PI の出力 u に正弦波を足す（u 自体は変えない）。
+                # u ＝ 0（min）を下回らない・ブレーキは min のまま
+                u = max(0.0, u + self._ramp_cruise_sine_offset(self._rp_cmd_now))
             accel = ff.accel_deadband_pct + u if u > 0.0 else 0.0
             brake = ff.brake_deadband_pct - u if u < 0.0 else 0.0
         self._accel_request = accel
@@ -1734,9 +1776,11 @@ class PatternLoop:
         self._rp_down_begun = False
         self._rp_cruise_n = 0
         self._rp_cruise_done_n = 0
+        self._rp_sine_n = 0
+        self._rp_sine_skipped = 0
         self._rp_acc = {
             "up": 0.0, "cruise": 0.0, "hold": 0.0, "down": 0.0, "release": 0.0,
-            "dither_brake": 0.0, "dither_accel": 0.0, "sweep": 0.0,
+            "dither_brake": 0.0, "dither_accel": 0.0, "sweep": 0.0, "cruise_sine": 0.0,
         }
         self._rp_dither_brake_done = set()
         self._rp_dither_brake_n = 0
@@ -1872,7 +1916,8 @@ class PatternLoop:
             # 開度を固定で持つ（基準は進めない。2026-10-13 段2o-2。戻しも同じ。2026-10-14 段2o-5:
             # 戻しを出るときの `_rp_turn_g0` が 0 になり、g_ref は 0 → −G で始まる）
             return 0.0
-        if self._phase is _Phase.RAMP_CRUISE:
+        if self._phase in (_Phase.RAMP_CRUISE, _Phase.RAMP_CRUISE_SINE):
+            # 2026-11-10 段10c: 正弦波の間も保持と同じ（基準は 0 G のまま）
             # 2026-10-13 段2o-2: 入った時点の実測（±G）→ 0 を ramp_turn_time_s で直線、その後 0
             if cfg.ramp_turn_time_s <= 0.0:
                 return 0.0
@@ -2279,7 +2324,9 @@ class PatternLoop:
         self._rp_e_prev = e
 
         if (
-            self._phase in (_Phase.RAMP_UP, _Phase.RAMP_CRUISE, _Phase.RAMP_HOLD)
+            self._phase in (
+                _Phase.RAMP_UP, _Phase.RAMP_CRUISE, _Phase.RAMP_CRUISE_SINE, _Phase.RAMP_HOLD
+            )
             and self._rp_u >= 0.0
         ):
             if (
@@ -2419,7 +2466,11 @@ class PatternLoop:
             return None
         measured_g = accel_kmhs / G_TO_KMHS
         lagged = self._ramp_lagged_openings(now)
-        if lagged is not None and now - self._rp_record_t >= 1.0:
+        # 2026-11-10 段10c: 正弦波の間の点は上限 G マップに貯めない（1 Hz の動きの点は表の効きと別）
+        if (
+            lagged is not None and now - self._rp_record_t >= 1.0
+            and self._phase is not _Phase.RAMP_CRUISE_SINE
+        ):
             lag_a, lag_b = lagged
             mean_v = sum(v for _, v in hist) / len(hist)
             # 2026-10-07 段2l-4: 両ペダルが待機位置にいるので「0 超・0.05 以下」では判定できない。
@@ -2487,6 +2538,9 @@ class PatternLoop:
         )
         if self._phase is _Phase.RAMP_CRUISE:
             self._advance_ramp_cruise(pattern, speed, now, measured_accel)
+            return
+        if self._phase is _Phase.RAMP_CRUISE_SINE:
+            self._advance_ramp_cruise_sine(pattern, speed, now)
             return
         if self._phase is _Phase.HOLD_STEP:
             self._advance_hold_step(speed, now)
@@ -2604,6 +2658,7 @@ class PatternLoop:
         区間（フェーズ）を切り替える前に呼ぶ。HOLD_STEP は保持（hold）に数える。"""
         key = {
             _Phase.RAMP_UP: "up", _Phase.RAMP_CRUISE: "cruise",
+            _Phase.RAMP_CRUISE_SINE: "cruise_sine",
             _Phase.RAMP_HOLD: "hold", _Phase.HOLD_STEP: "hold", _Phase.RAMP_DOWN: "down",
             _Phase.RAMP_RELEASE: "release", _Phase.RAMP_RELEASE_SWEEP: "sweep",
             _Phase.RAMP_BRAKE_DITHER: "dither_brake", _Phase.RAMP_ACCEL_DITHER: "dither_accel",
@@ -2711,12 +2766,74 @@ class PatternLoop:
             or (up and speed >= pattern.top_kmh)
             or (not up and speed <= STOP_SPEED_KMH)
         )
+        if done and not (timed_out or unsafe) and self._ramp_cruise_sine_try_enter(now):
+            return  # 2026-11-10 段10c: 保持を出る直前に正弦波（出るのは正弦波の後）
         if done and up and not (timed_out or unsafe) and self._ramp_dither_accel_try_enter(
             now
         ):
             return  # 2026-10-28 段2: 保持を出る直前に小さな動き（出るのは dither の後）
         if done or timed_out or unsafe:
             self._ramp_cruise_exit(pattern, speed, now, done)
+
+    def _ramp_cruise_sine_total_s(self) -> float:
+        """正弦波の流れの全体の秒数 ＝ 周期数 ÷ 周波数（2026-11-10 段10c）。"""
+        cfg = self._config
+        return cfg.ramp_cruise_sine_periods / max(cfg.ramp_cruise_sine_hz, 1e-6)
+
+    def _ramp_cruise_sine_try_enter(self, now: float) -> bool:
+        """保持（RAMP_CRUISE）が帯の時間で完了したとき、アクセルで保持していて（u ＞ 0）
+        u − A ≥ 0 なら RAMP_CRUISE_SINE へ入る。入ったら True。入れない（ブレーキ側・u が A 未満）
+        ときは `cruise_sine_skipped` に数えて False（保持は今のまま出る）。off なら何も数えない。
+        2026-11-10 ProblemReport_20261109 段10c。"""
+        cfg = self._config
+        if not cfg.ramp_cruise_sine_enabled:
+            return False
+        amp = cfg.ramp_cruise_sine_amplitude_pct
+        u = self._rp_u
+        if u <= 0.0 or u - amp < 0.0:
+            self._rp_sine_skipped += 1
+            return False
+        self._ramp_account(now)  # ここまでは保持の時間
+        self._rp_sine_t0 = now
+        self._rp_sine_n += 1
+        self._phase = _Phase.RAMP_CRUISE_SINE  # `_enter_phase` は通さない（`_rp_hist` を残す）
+        self._skip_count = 0
+        return True
+
+    def _ramp_cruise_sine_offset(self, now: float) -> float:
+        """正弦波の指令への足し分 A·sin(2πf(t − 入った時刻)) [%]（正弦波のフェーズ以外は 0）。"""
+        if self._phase is not _Phase.RAMP_CRUISE_SINE:
+            return 0.0
+        cfg = self._config
+        t = max(0.0, now - self._rp_sine_t0)
+        return cfg.ramp_cruise_sine_amplitude_pct * math.sin(
+            2.0 * math.pi * cfg.ramp_cruise_sine_hz * t
+        )
+
+    def _advance_ramp_cruise_sine(self, pattern: GRampPattern, speed: float, now: float) -> None:
+        """RAMP_CRUISE_SINE の前進。周期数ぶん経ったら、または安全網（実車速が最高速の
+        頭打ちを超えた・上りで上端に着いた・下りで停車した・保持と同じ時間切れ）で
+        `_ramp_cruise_exit`（保持を完了して元の区間へ戻る。上りは dither が入れるならその後）。
+        保持の PI は RAMP_CRUISE と同じに回す
+        （u は PI の出力のまま。正弦波は指令にだけ足す。`_ramp_command`）。帯の判定はしない。"""
+        cfg = self._config
+        up = self._rp_cruise_dir > 0
+        t = max(0.0, now - self._rp_sine_t0)
+        finished = t >= self._ramp_cruise_sine_total_s()
+        sine_s = self._ramp_cruise_sine_total_s()
+        limit_s = cfg.ramp_turn_time_s + cfg.ramp_cruise_timeout_s + sine_s
+        timed_out = now - self._rp_cruise_started >= limit_s
+        unsafe = (
+            speed > self._accel_speed_cap
+            or (up and speed >= pattern.top_kmh)
+            or (not up and speed <= STOP_SPEED_KMH)
+        )
+        if finished and not (timed_out or unsafe):
+            if up and self._ramp_dither_accel_try_enter(now):
+                return
+            self._ramp_cruise_exit(pattern, speed, now, True)
+        elif unsafe or timed_out:
+            self._ramp_cruise_exit(pattern, speed, now, finished)
 
     def _ramp_cruise_exit(
         self, pattern: GRampPattern, speed: float, now: float, done: bool
@@ -3419,6 +3536,9 @@ class PatternLoop:
                 sweep_n=self._rp_sweep_n,
                 sweep_skipped=self._rp_sweep_skipped,
                 sweep_timeout_n=self._rp_sweep_timeout_n,
+                cruise_sine_s=self._rp_acc["cruise_sine"],
+                cruise_sine_n=self._rp_sine_n,
+                cruise_sine_skipped=self._rp_sine_skipped,
             )
         )
 

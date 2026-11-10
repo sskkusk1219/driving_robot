@@ -514,6 +514,21 @@ def test_read_fwd_rows_phases_filters_rows_and_default_does_not(tmp_path: Path) 
     assert len(read(path, phases=None)) == len(both)  # 既定は絞らない
 
 
+def test_read_fwd_rows_excludes_cruise_sine_rows_unless_named(tmp_path: Path) -> None:
+    """2026-11-10 段10c: 保持の正弦波（RAMP_CRUISE_SINE）の行は学習に使わない（既定）。phases で
+    名指しすれば読める。"""
+    a = make_rows(30, lambda t: 40.0 + 0.5 * t, accel=14.0, phase="RAMP_CRUISE")
+    b = make_rows(
+        30, lambda t: 50.0 + 0.5 * (t - 5.0), accel=14.0, t0=5.0, phase="RAMP_CRUISE_SINE"
+    )
+    c = make_rows(30, lambda t: 60.0 + 0.5 * (t - 10.0), accel=14.0, t0=10.0, phase="RAMP_UP")
+    path = write_csv(tmp_path / "s.csv", a + b + c)
+    r = read(path)
+    assert not ((r.t_s >= 5.0) & (r.t_s < 8.0)).any()
+    assert (r.t_s < 3.0).any() and (r.t_s >= 10.0).any()
+    assert len(read(path, phases=("RAMP_CRUISE_SINE",))) > 0
+
+
 def _breakaway_rows(section: str, phase: str, brake_at_move: float, t0: float = 0.0):
     """停車（t0〜t0+1）で brake を 10 → brake_at_move へゆっくり離し、1 秒から動き出す。"""
     out = []

@@ -32,13 +32,23 @@ RAMP_HOLD）からも測る（`fit_cruise`）。dither は手順2 では off で
 `local_gain_at` がそのまま引ける）。閉ループの中からの推定なので、手順2 の遅れの測定の
 HOLD_STEP（開度固定 ＝ 開ループ）のアクセルのステップで同じ倍率を検算できる（`hold_step_ratios`）。
 
+2026-11-10 ProblemReport_20261109 段10c: 手順2 の定速の保持の正弦波（RAMP_CRUISE_SINE。保持の PI の
+出力に A·sin(2πft) を足す）から、1 Hz 付近の効きを測る（`fit_cruise_sine`）。保持ごとに最初の 1
+周期を
+捨て、車速と実開度（accel_actual_pct）に 3 次のトレンドと f の正弦波を同時に当てはめて（excite.py の
+解析と同じ式）|P|・位相・SNR を出す。倍率 r ＝ |P|·2πf ÷ 表の感度 S（その保持の平均の車速・開度で
+中心差分）。結果は meta `local_gain_accel_hf`（車速 20 km/h 刻みの中央値）に残す（段7 の
+`local_gain_accel_cruise` とは別。ゆっくり・大きな変化の倍率と 1 Hz 付近の倍率は別の数）。
+
 純関数が中心（config・ハードウェアには触らない）。src/ は import しない。
 """
 
 from __future__ import annotations
 
+import cmath
 import csv
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -726,3 +736,286 @@ def _hold_step_one(
     if not math.isfinite(k_tab) or abs(k_tab) < MIN_TABLE_SLOPE:
         return
     out.append((v_mean, ((a1 - a0) / (o1 - o0)) / k_tab))
+
+
+# ── 段10c: 定速の保持の正弦波（RAMP_CRUISE_SINE）からの 1 Hz 付近の効き ──────
+# 2026-11-10 ProblemReport_20261109 段10c
+PHASE_RAMP_CRUISE_SINE = "RAMP_CRUISE_SINE"
+# 3 次のトレンド（excite.py の _TREND_DEGREE と同じ。理由は ProblemReport_20260921: 1 次だと
+# 到達フェーズの整定の尾の曲がりが正弦波成分に漏れ、ゲイン・位相にバイアスが乗る）
+SINE_TREND_DEGREE = 3
+# SNR の下限。仮の値（段10b の加振で SNR 4〜8 が取れた。3
+# 未満はその周波数成分が他の変動に埋もれる）。
+# 効く先: 捨てる保持の数。決める時期: 段10e（SNR の分布を見て）
+SINE_MIN_SNR = 3.0
+# 表の感度を引く開度の幅 [%]（loop_margin.operating_point の du と同じ 0.5。中心差分）
+SINE_TABLE_H_PCT = 0.5
+# 当てはめに必要な行数の下限（計画行列の列数 トレンド 4 ＋ cos/sin 2 に余裕を足した値）
+SINE_MIN_ROWS = 10
+# 加振 CSV（excite.py）のブロック名 `<車速>kmh_<周波数>Hz`（_brake なしだけ読む）
+EXCITE_BLOCK_RE = re.compile(r"^(?P<v>\d+(?:\.\d+)?)kmh_(?P<f>\d+(?:\.\d+)?)Hz$")
+# 正弦波の周波数の既定 [Hz]（learning.ramp_cruise_sine_hz の既定と同じ。CSV には周波数が残らないので
+# 付ける側が渡す。渡されなければこれ）
+SINE_HZ_DEFAULT = 1.2
+EXCITE_SKIP_S = 2.0  # excite.analyze の既定（先頭の過渡）
+
+
+@dataclass(frozen=True)
+class SineSegment:
+    """正弦波の区間 1 回分（RAMP_CRUISE_SINE の連続行）。開度は絶対 [%]（accel_actual_pct と
+    accel_cmd_pct。読めない行は互いで埋める）。"""
+
+    t_s: np.ndarray
+    speed_kmh: np.ndarray
+    accel_actual_pct: np.ndarray
+    accel_cmd_pct: np.ndarray
+
+
+@dataclass(frozen=True)
+class SineResponse:
+    """正弦波の当てはめの結果（1 区間）。"""
+
+    n_rows: int
+    abs_p_kmh_per_pct: float  # 車速の振幅 ÷ 開度の振幅
+    phase_deg: float  # 車速が開度に対して遅れる向きを負で表す
+    snr: float  # 車速の振幅 ÷ 残差（トレンドと f の成分を除いた後）の RMS
+    speed_amp_kmh: float
+    opening_amp_pct: float
+    v_mean_kmh: float
+    u_mean_pct: float  # 開度の平均（絶対 [%]）
+
+
+@dataclass
+class SineFit:
+    """保持の正弦波からの測定結果。entry は meta に入れる dict（採れなければ None）。"""
+
+    entry: dict[str, Any] | None
+    hz: float
+    n_segments: int = 0
+    n_used: int = 0
+    reason: str = ""
+    reject: dict[str, int] = field(default_factory=dict)
+    per_segment: list[dict[str, float]] = field(default_factory=list)  # 採った区間ごとの値
+    by_speed: dict[float, list[float]] = field(default_factory=dict)  # 行の車速 → r
+
+
+def _sine_design(t: np.ndarray, hz: float) -> np.ndarray:
+    span = float(np.ptp(t))
+    tt = np.zeros_like(t) if span <= 0.0 else (t - t.mean()) / (span / 2.0)
+    cols = [tt**k for k in range(SINE_TREND_DEGREE + 1)]
+    return np.column_stack(
+        [*cols, np.cos(2.0 * np.pi * hz * t), np.sin(2.0 * np.pi * hz * t)]
+    )
+
+
+def _fit_sine(t: np.ndarray, x: np.ndarray, hz: float) -> tuple[complex, np.ndarray]:
+    """3 次のトレンドと hz の正弦波を 1 回の最小二乗で同時に当てはめる
+    （excite._fit_sinusoid と同じ）。複素成分は離散フーリエ和の規約
+    （2·|big|/n が振幅・angle(big) が位相）。残差も返す。"""
+    design = _sine_design(t, hz)
+    coeffs, *_ = np.linalg.lstsq(design, x, rcond=None)
+    big = 0.5 * len(t) * complex(coeffs[-2], -coeffs[-1])
+    return big, x - design @ coeffs
+
+
+def sine_response(
+    t_s: np.ndarray, v_kmh: np.ndarray, u_pct: np.ndarray, hz: float, *, skip_s: float,
+) -> SineResponse | None:
+    """区間の先頭 skip_s（過渡）を捨て、車速 y と開度 u に正弦波を当てて |P|・位相・SNR を出す
+    （excite.analyze と同じ式）。行が足りない・開度の振幅が 0 なら None。"""
+    m = (t_s - t_s[0]) >= skip_s
+    if int(m.sum()) < SINE_MIN_ROWS:
+        return None
+    t, y, u = t_s[m], v_kmh[m], u_pct[m]
+    big_u, _ = _fit_sine(t, u, hz)
+    big_y, res_y = _fit_sine(t, y, hz)
+    if abs(big_u) <= 0.0:
+        return None
+    n = len(t)
+    speed_amp = 2.0 * abs(big_y) / n
+    rms = float(np.sqrt(np.mean(res_y**2)))
+    return SineResponse(
+        n_rows=n, abs_p_kmh_per_pct=abs(big_y) / abs(big_u),
+        phase_deg=math.degrees(cmath.phase(big_y / big_u)),
+        snr=speed_amp / rms if rms > 0.0 else math.inf,
+        speed_amp_kmh=speed_amp, opening_amp_pct=2.0 * abs(big_u) / n,
+        v_mean_kmh=float(np.mean(y)), u_mean_pct=float(np.mean(u)),
+    )
+
+
+def read_sine_segments(csv_path: Path) -> list[SineSegment]:
+    """CSV から正弦波の区間を読む（phase が RAMP_CRUISE_SINE で、行間が GAP_S 未満の連続区間
+    1 つ = 1 回）。開度は accel_actual_pct（読めなければ accel_cmd_pct）。"""
+    segs: list[SineSegment] = []
+    cur: list[tuple[float, float, float, float]] = []
+    prev_t = math.nan
+
+    def flush() -> None:
+        nonlocal cur
+        if len(cur) >= 3:
+            a = np.array(cur, dtype=float)
+            segs.append(SineSegment(a[:, 0], a[:, 1], a[:, 2], a[:, 3]))
+        cur = []
+
+    with Path(csv_path).open(newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if (r.get("phase") or "") != PHASE_RAMP_CRUISE_SINE:
+                flush()
+                prev_t = math.nan
+                continue
+            t = _num(r.get("elapsed_s"))
+            v = _num(r.get("actual_speed_kmh"))
+            act = _num(r.get("accel_actual_pct"))
+            cmd = _num(r.get("accel_cmd_pct"))
+            if act is None:
+                act = cmd
+            if cmd is None:
+                cmd = act
+            if t is None or v is None or act is None or cmd is None:
+                continue
+            if cur and not (0.0 < t - prev_t < GAP_S):
+                flush()
+            prev_t = t
+            cur.append((t, v, act, cmd))
+    flush()
+    return segs
+
+
+def sine_ratio(
+    resp: SineResponse, table: Any, accel_min_pct: float, hz: float,
+) -> tuple[float | None, float]:
+    """倍率 r ＝ |P|·2πf ÷ 表の感度 S と S を返す。
+    S は (区間の平均の車速, 平均の u ＝ 平均開度 − min) のまわり ±SINE_TABLE_H_PCT の
+    中心差分（u の下は 0）。S が有限の正でなければ r は None。"""
+    u_mean = resp.u_mean_pct - accel_min_pct
+    sens = table_slope_at(table, resp.v_mean_kmh, u_mean, SINE_TABLE_H_PCT)
+    if not math.isfinite(sens) or sens <= MIN_TABLE_SLOPE:
+        return None, sens
+    return resp.abs_p_kmh_per_pct * 2.0 * math.pi * hz / sens, sens
+
+
+def fit_cruise_sine(
+    segments: Sequence[SineSegment], table: Any, *, accel_min_pct: float, hz: float,
+    min_snr: float = SINE_MIN_SNR, use: str = "actual",
+) -> SineFit:
+    """保持の正弦波の区間から、車速ごとの倍率 r の表を作る。区間ごとに最初の 1 周期（1 ÷ hz 秒）を
+    捨てて当てはめ、SNR が min_snr 未満・表の感度が無効な区間は捨てる（`reject`: rows・snr・sens）。
+    use は開度の列（"actual" ＝ accel_actual_pct・"cmd" ＝ accel_cmd_pct）。
+    表（entry）: speed_rep_kmh（accel_speed_rep の 20 km/h 刻み）ごとの r の中央値（ratio）・
+    数（n）・
+    |P| の中央値（abs_p）・位相の中央値（phase_deg）。clip はしない（C10 が使う側で扱う）。"""
+    fit = SineFit(entry=None, hz=float(hz), n_segments=len(segments))
+    rows: list[tuple[float, float, float, float]] = []  # (rep, r, |P|, phase)
+    for seg in segments:
+        u = seg.accel_actual_pct if use == "actual" else seg.accel_cmd_pct
+        resp = sine_response(seg.t_s, seg.speed_kmh, u, hz, skip_s=1.0 / hz)
+        if resp is None:
+            fit.reject["rows"] = fit.reject.get("rows", 0) + 1
+            continue
+        if not resp.snr >= min_snr:
+            fit.reject["snr"] = fit.reject.get("snr", 0) + 1
+            continue
+        ratio, sens = sine_ratio(resp, table, accel_min_pct, hz)
+        if ratio is None:
+            fit.reject["sens"] = fit.reject.get("sens", 0) + 1
+            continue
+        rep = accel_speed_rep(resp.v_mean_kmh)
+        rows.append((rep, ratio, resp.abs_p_kmh_per_pct, resp.phase_deg))
+        fit.n_used += 1
+        fit.by_speed.setdefault(rep, []).append(ratio)
+        fit.per_segment.append({
+            "v_mean_kmh": resp.v_mean_kmh, "u_mean_pct": resp.u_mean_pct - accel_min_pct,
+            "abs_p": resp.abs_p_kmh_per_pct, "phase_deg": resp.phase_deg, "snr": resp.snr,
+            "sens": sens, "ratio": ratio,
+        })
+    if not rows:
+        fit.reason = f"倍率が出た区間なし（区間 {fit.n_segments}・捨てた理由 {fit.reject}）"
+        return fit
+    reps = sorted({r[0] for r in rows})
+    fit.entry = {
+        "speed_rep_kmh": [float(r) for r in reps],
+        "ratio": [float(np.median([x[1] for x in rows if x[0] == r])) for r in reps],
+        "n": [sum(1 for x in rows if x[0] == r) for r in reps],
+        "abs_p": [float(np.median([x[2] for x in rows if x[0] == r])) for r in reps],
+        "phase_deg": [float(np.median([x[3] for x in rows if x[0] == r])) for r in reps],
+    }
+    return fit
+
+
+def attach_sine_to_meta(meta: dict[str, Any], fit: SineFit, source: str) -> bool:
+    """meta に local_gain_accel_hf（と _hz・_source・_n_segments・_n_used）を入れる。
+    倍率の表が無ければ False（meta は変えない）。"""
+    if fit.entry is None:
+        return False
+    meta["local_gain_accel_hf"] = fit.entry
+    meta["local_gain_accel_hf_hz"] = float(fit.hz)
+    meta["local_gain_accel_hf_source"] = source
+    meta["local_gain_accel_hf_n_segments"] = int(fit.n_segments)
+    meta["local_gain_accel_hf_n_used"] = int(fit.n_used)
+    return True
+
+
+def hf_ratio_at(entry: Mapping[str, Any] | None, v_kmh: float) -> float | None:
+    """meta local_gain_accel_hf の倍率 r(v)（車速で直線補間・測った範囲の外は端の値）。
+    entry が無い・空なら None（呼ぶ側で k ＝ 1）。"""
+    if not entry:
+        return None
+    reps = np.asarray(entry.get("speed_rep_kmh", []), dtype=float)
+    ratio = np.asarray(entry.get("ratio", []), dtype=float)
+    if len(reps) == 0 or len(reps) != len(ratio):
+        return None
+    return float(np.interp(float(v_kmh), reps, ratio))
+
+
+@dataclass(frozen=True)
+class ExciteBlock:
+    """加振 CSV のブロック（アクセル。`<車速>kmh_<周波数>Hz`）の時系列。"""
+
+    pattern: str
+    v_star_kmh: float
+    hz: float
+    t_s: np.ndarray
+    speed_kmh: np.ndarray
+    accel_actual_pct: np.ndarray
+    accel_cmd_pct: np.ndarray
+
+
+def read_excite_blocks(csv_path: Path, hz: float | None = None) -> list[ExciteBlock]:
+    """加振 CSV（section == EXCITE）のアクセルのブロックを読む。hz を渡すとその周波数だけ。
+    時刻は mode_time_s（excite.analyze と同じ）。"""
+    groups: dict[str, list[tuple[float, float, float, float]]] = {}
+    order: list[str] = []
+    with Path(csv_path).open(newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r.get("section") != "EXCITE":
+                continue
+            pat = r.get("pattern", "") or ""
+            m = EXCITE_BLOCK_RE.match(pat)
+            if m is None or (hz is not None and abs(float(m.group("f")) - hz) > 1e-9):
+                continue
+            t = _num(r.get("mode_time_s"))
+            v = _num(r.get("actual_speed_kmh"))
+            cmd = _num(r.get("accel_cmd_pct"))
+            act = _num(r.get("accel_actual_pct"))
+            if act is None:
+                act = cmd
+            if cmd is None:
+                cmd = act
+            if t is None or v is None or act is None or cmd is None:
+                continue
+            if pat not in groups:
+                groups[pat] = []
+                order.append(pat)
+            groups[pat].append((t, v, act, cmd))
+    out: list[ExciteBlock] = []
+    for pat in order:
+        a = np.array(groups[pat], dtype=float)
+        m = EXCITE_BLOCK_RE.match(pat)
+        assert m is not None
+        out.append(
+            ExciteBlock(
+                pat, float(m.group("v")), float(m.group("f")),
+                a[:, 0], a[:, 1], a[:, 2], a[:, 3],
+            )
+        )
+    return out

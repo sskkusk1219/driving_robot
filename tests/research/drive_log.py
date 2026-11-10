@@ -774,6 +774,12 @@ def total_effort(row: Mapping[str, str]) -> float | None:
     return _num(row.get("effort_pct"))
 
 
+# 2026-11-10 ProblemReport_20261109 段10c: 表（本体・発進側・停止側）の学習に使わない phase。
+# 保持の正弦波（pattern_loop の RAMP_CRUISE_SINE）は 1 Hz では効きが約 3 倍に見えるので、表の傾きが
+# ゆがむのを防ぐ。CSV の phase 列と同じ文字列（学習の行を読む所が共有する）
+TRAINING_EXCLUDED_PHASES: frozenset[str] = frozenset({"RAMP_CRUISE_SINE"})
+
+
 def read_drive_logs(path: Path, *, label: str = "cmd") -> list[DriveLog]:
     """CSV → 本番 model_training が受け取る DriveLog の列（パターン走行の行だけ）。
 
@@ -795,6 +801,8 @@ def read_drive_logs(path: Path, *, label: str = "cmd") -> list[DriveLog]:
         for row in csv.DictReader(f):
             if "section" in row and row["section"] != SECTION_PATTERN_DRIVE:
                 continue
+            if (row.get("phase") or "") in TRAINING_EXCLUDED_PHASES:
+                continue  # 2026-11-10 段10c: 保持の正弦波の行は学習に使わない
             if label == "actual":
                 accel_label = actual_opening(row, "accel")
                 brake_label = actual_opening(row, "brake")

@@ -31,6 +31,7 @@ from tests.research.drive_log import (
     SECTION_MODE_DRIVE,
     SECTION_PATTERN_DRIVE,
     SECTION_PEDAL_SEARCH,
+    TRAINING_EXCLUDED_PHASES,
     actual_opening,
     cmd_opening,
 )
@@ -302,6 +303,12 @@ def read_fwd_rows(
             if section not in sections or t is None:
                 continue
             if phases is not None and (r.get("phase") or "") not in phases:
+                continue
+            # 2026-11-10 段10c: 保持の正弦波の行は学習に使わない（phases
+            # で名指しされたときだけ読む）
+            row_phase = r.get("phase") or ""
+            excluded = row_phase in TRAINING_EXCLUDED_PHASES
+            if excluded and (phases is None or row_phase not in phases):
                 continue
             speed = _num(r.get("actual_speed_kmh"))
             new_seg = (

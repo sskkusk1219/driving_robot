@@ -434,7 +434,7 @@ def _ramp_total_s(r: RampResult) -> float:
     """G ランプ 1 本の合計秒数（加速・保持・減速・途中保持・戻し・dither・ゆっくり戻す）。"""
     return (
         r.up_s + r.hold_s + r.down_s + r.cruise_s + r.release_s + r.dither_brake_s
-        + r.dither_accel_s + r.sweep_s
+        + r.dither_accel_s + r.sweep_s + r.cruise_sine_s
     )
 
 
@@ -456,7 +456,8 @@ def result_table(
         "加速G中央値 | 減速G中央値 | 最高km/h | 途中保持 秒 | 途中保持 達成/入った | "
         "戻し 秒 | 戻し 入った/飛ばした | 効き始め アクセル | 効き始め ブレーキ | "
         "dither ブレーキ 秒 | dither ブレーキ 入った/飛ばした | dither アクセル 秒 | "
-        "dither アクセル 入った/飛ばした | ゆっくり戻す 秒 | ゆっくり戻す 入った/飛ばした/打ち切り"
+        "dither アクセル 入った/飛ばした | ゆっくり戻す 秒 | "
+        "ゆっくり戻す 入った/飛ばした/打ち切り | 保持の正弦波 秒 | 保持の正弦波 入った/飛ばした"
     )
     lines = [head, "-" * len(head)]
     for i, item in enumerate(order):
@@ -482,6 +483,8 @@ def result_table(
             f" | {r.dither_accel_s:>6.1f} | {r.dither_accel_n}/{r.dither_accel_skipped}"
             # 2026-10-31 段2: ゆっくり戻す（RAMP_RELEASE_SWEEP。合計秒に含む）
             f" | {r.sweep_s:>6.1f} | {r.sweep_n}/{r.sweep_skipped}/{r.sweep_timeout_n}"
+            # 2026-11-10 段10c: 保持の正弦波（RAMP_CRUISE_SINE。合計秒に含む）
+            f" | {r.cruise_sine_s:>6.1f} | {r.cruise_sine_n}/{r.cruise_sine_skipped}"
         )
     lines.append(f"全体の所要秒数: {total_s:.0f} s（{total_s / 60:.1f} 分）")
     return "\n".join(lines)
@@ -673,6 +676,11 @@ def loop_config_from_config(
         ramp_cruise_band_g=lr.ramp_cruise_band_g,
         ramp_cruise_hold_s=lr.ramp_cruise_hold_s,
         ramp_cruise_timeout_s=lr.ramp_cruise_timeout_s,
+        # 2026-11-10 段10c: 保持の完了時の正弦波（既定 off）
+        ramp_cruise_sine_enabled=lr.ramp_cruise_sine_enabled,
+        ramp_cruise_sine_hz=lr.ramp_cruise_sine_hz,
+        ramp_cruise_sine_amplitude_pct=lr.ramp_cruise_sine_amplitude_pct,
+        ramp_cruise_sine_periods=lr.ramp_cruise_sine_periods,
         # 2026-10-13 段2o-2: 遅れの測定のステップ（開度を固定で持つ）
         ramp_lag_step_g=lr.ramp_lag_step_g,
         ramp_lag_step_hold_s=lr.ramp_lag_step_hold_s,
@@ -810,6 +818,13 @@ async def run_pattern_drive(
         say(f"途中の定速保持（段2o-2）: 実測の加速度が ±{loop_config.ramp_cruise_band_g:g}G 以内の"
             f"時間が合計 {loop_config.ramp_cruise_hold_s:g} 秒で次へ（入ってから {limit_s:g} 秒で"
             "打ち切り）。保持中は偏差の項が両方向")
+        if loop_config.ramp_cruise_sine_enabled:
+            say(f"保持の正弦波（段10c）: アクセルで保持しているとき、保持の完了後に指令へ "
+                f"{loop_config.ramp_cruise_sine_amplitude_pct:g}% × sin(2π × "
+                f"{loop_config.ramp_cruise_sine_hz:g} Hz) を足して "
+                f"{loop_config.ramp_cruise_sine_periods} 周期（"
+                f"{loop_config.ramp_cruise_sine_periods / loop_config.ramp_cruise_sine_hz:.1f} 秒）"
+                "続ける（phase RAMP_CRUISE_SINE。表の学習には使わない）")
     if any(isinstance(p, GRampPattern) and p.release_stations for p in patterns):
         fracs = " → ".join(f"{f:g}" for f in loop_config.ramp_release_fracs)
         holds = "・".join(f"{h:g}" for h in loop_config.ramp_release_hold_s)
@@ -1145,14 +1160,46 @@ def _attach_pedal_track(table: Any, csv_path: Path) -> None:
 
 
 def _attach_local_gain(
-    table: Any, csv_path: Path, brake_speeds_kmh: Sequence[float] | None = None
+    table: Any, csv_path: Path, brake_speeds_kmh: Sequence[float] | None = None,
+    sine_hz: float | None = None,
 ) -> bool:
     """表の meta に、局所の効きの倍率の表を入れる。dither（ブレーキ・アクセル。
-    `_attach_dither_gain`）と、定速の保持（アクセル。`_attach_cruise_gain`。2026-11-10 段7）の
-    両方を試し、どちらかが入れば True。"""
+    `_attach_dither_gain`）と、定速の保持（アクセル。`_attach_cruise_gain`。2026-11-10 段7）と、
+    保持の正弦波（`_attach_cruise_sine_gain`。段10c。正弦波の区間があるときだけ）を試し、
+    どれかが入れば True。sine_hz は正弦波の周波数（learning.ramp_cruise_sine_hz。None は
+    local_gain.SINE_HZ_DEFAULT）。"""
     ok_dither = _attach_dither_gain(table, csv_path, brake_speeds_kmh)
     ok_cruise = _attach_cruise_gain(table, csv_path)
-    return ok_dither or ok_cruise
+    ok_sine = _attach_cruise_sine_gain(table, csv_path, sine_hz)
+    return ok_dither or ok_cruise or ok_sine
+
+
+def _attach_cruise_sine_gain(table: Any, csv_path: Path, sine_hz: float | None = None) -> bool:
+    """表の meta に、アクセルの定速の保持の正弦波（RAMP_CRUISE_SINE）から測った 1 Hz 付近の効きの
+    倍率 `local_gain_accel_hf`（と周波数 `_hz`）を入れる（2026-11-10 ProblemReport_20261109
+    段10c）。
+    正弦波の区間が無い CSV は何も言わず False（正弦波 off の手順2 は今までと同じ出力）。"""
+    hz = local_gain.SINE_HZ_DEFAULT if sine_hz is None else float(sine_hz)
+    segs = local_gain.read_sine_segments(csv_path)
+    if not segs:
+        return False
+    amin = float(table.meta.get("accel_deadband_pct", math.nan))
+    if not math.isfinite(amin):
+        say("  保持の正弦波の効き: 表の meta に min が無く測れず。meta に入れない")
+        return False
+    fit = local_gain.fit_cruise_sine(segs, table, accel_min_pct=amin, hz=hz)
+    if fit.entry is None:
+        say(f"  保持の正弦波の効き[アクセル]: 倍率の表なし（{fit.reason}）")
+        return False
+    rows = "・".join(
+        f"{rep:g}km/h {float(np.median(vals)):.2f}倍(n={len(vals)})"
+        for rep, vals in sorted(fit.by_speed.items())
+    )
+    snrs = [d["snr"] for d in fit.per_segment]
+    say(f"  保持の正弦波の効き[アクセル] {hz:g}Hz: 区間 {fit.n_segments}・倍率が出た区間 "
+        f"{fit.n_used}・SNR 中央値 {float(np.median(snrs)):.1f}（捨てた理由 {fit.reject}）")
+    say(f"    車速の行ごとの倍率の中央値: {rows}")
+    return local_gain.attach_sine_to_meta(table.meta, fit, csv_path.name)
 
 
 def _attach_cruise_gain(table: Any, csv_path: Path) -> bool:
@@ -1292,6 +1339,7 @@ def _build_table_model(
     announce: bool = True,
     lags: MeasuredLags | None = None,
     local_gain_brake_speeds_kmh: Sequence[float] | None = None,
+    local_gain_sine_hz: float | None = None,
 ) -> _BuiltModel:
     """C7: 走行 CSV から順モデルの表（車速 × 効く開度 u → 加速度）を作って保存する。
 
@@ -1309,7 +1357,7 @@ def _build_table_model(
     _attach_onsets(table, profile, csv_path)
     _attach_returns(table, csv_path)
     _attach_pedal_track(table, csv_path)
-    _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh)
+    _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh, local_gain_sine_hz)
     _attach_release_gain(table, [csv_path])
     path = save_table(table, _forward_pkl_path(models_dir, "fwd_table", hw_mode))
     say(f"  u の原点（min）: アクセル {st.accel_deadband_pct:g}・"
@@ -1774,6 +1822,7 @@ def _build_forward_model(
     local_gain_brake_speeds_kmh: Sequence[float] | None = None,
     stop_table_sub_min_weight: bool = False,
     launch_table_sub_min_weight: bool = False,
+    local_gain_sine_hz: float | None = None,
 ) -> _BuiltModel:
     """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
 
@@ -1806,6 +1855,7 @@ def _build_forward_model(
     like = _build_table_model(
         profile, csv_path, models_dir, hw_mode, announce=False, lags=lags,
         local_gain_brake_speeds_kmh=local_gain_brake_speeds_kmh,
+        local_gain_sine_hz=local_gain_sine_hz,
     )
     st = fwd_tool.settings_of_table(
         load_forward_map(Path(like.model_path)), _forward_settings(profile, lags)
@@ -1891,7 +1941,7 @@ def _build_forward_model(
     _attach_onsets(table, profile, csv_path)
     _attach_returns(table, csv_path)
     _attach_pedal_track(table, csv_path)
-    _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh)
+    _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh, local_gain_sine_hz)
     _attach_release_gain(table, [csv_path])
     path = save_table(table, _forward_pkl_path(models_dir, "fwd_model", hw_mode))
     say(f"モデル保存: {path}")
@@ -2141,6 +2191,7 @@ def build_ff_model(
         built = _build_table_model(
             profile, csv_path, models_dir, hw_mode, lags=lags,
             local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
+            local_gain_sine_hz=cfg.learning.ramp_cruise_sine_hz,
         )
     elif candidate in ("C8", "C10", "C11", "C12", "C13", "C14", "C15"):  # C10〜C15: C8 と同じ pkl
         built = _build_forward_model(
@@ -2158,6 +2209,7 @@ def build_ff_model(
             side_row_speed_rep=cfg.learning.side_row_speed_rep,
             stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
             local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
+            local_gain_sine_hz=cfg.learning.ramp_cruise_sine_hz,
             stop_table_sub_min_weight=cfg.learning.stop_table_sub_min_weight,
             launch_table_sub_min_weight=cfg.learning.launch_table_sub_min_weight,
         )
@@ -2245,6 +2297,7 @@ def build_ff_model(
             side_row_speed_rep=cfg.learning.side_row_speed_rep,
             stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
             local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
+            local_gain_sine_hz=cfg.learning.ramp_cruise_sine_hz,
             stop_table_sub_min_weight=cfg.learning.stop_table_sub_min_weight,
             launch_table_sub_min_weight=cfg.learning.launch_table_sub_min_weight,
         )
