@@ -97,6 +97,26 @@ def test_plan_stop_flags_use_the_original_reference() -> None:
     assert jump_sm < jump_orig
 
 
+def test_max_offset_caps_the_gap_and_keeps_small_offsets() -> None:
+    mode = _mode(TRAPEZOID)
+    orig = mdmod.ReferenceSpeed(mode)
+    plain = mdmod.SmoothedReference(mode, 0.5)
+    capped = mdmod.make_target_reference(mode, 0.5, 0.1)
+    ts = np.arange(0.0, 35.0, 0.01)
+    gap = np.array([capped.at(t) - orig.at(t) for t in ts])
+    assert np.abs(gap).max() <= 0.1 + 1e-9
+    assert np.abs(gap).max() > 0.09  # 肩では実際に上限で切られている
+    for t in ts:
+        d = plain.at(t) - orig.at(t)
+        if abs(d) < 0.1 and orig.at(t) > 1e-6:
+            assert capped.at(t) == pytest.approx(plain.at(t), abs=1e-9)
+    # 0 は上限なし（今と同じ）
+    zero = mdmod.make_target_reference(mode, 0.5, 0.0)
+    assert all(zero.at(t) == plain.at(t) for t in ts[::50])
+    assert "±0.1" in mdmod.ref_smooth_text(0.5, 0.1)
+    assert "±" not in mdmod.ref_smooth_text(0.5)
+
+
 def test_csv_has_ref_smooth_column_at_the_end() -> None:
     assert dlmod.CSV_COLUMNS[-1] == "ref_smooth_kmh"
     assert dlmod.CSV_COLUMNS.index("pred_dev_kmh") == len(dlmod.CSV_COLUMNS) - 2
@@ -192,6 +212,13 @@ def test_composed_modes_and_sigma_are_validated(tmp_path: Path) -> None:
         assert any("composed_modes" in p for p in cfgmod.validate_config(cfg)), bad
     cfg.modes.composed_modes = [good]
     assert not any("composed_modes" in p for p in cfgmod.validate_config(cfg))
+    assert cfg.feedforward.ref_smooth_max_kmh == 0.0
+    for bad_max in (-1.0, 5.5):
+        cfg.feedforward.ref_smooth_max_kmh = bad_max
+        assert any("ref_smooth_max_kmh" in p for p in cfgmod.validate_config(cfg))
+    cfg.feedforward.ref_smooth_max_kmh = 0.1
+    assert not any("ref_smooth_max_kmh" in p for p in cfgmod.validate_config(cfg))
+    cfg.feedforward.ref_smooth_max_kmh = 0.0
     for sigma in (-0.1, 2.5):
         cfg.feedforward.ref_smooth_sigma_s = sigma
         assert any("ref_smooth_sigma_s" in p for p in cfgmod.validate_config(cfg))

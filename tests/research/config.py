@@ -97,6 +97,8 @@ class FeedforwardSection:
     # 表の行・C12 の惰行の補助・C13 の予測の偏差）。KPI・偏差の記録・停車の判定・ガバナー・安全網・
     # 調停は元の基準のまま
     ref_smooth_sigma_s: float = 0.0
+    # 2026-11-11 PDCA-3: ぼかした基準と元の基準の差の上限 [km/h]（0.0 ＝ 上限なし。今と完全に同じ）
+    ref_smooth_max_kmh: float = 0.0
     engine_brake_decel_kmhs: float = 1.6
     coast_decel_speeds_kmh: list[float] = field(default_factory=list)
     coast_decel_kmhs: list[float] = field(default_factory=list)
@@ -2423,6 +2425,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         0.0 <= ff.ref_smooth_sigma_s <= 2.0,
         f"feedforward.ref_smooth_sigma_s は 0〜2 秒（0 ＝ ぼかさない）: {ff.ref_smooth_sigma_s}",
+    )
+    need(
+        0.0 <= ff.ref_smooth_max_kmh <= 5.0,
+        f"feedforward.ref_smooth_max_kmh は 0〜5 km/h（0 ＝ 上限なし）: {ff.ref_smooth_max_kmh}",
     )
     _check_composed_modes(cfg.modes.composed_modes, problems)
     names = cfg.modes.coverage_mode_names

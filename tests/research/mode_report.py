@@ -170,6 +170,7 @@ class RunInfo:
     # 2026-10-19 段3: 基準のぼかし σ [s]（feedforward.ref_smooth_sigma_s。0 ＝ なし）。None は不明
     # （CSV からの作り直し）。研究系の設定はログに残らないので、ここで確かめる
     ref_smooth_sigma_s: float | None = None
+    ref_smooth_max_kmh: float = 0.0  # 2026-11-11 PDCA-3: ぼかしのずれの上限 [km/h]（0 ＝ なし）
     # 2026-10-19 段2s-2b: FEL の 1 行（mode_drive.fel_text）。None は不明（CSV からの作り直し）か
     # FF が表の候補でない
     fel_text: str | None = None
@@ -1171,7 +1172,7 @@ def write_mode_report(
                  else ("あり" if info.switch_lead_enabled else "なし")),
                 ("基準のぼかし（段3。目標側だけ。KPI・偏差は元の基準）",
                  "不明（CSV からの作り直し）" if info.ref_smooth_sigma_s is None
-                 else ref_smooth_text(info.ref_smooth_sigma_s)),
+                 else ref_smooth_text(info.ref_smooth_sigma_s, info.ref_smooth_max_kmh)),
                 ("C13 の集計（推定と CAN の差の RMS・予測の当たり具合＝L 秒後の実車速との差）",
                  "なし" if info.predictor_summary is None else info.predictor_summary),
                 ("ブレーキ寄与ほぼ0（指令はあるが惰行カーブ相当しか効いていない）",
