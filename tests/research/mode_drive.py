@@ -531,6 +531,19 @@ def d_term_dev(td_s: float, need_kmhs: float, accel_meas_kmhs: float) -> float:
     return td_s * (need_kmhs - accel_meas_kmhs)
 
 
+def d_accel_filter_step(
+    a_f_kmhs: float, prev_t: float, prev_speed_kmh: float, t: float, speed_kmh: float, tf_s: float
+) -> float:
+    """2026-11-10 ProblemReport_20261109 段12c（c10_d_accel_source ＝ "filter"）: D の実測の加速度。
+    CAN 車速の後退差分 a_raw ＝ (speed − prev_speed) ÷ dt を 1 次のローパス（時定数 tf_s）に通す。
+    a_f ＋= dt ÷ (tf ＋ dt) × (a_raw − a_f)。dt ≦ 0 は更新せず前の値を返す。"""
+    dt = t - prev_t
+    if dt <= 0.0:
+        return a_f_kmhs
+    a_raw = (speed_kmh - prev_speed_kmh) / dt
+    return a_f_kmhs + dt / (tf_s + dt) * (a_raw - a_f_kmhs)
+
+
 def hold_stop_keep_brake(
     prev_pct: float | None,
     new_pct: float,
@@ -1895,7 +1908,14 @@ def c10_small_dev_text(fm: Any) -> str:
         f"あり（e ＝ {fm.c10_small_dev_e_kmh:g} km/h・r ＝ {fm.c10_small_dev_r:g}）"
         if fm.c10_small_dev_band else "なし"
     )
-    d = f"あり（窓 {fm.c10_d_window_s:g}s・Td ＝ 遅れ L）" if fm.c10_d_term else "なし"
+    if not fm.c10_d_term:
+        d = "なし"
+    else:
+        src = (
+            f"フィルタ {fm.c10_d_filter_s:g}s"
+            if fm.c10_d_accel_source == "filter" else f"窓 {fm.c10_d_window_s:g}s"
+        )
+        d = f"あり（{src}・Td ＝ {fm.c10_d_td_coef:g} × 遅れ L）"
     return f"小さい偏差の帯 {band}・D {d}"
 
 
@@ -2343,6 +2363,9 @@ class _ModeRun:
         self._p_local_ratio: float | None = None  # 段9: C10 の P の局所の効き（掛けない行は None）
         self._p_gain_div: float | None = None
         self._d_win: deque[tuple[float, float]] = deque()  # (t, 制御に使っている車速)
+        # 段12c: filter の状態（前の周期の (t, 車速)・フィルタ後の加速度。2 点そろうまで None）
+        self._d_prev: tuple[float, float] | None = None
+        self._d_af: float | None = None
         if cfg.forward_map.stop_end_accel_pred_enabled and self.pred is None:
             self._stop_pred_tp_s = stop_end_pred_tp_s(cfg, self.ff)
         if isinstance(self.ff, StopEndFeedforward):
@@ -2808,6 +2831,15 @@ class _ModeRun:
             dwin.append((t, speed))
             while dwin and dwin[0][0] < t - self.cfg.forward_map.c10_d_window_s - 1e-9:
                 dwin.popleft()
+            if self.cfg.forward_map.c10_d_accel_source == "filter":
+                # 段12c: 後退差分を 1 次のローパスへ（最初の周期は a_f ＝ 0・D は 2 点そろってから）
+                prev = self._d_prev
+                if prev is not None:
+                    self._d_af = d_accel_filter_step(
+                        self._d_af or 0.0, prev[0], prev[1], t, speed,
+                        self.cfg.forward_map.c10_d_filter_s,
+                    )
+                self._d_prev = (t, speed)
         self._pf_row = None
         self._ho_now = 0 if self._ho_on else None
         self._ho_p_now = None
@@ -3542,10 +3574,19 @@ class _ModeRun:
             if fm_sd.c10_d_term:
                 tau_d = ff.tau_accel_s if ff_effort > 0.0 else ff.tau_brake_s
                 dwin = self._d_win
-                if tau_d is not None and ff.deviation_c > 0.0 and len(dwin) >= 3:
-                    a_meas = fit_slope([w[0] for w in dwin], [w[1] for w in dwin])
-                    # Td ＝ τ ÷ deviation_c ＝ そのペダルの遅れ L（τ を作るのに使った遅れと同じ）
-                    d_dev = d_term_dev(tau_d / ff.deviation_c, float(kwargs["need_kmhs"]), a_meas)
+                use_filter = fm_sd.c10_d_accel_source == "filter"
+                a_meas = None
+                if tau_d is not None and ff.deviation_c > 0.0:
+                    if use_filter:
+                        a_meas = self._d_af
+                    elif len(dwin) >= 3:
+                        a_meas = fit_slope([w[0] for w in dwin], [w[1] for w in dwin])
+                if a_meas is not None:
+                    # Td ＝ coef × τ ÷ deviation_c ＝ coef × そのペダルの遅れ L（既定 coef ＝ 1）
+                    d_dev = d_term_dev(
+                        fm_sd.c10_d_td_coef * tau_d / ff.deviation_c,
+                        float(kwargs["need_kmhs"]), a_meas,
+                    )
                     dev_p += d_dev
                     self._d_term_kmh, self._d_accel_kmhs = d_dev, a_meas
             kwargs["dev_kmh"] = dev_p

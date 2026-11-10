@@ -2394,6 +2394,20 @@ def test_small_dev_band_is_continuous_and_keeps_outer_slope() -> None:
     assert f(0.7, 0.2, 1.0) == pytest.approx(0.7)  # r ＝ 1 は今と同じ
 
 
+def test_d_accel_filter_step() -> None:
+    # 傾き 2 km/h/s を 0.1 s 刻みで流すと a_f は 2 へ寄る（1 周期で 2/3 だけ進む）
+    a = mdmod.d_accel_filter_step(0.0, 0.0, 0.0, 0.1, 0.2, 0.05)
+    assert a == pytest.approx(2.0 * 2.0 / 3.0)
+    a_f, t, v = 0.0, 0.0, 0.0
+    for _ in range(100):
+        a_f = mdmod.d_accel_filter_step(a_f, t, v, t + 0.1, v + 0.2, 0.05)
+        t, v = t + 0.1, v + 0.2
+    assert a_f == pytest.approx(2.0, abs=1e-6)
+    # dt <= 0 は更新しない
+    assert mdmod.d_accel_filter_step(1.5, 1.0, 5.0, 1.0, 9.0, 0.05) == 1.5
+    assert mdmod.d_accel_filter_step(1.5, 1.0, 5.0, 0.9, 9.0, 0.05) == 1.5
+
+
 def test_d_term_dev_sign_matches_dev() -> None:
     # 要る加速度より実加速度が小さい（遅れていく）なら正
     assert mdmod.d_term_dev(0.2, 1.0, 0.5) == pytest.approx(0.1)

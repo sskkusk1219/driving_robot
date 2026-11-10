@@ -1061,6 +1061,13 @@ class ForwardMapSection:
     # 効く先: 定速の揺れ・IWR。決める時期: 段5 の実機。既定 false ＝ 今と完全に同じ
     c10_d_term: bool = False
     c10_d_window_s: float = 0.3
+    # 2026-11-10 ProblemReport_20261109 段12c: D の実測の加速度の測り方。
+    # "window" ＝ 今の窓の直線の傾き、
+    # "filter" ＝ CAN 車速の後退差分を時定数 c10_d_filter_s の 1 次ローパスに通した値。
+    # Td ＝ c10_d_td_coef × L。既定（"window"・0.05・1.0）＝ 今と完全に同じ
+    c10_d_accel_source: str = "window"
+    c10_d_filter_s: float = 0.05
+    c10_d_td_coef: float = 1.0
     # 2026-11-10 ProblemReport_20261109 段9: C10 の P の加速度 dev ÷ τ だけを、
     # 手順2 の定速の保持から測った局所の効きの倍率（pkl meta local_gain_accel_cruise）で割る
     # （I・DOB は今のまま ＝ P ÷ Ti を保つのと同じ。`gain_ratio` は P＋I＋DOB 全部を割るので別）。
@@ -2275,6 +2282,18 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(
         fm.c10_d_window_s > 0.0,
         f"forward_map.c10_d_window_s は正値: {fm.c10_d_window_s}",
+    )
+    need(
+        fm.c10_d_accel_source in ("window", "filter"),
+        f"forward_map.c10_d_accel_source は window / filter: {fm.c10_d_accel_source!r}",
+    )
+    need(
+        0.0 < fm.c10_d_filter_s <= 1.0,
+        f"forward_map.c10_d_filter_s は 0 より大きく 1.0 以下: {fm.c10_d_filter_s}",
+    )
+    need(
+        0.0 < fm.c10_d_td_coef <= 5.0,
+        f"forward_map.c10_d_td_coef は 0 より大きく 5.0 以下: {fm.c10_d_td_coef}",
     )
     need(
         fm.c10_integral_low_speed in ("off", "hold", "accumulate"),

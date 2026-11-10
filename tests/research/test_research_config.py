@@ -1904,11 +1904,21 @@ def test_c10_small_dev_and_d_term_validation() -> None:
     for key, bad in (
         ("c10_small_dev_e_kmh", 0.0), ("c10_small_dev_r", 0.0), ("c10_small_dev_r", 1.5),
         ("c10_d_window_s", 0.0),
+        ("c10_d_accel_source", "bad"), ("c10_d_filter_s", 0.0), ("c10_d_filter_s", 1.5),
+        ("c10_d_td_coef", 0.0), ("c10_d_td_coef", 5.5),
     ):
         old = getattr(cfg.forward_map, key)
         setattr(cfg.forward_map, key, bad)
         assert any(key in p for p in cfgmod.validate_config(cfg)), key
         setattr(cfg.forward_map, key, old)
+
+
+def test_c10_d_accel_source_defaults() -> None:
+    """2026-11-10 段12c: 既定は今と同じ（window・0.05・1.0）。"""
+    fm0 = cfgmod.ForwardMapSection()
+    assert (fm0.c10_d_accel_source, fm0.c10_d_filter_s, fm0.c10_d_td_coef) == ("window", 0.05, 1.0)
+    cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
+    assert cfg.forward_map.c10_d_accel_source == "window"  # 引用符つきが文字列で読める
 
 
 def test_c10_p_local_gain_defaults_and_validation() -> None:

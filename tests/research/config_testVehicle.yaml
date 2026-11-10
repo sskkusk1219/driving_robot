@@ -653,6 +653,14 @@ forward_map:
   # 帯の f は D に掛けない。効く先: 定速の揺れ・IWR。決める時期: 段5 の実機
   c10_d_term: false
   c10_d_window_s: 0.3
+  # 2026-11-10 ProblemReport_20261109 段12c: D の実測の加速度の測り方と Td の係数。
+  # source: "window" ＝ 上の窓の直線の傾き（今）、"filter" ＝ CAN 車速の後退差分を時定数 c10_d_filter_s の 1 次ローパスに通した値。
+  # filter_s 0.05 s は仮の値・意見の文書の値。定速区間の差分のノイズ（>3 Hz の振れ 0.03 km/h/s、段11 `200019`）では 0.05 で足りる。
+  # td_coef 1.0: Td ＝ coef × L。段11 の勝ちの揺れの周期 Tu 1.6 s（0.62 Hz）÷ 8 ＝ 0.20 s ≈ 1.1 L で同じ程度。
+  # 全車共通の固定値で、車ごとの値は手順2 で測る L だけ。効く先: 定速の揺れ・IWR。決める時期: 段12c の実機
+  c10_d_accel_source: "window"
+  c10_d_filter_s: 0.05
+  c10_d_td_coef: 1.0
   # 2026-11-10 ProblemReport_20261109 段9: C10 の P の加速度 dev ÷ τ だけを、手順2 の定速の保持から測った局所の効きの倍率
   # （pkl meta local_gain_accel_cruise）で割る（I・DOB は今のまま）。"off"（引用符が要る）／"cruise"＝要る加速度 ＜ cruise_kmhs の
   # アクセルの行（taper_kmhs まで直線で戻す）／"all"＝7.5 km/h 以上のアクセルの行すべて。割る量 k ＝ max(1, 倍率 × c ÷ 6)。
