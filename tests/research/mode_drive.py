@@ -461,6 +461,14 @@ def forward_map_plan_args(
         creep_accel_speeds_kmh=tuple(ff_cfg.creep_accel_speeds_kmh),
         creep_accel_kmhs=tuple(ff_cfg.creep_accel_kmhs),
     )
+    if fm.ff_hf_div != "off":
+        # 2026-11-10 PDCA-2: off のときは kwargs に入れない（今と完全に同じ）
+        kwargs.update(
+            ff_hf_div=fm.ff_hf_div, ff_hf_sigma_s=fm.ff_hf_sigma_s,
+            ff_hf_div_coef=fm.ff_hf_div_coef,
+            ff_hf_cruise_kmhs=fm.c10_p_local_gain_cruise_kmhs,
+            ff_hf_taper_kmhs=fm.c10_p_local_gain_taper_kmhs,
+        )
     if fm.launch_brake_band:
         # 2026-10-31 発進のブレーキの帯（案 B）: off のときは kwargs に入れない（今と完全に同じ）
         band = launch_band_for(cfg, mode, table)
@@ -1177,6 +1185,7 @@ def _prepare_forward_map_plan(
         )
         say("  C10 の P の局所の効き（20261109 段9・段10c）: "
             f"{c10_p_local_gain_text(fm, ff.table.meta, _lag_a, ff.deviation_c)}")
+        say(f"  FF のアクセルの速い成分を割る（PDCA-2）: {ff_hf_div_text(fm, ff.table.meta)}")
     if isinstance(ff, CoastAssistFeedforward):
         # 2026-10-18 段2r: 惰行の補助。保持時間 ＝ 係数 × (遅れ ＋ 効き始めまでの戻り時間)
         ff.set_coast(
@@ -1900,6 +1909,27 @@ def c10_p_local_gain_text(
         cells = int(sum(1 for row in entry["n"] for n in row if n > 0))
         table = f"あり（マス {cells}）"
     return f"{scope}・c ＝ {fm.c10_p_local_gain_c:g}・倍率の表 {table}{taper}"
+
+
+def ff_hf_div_text(fm: Any, meta: Any) -> str:
+    """2026-11-10 PDCA-2（ff_hf_div）の設定の表示。割る量 ＝ 1 ＋ β(r − 1) の範囲も出す。"""
+    if fm.ff_hf_div == "off":
+        return "なし"
+    entry = meta.get("local_gain_accel_hf")
+    if not entry or not entry.get("ratio"):
+        return (
+            f"{fm.ff_hf_div}・σ ＝ {fm.ff_hf_sigma_s:g} s・β ＝ {fm.ff_hf_div_coef:g}"
+            "・倍率の表なし（pkl の meta に local_gain_accel_hf が無い → 割る量 1 ＝ 今のまま）"
+        )
+    divs = [max(1.0 + fm.ff_hf_div_coef * (float(r) - 1.0), 1.0) for r in entry["ratio"]]
+    taper = (
+        f"・要る加速度 ＜ {fm.c10_p_local_gain_cruise_kmhs:g}〜{fm.c10_p_local_gain_taper_kmhs:g}"
+        " km/h/s でなめらかに戻す" if fm.ff_hf_div == "cruise" else ""
+    )
+    return (
+        f"{fm.ff_hf_div}・σ ＝ {fm.ff_hf_sigma_s:g} s・β ＝ {fm.ff_hf_div_coef:g}"
+        f"・割る量 {min(divs):.2f}〜{max(divs):.2f}{taper}"
+    )
 
 
 def c10_small_dev_text(fm: Any) -> str:

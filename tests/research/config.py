@@ -1096,6 +1096,22 @@ class ForwardMapSection:
     # "cruise"
     c10_p_local_gain_source: str = "cruise"
     c10_p_local_gain_gm_db: float = 10.0
+    # 2026-11-10 ProblemReport_20261109 PDCA-2: FF の計画のアクセル開度の「速い成分」だけを、
+    # 手順2 の保持の正弦波から測った 1 Hz 付近の倍率 r（pkl meta local_gain_accel_hf。
+    # c10_p_local_gain の source "hf" と同じ表）で割る。根拠: 車は速い（約 0.3 Hz 以上）小さな
+    # 開度の動きに、FF の表の傾きの 2.4〜3.4 倍効く。基準の 1 秒刻みの折れ目からできる FF の
+    # 細かい動きが車を踏みすぎ、車速が基準の揺れを 0.8〜0.95 Hz で 1.3〜1.5 倍に増やす。
+    # ff_hf_div: "off" ＝ 今と完全に同じ／"cruise" ＝ 要る加速度の大きさが
+    # c10_p_local_gain_cruise_kmhs 未満の行だけ（taper まで直線で戻す。段9 と同じ重み）／
+    # "all" ＝ 全行。yaml では "off" を引用符で書く。
+    # 対象はアクセルの連続区間（開度 ＞ min かつ基準 ≧ 7.5 km/h）の中だけ。ブレーキは触らない。
+    # ff_hf_sigma_s: 遅い成分を取るガウスの σ [s]。1.0 は仮の値（0.3 Hz 以上をほぼ速い側に入れる）。
+    # ff_hf_div_coef β: 割る量 ＝ 1 ＋ β ×（r(v) − 1）（β ＝ 1 で r そのまま）。1.0 は仮の値。
+    # r が無い（meta なし）行は割る量 1。効く先: 定速・緩い加減速の 1 Hz 付近の揺れ。
+    # 決める時期: 机上（PDCA-2）の後の実機比較。既定 off ＝ 今と完全に同じ
+    ff_hf_div: str = "off"
+    ff_hf_sigma_s: float = 1.0
+    ff_hf_div_coef: float = 1.0
     # 2026-10-23 段5-6 追加 A1: true なら、dir の発進の途中（停車保持を抜けてから計画が初めて
     # アクセルを踏むまで）のブレーキを、動き出す開度（pkl meta launch_breakaway_u_pct の大きさ。
     # min からの量）で頭打ちにする（浅くする向きだけ・(ロ) の後。meta が無い／非有限なら何もしない・
@@ -2278,6 +2294,18 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         0.0 < fm.c10_p_local_gain_cruise_kmhs < fm.c10_p_local_gain_taper_kmhs,
         "forward_map.c10_p_local_gain_cruise_kmhs は正値で c10_p_local_gain_taper_kmhs 未満: "
         f"{fm.c10_p_local_gain_cruise_kmhs}（taper {fm.c10_p_local_gain_taper_kmhs}）",
+    )
+    need(
+        fm.ff_hf_div in ("off", "cruise", "all"),
+        f"forward_map.ff_hf_div は off / cruise / all: {fm.ff_hf_div!r}",
+    )
+    need(
+        0.1 <= fm.ff_hf_sigma_s <= 5.0,
+        f"forward_map.ff_hf_sigma_s は 0.1〜5.0: {fm.ff_hf_sigma_s}",
+    )
+    need(
+        0.0 < fm.ff_hf_div_coef <= 2.0,
+        f"forward_map.ff_hf_div_coef は 0 より大きく 2 以下: {fm.ff_hf_div_coef}",
     )
     need(
         fm.c10_d_window_s > 0.0,

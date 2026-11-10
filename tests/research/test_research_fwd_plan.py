@@ -4027,3 +4027,36 @@ def test_deviation_offset_p_gain_div_divides_only_the_p_part() -> None:
     a, _ = deviation_offset_detail(t, **only)
     b, _ = deviation_offset_detail(t, p_gain_div=4.0, **only)
     assert a == b
+
+
+def test_hf_divide_accel_splits_fast_and_slow() -> None:
+    """2026-11-10 PDCA-2: 速い成分だけを 1/割る量 にする。遅い成分・ブレーキ・低速は不変。"""
+    from tests.research.fwd_plan import hf_cruise_weight, hf_divide_accel, hf_divisor
+
+    period, mn = 0.05, 8.0
+    t = np.arange(0, 60.0, period)
+    slow = 20.0 + 0.0 * t
+    wig = 1.0 * np.sin(2 * np.pi * 1.0 * t)  # 1 Hz（σ 1 s のガウスでほぼ全部が速い側）
+    effort = slow + wig
+    effort[:200] = -10.0  # ブレーキ
+    ref = np.full_like(t, 50.0)
+    ref[200:400] = 5.0  # 低速（7.5 未満）の区間
+    kw = dict(accel_min_pct=mn, sigma_s=1.0, period_s=period)
+    div = hf_divisor(np.full_like(t, 3.0), 1.0)
+    assert np.allclose(div, 3.0)
+    assert np.allclose(hf_divisor(np.array([0.5, 1.0]), 1.0), 1.0)  # 1 未満にはしない
+    out = hf_divide_accel(effort, ref, div, np.ones_like(t), **kw)
+    assert np.array_equal(out[:400], effort[:400])  # ブレーキ・低速は不変
+    mid = slice(800, 1000)  # 区間の端の影響が無い所
+    assert np.allclose(out[mid].mean(), effort[mid].mean(), atol=0.02)  # 遅い成分は不変
+    ratio = out[mid].std() / effort[mid].std()
+    assert abs(ratio - 1 / 3) < 0.02
+    # 重み 0 は何も変えない・min 未満にはしない
+    assert np.array_equal(hf_divide_accel(effort, ref, div, np.zeros_like(t), **kw), effort)
+    big = np.where(ref > 7.5, mn + 0.5 + 5.0 * np.sin(2 * np.pi * 1.0 * t), -10.0)
+    o2 = hf_divide_accel(big, ref, div, np.ones_like(t), **kw)
+    assert (o2[ref > 7.5][big[ref > 7.5] > mn] >= mn).all()
+    # cruise の重み: 0.3 以下で 1・0.6 以上で 0・間は直線
+    assert hf_cruise_weight(0.2, 0.3, 0.6) == 1.0
+    assert hf_cruise_weight(0.45, 0.3, 0.6) == pytest.approx(0.5)
+    assert hf_cruise_weight(0.9, 0.3, 0.6) == 0.0

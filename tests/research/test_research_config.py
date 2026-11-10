@@ -1940,3 +1940,19 @@ def test_c10_p_local_gain_defaults_and_validation() -> None:
         setattr(cfg.forward_map, key, bad)
         assert any(key in p for p in cfgmod.validate_config(cfg)), (key, bad)
         setattr(cfg.forward_map, key, old)
+
+
+def test_ff_hf_div_defaults_and_validation() -> None:
+    """2026-11-10 PDCA-2: 既定 off（今と同じ）・値の検証（yaml の値は固定しない）。"""
+    fm0 = cfgmod.ForwardMapSection()
+    assert fm0.ff_hf_div == "off" and fm0.ff_hf_sigma_s == 1.0 and fm0.ff_hf_div_coef == 1.0
+    cfg = cfgmod.load_config(Path(cfgmod.__file__).with_name("config_testVehicle.yaml"))
+    assert cfg.forward_map.ff_hf_div == "off"  # 引用符つきの "off" が文字列で読める
+    for key, bad in (
+        ("ff_hf_div", "on"), ("ff_hf_sigma_s", 0.05), ("ff_hf_sigma_s", 6.0),
+        ("ff_hf_div_coef", 0.0), ("ff_hf_div_coef", 2.5),
+    ):
+        old = getattr(cfg.forward_map, key)
+        setattr(cfg.forward_map, key, bad)
+        assert any(key in p for p in cfgmod.validate_config(cfg)), (key, bad)
+        setattr(cfg.forward_map, key, old)

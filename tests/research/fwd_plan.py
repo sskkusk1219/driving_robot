@@ -55,6 +55,7 @@ from typing import Any
 
 import numpy as np
 
+from tests.research import local_gain as _local_gain
 from tests.research.ff_bias import PEDAL_ACCEL, PEDAL_BRAKE, PEDAL_COAST, count_pedal_switches
 from tests.research.ff_model import STOP_SPEED_KMH
 from tests.research.fwd_data import DEFAULT_ACCEL_LAG_S as _DATA_ACCEL_LAG_S
@@ -889,6 +890,11 @@ def build_plan(
     predict_creep_curve: bool = False,
     creep_accel_speeds_kmh: Sequence[float] = (),
     creep_accel_kmhs: Sequence[float] = (),
+    ff_hf_div: str = "off",  # 2026-11-10 PDCA-2
+    ff_hf_sigma_s: float = 1.0,
+    ff_hf_div_coef: float = 1.0,
+    ff_hf_cruise_kmhs: float = 0.3,
+    ff_hf_taper_kmhs: float = 0.6,
     _lead_extra: np.ndarray | None = None,
     _need_add: np.ndarray | None = None,
     _aux_out: dict[str, np.ndarray] | None = None,
@@ -1169,6 +1175,9 @@ def build_plan(
             "predict_creep_curve": predict_creep_curve,
             "creep_accel_speeds_kmh": creep_accel_speeds_kmh,
             "creep_accel_kmhs": creep_accel_kmhs,
+            "ff_hf_div": ff_hf_div, "ff_hf_sigma_s": ff_hf_sigma_s,  # 2026-11-10 PDCA-2
+            "ff_hf_div_coef": ff_hf_div_coef, "ff_hf_cruise_kmhs": ff_hf_cruise_kmhs,
+            "ff_hf_taper_kmhs": ff_hf_taper_kmhs,
             "preposition_enabled": False, "return_gap_enabled": False,
         }
         aux: dict[str, np.ndarray] = {}
@@ -1435,6 +1444,27 @@ def build_plan(
         )
         # 解き直した行（7.5 km/h 以上の legacy の発進側）は本体の表なので、ラベルも本体にする
         relabel_a = redo_a & launch_a
+    if ff_hf_div != "off":
+        # 2026-11-10 PDCA-2: アクセルの開度の速い成分を 1 Hz 付近の倍率で割る。
+        # アクセルの戻し・踏み増しの解き直し（上）で開度が確定した後に置く（解き直しが上書きすると
+        # 割った量が消える）。ブレーキ側の処理・停車前の踏み増し・発進の ramp・clip・先置き・
+        # すき間・ペダルの追従（下）の前
+        r_hf = np.array([
+            _local_gain.hf_ratio_at(table.meta.get("local_gain_accel_hf"), float(x)) or 1.0
+            for x in np.broadcast_to(np.asarray(v, dtype=float), (n,))
+        ])
+        div_hf = hf_divisor(r_hf, ff_hf_div_coef)
+        w_hf = (
+            np.ones(n) if ff_hf_div == "all"
+            else np.array([
+                hf_cruise_weight(abs(float(x)), ff_hf_cruise_kmhs, ff_hf_taper_kmhs)
+                for x in np.broadcast_to(np.asarray(need_a, dtype=float), (n,))
+            ])
+        )
+        effort = hf_divide_accel(
+            effort, np.broadcast_to(np.asarray(v, dtype=float), (n,)), div_hf, w_hf,
+            accel_min_pct=accel_deadband_pct, sigma_s=ff_hf_sigma_s, period_s=period_s,
+        )
     side_brake_dir = None
     if dir_rule:
         # 戻しで解き直した行（低速の停止側だった行を含む）は SIDE_RELEASE、それ以外は上の表のまま
@@ -1623,6 +1653,66 @@ def build_plan(
         stop_keep=None if stop_keep_rows is None else (stop_keep_rows & (effort < 0.0)),
         stop_keep_stats=stop_keep_stats,
     )
+
+
+def hf_divisor(ratio: np.ndarray, coef: float) -> np.ndarray:
+    """2026-11-10 PDCA-2: 速い成分を割る量 ＝ 1 ＋ β ×（r − 1）。1 未満にはしない。"""
+    return np.maximum(1.0 + coef * (np.asarray(ratio, dtype=float) - 1.0), 1.0)
+
+
+def hf_cruise_weight(need_abs_kmhs: float, cruise_kmhs: float, taper_kmhs: float) -> float:
+    """2026-11-10 PDCA-2: "cruise" の重み。要る加速度の大きさ ≦ cruise_kmhs で 1、taper_kmhs で 0 へ
+    直線に戻す（段9 の p_local_gain_weight の "cruise" と同じ）。"""
+    if need_abs_kmhs <= cruise_kmhs:
+        return 1.0
+    if need_abs_kmhs >= taper_kmhs:
+        return 0.0
+    return (taper_kmhs - need_abs_kmhs) / (taper_kmhs - cruise_kmhs)
+
+
+def _gauss_smooth(x: np.ndarray, sigma_rows: float) -> np.ndarray:
+    """ガウスで平滑（端は最近傍の値で埋める）。"""
+    half = max(int(np.ceil(4.0 * sigma_rows)), 1)
+    k = np.exp(-0.5 * (np.arange(-half, half + 1) / sigma_rows) ** 2)
+    k /= k.sum()
+    pad = np.concatenate([np.full(half, x[0]), x, np.full(half, x[-1])])
+    return np.convolve(pad, k, mode="valid")
+
+
+def hf_divide_accel(
+    effort: np.ndarray,
+    ref_kmh: np.ndarray,
+    divisor: np.ndarray,
+    weight: np.ndarray,
+    *,
+    accel_min_pct: float,
+    sigma_s: float,
+    period_s: float,
+    min_speed_kmh: float = _local_gain.MIN_SPEED_KMH,
+) -> np.ndarray:
+    """2026-11-10 PDCA-2: アクセル開度の速い成分だけを割った開度の列を返す（元は変えない）。
+    開度 ＞ accel_min かつ基準 ≧ min_speed_kmh の連続区間ごとに、遅い成分 ＝ 区間内のガウス平滑
+    （σ ＝ sigma_s ÷ period_s 行・端は最近傍で埋める）、速い成分 ＝ 開度 − 遅い成分。
+    開度' ＝ 開度 − 重み × 速い成分 × (1 − 1 ÷ 割る量)、accel_min 未満にはしない。区間の外・
+    ブレーキの行は変えない。"""
+    out = np.array(effort, dtype=float)
+    ok = (out > accel_min_pct) & (np.asarray(ref_kmh, dtype=float) >= min_speed_kmh)
+    sigma_rows = sigma_s / period_s
+    n = len(out)
+    i = 0
+    while i < n:
+        if not ok[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and ok[j]:
+            j += 1
+        seg = out[i:j].copy()
+        fast = seg - _gauss_smooth(seg, sigma_rows)
+        new = seg - weight[i:j] * fast * (1.0 - 1.0 / divisor[i:j])
+        out[i:j] = np.maximum(new, accel_min_pct)
+        i = j
+    return out
 
 
 def _switch_alt_effort(
