@@ -118,8 +118,9 @@ def test_max_offset_caps_the_gap_and_keeps_small_offsets() -> None:
 
 
 def test_csv_has_ref_smooth_column_at_the_end() -> None:
-    assert dlmod.CSV_COLUMNS[-1] == "ref_smooth_kmh"
-    assert dlmod.CSV_COLUMNS.index("pred_dev_kmh") == len(dlmod.CSV_COLUMNS) - 2
+    # 後から列が末尾に足されるので、並び（pred_dev_kmh の直後）だけを見る（2026-11-11）
+    cols = dlmod.CSV_COLUMNS
+    assert cols.index("ref_smooth_kmh") == cols.index("pred_dev_kmh") + 1
 
 
 # ── 段3b: 合成モード ─────────────────────────────────────────────
