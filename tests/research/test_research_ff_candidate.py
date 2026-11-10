@@ -1149,3 +1149,17 @@ def test_c7_guards_misuse(tmp_path: Path) -> None:
         ff.effort_at(0.0)
     with pytest.raises(NotImplementedError, match="時刻で引きます"):
         ff.predict_effort(0.0, [], [])
+
+
+def test_c7_build_plan_passes_ff_hf_div_kwargs(tmp_path: Path) -> None:
+    """2026-11-10 PDCA-2: build_plan が ff_hf_* を fwd_plan へ通す（TypeError にならない）"""
+    pkl = tmp_path / "fwd_table.pkl"
+    _write_forward_table_pkl(pkl)
+    ff = make_candidate("C7")
+    ff.load_model(str(pkl))
+    ff.build_plan(
+        lambda t: min(60.0, 10.0 * t), 12.0, **_c7_plan_kwargs(),  # type: ignore[arg-type]
+        ff_hf_div="cruise", ff_hf_sigma_s=1.0, ff_hf_div_coef=1.0,
+        ff_hf_fast_max_pct=1.0, ff_hf_cruise_kmhs=0.3, ff_hf_taper_kmhs=0.6,
+    )
+    assert isinstance(ff.effort_at(3.0), float)

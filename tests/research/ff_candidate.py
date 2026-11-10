@@ -836,6 +836,12 @@ class ForwardMapFeedforward:
         coast_band_release_at_zero: bool = False,
         coast_fill_max_s: float = 0.0,
         coast_fill_same_pedal: bool = False,
+        ff_hf_div: str = "off",  # 2026-11-10 PDCA-2
+        ff_hf_sigma_s: float = 1.0,
+        ff_hf_div_coef: float = 1.0,
+        ff_hf_fast_max_pct: float = 1.0,
+        ff_hf_cruise_kmhs: float = 0.3,
+        ff_hf_taper_kmhs: float = 0.6,
     ) -> ForwardPlan:
         """基準車速から開度の列を作って保持する（fwd_plan.build_plan をそのまま呼ぶ）。
 
@@ -902,6 +908,12 @@ class ForwardMapFeedforward:
             coast_band_release_at_zero=coast_band_release_at_zero,  # 2026-10-30 案 B
             coast_fill_max_s=coast_fill_max_s,  # 2026-10-30 案 D
             coast_fill_same_pedal=coast_fill_same_pedal,  # 2026-11-09 段6a
+            ff_hf_div=ff_hf_div,  # 2026-11-10 PDCA-2 FF の速い成分を割る
+            ff_hf_sigma_s=ff_hf_sigma_s,
+            ff_hf_div_coef=ff_hf_div_coef,
+            ff_hf_fast_max_pct=ff_hf_fast_max_pct,
+            ff_hf_cruise_kmhs=ff_hf_cruise_kmhs,
+            ff_hf_taper_kmhs=ff_hf_taper_kmhs,
         )
         return self._plan
 
