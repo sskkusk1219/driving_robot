@@ -236,7 +236,7 @@ def test_load_mode_sees_composed_modes_before_the_db(
 
 def test_composed_modes_and_sigma_are_validated(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
-    assert cfg.feedforward.ref_smooth_sigma_s == 0.0
+    assert cfg.feedforward.ref_smooth_sigma_s == 0.15  # 2026-11-11 PDCA-4 で本体 on
     assert not any("composed_modes" in p or "ref_smooth" in p for p in cfgmod.validate_config(cfg))
     good = {"name": "a", "source": "b", "windows_s": [[0, 5], [8, 9]]}
     for bad in (
@@ -252,7 +252,7 @@ def test_composed_modes_and_sigma_are_validated(tmp_path: Path) -> None:
         assert any("composed_modes" in p for p in cfgmod.validate_config(cfg)), bad
     cfg.modes.composed_modes = [good]
     assert not any("composed_modes" in p for p in cfgmod.validate_config(cfg))
-    assert cfg.feedforward.ref_smooth_max_kmh == 0.0
+    assert cfg.feedforward.ref_smooth_max_kmh == 0.1
     for bad_max in (-1.0, 5.5):
         cfg.feedforward.ref_smooth_max_kmh = bad_max
         assert any("ref_smooth_max_kmh" in p for p in cfgmod.validate_config(cfg))
@@ -260,7 +260,7 @@ def test_composed_modes_and_sigma_are_validated(tmp_path: Path) -> None:
     assert not any("ref_smooth_max_kmh" in p for p in cfgmod.validate_config(cfg))
     cfg.feedforward.ref_smooth_max_kmh = 0.0
     ff = cfg.feedforward
-    assert ff.ref_smooth_brake_from_kmhs == 0.0 and ff.ref_smooth_brake_to_kmhs == 0.0
+    assert ff.ref_smooth_brake_from_kmhs == 0.3 and ff.ref_smooth_brake_to_kmhs == 0.6  # 本体 yaml
     for fr, to in ((0.6, 0.3), (0.3, 0.3), (-0.1, 0.5), (0.3, 11.0), (0.0, 0.5)):
         ff.ref_smooth_brake_from_kmhs, ff.ref_smooth_brake_to_kmhs = fr, to
         assert any("ref_smooth_brake" in p for p in cfgmod.validate_config(cfg)), (fr, to)
