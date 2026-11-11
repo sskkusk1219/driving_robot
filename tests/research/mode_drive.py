@@ -2239,6 +2239,40 @@ def stop_end_monotone_brake(effort: float, prev_effort: float | None) -> float:
     return min(effort, prev_effort)
 
 
+class NoSpeedWatch:
+    """基準車速が出てから一定時間、実車速が出なければ中止を知らせる（手順 24: D に入れたか）。
+
+    基準車速が 0 を超えた時刻を覚え、そこから `abort_s` 秒たっても実車速が `no_speed_kmh` 以下
+    のままなら理由の文字列を返す。一度でも `no_speed_kmh` を超えたら判定を止める（停車の場面で
+    誤って中止しないため）。2026-11-12（ProblemReport_20261112 段5）。
+    """
+
+    def __init__(self, abort_s: float, no_speed_kmh: float) -> None:
+        self.abort_s = abort_s
+        self.no_speed_kmh = no_speed_kmh
+        self.released = False  # 一度でも車速が出た（判定を止めた）
+        self._ref_moving_since: float | None = None
+
+    def update(self, now: float, ref_kmh: float, speed_kmh: float) -> str | None:
+        """中止すべきなら理由を返す。それ以外は None。"""
+        if self.released:
+            return None
+        if speed_kmh > self.no_speed_kmh:
+            self.released = True
+            return None
+        if ref_kmh <= 0.0:
+            return None
+        if self._ref_moving_since is None:
+            self._ref_moving_since = now
+            return None
+        if now - self._ref_moving_since >= self.abort_s:
+            return (
+                f"基準車速が出てから {self.abort_s:g}s たっても車速が {self.no_speed_kmh:g} km/h "
+                f"以下のままです（現在 {speed_kmh:.2f} km/h）。D に入っていない可能性があります"
+            )
+        return None
+
+
 class _ModeRun:
     """1 本のモード走行の状態。run() が 50ms 周期でモード終わりまで回す。"""
 
@@ -2315,6 +2349,7 @@ class _ModeRun:
         log: SessionLog,
         duration_s: float,
         section: str = SECTION_MODE_DRIVE,
+        no_speed_abort: tuple[float, float] | None = None,
     ) -> None:
         self.hw = hw
         self.cfg = cfg
@@ -2625,6 +2660,8 @@ class _ModeRun:
         self._accel_cmd: int | None = None
         self._brake_cmd: int | None = None
         self._deviation_since: float | None = None
+        # 手順 24: 基準車速が出ても車速が出ないときの中止（None なら何もしない。手順 3 など）
+        self._no_speed = None if no_speed_abort is None else NoSpeedWatch(*no_speed_abort)
         self.max_abs_dev = 0.0
         self._next_print = 0.0
         self._segment = ""
@@ -4557,6 +4594,10 @@ class _ModeRun:
                 )
         else:
             self._deviation_since = None
+        if self._no_speed is not None:
+            reason = self._no_speed.update(now, ref, speed)
+            if reason is not None:
+                raise DriveError(reason)
 
 
 def cycle_time_text(cycle_ms: list[float], interval_s: float) -> str:
@@ -4577,6 +4618,7 @@ async def run_mode_drive(
     log: SessionLog,
     limit_s: float | None = None,
     section: str = SECTION_MODE_DRIVE,
+    no_speed_abort: tuple[float, float] | None = None,
 ) -> ModeDriveResult:
     """停車保持の状態からモードを走り、停車保持で終える。
 
@@ -4584,6 +4626,8 @@ async def run_mode_drive(
     abort_reason 付きの結果を返す（途中までのレポートを作れるように）。
     `limit_s` はモードの先頭だけ走る動作確認用。`section` は CSV の section 列（既定 MODE_DRIVE。
     FEL の学習用パターンは FEL_DRIVE。2026-10-19 段2s-2b）。
+    `no_speed_abort`（秒, km/h）は手順 24 用: 基準車速が 0 を超えてから秒の間、車速が km/h 以下
+    のままなら中止する（D に入っていない可能性。2026-11-12）。None なら判定しない。
     """
     mode = setup.mode
     duration = mode.total_duration if limit_s is None else min(limit_s, mode.total_duration)
@@ -4599,7 +4643,9 @@ async def run_mode_drive(
         say(f"*** 実機モード: 車両が最高 {mode.max_speed:.0f} km/h まで走ります。"
             "シャシダイナモ上で実施してください ***")
 
-    run = _ModeRun(hw, cfg, setup, log, duration, section=section)
+    run = _ModeRun(
+        hw, cfg, setup, log, duration, section=section, no_speed_abort=no_speed_abort
+    )
     await log.stop_sampler()  # 50ms の制御ループと Modbus を取り合わない（記録はループから）
     log.mark(section, "")
     loop = asyncio.get_running_loop()

@@ -2637,3 +2637,33 @@ def test_c10_p_local_gain_text_and_validation() -> None:
     entry = {"n": [[1, 0], [2, 3]]}
     txt = mdmod.c10_p_local_gain_text(fm, {"local_gain_accel_cruise": entry})
     assert "マス 3" in txt and "警告" not in txt
+
+
+# ── 手順 24: 基準車速が出ても車速が出ないときの中止（2026-11-12 段5） ──────────
+def test_no_speed_watch_aborts_when_speed_never_appears() -> None:
+    w = mdmod.NoSpeedWatch(abort_s=3.0, no_speed_kmh=0.2)
+    assert w.update(0.0, 0.0, 0.0) is None  # 基準が 0 の間は数えない
+    assert w.update(1.0, 2.0, 0.0) is None  # 基準が 0 を超えた時刻
+    assert w.update(3.9, 5.0, 0.1) is None  # まだ 3 s たっていない
+    reason = w.update(4.0, 5.0, 0.1)
+    assert reason is not None and "D に入っていない" in reason
+
+
+def test_no_speed_watch_stops_after_speed_appears() -> None:
+    w = mdmod.NoSpeedWatch(abort_s=3.0, no_speed_kmh=0.2)
+    assert w.update(1.0, 2.0, 0.0) is None
+    assert w.update(2.0, 4.0, 1.5) is None  # 車速が出た → 判定を止める
+    assert w.released
+    # その後の停車の場面（基準も車速も 0 付近）で何分たっても中止しない
+    assert w.update(10.0, 0.0, 0.0) is None
+    assert w.update(60.0, 3.0, 0.0) is None
+
+
+def test_no_speed_watch_none_does_nothing_in_mode_run() -> None:
+    """手順 3 など no_speed_abort=None なら _ModeRun は監視を持たない。"""
+    import inspect
+
+    sig = inspect.signature(mdmod.run_mode_drive)
+    assert sig.parameters["no_speed_abort"].default is None
+    sig = inspect.signature(mdmod._ModeRun.__init__)  # noqa: SLF001
+    assert sig.parameters["no_speed_abort"].default is None

@@ -1959,3 +1959,36 @@ def test_ff_hf_div_defaults_and_validation() -> None:
         setattr(cfg.forward_map, key, bad)
         assert any(key in p for p in cfgmod.validate_config(cfg)), (key, bad)
         setattr(cfg.forward_map, key, old)
+
+
+def test_buttons_section_defaults_and_validation(tmp_path: Path) -> None:
+    """ボタン手順（手順 20〜25）の値: 既定・検証（2026-11-12 段2）。"""
+    cfg = _load_default()
+    bt = cfg.buttons
+    assert (bt.start_short_press_s, bt.start_long_press_s, bt.shift_press_s) == (0.5, 3.0, 0.5)
+    assert bt.after_press_wait_s == 1.0
+    assert (bt.accel_tap_opening_pct, bt.accel_tap_on_s, bt.accel_tap_off_s) == (10.0, 0.5, 0.5)
+    assert (bt.maintenance_tap_count, bt.n_hold_gap_s) == (3, 1.0)
+    assert (bt.no_speed_abort_s, bt.no_speed_kmh) == (3.0, 0.2)
+    assert cfgmod.ButtonsSection() == bt  # yaml の値は dataclass の既定と同じ
+    assert not [p for p in cfgmod.validate_config(cfg) if "buttons." in p]
+    for name, bad in (
+        ("start_short_press_s", 0.0),
+        ("accel_tap_on_s", -1.0),
+        ("no_speed_kmh", 0.0),
+        ("maintenance_tap_count", 0),
+        ("start_long_press_s", 1.9),  # 2 s 未満は RLY-OFF に届かない
+        ("start_long_press_s", 5.0),  # 5 s 以上は IGN-OFF まで進む
+    ):
+        cfg = _load_default()
+        setattr(cfg.buttons, name, bad)
+        assert any(f"buttons.{name}" in p for p in cfgmod.validate_config(cfg)), name
+
+
+def test_buttons_section_absent_uses_defaults(tmp_path: Path) -> None:
+    src = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    start = src.index("\nbuttons:\n")
+    end = src.index("\n# ── 出力", start)
+    f = tmp_path / "c.yaml"
+    f.write_text(src[:start] + src[end:], encoding="utf-8")
+    assert cfgmod.load_config(f).buttons == cfgmod.ButtonsSection()

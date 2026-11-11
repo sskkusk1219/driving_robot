@@ -28,7 +28,7 @@ def _ctx(cfg: cfgmod.ResearchConfig) -> mainmod.RunContext:
 def test_step14_exists_and_pkl_name() -> None:
     step = next(s for s in mainmod.STEPS if s.number == 14)
     assert step.drives and step.prepare is not None
-    assert mainmod.MAX_STEP == 14
+    assert mainmod.MAX_STEP == 25  # 手順 20〜25（ボタン）を足した
     assert mainmod.stop_pkl_path("a/b/fwd_model_x_hold.pkl") == Path(
         "a/b/fwd_model_x_hold_stop.pkl"
     )

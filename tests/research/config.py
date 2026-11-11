@@ -707,6 +707,28 @@ class ChecksSection:
 
 
 @dataclass
+class ButtonsSection:
+    """スタートスイッチ・P/N/D ボタンを押す手順（手順 20〜25）の値（ProblemReport_20261112）。
+
+    押す流れ（どのボタンをどの順に押すか）はコードに書き、回数・秒数・開度だけをここに置く。
+    根拠が「仮の値」のものは実機確認（段6）で決める。ブレーキ ON の開度は新しい値を作らず
+    stop_brake_opening_pct（手順 2 が書く停車保持の開度）を使う。
+    """
+
+    start_short_press_s: float = 0.5  # スタートの短押し（Ready・IGN-OFF）[s]
+    start_long_press_s: float = 3.0  # スタートの長押し（IGN-ON(RLY-OFF)）。2 s 以上 5 s 未満 [s]
+    shift_press_s: float = 0.5  # P/N/D の押下 [s]
+    after_press_wait_s: float = 1.0  # 押した後に車が状態を変えるまでの待ち [s]
+    accel_tap_opening_pct: float = 10.0  # アクセル踏み 1 回の開度（資料の 1% 以上を超える）[%]
+    accel_tap_on_s: float = 0.5  # アクセル踏み 1 回の踏んでいる時間 [s]
+    accel_tap_off_s: float = 0.5  # アクセル踏み 1 回の離している時間 [s]
+    maintenance_tap_count: int = 3  # メンテナンスモードの各レンジの踏み回数（車種で変わる）
+    n_hold_gap_s: float = 1.0  # N ホールドの N 2 回押しの間隔（資料の 5 s 以内より十分短く）[s]
+    no_speed_abort_s: float = 3.0  # 手順 24: 基準車速が出てからこの間、実車速が出なければ中止 [s]
+    no_speed_kmh: float = 0.2  # 手順 24: これ以下なら「車速が出ていない」[km/h]（資料の停車中）
+
+
+@dataclass
 class OutputSection:
     results_dir: str = "tests/research/results"
     csv_interval_s: float = 0.1
@@ -1635,6 +1657,7 @@ class ResearchConfig:
     decel_stop: DecelStopSection = field(default_factory=DecelStopSection)
     kpi: KpiSection = field(default_factory=KpiSection)
     checks: ChecksSection = field(default_factory=ChecksSection)
+    buttons: ButtonsSection = field(default_factory=ButtonsSection)
     output: OutputSection = field(default_factory=OutputSection)
     hardware: HardwareSection = field(default_factory=HardwareSection)
 
@@ -1684,6 +1707,7 @@ _SECTION_TYPES: dict[str, type] = {
     "decel_stop": DecelStopSection,
     "kpi": KpiSection,
     "checks": ChecksSection,
+    "buttons": ButtonsSection,
     "output": OutputSection,
     "hardware": HardwareSection,
 }
@@ -2878,6 +2902,20 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         not (chk.pre_ups and not chk.init_ups),
         "checks.pre_ups が true なのに checks.init_ups が false です"
         "（UPS 監視を開始しないため残量が取得できません。両方 true か両方 false にしてください）",
+    )
+
+    bt = cfg.buttons
+    for name in (
+        "start_short_press_s", "start_long_press_s", "shift_press_s", "after_press_wait_s",
+        "accel_tap_on_s", "accel_tap_off_s", "n_hold_gap_s", "no_speed_abort_s", "no_speed_kmh",
+    ):
+        need(getattr(bt, name) > 0.0, f"buttons.{name} は正値")
+    need(bt.accel_tap_opening_pct > 0.0, "buttons.accel_tap_opening_pct は正値")
+    need(bt.maintenance_tap_count >= 1, "buttons.maintenance_tap_count は 1 以上")
+    # 2 s 未満は RLY-OFF に届かず、5 s 以上は IGN-OFF まで進む（資料の表 2 の区切り）
+    need(
+        2.0 <= bt.start_long_press_s < 5.0,
+        f"buttons.start_long_press_s が範囲外(2<=s<5): {bt.start_long_press_s}",
     )
     return problems
 

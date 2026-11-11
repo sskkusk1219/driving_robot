@@ -30,6 +30,12 @@
     / 6 モデル作成エラー / 7 走行前チェックエラー
     / 8 手順2 の学習結果のチェックが NG（yaml は書き換えていない。後の手順には進まない）
 
+ボタンの手順（20〜25。スタートスイッチ・P/N/D ボタンを PCA9685＋SG90 で押す。2026-11-12）:
+    20 IGN-ON(RLY-OFF) / 21 メンテナンスモード（先頭で 20 も行う） / 22 N レンジホールド
+    / 23 Ready / 24 モード走行（D → モード → N。車速が出なければ中止） / 25 IGN-OFF
+    例: --steps 1,21,22,23,24,25 --limit-s 60（スタブで一連の流れ。各手順の後に車両の状態を表示）
+    どの手順も手順 1（初期化）が先に要る。PCA9685 は最初にボタンを押す手順で接続する。
+
 安全上の注意:
     `--hw real` は実アクチュエータを物理的に動かす。既定は `stub`（本番と同じスタブ HW）。
     Claude が無人で実行してよい条件は `.claude/skills/bench-verification/SKILL.md` に従う。
@@ -47,6 +53,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
+from tests.research import button_steps
 from tests.research.config import (
     ConfigError,
     ResearchConfig,
@@ -349,6 +356,9 @@ PRE_DRIVE_CHECK_TITLE = (
 async def pre_drive_check(ctx: RunContext, *, has_ref: bool = False, next_step: int) -> None:
     """初期化済み HW で走行前チェックを行い、停車保持の状態にする。"""
     hw = ctx.require_hardware()
+    if hw.buttons_connected:
+        # ボタンの手順（20〜23）の後はペダルが待機位置にある。原点にいることを確かめる前に戻す
+        await button_steps.return_pedals_to_origin(hw)
     if ctx.session_log is None:
         log = SessionLog(ctx.config, hw, has_ref=has_ref)
         log.start(SECTION_PRE_DRIVE_CHECK, PHASE_PRE_CHECK)
@@ -895,13 +905,38 @@ def _fel_text_of(cfg: ResearchConfig, setup: ModeDriveSetup) -> str | None:
 
 async def step3_mode_drive_ff(ctx: RunContext) -> None:
     """停車保持の状態からモードを走り、CSV（0.1s 刻み）・走行時の設定・レポートを残す。"""
+    await _mode_drive_step(ctx, buttons=False)
+
+
+async def step24_mode_drive_buttons(ctx: RunContext) -> None:
+    """手順 3 と同じ流れ。停車保持の開度のまま D を押してからモードを走り、終わったら N を押す。
+
+    基準車速が出てから `buttons.no_speed_abort_s` の間、車速が出なければ（D に入っていない
+    可能性）中止する。中止したときも、ブレーキを停車保持の開度にして N を押してから終わる。
+    """
+    await _mode_drive_step(ctx, buttons=True)
+
+
+async def _mode_drive_step(ctx: RunContext, *, buttons: bool) -> None:
+    """手順 3（buttons=False）と手順 24（buttons=True）の共通の流れ。違いは次の 3 点だけ:
+    走行の前に D を押す・走行の後に N を押す・車速が出なければ中止する。"""
     hw = ctx.require_hardware()
     setup = ctx.mode_setup
     if setup is None:  # prepare_step3 が走行前チェックの前に作る
         raise ConfigError("走行モードと FF モデルが読み込まれていません")
+    cfg = ctx.config
     log = _session_log_for_drive(ctx, hw)
     started_at = datetime.now()
-    result = await run_mode_drive(hw, ctx.config, setup, log=log, limit_s=ctx.limit_s)
+    no_speed_abort = None
+    if buttons:
+        no_speed_abort = (cfg.buttons.no_speed_abort_s, cfg.buttons.no_speed_kmh)
+        await button_steps.press_shift_d(hw, cfg)  # 停車保持の開度のまま D を押す
+    result = await run_mode_drive(
+        hw, cfg, setup, log=log, limit_s=ctx.limit_s, no_speed_abort=no_speed_abort
+    )
+    if buttons:
+        # 終わったら（中止でも）停車保持の開度で N を押す。D のままペダルを離さない
+        await button_steps.press_shift_n_after_drive(hw, cfg)
     await log.close()  # 停車保持まで記録したら保存し、その行でレポートを作る
 
     limited = result.mode_duration_s < setup.mode.total_duration
@@ -924,7 +959,7 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
             say(f"警告: 走行時の設定を保存できませんでした（{exc}）")
     info = RunInfo(
         label=mode_label(result.mode_name),
-        title="手順 3: モード走行",
+        title="手順 24: モード走行（D → モード → N）" if buttons else "手順 3: モード走行",
         controller=controller_text(ctx.config),
         csv_path=log.csv_path,
         hw_mode=hw.hw_mode,
@@ -990,7 +1025,10 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
     if not result.completed:
         raise DriveError(result.abort_reason)
     say()
-    say("手順 3 完了。次は手順 4（Kp のみ適合）です。")
+    if buttons:
+        say("手順 24 完了。")
+    else:
+        say("手順 3 完了。次は手順 4（Kp のみ適合）です。")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1024,6 +1062,36 @@ async def step11_excite(ctx: RunContext) -> None:
         raise DriveError(result.abort_reason)
     say()
     say("手順 11 完了。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 20〜25: スタートスイッチ・P/N/D ボタンを押す（ProblemReport_20261112）
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def step20_ign_on(ctx: RunContext) -> None:
+    await button_steps.ign_on_rly_off(ctx.require_hardware(), ctx.config)
+    say("手順 20 完了。")
+
+
+async def step21_maintenance(ctx: RunContext) -> None:
+    await button_steps.maintenance_mode(ctx.require_hardware(), ctx.config)
+    say("手順 21 完了。")
+
+
+async def step22_n_hold(ctx: RunContext) -> None:
+    await button_steps.n_range_hold(ctx.require_hardware(), ctx.config)
+    say("手順 22 完了。")
+
+
+async def step23_ready(ctx: RunContext) -> None:
+    await button_steps.ready(ctx.require_hardware(), ctx.config)
+    say("手順 23 完了。")
+
+
+async def step25_ign_off(ctx: RunContext) -> None:
+    await button_steps.ign_off(ctx.require_hardware(), ctx.config)
+    say("手順 25 完了。")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1096,6 +1164,19 @@ STEPS: tuple[Step, ...] = (
         drives=True,
         prepare=prepare_step14,
     ),
+    Step(20, "IGN-ON(RLY-OFF)（スタートを長押し）", step20_ign_on),
+    Step(21, "メンテナンスモード（先頭で 20 も行う。P・N・P でアクセル踏み）", step21_maintenance),
+    Step(22, "N レンジホールド（N を 2 回押す）", step22_n_hold),
+    Step(23, "Ready（ブレーキ ON でスタートを短押し）", step23_ready),
+    Step(
+        24,
+        "モード走行（停車保持の開度で D → モード → 終わったら N。車速が出なければ中止）",
+        step24_mode_drive_buttons,
+        drives=True,
+        prepare=prepare_step3,
+        has_ref=True,
+    ),
+    Step(25, "IGN-OFF（停車中にブレーキ ON でスタートを短押し）", step25_ign_off),
 )
 _STEP_BY_NUMBER = {step.number: step for step in STEPS}
 MAX_STEP = max(_STEP_BY_NUMBER)

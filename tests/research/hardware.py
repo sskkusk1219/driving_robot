@@ -33,11 +33,13 @@ from typing import Protocol
 
 from tests.research.app_settings import AppSettings, load_settings
 from tests.research.axis_monitor import AxisMonitor
+from tests.research.button_servo import ButtonServoDriver, ButtonServoProtocol, StubButtonServo
 from tests.research.config import ChecksSection, ResearchConfig
 from tests.research.pre_check import HOME_POSITION_TOLERANCE_PULSE, UPS_MIN_BATTERY_PCT
 from tests.research.research_types import FeedforwardParams, coast_decel_at
 from tests.research.term import display_width, say
 from tests.research.vehicle import feedforward_params, pulse_to_opening
+from tests.research.vehicle_status import VehicleStatus
 
 HW_STUB = "stub"
 HW_REAL = "real"
@@ -238,6 +240,8 @@ class StubVehicle:
     brake_play_pct: float = STUB_BRAKE_PLAY_PCT
     creep_stiffness_per_s: float = STUB_CREEP_STIFFNESS_PER_S
     last_t: float | None = None
+    # 車両の状態（アイデア資料の状態遷移）。active のときだけ見る（手順 2・3 だけなら従来どおり）
+    status: VehicleStatus | None = None
 
     def advance(self, speed_kmh: float, now: float | None = None) -> float:
         now = time.monotonic() if now is None else now
@@ -246,6 +250,23 @@ class StubVehicle:
         p = self.params
         accel_pct = pulse_to_opening(self.accel.position)
         brake_pct = pulse_to_opening(self.brake.position)
+        status = self.status
+        if status is not None and status.active:
+            # シミュレータが読むペダルの値は「ペダルに触れた位置（min）を 0 とした開度」
+            status.update(
+                now,
+                max(0.0, accel_pct - p.accel_deadband_pct),
+                max(0.0, brake_pct - p.brake_deadband_pct),
+                speed_kmh,
+            )
+            mode = status.drive_mode()
+            if mode == "P":
+                return 0.0
+            if mode == "N":
+                # アクセルは無効。惰行減速の半分＋ブレーキの分だけ減速する（0 未満にはならない）
+                decel = coast_decel_at(p, speed_kmh) / 2.0
+                decel += max(0.0, brake_pct - self.brake_play_pct) * self.brake_gain_kmhs_per_pct
+                return max(0.0, speed_kmh - decel * dt)
         pull = self.creep_stiffness_per_s * (p.creep_speed_kmh - speed_kmh)
         a = min(p.creep_rate_kmhs, max(-coast_decel_at(p, speed_kmh), pull))
         a += max(0.0, accel_pct - self.accel_play_pct) * self.accel_gain_kmhs_per_pct
@@ -329,6 +350,12 @@ class ResearchHardware:
     settings: AppSettings | None = None
     connected: bool = False
     initialized: bool = False
+    # ボタンサーボ（スタート・P/N/D を押す）。PCA9685 は手順 1 では接続せず、ボタンを使う手順が
+    # 最初に ensure_buttons_connected() で接続する（手順 2・3 だけの実行は PCA9685 が無くても動く）
+    buttons: ButtonServoProtocol | None = None
+    buttons_connected: bool = False
+    # スタブの車両の状態（アイデア資料の状態遷移）。実機では None
+    vehicle_status: VehicleStatus | None = None
 
     @property
     def is_real(self) -> bool:
@@ -346,7 +373,8 @@ def build_hardware(cfg: ResearchConfig, hw_mode: str) -> ResearchHardware:
         accel = StubActuator(axis_name="accel")
         brake = StubActuator(axis_name="brake")
         params = feedforward_params(cfg)
-        vehicle = StubVehicle(accel=accel, brake=brake, params=params)
+        status = VehicleStatus()  # active=False のまま。ボタンの手順が使うときに有効にする
+        vehicle = StubVehicle(accel=accel, brake=brake, params=params, status=status)
         return ResearchHardware(
             accel=accel,
             brake=brake,
@@ -355,6 +383,8 @@ def build_hardware(cfg: ResearchConfig, hw_mode: str) -> ResearchHardware:
             can=StubCANReader(speed_kmh=params.creep_speed_kmh, vehicle=vehicle),
             ups=StubUPSMonitor(),
             hw_mode=HW_STUB,
+            buttons=StubButtonServo(listener=status),
+            vehicle_status=status,
         )
     if hw_mode != HW_REAL:
         raise InitializationError(f"未知のハードウェアモード: {hw_mode!r}")
@@ -424,8 +454,17 @@ def build_hardware(cfg: ResearchConfig, hw_mode: str) -> ResearchHardware:
         ups_name=settings.ups.ups_name,
         poll_interval_s=settings.ups.poll_interval_s,
     )
+    servo = settings.servo
+    buttons = ButtonServoDriver(
+        i2c_bus=servo.i2c_bus,
+        address=servo.address,
+        pwm_freq_hz=servo.pwm_freq_hz,
+        rest_angle=servo.rest_angle,
+        press_angle=servo.press_angle,
+    )
     return ResearchHardware(
-        accel=accel, brake=brake, can=can, ups=ups, hw_mode=HW_REAL, settings=settings
+        accel=accel, brake=brake, can=can, ups=ups, hw_mode=HW_REAL, settings=settings,
+        buttons=buttons,
     )
 
 
@@ -687,6 +726,29 @@ async def _home_return(hw: ResearchHardware, report: InitReport) -> None:
     )
 
 
+async def ensure_buttons_connected(hw: ResearchHardware) -> None:
+    """ボタンを使う手順の最初に呼ぶ。PCA9685 を接続する（接続済みなら何もしない）。
+
+    スタブでは車両の状態（VehicleStatus）を有効にし、IGN-OFF・P・車速 0 から始める。
+    """
+    if hw.buttons is None:
+        raise InitializationError("ボタンサーボが構築されていません")
+    if hw.buttons_connected:
+        return
+    say("ボタンサーボ: PCA9685 に接続 …")
+    # 接続の途中で失敗しても shutdown が release_all / close できるよう、試行前に立てる
+    hw.buttons_connected = True
+    try:
+        await hw.buttons.connect()
+    except Exception as exc:
+        raise InitializationError(f"ボタンサーボ接続: {type(exc).__name__}: {exc}") from exc
+    if hw.vehicle_status is not None:
+        hw.vehicle_status.activate()
+        if isinstance(hw.can, StubCANReader):
+            hw.can.speed_kmh = 0.0  # IGN-OFF・P から始める（スタブ CAN の車速を 0 にする）
+        say("ボタンサーボ: スタブ車両の状態を有効化（IGN-OFF・P・0 km/h から）")
+
+
 async def shutdown(hw: ResearchHardware) -> None:
     """終了処理: 原点復帰 → サーボOFF → 切断（本番 stop() と同じ順）。
 
@@ -698,12 +760,18 @@ async def shutdown(hw: ResearchHardware) -> None:
     say("終了処理: 原点復帰 → サーボOFF → 切断 …")
     # コルーチンは呼び出し時に生成する（タプル内で先に生成すると gather が即座に走り出し、
     # 原点復帰とサーボOFF が同時に動いてしまう）
-    steps: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
+    steps: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = ()
+    # ボタンを接続していれば、まず全ボタンを待機角へ戻す（押したまま終わらない）
+    if hw.buttons is not None and hw.buttons_connected:
+        steps += (("ボタン解放", hw.buttons.release_all),)
+    steps += (
         ("原点復帰", lambda: asyncio.gather(hw.accel.home_return(), hw.brake.home_return())),
         ("サーボOFF", lambda: asyncio.gather(hw.accel.servo_off(), hw.brake.servo_off())),
         ("UPS ポーリング停止", hw.ups.stop_polling),
         ("切断", lambda: asyncio.gather(hw.accel.close(), hw.brake.close(), hw.can.close())),
     )
+    if hw.buttons is not None and hw.buttons_connected:
+        steps += (("ボタン切断", hw.buttons.close),)
     for label, make_coro in steps:
         try:
             await make_coro()
@@ -711,4 +779,5 @@ async def shutdown(hw: ResearchHardware) -> None:
             say(f"  警告: {label}に失敗しました（{type(exc).__name__}: {exc}）")
     hw.connected = False
     hw.initialized = False
+    hw.buttons_connected = False
     say("終了処理: 完了")

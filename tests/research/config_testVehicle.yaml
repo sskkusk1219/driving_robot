@@ -1397,6 +1397,23 @@ checks:
   pre_brake_stop: true         # ブレーキを踏んで停止確認（false だと踏まずに現在位置で続行。危険）
   pre_vehicle_stopped: true    # 車速確認 0 km/h（踏込後のみ）
 
+# ── スタートスイッチ・P/N/D ボタンを押す手順（手順 20〜25、ProblemReport_20261112） ──
+#   押す流れ（どのボタンをどの順に押すか）はコード。ここには回数・秒数・開度だけを置く。
+#   「仮」は根拠のない仮の値で、実機確認（ハード取り付け後）で決める。
+#   ブレーキ ON の開度は新しい値を作らず、手順 2 が書く停車保持の開度（stop_brake_offset_pct）を使う。
+buttons:
+  start_short_press_s: 0.5     # スタートの短押し（Ready・IGN-OFF）[s]（仮：表2 の 2 s より十分短く）
+  start_long_press_s: 3.0      # スタートの長押し（IGN-ON(RLY-OFF)）[s]（資料の「2 s 以上 5 s 未満」の真ん中）
+  shift_press_s: 0.5           # P/N/D の押下 [s]（仮）
+  after_press_wait_s: 1.0      # 押した後に車が状態を変えるまでの待ち [s]（仮）
+  accel_tap_opening_pct: 10.0  # アクセル踏み 1 回の開度 [%]（仮：資料の「1% 以上」を確実に超える）
+  accel_tap_on_s: 0.5          # アクセル踏み 1 回の踏んでいる時間 [s]（仮）
+  accel_tap_off_s: 0.5         # アクセル踏み 1 回の離している時間 [s]（仮）
+  maintenance_tap_count: 3     # メンテナンスモードの各レンジでの踏み回数（資料の値。車種で変わる）
+  n_hold_gap_s: 1.0            # N ホールドの N 2 回押しの間隔 [s]（資料の「5 s 以内」より十分短く。車ごと）
+  no_speed_abort_s: 3.0        # 手順 24: 基準車速が 0 を超えてからこの間、実車速が出なければ中止 [s]（仮：ユーザー決定）
+  no_speed_kmh: 0.2            # 手順 24: これ以下なら「車速が出ていない」[km/h]（資料の停車中のしきい値。車ごと）
+
 # ── 出力 ─────────────────────────────────────────────────────────────
 output:
   results_dir: tests/research/results   # CSV・図・レポートの保存先
