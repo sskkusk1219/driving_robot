@@ -686,6 +686,10 @@ forward_map:
   c10_p_local_gain_c: 6.0
   c10_p_local_gain_cruise_kmhs: 0.3
   c10_p_local_gain_taper_kmhs: 0.6
+  # 2026-11-11 ProblemReport_20261109 PDCA-8-3: 定速（段9 と同じ行）のアクセルで、P に渡す偏差に 1 次の遅れ τ [s]。
+  # 0 ＝ off（今と同じ）。min_kmh 以上の行だけ。ねらいは高速の定速の揺れ（0.6〜1 Hz）の周波数を下げること。値は仮
+  c10_p_lag_s: 0.0
+  c10_p_lag_min_kmh: 0.0
   # 2026-11-10 段10c: 割る量 k の出どころ。"cruise" ＝ 今まで（倍率 × c ÷ 6）／"hf" ＝ 手順2 の定速の保持の正弦波
   # （meta local_gain_accel_hf・周波数 f_hf）から k ＝ max(1, r(v) × 10^(G/20) ÷ (6 × L × 2π f_hf))。
   # 「P だけのループの f_hf での大きさ」を目標のゲイン余裕 G [dB] まで下げる量で、車ごとに r と L が手順2 で決まる。
