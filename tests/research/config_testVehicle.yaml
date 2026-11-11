@@ -696,8 +696,8 @@ forward_map:
   # gm_db 10: 半分データ由来（一般の目安は 6〜12 dB。段10b で P だけの余裕は DOB・I を足すと約 2 dB 減るので、
   # DOB 込みで約 8 dB）。段11 の実機で 10 と 13 dB（DOB 込み約 11 dB）を比べて決める。meta が無ければ k ＝ 1
   c10_p_local_gain_source: "hf"
-  # 2026-11-11 ProblemReport_20261109 PDCA-6（ユーザー決定）: 13 → 16 dB（W の IWR +0.39→+0.04・往復 U/US06 減・偏差は off と同等）
-  c10_p_local_gain_gm_db: 16.0
+  # 2026-11-12 ProblemReport_20261109 クローズ（ユーザー決定）: PDCA-5 の 13 dB に戻す。16 dB（PDCA-6）は W の IWR の差が走行のばらつきの中で、U の IWR が目標外（−0.40）・p95 U/US06 がやや悪い（31 本の比較）
+  c10_p_local_gain_gm_db: 13.0
   # 2026-11-10 ProblemReport_20261109 PDCA-2: FF の計画のアクセル開度の速い成分だけを、手順2 の保持の正弦波の倍率 r
   # （meta local_gain_accel_hf）で割る。根拠: 車は約 0.3 Hz 以上の小さな開度の動きに表の傾きの 2.4〜3.4 倍効き、基準の 1 秒刻みの
   # 折れ目からできる FF の細かい動きが踏みすぎて、車速が基準の揺れを 0.8〜0.95 Hz で 1.3〜1.5 倍にする。
