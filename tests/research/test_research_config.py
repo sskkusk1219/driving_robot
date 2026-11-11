@@ -1386,6 +1386,8 @@ def test_keys_missing_in_yaml_lists_dataclass_keys_not_written(tmp_path: Path) -
     text = cfgmod.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
     base = cfgmod.keys_missing_in_yaml(cfgmod.DEFAULT_CONFIG_PATH)
     assert base == [
+        "forward_map.c10_p_lag_s",  # 2026-11-11 PDCA-8-3: 本体 yaml に書くまでは既定が効く
+        "forward_map.c10_p_lag_min_kmh",
         "forward_map.launch_shift_center_lag",
         "forward_map.low_speed_keep_enabled",
         "forward_map.low_speed_keep_band",

@@ -1095,6 +1095,13 @@ class ForwardMapSection:
     c10_p_local_gain_c: float = 6.0
     c10_p_local_gain_cruise_kmhs: float = 0.3
     c10_p_local_gain_taper_kmhs: float = 0.6
+    # 2026-11-11 ProblemReport_20261109 PDCA-8-3: 高速の定速だけ C10 の P に渡す偏差を 1 次の遅れ
+    # （時定数 c10_p_lag_s [秒]）に通す（I・DOB は今の偏差のまま。帯・D を掛けたあとの最終の
+    # P の偏差に掛ける）。掛ける行は帯・D・段9 と同じ定速の行（`_small_dev_row`）で、アクセルの行
+    # だけ・行の車速が c10_p_lag_min_kmh 以上。根拠: 約 0.6〜1 Hz の揺れの周波数を下げる狙い。
+    # 値は仮（実機の揺れの周波数で決め直す）。0.0 ＝ off ＝ 今と完全に同じ
+    c10_p_lag_s: float = 0.0
+    c10_p_lag_min_kmh: float = 0.0
     # 2026-11-10 ProblemReport_20261109 段10c: 割る量 k の出どころ。"cruise" ＝ 今まで（段9: 倍率
     # × c ÷ deviation_c。
     # 倍率は meta local_gain_accel_cruise）／"hf" ＝ 手順2 の定速の保持の正弦波（meta
@@ -2306,6 +2313,14 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         0.0 < fm.c10_p_local_gain_cruise_kmhs < fm.c10_p_local_gain_taper_kmhs,
         "forward_map.c10_p_local_gain_cruise_kmhs は正値で c10_p_local_gain_taper_kmhs 未満: "
         f"{fm.c10_p_local_gain_cruise_kmhs}（taper {fm.c10_p_local_gain_taper_kmhs}）",
+    )
+    need(
+        fm.c10_p_lag_s >= 0.0,
+        f"forward_map.c10_p_lag_s は 0 以上: {fm.c10_p_lag_s}",
+    )
+    need(
+        fm.c10_p_lag_min_kmh >= 0.0,
+        f"forward_map.c10_p_lag_min_kmh は 0 以上: {fm.c10_p_lag_min_kmh}",
     )
     need(
         fm.ff_hf_div in ("off", "cruise", "all"),

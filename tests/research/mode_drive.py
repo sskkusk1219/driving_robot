@@ -536,6 +536,17 @@ def small_dev_band(dev_kmh: float, e_kmh: float, r: float) -> float:
     return math.copysign(r * e_kmh + (mag - e_kmh), dev_kmh)
 
 
+def p_lag_step(prev: float | None, dev: float, dt: float, tau: float) -> float:
+    """2026-11-11 PDCA-8-3（c10_p_lag_s）: P に渡す偏差の 1 次の遅れ 1 歩。
+    prev が None（初回）は dev をそのまま返す。dt ≦ 0 は更新せず prev を保つ。
+    x ＝ prev ＋ (dev − prev) × dt ÷ (tau ＋ dt)。"""
+    if prev is None:
+        return dev
+    if dt <= 0.0:
+        return prev
+    return prev + (dev - prev) * dt / (tau + dt)
+
+
 def d_term_dev(td_s: float, need_kmhs: float, accel_meas_kmhs: float) -> float:
     """2026-11-09 段4（c10_d_term）: P の偏差に足す D ＝ Td ×（要る加速度 − 実測の加速度）[km/h]。
     要る加速度より実加速度が小さい（遅れていく）なら正（dev ＝ 基準 − 実車速 と同じ向き）。"""
@@ -1194,6 +1205,7 @@ def _prepare_forward_map_plan(
         )
         say("  C10 の P の局所の効き（20261109 段9・段10c）: "
             f"{c10_p_local_gain_text(fm, ff.table.meta, _lag_a, ff.deviation_c)}")
+        say(f"  C10 の P の遅れ（PDCA-8-3）: {c10_p_lag_text(fm)}")
         say(f"  FF のアクセルの速い成分を割る（PDCA-2）: {ff_hf_div_text(fm, ff.table.meta)}")
     if isinstance(ff, CoastAssistFeedforward):
         # 2026-10-18 段2r: 惰行の補助。保持時間 ＝ 係数 × (遅れ ＋ 効き始めまでの戻り時間)
@@ -1976,6 +1988,13 @@ def ff_hf_div_text(fm: Any, meta: Any) -> str:
     )
 
 
+def c10_p_lag_text(fm: Any) -> str:
+    """2026-11-11 PDCA-8-3（c10_p_lag_s）の設定の表示（走行前）。"""
+    if fm.c10_p_lag_s <= 0.0:
+        return "off"
+    return f"τ {fm.c10_p_lag_s:g} s・{fm.c10_p_lag_min_kmh:g} km/h 以上の定速（アクセル）"
+
+
 def c10_small_dev_text(fm: Any) -> str:
     """2026-11-09 段2・4（小さい偏差の帯・D）の設定の表示（走行前）。"""
     band = (
@@ -2440,6 +2459,7 @@ class _ModeRun:
         self._d_accel_kmhs: float | None = None
         self._p_local_ratio: float | None = None  # 段9: C10 の P の局所の効き（掛けない行は None）
         self._p_gain_div: float | None = None
+        self._p_lag_kmh: float | None = None  # PDCA-8-3: P の偏差の 1 次の遅れの状態
         self._d_win: deque[tuple[float, float]] = deque()  # (t, 制御に使っている車速)
         # 段12c: filter の状態（前の周期の (t, 車速)・フィルタ後の加速度。2 点そろうまで None）
         self._d_prev: tuple[float, float] | None = None
@@ -2902,7 +2922,7 @@ class _ModeRun:
         self._stop_end_tau_s = None
         self._stop_pred_dev = None
         self._sdb_p_kmh = self._d_term_kmh = self._d_accel_kmhs = None
-        self._p_local_ratio = self._p_gain_div = None
+        self._p_local_ratio = self._p_gain_div = self._p_lag_kmh = None
         if self.cfg.forward_map.c10_d_term:
             # 段4: D の実測の加速度の窓。行の種類に関係なく毎周期進める
             dwin = self._d_win
@@ -3044,7 +3064,7 @@ class _ModeRun:
                 c10_effort = None if c10_effort is None else 0.0
                 coast_active = False
                 self._sdb_p_kmh = self._d_term_kmh = self._d_accel_kmhs = None  # 段2・4
-                self._p_local_ratio = self._p_gain_div = None  # 段9
+                self._p_local_ratio = self._p_gain_div = self._p_lag_kmh = None  # 段9・PDCA-8-3
                 self._coast_effort = 0.0
                 self._pf_row = None  # 保持の場面は下限を掛けない（20261108 段1）
                 self._ho_now = 0 if self._ho_on else None
@@ -3628,7 +3648,7 @@ class _ModeRun:
         fm_sd = self.cfg.forward_map
         plg_on = fm_sd.c10_p_local_gain != "off"
         sd_row = (
-            fm_sd.c10_small_dev_band or fm_sd.c10_d_term or plg_on
+            fm_sd.c10_small_dev_band or fm_sd.c10_d_term or plg_on or fm_sd.c10_p_lag_s > 0.0
         ) and self._small_dev_row(
             t, i, plan, ff_effort, flag_now,
             flag_override=flag_override, p_dev=p_dev, tau_end=tau_end,
@@ -3668,6 +3688,18 @@ class _ModeRun:
                     dev_p += d_dev
                     self._d_term_kmh, self._d_accel_kmhs = d_dev, a_meas
             kwargs["dev_kmh"] = dev_p
+        if (
+            fm_sd.c10_p_lag_s > 0.0 and sd_row and ff_effort > 0.0
+            and float(kwargs["row_kmh"]) >= fm_sd.c10_p_lag_min_kmh
+        ):
+            # 2026-11-11 PDCA-8-3（c10_p_lag_s）: 帯・D を掛けたあとの最終の P の偏差に 1 次の遅れ
+            # （I・DOB は今の dev のまま）。dt ≦ 0 は前の値を保つ
+            self._p_lag_kmh = p_lag_step(
+                self._p_lag_kmh, float(kwargs["dev_kmh"]), dt_ci, fm_sd.c10_p_lag_s
+            )
+            kwargs["dev_kmh"] = self._p_lag_kmh
+        else:
+            self._p_lag_kmh = None  # 条件を外れたら捨てる（次は今の偏差から始める）
         kwargs["integral_kmhs"] = integral_kmhs
         fb_table = self._fb_table()  # 段8-b
         # 段4 (ア): 局所の効きの倍率で、P と DOB の上乗せの差を割る（deviation_offset_detail の
