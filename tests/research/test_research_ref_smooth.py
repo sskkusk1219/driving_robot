@@ -197,8 +197,9 @@ def test_brake_side_upper_stops_only_the_positive_offset() -> None:
 
 
 def test_brake_side_is_validated(tmp_path: Path) -> None:
+    assert cfgmod.FeedforwardSection().ref_smooth_brake_side == "both"  # 既定は今まで
     cfg = _cfg(tmp_path)
-    assert cfg.feedforward.ref_smooth_brake_side == "both"
+    assert cfg.feedforward.ref_smooth_brake_side == "upper"  # 2026-11-11 PDCA-5 で本体 on
     cfg.feedforward.ref_smooth_brake_side = "lower"
     assert any("ref_smooth_brake_side" in p for p in cfgmod.validate_config(cfg))
     cfg.feedforward.ref_smooth_brake_side = "upper"
