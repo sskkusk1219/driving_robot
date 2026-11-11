@@ -103,6 +103,9 @@ class FeedforwardSection:
     # from 0 ＝ 全部ぼかす。今と完全に同じ）
     ref_smooth_brake_from_kmhs: float = 0.0
     ref_smooth_brake_to_kmhs: float = 0.0
+    # 2026-11-11 PDCA-5: 強い減速で止めるずれの向き。
+    # "both"＝上下とも／"upper"＝基準より上に出る分だけ
+    ref_smooth_brake_side: str = "both"
     engine_brake_decel_kmhs: float = 1.6
     coast_decel_speeds_kmh: list[float] = field(default_factory=list)
     coast_decel_kmhs: list[float] = field(default_factory=list)
@@ -2445,6 +2448,10 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         ff.ref_smooth_brake_from_kmhs > 0.0 or ff.ref_smooth_brake_to_kmhs == 0.0,
         "feedforward.ref_smooth_brake_to_kmhs は from が 0 のとき 0 にしてください: "
         f"{ff.ref_smooth_brake_from_kmhs}, {ff.ref_smooth_brake_to_kmhs}",
+    )
+    need(
+        ff.ref_smooth_brake_side in ("both", "upper"),
+        f"feedforward.ref_smooth_brake_side は both か upper: {ff.ref_smooth_brake_side!r}",
     )
     _check_composed_modes(cfg.modes.composed_modes, problems)
     names = cfg.modes.coverage_mode_names

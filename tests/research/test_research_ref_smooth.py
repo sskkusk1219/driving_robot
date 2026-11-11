@@ -156,6 +156,55 @@ def test_brake_weight_keeps_original_where_decel_is_steep() -> None:
     assert "減速" not in mdmod.ref_smooth_text(0.5, 0.1)
 
 
+def test_brake_side_upper_stops_only_the_positive_offset() -> None:
+    mode = _mode([(0, 0), (5, 0), (15, 30), (20, 30), (30, 20), (35, 20),
+                  (45, 20), (55, 0), (60, 0)])
+    orig = mdmod.ReferenceSpeed(mode)
+    capped = mdmod.make_target_reference(mode, 0.5, 0.1)
+    both = mdmod.make_target_reference(mode, 0.5, 0.1, 0.3, 0.6)
+    both2 = mdmod.make_target_reference(mode, 0.5, 0.1, 0.3, 0.6, "both")
+    upper = mdmod.make_target_reference(mode, 0.5, 0.1, 0.3, 0.6, "upper")
+    ts = np.arange(5.5, 59.0, 0.01)
+    assert all(both.at(t) == both2.at(t) for t in ts[::13])
+    grid = np.arange(0.0, 60.0, 0.01)
+    base = np.array([orig.at(t) for t in grid])
+    x = np.arange(-200, 201) * 0.01
+    k = np.exp(-0.5 * (x / 0.5) ** 2)
+    k /= k.sum()
+    acc = np.convolve(np.pad(np.gradient(base, 0.01), 200, mode="edge"), k, mode="valid")
+    n_pos = n_neg = 0
+    for t in ts:
+        if orig.at(t) <= 1e-6:
+            continue
+        a = acc[int(round(t / 0.01))]
+        off = capped.at(t) - orig.at(t)
+        if a <= -0.6 - 0.02:
+            if off > 1e-9:
+                n_pos += 1
+                assert upper.at(t) == pytest.approx(orig.at(t), abs=1e-6)
+            elif off < -1e-9:
+                n_neg += 1
+                assert upper.at(t) == pytest.approx(capped.at(t), abs=1e-6)
+        elif a >= -0.3 + 0.02:
+            assert upper.at(t) == pytest.approx(capped.at(t), abs=1e-6)
+        else:
+            if off < -1e-9:
+                assert upper.at(t) == pytest.approx(capped.at(t), abs=1e-6)
+    assert n_pos > 20 and n_neg > 20
+    text = mdmod.ref_smooth_text(0.5, 0.1, 0.3, 0.6, "upper")
+    assert "より強い所は基準より上に出る分だけぼかさない" in text
+    assert "基準より上に出る分だけ" not in mdmod.ref_smooth_text(0.5, 0.1, 0.3, 0.6)
+
+
+def test_brake_side_is_validated(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    assert cfg.feedforward.ref_smooth_brake_side == "both"
+    cfg.feedforward.ref_smooth_brake_side = "lower"
+    assert any("ref_smooth_brake_side" in p for p in cfgmod.validate_config(cfg))
+    cfg.feedforward.ref_smooth_brake_side = "upper"
+    assert not any("ref_smooth_brake_side" in p for p in cfgmod.validate_config(cfg))
+
+
 def test_csv_has_ref_smooth_column_at_the_end() -> None:
     # 後から列が末尾に足されるので、並び（pred_dev_kmh の直後）だけを見る（2026-11-11）
     cols = dlmod.CSV_COLUMNS

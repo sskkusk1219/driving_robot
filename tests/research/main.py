@@ -966,6 +966,7 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
         ref_smooth_max_kmh=ctx.config.feedforward.ref_smooth_max_kmh,
         ref_smooth_brake_from_kmhs=ctx.config.feedforward.ref_smooth_brake_from_kmhs,
         ref_smooth_brake_to_kmhs=ctx.config.feedforward.ref_smooth_brake_to_kmhs,
+        ref_smooth_brake_side=ctx.config.feedforward.ref_smooth_brake_side,
         low_speed_side_rule=ctx.config.forward_map.low_speed_side_rule,
         switch_lead_enabled=ctx.config.forward_map.switch_lead_enabled,
         fel_text=_fel_text_of(ctx.config, setup),

@@ -399,7 +399,8 @@ def forward_map_plan_args(
     orig_ref = ReferenceSpeed(mode)
     target_ref = make_target_reference(
         mode, ff_cfg.ref_smooth_sigma_s, ff_cfg.ref_smooth_max_kmh,
-        ff_cfg.ref_smooth_brake_from_kmhs, ff_cfg.ref_smooth_brake_to_kmhs)
+        ff_cfg.ref_smooth_brake_from_kmhs, ff_cfg.ref_smooth_brake_to_kmhs,
+        ff_cfg.ref_smooth_brake_side)
     kwargs: dict[str, Any] = dict(
         accel_deadband_pct=cfg.vehicle.min_accel_opening_pct,
         brake_deadband_pct=cfg.vehicle.min_brake_opening_pct,
@@ -1037,7 +1038,8 @@ def _prepare_forward_map_plan(
     plan = ff.build_plan(ref_at, duration_s, **plan_kwargs)
     target_ref = make_target_reference(
         mode, ff_cfg.ref_smooth_sigma_s, ff_cfg.ref_smooth_max_kmh,
-        ff_cfg.ref_smooth_brake_from_kmhs, ff_cfg.ref_smooth_brake_to_kmhs)
+        ff_cfg.ref_smooth_brake_from_kmhs, ff_cfg.ref_smooth_brake_to_kmhs,
+        ff_cfg.ref_smooth_brake_side)
     meta = ff.table.meta
     # 使った遅れ（None なら fwd_plan と同じく pkl の meta の値）
     lag_a = fm.accel_lag_s if fm.accel_lag_s is not None else meta.get("accel_lag_s")
@@ -1045,7 +1047,8 @@ def _prepare_forward_map_plan(
     say(f"FF 候補: {ff.candidate}（順モデルの表）　表: {ff_cfg.model_path}")
     say("  " + ref_smooth_text(
         ff_cfg.ref_smooth_sigma_s, ff_cfg.ref_smooth_max_kmh,
-        ff_cfg.ref_smooth_brake_from_kmhs, ff_cfg.ref_smooth_brake_to_kmhs))
+        ff_cfg.ref_smooth_brake_from_kmhs, ff_cfg.ref_smooth_brake_to_kmhs,
+        ff_cfg.ref_smooth_brake_side))
     say(fel_text(cfg, ff.table))
     say(f"  遅れ アクセル {lag_a}s / ブレーキ {lag_b}s・惰行の帯 ±{fm.coast_band_kmhs:g} km/h/s・"
         f"窓 {fm.need_window_s:g}s")
@@ -1364,13 +1367,15 @@ class ReferenceSpeed:
 
 def ref_smooth_text(
     sigma_s: float, max_kmh: float = 0.0, brake_from_kmhs: float = 0.0, brake_to_kmhs: float = 0.0,
+    brake_side: str = "both",
 ) -> str:
     """基準のぼかし（feedforward.ref_smooth_sigma_s）の 1 行表示（走行前の表示・レポート 5 章）。"""
     if sigma_s <= 0.0:
         return "基準のぼかし: なし（σ=0。目標も元の基準）"
     cap = f"・元の基準とのずれは ±{max_kmh:g} km/h まで" if max_kmh > 0.0 else ""
     if brake_from_kmhs > 0.0:
-        cap += f"・減速 {brake_from_kmhs:g}〜{brake_to_kmhs:g} km/h/s より強い所はぼかさない"
+        part = "基準より上に出る分だけ" if brake_side == "upper" else ""
+        cap += f"・減速 {brake_from_kmhs:g}〜{brake_to_kmhs:g} km/h/s より強い所は{part}ぼかさない"
     return (f"基準のぼかし: σ={sigma_s:g}s のガウス{cap}（開度の列・C10 の P・DOB の表の行・"
             "C12 の惰行の補助・C13 の予測の偏差の目標だけ。KPI・偏差の記録・停車の判定・"
             "ガバナー・安全網・調停は元の基準）")
@@ -1393,7 +1398,7 @@ class SmoothedReference:
 
     def __init__(
         self, mode: DrivingMode, sigma_s: float, max_offset_kmh: float = 0.0,
-        brake_from_kmhs: float = 0.0, brake_to_kmhs: float = 0.0,
+        brake_from_kmhs: float = 0.0, brake_to_kmhs: float = 0.0, brake_side: str = "both",
     ) -> None:
         if sigma_s <= 0.0:
             raise ValueError("sigma_s は正値（0 ならぼかさない = ReferenceSpeed を使う）")
@@ -1419,7 +1424,11 @@ class SmoothedReference:
             # w = 1（ぼかす）: a ≥ −from、w = 0（元のまま）: a ≤ −to、間は直線
             accel = np.convolve(np.gradient(orig, self.GRID_S), kernel, mode="valid")
             w = np.clip((accel + brake_to_kmhs) / (brake_to_kmhs - brake_from_kmhs), 0.0, 1.0)
-            blurred = orig_inner + w * (blurred - orig_inner)
+            offset = blurred - orig_inner
+            if brake_side == "upper":  # 2026-11-11 PDCA-5: 上に出る分だけ止める（下は残す）
+                blurred = orig_inner + np.where(offset > 0.0, w * offset, offset)
+            else:
+                blurred = orig_inner + w * offset
         self._vals = np.where(orig_inner <= self.ZERO_KMH, orig_inner, blurred)
 
     def at(self, t_s: float) -> float:
@@ -1428,7 +1437,7 @@ class SmoothedReference:
 
 def make_target_reference(
     mode: DrivingMode, sigma_s: float, max_offset_kmh: float = 0.0,
-    brake_from_kmhs: float = 0.0, brake_to_kmhs: float = 0.0,
+    brake_from_kmhs: float = 0.0, brake_to_kmhs: float = 0.0, brake_side: str = "both",
 ) -> ReferenceSpeed | SmoothedReference:
     """目標側の基準。σ が 0 以下なら元の基準（ReferenceSpeed）をそのまま返す（今と完全に同じ）。
 
@@ -1437,7 +1446,8 @@ def make_target_reference(
     """
     if sigma_s <= 0.0:
         return ReferenceSpeed(mode)
-    return SmoothedReference(mode, sigma_s, max_offset_kmh, brake_from_kmhs, brake_to_kmhs)
+    return SmoothedReference(
+        mode, sigma_s, max_offset_kmh, brake_from_kmhs, brake_to_kmhs, brake_side)
 
 
 class ActualSpeedHistory:
@@ -2299,7 +2309,8 @@ class _ModeRun:
             else make_target_reference(
                 setup.mode, cfg.feedforward.ref_smooth_sigma_s, cfg.feedforward.ref_smooth_max_kmh,
                 cfg.feedforward.ref_smooth_brake_from_kmhs,
-                cfg.feedforward.ref_smooth_brake_to_kmhs)
+                cfg.feedforward.ref_smooth_brake_to_kmhs,
+                cfg.feedforward.ref_smooth_brake_side)
         )
         self.log = log
         self.duration_s = duration_s
