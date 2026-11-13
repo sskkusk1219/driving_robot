@@ -1413,6 +1413,16 @@ buttons:
   n_hold_gap_s: 1.0            # N ホールドの N 2 回押しの間隔 [s]（資料の「5 s 以内」より十分短く。車ごと）
   no_speed_abort_s: 3.0        # 手順 24: 基準車速が 0 を超えてからこの間、実車速が出なければ中止 [s]（仮：ユーザー決定）
   no_speed_kmh: 0.2            # 手順 24: これ以下なら「車速が出ていない」[km/h]（資料の停車中のしきい値。車ごと）
+  # SG90 は 2 個で 4 ボタンを押す（ユーザーの取り付けから決めた値、2026-11-14）。1 個を基準から
+  # 左右に振る。指令する角度 ＝ servo_rest_angle_deg ＋ offset_deg（スタート・P は ch0、N・D は ch1）。
+  # I2C のバス・アドレス・PWM 周波数は config/settings.toml の [servo] から読む。
+  # シミュレータ（試験車両）側のキーは E/R/T/Y（スタート・P・N・D に対応）。
+  servo_rest_angle_deg: 90.0   # 基準（待機）の角度 [deg]
+  servo_map:
+    start: {channel: 0, offset_deg: -80.0}   # 10°
+    P: {channel: 0, offset_deg: 80.0}        # 170°
+    N: {channel: 1, offset_deg: -80.0}       # 10°
+    D: {channel: 1, offset_deg: 80.0}        # 170°
 
 # ── 出力 ─────────────────────────────────────────────────────────────
 output:

@@ -1970,6 +1970,13 @@ def test_buttons_section_defaults_and_validation(tmp_path: Path) -> None:
     assert (bt.accel_tap_opening_pct, bt.accel_tap_on_s, bt.accel_tap_off_s) == (10.0, 0.5, 0.5)
     assert (bt.maintenance_tap_count, bt.n_hold_gap_s) == (3, 1.0)
     assert (bt.no_speed_abort_s, bt.no_speed_kmh) == (3.0, 0.2)
+    assert bt.servo_rest_angle_deg == 90.0
+    assert bt.servo_map == {
+        "start": {"channel": 0, "offset_deg": -80.0},
+        "P": {"channel": 0, "offset_deg": 80.0},
+        "N": {"channel": 1, "offset_deg": -80.0},
+        "D": {"channel": 1, "offset_deg": 80.0},
+    }
     assert cfgmod.ButtonsSection() == bt  # yaml の値は dataclass の既定と同じ
     assert not [p for p in cfgmod.validate_config(cfg) if "buttons." in p]
     for name, bad in (
@@ -1983,6 +1990,24 @@ def test_buttons_section_defaults_and_validation(tmp_path: Path) -> None:
         cfg = _load_default()
         setattr(cfg.buttons, name, bad)
         assert any(f"buttons.{name}" in p for p in cfgmod.validate_config(cfg)), name
+
+
+def test_buttons_servo_map_validation() -> None:
+    """servo_map の検証: 欠け・ch 範囲・角度範囲・offset 0・同じ ch/角度の重複。"""
+
+    def problems_after(edit) -> list[str]:  # type: ignore[no-untyped-def]
+        cfg = _load_default()
+        edit(cfg.buttons)
+        return [p for p in cfgmod.validate_config(cfg) if "servo" in p]
+
+    assert not problems_after(lambda b: None)
+    assert problems_after(lambda b: b.servo_map.pop("D"))
+    assert problems_after(lambda b: b.servo_map["N"].update(channel=16))
+    assert problems_after(lambda b: b.servo_map["N"].update(channel=-1))
+    assert problems_after(lambda b: b.servo_map["N"].update(offset_deg=0.0))
+    assert problems_after(lambda b: b.servo_map["N"].update(offset_deg=95.0))  # 90+95 > 180
+    assert problems_after(lambda b: b.servo_map["P"].update(offset_deg=-80.0))  # start と重複
+    assert problems_after(lambda b: setattr(b, "servo_rest_angle_deg", 181.0))
 
 
 def test_buttons_section_absent_uses_defaults(tmp_path: Path) -> None:

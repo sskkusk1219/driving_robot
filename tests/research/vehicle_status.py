@@ -6,7 +6,8 @@
 
 使い方（スタブ HW）:
     status.update(now, accel_pct, brake_pct, speed_kmh)   # 車速を読むたびに（StubVehicle.advance）
-    status.on_press_start(ch, now) / on_press_end(ch, now) # ボタンを押す前後（StubButtonServo）
+    status.on_press_start(button, now) / on_press_end(button, now)
+        # ボタンを押す前後（button_steps.press_button が呼ぶ）
 `active` が False の間は何もしない（手順 2・3 だけの実行は今までどおり）。ボタンを使う手順が
 最初に activate() を呼ぶ（hardware.ensure_buttons_connected）。
 
@@ -19,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from tests.research.button_servo import CH_D, CH_N, CH_P, CH_START
+from tests.research.button_servo import BUTTON_D, BUTTON_N, BUTTON_P, BUTTON_START
 
 STOP_KMH = 0.2  # 停車中 ≤ この値、走行中 > この値 [km/h]
 BRAKE_ON_PCT = 0.1  # ブレーキ ON ≥ この値 [%]
@@ -126,18 +127,19 @@ class VehicleStatus:
             self._m_stage = self._m_count = 0
         self._count_accel_tap(now)
 
-    def on_press_start(self, channel: int, now: float) -> None:
+    def on_press_start(self, button: str, now: float) -> None:
+        """button はボタンの名前（"start"・"P"・"N"・"D"）。"""
         if not self.active:
             return
-        if channel == CH_START:
+        if button == BUTTON_START:
             self._start_pressed(now)
-        elif channel in (CH_P, CH_N, CH_D):
-            self._shift_pressed({CH_P: "P", CH_N: "N", CH_D: "D"}[channel], now)
+        elif button in (BUTTON_P, BUTTON_N, BUTTON_D):
+            self._shift_pressed(button, now)
 
-    def on_press_end(self, channel: int, now: float) -> None:
+    def on_press_end(self, button: str, now: float) -> None:
         if not self.active:
             return
-        if channel == CH_START and self._hold is not None:
+        if button == BUTTON_START and self._hold is not None:
             self._apply_hold(now)
             self._hold = None
 

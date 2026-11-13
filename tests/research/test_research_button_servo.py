@@ -37,11 +37,12 @@ class FakeBus:
 
 
 def _driver(bus: FakeBus) -> bs.ButtonServoDriver:
-    return bs.ButtonServoDriver(rest_angle=60.0, press_angle=110.0, bus_factory=lambda _n: bus)
+    return bs.ButtonServoDriver(rest_angle=90.0, bus_factory=lambda _n: bus)
 
 
-REST = bs.angle_to_count(60.0, 50)
-PRESS = bs.angle_to_count(110.0, 50)
+REST = bs.angle_to_count(90.0, 50)
+PRESS = bs.angle_to_count(170.0, 50)  # 基準から +80°
+PRESS_LOW = bs.angle_to_count(10.0, 50)  # 基準から -80°
 
 
 def test_angle_to_count_known_values_and_clamp() -> None:
@@ -50,13 +51,14 @@ def test_angle_to_count_known_values_and_clamp() -> None:
     assert bs.angle_to_count(180.0, 50) == 512
     assert bs.angle_to_count(-10.0, 50) == 102  # 範囲外は端に丸める
     assert bs.angle_to_count(999.0, 50) == 512
-    assert bs.angle_to_count(60.0, 50) < bs.angle_to_count(110.0, 50)
+    assert bs.angle_to_count(90.0, 50) < bs.angle_to_count(170.0, 50)
 
 
-def test_channel_constants_and_names() -> None:
-    assert (bs.CH_START, bs.CH_P, bs.CH_N, bs.CH_D) == (0, 1, 2, 3)
-    assert bs.button_name(bs.CH_N) == "N"
-    assert bs.button_name(9) == "ch9"
+def test_button_keys_and_names() -> None:
+    assert bs.BUTTON_KEYS == ("start", "P", "N", "D")
+    assert bs.button_name(bs.BUTTON_START) == "スタート"
+    assert bs.button_name(bs.BUTTON_N) == "N"
+    assert bs.button_name("X") == "X"
 
 
 async def test_connect_sets_all_channels_to_rest() -> None:
@@ -71,32 +73,35 @@ async def test_press_ends_at_rest_angle() -> None:
     drv = _driver(bus)
     await drv.connect()
     bus.writes.clear()
-    await drv.press(bs.CH_N, 0.01)
-    assert bus.writes == [(bs.CH_N, PRESS), (bs.CH_N, REST)]
-    assert bus.counts[bs.CH_N] == REST
+    await drv.press(1, 170.0, 0.01)
+    assert bus.writes == [(1, PRESS), (1, REST)]  # 指定角 → 基準角の順
+    assert bus.counts[1] == REST
+    bus.writes.clear()
+    await drv.press(1, 10.0, 0.01)  # 同じ ch を反対向きへ
+    assert bus.writes == [(1, PRESS_LOW), (1, REST)]
 
 
 async def test_press_cancel_still_returns_to_rest() -> None:
     bus = FakeBus()
     drv = _driver(bus)
     await drv.connect()
-    task = asyncio.create_task(drv.press(bs.CH_START, 5.0))
+    task = asyncio.create_task(drv.press(0, 170.0, 5.0))
     await asyncio.sleep(0.1)  # 押下角へ動いて待機に入るまで
-    assert bus.counts[bs.CH_START] == PRESS
+    assert bus.counts[0] == PRESS
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     await asyncio.sleep(0.05)  # 解放タスクの完了待ち
-    assert bus.counts[bs.CH_START] == REST
+    assert bus.counts[0] == REST
 
 
 async def test_press_rejects_bad_channel_and_unconnected() -> None:
     drv = _driver(FakeBus())
     with pytest.raises(RuntimeError, match="connect"):
-        await drv.press(0, 0.0)
+        await drv.press(0, 170.0, 0.0)
     await drv.connect()
     with pytest.raises(ValueError):
-        await drv.press(16, 0.0)
+        await drv.press(16, 170.0, 0.0)
 
 
 async def test_release_all_and_close() -> None:
@@ -111,27 +116,17 @@ async def test_release_all_and_close() -> None:
     assert bus.closed
 
 
-class _Listener:
-    def __init__(self) -> None:
-        self.events: list[tuple[str, int]] = []
-
-    def on_press_start(self, channel: int, now: float) -> None:
-        self.events.append(("start", channel))
-
-    def on_press_end(self, channel: int, now: float) -> None:
-        self.events.append(("end", channel))
-
-
-async def test_stub_records_history_and_notifies_listener() -> None:
-    listener = _Listener()
-    stub = bs.StubButtonServo(listener=listener)
+async def test_stub_records_history() -> None:
+    stub = bs.StubButtonServo()
     with pytest.raises(RuntimeError):
-        await stub.press(bs.CH_N, 0.0)
+        await stub.press(1, 10.0, 0.0)
     await stub.connect()
-    await stub.press(bs.CH_N, 0.02)
-    await stub.press(bs.CH_START, 0.0)
-    assert [(r.channel, r.duration_s) for r in stub.history] == [(2, 0.02), (0, 0.0)]
-    assert listener.events == [("start", 2), ("end", 2), ("start", 0), ("end", 0)]
+    await stub.press(1, 10.0, 0.02)
+    await stub.press(0, 170.0, 0.0)
+    assert [(r.channel, r.angle, r.duration_s) for r in stub.history] == [
+        (1, 10.0, 0.02),
+        (0, 170.0, 0.0),
+    ]
     await stub.release_all()
     assert stub.released_all_count == 1
 

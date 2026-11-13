@@ -726,6 +726,18 @@ class ButtonsSection:
     n_hold_gap_s: float = 1.0  # N ホールドの N 2 回押しの間隔（資料の 5 s 以内より十分短く）[s]
     no_speed_abort_s: float = 3.0  # 手順 24: 基準車速が出てからこの間、実車速が出なければ中止 [s]
     no_speed_kmh: float = 0.2  # 手順 24: これ以下なら「車速が出ていない」[km/h]（資料の停車中）
+    # SG90 は 2 個で 4 ボタンを押す（1 個を基準から左右に振る。ユーザーの取り付けから決めた値）。
+    # 指令する角度 ＝ servo_rest_angle_deg ＋ offset_deg。I2C のバス・アドレス・PWM 周波数は
+    # config/settings.toml の [servo] から読む（その rest_angle/press_angle は使わない）。
+    servo_rest_angle_deg: float = 90.0  # 基準（待機）の角度 [deg]
+    servo_map: dict[str, dict[str, Any]] = field(
+        default_factory=lambda: {
+            "start": {"channel": 0, "offset_deg": -80.0},
+            "P": {"channel": 0, "offset_deg": 80.0},
+            "N": {"channel": 1, "offset_deg": -80.0},
+            "D": {"channel": 1, "offset_deg": 80.0},
+        }
+    )
 
 
 @dataclass
@@ -1892,6 +1904,12 @@ def _coerce(dotted: str, value: Any, declared: Any) -> Any:
         if not isinstance(value, list) or any(not isinstance(v, dict) for v in value):
             raise ConfigError(f"{dotted} はマッピングのリストで指定してください（現在: {value!r}）")
         return value
+    if declared == "dict[str, dict[str, Any]]":
+        if not isinstance(value, dict) or any(
+            not isinstance(k, str) or not isinstance(v, dict) for k, v in value.items()
+        ):
+            raise ConfigError(f"{dotted} はマッピングの入れ子で指定してください（現在: {value!r}）")
+        return value
     if declared == "list[str]":
         if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
             raise ConfigError(f"{dotted} は文字列のリストで指定してください（現在: {value!r}）")
@@ -2917,7 +2935,47 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
         2.0 <= bt.start_long_press_s < 5.0,
         f"buttons.start_long_press_s が範囲外(2<=s<5): {bt.start_long_press_s}",
     )
+    _validate_servo_map(bt, problems)
     return problems
+
+
+def _validate_servo_map(bt: ButtonsSection, problems: list[str]) -> None:
+    """buttons.servo_map（ボタン → ch・基準からの角度）の形と値域。"""
+    keys = ("start", "P", "N", "D")
+    rest = bt.servo_rest_angle_deg
+    if not 0.0 <= rest <= 180.0:
+        problems.append(f"buttons.servo_rest_angle_deg が範囲外(0<=deg<=180): {rest}")
+    missing = [k for k in keys if k not in bt.servo_map]
+    extra = sorted(set(bt.servo_map) - set(keys))
+    if missing:
+        problems.append(f"buttons.servo_map に {', '.join(missing)} がありません")
+    if extra:
+        problems.append(f"buttons.servo_map に未知のボタン: {', '.join(extra)}")
+    seen: dict[tuple[int, float], str] = {}
+    for key in keys:
+        item = bt.servo_map.get(key)
+        if item is None:
+            continue
+        label = f"buttons.servo_map.{key}"
+        ch, off = item.get("channel"), item.get("offset_deg")
+        if set(item) - {"channel", "offset_deg"}:
+            problems.append(f"{label} に未知のキー（channel・offset_deg だけ）")
+            continue
+        if isinstance(ch, bool) or not isinstance(ch, int) or not 0 <= ch <= 15:
+            problems.append(f"{label}.channel は 0〜15 の整数: {ch!r}")
+            continue
+        if isinstance(off, bool) or not isinstance(off, int | float):
+            problems.append(f"{label}.offset_deg は数値: {off!r}")
+            continue
+        if off == 0:
+            problems.append(f"{label}.offset_deg は 0 以外（基準のままでは押せない）")
+        angle = rest + float(off)
+        if not 0.0 <= angle <= 180.0:
+            problems.append(f"{label}: 基準＋角度が 0〜180° の外: {angle:g}")
+        prev = seen.get((ch, angle))
+        if prev is not None:
+            problems.append(f"{label} は {prev} と同じ ch・同じ角度")
+        seen[(ch, angle)] = key
 
 
 def _validate_features(ft: FeaturesSection) -> list[str]:

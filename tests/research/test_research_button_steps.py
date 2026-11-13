@@ -15,7 +15,6 @@ from tests.research import config as cfgmod
 from tests.research import hardware as hwmod
 from tests.research import main as mainmod
 from tests.research import mode_drive as mdmod
-from tests.research.button_servo import CH_D, CH_N, StubButtonServo
 from tests.research.vehicle_status import State
 
 
@@ -113,6 +112,18 @@ def test_steps_are_registered_and_listed() -> None:
     assert "手順:" in text and " 24 " in text
 
 
+async def test_buttons_use_yaml_channel_and_angle() -> None:
+    """スタートと P はどちらも ch0（10° と 170°）、N と D は ch1（10° と 170°）。"""
+    cfg = _cfg()
+    hw = await _hw(cfg)
+    for button in ("start", "P", "N", "D"):
+        await bsmod.press_button(hw, cfg, button, 0.0)
+    pressed = [(r.channel, r.angle) for r in hw.buttons.history]  # type: ignore[union-attr]
+    assert pressed == [(0, 10.0), (0, 170.0), (1, 10.0), (1, 170.0)]
+    assert bsmod.button_target(cfg, "P") == (0, 170.0)
+    await hwmod.shutdown(hw)
+
+
 # ── 手順 24（D を押す・N を押す・中止） ──────────────────────────────────
 class _FakeLog:
     csv_path = None
@@ -128,16 +139,16 @@ async def _run_step24(
     cfg = _cfg()
     hw = await _hw(cfg)
     seen: dict[str, object] = {}
-    if ignore_d:  # スタブの D を無視させる（D が入らない車）
-        orig = StubButtonServo.press
+    if ignore_d:  # スタブ車両が D を無視する（押した履歴は残るが D が入らない車）
+        status = hw.vehicle_status
+        assert status is not None
+        orig = status.on_press_start
 
-        async def press(self, channel: int, duration_s: float) -> None:  # type: ignore[no-untyped-def]
-            if channel == CH_D:
-                self.history.append(SimpleNamespace(channel=channel, duration_s=duration_s))
-                return
-            await orig(self, channel, duration_s)
+        def on_press_start(button: str, now: float) -> None:
+            if button != "D":
+                orig(button, now)
 
-        monkeypatch.setattr(StubButtonServo, "press", press)
+        monkeypatch.setattr(status, "on_press_start", on_press_start)
 
     async def fake_run(hw_, cfg_, setup_, **kwargs):  # type: ignore[no-untyped-def]
         seen["no_speed_abort"] = kwargs["no_speed_abort"]
@@ -174,8 +185,8 @@ async def _run_step24(
 async def test_step24_presses_d_runs_and_presses_n(monkeypatch: pytest.MonkeyPatch) -> None:
     hw, seen = await _run_step24(monkeypatch, completed=True)
     assert seen["no_speed_abort"] == (3.0, 0.2)  # yaml の既定（手順 3 は None）
-    channels = [r.channel for r in hw.buttons.history]  # type: ignore[union-attr]
-    assert channels[-2:] == [CH_D, CH_N]
+    pressed = [(r.channel, r.angle) for r in hw.buttons.history]  # type: ignore[union-attr]
+    assert pressed[-2:] == [(1, 170.0), (1, 10.0)]  # D＝ch1 170°、N＝ch1 10°
     assert seen["range_at_run"] == "D"  # 走る間は D
     assert hw.vehicle_status is not None and hw.vehicle_status.range == "N"
     # 終わりは停車保持の開度のまま N を押した
@@ -199,7 +210,8 @@ async def test_step24_abort_presses_n_with_stop_hold_then_raises(
         await _run_step24(monkeypatch, completed=False, ignore_d=True)
     hw = holder["hw"]
     history = hw.buttons.history  # type: ignore[union-attr]
-    assert [r.channel for r in history][-2:] == [CH_D, CH_N]  # D は押した（が入らない）→ N
+    pressed = [(r.channel, r.angle) for r in history]
+    assert pressed[-2:] == [(1, 170.0), (1, 10.0)]  # D（入らない）→ N
     assert hw.vehicle_status is not None
     assert hw.vehicle_status.range == "N"  # D は入っていない
     brake_pos = await hw.brake.read_position()
