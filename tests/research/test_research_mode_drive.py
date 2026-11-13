@@ -7,6 +7,7 @@ KPI の数え方は本番 KPIMonitor と突き合わせる。
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import math
 import random
@@ -2667,3 +2668,105 @@ def test_no_speed_watch_none_does_nothing_in_mode_run() -> None:
     assert sig.parameters["no_speed_abort"].default is None
     sig = inspect.signature(mdmod._ModeRun.__init__)  # noqa: SLF001
     assert sig.parameters["no_speed_abort"].default is None
+
+
+# ── 手順 24: モード中のボタン（段5c） ─────────────────────────────────────
+
+
+def test_compute_hold_at_s_is_start_minus_h0_minus_one_cycle() -> None:
+    mode = _mode([(0.0, 0.0), (1.0, 0.0), (3.0, 10.0), (6.0, 0.0)])
+    # 基準が停車速度を超える最初の 0.05 秒刻みは 1.05 s。− h0_s(0.5) − 1 周期(0.05) ＝ 0.5 s
+    assert mdmod.compute_hold_at_s(mode, 0.5, 0.05) == pytest.approx(0.5, abs=1e-6)
+    # 走り出しが h0_s より早ければ 0 未満にならない
+    early = _mode([(0.0, 0.0), (0.2, 0.0), (2.0, 10.0), (3.0, 0.0)])
+    assert mdmod.compute_hold_at_s(early, 0.5, 0.05) == 0.0
+    # 最後まで動かない基準は止めない
+    assert mdmod.compute_hold_at_s(_mode([(0.0, 0.0), (5.0, 0.0)]), 0.5, 0.05) is None
+
+
+async def _button_plan_run(
+    tmp_path: Path, *, d_press_s: float, hold_at_s: float | None, button_plan_none: bool = False
+) -> tuple[mdmod.ModeDriveResult, list[tuple[str, float]], FakeFF]:
+    cfg = _tmp_cfg(tmp_path)
+    cfg.mode_drive.pedal_standby = False
+    cfg.forward_map.hold_pi_enabled = False  # この試験は保持の場面を使わない
+    hw = await _held_stub(cfg)
+    mode = _mode([(0.0, 0.0), (0.5, 0.0), (1.5, 6.0), (2.5, 6.0), (3.0, 0.0), (3.5, 0.0)])
+    ff = FakeFF()
+    log = dlmod.SessionLog(cfg, hw, has_ref=True)
+    log.start(dlmod.SECTION_MODE_DRIVE, "")
+    loop = asyncio.get_running_loop()
+    base = loop.time()
+    events: list[tuple[str, float]] = []
+
+    async def ready() -> None:
+        events.append(("ready", loop.time() - base))
+        await asyncio.sleep(0.1)
+
+    async def d() -> None:
+        events.append(("d", loop.time() - base))
+        await asyncio.sleep(d_press_s)
+
+    plan = None if button_plan_none else mdmod.ModeButtonPlan(
+        ready_press=ready, d_press=d, d_press_at_s=0.3, after_d_wait_s=0.2, hold_at_s=hold_at_s
+    )
+    result = await mdmod.run_mode_drive(
+        hw, cfg, mdmod.ModeDriveSetup(mode, ff), log=log, button_plan=plan  # type: ignore[arg-type]
+    )
+    await log.close()
+    return result, events, ff
+
+
+async def test_button_plan_holds_mode_clock_until_d_is_done(tmp_path: Path) -> None:
+    """Ready は 0 秒・D は 0.3 秒に始まる。D が終わる（約 1.3 秒）までモードの時刻を止める。"""
+    result, events, _ff = await _button_plan_run(tmp_path, d_press_s=0.8, hold_at_s=0.4)
+    assert result.completed
+    assert [name for name, _ in events] == ["ready", "d"]
+    assert events[0][1] < 0.1 and events[1][1] == pytest.approx(0.3, abs=0.12)
+    # 0.4 s で止め、D 済み（約 1.3 s）まで待った → 止めた秒数は約 0.9 s
+    assert result.button_hold_s == pytest.approx(0.9, abs=0.2)
+    # モードの時刻は止めた間進まず、走った秒数（モードの時刻）は 3.5 s
+    assert result.run_duration_s == pytest.approx(3.5, abs=0.15)
+    rows = mrmod.rows_from_samples(result.samples)
+    ts = [r.t_s for r in rows]
+    assert ts == sorted(ts)
+    assert max(b - a for a, b in zip(ts, ts[1:], strict=False)) < 0.2  # 止めた間は行を書かない
+
+
+async def test_button_plan_no_hold_when_d_is_done_in_time(tmp_path: Path) -> None:
+    result, events, _ff = await _button_plan_run(tmp_path, d_press_s=0.05, hold_at_s=2.0)
+    assert result.completed and result.button_hold_s == 0.0
+    assert [name for name, _ in events] == ["ready", "d"]
+
+
+async def test_button_plan_none_changes_nothing(tmp_path: Path) -> None:
+    result, events, ff = await _button_plan_run(
+        tmp_path, d_press_s=0.0, hold_at_s=None, button_plan_none=True
+    )
+    assert result.completed and result.button_hold_s == 0.0 and events == []
+    assert ff.calls == result.cycles
+
+
+async def test_button_plan_press_failure_aborts(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    cfg.mode_drive.pedal_standby = False
+    cfg.forward_map.hold_pi_enabled = False  # この試験は保持の場面を使わない
+    hw = await _held_stub(cfg)
+    mode = _mode([(0.0, 0.0), (0.5, 0.0), (1.5, 6.0), (3.5, 0.0)])
+    log = dlmod.SessionLog(cfg, hw, has_ref=True)
+    log.start(dlmod.SECTION_MODE_DRIVE, "")
+
+    async def broken() -> None:
+        raise RuntimeError("PCA9685 が応答しない")
+
+    async def ok() -> None:
+        await asyncio.sleep(0.0)
+
+    plan = mdmod.ModeButtonPlan(
+        ready_press=broken, d_press=ok, d_press_at_s=0.3, after_d_wait_s=0.1, hold_at_s=None
+    )
+    result = await mdmod.run_mode_drive(
+        hw, cfg, mdmod.ModeDriveSetup(mode, FakeFF()), log=log, button_plan=plan  # type: ignore[arg-type]
+    )
+    await log.close()
+    assert not result.completed and "ボタンを押せませんでした" in result.abort_reason

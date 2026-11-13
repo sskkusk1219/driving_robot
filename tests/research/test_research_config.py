@@ -1970,6 +1970,7 @@ def test_buttons_section_defaults_and_validation(tmp_path: Path) -> None:
     assert (bt.accel_tap_opening_pct, bt.accel_tap_on_s, bt.accel_tap_off_s) == (10.0, 0.5, 0.5)
     assert (bt.maintenance_tap_count, bt.n_hold_gap_s) == (3, 1.0)
     assert (bt.no_speed_abort_s, bt.no_speed_kmh) == (3.0, 0.2)
+    assert bt.d_press_at_s == 3.0
     assert bt.servo_rest_angle_deg == 90.0
     assert bt.servo_map == {
         "start": {"channel": 0, "offset_deg": -80.0},
@@ -1983,6 +1984,7 @@ def test_buttons_section_defaults_and_validation(tmp_path: Path) -> None:
         ("start_short_press_s", 0.0),
         ("accel_tap_on_s", -1.0),
         ("no_speed_kmh", 0.0),
+        ("d_press_at_s", 0.0),
         ("maintenance_tap_count", 0),
         ("start_long_press_s", 1.9),  # 2 s 未満は RLY-OFF に届かない
         ("start_long_press_s", 5.0),  # 5 s 以上は IGN-OFF まで進む

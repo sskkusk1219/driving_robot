@@ -724,6 +724,9 @@ class ButtonsSection:
     accel_tap_off_s: float = 0.5  # アクセル踏み 1 回の離している時間 [s]
     maintenance_tap_count: int = 3  # メンテナンスモードの各レンジの踏み回数（車種で変わる）
     n_hold_gap_s: float = 1.0  # N ホールドの N 2 回押しの間隔（資料の 5 s 以内より十分短く）[s]
+    # 手順 24: モード開始（0 秒）にスタートを短押しして Ready にし、この秒数後に D を押す。
+    # 間に合わないモード（走り出す時刻 − h0_s がこれ以前）は、モードの時刻を止めて D の後に再開する
+    d_press_at_s: float = 3.0  # [s]（ユーザー決定: Ready から D までの余裕。実機確認 段6 で決める）
     no_speed_abort_s: float = 3.0  # 手順 24: 基準車速が出てからこの間、実車速が出なければ中止 [s]
     no_speed_kmh: float = 0.2  # 手順 24: これ以下なら「車速が出ていない」[km/h]（資料の停車中）
     # SG90 は 2 個で 4 ボタンを押す（1 個を基準から左右に振る。ユーザーの取り付けから決めた値）。
@@ -2925,7 +2928,8 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     bt = cfg.buttons
     for name in (
         "start_short_press_s", "start_long_press_s", "shift_press_s", "after_press_wait_s",
-        "accel_tap_on_s", "accel_tap_off_s", "n_hold_gap_s", "no_speed_abort_s", "no_speed_kmh",
+        "accel_tap_on_s", "accel_tap_off_s", "n_hold_gap_s", "d_press_at_s", "no_speed_abort_s",
+        "no_speed_kmh",
     ):
         need(getattr(bt, name) > 0.0, f"buttons.{name} は正値")
     need(bt.accel_tap_opening_pct > 0.0, "buttons.accel_tap_opening_pct は正値")

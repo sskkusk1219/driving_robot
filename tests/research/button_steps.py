@@ -66,9 +66,18 @@ def button_target(cfg: ResearchConfig, button: str) -> tuple[int, float]:
 
 
 async def press_button(
-    hw: ResearchHardware, cfg: ResearchConfig, button: str, seconds: float
+    hw: ResearchHardware,
+    cfg: ResearchConfig,
+    button: str,
+    seconds: float,
+    *,
+    poll: bool = True,
+    wait_after: bool = True,
 ) -> None:
     """ボタンを押し、`after_press_wait_s` 待つ。ボタン名・ch・角度・秒数を表示する。
+
+    `poll=False` は押す間・押した後に車速を読まない（モード走行の周期が読んでいる最中に使う）。
+    `wait_after=False` は押した後の待ちを呼び出し側が持つとき（手順 24 の D・Ready）。
 
     スタブのときは押す前後に車両の状態（VehicleStatus）へ押下を伝える（同じ ch に 2 つの
     ボタンがあるので、ch 番号ではなくボタンの名前で伝える）。
@@ -77,7 +86,8 @@ async def press_button(
     assert hw.buttons is not None
     ch, angle = button_target(cfg, button)
     status = hw.vehicle_status
-    await _poll_speed(hw)  # 押す直前の車速・ペダルを車両の状態へ渡す
+    if poll:
+        await _poll_speed(hw)  # 押す直前の車速・ペダルを車両の状態へ渡す
     loop = asyncio.get_running_loop()
     say(
         f"  ボタン「{button_name(button)}」を ch{ch} {angle:g}° で {seconds:g}s 押します …"
@@ -88,7 +98,8 @@ async def press_button(
     press = asyncio.create_task(hw.buttons.press(ch, angle, seconds))
     try:
         while not press.done():
-            await _poll_speed(hw)
+            if poll:
+                await _poll_speed(hw)
             await asyncio.sleep(_POLL_S)
         await press
     finally:
@@ -98,7 +109,8 @@ async def press_button(
                 await press
         if status is not None:
             status.on_press_end(button, time.monotonic())
-    await wait_polling(hw, cfg.buttons.after_press_wait_s)
+    if wait_after:
+        await wait_polling(hw, cfg.buttons.after_press_wait_s)
 
 
 async def _move_pedal(axis: ActuatorProtocol, target_pulse: int) -> None:
@@ -177,12 +189,15 @@ async def ign_on_rly_off(hw: ResearchHardware, cfg: ResearchConfig) -> None:
 
 
 async def maintenance_mode(hw: ResearchHardware, cfg: ResearchConfig) -> None:
-    """手順 21: 手順 20 → P でアクセル踏み → N でアクセル踏み → P でアクセル踏み。
+    """手順 21: 手順 20 → P を押す → P でアクセル踏み → N でアクセル踏み → P でアクセル踏み。
 
     メンテナンスモードは RLY-OFF から 60 秒以内に完了する必要があるため、先頭で手順 20 も行う。
+    最初のレンジが P とは限らないので、最初に P を押してから踏む（ユーザー決定 2026-11-14）。
+    P を押すのは停車中だけ（手順 20 の時点で車は止まっている）。
     """
     n = cfg.buttons.maintenance_tap_count
     await ign_on_rly_off(hw, cfg)
+    await press_button(hw, cfg, BUTTON_P, cfg.buttons.shift_press_s)
     await accel_taps(hw, cfg, n)  # P × n
     await set_brake(hw, cfg, on=True)
     await press_button(hw, cfg, BUTTON_N, cfg.buttons.shift_press_s)
@@ -232,14 +247,25 @@ async def ign_off(hw: ResearchHardware, cfg: ResearchConfig) -> None:
     show_stub_status(hw)
 
 
-# ── 手順 24（モード走行）の前後の押下 ─────────────────────────────────
+# ── 手順 24（モード走行）の中・後の押下 ───────────────────────────────
 
 
-async def press_shift_d(hw: ResearchHardware, cfg: ResearchConfig) -> None:
-    """手順 24: 走行前チェックの後（停車保持の開度のまま）D を押す。"""
+async def press_ready_in_mode(hw: ResearchHardware, cfg: ResearchConfig) -> None:
+    """手順 24: モード開始（0 秒）にスタートを短押しして Ready にする（停車保持済み）。
+
+    押す間は車速を読まない（モード走行の周期が読んでいる）。押した後の待ちは持たない。
+    """
     await _begin(hw)
-    await press_button(hw, cfg, BUTTON_D, cfg.buttons.shift_press_s)
-    show_stub_status(hw)
+    await press_button(
+        hw, cfg, BUTTON_START, cfg.buttons.start_short_press_s, poll=False, wait_after=False
+    )
+
+
+async def press_shift_d_in_mode(hw: ResearchHardware, cfg: ResearchConfig) -> None:
+    """手順 24: モード開始から `d_press_at_s` 後に D を押す。押した後の待ち
+    （`after_press_wait_s`）はモード走行側が持つ（待つ間にモードの時刻を止めるかを決めるため）。"""
+    await _begin(hw)
+    await press_button(hw, cfg, BUTTON_D, cfg.buttons.shift_press_s, poll=False, wait_after=False)
 
 
 async def press_shift_n_after_drive(hw: ResearchHardware, cfg: ResearchConfig) -> None:

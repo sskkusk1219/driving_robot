@@ -152,6 +152,16 @@ async def _run_step24(
 
     async def fake_run(hw_, cfg_, setup_, **kwargs):  # type: ignore[no-untyped-def]
         seen["no_speed_abort"] = kwargs["no_speed_abort"]
+        plan = kwargs["button_plan"]
+        seen["plan"] = plan
+        # モード中の押下を順に呼ぶ（Ready は 0 秒・D は d_press_at_s。時刻は mode_drive 側のテスト）
+        pressed_before = len(hw_.buttons.history)
+        await plan.ready_press()
+        seen["state_after_ready"] = hw_.vehicle_status.state
+        await plan.d_press()
+        seen["pressed_in_run"] = [
+            (r.channel, r.angle) for r in hw_.buttons.history[pressed_before:]
+        ]
         seen["range_at_run"] = hw_.vehicle_status.range  # D を押した後の状態
         seen["brake_pos_at_run"] = await hw_.brake.read_position()
         # 実際の中止（run_mode_drive）はペダルを離して返す
@@ -164,11 +174,16 @@ async def _run_step24(
     monkeypatch.setattr(mainmod, "run_mode_drive", fake_run)
     monkeypatch.setattr(mainmod, "_session_log_for_drive", lambda *a, **k: _FakeLog())
     ctx = mainmod.RunContext(config=cfg, hw_mode=hwmod.HW_STUB, started_at=0.0, hardware=hw)
-    ctx.mode_setup = SimpleNamespace(mode=SimpleNamespace(total_duration=60.0), ff=None)
-    # 手順 24 の前（手順 21〜23）を済ませた状態: Ready・N。走行前チェックは停車保持の開度にする
+    mode = SimpleNamespace(
+        total_duration=60.0, reference_speed=[SimpleNamespace(time_s=0.0, speed_kmh=0.0),
+                                              SimpleNamespace(time_s=1.0, speed_kmh=0.0),
+                                              SimpleNamespace(time_s=5.0, speed_kmh=10.0)],
+    )
+    ctx.mode_setup = SimpleNamespace(mode=mode, ff=None)
+    # 手順 24 の前（手順 21・22）を済ませた状態: IGN-ON・N。Ready は手順 24 の中で押す。
+    # 走行前チェックは停車保持の開度にする
     await bsmod.maintenance_mode(hw, cfg)
     await bsmod.n_range_hold(hw, cfg)
-    await bsmod.ready(hw, cfg)
     await bsmod.set_brake(hw, cfg, on=True)
     monkeypatch.setattr(mainmod, "write_mode_report", lambda *a, **k: None)
     monkeypatch.setattr(mainmod, "rows_from_samples", lambda s: [])
@@ -182,11 +197,18 @@ async def _run_step24(
     return hw, seen
 
 
-async def test_step24_presses_d_runs_and_presses_n(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_step24_presses_ready_and_d_in_mode_then_n(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     hw, seen = await _run_step24(monkeypatch, completed=True)
     assert seen["no_speed_abort"] == (3.0, 0.2)  # yaml の既定（手順 3 は None）
+    plan = seen["plan"]
+    assert (plan.d_press_at_s, plan.after_d_wait_s) == (3.0, 0.1)  # type: ignore[attr-defined]
+    # 走る前に D は押さない。モードの中で Ready（スタート ch0 10°）→ D（ch1 170°）
+    assert seen["pressed_in_run"] == [(0, 10.0), (1, 170.0)]
+    assert seen["state_after_ready"] is State.READY
     pressed = [(r.channel, r.angle) for r in hw.buttons.history]  # type: ignore[union-attr]
-    assert pressed[-2:] == [(1, 170.0), (1, 10.0)]  # D＝ch1 170°、N＝ch1 10°
+    assert pressed[-1] == (1, 10.0)  # 最後は N＝ch1 10°
     assert seen["range_at_run"] == "D"  # 走る間は D
     assert hw.vehicle_status is not None and hw.vehicle_status.range == "N"
     # 終わりは停車保持の開度のまま N を押した
@@ -211,8 +233,37 @@ async def test_step24_abort_presses_n_with_stop_hold_then_raises(
     hw = holder["hw"]
     history = hw.buttons.history  # type: ignore[union-attr]
     pressed = [(r.channel, r.angle) for r in history]
-    assert pressed[-2:] == [(1, 170.0), (1, 10.0)]  # D（入らない）→ N
+    assert pressed[-3:] == [(0, 10.0), (1, 170.0), (1, 10.0)]  # Ready・D（入らない）→ N
     assert hw.vehicle_status is not None
     assert hw.vehicle_status.range == "N"  # D は入っていない
     brake_pos = await hw.brake.read_position()
     assert brake_pos == bsmod.opening_to_pulse(_cfg().stop_brake_opening_pct)
+
+
+async def test_step21_presses_p_first_even_if_start_range_is_n() -> None:
+    """最初のレンジが N でも、先に P を押してからアクセルを踏む（メンテナンスモードに入る）。"""
+    cfg = _cfg()
+    hw = await _hw(cfg)
+    await hwmod.ensure_buttons_connected(hw)
+    status = hw.vehicle_status
+    assert status is not None
+    status.activate()
+    status.range = "N"  # 最初のレンジが P とは限らない
+    await bsmod.maintenance_mode(hw, cfg)
+    pressed = [(r.channel, r.angle) for r in hw.buttons.history]  # type: ignore[union-attr]
+    # スタート長押し → P（ch0 170°）→ …（N → P）
+    assert pressed[:2] == [(0, 10.0), (0, 170.0)]
+    assert status.maintenance is True and status.range == "P"
+    await hwmod.shutdown(hw)
+
+
+def test_steps_23_and_24_in_one_run_is_a_config_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    steps = {s.number: s for s in mainmod.STEPS}
+    assert mainmod.button_step_conflict([steps[1], steps[23], steps[24]]) is not None
+    chain = [steps[n] for n in (1, 21, 22, 24, 25)]
+    assert mainmod.button_step_conflict(chain) is None
+    assert mainmod.button_step_conflict([steps[1], steps[23]]) is None
+    assert mainmod.main(["--steps", "1,23,24"]) == 2
+    assert "手順23 と同じ実行にできません" in capsys.readouterr().out
