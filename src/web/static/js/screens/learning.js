@@ -73,12 +73,10 @@ function LearningScreen() {
   };
 
   // 学習サイクルの進捗を DriveMonitorScreen の resultPanel 枠に表示する。
-  // 状態遷移でフレームの高さが変わらないよう、中身の有無に関わらず同じ要素を返す。
-  const resultPanel = (
+  // 待機中（IDLE）は中身なし（現在ステータスのログ・案内文だけを出す）。
+  const resultPanel = !cycleProgress || cyclePhase === 'IDLE' ? null : (
     <div style={{ fontSize: 12, color: INK }}>
-      {!cycleProgress || cyclePhase === 'IDLE' ? (
-        <div style={{ color: INK_MUTE }}>—</div>
-      ) : (
+      {(
         <div>
           <div style={{ fontWeight: 700 }}>
             {PHASE_LABEL[cyclePhase] ?? cyclePhase}
@@ -113,7 +111,8 @@ function LearningScreen() {
   return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
       {React.createElement(window.DriveMonitorScreen, {
-        showModeAxis: false,
+        showRefLine: false,
+        progressLabel: '学習運転',
         profileMaxSpeed,
         screenTitle: '学習運転',
         driveStartPath: '/api/v1/drive/learning-cycle/start',
@@ -126,6 +125,8 @@ function LearningScreen() {
         busyLabel: PHASE_LABEL[cyclePhase] ?? cyclePhase,
         onAbort: handleAbortCycle,
         resultPanel,
+        showStatusLog: true,
+        bottomRatio: 0.6,
       })}
 
       {cfg && (

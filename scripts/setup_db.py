@@ -163,6 +163,18 @@ DDL_STATEMENTS = [
         created_at     TIMESTAMPTZ NOT NULL
     )
     """,
+    # シーケンス: 走行モード／タイムスケジュールを順に並べたもの。参照先は外部キーにしない
+    # （モード・スケジュールを削除できなくなるため。表示側で「見つからない」にする）
+    """
+    CREATE TABLE IF NOT EXISTS sequences (
+        id          UUID PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        description TEXT NOT NULL DEFAULT '',
+        steps       JSONB NOT NULL,
+        repeat      INTEGER NOT NULL DEFAULT 1,
+        created_at  TIMESTAMPTZ NOT NULL
+    )
+    """,
     # ループ再生機能を廃止したため既存DBから loop 列を削除
     """
     ALTER TABLE time_schedules

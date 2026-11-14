@@ -7,8 +7,11 @@ connect / press / release_all / close だけを残した（16ch・check_connecti
 用語注意: ここでの「サーボ」は SG90（ボタン押下用）を指す。IAI アクチュエータの
 「サーボON」（励磁）とは別物。
 
-スタブ（StubButtonServo）は押した履歴を記録し、車両の状態（vehicle_status.VehicleStatus）が
-あれば押下の開始・終了を伝える。asyncio.sleep は本物どおり待つ。
+SG90 は 2 個で 4 ボタンを押す（1 個を基準から左右に振る）。どのボタンをどの ch・角度で押すかは
+yaml の `buttons.servo_map`、ドライバは「ch と角度」だけを受け取る。
+
+スタブ（StubButtonServo）は押した履歴（ch・角度・秒数・時刻）を記録するだけ。車両の状態への
+押下の通知はボタン層（button_steps.press_button）が行う。asyncio.sleep は本物どおり待つ。
 """
 
 from __future__ import annotations
@@ -22,20 +25,21 @@ from typing import Protocol
 
 _logger = logging.getLogger(__name__)
 
-# チャンネル ⇔ ボタン（この研究ハーネスの割り当て）
-CH_START = 0
-CH_P = 1
-CH_N = 2
-CH_D = 3
+# ボタンの名前（yaml の buttons.servo_map のキー）
+BUTTON_START = "start"
+BUTTON_P = "P"
+BUTTON_N = "N"
+BUTTON_D = "D"
+BUTTON_KEYS = (BUTTON_START, BUTTON_P, BUTTON_N, BUTTON_D)
 CH_MIN = 0
 CH_MAX = 15
 
 # 画面表示用のボタン名
-BUTTON_NAMES: dict[int, str] = {
-    CH_START: "スタート",
-    CH_P: "P",
-    CH_N: "N",
-    CH_D: "D",
+BUTTON_NAMES: dict[str, str] = {
+    BUTTON_START: "スタート",
+    BUTTON_P: "P",
+    BUTTON_N: "N",
+    BUTTON_D: "D",
 }
 
 # 角度 ⇔ パルス幅（SG90 標準。個体差があるため必要に応じて調整する）
@@ -59,9 +63,9 @@ _MODE1_RESTART = 0x80
 _MODE2_OUTDRV = 0x04
 
 
-def button_name(channel: int) -> str:
-    """チャンネル番号を表示名にする（割り当て外は ch 番号）。"""
-    return BUTTON_NAMES.get(channel, f"ch{channel}")
+def button_name(button: str) -> str:
+    """ボタンの名前を表示名にする（割り当て外はそのまま）。"""
+    return BUTTON_NAMES.get(button, button)
 
 
 def angle_to_count(angle: float, pwm_freq_hz: int) -> int:
@@ -78,19 +82,11 @@ class ButtonServoProtocol(Protocol):
 
     async def connect(self) -> None: ...
 
-    async def press(self, channel: int, duration_s: float) -> None: ...
+    async def press(self, channel: int, angle: float, duration_s: float) -> None: ...
 
     async def release_all(self) -> None: ...
 
     async def close(self) -> None: ...
-
-
-class PressListener(Protocol):
-    """スタブが押下の開始・終了を伝える相手（vehicle_status.VehicleStatus）。"""
-
-    def on_press_start(self, channel: int, now: float) -> None: ...
-
-    def on_press_end(self, channel: int, now: float) -> None: ...
 
 
 class I2CBusProtocol(Protocol):
@@ -116,15 +112,13 @@ class ButtonServoDriver:
         i2c_bus: int = 1,
         address: int = 0x40,
         pwm_freq_hz: int = 50,
-        rest_angle: float = 60.0,
-        press_angle: float = 110.0,
+        rest_angle: float = 90.0,
         bus_factory: Callable[[int], I2CBusProtocol] | None = None,
     ) -> None:
         self._bus_num = i2c_bus
         self._addr = address
         self._freq = pwm_freq_hz
         self._rest_angle = rest_angle
-        self._press_angle = press_angle
         # bus_factory を渡すとテスト等でフェイク I2C バスを注入できる（既定は smbus2）。
         self._bus_factory = bus_factory
         self._bus: I2CBusProtocol | None = None
@@ -195,17 +189,17 @@ class ButtonServoDriver:
 
         await asyncio.to_thread(_do)
 
-    async def press(self, channel: int, duration_s: float) -> None:
-        """指定チャンネルを押下角へ動かし duration_s 保持してから待機角へ戻す。
+    async def press(self, channel: int, angle: float, duration_s: float) -> None:
+        """指定チャンネルを angle へ動かし duration_s 保持してから基準（待機）の角度へ戻す。
 
         待機中のキャンセルや解放時の I2C エラーでボタンを押したまま放置しないよう、
-        解放（待機角への復帰）は try/finally で必ず試みる。
+        解放（基準の角度への復帰）は try/finally で必ず試みる。
         """
         if not CH_MIN <= channel <= CH_MAX:
             raise ValueError(f"channel は {CH_MIN}-{CH_MAX} で指定してください: {channel}")
         if self._bus is None:
             raise RuntimeError("connect() を先に呼んでください")
-        await asyncio.to_thread(self._set_angle, channel, self._press_angle)
+        await asyncio.to_thread(self._set_angle, channel, angle)
         try:
             await asyncio.sleep(max(0.0, duration_s))
         finally:
@@ -253,18 +247,19 @@ class PressRecord:
     """スタブが記録する押下 1 回分。"""
 
     channel: int
+    angle: float
     duration_s: float
     started_at: float  # time.monotonic()
 
 
 @dataclass
 class StubButtonServo:
-    """スタブのボタンサーボ。押した履歴を記録し、車両の状態があれば押下の開始・終了を伝える。
+    """スタブのボタンサーボ。押した履歴（ch・角度・秒数・時刻）を記録する。
 
     押している間は本物どおり asyncio.sleep で待つ（その間も呼び出し側が車速を読めるように）。
+    車両の状態への通知はボタン層（button_steps.press_button）が行う（ここでは持たない）。
     """
 
-    listener: PressListener | None = None
     connected: bool = False
     history: list[PressRecord] = field(default_factory=list)
     released_all_count: int = 0
@@ -272,20 +267,13 @@ class StubButtonServo:
     async def connect(self) -> None:
         self.connected = True
 
-    async def press(self, channel: int, duration_s: float) -> None:
+    async def press(self, channel: int, angle: float, duration_s: float) -> None:
         if not CH_MIN <= channel <= CH_MAX:
             raise ValueError(f"channel は {CH_MIN}-{CH_MAX} で指定してください: {channel}")
         if not self.connected:
             raise RuntimeError("connect() を先に呼んでください")
-        started = time.monotonic()
-        self.history.append(PressRecord(channel, duration_s, started))
-        if self.listener is not None:
-            self.listener.on_press_start(channel, started)
-        try:
-            await asyncio.sleep(max(0.0, duration_s))
-        finally:
-            if self.listener is not None:
-                self.listener.on_press_end(channel, time.monotonic())
+        self.history.append(PressRecord(channel, angle, duration_s, time.monotonic()))
+        await asyncio.sleep(max(0.0, duration_s))
 
     async def release_all(self) -> None:
         if self.connected:

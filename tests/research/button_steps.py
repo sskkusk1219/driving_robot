@@ -12,8 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 
-from tests.research.button_servo import CH_D, CH_N, CH_P, CH_START, button_name
+from tests.research.button_servo import (
+    BUTTON_D,
+    BUTTON_N,
+    BUTTON_P,
+    BUTTON_START,
+    button_name,
+)
 from tests.research.config import ResearchConfig
 from tests.research.hardware import (
     ActuatorProtocol,
@@ -52,25 +59,58 @@ async def wait_polling(hw: ResearchHardware, seconds: float) -> None:
         await asyncio.sleep(min(_POLL_S, remaining))
 
 
-async def press_button(hw: ResearchHardware, cfg: ResearchConfig, ch: int, seconds: float) -> None:
-    """ボタンを押し、`after_press_wait_s` 待つ。押した時刻・ボタン名・秒数を表示する。"""
+def button_target(cfg: ResearchConfig, button: str) -> tuple[int, float]:
+    """ボタンの名前から (ch, 指令する角度) を求める。角度 ＝ 基準の角度 ＋ offset_deg。"""
+    item = cfg.buttons.servo_map[button]
+    return int(item["channel"]), cfg.buttons.servo_rest_angle_deg + float(item["offset_deg"])
+
+
+async def press_button(
+    hw: ResearchHardware,
+    cfg: ResearchConfig,
+    button: str,
+    seconds: float,
+    *,
+    poll: bool = True,
+    wait_after: bool = True,
+) -> None:
+    """ボタンを押し、`after_press_wait_s` 待つ。ボタン名・ch・角度・秒数を表示する。
+
+    `poll=False` は押す間・押した後に車速を読まない（モード走行の周期が読んでいる最中に使う）。
+    `wait_after=False` は押した後の待ちを呼び出し側が持つとき（手順 24 の D・Ready）。
+
+    スタブのときは押す前後に車両の状態（VehicleStatus）へ押下を伝える（同じ ch に 2 つの
+    ボタンがあるので、ch 番号ではなくボタンの名前で伝える）。
+    """
     await ensure_buttons_connected(hw)
     assert hw.buttons is not None
-    await _poll_speed(hw)  # 押す直前の車速・ペダルを車両の状態へ渡す
+    ch, angle = button_target(cfg, button)
+    status = hw.vehicle_status
+    if poll:
+        await _poll_speed(hw)  # 押す直前の車速・ペダルを車両の状態へ渡す
     loop = asyncio.get_running_loop()
-    say(f"  ボタン「{button_name(ch)}」を {seconds:g}s 押します …（t={loop.time():.1f}）")
-    press = asyncio.create_task(hw.buttons.press(ch, seconds))
+    say(
+        f"  ボタン「{button_name(button)}」を ch{ch} {angle:g}° で {seconds:g}s 押します …"
+        f"（t={loop.time():.1f}）"
+    )
+    if status is not None:
+        status.on_press_start(button, time.monotonic())
+    press = asyncio.create_task(hw.buttons.press(ch, angle, seconds))
     try:
         while not press.done():
-            await _poll_speed(hw)
+            if poll:
+                await _poll_speed(hw)
             await asyncio.sleep(_POLL_S)
         await press
     finally:
         if not press.done():
-            press.cancel()  # 中断時は待機角へ戻る（press の finally）
+            press.cancel()  # 中断時は基準の角度へ戻る（press の finally）
             with contextlib.suppress(asyncio.CancelledError):
                 await press
-    await wait_polling(hw, cfg.buttons.after_press_wait_s)
+        if status is not None:
+            status.on_press_end(button, time.monotonic())
+    if wait_after:
+        await wait_polling(hw, cfg.buttons.after_press_wait_s)
 
 
 async def _move_pedal(axis: ActuatorProtocol, target_pulse: int) -> None:
@@ -144,23 +184,26 @@ async def ign_on_rly_off(hw: ResearchHardware, cfg: ResearchConfig) -> None:
     """手順 20: ブレーキを待機位置 → スタートを長押し（IGN-OFF → IGN-ON(RLY-OFF)）。"""
     await _begin(hw)
     await set_brake(hw, cfg, on=False)
-    await press_button(hw, cfg, CH_START, cfg.buttons.start_long_press_s)
+    await press_button(hw, cfg, BUTTON_START, cfg.buttons.start_long_press_s)
     show_stub_status(hw)
 
 
 async def maintenance_mode(hw: ResearchHardware, cfg: ResearchConfig) -> None:
-    """手順 21: 手順 20 → P でアクセル踏み → N でアクセル踏み → P でアクセル踏み。
+    """手順 21: 手順 20 → P を押す → P でアクセル踏み → N でアクセル踏み → P でアクセル踏み。
 
     メンテナンスモードは RLY-OFF から 60 秒以内に完了する必要があるため、先頭で手順 20 も行う。
+    最初のレンジが P とは限らないので、最初に P を押してから踏む（ユーザー決定 2026-11-14）。
+    P を押すのは停車中だけ（手順 20 の時点で車は止まっている）。
     """
     n = cfg.buttons.maintenance_tap_count
     await ign_on_rly_off(hw, cfg)
+    await press_button(hw, cfg, BUTTON_P, cfg.buttons.shift_press_s)
     await accel_taps(hw, cfg, n)  # P × n
     await set_brake(hw, cfg, on=True)
-    await press_button(hw, cfg, CH_N, cfg.buttons.shift_press_s)
+    await press_button(hw, cfg, BUTTON_N, cfg.buttons.shift_press_s)
     await release_brake(hw, cfg)
     await accel_taps(hw, cfg, n)  # N × n
-    await press_button(hw, cfg, CH_P, cfg.buttons.shift_press_s)
+    await press_button(hw, cfg, BUTTON_P, cfg.buttons.shift_press_s)
     await accel_taps(hw, cfg, n)  # P × n
     show_stub_status(hw)
 
@@ -169,9 +212,9 @@ async def n_range_hold(hw: ResearchHardware, cfg: ResearchConfig) -> None:
     """手順 22: ブレーキ ON → N → 待つ → N → ブレーキを離す（IGN-ON・P から N を 2 回）。"""
     await _begin(hw)
     await set_brake(hw, cfg, on=True)
-    await press_button(hw, cfg, CH_N, cfg.buttons.shift_press_s)
+    await press_button(hw, cfg, BUTTON_N, cfg.buttons.shift_press_s)
     await wait_polling(hw, cfg.buttons.n_hold_gap_s)
-    await press_button(hw, cfg, CH_N, cfg.buttons.shift_press_s)
+    await press_button(hw, cfg, BUTTON_N, cfg.buttons.shift_press_s)
     await release_brake(hw, cfg)
     show_stub_status(hw)
 
@@ -180,7 +223,7 @@ async def ready(hw: ResearchHardware, cfg: ResearchConfig) -> None:
     """手順 23: ブレーキ ON → スタートを短押し → ブレーキを離す（→ Ready）。"""
     await _begin(hw)
     await set_brake(hw, cfg, on=True)
-    await press_button(hw, cfg, CH_START, cfg.buttons.start_short_press_s)
+    await press_button(hw, cfg, BUTTON_START, cfg.buttons.start_short_press_s)
     await release_brake(hw, cfg)
     show_stub_status(hw)
 
@@ -200,23 +243,34 @@ async def ign_off(hw: ResearchHardware, cfg: ResearchConfig) -> None:
             f"停車していません（車速 {speed:.2f} km/h > {kmh:g} km/h）。IGN-OFF を押しません"
         )
     await set_brake(hw, cfg, on=True)
-    await press_button(hw, cfg, CH_START, cfg.buttons.start_short_press_s)
+    await press_button(hw, cfg, BUTTON_START, cfg.buttons.start_short_press_s)
     show_stub_status(hw)
 
 
-# ── 手順 24（モード走行）の前後の押下 ─────────────────────────────────
+# ── 手順 24（モード走行）の中・後の押下 ───────────────────────────────
 
 
-async def press_shift_d(hw: ResearchHardware, cfg: ResearchConfig) -> None:
-    """手順 24: 走行前チェックの後（停車保持の開度のまま）D を押す。"""
+async def press_ready_in_mode(hw: ResearchHardware, cfg: ResearchConfig) -> None:
+    """手順 24: モード開始（0 秒）にスタートを短押しして Ready にする（停車保持済み）。
+
+    押す間は車速を読まない（モード走行の周期が読んでいる）。押した後の待ちは持たない。
+    """
     await _begin(hw)
-    await press_button(hw, cfg, CH_D, cfg.buttons.shift_press_s)
-    show_stub_status(hw)
+    await press_button(
+        hw, cfg, BUTTON_START, cfg.buttons.start_short_press_s, poll=False, wait_after=False
+    )
+
+
+async def press_shift_d_in_mode(hw: ResearchHardware, cfg: ResearchConfig) -> None:
+    """手順 24: モード開始から `d_press_at_s` 後に D を押す。押した後の待ち
+    （`after_press_wait_s`）はモード走行側が持つ（待つ間にモードの時刻を止めるかを決めるため）。"""
+    await _begin(hw)
+    await press_button(hw, cfg, BUTTON_D, cfg.buttons.shift_press_s, poll=False, wait_after=False)
 
 
 async def press_shift_n_after_drive(hw: ResearchHardware, cfg: ResearchConfig) -> None:
     """手順 24: モードの後（中止でも）ブレーキを停車保持の開度にしてから N を押す。"""
     await _begin(hw)
     await set_brake(hw, cfg, on=True)
-    await press_button(hw, cfg, CH_N, cfg.buttons.shift_press_s)
+    await press_button(hw, cfg, BUTTON_N, cfg.buttons.shift_press_s)
     show_stub_status(hw)

@@ -1,83 +1,90 @@
-// ── プラン学習（エピソード型方策改善）状態パネル ─────────────────────────
-// profile×mode の学習反復回数・最良reward・有効トグル・リセット・reward 収束履歴を表示する。
-function PlanPanel({ profileId, modeId, robotState }) {
-  const { useState, useEffect, useContext } = React;
-  const { apiFetch } = useContext(window.AppContext);
-  const { INK, INK_SOFT, Btn } = window;
-  const [status, setStatus] = useState(null);
+// ── Auto-drive monitor screen ─────────────────────────────
+// 4枠レイアウト（縦の比率 車速 1 : ペダル 1 : 全体進捗 0.25 : 情報 0.25）
+//   車速グラフ / ペダル開度グラフ / 全体進捗（名前・経過/全体・残り） / 情報1行（実車速・基準偏差・結果・ボタン）
+// showRefLine=false（学習運転・スケジュール）は基準の線・カーブを出さず、全体時間は「—」にする。
+// showStatusLog=true（学習運転・自動運転）は最下段を「現在ステータス」（サーバーログのターミナル風表示）にし、
+// bottomRatio で最下段の縦比率（既定 0.25）を変えられる。
 
-  const base = `/api/v1/drive/plan/${profileId}/${modeId}`;
-  const refresh = () => {
-    if (!profileId || !modeId) return;
-    apiFetch('GET', base).then(d => { if (d) setStatus(d); });
-  };
-  // マウント時・profile/mode 変更時、および走行終了（READY 復帰）で反復回数を取り込む。
-  useEffect(() => { refresh(); }, [profileId, modeId]);
-  useEffect(() => { if (robotState === 'READY') refresh(); }, [robotState]);
+// 現在ステータス: GET /api/v1/drive/log を 1 秒ごとに取りに行き、ターミナル風に流す。
+// 一番下にいる間だけ新しい行へ自動スクロールし、ユーザーが上へスクロールしたら止める。
+function DriveStatusLog({ robotState, summary }) {
+  const { useState, useEffect, useRef } = React;
+  const { INK, INK_MUTE, HATCH } = window;
+  const [lines, setLines] = useState([]);
+  const lastSeqRef = useRef(0);
+  const boxRef = useRef(null);
+  const stickRef = useRef(true);
 
-  if (!status) return null;
+  useEffect(() => {
+    let alive = true;
+    let timer = null;
+    async function poll() {
+      try {
+        const q = lastSeqRef.current > 0 ? `?after=${lastSeqRef.current}` : '';
+        const res = await fetch(`/api/v1/drive/log${q}`);
+        if (res.ok && alive) {
+          const j = await res.json();
+          if (j.last_seq < lastSeqRef.current) {
+            // サーバー再起動などで連番が巻き戻った: 取り直す
+            lastSeqRef.current = 0;
+            setLines([]);
+          } else {
+            if (j.lines.length > 0) setLines(prev => prev.concat(j.lines).slice(-500));
+            lastSeqRef.current = j.last_seq;
+          }
+        }
+      } catch (e) { /* 通信失敗は次回に再試行（トーストは出さない） */ }
+      if (alive) timer = setTimeout(poll, 1000);
+    }
+    poll();
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, []);
 
-  const toggle = async () => {
-    const path = status.enabled ? `${base}/disable` : `${base}/enable`;
-    const d = await apiFetch('POST', path);
-    if (d) setStatus(d);
-  };
-  const reset = async () => {
-    const d = await apiFetch('POST', `${base}/reset`);
-    if (d) { setStatus(d); window.showToast('保存プランをリセットしました', 'success'); }
-  };
+  useEffect(() => {
+    const el = boxRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  }, [lines]);
 
-  const hist = (status.reward_history || []).slice(-6);
-  const reward = status.best_reward;
-  const disabled = robotState === 'RUNNING' || robotState === 'PAUSED';
+  function onScroll() {
+    const el = boxRef.current;
+    if (el) stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  }
+
+  const idleHint = robotState === 'STANDBY' ? '初期化を実行してください'
+    : robotState === 'READY' ? '「開始」を押せます'
+    : (robotState ?? '—');
+  const colorOf = lv => lv === 'ERROR' || lv === 'CRITICAL' ? '#f07070' : lv === 'WARNING' ? '#f0c84a' : INK;
 
   return (
-    <div style={{ marginTop: 6, paddingTop: 6, borderTop: `1px solid ${window.HATCH}`, fontSize: 12 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ color: INK_SOFT }}>プラン学習</span>
-        <span style={{ color: INK, fontWeight: 600 }}>第{status.iteration}回</span>
-        <span style={{ color: status.enabled ? '#68d468' : INK_SOFT }}>
-          {status.enabled ? '有効' : '無効'}
-        </span>
-        <span style={{ color: INK_SOFT, marginLeft: 'auto' }}>
-          {reward != null ? `最良reward ${reward.toFixed(3)}` : '未学習'}
-        </span>
-      </div>
-      {hist.length > 0 && (
-        <div style={{ color: INK_SOFT, marginTop: 3, fontFamily: 'monospace', fontSize: 11 }}>
-          reward: {hist.map(h => (h.reward != null ? h.reward.toFixed(2) : '—')).join(' → ')}
-        </div>
-      )}
-      <div style={{ display: 'flex', gap: 6, marginTop: 5 }}>
-        <Btn disabled={disabled} style={{ flex: 1, fontSize: 11, padding: '3px 6px' }} onClick={toggle}>
-          {status.enabled ? '無効化' : '有効化'}
-        </Btn>
-        <Btn disabled={disabled || (status.iteration === 0 && !status.has_plan)}
-             style={{ flex: 1, fontSize: 11, padding: '3px 6px' }} onClick={reset}>
-          リセット
-        </Btn>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+      {summary && <div style={{ flexShrink: 0, paddingBottom: 3, marginBottom: 3, borderBottom: `1px solid ${HATCH}` }}>{summary}</div>}
+      <div ref={boxRef} onScroll={onScroll}
+        style={{ flex: 1, minHeight: 0, overflowY: 'auto', fontFamily: 'ui-monospace, Menlo, Consolas, monospace', fontSize: 12, lineHeight: 1.45 }}>
+        {lines.length === 0
+          ? <div style={{ color: INK_MUTE }}>{idleHint}</div>
+          : lines.map(ln => (
+              <div key={ln.seq} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: colorOf(ln.level) }}>
+                {`[${ln.t.toFixed(1).padStart(6)}s] ${ln.message}`}
+              </div>
+            ))}
       </div>
     </div>
   );
 }
 
-window.PlanPanel = PlanPanel;
-
-// ── Auto-drive monitor screen ─────────────────────────────
-// AutoDriveD layout: 3-axis graph + BigSpeed + session info + stop
-
 function DriveMonitorScreen({
-  showModeAxis = true, showPause = false, profileMaxSpeed = null,
+  showRefLine = true, showPause = false, profileMaxSpeed = null,
   screenTitle = '自動走行モニター', driveStartPath = '/api/v1/drive/start', driveStartBody = null,
   driveStopPath = '/api/v1/drive/stop', driveArmPath = null, driveCancelPath = null,
   confirmStartMessage = '開始しますか？', resultPanel = null,
-  modeRowLabel = showModeAxis ? '走行モード' : null,
+  progressLabel = null,
   confirmOnly = false, busy = false, busyLabel = null, onAbort = null,
   startedToastMessage = '走行を開始しました',
+  showStatusLog = false, bottomRatio = 0.25,
 }) {
   const { useState, useEffect, useContext, useRef } = React;
-  const { apiFetch, realtimeData, realtimeBuf, activeProfileId, activeModeId, activeModeName, activeModeKind, robotState, setNavLock } = useContext(window.AppContext);
-  const { INK, INK_SOFT, PAPER, PAPER_2, HATCH, Box, Btn, Row, BigSpeed } = window;
+  const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeModeKind, robotState, setNavLock, setNav } = useContext(window.AppContext);
+  const { INK, INK_SOFT, PAPER, PAPER_2, HATCH, Box, Btn, Note } = window;
 
   const [modeDetail, setModeDetail] = useState(null);
   const [nowS, setNowS] = useState(0);
@@ -175,7 +182,10 @@ function DriveMonitorScreen({
 
   async function handleConfirmStartYes() {
     const r = await apiFetch('POST', driveStartPath, driveStartBody);
-    if (r) { window.showToast(startedToastMessage, 'success'); setConfirmStart(false); }
+    if (r) window.showToast(startedToastMessage, 'success');
+    // 失敗してもダイアログは閉じる（エラーはトーストと現在ステータスに出る。サーバー側は
+    // 失敗時に READY へ戻しているので、ここで開いたままにしても押せるものが無い）
+    setConfirmStart(false);
   }
 
   async function handleConfirmStartNo() {
@@ -242,8 +252,9 @@ function DriveMonitorScreen({
     }} />;
   }
 
-  // Axis 3: profile data
-  const refProfile = modeDetail?.reference_speed ?? [];
+  // 全体進捗: profile data
+  // showRefLine=false（学習運転・スケジュール）では基準を使わない（選択中モードの全体時間を出さない）
+  const refProfile = showRefLine ? (modeDetail?.reference_speed ?? []) : [];
   const totalDurS = refProfile.length > 0 ? refProfile[refProfile.length - 1].time_s : 0;
 
   const profileSpeedMax = refProfile.reduce((m, p) => Math.max(m, p.speed_kmh), 0);
@@ -296,7 +307,7 @@ function DriveMonitorScreen({
   };
 
   // 基準車速: プロファイルから直接サンプリング（モードロード済なら常に表示）
-  const speedRef_pts = refProfile.length > 0
+  const speedRef_pts = showRefLine && refProfile.length > 0
     ? Array.from({ length: 150 }, (_, i) => {
         const frac  = i / 149;
         const t     = windowStartS + frac * WINDOW_S;
@@ -329,22 +340,35 @@ function DriveMonitorScreen({
 
   const fmt = s => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
+  // 目盛りの数字・単位は SVG の外（HTML の絶対配置）に出す。SVG は preserveAspectRatio="none" で
+  // 非等比に伸縮するため、<text> を中に置くと文字が縦長につぶれる。線だけ SVG に残す。
+  // 親要素は position: relative（枠内の div）。位置は目盛りの y を高さに対する割合で指定する。
   function GraphSvg({ height, children, yMax, unit, unitLabel, padT = G_PAD_T, padB = G_PAD_B }) {
     const ticks = [0, 0.25, 0.5, 0.75, 1].map(f => ({
       v: Math.round(f * yMax),
       y: (height - padB) - f * (height - padT - padB),
     }));
     return (
-      <svg viewBox={`0 0 ${VW} ${height}`} width="100%" height="100%" preserveAspectRatio="none" style={{ display: 'block' }}>
-        {unitLabel && <text x={2} y={padT} textAnchor="start" fontSize="10" fill={INK_SOFT}>{unitLabel}</text>}
+      <>
+        <svg viewBox={`0 0 ${VW} ${height}`} width="100%" height="100%" preserveAspectRatio="none" style={{ display: 'block' }}>
+          {ticks.map(({ v, y }) => (
+            <line key={v} x1={PL} y1={y} x2={PL + PW} y2={y} stroke={HATCH} strokeWidth="1" strokeDasharray="3 4" />
+          ))}
+          {children}
+        </svg>
+        {unitLabel && (
+          <div style={{ position: 'absolute', left: 2, top: 0, fontSize: 10, lineHeight: 1, color: INK_SOFT, pointerEvents: 'none' }}>{unitLabel}</div>
+        )}
         {ticks.map(({ v, y }, i) => (
-          <g key={v}>
-            <line x1={PL} y1={y} x2={PL + PW} y2={y} stroke={HATCH} strokeWidth="1" strokeDasharray="3 4" />
-            <text x={PL - 4} y={i === 0 ? y - 3 : y + 4} textAnchor="end" fontSize="11" fill={INK}>{v}{unit}</text>
-          </g>
+          <div key={v} style={{
+            position: 'absolute', left: 0, width: `calc(${(PL / VW) * 100}% - 4px)`,
+            top: `${(y / height) * 100}%`, textAlign: 'right',
+            fontSize: 11, lineHeight: 1, whiteSpace: 'nowrap', color: INK, pointerEvents: 'none',
+            // 最下段（0）は線の上側に置き、それ以外は線の中央に合わせる
+            transform: i === 0 ? 'translateY(-110%)' : 'translateY(-50%)',
+          }}>{v}{unit}</div>
         ))}
-        {children}
-      </svg>
+      </>
     );
   }
 
@@ -353,17 +377,17 @@ function DriveMonitorScreen({
   return (
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 10, flex: 1, minHeight: 0 }}>
 
-      {/* Axis 1: speed graph — 1と2軸は同じ高さ */}
-      <Box style={{ padding: '6px 0 2px', flex: 3, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+      {/* 枠1: speed graph — 車速とペダルは同じ高さ */}
+      <Box style={{ padding: '6px 0 2px', flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <GraphSvg height={PH1} yMax={maxSpeed} unit="" unitLabel="km/h">
-            {showModeAxis && polyline(speedRef_pts, INK_SOFT, 1.5, '4 3')}
+            {showRefLine && polyline(speedRef_pts, INK_SOFT, 1.5, '4 3')}
             {polyline(speedAct_pts, '#c8922a', 2.2)}
           </GraphSvg>
           {marker(rd.actual_speed_kmh, maxSpeed, PH1, '#c8922a')}
         </div>
         <div style={{ display: 'flex', gap: 20, fontSize: 12, color: INK_SOFT, paddingLeft: PL, paddingBottom: 4, alignItems: 'center' }}>
-          {showModeAxis && (
+          {showRefLine && (
             <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <svg width="28" height="10" style={{ flexShrink: 0 }}>
                 <line x1="0" y1="5" x2="28" y2="5" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />
@@ -380,8 +404,8 @@ function DriveMonitorScreen({
         </div>
       </Box>
 
-      {/* Axis 2: openings graph — 1と2軸は同じ高さ */}
-      <Box style={{ padding: '6px 0 2px', flex: 3, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+      {/* 枠2: openings graph */}
+      <Box style={{ padding: '6px 0 2px', flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <GraphSvg height={PH2} yMax={100} unit="%">
             {polyline(accelPts, '#78c8f0', 2.2)}
@@ -390,25 +414,27 @@ function DriveMonitorScreen({
           {marker(rd.accel_opening, 100, PH2, '#78c8f0')}
           {marker(rd.brake_opening, 100, PH2, '#f07070')}
         </div>
-        {/* 共通時間軸ラベル（5秒ごと） */}
-        <svg viewBox={`0 0 ${VW} 18`} width="100%" height="18" preserveAspectRatio="none" style={{ display: 'block' }}>
-          <line x1={PL} y1={0} x2={PL + PW} y2={0} stroke={HATCH} strokeWidth="0.5" />
-          <text x={PL + PW + 8} y={15} textAnchor="start" fontSize="10" fill={INK_SOFT}>s</text>
-          {(() => {
-            const first = Math.max(0, Math.ceil(windowStartS / 5) * 5);
-            const ticks = [];
-            for (let t = first; t <= windowEndS; t += 5) ticks.push(t);
-            return ticks.map(t => {
-              const x = toXFull((t - windowStartS) / WINDOW_S);
-              return (
-                <g key={t}>
-                  <line x1={x} y1={0} x2={x} y2={4} stroke={HATCH} strokeWidth="1" />
-                  <text x={x} y={15} textAnchor="middle" fontSize="10" fill={INK_SOFT}>{t}</text>
-                </g>
-              );
-            });
-          })()}
-        </svg>
+        {/* 共通時間軸ラベル（5秒ごと）。目盛りの線は SVG、数字は伸びないよう HTML で重ねる */}
+        {(() => {
+          const first = Math.max(0, Math.ceil(windowStartS / 5) * 5);
+          const ticks = [];
+          for (let t = first; t <= windowEndS; t += 5) ticks.push({ t, x: toXFull((t - windowStartS) / WINDOW_S) });
+          const pct = x => `${(x / VW) * 100}%`;
+          return (
+            <div style={{ position: 'relative', height: 18 }}>
+              <svg viewBox={`0 0 ${VW} 18`} width="100%" height="18" preserveAspectRatio="none" style={{ display: 'block' }}>
+                <line x1={PL} y1={0} x2={PL + PW} y2={0} stroke={HATCH} strokeWidth="0.5" />
+                {ticks.map(({ t, x }) => (
+                  <line key={t} x1={x} y1={0} x2={x} y2={4} stroke={HATCH} strokeWidth="1" />
+                ))}
+              </svg>
+              {ticks.map(({ t, x }) => (
+                <span key={t} style={{ position: 'absolute', top: 5, left: pct(x), transform: 'translateX(-50%)', fontSize: 11, lineHeight: 1, color: INK_SOFT, pointerEvents: 'none' }}>{t}</span>
+              ))}
+              <span style={{ position: 'absolute', top: 5, left: pct(PL + PW + 8), fontSize: 11, lineHeight: 1, color: INK_SOFT, pointerEvents: 'none' }}>s</span>
+            </div>
+          );
+        })()}
         <div style={{ display: 'flex', gap: 20, fontSize: 12, color: INK_SOFT, paddingLeft: PL, paddingBottom: 4, alignItems: 'center' }}>
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <svg width="28" height="10" style={{ flexShrink: 0 }}>
@@ -425,85 +451,100 @@ function DriveMonitorScreen({
         </div>
       </Box>
 
-      {/* Axis 3: full profile overview — 走行モード使用時のみ表示 */}
-      {showModeAxis && (
-        <Box style={{ padding: '6px 0 2px', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-          <div style={{ flex: 1, minHeight: 0 }}>
-            <svg viewBox={`0 0 ${VW} ${PH3}`} width="100%" height="100%" preserveAspectRatio="none" style={{ display: 'block' }}>
-              <line x1={PL} y1={PH3 - G3_PAD_B} x2={PL + PW} y2={PH3 - G3_PAD_B} stroke={HATCH} strokeWidth="0.8" />
-              {profilePts.length > 0 && (() => {
-                const d = profilePts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-                return <path d={d} fill="none" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />;
-              })()}
-              {isDriving && totalDurS > 0 && (
-                <>
-                  <line x1={markerX} y1={4} x2={markerX} y2={PH3 - 4} stroke="#f07070" strokeWidth="2" />
-                  <text x={markerX} y={14} textAnchor="middle" fontSize="13" fill="#f07070">▼</text>
-                </>
-              )}
-            </svg>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, fontFamily: 'inherit', paddingLeft: PL, paddingRight: PR, paddingBottom: 4, color: INK_SOFT }}>
-            <span>{activeModeName ?? '—'}</span>
-            <span style={{ color: '#a23232', fontWeight: 700 }}>
-              {isDriving && totalDurS > 0 ? `${fmt(elapsed)} / ${fmt(totalDurS)}  (${Math.round(progressFrac * 100)}%)` : '—'}
-            </span>
-            <span>残 {isDriving && totalDurS > 0 ? fmt(Math.max(0, totalDurS - elapsed)) : '—'}</span>
-          </div>
-        </Box>
-      )}
+      {/* 枠3: 全体進捗 — 常に表示。基準カーブ・▼は showRefLine かつ基準があるときだけ */}
+      <Box style={{ padding: '6px 0 2px', flex: '0.25 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <svg viewBox={`0 0 ${VW} ${PH3}`} width="100%" height="100%" preserveAspectRatio="none" style={{ display: 'block' }}>
+            <line x1={PL} y1={PH3 - G3_PAD_B} x2={PL + PW} y2={PH3 - G3_PAD_B} stroke={HATCH} strokeWidth="0.8" />
+            {showRefLine && profilePts.length > 0 && (() => {
+              const d = profilePts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+              return <path d={d} fill="none" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />;
+            })()}
+            {showRefLine && isDriving && totalDurS > 0 && (
+              <>
+                <line x1={markerX} y1={4} x2={markerX} y2={PH3 - 4} stroke="#f07070" strokeWidth="2" />
+                <text x={markerX} y={14} textAnchor="middle" fontSize="13" fill="#f07070">▼</text>
+              </>
+            )}
+          </svg>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, fontFamily: 'inherit', paddingLeft: PL, paddingRight: PR, paddingBottom: 4, color: INK_SOFT }}>
+          <span>{progressLabel ?? activeModeName ?? '—'}</span>
+          <span style={{ color: '#a23232', fontWeight: 700 }}>
+            {!isDriving
+              ? ''
+              : totalDurS > 0
+                ? `${fmt(elapsed)} / ${fmt(totalDurS)}  (${Math.round(progressFrac * 100)}%)`
+                : `${fmt(elapsed)} / — (—%)`}
+          </span>
+          <span>残 {isDriving && totalDurS > 0 ? fmt(Math.max(0, totalDurS - elapsed)) : '—'}</span>
+        </div>
+      </Box>
 
-      {/* Bottom: BigSpeed + profile | session info + buttons */}
-      <div style={{ display: 'grid', gridTemplateColumns: '0.8fr 1.2fr', gap: 10 }}>
-        <Box style={{ display: 'flex', gap: 10, alignItems: 'center', padding: 8 }}>
-          <BigSpeed value={rd.actual_speed_kmh} refSpeed={rd.ref_speed_kmh ?? null} size={84} showRef={showModeAxis} />
-          <Box style={{ flex: 1, padding: '6px 10px', display: 'flex', alignItems: 'center' }}>
-            <div style={{ fontSize: 12, color: INK_SOFT }}>アクセル {rd.accel_opening.toFixed(1)}% / ブレーキ {rd.brake_opening.toFixed(1)}%</div>
-          </Box>
-        </Box>
-        <div style={{ display: 'flex', gap: 10, alignItems: 'stretch' }}>
-          <Box style={{ padding: '8px 12px', fontSize: 13, flex: 1.6, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-            {/* T6: 経過時間は走行中のみ表示 */}
-            <Row cells={[['経過時間', '1.4fr'], [isDriving ? fmt(elapsed) : '—', '1fr', 'mono']]} />
-            {modeRowLabel && <Row cells={[[modeRowLabel, '1.4fr'], [activeModeName ?? '—', '1fr']]} />}
-            {showModeAxis && <Row cells={[['全体時間', '1.4fr'], [totalDurS > 0 ? fmt(totalDurS) : '—', '1fr', 'mono']]} />}
-            {resultPanel && (
-              // 高さを固定し、内容量（未実行/学習中/完了）で枠が伸縮しないようにする。
-              // はみ出す分は内部スクロールで見せる。
-              <div style={{ marginTop: 6, overflowY: 'auto', height: 72 }}>
-                {resultPanel}
-              </div>
-            )}
-            {/* プラン学習状態: mode ベース自動走行かつ profile/mode 選択時のみ（schedule 除く） */}
-            {showModeAxis && activeProfileId && activeModeId && activeModeKind !== 'schedule' &&
-              React.createElement(window.PlanPanel, {
-                profileId: activeProfileId, modeId: activeModeId, robotState,
-              })}
-          </Box>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
-            {busy ? (
-              <>
-                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center', fontSize: 13, color: INK_SOFT, border: `1px solid ${HATCH}`, borderRadius: 4, padding: 8 }}>
-                  {busyLabel ?? '実行中…'}
-                </div>
-                {onAbort && <Btn danger big style={{ flex: 1 }} onClick={onAbort}>■ 中断</Btn>}
-              </>
-            ) : robotState === 'RUNNING' ? (
-              <>
-                {showPause && (
-                  <Btn big style={{ flex: 1, borderColor: INK_SOFT, background: PAPER_2, color: INK }} onClick={handlePause}>⏸ 一時停止</Btn>
-                )}
-                <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
-              </>
-            ) : robotState === 'PAUSED' ? (
-              <>
-                <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleResume}>▶ 走行再開</Btn>
-                <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
-              </>
-            ) : (
-              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleStart}>開始</Btn>
-            )}
+      {/* 枠4: 情報1行 — 実車速 | 基準・偏差・開度 | 結果 | ボタン */}
+      <div style={{ flex: `${bottomRatio} 1 0`, minHeight: 0, display: 'flex', gap: 10, alignItems: 'stretch', overflow: 'hidden' }}>
+        {/* 現在ステータスを出すときは、ログの幅を取るため実車速と基準・開度を縦に積む */}
+        <Box style={{ display: 'flex', gap: showStatusLog ? 6 : 14, alignItems: showStatusLog ? 'flex-start' : 'center', justifyContent: 'center', flexDirection: showStatusLog ? 'column' : 'row', padding: '4px 12px', minHeight: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, whiteSpace: 'nowrap' }}>
+            <span style={{ fontSize: 12, color: INK_SOFT, letterSpacing: 1 }}>実車速</span>
+            <span style={{ fontSize: 34, fontWeight: 700, lineHeight: 1, fontFamily: 'inherit' }}>
+              {(typeof rd.actual_speed_kmh === 'number' ? rd.actual_speed_kmh : 0).toFixed(1)}
+            </span>
+            <span style={{ fontSize: 12, color: INK_SOFT }}>km/h</span>
           </div>
+          <div style={{ fontSize: 12, color: INK_SOFT, whiteSpace: 'nowrap' }}>
+            {showRefLine && (
+              (rd.ref_speed_kmh ?? null) !== null
+                ? `基準 ${rd.ref_speed_kmh.toFixed(1)} / 偏差 ${(rd.actual_speed_kmh - rd.ref_speed_kmh).toFixed(2)}　`
+                : '基準 — / 偏差 —　'
+            )}
+            {showRefLine && showStatusLog && <br />}
+            {`アクセル ${rd.accel_opening.toFixed(1)}% / ブレーキ ${rd.brake_opening.toFixed(1)}%`}
+          </div>
+        </Box>
+        {showStatusLog ? (
+          // 現在ステータス: 段の要約（resultPanel）を上に 1 つ、その下にサーバーログを流す。
+          <Box style={{ flex: 1, minWidth: 0, minHeight: 0, padding: '4px 10px', fontSize: 13, overflow: 'hidden' }}>
+            <DriveStatusLog robotState={robotState} summary={resultPanel} />
+          </Box>
+        ) : resultPanel ? (
+          // 学習運転の段の名前・メッセージ。はみ出す分は枠内でスクロール。
+          <Box style={{ flex: 1, minWidth: 0, minHeight: 0, padding: '4px 10px', overflowY: 'auto', fontSize: 13 }}>
+            {resultPanel}
+          </Box>
+        ) : <div style={{ flex: 1 }} />}
+        <div style={{ display: 'flex', flexDirection: 'row', gap: 8, flex: '0 0 30%', minHeight: 0 }}>
+          {busy ? (
+            <>
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center', fontSize: 13, color: INK_SOFT, border: `1px solid ${HATCH}`, borderRadius: 4, padding: 8 }}>
+                {busyLabel ?? '実行中…'}
+              </div>
+              {onAbort && <Btn danger big style={{ flex: 1 }} onClick={onAbort}>■ 中断</Btn>}
+            </>
+          ) : robotState === 'RUNNING' ? (
+            <>
+              {showPause && (
+                <Btn big style={{ flex: 1, borderColor: INK_SOFT, background: PAPER_2, color: INK }} onClick={handlePause}>⏸ 一時停止</Btn>
+              )}
+              <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
+            </>
+          ) : robotState === 'PAUSED' ? (
+            <>
+              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleResume}>▶ 走行再開</Btn>
+              <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
+            </>
+          ) : robotState !== 'READY' ? (
+            // READY 以外で「開始」すると 409 になるため押せなくし、初期化画面へ誘導する
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <Note style={{ fontSize: 11, padding: '2px 8px', lineHeight: 1.3 }}>先に初期化を実行してください（現在: {robotState}）</Note>
+              <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
+                <Btn big disabled style={{ flex: 1, padding: '4px 10px' }}>開始</Btn>
+                <Btn style={{ flex: 1 }} onClick={() => setNav('init')}>初期化へ</Btn>
+              </div>
+            </div>
+          ) : (
+            <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleStart}>開始</Btn>
+          )}
         </div>
       </div>
 
@@ -549,11 +590,12 @@ function AutoDriveScreen() {
   return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
       {isSchedule ? (
-        <DriveMonitorScreen showPause={false} showModeAxis={false} modeRowLabel="スケジュール" screenTitle="自動走行モニター"
+        <DriveMonitorScreen showPause={false} showRefLine={false} screenTitle="自動走行モニター"
           driveStartPath="/api/v1/drive/schedule/start"
           driveStartBody={activeModeId ? { schedule_id: activeModeId } : null}
           driveStopPath="/api/v1/drive/schedule/stop"
-          confirmStartMessage="開始しますか？" />
+          confirmStartMessage="開始しますか？"
+          showStatusLog={true} bottomRatio={0.6} />
       ) : (
         <DriveMonitorScreen showPause={true} screenTitle="自動走行モニター"
           driveStartPath="/api/v1/drive/start"
@@ -561,7 +603,8 @@ function AutoDriveScreen() {
           driveStopPath="/api/v1/drive/stop"
           driveArmPath="/api/v1/drive/arm"
           driveCancelPath="/api/v1/drive/cancel"
-          confirmStartMessage="開始しますか？" />
+          confirmStartMessage="開始しますか？"
+          showStatusLog={true} bottomRatio={0.6} />
       )}
       {cfg && (
         <ValidationPopup

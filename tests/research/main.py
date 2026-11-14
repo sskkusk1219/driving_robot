@@ -92,7 +92,9 @@ from tests.research.hardware import (
 )
 from tests.research.learning_patterns import LearningDataError
 from tests.research.mode_drive import (
+    ModeButtonPlan,
     ModeDriveSetup,
+    compute_hold_at_s,
     controller_text,
     fel_text,
     load_mode,
@@ -909,17 +911,71 @@ async def step3_mode_drive_ff(ctx: RunContext) -> None:
 
 
 async def step24_mode_drive_buttons(ctx: RunContext) -> None:
-    """手順 3 と同じ流れ。停車保持の開度のまま D を押してからモードを走り、終わったら N を押す。
+    """手順 3 と同じ流れ。0 秒にスタート短押しで Ready・3 秒後に D・終わりに N を押す。
 
+    走行前チェックで停車保持の開度にしておく。D が間に合わないモード（走り出す時刻 − h0_s が
+    D の押し終わりより早い）は、その時刻でモードの時刻を止め、D の後に再開する。
     基準車速が出てから `buttons.no_speed_abort_s` の間、車速が出なければ（D に入っていない
     可能性）中止する。中止したときも、ブレーキを停車保持の開度にして N を押してから終わる。
     """
     await _mode_drive_step(ctx, buttons=True)
 
 
+def build_button_plan(
+    hw: ResearchHardware, cfg: ResearchConfig, setup: ModeDriveSetup
+) -> ModeButtonPlan:
+    """手順 24: モード中のボタンの予定を組む。止める時刻（hold_at_s）は走る前に計算して表示する。"""
+    hold_at_s = compute_hold_at_s(setup.mode, cfg.features.h0_s, cfg.control.loop_interval_s)
+    b = cfg.buttons
+    if hold_at_s is None:
+        say("手順 24: 基準車速が動かないため、モードの時刻は止めません")
+    else:
+        say(
+            f"手順 24: Ready は 0 秒・D は {b.d_press_at_s:g} 秒。D が間に合わなければ"
+            f"モードの時刻 {hold_at_s:.2f}s で止めます（hold_at_s = 走り出す時刻 − h0_s "
+            f"{cfg.features.h0_s:g}s − 1 周期）"
+        )
+    return ModeButtonPlan(
+        ready_press=lambda: button_steps.press_ready_in_mode(hw, cfg),
+        d_press=lambda: button_steps.press_shift_d_in_mode(hw, cfg),
+        d_press_at_s=b.d_press_at_s,
+        after_d_wait_s=b.after_press_wait_s,
+        hold_at_s=hold_at_s,
+    )
+
+
+# ボタンを押す手順（20〜25 のうち、モード走行の中で押す 24 を除く）。この手順の前に、
+# 後ろの走行の手順の準備（読み込み・計画作成）を済ませ、ボタン操作の途中で車を待たせない
+BUTTON_STEP_NUMBERS = frozenset({20, 21, 22, 23, 25})
+
+
+def preload_target(steps: list[Step], index: int) -> Step | None:
+    """steps[index] が最初のボタン手順のとき、前倒しで準備する走行の手順を返す。なければ None。"""
+    if steps[index].number not in BUTTON_STEP_NUMBERS:
+        return None
+    if any(s.number in BUTTON_STEP_NUMBERS for s in steps[:index]):
+        return None  # 最初のボタン手順ではない
+    for later in steps[index + 1 :]:
+        if later.drives and later.prepare is not None:
+            return later
+    return None
+
+
+def button_step_conflict(steps: list[Step]) -> str | None:
+    """手順 23（Ready 単独）と 24 が同じ実行にあれば、設定エラーの文を返す。なければ None。"""
+    numbers = {step.number for step in steps}
+    if 23 in numbers and 24 in numbers:
+        return (
+            "手順24 の中で Ready にするため、手順23 と同じ実行にできません"
+            "（Ready でスタートを押すと IGN-OFF になる）"
+        )
+    return None
+
+
 async def _mode_drive_step(ctx: RunContext, *, buttons: bool) -> None:
     """手順 3（buttons=False）と手順 24（buttons=True）の共通の流れ。違いは次の 3 点だけ:
-    走行の前に D を押す・走行の後に N を押す・車速が出なければ中止する。"""
+    走行の中で Ready（0 秒）・D（d_press_at_s 後）を押す・走行の後に N を押す・
+    車速が出なければ中止する。"""
     hw = ctx.require_hardware()
     setup = ctx.mode_setup
     if setup is None:  # prepare_step3 が走行前チェックの前に作る
@@ -928,11 +984,13 @@ async def _mode_drive_step(ctx: RunContext, *, buttons: bool) -> None:
     log = _session_log_for_drive(ctx, hw)
     started_at = datetime.now()
     no_speed_abort = None
+    button_plan = None
     if buttons:
         no_speed_abort = (cfg.buttons.no_speed_abort_s, cfg.buttons.no_speed_kmh)
-        await button_steps.press_shift_d(hw, cfg)  # 停車保持の開度のまま D を押す
+        button_plan = build_button_plan(hw, cfg, setup)
     result = await run_mode_drive(
-        hw, cfg, setup, log=log, limit_s=ctx.limit_s, no_speed_abort=no_speed_abort
+        hw, cfg, setup, log=log, limit_s=ctx.limit_s, no_speed_abort=no_speed_abort,
+        button_plan=button_plan,
     )
     if buttons:
         # 終わったら（中止でも）停車保持の開度で N を押す。D のままペダルを離さない
@@ -943,6 +1001,8 @@ async def _mode_drive_step(ctx: RunContext, *, buttons: bool) -> None:
     notes = []
     if not hw.is_real:
         notes.append("スタブ HW の結果（車両モデルは実車の同定値ではない。流れの確認用）。")
+    if result.button_hold_s > 0.0:
+        notes.append(f"D 待ちで {result.button_hold_s:.1f} 秒止めた（モードの時刻を止めた）。")
     if limited:
         notes.append(
             f"--limit-s でモードの先頭 {result.mode_duration_s:.0f}s だけ走った（KPI は参考値）。"
@@ -959,7 +1019,7 @@ async def _mode_drive_step(ctx: RunContext, *, buttons: bool) -> None:
             say(f"警告: 走行時の設定を保存できませんでした（{exc}）")
     info = RunInfo(
         label=mode_label(result.mode_name),
-        title="手順 24: モード走行（D → モード → N）" if buttons else "手順 3: モード走行",
+        title="手順 24: モード走行（Ready → D → モード → N）" if buttons else "手順 3: モード走行",
         controller=controller_text(ctx.config),
         csv_path=log.csv_path,
         hw_mode=hw.hw_mode,
@@ -1170,7 +1230,7 @@ STEPS: tuple[Step, ...] = (
     Step(23, "Ready（ブレーキ ON でスタートを短押し）", step23_ready),
     Step(
         24,
-        "モード走行（停車保持の開度で D → モード → 終わったら N。車速が出なければ中止）",
+        "モード走行（0 秒 Ready・3 秒後 D・間に合わなければ止めて再開・終わりに N）",
         step24_mode_drive_buttons,
         drives=True,
         prepare=prepare_step3,
@@ -1277,6 +1337,10 @@ def main(argv: list[str] | None = None) -> int:
         return retrain_only(args)
 
     steps = resolve_steps(args)
+    conflict = button_step_conflict(steps)
+    if conflict is not None:
+        say(f"設定エラー: {conflict}")
+        return 2
     if args.limit_s is not None and args.limit_s <= 0.0:
         raise SystemExit("--limit-s は正の秒数で指定してください")
     banner("研究開発用ハーネス（ProblemReport_20260910）")
@@ -1359,13 +1423,22 @@ async def run_steps(ctx: RunContext, steps: list[Step]) -> int:
             say(f"設定エラー: {exc}")
             exit_code = 2
             return exit_code
-        for step in steps:
+        prepared: set[int] = set()  # ボタン手順の前に準備を済ませた走行の手順
+        for index, step in enumerate(steps):
             try:
+                # ボタン手順が先にある実行は、最初のボタン手順の直前に走行の手順の準備を済ませる
+                target = preload_target(steps, index)
+                if target is not None:
+                    ctx.require_hardware()
+                    say()
+                    banner(f"手順 {target.number} の準備（ボタン操作の前に読み込み）")
+                    await target.prepare(ctx)
+                    prepared.add(target.number)
                 # 手順 1（初期化）→ [準備] → 走行前チェック → 走行する手順
                 # （本番も走行開始前に必ず行う）
                 if step.drives:
                     ctx.require_hardware()
-                    if step.prepare is not None:
+                    if step.prepare is not None and step.number not in prepared:
                         say()
                         banner(f"手順 {step.number} の準備（走行前チェックの前に読み込み）")
                         await step.prepare(ctx)

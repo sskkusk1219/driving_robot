@@ -203,7 +203,7 @@ function ScheduleScreen() {
     );
   }
 
-  const gridCols = '2fr 1.6fr 0.9fr 0.8fr 0.8fr 2fr';
+  const gridCols = 'minmax(0, 2fr) minmax(0, 1.6fr) minmax(0, 0.9fr) minmax(0, 0.8fr) minmax(0, 0.8fr) 290px';
   const q = search.trim().toLowerCase();
   const filtered = schedules.filter(s =>
     s.name.toLowerCase().includes(q) ||
@@ -238,9 +238,9 @@ function ScheduleScreen() {
         }}>
           <div>名前</div>
           <div>説明</div>
-          <div style={{ fontFamily: 'monospace' }}>総時間[s]</div>
-          <div style={{ fontFamily: 'monospace' }}>ペダル点</div>
-          <div style={{ fontFamily: 'monospace' }}>ボタン</div>
+          <div>総時間[s]</div>
+          <div>ペダル点</div>
+          <div>ボタン</div>
           <div>操作</div>
         </div>
 
@@ -377,12 +377,18 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
   const gridCols = `84px 84px 84px ${visibleChannels.map(() => '92px').join(' ')} 1fr`;
 
   return (
-    <div style={{ padding: 32, height: '100%', overflowY: 'auto' }}>
-      <H2 sub={isEdit ? `スケジュール「${initial.name}」を編集します` : '時刻ごとにペダル開度とボタン押下を設定します'}>
-        {isEdit ? 'スケジュール編集' : 'スケジュール新規作成'}
-      </H2>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, height: '100%' }}>
+      {/* ヘッダ（走行モード・プロファイルのフォームと同じ並び） */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <Btn onClick={onCancel}>← 一覧に戻る</Btn>
+        <H2 sub={isEdit ? `スケジュール「${initial.name}」を編集します` : '時刻ごとにペダル開度とボタン押下を設定します'}>
+          {isEdit ? 'スケジュール編集' : 'スケジュール新規作成'}
+        </H2>
+      </div>
 
-      <Box style={{ padding: 20, marginTop: 16 }}>
+      {/* 本体（ここだけスクロール。保存・キャンセルは常に見える） */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+      <Box style={{ padding: 20 }}>
         <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
           <Input label="名前" value={name} onChange={v => setName(v)} width={260} />
           <Input label="説明" value={desc} onChange={v => setDesc(v)} width={360} />
@@ -521,10 +527,11 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
       {errors.length > 0 && (
         <Note style={{ marginTop: 16 }}>{errors[0].message}</Note>
       )}
+      </div>
 
-      <div style={{ display: 'flex', gap: 12, marginTop: 20 }}>
-        <Btn primary disabled={saving} onClick={handleSave}>{saving ? '保存中…' : '保存'}</Btn>
-        <Btn ghost onClick={onCancel}>キャンセル</Btn>
+      <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', flexShrink: 0 }}>
+        <Btn onClick={onCancel}>キャンセル</Btn>
+        <Btn primary big disabled={saving} onClick={handleSave}>{saving ? '保存中…' : '保存'}</Btn>
       </div>
     </div>
   );
@@ -545,14 +552,379 @@ const selectStyle = {
   outline: 'none',
 };
 
+// ── シーケンス（走行モード／タイムスケジュールを順に並べる） ────────
+// 作成・編集・一覧・削除・保存のみ。実行（自動運転画面から走らせる）は次の段。
+
+const SEQ_KIND_LABEL = { mode: '走行モード', schedule: 'スケジュール' };
+const SEQ_KIND_COLOR = { mode: '#78c8f0', schedule: '#c8922a' };
+
+// 秒を mm:ss に整形
+function fmtMMSS(sec) {
+  const s = Math.round(sec);
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// 正の整数へ丸める（空・不正は 1）
+function toRepeat(v) {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+}
+
 function SequenceScreen() {
-  const { Box, H2, Note } = window;
+  const { useState, useEffect } = React;
+  const { INK, INK_SOFT, INK_MUTE, PAPER, PAPER_2, HATCH, Box, Btn } = window;
+
+  const [sequences, setSequences] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [mode, setMode] = useState('list'); // list | create | edit
+  const [editTarget, setEditTarget] = useState(null);
+  const [search, setSearch] = useState('');
+
+  async function refresh() {
+    setLoading(true);
+    const data = await window.apiFetch('GET', '/api/v1/sequences/');
+    setSequences(data || []);
+    setLoading(false);
+  }
+
+  useEffect(() => { refresh(); }, []);
+
+  async function handleDelete(s) {
+    if (!confirm(`「${s.name}」を削除しますか？`)) return;
+    const r = await window.apiFetch('DELETE', `/api/v1/sequences/${s.id}`);
+    if (r !== null) {
+      window.showToast('シーケンスを削除しました', 'success');
+      refresh();
+    }
+  }
+
+  async function handleEdit(s) {
+    const detail = await window.apiFetch('GET', `/api/v1/sequences/${s.id}`);
+    if (detail) { setEditTarget(detail); setMode('edit'); }
+  }
+
+  if (mode === 'create' || mode === 'edit') {
+    return (
+      <SequenceEditForm
+        initial={mode === 'edit' ? editTarget : null}
+        onCancel={() => { setMode('list'); setEditTarget(null); }}
+        onSaved={() => { setMode('list'); setEditTarget(null); refresh(); }}
+      />
+    );
+  }
+
+  const gridCols = 'minmax(0, 2fr) minmax(0, 1.8fr) minmax(0, 0.7fr) minmax(0, 1.2fr) minmax(0, 0.9fr) 150px';
+  const q = search.trim().toLowerCase();
+  const filtered = sequences.filter(s =>
+    s.name.toLowerCase().includes(q) ||
+    (s.description || '').toLowerCase().includes(q)
+  );
+
   return (
-    <div style={{ padding: 32 }}>
-      <H2>シーケンス</H2>
-      <Box style={{ padding: 32, marginTop: 20, textAlign: 'center' }}>
-        <Note>シーケンス機能は Post-MVP で実装予定です。</Note>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, height: '100%' }}>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ flex: 1 }} />
+        <input
+          type="text"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder="名前・説明で検索…"
+          style={{
+            padding: '6px 12px', fontSize: 14,
+            border: `1.3px solid ${INK}`, borderRadius: 4,
+            fontFamily: 'inherit', background: PAPER, color: INK, outline: 'none',
+            width: 200,
+          }}
+        />
+        <Btn primary big onClick={() => setMode('create')}>＋ 新規作成</Btn>
+      </div>
+
+      <Box style={{ padding: 0, display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+        <div style={{
+          display: 'grid', gridTemplateColumns: gridCols,
+          borderBottom: `1px solid ${INK}`, padding: '10px 14px',
+          background: PAPER_2, fontSize: 14, fontWeight: 700, flexShrink: 0,
+        }}>
+          <div>名前</div>
+          <div>説明</div>
+          <div>段数</div>
+          <div>合計時間</div>
+          <div>繰り返し</div>
+          <div>操作</div>
+        </div>
+
+        <div style={{ overflowY: 'auto', flex: 1, minHeight: 0 }}>
+          {loading ? (
+            <div style={{ padding: '20px 14px', color: INK_SOFT, fontSize: 14 }}>読み込み中…</div>
+          ) : filtered.length === 0 ? (
+            <div style={{ padding: '20px 14px', color: INK_SOFT, fontSize: 14 }}>
+              {sequences.length === 0
+                ? 'シーケンスがありません。「新規作成」から追加してください。'
+                : `「${search}」に一致するシーケンスがありません。`}
+            </div>
+          ) : (
+            filtered.map(s => (
+              <div key={s.id} style={{
+                display: 'grid', gridTemplateColumns: gridCols,
+                padding: '10px 14px', alignItems: 'center',
+                borderBottom: `1px dashed ${HATCH}`,
+              }}>
+                <div>
+                  <b>{s.name}</b>
+                  {s.has_missing && (
+                    <div style={{ color: '#f07070', fontSize: 12, fontWeight: 700 }}>見つからない段あり</div>
+                  )}
+                </div>
+                <div style={{ color: s.description ? INK : INK_MUTE }}>{s.description || '—'}</div>
+                <div style={{ fontFamily: 'monospace' }}>{s.steps.length}</div>
+                <div style={{ fontFamily: 'monospace' }}>
+                  {fmtMMSS(s.total_duration)}（{s.total_duration.toFixed(1)}s）
+                </div>
+                <div style={{ fontFamily: 'monospace' }}>× {s.repeat}</div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <Btn onClick={() => handleEdit(s)}>編集</Btn>
+                  <Btn danger onClick={() => handleDelete(s)}>削除</Btn>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
       </Box>
+    </div>
+  );
+}
+
+// 新規作成・編集共通のシーケンスエディタ
+// initial: SequenceResponse | null（あり=編集/PUT、なし=新規/POST）
+function SequenceEditForm({ initial, onCancel, onSaved }) {
+  const { useState, useEffect } = React;
+  const { INK, INK_SOFT, PAPER, PAPER_2, HATCH, Box, Btn, H2, Note, Input } = window;
+  const isEdit = !!initial;
+
+  const [name, setName] = useState(initial?.name ?? '');
+  const [desc, setDesc] = useState(initial?.description ?? '');
+  const [repeat, setRepeat] = useState(initial?.repeat ?? 1);
+  const [steps, setSteps] = useState(() =>
+    initial ? initial.steps.map(s => ({ kind: s.kind, ref_id: s.ref_id, repeat: s.repeat })) : []);
+  const [modes, setModes] = useState(null);       // null=読み込み中
+  const [schedules, setSchedules] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const m = await window.apiFetch('GET', '/api/v1/modes/');
+      const s = await window.apiFetch('GET', '/api/v1/schedules/');
+      setModes(m || []);
+      setSchedules(s || []);
+    })();
+  }, []);
+
+  const loaded = modes !== null && schedules !== null;
+  const optionsOf = (kind) => (kind === 'mode' ? modes : schedules) || [];
+
+  // 参照先の解決（一覧にある=存在。長さは現在の値）
+  function resolve(step) {
+    const found = optionsOf(step.kind).find(o => o.id === step.ref_id);
+    return found
+      ? { name: found.name, duration: found.total_duration, missing: false }
+      : { name: '（見つからない）', duration: 0, missing: true };
+  }
+
+  function addStep(kind) {
+    const opts = optionsOf(kind);
+    if (opts.length === 0) {
+      window.showToast(`追加できる${SEQ_KIND_LABEL[kind]}がありません`, 'error');
+      return;
+    }
+    setSteps(ss => [...ss, { kind, ref_id: opts[0].id, repeat: 1 }]);
+  }
+
+  function updateStep(idx, patch) {
+    setSteps(ss => ss.map((s, i) => (i === idx ? { ...s, ...patch } : s)));
+  }
+
+  // 種類を切り替えたら参照先はその種類の先頭にする
+  function changeKind(idx, kind) {
+    const opts = optionsOf(kind);
+    updateStep(idx, { kind, ref_id: opts.length ? opts[0].id : '' });
+  }
+
+  function moveStep(idx, delta) {
+    setSteps(ss => {
+      const to = idx + delta;
+      if (to < 0 || to >= ss.length) return ss;
+      const copy = ss.slice();
+      [copy[idx], copy[to]] = [copy[to], copy[idx]];
+      return copy;
+    });
+  }
+
+  function deleteStep(idx) {
+    setSteps(ss => ss.filter((_, i) => i !== idx));
+  }
+
+  const resolved = steps.map(resolve);
+  const onePass = steps.reduce((acc, s, i) => acc + resolved[i].duration * s.repeat, 0);
+  const totalDuration = onePass * repeat;
+  const hasMissing = loaded && resolved.some(r => r.missing);
+
+  async function handleSave() {
+    if (!name.trim()) { window.showToast('名前を入力してください', 'error'); return; }
+    if (steps.length === 0) { window.showToast('段を 1 つ以上追加してください', 'error'); return; }
+    if (hasMissing) {
+      const i = resolved.findIndex(r => r.missing);
+      window.showToast(`${i + 1} 段目の参照先が見つかりません。選び直すか削除してください`, 'error');
+      return;
+    }
+    const payload = {
+      name: name.trim(), description: desc, repeat: toRepeat(repeat),
+      steps: steps.map(s => ({ kind: s.kind, ref_id: s.ref_id, repeat: toRepeat(s.repeat) })),
+    };
+    setSaving(true);
+    const r = isEdit
+      ? await window.apiFetch('PUT', `/api/v1/sequences/${initial.id}`, payload)
+      : await window.apiFetch('POST', '/api/v1/sequences/', payload);
+    setSaving(false);
+    if (r) {
+      window.showToast(`「${r.name}」を${isEdit ? '更新' : '作成'}しました`, 'success');
+      onSaved();
+    }
+  }
+
+  const gridCols = '130px minmax(200px, 1fr) 90px 150px 150px';
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, height: '100%' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <Btn onClick={onCancel}>← 一覧に戻る</Btn>
+        <H2 sub={isEdit ? `シーケンス「${initial.name}」を編集します` : '走行モードとスケジュールを順に並べます'}>
+          {isEdit ? 'シーケンス編集' : 'シーケンス新規作成'}
+        </H2>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+        <Box style={{ padding: 20 }}>
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+            <Input label="名前" value={name} onChange={v => setName(v)} width={260} />
+            <Input label="説明" value={desc} onChange={v => setDesc(v)} width={360} />
+            <Input label="全体の繰り返し回数" type="number" min="1" step="1" mono
+                   value={repeat} onChange={v => setRepeat(v === '' ? '' : Number(v))} width={160} />
+          </div>
+        </Box>
+
+        <Box style={{ padding: 16, marginTop: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <div style={{ fontSize: 14, color: INK_SOFT }}>段（{steps.length} 段）</div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Btn disabled={!loaded} onClick={() => addStep('mode')}>＋ 走行モードを追加</Btn>
+              <Btn disabled={!loaded} onClick={() => addStep('schedule')}>＋ スケジュールを追加</Btn>
+            </div>
+          </div>
+
+          <div style={{ overflowX: 'auto' }}>
+            <div style={{ minWidth: 'fit-content' }}>
+              <div style={{
+                display: 'grid', gridTemplateColumns: gridCols, gap: 8,
+                borderBottom: `1px solid ${INK}`, padding: '4px 4px 8px', fontSize: 13,
+                fontWeight: 700, color: INK_SOFT,
+              }}>
+                <div>種類</div><div>参照先</div><div>繰り返し</div><div>長さ</div><div>操作</div>
+              </div>
+
+              {steps.length === 0 && (
+                <div style={{ padding: '14px 4px', color: INK_SOFT, fontSize: 14 }}>
+                  段がありません。上のボタンから追加してください。
+                </div>
+              )}
+
+              {steps.map((s, idx) => {
+                const r = resolved[idx];
+                const missing = loaded && r.missing;
+                return (
+                  <div key={idx} style={{
+                    display: 'grid', gridTemplateColumns: gridCols, gap: 8,
+                    padding: '6px 4px', borderBottom: `1px dashed ${HATCH}`, alignItems: 'center',
+                  }}>
+                    <select value={s.kind} onChange={e => changeKind(idx, e.target.value)} style={selectStyle}>
+                      <option value="mode">{SEQ_KIND_LABEL.mode}</option>
+                      <option value="schedule">{SEQ_KIND_LABEL.schedule}</option>
+                    </select>
+                    <select value={s.ref_id} onChange={e => updateStep(idx, { ref_id: e.target.value })}
+                            style={{ ...selectStyle, borderColor: missing ? '#b04040' : HATCH,
+                                     color: missing ? '#f07070' : window.INK }}>
+                      {missing && <option value={s.ref_id}>（見つからない）</option>}
+                      {optionsOf(s.kind).map(o => (
+                        <option key={o.id} value={o.id}>{o.name}</option>
+                      ))}
+                    </select>
+                    <input type="number" min="1" step="1" value={s.repeat}
+                           onChange={e => updateStep(idx, { repeat: e.target.value === '' ? '' : Number(e.target.value) })}
+                           style={numberInputStyle} />
+                    <div style={{ fontFamily: 'monospace', fontSize: 13, color: missing ? '#f07070' : INK }}>
+                      {missing ? '—' : `${fmtMMSS(r.duration * toRepeat(s.repeat))}（${(r.duration * toRepeat(s.repeat)).toFixed(1)}s）`}
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <Btn disabled={idx === 0} onClick={() => moveStep(idx, -1)} style={{ padding: '4px 10px' }}>↑</Btn>
+                      <Btn disabled={idx === steps.length - 1} onClick={() => moveStep(idx, 1)} style={{ padding: '4px 10px' }}>↓</Btn>
+                      <Btn danger onClick={() => deleteStep(idx)} style={{ padding: '4px 10px' }}>✕</Btn>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </Box>
+
+        <Box style={{ padding: 16, marginTop: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 10 }}>
+            <div style={{ fontSize: 14, color: INK_SOFT }}>プレビュー（1 周ぶん。段の幅は 長さ×繰り返し に比例）</div>
+            <div style={{ fontSize: 14 }}>
+              合計時間（× {toRepeat(repeat)} 周）：
+              <b style={{ fontFamily: 'monospace' }}> {fmtMMSS(totalDuration)}（{totalDuration.toFixed(1)}s）</b>
+            </div>
+          </div>
+          {steps.length === 0 ? (
+            <div style={{ color: INK_SOFT, fontSize: 13 }}>—</div>
+          ) : (
+            <div style={{ display: 'flex', height: 36, border: `1px solid ${HATCH}`, borderRadius: 3, background: PAPER, overflow: 'hidden' }}>
+              {steps.map((s, idx) => {
+                const r = resolved[idx];
+                const w = r.duration * toRepeat(s.repeat);
+                const missing = loaded && r.missing;
+                const label = `${r.name} ×${toRepeat(s.repeat)}`;
+                return (
+                  <div key={idx}
+                       title={`${idx + 1} 段目 ${SEQ_KIND_LABEL[s.kind]}: ${label}（${w.toFixed(1)}s）`}
+                       style={{
+                         flex: `${Math.max(w, 0.001)} 1 0`, minWidth: 40,
+                         background: missing ? '#b04040' : SEQ_KIND_COLOR[s.kind],
+                         color: '#14110a', fontSize: 12, fontWeight: 700,
+                         display: 'flex', alignItems: 'center', padding: '0 6px',
+                         borderRight: `1px solid ${PAPER}`, overflow: 'hidden',
+                         whiteSpace: 'nowrap', textOverflow: 'ellipsis',
+                       }}>{label}</div>
+                );
+              })}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 16, marginTop: 8, fontSize: 12, color: INK_SOFT }}>
+            <span><span style={{ color: SEQ_KIND_COLOR.mode }}>■</span> 走行モード</span>
+            <span><span style={{ color: SEQ_KIND_COLOR.schedule }}>■</span> スケジュール</span>
+            <span><span style={{ color: '#b04040' }}>■</span> 見つからない</span>
+          </div>
+        </Box>
+
+        {hasMissing && (
+          <Note style={{ marginTop: 16 }}>参照先が見つからない段があります。選び直すか削除すると保存できます。</Note>
+        )}
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', flexShrink: 0 }}>
+        <Btn onClick={onCancel}>キャンセル</Btn>
+        <Btn primary big disabled={saving} onClick={handleSave}>{saving ? '保存中…' : '保存'}</Btn>
+      </div>
     </div>
   );
 }

@@ -383,7 +383,7 @@ def build_hardware(cfg: ResearchConfig, hw_mode: str) -> ResearchHardware:
             can=StubCANReader(speed_kmh=params.creep_speed_kmh, vehicle=vehicle),
             ups=StubUPSMonitor(),
             hw_mode=HW_STUB,
-            buttons=StubButtonServo(listener=status),
+            buttons=StubButtonServo(),
             vehicle_status=status,
         )
     if hw_mode != HW_REAL:
@@ -454,13 +454,15 @@ def build_hardware(cfg: ResearchConfig, hw_mode: str) -> ResearchHardware:
         ups_name=settings.ups.ups_name,
         poll_interval_s=settings.ups.poll_interval_s,
     )
+    # I2C のバス・アドレス・PWM 周波数だけ settings.toml の [servo] から読む。
+    # AppSettings.servo.rest_angle/press_angle は研究ハーネスでは使わない
+    # （基準の角度と各ボタンの角度は yaml の buttons.servo_map・servo_rest_angle_deg）。
     servo = settings.servo
     buttons = ButtonServoDriver(
         i2c_bus=servo.i2c_bus,
         address=servo.address,
         pwm_freq_hz=servo.pwm_freq_hz,
-        rest_angle=servo.rest_angle,
-        press_angle=servo.press_angle,
+        rest_angle=cfg.buttons.servo_rest_angle_deg,
     )
     return ResearchHardware(
         accel=accel, brake=brake, can=can, ups=ups, hw_mode=HW_REAL, settings=settings,

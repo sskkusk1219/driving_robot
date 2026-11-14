@@ -203,7 +203,17 @@ class LearningCycleOrchestrator:
         return self._progress
 
     def _set_progress(self, **kwargs: object) -> None:
+        old_phase = self._progress.phase
         self._progress = replace(self._progress, **kwargs)  # type: ignore[arg-type]
+        # WebUI の「現在ステータス」に流す。段階が変わったとき・メッセージが付くとき 1 行出す
+        # （周期処理ではなく段階単位の呼び出しのみ）。
+        if self._progress.phase != old_phase:
+            _logger.info(
+                "学習サイクル 段階: %s → %s", old_phase.value, self._progress.phase.value
+            )
+        message = kwargs.get("message")
+        if message:
+            _logger.info("  %s", message)
 
     def _check_abort(self) -> None:
         if self._abort_requested:
@@ -270,6 +280,7 @@ class LearningCycleOrchestrator:
             raise InvalidStateTransition("学習サイクルの開始には先に arm() が必要です")
         self._pending_profile_id = None
 
+        _logger.info("学習サイクルを開始します（PID粗適合 %d 回）", refine_runs_stage1)
         self._set_progress(phase=CyclePhase.LEARNING, message="学習運転を実行しています")
         try:
             session = await self._controller.start_learning_drive(log_writer=self._log_writer)
@@ -277,7 +288,10 @@ class LearningCycleOrchestrator:
             cycle_id = session.cycle_id or self._controller.active_cycle_id
             if cycle_id is None:
                 raise RuntimeError("学習サイクルIDを採番できませんでした")
-        except Exception:
+        except Exception as e:
+            # 失敗を現在ステータス（WebUI のログ枠）に残す。無いと「学習運転を実行しています」の
+            # 後に何も出ないまま READY に戻り、止まった理由が画面から分からない。
+            _logger.error("  [NG  ] 学習運転を開始できませんでした: %s", e)
             # start_learning_drive 失敗時、ロボット状態は READY へロールバック済みだが
             # progress を LEARNING のままにすると WS 配信で「実行中」が永久に見え続ける
             # （W5 レビュー指摘）。ロボット状態のロールバックに合わせて progress も戻す。
@@ -323,6 +337,13 @@ class LearningCycleOrchestrator:
             if current_best is None or cost < current_best:
                 best_holder["cost"] = cost
                 best_holder["pid_preview_s"] = params.pid_preview_s
+            _logger.info(
+                "  PID適合 %d/%d 回目 完了: コスト=%.4f（最良 %.4f）",
+                run_index,
+                run_total,
+                cost,
+                best_holder["cost"] if best_holder["cost"] is not None else cost,
+            )
             self._set_progress(
                 run_index=run_index,
                 run_total=run_total,
@@ -661,6 +682,7 @@ class LearningCycleOrchestrator:
         )
         await self._persist_best_params(profile, best)
         best_cost = min((h["cost"] for h in history), default=None)
+        _logger.info("  [OK  ] PID仕上げ 完了（%d 回走行・最良コスト=%s）", len(history), best_cost)
         return {
             "gains": asdict(best.gains),
             "pid_preview_s": best.pid_preview_s,
@@ -736,6 +758,7 @@ class LearningCycleOrchestrator:
                 update_pid_gains=True,
                 feature_spec=feature_spec,
             )
+            _logger.info("  [OK  ] 運転モデルの学習完了（学習運転ログ）  … %s", result1.model_path)
             detail["stage1_model_path"] = result1.model_path
             detail["stage1_metrics"] = result1.metrics
             detail["stage1_initial_gains"] = asdict(result1.pid_gains)
@@ -761,6 +784,7 @@ class LearningCycleOrchestrator:
                 on_run=self._make_on_run(refine_runs_stage1),
             )
             await self._persist_best_params(profile1, best1)
+            _logger.info("  [OK  ] PID粗適合 完了（%d 回走行）", len(history1))
             detail["stage1_gains"] = asdict(best1.gains)
             detail["stage1_pid_preview_s"] = best1.pid_preview_s
             detail["stage1_best_cost"] = min((h["cost"] for h in history1), default=None)
@@ -782,6 +806,7 @@ class LearningCycleOrchestrator:
                 update_pid_gains=False,
                 feature_spec=feature_spec,
             )
+            _logger.info("  [OK  ] 運転モデルの再学習完了（全ログ）  … %s", result2.model_path)
             detail["stage2_model_path"] = result2.model_path
             detail["stage2_metrics"] = result2.metrics
             self._check_abort()
@@ -838,19 +863,20 @@ class LearningCycleOrchestrator:
                     f"学習サイクルは完了しました"
                     f"（警告: KPI 未達 p95={p95:.2f} / max={max_dev:.2f}）"
                 )
+            _logger.info("学習サイクル 完了（KPI %s）", "合格" if kpi_passed else "未達")
             self._set_progress(
                 phase=CyclePhase.COMPLETED,
                 message=completion_message,
                 best_cost=final_best_cost,
             )
         except CycleAborted:
-            _logger.info("学習サイクル %s を中断しました", cycle_id)
+            _logger.warning("学習サイクル %s を中断しました", cycle_id[:8])
             await self._release_and_stop_if_needed()
             if self._log_writer is not None:
                 await self._log_writer.end_cycle(cycle_id, "aborted", detail=detail)
             self._set_progress(phase=CyclePhase.ABORTED, message="学習サイクルを中断しました")
         except Exception as e:
-            _logger.exception("学習サイクル %s でエラーが発生しました", cycle_id)
+            _logger.exception("学習サイクル %s でエラーが発生しました", cycle_id[:8])
             await self._release_and_stop_if_needed()
             detail = {**detail, "error": str(e), "phase": self._progress.phase.value}
             if self._log_writer is not None:

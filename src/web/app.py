@@ -17,6 +17,7 @@ from src.app.stubs import (
     InMemoryPedalPlanRepository,
     InMemoryProfileRepository,
     InMemoryScheduleRepository,
+    InMemorySequenceRepository,
     InMemorySessionRepository,
     _StubUPSMonitor,
     build_stub_controller,
@@ -24,8 +25,9 @@ from src.app.stubs import (
 from src.app.training_service import feature_spec_from_settings
 from src.domain.model_training import DEFAULT_FEATURE_SPEC, FeatureSpec
 from src.infra.db import DuplicateNameError
+from src.infra.log_buffer import LogBufferHandler
 from src.infra.settings import LearningSettings
-from src.web.routers import drive, modes, profiles, schedules, sessions, ups
+from src.web.routers import drive, modes, profiles, schedules, sequences, sessions, ups
 from src.web.ws import broadcast_loop, realtime_ws
 
 
@@ -54,6 +56,7 @@ async def _build_repos(app: FastAPI) -> None:
         from src.infra.pedal_plan_repository import PedalPlanRepository  # noqa: PLC0415
         from src.infra.profile_repository import ProfileRepository  # noqa: PLC0415
         from src.infra.schedule_repository import ScheduleRepository  # noqa: PLC0415
+        from src.infra.sequence_repository import SequenceRepository  # noqa: PLC0415
         from src.infra.session_repository import SessionRepository  # noqa: PLC0415
 
         pool = await create_pool(db_url)
@@ -62,6 +65,7 @@ async def _build_repos(app: FastAPI) -> None:
         app.state.mode_repo = ModeRepository(pool)
         app.state.session_repo = SessionRepository(pool)
         app.state.schedule_repo = ScheduleRepository(pool)
+        app.state.sequence_repo = SequenceRepository(pool)
         app.state.plan_repo = PedalPlanRepository(pool)
 
         # 前回プロセスの異常終了で 'running' のまま残った孤児セッションを是正する。
@@ -78,11 +82,19 @@ async def _build_repos(app: FastAPI) -> None:
         app.state.mode_repo = InMemoryModeRepository()
         app.state.session_repo = InMemorySessionRepository()
         app.state.schedule_repo = InMemoryScheduleRepository()
+        app.state.sequence_repo = InMemorySequenceRepository()
         app.state.plan_repo = InMemoryPedalPlanRepository()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # サーバーログを WebUI の「現在ステータス」へ流すためのバッファを src ロガーに付ける
+    log_buffer = LogBufferHandler(maxlen=500)
+    src_logger = logging.getLogger("src")
+    src_logger.addHandler(log_buffer)
+    src_logger.setLevel(logging.INFO)
+    app.state.log_buffer = log_buffer
+
     await _build_repos(app)
 
     if os.environ.get("DRIVING_ROBOT_USE_REAL_HW") == "1":
@@ -96,7 +108,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         await ups_monitor.start_polling()
     else:
-        controller = build_stub_controller()
+        controller = build_stub_controller(profile_repo=app.state.profile_repo)
         ups_monitor = _StubUPSMonitor()
 
     await controller.start()
@@ -137,6 +149,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await ups_monitor.stop_polling()
         if app.state.db_pool is not None:
             await app.state.db_pool.close()
+        src_logger.removeHandler(log_buffer)
 
 
 app = FastAPI(
@@ -177,6 +190,7 @@ app.include_router(drive.router)
 app.include_router(profiles.router)
 app.include_router(modes.router)
 app.include_router(schedules.router)
+app.include_router(sequences.router)
 app.include_router(sessions.router)
 app.include_router(ups.router)
 

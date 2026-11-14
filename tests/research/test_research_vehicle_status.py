@@ -9,7 +9,7 @@ import pytest
 
 from tests.research import config as cfgmod
 from tests.research import hardware as hwmod
-from tests.research.button_servo import CH_D, CH_N, CH_P, CH_START
+from tests.research.button_servo import BUTTON_D, BUTTON_N, BUTTON_P, BUTTON_START
 from tests.research.vehicle_status import State, VehicleStatus
 
 
@@ -38,14 +38,14 @@ class Car:
             self.speed = speed
         self.tick(0.0)
 
-    def press(self, ch: int, hold_s: float = 0.1) -> None:
+    def press(self, button: str, hold_s: float = 0.1) -> None:
         self.tick(0.0)
-        self.vs.on_press_start(ch, self.t)
+        self.vs.on_press_start(button, self.t)
         # 押している間も update が呼ばれる（途中で表 2 の判定が進む）
         n = max(1, round(hold_s / 0.1))
         for _ in range(n):
             self.tick(hold_s / n)
-        self.vs.on_press_end(ch, self.t)
+        self.vs.on_press_end(button, self.t)
 
     def tap(self, n: int = 1, pct: float = 10.0) -> None:
         for _ in range(n):
@@ -56,15 +56,24 @@ class Car:
 
 
 def _ign_on(car: Car, hold_s: float = 3.0) -> None:
-    car.press(CH_START, hold_s)
+    car.press(BUTTON_START, hold_s)
+
+
+def test_press_notification_uses_button_name() -> None:
+    """ボタンの名前（"start"・"P"・"N"・"D"）で受け取る。知らない名前は無視する。"""
+    car = Car()
+    car.press("start", 3.0)
+    assert car.vs.state is State.IGN_ON_RLY_OFF
+    car.press("X")  # 知らない名前は何も起きない
+    assert car.vs.range == "P" and car.vs.state is State.IGN_ON_RLY_OFF
 
 
 # ── 無効のとき ───────────────────────────────────────────────────
 def test_inactive_status_ignores_everything() -> None:
     vs = VehicleStatus()
     vs.update(1.0, 0.0, 50.0, 0.0)
-    vs.on_press_start(CH_START, 1.0)
-    vs.on_press_end(CH_START, 4.0)
+    vs.on_press_start(BUTTON_START, 1.0)
+    vs.on_press_end(BUTTON_START, 4.0)
     assert vs.active is False
     assert vs.state is State.IGN_OFF
     assert vs.range == "P"
@@ -80,80 +89,80 @@ def test_activate_starts_from_ign_off_p() -> None:
 # ── 表 1（押した瞬間） ───────────────────────────────────────────
 def test_table1_ign_off_brake_off_goes_ign_on_rly_on() -> None:
     car = Car()
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     assert car.vs.state is State.IGN_ON_RLY_ON
 
 
 def test_table1_ign_off_brake_on_goes_ready() -> None:
     car = Car()
     car.set(brake=5.0)
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     assert car.vs.state is State.READY
 
 
 def test_table1_ign_on_brake_on_goes_ready_brake_off_stopped_goes_off() -> None:
     car = Car()
-    car.press(CH_START, 0.5)  # RLY-ON
+    car.press(BUTTON_START, 0.5)  # RLY-ON
     car.set(brake=5.0)
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     assert car.vs.state is State.READY
     car2 = Car()
-    car2.press(CH_START, 0.5)
-    car2.press(CH_START, 0.5)  # ブレーキ OFF・停車中 → IGN-OFF
+    car2.press(BUTTON_START, 0.5)
+    car2.press(BUTTON_START, 0.5)  # ブレーキ OFF・停車中 → IGN-OFF
     assert car2.vs.state is State.IGN_OFF
 
 
 def test_table1_ign_on_brake_off_running_no_change() -> None:
     car = Car()
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     car.set(speed=10.0)
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     assert car.vs.state is State.IGN_ON_RLY_ON
 
 
 def test_table1_ready_stopped_goes_off_running_no_change() -> None:
     car = Car()
     car.set(brake=5.0)
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     assert car.vs.state is State.READY
     car.set(speed=10.0)
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     assert car.vs.state is State.READY
     car.set(speed=0.0)
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     assert car.vs.state is State.IGN_OFF
 
 
 # ── 表 2（押し続け） ─────────────────────────────────────────────
 def test_table2_under_2s_stays_rly_on() -> None:
     car = Car()
-    car.press(CH_START, 1.5)
+    car.press(BUTTON_START, 1.5)
     assert car.vs.state is State.IGN_ON_RLY_ON
 
 
 def test_table2_2s_to_5s_goes_rly_off_and_records_start_time() -> None:
     car = Car()
     t0 = car.t
-    car.press(CH_START, 3.0)
+    car.press(BUTTON_START, 3.0)
     assert car.vs.state is State.IGN_ON_RLY_OFF
     assert car.vs._rly_off_t == pytest.approx(t0 + 2.0)  # 押した時刻 ＋ 2 s
 
 
 def test_table2_5s_goes_back_to_ign_off() -> None:
     car = Car()
-    car.press(CH_START, 5.2)
+    car.press(BUTTON_START, 5.2)
     assert car.vs.state is State.IGN_OFF
 
 
 def test_table2_running_5s_emergency_off_goes_n_and_coasts_then_p() -> None:
     car = Car()
     car.set(brake=5.0)
-    car.press(CH_START, 0.5)  # Ready
+    car.press(BUTTON_START, 0.5)  # Ready
     car.vs.range = "D"
     car.set(brake=0.0, speed=30.0)
-    car.press(CH_START, 3.0)  # 5 s 未満は変化なし
+    car.press(BUTTON_START, 3.0)  # 5 s 未満は変化なし
     assert car.vs.state is State.READY
-    car.press(CH_START, 5.2)  # 緊急 OFF
+    car.press(BUTTON_START, 5.2)  # 緊急 OFF
     assert car.vs.state is State.IGN_OFF
     assert car.vs.range == "N"  # 走行中は N へ
     car.set(speed=0.0)  # 停車したら P
@@ -163,7 +172,7 @@ def test_table2_running_5s_emergency_off_goes_n_and_coasts_then_p() -> None:
 def test_table2_other_transitions_unchanged_by_long_press() -> None:
     car = Car()
     car.set(brake=5.0)
-    car.press(CH_START, 6.0)  # → Ready。押し続けても変化なし
+    car.press(BUTTON_START, 6.0)  # → Ready。押し続けても変化なし
     assert car.vs.state is State.READY
 
 
@@ -171,37 +180,37 @@ def test_table2_other_transitions_unchanged_by_long_press() -> None:
 def test_shift_ignored_in_ign_off() -> None:
     car = Car()
     car.set(brake=5.0)
-    car.press(CH_N)
+    car.press(BUTTON_N)
     assert car.vs.range == "P"
 
 
 def test_shift_conditions() -> None:
     car = Car()
-    car.press(CH_START, 3.0)  # IGN-ON(RLY-OFF)・ブレーキ OFF
-    car.press(CH_N)  # N はブレーキ ON が条件
+    car.press(BUTTON_START, 3.0)  # IGN-ON(RLY-OFF)・ブレーキ OFF
+    car.press(BUTTON_N)  # N はブレーキ ON が条件
     assert car.vs.range == "P"
     car.set(brake=5.0)
-    car.press(CH_N)
+    car.press(BUTTON_N)
     assert car.vs.range == "N"
-    car.press(CH_D)  # D は Ready のみ
+    car.press(BUTTON_D)  # D は Ready のみ
     assert car.vs.range == "N"
     car.set(speed=5.0)
-    car.press(CH_P)  # P は停車中が条件
+    car.press(BUTTON_P)  # P は停車中が条件
     assert car.vs.range == "N"
     car.set(speed=0.0)
-    car.press(CH_P)
+    car.press(BUTTON_P)
     assert car.vs.range == "P"
 
 
 def test_d_needs_ready_and_brake() -> None:
     car = Car()
     car.set(brake=5.0)
-    car.press(CH_START, 0.5)  # Ready・P
+    car.press(BUTTON_START, 0.5)  # Ready・P
     car.set(brake=0.0)
-    car.press(CH_D)
+    car.press(BUTTON_D)
     assert car.vs.range == "P"
     car.set(brake=5.0)
-    car.press(CH_D)
+    car.press(BUTTON_D)
     assert car.vs.range == "D"
     assert car.vs.drive_mode() == "D"
 
@@ -209,61 +218,61 @@ def test_d_needs_ready_and_brake() -> None:
 # ── N ホールド ───────────────────────────────────────────────────
 def test_n_hold_established_by_two_n_within_5s_from_p() -> None:
     car = Car()
-    car.press(CH_START, 3.0)
+    car.press(BUTTON_START, 3.0)
     car.set(brake=5.0)
-    car.press(CH_N)
+    car.press(BUTTON_N)
     assert car.vs.n_hold is False
     car.tick(1.0)
-    car.press(CH_N)
+    car.press(BUTTON_N)
     assert car.vs.n_hold is True
 
 
 def test_n_hold_not_established_after_5s_or_from_non_p() -> None:
     car = Car()
-    car.press(CH_START, 3.0)
+    car.press(BUTTON_START, 3.0)
     car.set(brake=5.0)
-    car.press(CH_N)
+    car.press(BUTTON_N)
     car.tick(6.0)
-    car.press(CH_N)
+    car.press(BUTTON_N)
     assert car.vs.n_hold is False
     # P を挟んだらやり直し（1 回目から）
     car.set(speed=0.0)
-    car.press(CH_P)
-    car.press(CH_N)
+    car.press(BUTTON_P)
+    car.press(BUTTON_N)
     car.tick(1.0)
-    car.press(CH_N)
+    car.press(BUTTON_N)
     assert car.vs.n_hold is True
 
 
 def test_n_hold_keeps_n_at_ign_off_and_is_released_at_next_ign_on() -> None:
     car = Car()
-    car.press(CH_START, 3.0)
+    car.press(BUTTON_START, 3.0)
     car.set(brake=5.0)
-    car.press(CH_N)
-    car.press(CH_N)
+    car.press(BUTTON_N)
+    car.press(BUTTON_N)
     assert car.vs.n_hold
     car.set(brake=5.0)
-    car.press(CH_START, 0.5)  # Ready
+    car.press(BUTTON_START, 0.5)  # Ready
     assert car.vs.state is State.READY and car.vs.n_hold  # Ready になっても継続
-    car.press(CH_START, 0.5)  # IGN-OFF（停車）
+    car.press(BUTTON_START, 0.5)  # IGN-OFF（停車）
     assert car.vs.state is State.IGN_OFF
     assert car.vs.range == "N" and car.vs.n_hold  # N のまま
     car.set(brake=0.0)
-    car.press(CH_START, 0.5)  # IGN-OFF → IGN-ON で解除（N は維持）
+    car.press(BUTTON_START, 0.5)  # IGN-OFF → IGN-ON で解除（N は維持）
     assert car.vs.state is State.IGN_ON_RLY_ON
     assert car.vs.range == "N" and car.vs.n_hold is False
 
 
 def test_n_hold_does_not_apply_to_d_emergency_off() -> None:
     car = Car()
-    car.press(CH_START, 3.0)
+    car.press(BUTTON_START, 3.0)
     car.set(brake=5.0)
-    car.press(CH_N)
-    car.press(CH_N)
-    car.press(CH_START, 0.5)  # Ready・N
-    car.press(CH_D)
+    car.press(BUTTON_N)
+    car.press(BUTTON_N)
+    car.press(BUTTON_START, 0.5)  # Ready・N
+    car.press(BUTTON_D)
     car.set(brake=0.0, speed=20.0)
-    car.press(CH_START, 5.2)  # D で走行中の緊急 OFF
+    car.press(BUTTON_START, 5.2)  # D で走行中の緊急 OFF
     assert car.vs.state is State.IGN_OFF and car.vs.range == "N"
     car.set(speed=0.0)
     assert car.vs.range == "P"  # N ホールドが有効でも停車で P
@@ -271,13 +280,13 @@ def test_n_hold_does_not_apply_to_d_emergency_off() -> None:
 
 def test_n_hold_keeps_n_after_emergency_off_from_n() -> None:
     car = Car()
-    car.press(CH_START, 3.0)
+    car.press(BUTTON_START, 3.0)
     car.set(brake=5.0)
-    car.press(CH_N)
-    car.press(CH_N)
-    car.press(CH_START, 0.5)  # Ready・N
+    car.press(BUTTON_N)
+    car.press(BUTTON_N)
+    car.press(BUTTON_START, 0.5)  # Ready・N
     car.set(brake=0.0, speed=20.0)
-    car.press(CH_START, 5.2)
+    car.press(BUTTON_START, 5.2)
     car.set(speed=0.0)
     assert car.vs.range == "N"
 
@@ -285,11 +294,11 @@ def test_n_hold_keeps_n_after_emergency_off_from_n() -> None:
 # ── IGN-OFF のレンジ ─────────────────────────────────────────────
 def test_ign_off_stopped_goes_p_without_hold() -> None:
     car = Car()
-    car.press(CH_START, 3.0)
+    car.press(BUTTON_START, 3.0)
     car.set(brake=5.0)
-    car.press(CH_N)
-    car.press(CH_START, 0.5)  # Ready・N
-    car.press(CH_START, 0.5)  # IGN-OFF・停車
+    car.press(BUTTON_N)
+    car.press(BUTTON_START, 0.5)  # Ready・N
+    car.press(BUTTON_START, 0.5)  # IGN-OFF・停車
     assert car.vs.range == "P"
 
 
@@ -297,10 +306,10 @@ def test_ign_off_stopped_goes_p_without_hold() -> None:
 def _maintenance_sequence(car: Car) -> None:
     car.tap(3)  # P × 3
     car.set(brake=5.0)
-    car.press(CH_N)
+    car.press(BUTTON_N)
     car.set(brake=0.0)
     car.tap(3)  # N × 3
-    car.press(CH_P)
+    car.press(BUTTON_P)
     car.tap(3)  # P × 3
 
 
@@ -316,10 +325,10 @@ def test_maintenance_wrong_order_restarts_within_60s() -> None:
     _ign_on(car)
     car.tap(2)
     car.set(brake=5.0)
-    car.press(CH_N)  # P で 2 回しか踏まずに N へ
+    car.press(BUTTON_N)  # P で 2 回しか踏まずに N へ
     car.set(brake=0.0)
     car.tap(3)
-    car.press(CH_P)
+    car.press(BUTTON_P)
     car.tap(3)
     assert car.vs.maintenance is False
     _maintenance_sequence(car)  # 60 s 内ならやり直せる
@@ -333,10 +342,10 @@ def test_maintenance_fourth_tap_breaks_order() -> None:
     assert car.vs._m_stage == 0 and car.vs._m_count == 1
     car.tap(2)
     car.set(brake=5.0)
-    car.press(CH_N)
+    car.press(BUTTON_N)
     car.set(brake=0.0)
     car.tap(3)
-    car.press(CH_P)
+    car.press(BUTTON_P)
     car.tap(3)
     assert car.vs.maintenance is True
 
@@ -354,15 +363,15 @@ def test_maintenance_continues_into_ready_and_clears_at_ign_off() -> None:
     _ign_on(car)
     _maintenance_sequence(car)
     car.set(brake=5.0)
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     assert car.vs.state is State.READY and car.vs.maintenance is True
-    car.press(CH_START, 0.5)
+    car.press(BUTTON_START, 0.5)
     assert car.vs.state is State.IGN_OFF and car.vs.maintenance is False
 
 
 def test_taps_outside_rly_off_do_not_count() -> None:
     car = Car()
-    car.press(CH_START, 0.5)  # RLY-ON のまま
+    car.press(BUTTON_START, 0.5)  # RLY-ON のまま
     car.tap(3)
     assert car.vs._m_count == 0
 

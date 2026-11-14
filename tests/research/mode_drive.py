@@ -35,10 +35,12 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import contextlib
 import json
 import math
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -2200,6 +2202,8 @@ class ModeDriveResult:
     stop_lead_stats: StopLeadStats | None = None
     stop_end_stats: StopEndStats | None = None
     samples: list[DriveSample] = field(default_factory=list)  # MODE_DRIVE の行（0.1s 刻み）
+    # 手順 24: D の用意が間に合わずモードの時刻を止めていた秒数（段5c。止めなければ 0）
+    button_hold_s: float = 0.0
 
 
 def cut_deeper_brake_fb(ff_effort: float, fb_effort: float) -> float:
@@ -2237,6 +2241,42 @@ def stop_end_monotone_brake(effort: float, prev_effort: float | None) -> float:
     if prev_effort is None or effort >= 0.0:
         return effort
     return min(effort, prev_effort)
+
+
+@dataclass
+class ModeButtonPlan:
+    """手順 24: モード走行の中でボタンを押す予定（ProblemReport_20261112 段5c）。
+
+    mode_drive は ch・角度を知らない（ボタン層の関数を受け取るだけ）。
+    `ready_press` はモード開始（0 秒）に押し、`d_press` は開始から `d_press_at_s` 秒後（Ready の
+    押下が終わってから）に押す。D を押し終えて `after_d_wait_s` 待つと「D 済み」。モードの時刻が
+    `hold_at_s` に達してもまだ D 済みでなければ、D 済みになるまでモードの時刻を止める
+    （ペダルは停車保持のまま）。`hold_at_s` が None なら止めない。
+    """
+
+    ready_press: Callable[[], Awaitable[None]]
+    d_press: Callable[[], Awaitable[None]]
+    d_press_at_s: float
+    after_d_wait_s: float
+    hold_at_s: float | None = None
+
+
+_HOLD_SCAN_STEP_S = 0.05  # hold_at_s を求めるときの基準車速の引き間隔 [s]
+
+
+def compute_hold_at_s(mode: DrivingMode, h0_s: float, interval_s: float) -> float | None:
+    """基準車速が VEHICLE_STOP_SPEED_KMH を超える最初の時刻 − h0_s − 1 周期（0 未満は 0）。
+
+    停車保持を離し始める判定（`_ff_inputs` の ref_is_stopped ＝ 最短ホライズン h0_s 先の基準が
+    停車速度を超えたら離す）と同じ物差し。基準が最後まで動かなければ None（止めない）。
+    """
+    ref = ReferenceSpeed(mode)
+    n = int(mode.total_duration / _HOLD_SCAN_STEP_S) + 1
+    for i in range(n + 1):
+        t = i * _HOLD_SCAN_STEP_S
+        if ref.at(t) > VEHICLE_STOP_SPEED_KMH:
+            return max(0.0, t - h0_s - interval_s)
+    return None
 
 
 class NoSpeedWatch:
@@ -2350,6 +2390,7 @@ class _ModeRun:
         duration_s: float,
         section: str = SECTION_MODE_DRIVE,
         no_speed_abort: tuple[float, float] | None = None,
+        button_plan: ModeButtonPlan | None = None,
     ) -> None:
         self.hw = hw
         self.cfg = cfg
@@ -2662,6 +2703,13 @@ class _ModeRun:
         self._deviation_since: float | None = None
         # 手順 24: 基準車速が出ても車速が出ないときの中止（None なら何もしない。手順 3 など）
         self._no_speed = None if no_speed_abort is None else NoSpeedWatch(*no_speed_abort)
+        # 手順 24: モード中にボタンを押す予定（None なら何もしない。手順 3 など）
+        self.button_plan = button_plan
+        self.button_hold_s = 0.0  # モードの時刻を止めていた秒数の合計
+        self._ready_task: asyncio.Task[None] | None = None
+        self._d_task: asyncio.Task[None] | None = None
+        self._d_finished_at: float | None = None
+        self._hold_t: float | None = None  # 止めている間の、止めたときのモードの時刻
         self.max_abs_dev = 0.0
         self._next_print = 0.0
         self._segment = ""
@@ -2670,21 +2718,104 @@ class _ModeRun:
 
     async def run(self) -> float:
         """モード終わり（または duration_s）まで回し、走った秒数を返す。異常は DriveError。"""
+        if self.button_plan is not None:
+            try:
+                return await self._run_loop()
+            finally:
+                await self._cancel_button_tasks()
+        return await self._run_loop()
+
+    async def _run_loop(self) -> float:
         loop = asyncio.get_running_loop()
         started = loop.time()
         next_tick = started
+        hold_total = 0.0  # 手順 24: モードの時刻を止めていた秒数（button_plan なしは常に 0）
         while True:
-            t = loop.time() - started
+            now = loop.time()
+            t = now - started - hold_total
+            holding = False
+            if self.button_plan is not None:
+                prev_hold_t = self._hold_t
+                holding = await self._button_step(now - started, t, now)
+                held_t = self._hold_t if holding else prev_hold_t
+                if held_t is not None:
+                    # 止めている間（と再開する周期）は、モードの時刻を止めた時刻に固定する
+                    hold_total = now - started - held_t
+                    self.button_hold_s = hold_total
+                    t = held_t
             if t >= self.duration_s:
                 return t
-            await self._cycle(t, loop.time())
-            self.cycles += 1
+            if not holding:
+                # モードの時刻の連続のため、止めていた分を now からも引いて渡す
+                await self._cycle(t, loop.time() - hold_total)
+                self.cycles += 1
             next_tick += self.interval_s
             now = loop.time()
             if now - next_tick > self.interval_s:
                 self.overruns += 1  # 1 周期以上遅れた: まとめて取り返さず次の周期から数え直す
                 next_tick = now
             await asyncio.sleep(max(0.0, next_tick - now))
+
+    async def _button_step(self, elapsed: float, t: float, now: float) -> bool:
+        """手順 24: 1 周期分のボタン処理。モードの時刻を止める周期なら True。
+
+        elapsed は走り始めからの実時間、t は今のモードの時刻。Ready は 0 秒、D は elapsed が
+        `d_press_at_s` 以降で Ready の押下が終わってから押す（止めている間も実時間で進む）。
+        """
+        plan = self.button_plan
+        assert plan is not None
+        if self._ready_task is None:
+            say(f"  [手順 24] 0 秒: Ready（スタート短押し）を始めます（モードの時刻 {t:.2f}s）")
+            self._ready_task = asyncio.create_task(plan.ready_press())
+        if (
+            self._d_task is None
+            and elapsed >= plan.d_press_at_s
+            and self._ready_task.done()
+        ):
+            say(f"  [手順 24] {elapsed:.2f} 秒: D を押します（モードの時刻 {t:.2f}s）")
+            self._d_task = asyncio.create_task(plan.d_press())
+        for task in (self._ready_task, self._d_task):
+            if task is not None and task.done() and not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    raise DriveError(
+                        f"ボタンを押せませんでした（{type(exc).__name__}: {exc}）"
+                    ) from exc
+        if self._d_task is not None and self._d_task.done() and self._d_finished_at is None:
+            self._d_finished_at = now
+        d_done = (
+            self._d_finished_at is not None and now - self._d_finished_at >= plan.after_d_wait_s
+        )
+        if d_done or plan.hold_at_s is None:
+            if self._hold_t is not None:
+                say(
+                    f"  [手順 24] D 済み: モードの時刻 {self._hold_t:.2f}s から再開します"
+                    f"（{self.button_hold_s:.2f} 秒止めました）"
+                )
+                self._hold_t = None
+            return False
+        if self._hold_t is None and t >= plan.hold_at_s:
+            self._hold_t = t
+            say(
+                f"  [手順 24] D が間に合わないため、モードの時刻 {t:.2f}s で止めます"
+                "（停車保持のまま待ちます）"
+            )
+        if self._hold_t is None:
+            return False
+        # 止めている間も CAN の車速を読む（鮮度を保つ）
+        try:
+            await self.hw.can.read_speed()
+        except Exception as exc:
+            raise DriveError(f"CAN 車速を読めません（{type(exc).__name__}: {exc}）") from exc
+        return True
+
+    async def _cancel_button_tasks(self) -> None:
+        """走行が終わった・中止したとき、動いている押下をやめる（press の finally で基準角へ）。"""
+        for task in (self._ready_task, self._d_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
     def _ff_inputs(
         self, t: float, ref: float, speed: float
@@ -4619,6 +4750,7 @@ async def run_mode_drive(
     limit_s: float | None = None,
     section: str = SECTION_MODE_DRIVE,
     no_speed_abort: tuple[float, float] | None = None,
+    button_plan: ModeButtonPlan | None = None,
 ) -> ModeDriveResult:
     """停車保持の状態からモードを走り、停車保持で終える。
 
@@ -4628,6 +4760,7 @@ async def run_mode_drive(
     FEL の学習用パターンは FEL_DRIVE。2026-10-19 段2s-2b）。
     `no_speed_abort`（秒, km/h）は手順 24 用: 基準車速が 0 を超えてから秒の間、車速が km/h 以下
     のままなら中止する（D に入っていない可能性。2026-11-12）。None なら判定しない。
+    `button_plan` は手順 24 用: モード中に Ready・D を押す予定（None なら何もしない。段5c）。
     """
     mode = setup.mode
     duration = mode.total_duration if limit_s is None else min(limit_s, mode.total_duration)
@@ -4644,7 +4777,8 @@ async def run_mode_drive(
             "シャシダイナモ上で実施してください ***")
 
     run = _ModeRun(
-        hw, cfg, setup, log, duration, section=section, no_speed_abort=no_speed_abort
+        hw, cfg, setup, log, duration, section=section, no_speed_abort=no_speed_abort,
+        button_plan=button_plan,
     )
     await log.stop_sampler()  # 50ms の制御ループと Modbus を取り合わない（記録はループから）
     log.mark(section, "")
@@ -4684,6 +4818,7 @@ async def run_mode_drive(
         stop_lead_stats=run.stop_lead_stats,
         stop_end_stats=None if run.stop_end is None else run.stop_end.stats,
         samples=run.samples,
+        button_hold_s=run.button_hold_s,
     )
     say(f"モード走行 {'完了' if result.completed else '中断'}: {run_s:.1f}s・{run.cycles} 周期"
         f"（1 周期以上の遅れ {run.overruns} 回・減速G ガバナー作動 {run.governor_cycles} 周期）"

@@ -36,6 +36,20 @@ class SystemStateResponse(BaseModel):
     updated_at: datetime
 
 
+class LogLineSchema(BaseModel):
+    seq: int
+    t: float
+    time: str
+    level: str
+    logger: str
+    message: str
+
+
+class DriveLogResponse(BaseModel):
+    lines: list[LogLineSchema]
+    last_seq: int
+
+
 # ── Drive session ─────────────────────────────────────────────────────────────
 
 
@@ -533,3 +547,50 @@ class PlanStatusResponse(BaseModel):
     has_plan: bool  # 保存プランが存在するか（efforts が非空）
     best_reward: float | None  # これまでの最良走行 reward
     reward_history: list[dict[str, object]] = []  # 反復ごとの reward/p95/採否 履歴（収束表示用）
+
+
+# ── Sequence ─────────────────────────────────────────────────────────────────
+
+
+class SequenceStepSchema(BaseModel):
+    """シーケンスの1段（リクエスト用）。"""
+
+    kind: Literal["mode", "schedule"]
+    ref_id: str = Field(min_length=1)
+    repeat: int = Field(default=1, ge=1)
+
+
+class SequenceStepResponse(BaseModel):
+    """シーケンスの1段（参照先を解決した応答用）。見つからない場合は missing=True・長さ 0。"""
+
+    kind: Literal["mode", "schedule"]
+    ref_id: str
+    repeat: int
+    name: str
+    duration_s: float
+    missing: bool
+
+
+class SequenceResponse(BaseModel):
+    id: str
+    name: str
+    description: str
+    steps: list[SequenceStepResponse]
+    repeat: int
+    total_duration: float
+    has_missing: bool
+    created_at: datetime
+
+
+class SequenceCreateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    description: str = ""
+    steps: list[SequenceStepSchema] = Field(min_length=1)
+    repeat: int = Field(default=1, ge=1)
+
+
+class SequenceUpdateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    description: str = ""
+    steps: list[SequenceStepSchema] = Field(min_length=1)
+    repeat: int = Field(default=1, ge=1)

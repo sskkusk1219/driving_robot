@@ -326,6 +326,7 @@ function Row({ cells, header, style = {} }) {
       padding: '6px 8px',
       fontSize: 14,
       fontWeight: header ? 600 : 400,
+      alignItems: 'center',  // セルの縦位置をそろえる（ボタン・Pill と文字のずれ防止）
       ...style,
     }}>
       {cells.map((c, i) => (
