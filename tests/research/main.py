@@ -944,6 +944,23 @@ def build_button_plan(
     )
 
 
+# ボタンを押す手順（20〜25 のうち、モード走行の中で押す 24 を除く）。この手順の前に、
+# 後ろの走行の手順の準備（読み込み・計画作成）を済ませ、ボタン操作の途中で車を待たせない
+BUTTON_STEP_NUMBERS = frozenset({20, 21, 22, 23, 25})
+
+
+def preload_target(steps: list[Step], index: int) -> Step | None:
+    """steps[index] が最初のボタン手順のとき、前倒しで準備する走行の手順を返す。なければ None。"""
+    if steps[index].number not in BUTTON_STEP_NUMBERS:
+        return None
+    if any(s.number in BUTTON_STEP_NUMBERS for s in steps[:index]):
+        return None  # 最初のボタン手順ではない
+    for later in steps[index + 1 :]:
+        if later.drives and later.prepare is not None:
+            return later
+    return None
+
+
 def button_step_conflict(steps: list[Step]) -> str | None:
     """手順 23（Ready 単独）と 24 が同じ実行にあれば、設定エラーの文を返す。なければ None。"""
     numbers = {step.number for step in steps}
@@ -1406,13 +1423,22 @@ async def run_steps(ctx: RunContext, steps: list[Step]) -> int:
             say(f"設定エラー: {exc}")
             exit_code = 2
             return exit_code
-        for step in steps:
+        prepared: set[int] = set()  # ボタン手順の前に準備を済ませた走行の手順
+        for index, step in enumerate(steps):
             try:
+                # ボタン手順が先にある実行は、最初のボタン手順の直前に走行の手順の準備を済ませる
+                target = preload_target(steps, index)
+                if target is not None:
+                    ctx.require_hardware()
+                    say()
+                    banner(f"手順 {target.number} の準備（ボタン操作の前に読み込み）")
+                    await target.prepare(ctx)
+                    prepared.add(target.number)
                 # 手順 1（初期化）→ [準備] → 走行前チェック → 走行する手順
                 # （本番も走行開始前に必ず行う）
                 if step.drives:
                     ctx.require_hardware()
-                    if step.prepare is not None:
+                    if step.prepare is not None and step.number not in prepared:
                         say()
                         banner(f"手順 {step.number} の準備（走行前チェックの前に読み込み）")
                         await step.prepare(ctx)

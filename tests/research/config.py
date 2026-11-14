@@ -715,11 +715,11 @@ class ButtonsSection:
     stop_brake_opening_pct（手順 2 が書く停車保持の開度）を使う。
     """
 
-    start_short_press_s: float = 0.5  # スタートの短押し（Ready・IGN-OFF）[s]
+    start_short_press_s: float = 1.0  # スタートの短押し（Ready・IGN-OFF）[s]（調整 11-15）
     start_long_press_s: float = 3.0  # スタートの長押し（IGN-ON(RLY-OFF)）。2 s 以上 5 s 未満 [s]
-    shift_press_s: float = 0.5  # P/N/D の押下 [s]
+    shift_press_s: float = 1.2  # P/N/D の押下 [s]（ユーザー調整 2026-11-15）
     after_press_wait_s: float = 1.0  # 押した後に車が状態を変えるまでの待ち [s]
-    accel_tap_opening_pct: float = 10.0  # アクセル踏み 1 回の開度（資料の 1% 以上を超える）[%]
+    accel_tap_opening_pct: float = 50.0  # アクセル踏み 1 回の開度（ユーザー決定 2026-11-15）[%]
     accel_tap_on_s: float = 0.5  # アクセル踏み 1 回の踏んでいる時間 [s]
     accel_tap_off_s: float = 0.5  # アクセル踏み 1 回の離している時間 [s]
     maintenance_tap_count: int = 3  # メンテナンスモードの各レンジの踏み回数（車種で変わる）
@@ -735,10 +735,10 @@ class ButtonsSection:
     servo_rest_angle_deg: float = 90.0  # 基準（待機）の角度 [deg]
     servo_map: dict[str, dict[str, Any]] = field(
         default_factory=lambda: {
-            "start": {"channel": 0, "offset_deg": -80.0},
-            "P": {"channel": 0, "offset_deg": 80.0},
-            "N": {"channel": 1, "offset_deg": -80.0},
-            "D": {"channel": 1, "offset_deg": 80.0},
+            "start": {"channel": 0, "offset_deg": -58.0},
+            "P": {"channel": 0, "offset_deg": 90.0},
+            "N": {"channel": 1, "offset_deg": -87.0},
+            "D": {"channel": 1, "offset_deg": 85.0},
         }
     )
 

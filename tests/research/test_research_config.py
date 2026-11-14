@@ -1965,18 +1965,18 @@ def test_buttons_section_defaults_and_validation(tmp_path: Path) -> None:
     """ボタン手順（手順 20〜25）の値: 既定・検証（2026-11-12 段2）。"""
     cfg = _load_default()
     bt = cfg.buttons
-    assert (bt.start_short_press_s, bt.start_long_press_s, bt.shift_press_s) == (0.5, 3.0, 0.5)
+    assert (bt.start_short_press_s, bt.start_long_press_s, bt.shift_press_s) == (1.0, 3.0, 1.2)
     assert bt.after_press_wait_s == 1.0
-    assert (bt.accel_tap_opening_pct, bt.accel_tap_on_s, bt.accel_tap_off_s) == (10.0, 0.5, 0.5)
+    assert (bt.accel_tap_opening_pct, bt.accel_tap_on_s, bt.accel_tap_off_s) == (50.0, 0.5, 0.5)
     assert (bt.maintenance_tap_count, bt.n_hold_gap_s) == (3, 1.0)
     assert (bt.no_speed_abort_s, bt.no_speed_kmh) == (3.0, 0.2)
     assert bt.d_press_at_s == 3.0
     assert bt.servo_rest_angle_deg == 90.0
     assert bt.servo_map == {
-        "start": {"channel": 0, "offset_deg": -80.0},
-        "P": {"channel": 0, "offset_deg": 80.0},
-        "N": {"channel": 1, "offset_deg": -80.0},
-        "D": {"channel": 1, "offset_deg": 80.0},
+        "start": {"channel": 0, "offset_deg": -58.0},
+        "P": {"channel": 0, "offset_deg": 90.0},
+        "N": {"channel": 1, "offset_deg": -87.0},
+        "D": {"channel": 1, "offset_deg": 85.0},
     }
     assert cfgmod.ButtonsSection() == bt  # yaml の値は dataclass の既定と同じ
     assert not [p for p in cfgmod.validate_config(cfg) if "buttons." in p]
@@ -2008,7 +2008,7 @@ def test_buttons_servo_map_validation() -> None:
     assert problems_after(lambda b: b.servo_map["N"].update(channel=-1))
     assert problems_after(lambda b: b.servo_map["N"].update(offset_deg=0.0))
     assert problems_after(lambda b: b.servo_map["N"].update(offset_deg=95.0))  # 90+95 > 180
-    assert problems_after(lambda b: b.servo_map["P"].update(offset_deg=-80.0))  # start と重複
+    assert problems_after(lambda b: b.servo_map["P"].update(offset_deg=-58.0))  # start と重複
     assert problems_after(lambda b: setattr(b, "servo_rest_angle_deg", 181.0))
 
 

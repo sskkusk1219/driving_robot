@@ -119,8 +119,8 @@ async def test_buttons_use_yaml_channel_and_angle() -> None:
     for button in ("start", "P", "N", "D"):
         await bsmod.press_button(hw, cfg, button, 0.0)
     pressed = [(r.channel, r.angle) for r in hw.buttons.history]  # type: ignore[union-attr]
-    assert pressed == [(0, 10.0), (0, 170.0), (1, 10.0), (1, 170.0)]
-    assert bsmod.button_target(cfg, "P") == (0, 170.0)
+    assert pressed == [(0, 32.0), (0, 180.0), (1, 3.0), (1, 175.0)]
+    assert bsmod.button_target(cfg, "P") == (0, 180.0)
     await hwmod.shutdown(hw)
 
 
@@ -205,10 +205,10 @@ async def test_step24_presses_ready_and_d_in_mode_then_n(
     plan = seen["plan"]
     assert (plan.d_press_at_s, plan.after_d_wait_s) == (3.0, 0.1)  # type: ignore[attr-defined]
     # 走る前に D は押さない。モードの中で Ready（スタート ch0 10°）→ D（ch1 170°）
-    assert seen["pressed_in_run"] == [(0, 10.0), (1, 170.0)]
+    assert seen["pressed_in_run"] == [(0, 32.0), (1, 175.0)]
     assert seen["state_after_ready"] is State.READY
     pressed = [(r.channel, r.angle) for r in hw.buttons.history]  # type: ignore[union-attr]
-    assert pressed[-1] == (1, 10.0)  # 最後は N＝ch1 10°
+    assert pressed[-1] == (1, 3.0)  # 最後は N＝ch1 3°
     assert seen["range_at_run"] == "D"  # 走る間は D
     assert hw.vehicle_status is not None and hw.vehicle_status.range == "N"
     # 終わりは停車保持の開度のまま N を押した
@@ -233,7 +233,7 @@ async def test_step24_abort_presses_n_with_stop_hold_then_raises(
     hw = holder["hw"]
     history = hw.buttons.history  # type: ignore[union-attr]
     pressed = [(r.channel, r.angle) for r in history]
-    assert pressed[-3:] == [(0, 10.0), (1, 170.0), (1, 10.0)]  # Ready・D（入らない）→ N
+    assert pressed[-3:] == [(0, 32.0), (1, 175.0), (1, 3.0)]  # Ready・D（入らない）→ N
     assert hw.vehicle_status is not None
     assert hw.vehicle_status.range == "N"  # D は入っていない
     brake_pos = await hw.brake.read_position()
@@ -252,7 +252,7 @@ async def test_step21_presses_p_first_even_if_start_range_is_n() -> None:
     await bsmod.maintenance_mode(hw, cfg)
     pressed = [(r.channel, r.angle) for r in hw.buttons.history]  # type: ignore[union-attr]
     # スタート長押し → P（ch0 170°）→ …（N → P）
-    assert pressed[:2] == [(0, 10.0), (0, 170.0)]
+    assert pressed[:2] == [(0, 32.0), (0, 180.0)]
     assert status.maintenance is True and status.range == "P"
     await hwmod.shutdown(hw)
 
@@ -267,3 +267,49 @@ def test_steps_23_and_24_in_one_run_is_a_config_error(
     assert mainmod.button_step_conflict([steps[1], steps[23]]) is None
     assert mainmod.main(["--steps", "1,23,24"]) == 2
     assert "手順23 と同じ実行にできません" in capsys.readouterr().out
+
+
+async def _order_of_run(numbers: tuple[int, ...], monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """手順を空の handler/prepare に差し替えて run_steps を流し、呼ばれた順を返す。"""
+    from dataclasses import replace
+
+    events: list[str] = []
+
+    def fake(step: mainmod.Step) -> mainmod.Step:
+        async def handler(ctx: object, n: int = step.number) -> None:
+            events.append(f"handler{n}")
+
+        async def prepare(ctx: object, n: int = step.number) -> None:
+            events.append(f"prepare{n}")
+
+        return replace(
+            step, handler=handler, prepare=prepare if step.prepare is not None else None
+        )
+
+    async def fake_check(ctx: object, **kwargs: object) -> None:
+        events.append("check")
+        ctx.pre_drive_checked = True  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(mainmod, "pre_drive_check", fake_check)
+    monkeypatch.setattr(mainmod, "validate_config_once", lambda ctx: None)
+    ctx = SimpleNamespace(
+        require_hardware=lambda: None, pre_drive_checked=False, session_log=None, hardware=None
+    )
+    by_number = {s.number: s for s in mainmod.STEPS}
+    code = await mainmod.run_steps(ctx, [fake(by_number[n]) for n in numbers])  # type: ignore[arg-type]
+    assert code == 0
+    return events
+
+
+async def test_prepare_runs_once_before_first_button_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = await _order_of_run((1, 21, 22, 24, 25), monkeypatch)
+    assert events == [
+        "handler1", "prepare24", "handler21", "handler22", "check", "handler24", "handler25",
+    ]
+
+
+async def test_order_unchanged_without_button_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = await _order_of_run((1, 3), monkeypatch)
+    assert events == ["handler1", "prepare3", "check", "handler3"]

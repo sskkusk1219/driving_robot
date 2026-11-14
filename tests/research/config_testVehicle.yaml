@@ -1402,11 +1402,11 @@ checks:
 #   「仮」は根拠のない仮の値で、実機確認（ハード取り付け後）で決める。
 #   ブレーキ ON の開度は新しい値を作らず、手順 2 が書く停車保持の開度（stop_brake_offset_pct）を使う。
 buttons:
-  start_short_press_s: 0.5     # スタートの短押し（Ready・IGN-OFF）[s]（仮：表2 の 2 s より十分短く）
+  start_short_press_s: 1.0     # スタートの短押し（Ready・IGN-OFF）[s]（ユーザー調整 2026-11-15: 0.5 s は短すぎ。表2 の 2 s より短く）
   start_long_press_s: 3.0      # スタートの長押し（IGN-ON(RLY-OFF)）[s]（資料の「2 s 以上 5 s 未満」の真ん中）
-  shift_press_s: 0.5           # P/N/D の押下 [s]（仮）
+  shift_press_s: 1.2           # P/N/D の押下 [s]（ユーザー調整 2026-11-15: 0.5 s では N が効かなかった）
   after_press_wait_s: 1.0      # 押した後に車が状態を変えるまでの待ち [s]（仮）
-  accel_tap_opening_pct: 10.0  # アクセル踏み 1 回の開度 [%]（仮：資料の「1% 以上」を確実に超える）
+  accel_tap_opening_pct: 50.0  # アクセル踏み 1 回の開度 [%]（ユーザー決定 2026-11-15: 10% ではメンテナンスモードに入らなかった）
   accel_tap_on_s: 0.5          # アクセル踏み 1 回の踏んでいる時間 [s]（仮）
   accel_tap_off_s: 0.5         # アクセル踏み 1 回の離している時間 [s]（仮）
   maintenance_tap_count: 3     # メンテナンスモードの各レンジでの踏み回数（資料の値。車種で変わる）
@@ -1420,10 +1420,10 @@ buttons:
   # シミュレータ（試験車両）側のキーは E/R/T/Y（スタート・P・N・D に対応）。
   servo_rest_angle_deg: 90.0   # 基準（待機）の角度 [deg]
   servo_map:
-    start: {channel: 0, offset_deg: -80.0}   # 10°
-    P: {channel: 0, offset_deg: 80.0}        # 170°
-    N: {channel: 1, offset_deg: -80.0}       # 10°
-    D: {channel: 1, offset_deg: 80.0}        # 170°
+    start: {channel: 0, offset_deg: -58.0}   # 32°（ユーザー調整 2026-11-15: 35° では IGN-OFF にならなかった）
+    P: {channel: 0, offset_deg: 90.0}        # 180°（ユーザー調整 2026-11-15）
+    N: {channel: 1, offset_deg: -87.0}       # 3°（ユーザー調整 2026-11-15）
+    D: {channel: 1, offset_deg: 85.0}        # 175°（ユーザー調整 2026-11-15）
 
 # ── 出力 ─────────────────────────────────────────────────────────────
 output:
