@@ -1,7 +1,7 @@
 from dataclasses import replace
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from src.app.learning_cycle import CycleBusyError, LearningCycleOrchestrator
 from src.app.robot_controller import (
@@ -39,6 +39,7 @@ from src.web.schemas import (
     CalibrationDataResponse,
     CalibrationResultResponse,
     CycleProgressSchema,
+    DriveLogResponse,
     DriveSessionResponse,
     DynamicsParamsSchema,
     FeedforwardParamsSchema,
@@ -47,6 +48,7 @@ from src.web.schemas import (
     LearningCycleAbortResponse,
     LearningCycleStartRequest,
     LearningCycleStartResponse,
+    LogLineSchema,
     PIDGainsSchema,
     PidRefineRequest,
     PidRefineResponse,
@@ -99,6 +101,19 @@ async def get_status(controller: Controller) -> SystemStateResponse:
         last_normal_shutdown=state.last_normal_shutdown,
         updated_at=state.updated_at,
     )
+
+
+@router.get("/log", response_model=DriveLogResponse)
+async def get_drive_log(
+    request: Request, after: Annotated[int | None, Query(ge=0)] = None
+) -> DriveLogResponse:
+    """サーバーログの差分（`seq > after`）を古い順に最大 200 行返す（現在ステータス表示用）。"""
+    buf = getattr(request.app.state, "log_buffer", None)
+    if buf is None:
+        return DriveLogResponse(lines=[], last_seq=0)
+    lines = buf.get_lines(after=after, limit=200)
+    last_seq = lines[-1]["seq"] if lines else buf.last_seq
+    return DriveLogResponse(lines=[LogLineSchema(**ln) for ln in lines], last_seq=last_seq)
 
 
 @router.post("/initialize", status_code=200)

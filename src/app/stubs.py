@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from src.app.robot_controller import RobotController
+from src.domain.calibration import CalibrationManager
 from src.domain.control.feedforward import FeedforwardController
 from src.domain.control.pedal_plan import PedalPlan
 from src.domain.control.pid import PIDController
@@ -19,10 +20,20 @@ from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession, LearningCycle
 from src.models.driving_mode import DrivingMode
 from src.models.profile import VehicleProfile
+from src.models.sequence import Sequence
 from src.models.time_schedule import TimeSchedule
 
 
 class _StubActuator:
+    """開発用アクチュエータスタブ。最後に指令された位置を覚えて read_position で返す。
+
+    キャリブレーション画面のジョグ（相対移動）→ ZERO/FULL 記録が、実機と同様に
+    「動かした位置が読める」形で成立する（常に 0 を返すとストローク検証で保存できない）。
+    """
+
+    def __init__(self) -> None:
+        self._position = 0
+
     async def connect(self) -> None:
         pass
 
@@ -30,7 +41,7 @@ class _StubActuator:
         pass
 
     async def home_return(self) -> None:
-        pass
+        self._position = 0
 
     async def servo_off(self) -> None:
         pass
@@ -45,18 +56,18 @@ class _StubActuator:
         return False
 
     async def read_position(self) -> int:
-        return 0
+        return self._position
 
     async def read_current(self) -> float:
         return 0.0
 
-    async def move_to_position(self, pos: int) -> None:  # noqa: ARG002
-        pass
+    async def move_to_position(self, pos: int) -> None:
+        self._position = pos
 
     async def move_to_position_timed(  # noqa: ARG002
         self, target_pos: int, current_pos: int, duration_s: float
     ) -> None:
-        pass
+        self._position = target_pos
 
     async def wait_for_position_complete(self) -> None:
         pass
@@ -142,12 +153,28 @@ class _StubSafetyMonitor:
         return False
 
 
-def build_stub_controller() -> RobotController:
+def build_stub_controller(
+    profile_repo: InMemoryProfileRepository | None = None,
+) -> RobotController:
+    """スタブ構成のコントローラを組み立てる。
+
+    profile_repo を渡すと CalibrationManager を配線し、スタブ構成でもキャリブレーションを
+    保存できる（ジョグ → ZERO/FULL → 保存。アクチュエータスタブが指令位置を覚えるため成立する）。
+    """
     pid = PIDController(kp=1.0, ki=0.0, kd=0.0)
     safety_monitor = _StubSafetyMonitor()
+    accel_driver = _StubActuator()
+    brake_driver = _StubActuator()
+    calibration_manager = (
+        CalibrationManager(
+            accel_driver=accel_driver, brake_driver=brake_driver, profile_repo=profile_repo
+        )
+        if profile_repo is not None
+        else None
+    )
     controller = RobotController(
-        accel_driver=_StubActuator(),
-        brake_driver=_StubActuator(),
+        accel_driver=accel_driver,
+        brake_driver=brake_driver,
         can_reader=_StubCANReader(),
         safety_monitor=safety_monitor,
         pid=pid,
@@ -155,6 +182,7 @@ def build_stub_controller() -> RobotController:
         last_normal_shutdown=False,
         learning_manager=LearningDriveManager(),
         button_servo=_StubButtonServo(),
+        calibration_manager=calibration_manager,
     )
     # 実機 factory と同じ一方向ディスパッチ配線（monitor → controller）
     safety_monitor.register_emergency_callback(controller.emergency_stop)
@@ -348,6 +376,51 @@ class InMemoryScheduleRepository:
         if schedule_id not in self._schedules:
             return False
         del self._schedules[schedule_id]
+        return True
+
+
+class InMemorySequenceRepository:
+    """DB なし環境用の in-memory シーケンスリポジトリ。"""
+
+    def __init__(self) -> None:
+        self._sequences: dict[str, Sequence] = {}
+
+    async def list_all(self) -> list[Sequence]:
+        return sorted(self._sequences.values(), key=lambda s: s.created_at, reverse=True)
+
+    async def get_by_id(self, sequence_id: str) -> Sequence | None:
+        return self._sequences.get(sequence_id)
+
+    async def create(self, sequence: Sequence) -> Sequence:
+        # DB の UNIQUE(name) 制約と挙動を揃える
+        if any(s.name == sequence.name for s in self._sequences.values()):
+            raise DuplicateNameError(f"シーケンス名 {sequence.name!r} は既に使用されています")
+        sequence_id = sequence.id if sequence.id else str(uuid4())
+        stored = Sequence(
+            id=sequence_id,
+            name=sequence.name,
+            description=sequence.description,
+            steps=sequence.steps,
+            repeat=sequence.repeat,
+            created_at=sequence.created_at,
+        )
+        self._sequences[sequence_id] = stored
+        return stored
+
+    async def update(self, sequence: Sequence) -> Sequence | None:
+        if sequence.id not in self._sequences:
+            return None
+        if any(
+            s.name == sequence.name and sid != sequence.id for sid, s in self._sequences.items()
+        ):
+            raise DuplicateNameError(f"シーケンス名 {sequence.name!r} は既に使用されています")
+        self._sequences[sequence.id] = sequence
+        return sequence
+
+    async def delete(self, sequence_id: str) -> bool:
+        if sequence_id not in self._sequences:
+            return False
+        del self._sequences[sequence_id]
         return True
 
 

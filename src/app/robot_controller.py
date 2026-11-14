@@ -387,7 +387,18 @@ class RobotController:
         allowed = VALID_TRANSITIONS.get(self._state, frozenset())
         if new_state not in allowed:
             raise InvalidStateTransition(f"{self._state} → {new_state} は許可されていない遷移です")
+        _logger.info("状態: %s → %s", self._state, new_state)
         self._state = new_state
+
+    @staticmethod
+    def _log_pre_check(label: str, result: PreCheckResult) -> None:
+        """走行前チェックの各項目の結果を 1 行ずつログに出す（現在ステータス表示用）。"""
+        _logger.info("走行前チェック (%s) …", label)
+        for item in result.items:
+            if item.passed:
+                _logger.info("  [OK  ] %s", item.item_name)
+            else:
+                _logger.warning("  [NG  ] %s  … %s", item.item_name, item.error_message or "")
 
     def get_system_state(self) -> SystemState:
         return SystemState(
@@ -632,6 +643,7 @@ class RobotController:
 
     async def start(self) -> None:
         """電源ON後の通信確認。成功で STANDBY、失敗で ERROR へ遷移。"""
+        _logger.info("接続中: アクセル軸 / ブレーキ軸 / CAN …")
         try:
             await asyncio.gather(
                 self._accel_driver.connect(),
@@ -648,8 +660,10 @@ class RobotController:
                         "ボタンサーボの接続に失敗しました（タイムスケジュール走行は利用不可）",
                         exc_info=True,
                     )
+            _logger.info("  [OK  ] 接続 (アクセル/ブレーキ/CAN)")
             self._transition(RobotState.STANDBY)
-        except Exception:
+        except Exception as exc:
+            _logger.error("  [NG  ] 接続失敗: %r", exc)
             self._transition(RobotState.ERROR)
             raise
 
@@ -700,48 +714,64 @@ class RobotController:
             self._transition(RobotState.STANDBY)
         self._transition(RobotState.INITIALIZING)
         self._init_steps = self._build_init_steps()
+        _logger.info("初期化を開始します（通信確認 → アラームリセット → サーボON → 原点復帰）")
         try:
             # 通信確認: 各軸・CAN の応答を確認しながらステップを進める。
+            _logger.info("サーボ通信チェック: Modbus 操作権 (ブレーキ) …")
             self._set_init_step("comm_brake", InitStepStatus.RUNNING)
             await self._brake_driver.enable_modbus_control()
             self._set_init_step("comm_brake", InitStepStatus.DONE)
+            _logger.info("  [OK  ] 通信確認 (ブレーキ)")
 
+            _logger.info("サーボ通信チェック: Modbus 操作権 (アクセル) …")
             self._set_init_step("comm_accel", InitStepStatus.RUNNING)
             await self._accel_driver.enable_modbus_control()
             self._set_init_step("comm_accel", InitStepStatus.DONE)
+            _logger.info("  [OK  ] 通信確認 (アクセル)")
 
+            _logger.info("CAN 通信チェック: 車速読み出し …")
             self._set_init_step("comm_can", InitStepStatus.RUNNING)
-            await self._can_reader.read_speed()
+            speed_kmh = await self._can_reader.read_speed()
             self._set_init_step("comm_can", InitStepStatus.DONE)
+            _logger.info("  [OK  ] 通信確認 (CAN)  … 車速=%.2fkm/h", speed_kmh)
 
             # アラームリセット（両軸同時）
+            _logger.info("エラー消去: アラームリセット (両軸同時) …")
             self._set_init_step("alarm_reset", InitStepStatus.RUNNING)
             await asyncio.gather(
                 self._accel_driver.reset_alarm(),
                 self._brake_driver.reset_alarm(),
             )
             self._set_init_step("alarm_reset", InitStepStatus.DONE)
+            _logger.info("  [OK  ] アラームリセット (両軸)")
 
             # サーボON（両軸同時）
+            _logger.info("サーボON (両軸同時) …")
             self._set_init_step("servo_on", InitStepStatus.RUNNING)
             await asyncio.gather(
                 self._accel_driver.servo_on(),
                 self._brake_driver.servo_on(),
             )
             self._set_init_step("servo_on", InitStepStatus.DONE)
+            _logger.info("  [OK  ] サーボON (両軸)")
 
             # 原点復帰（前回正常終了済みならスキップ）
             if not self._last_normal_shutdown:
+                _logger.info("原点復帰 (両軸) …")
                 self._set_init_step("home_return", InitStepStatus.RUNNING)
                 await self._home_both()
                 self._set_init_step("home_return", InitStepStatus.DONE)
+                _logger.info("  [OK  ] 原点復帰 (両軸)")
             else:
                 self._set_init_step("home_return", InitStepStatus.SKIPPED)
-        except Exception:
+                _logger.info("  [SKIP] 原点復帰（前回は正常終了済み）")
+        except Exception as exc:
+            _logger.error("  [NG  ] 初期化失敗: %r", exc)
             self._fail_running_init_steps()
             self._transition(RobotState.ERROR)
             raise
         self._transition(RobotState.READY)
+        _logger.info("初期化が完了しました")
 
     async def stop(self) -> None:
         """正常停止: 原点復帰 → サーボOFF → READY。RUNNING・PAUSED・MANUAL 状態でのみ呼べる。"""
@@ -862,6 +892,7 @@ class RobotController:
             self._signal_drive_complete(aborted=True)  # PID 自動適合の走行完了待ちを起こす
             self._learning_complete.set()  # 学習サイクルオーケストレータの完了待ちを起こす（同）
             return
+        _logger.error("非常停止: 両軸を原点復帰します")
         self._transition(RobotState.EMERGENCY)
         # home_return（実機 Modbus）が失敗してもセッションは必ず 'emergency' で閉じる。
         # try なしだと例外で _close_session に到達せず status='running' のまま残る。
@@ -910,11 +941,16 @@ class RobotController:
     async def run_calibration(self) -> CalibrationResult:
         """キャリブレーション実行。READY → CALIBRATING → READY。"""
         self._transition(RobotState.CALIBRATING)
+        _logger.info("キャリブレーションを開始します …")
         try:
             if self._calibration_manager is not None:
                 result = await self._calibration_manager.run_calibration(
                     profile_id=self._active_profile.id if self._active_profile else ""
                 )
+                if result.success:
+                    _logger.info("  [OK  ] キャリブレーション完了")
+                else:
+                    _logger.warning("  [NG  ] キャリブレーション失敗: %s", result.error_message)
                 self._apply_calibration_to_active_profile(result)
                 return result
             return CalibrationResult(
@@ -950,6 +986,9 @@ class RobotController:
             session_id = str(uuid4())
             self._log_writer = None
         self._active_session_id = session_id
+        _logger.info(
+            "走行開始: 種別=%s mode=%s セッション=%s", run_type, mode_id or "-", session_id[:8]
+        )
         return session_id
 
     async def _close_session(self, status: str) -> None:
@@ -957,6 +996,8 @@ class RobotController:
 
         status: 'completed' | 'error' | 'emergency'
         """
+        if self._active_session_id is not None:
+            _logger.info("走行終了: 状態=%s セッション=%s", status, self._active_session_id[:8])
         if self._log_writer is not None and self._active_session_id is not None:
             try:
                 await self._log_writer.end_session(self._active_session_id, status)
@@ -977,6 +1018,7 @@ class RobotController:
         try:
             if self._pre_check_runner is not None:
                 result = await self._pre_check_runner.run(include_button_servo=include_button_servo)
+                self._log_pre_check("走行前", result)
                 if not result.passed:
                     raise PreCheckFailed(result)
             self._transition(target)
@@ -1710,18 +1752,22 @@ class RobotController:
             #    両ペダルが原点付近にあること等をここで確認する。
             if runner is not None:
                 pre = await runner.run(exclude=frozenset({ITEM_VEHICLE_STOPPED}))
+                self._log_pre_check("踏込前", pre)
                 if not pre.passed:
                     raise PreCheckFailed(pre)
             # 2. ブレーキを停車保持開度まで踏む → 3. 車速が 0 に収束するまで待機
+            _logger.info("停車保持ブレーキを踏み込み、車速の収束を待ちます …")
             await self._apply_brake_hold(profile)
             await self._wait_for_vehicle_stopped()
             # 4. 踏込後チェック: アクチュエータ位置を除外（保持ブレーキで意図的に原点から離れる）。
             #    停止後に車速0・通信・サーボ等を判定する。
             if runner is not None:
                 post = await runner.run(exclude=frozenset({ITEM_ACTUATOR_POSITION}))
+                self._log_pre_check("踏込後", post)
                 if not post.passed:
                     raise PreCheckFailed(post)
-        except Exception:
+        except Exception as exc:
+            _logger.error("  [NG  ] 走行準備に失敗: %s", exc)
             # 踏んだブレーキを解放してから READY へ戻す（home_return 失敗は握りつぶす）
             try:
                 await self._home_both()

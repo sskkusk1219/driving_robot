@@ -1,5 +1,8 @@
 // ── Profiles screens ──────────────────────────────────────
 
+// 一覧の列幅（ヘッダと各行で同じ値。fr は minmax(0, …)、操作（4 ボタン）は固定 px）
+const PROFILE_LIST_COLS = ['minmax(0, 2fr)', 'minmax(0, 1.4fr)', 'minmax(0, 1fr)', 'minmax(0, 0.7fr)', 'minmax(0, 0.7fr)', '290px'];
+
 function ProfilesScreen() {
   const { useState, useEffect, useContext } = React;
   const { apiFetch, activeProfileId, setActiveProfileId, activeProfileName, setActiveProfileName, setNav } = useContext(window.AppContext);
@@ -156,7 +159,7 @@ function ProfilesScreen() {
       React.createElement('div', {
         style: {
           display: 'grid',
-          gridTemplateColumns: '2fr 1.4fr 1fr 1.4fr 0.7fr 0.7fr 2fr',
+          gridTemplateColumns: PROFILE_LIST_COLS.join(' '),
           borderBottom: `1px solid ${INK}`,
           padding: '10px 14px',
           background: PAPER_2,
@@ -173,7 +176,6 @@ function ProfilesScreen() {
           onClick: () => handleSortClick('max_speed'),
           style: { cursor: 'pointer', userSelect: 'none', fontFamily: 'inherit' },
         }, '最高車速' + sortIcon('max_speed')),
-        React.createElement('div', { style: { fontFamily: 'inherit' } }, 'Kp / Ki / Kd'),
         React.createElement('div', null, 'キャリブ'),
         React.createElement('div', null, 'モデル'),
         React.createElement('div', null, '操作'),
@@ -183,15 +185,12 @@ function ProfilesScreen() {
       sorted.length === 0
         ? React.createElement('div', { style: { padding: '20px 14px', color: INK_SOFT, fontSize: 14 } },
             profiles.length === 0
-              ? 'プロファイルがありません。「+ 新規プロファイル」で作成してください。'
+              ? 'プロファイルがありません。「＋ 新規作成」で作成してください。'
               : `「${search}」に一致するプロファイルがありません。`)
         : sorted.map((p, i) => {
             const isActive = p.id === activeProfileId;
             const hasCalib = p.calibration?.is_valid;
             const hasModel = !!p.model_path;
-            const kp = p.pid_gains?.kp ?? '—';
-            const ki = p.pid_gains?.ki ?? '—';
-            const kd = p.pid_gains?.kd ?? '—';
 
             return React.createElement(Row, {
               key: p.id,
@@ -232,18 +231,17 @@ function ProfilesScreen() {
                         style: { cursor: 'pointer', opacity: 0.5, fontSize: 13, userSelect: 'none' },
                       }, '✎'),
                     ),
-                  '2fr'],
-                [`${p.max_accel_opening} / ${p.max_brake_opening} %`, '1.4fr', 'mono'],
-                [`${p.max_speed} km/h`, '1fr', 'mono'],
-                [`${kp} / ${ki} / ${kd}`, '1.4fr', 'mono'],
+                  PROFILE_LIST_COLS[0]],
+                [`${p.max_accel_opening} / ${p.max_brake_opening} %`, PROFILE_LIST_COLS[1], 'mono'],
+                [`${p.max_speed} km/h`, PROFILE_LIST_COLS[2], 'mono'],
                 [hasCalib
                   ? React.createElement(Pill, { key: 'c', accent: 'READY' }, 'OK')
                   : React.createElement(Pill, { key: 'c' }, '未'),
-                  '0.7fr'],
+                  PROFILE_LIST_COLS[3]],
                 [hasModel
                   ? React.createElement(Pill, { key: 'm', accent: 'READY' }, 'あり')
                   : React.createElement(Pill, { key: 'm' }, 'なし'),
-                  '0.7fr'],
+                  PROFILE_LIST_COLS[4]],
                 [React.createElement(RowActions, {
                   key: 'b',
                   isActive,
@@ -251,7 +249,7 @@ function ProfilesScreen() {
                   onEdit:   () => { setEditTarget(p); setMode('edit'); },
                   onCopy:   () => handleCopy(p),
                   onDelete: () => handleDelete(p),
-                }), '2fr'],
+                }), PROFILE_LIST_COLS[5]],
               ],
               style: {
                 padding: '12px 14px',
@@ -377,7 +375,7 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
     },
 
       // ── Left column ──────────────────────────────────────
-      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', justifyContent: 'space-between', height: '100%', minHeight: 0 } },
+      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, height: '100%', minHeight: 0 } },
 
         // 基本情報
         React.createElement(Box, { label: '基本情報', style: { padding: 14 } },
@@ -402,43 +400,17 @@ function ProfileForm({ initial, onSave, onCancel, onDelete }) {
 
         // フィードフォワード（学習で自動更新／手動調整可）
         React.createElement(Box, { label: 'フィードフォワード', style: { padding: 14 } },
-          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
+          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
             inp('クリープ車速 [km/h]', 'creep_speed_kmh', { type: 'number', mono: true }),
             inp('クリープ加速率 [km/h/s]', 'creep_rate_kmhs', { type: 'number', mono: true }),
             inp('コースト減速量 [km/h/s]', 'engine_brake_decel_kmhs', { type: 'number', mono: true }),
             inp('停車時ブレーキ開度 [%]', 'stop_brake_opening_pct', { type: 'number', mono: true }),
-            inp('ブレーキ不感帯 [%]', 'brake_deadband_pct', { type: 'number', mono: true }),
-            inp('アクセル不感帯 [%]', 'accel_deadband_pct', { type: 'number', mono: true }),
           ),
         ),
       ),
 
       // ── Right column ─────────────────────────────────────
-      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', justifyContent: 'space-between', height: '100%', minHeight: 0 } },
-
-        // フィードバック（PIDゲイン）
-        React.createElement(Box, { label: 'フィードバック', style: { padding: 14 } },
-          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
-            inp('Kp', 'kp', { type: 'number', mono: true }),
-            inp('Ki', 'ki', { type: 'number', mono: true }),
-            inp('Kd', 'kd', { type: 'number', mono: true }),
-          ),
-        ),
-
-        // PID先読み（FBループのむだ時間補償。PID自動適合で自動算出／手動調整可。FFはnow-frame）
-        React.createElement(Box, { label: 'PID先読み', style: { padding: 14 } },
-          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-            inp('PID先読み補償 [s]', 'pid_preview_s', { type: 'number', mono: true }),
-            React.createElement('div', { style: { fontSize: 12, color: INK_SOFT, lineHeight: 1.4 } },
-              'PIDフィードバックのみ前倒しします（FFはnow-frame）。PID自動適合（学習サイクル）で自動算出されます。'
-            ),
-            React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, fontSize: 13 } },
-              React.createElement('div', null, 'K: ', React.createElement('b', null, initial?.dynamics_params?.fopdt_k ?? '—')),
-              React.createElement('div', null, 'τ [s]: ', React.createElement('b', null, initial?.dynamics_params?.fopdt_tau ?? '—')),
-              React.createElement('div', null, 'θ [s]: ', React.createElement('b', null, initial?.dynamics_params?.fopdt_theta ?? '—')),
-            ),
-          ),
-        ),
+      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, height: '100%', minHeight: 0 } },
 
         // キャリブレーション
         React.createElement(Box, { label: 'キャリブレーション', style: { padding: 14 } },

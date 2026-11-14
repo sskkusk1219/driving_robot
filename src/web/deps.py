@@ -14,6 +14,7 @@ from src.models.calibration import CalibrationData
 from src.models.drive_log import DriveLog, DriveSession, LearningCycle
 from src.models.driving_mode import DrivingMode
 from src.models.profile import VehicleProfile
+from src.models.sequence import Sequence
 from src.models.time_schedule import TimeSchedule
 
 
@@ -40,6 +41,14 @@ class ScheduleRepoProtocol(Protocol):
     async def create(self, schedule: TimeSchedule) -> TimeSchedule: ...
     async def update(self, schedule: TimeSchedule) -> TimeSchedule | None: ...
     async def delete(self, schedule_id: str) -> bool: ...
+
+
+class SequenceRepoProtocol(Protocol):
+    async def list_all(self) -> list[Sequence]: ...
+    async def get_by_id(self, sequence_id: str) -> Sequence | None: ...
+    async def create(self, sequence: Sequence) -> Sequence: ...
+    async def update(self, sequence: Sequence) -> Sequence | None: ...
+    async def delete(self, sequence_id: str) -> bool: ...
 
 
 class SessionRepoProtocol(Protocol):
@@ -108,6 +117,11 @@ def get_session_repo(request: Request) -> SessionRepoProtocol:
 
 def get_schedule_repo(request: Request) -> ScheduleRepoProtocol:
     repo: ScheduleRepoProtocol = request.app.state.schedule_repo
+    return repo
+
+
+def get_sequence_repo(request: Request) -> SequenceRepoProtocol:
+    repo: SequenceRepoProtocol = request.app.state.sequence_repo
     return repo
 
 

@@ -132,6 +132,10 @@ function CsvSpeedGraph({ rows, width = 600, height = 220 }) {
   );
 }
 
+// 一覧の列幅（ヘッダと各行で同じ値を使う。fr は minmax(0, …) にして中身の幅で列がずれないようにし、
+// プレビュー（MiniSpeedGraph 200px）と操作（4 ボタン）は固定 px にする）
+const MODE_LIST_COLS = ['minmax(0, 2fr)', 'minmax(0, 1.5fr)', '130px', '110px', '210px', '290px'];
+
 function ModesScreen() {
   const { useState, useEffect, useContext } = React;
   const { apiFetch, activeModeId, setActiveModeId, activeModeName, setActiveModeName, activeModeKind, setActiveModeKind } = useContext(window.AppContext);
@@ -333,7 +337,7 @@ function ModesScreen() {
       React.createElement('div', {
         style: {
           display: 'grid',
-          gridTemplateColumns: '2fr 1.5fr 1fr 1fr 2fr 2fr',
+          gridTemplateColumns: MODE_LIST_COLS.join(' '),
           borderBottom: `1px solid ${INK}`,
           padding: '10px 14px',
           background: PAPER_2,
@@ -355,7 +359,6 @@ function ModesScreen() {
             style: {
               cursor: key ? 'pointer' : 'default',
               userSelect: 'none',
-              fontFamily: (key === 'total_duration' || key === 'max_speed') ? 'monospace' : 'inherit',
             },
           }, label + (key ? sortIcon(key) : ''))
         ),
@@ -414,18 +417,18 @@ function ModesScreen() {
                         style: { cursor: 'pointer', opacity: 0.5, fontSize: 13, userSelect: 'none' },
                       }, '✎'),
                     ),
-                  '2fr'],
+                  MODE_LIST_COLS[0]],
                 // 説明
-                [m.description || React.createElement('span', { key: 'd', style: { color: INK_MUTE } }, '—'), '1.5fr'],
+                [m.description || React.createElement('span', { key: 'd', style: { color: INK_MUTE } }, '—'), MODE_LIST_COLS[1]],
                 // 長さ
-                [fmtDuration(m.total_duration), '1fr', 'mono'],
+                [fmtDuration(m.total_duration), MODE_LIST_COLS[2], 'mono'],
                 // 最高車速
-                [`${m.max_speed.toFixed(1)} km/h`, '1fr', 'mono'],
+                [`${m.max_speed.toFixed(1)} km/h`, MODE_LIST_COLS[3], 'mono'],
                 // プレビュー (実データグラフ、ロード中は Hatch)
                 [detailMap[m.id]
                   ? React.createElement(MiniSpeedGraph, { key: 'g', rows: detailMap[m.id] })
                   : React.createElement(Hatch, { key: 'g', width: 160, height: 44 }),
-                '2fr'],
+                MODE_LIST_COLS[4]],
                 // 操作
                 [React.createElement(RowActions, {
                   key: 'b',
@@ -434,7 +437,7 @@ function ModesScreen() {
                   onEdit:   () => { setEditTarget(m); setMode('edit'); },
                   onCopy:   () => handleCopy(m),
                   onDelete: () => handleDelete(m),
-                }), '2fr'],
+                }), MODE_LIST_COLS[5]],
               ],
               style: {
                 padding: '10px 14px',
@@ -561,10 +564,10 @@ function ModeEdit({ initial, referenceSpeed, onSave, onCancel, onDelete }) {
                 value: desc,
                 onChange: e => setDesc(e.target.value),
                 style: {
-                  width: '100%', padding: '7px 10px',
-                  border: `1.3px solid ${INK}`, borderRadius: 3,
-                  fontFamily: "'Patrick Hand', cursive",
-                  fontSize: 15, background: PAPER, color: INK,
+                  width: '100%', padding: '6px 10px',
+                  border: `1px solid ${window.HATCH}`, borderRadius: 4,
+                  fontFamily: "'Noto Sans JP', 'Meiryo UI', sans-serif",
+                  fontSize: 14, background: PAPER, color: INK,
                   minHeight: 60, resize: 'vertical', outline: 'none',
                   boxSizing: 'border-box',
                 },
@@ -817,10 +820,10 @@ function ModeCreate({ onSave, onCancel }) {
                 onChange: e => setDesc(e.target.value),
                 placeholder: '例: 国際標準 WLTP クラス3',
                 style: {
-                  width: '100%', padding: '7px 10px',
-                  border: `1.3px solid ${INK}`, borderRadius: 3,
-                  fontFamily: "'Patrick Hand', cursive",
-                  fontSize: 15, background: PAPER, color: INK,
+                  width: '100%', padding: '6px 10px',
+                  border: `1px solid ${window.HATCH}`, borderRadius: 4,
+                  fontFamily: "'Noto Sans JP', 'Meiryo UI', sans-serif",
+                  fontSize: 14, background: PAPER, color: INK,
                   minHeight: 60, resize: 'vertical', outline: 'none',
                   boxSizing: 'border-box',
                 },

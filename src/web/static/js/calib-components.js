@@ -199,16 +199,94 @@ function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullP
 
       {/* Current value */}
       <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2, pointerEvents: 'none' }}>
-        <div style={{ fontSize: 26, fontFamily: 'inherit', fontWeight: 700, lineHeight: 1 }}>{currentPos}</div>
+        <div style={{ fontSize: 26, fontFamily: 'inherit', fontWeight: 700, lineHeight: 1 }}>{currentPos ?? '—'}</div>
         <div style={{ fontSize: 10, color: INK_SOFT }}>pulse</div>
         <div style={{ fontSize: 10, color: INK_SOFT, marginTop: 4 }}>← ドラッグ →</div>
       </div>
 
       {/* Scale labels */}
-      <div style={{ position: 'absolute', top: 3, left: 5, fontSize: 9, color: INK_SOFT, pointerEvents: 'none' }}>0</div>
-      <div style={{ position: 'absolute', top: 3, right: 5, fontSize: 9, color: INK_SOFT, pointerEvents: 'none' }}>{maxPulse}</div>
+      <div style={{ position: 'absolute', top: 4, left: 6, fontSize: 12, color: INK_SOFT, pointerEvents: 'none' }}>0</div>
+      <div style={{ position: 'absolute', top: 4, right: 6, fontSize: 12, color: INK_SOFT, pointerEvents: 'none' }}>{maxPulse}</div>
     </div>
   );
 }
 
-Object.assign(window, { JogKey, PosRuler, OpeningBar, DragSlider });
+// ── useJogKeys ────────────────────────────────────────────
+// キャリブレーション・手動運転共通のキー操作。
+//   d / s = +10 / −10、e / w = +100 / −100、Tab = 軸切替、Enter = onEnter(axis)（任意）
+// 入力欄（input/textarea/select）と修飾キー付きは無視。応答待ちの間のキーリピートは捨てる。
+// enabled が false の間は何もしない。onJog(axisId, step) / onEnter(axisId) は Promise を返せる。
+function useJogKeys({ enabled, selectedAxis, setSelectedAxis, onJog, onEnter }) {
+  const { useEffect, useRef } = React;
+  const busyRef = useRef(false);
+  const latest = useRef({});
+  latest.current = { enabled, selectedAxis, onJog, onEnter };
+
+  useEffect(() => {
+    async function run(fn) {
+      if (busyRef.current) return;
+      busyRef.current = true;
+      try { await fn(); } finally { busyRef.current = false; }
+    }
+    function onKeyDown(e) {
+      const st = latest.current;
+      if (!st.enabled) return;
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const axis = st.selectedAxis;
+      const steps = { d: 10, s: -10, e: 100, w: -100 };
+      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if (k in steps) {
+        e.preventDefault();
+        run(() => st.onJog(axis, steps[k]));
+      } else if (k === 'Enter' && st.onEnter) {
+        e.preventDefault();
+        run(() => st.onEnter(axis));
+      } else if (k === 'Tab') {
+        e.preventDefault();
+        setSelectedAxis(a => (a === 'brake' ? 'accel' : 'brake'));
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+}
+
+// ── AxisPanel ─────────────────────────────────────────────
+// 軸パネルの外枠。クリックで軸を選び、選択中は橙の枠と「（キー操作中）」を表示する。
+// 共有 Box は onClick を受け取らないので外側の div の onMouseDown で拾う。
+function AxisPanel({ label, axisId, selected, enabled = true, onSelect, children }) {
+  const { Box } = window;
+  const on = selected && enabled;
+  return (
+    <div onMouseDown={() => onSelect && onSelect(axisId)} style={{ display: 'flex', flex: 1, minHeight: 0, minWidth: 0 }}>
+      <Box label={on ? `${label}（キー操作中）` : label} style={{
+        padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minHeight: 0,
+        ...(on ? { border: '2px solid #c8922a' } : {}),
+      }}>
+        {children}
+      </Box>
+    </div>
+  );
+}
+
+// ── JogRow ────────────────────────────────────────────────
+// −10/−100 ボタン + ドラッグスライダー + +10/+100 ボタン（ヒント文字 s/w/d/e つき）
+function JogRow({ axisId, currentPos, onJog, zeroPos, fullPos, disabled }) {
+  return (
+    <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
+        <JogKey label="−10"  hint="s" onClick={() => onJog(axisId, -10)} disabled={disabled} />
+        <JogKey label="−100" hint="w" onClick={() => onJog(axisId, -100)} disabled={disabled} />
+      </div>
+      <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} zeroPos={zeroPos} fullPos={fullPos} disabled={disabled} />
+      <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
+        <JogKey label="+10"  hint="d" onClick={() => onJog(axisId, 10)} disabled={disabled} />
+        <JogKey label="+100" hint="e" onClick={() => onJog(axisId, 100)} disabled={disabled} />
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { JogKey, PosRuler, OpeningBar, DragSlider, useJogKeys, AxisPanel, JogRow });
