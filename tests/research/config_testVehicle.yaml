@@ -1386,13 +1386,13 @@ checks:
   init_clear_errors: true      # アラームリセット＋残留確認
   init_servo_on: true          # サーボON（false だとアクチュエータが動かない）
   init_can: true               # CAN 通信チェック（車速読み出し）
-  init_ups: false              # UPS 通信チェック（NUT 監視開始＋残量 >= 20%）。false なら UPS を監視しない
+  init_ups: true               # UPS 通信チェック（NUT 監視開始＋残量 >= 20%）。false なら UPS を監視しない
   init_home_return: true       # 原点復帰＋位置確認（false だと開度 0% の基準が保証されない。危険）
   # 走行前チェック（踏込前・踏込後の両方に効く）
   pre_communication: true      # 通信確認
   pre_servo_state: true        # サーボ状態（アラーム）
   pre_profile: true            # プロファイル
-  pre_ups: false               # UPS残量（init_ups: false のときは true にできない）
+  pre_ups: true                # UPS残量（init_ups: false のときは true にできない）
   pre_actuator_position: true  # アクチュエータ位置（踏込前のみ）
   pre_brake_stop: true         # ブレーキを踏んで停止確認（false だと踏まずに現在位置で続行。危険）
   pre_vehicle_stopped: true    # 車速確認 0 km/h（踏込後のみ）
@@ -1420,10 +1420,10 @@ buttons:
   # シミュレータ（試験車両）側のキーは E/R/T/Y（スタート・P・N・D に対応）。
   servo_rest_angle_deg: 90.0   # 基準（待機）の角度 [deg]
   servo_map:
-    start: {channel: 0, offset_deg: -58.0}   # 32°（ユーザー調整 2026-11-15: 35° では IGN-OFF にならなかった）
-    P: {channel: 0, offset_deg: 90.0}        # 180°（ユーザー調整 2026-11-15）
-    N: {channel: 1, offset_deg: -87.0}       # 3°（ユーザー調整 2026-11-15）
-    D: {channel: 1, offset_deg: 85.0}        # 175°（ユーザー調整 2026-11-15）
+    start: {channel: 0, offset_deg: -45.0}   # 45°（ユーザー指定 2026-11-18。旧 32°）
+    P: {channel: 0, offset_deg: 55.0}        # 145°（ユーザー指定 2026-11-18。旧 180°）
+    N: {channel: 1, offset_deg: -60.0}       # 30°（ユーザー指定 2026-11-18。旧 3°）
+    D: {channel: 1, offset_deg: 60.0}        # 150°（ユーザー指定 2026-11-18。旧 175°）
 
 # ── 出力 ─────────────────────────────────────────────────────────────
 output:

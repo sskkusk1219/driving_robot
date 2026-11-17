@@ -519,10 +519,10 @@ def test_removed_deadband_and_standby_margin_keys(tmp_path: Path) -> None:
 
 
 def test_checks_section_loads_from_default_yaml() -> None:
-    """既定 YAML は開発時に UPS を使わないため checks.init_ups/pre_ups だけ false。"""
+    """既定 YAML は UPS を使う（2026-11-18 ユーザー指示で init_ups/pre_ups を true）。"""
     cfg = _load_default()
-    assert cfg.checks.init_ups is False
-    assert cfg.checks.pre_ups is False
+    assert cfg.checks.init_ups is True
+    assert cfg.checks.pre_ups is True
     assert cfg.checks.init_servo_comm is True
     assert cfg.checks.init_clear_errors is True
     assert cfg.checks.init_servo_on is True
@@ -539,7 +539,8 @@ def test_checks_section_loads_from_default_yaml() -> None:
 
 def test_pre_ups_true_requires_init_ups_true() -> None:
     cfg = _load_default()
-    cfg.checks.pre_ups = True  # init_ups は既定 YAML のまま false
+    cfg.checks.pre_ups = True
+    cfg.checks.init_ups = False
     assert any("checks.init_ups" in p for p in cfgmod.validate_config(cfg))
     cfg.checks.init_ups = True
     assert not any("checks.init_ups" in p for p in cfgmod.validate_config(cfg))
@@ -1973,10 +1974,10 @@ def test_buttons_section_defaults_and_validation(tmp_path: Path) -> None:
     assert bt.d_press_at_s == 3.0
     assert bt.servo_rest_angle_deg == 90.0
     assert bt.servo_map == {
-        "start": {"channel": 0, "offset_deg": -58.0},
-        "P": {"channel": 0, "offset_deg": 90.0},
-        "N": {"channel": 1, "offset_deg": -87.0},
-        "D": {"channel": 1, "offset_deg": 85.0},
+        "start": {"channel": 0, "offset_deg": -45.0},
+        "P": {"channel": 0, "offset_deg": 55.0},
+        "N": {"channel": 1, "offset_deg": -60.0},
+        "D": {"channel": 1, "offset_deg": 60.0},
     }
     assert cfgmod.ButtonsSection() == bt  # yaml の値は dataclass の既定と同じ
     assert not [p for p in cfgmod.validate_config(cfg) if "buttons." in p]
@@ -2008,7 +2009,7 @@ def test_buttons_servo_map_validation() -> None:
     assert problems_after(lambda b: b.servo_map["N"].update(channel=-1))
     assert problems_after(lambda b: b.servo_map["N"].update(offset_deg=0.0))
     assert problems_after(lambda b: b.servo_map["N"].update(offset_deg=95.0))  # 90+95 > 180
-    assert problems_after(lambda b: b.servo_map["P"].update(offset_deg=-58.0))  # start と重複
+    assert problems_after(lambda b: b.servo_map["P"].update(offset_deg=-45.0))  # start と重複
     assert problems_after(lambda b: setattr(b, "servo_rest_angle_deg", 181.0))
 
 

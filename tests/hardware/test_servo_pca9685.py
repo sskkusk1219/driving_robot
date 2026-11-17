@@ -38,7 +38,7 @@ adafruit ライブラリは使わず、既存の smbus2 で PCA9685 レジスタ
     p       : 押下デモ（待機角 ↔ 押下角 を1往復）
     o       : OE=HIGH（PCA9685の全出力をハードウェア的に無効化。非常停止相当）
     i       : OE=LOW（出力を有効化。o で無効化した後の復帰）
-    q       : 終了（サーボを0°に戻し、出力オフ）
+    q       : 終了（サーボを待機角 90° に戻し、出力オフ）
 
 実行方法:
     .venv/bin/python tests/hardware/test_servo_pca9685.py         # ch0 を使用
@@ -68,8 +68,9 @@ _ANGLE_MIN = 0.0
 _ANGLE_MAX = 180.0
 
 # --- デモ用ポジション（本番の待機/押下相当） ---
-_REST_ANGLE = 0.0  # 待機角
-_PRESS_ANGLE = 90.0  # 押下角
+# 待機角は src の ButtonServoDriver(rest_angle=90.0) と合わせる
+_REST_ANGLE = 90.0  # 待機角（起動時・終了時もこの角度）
+_PRESS_ANGLE = 180.0  # 押下角
 _PRESS_HOLD_S = 0.6  # 押下保持時間
 
 _JOG_LARGE = 5.0  # e/w キー
@@ -260,11 +261,11 @@ def main() -> int:
         pca.close()
         return 1
 
-    angle = 0.0
+    angle = _REST_ANGLE
     oe_enabled = True
     try:
         pca.set_angle(channel, angle)
-        print("接続 OK。サーボを 0° に移動しました。")
+        print(f"接続 OK。サーボを待機角 {_REST_ANGLE:.0f}° に移動しました。")
         print(
             "操作: Enter=+45°  e/w=±5°  d/s=±1°  0/5/9=0/90/180°  "
             "p=押下デモ  o=OE無効化  i=OE有効化  q=終了"
@@ -314,16 +315,19 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        oe.enable()  # OEを有効に戻してからサーボを0°へ
+        oe.enable()  # OEを有効に戻してからサーボを待機角へ
         try:
-            pca.set_angle(channel, 0.0)
+            pca.set_angle(channel, _REST_ANGLE)
             time.sleep(_MOVE_SETTLE_S)
         except OSError:
             pass
         pca.all_off()
         pca.close()
         oe.close()
-        print("\nサーボを 0° に戻し、出力をオフ・OEを有効に戻して終了しました。")
+        print(
+            f"\nサーボを待機角 {_REST_ANGLE:.0f}° に戻し、"
+            "出力をオフ・OEを有効に戻して終了しました。"
+        )
     return 0
 
 

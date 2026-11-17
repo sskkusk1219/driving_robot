@@ -735,10 +735,10 @@ class ButtonsSection:
     servo_rest_angle_deg: float = 90.0  # 基準（待機）の角度 [deg]
     servo_map: dict[str, dict[str, Any]] = field(
         default_factory=lambda: {
-            "start": {"channel": 0, "offset_deg": -58.0},
-            "P": {"channel": 0, "offset_deg": 90.0},
-            "N": {"channel": 1, "offset_deg": -87.0},
-            "D": {"channel": 1, "offset_deg": 85.0},
+            "start": {"channel": 0, "offset_deg": -45.0},
+            "P": {"channel": 0, "offset_deg": 55.0},
+            "N": {"channel": 1, "offset_deg": -60.0},
+            "D": {"channel": 1, "offset_deg": 60.0},
         }
     )
 
