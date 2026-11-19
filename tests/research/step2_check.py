@@ -6,7 +6,7 @@ import math
 import statistics
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,8 @@ from tests.research.research_types import DrivingMode
 STATUS_OK = "OK"
 STATUS_NG = "NG"
 STATUS_SKIP = "SKIP"
+# 段10-1: NG だが「止める」項目ではないもの（モデルは使う。チェック表に注意として残す）
+STATUS_WARN = "WARN"
 
 # B1 の乱数の外れ: 乱数ごとの学習データでの MAE が「残りの乱数の中央値 × この倍率」を超えたら外れ。
 # 段2o-7 仮値。135724 の乱数ごとの値で見直す
@@ -94,7 +96,9 @@ THRESHOLDS: dict[str, float | None] = {
 
 
 class Step2CheckError(Exception):
-    """手順2 の学習結果のチェックで NG があった（yaml は書き換えていない）。"""
+    """手順2 の学習結果のチェックで「止める」NG があった（C2・D1 の NaN・B1。yaml は
+    書き換えていない、または書いた分を戻した）。それ以外の NG は注意（STATUS_WARN）で、
+    モデルは使う。"""
 
     def __init__(self, items: Sequence[CheckItem]) -> None:
         self.items = list(items)
@@ -157,9 +161,51 @@ def ng_items(items: Sequence[CheckItem]) -> list[CheckItem]:
     return [i for i in items if i.status == STATUS_NG]
 
 
+def warn_items(items: Sequence[CheckItem]) -> list[CheckItem]:
+    return [i for i in items if i.status == STATUS_WARN]
+
+
+def is_blocking(item: CheckItem) -> bool:
+    """NG のうち、モデルを使わず止める項目か（段10 ユーザー決定 2026-11-16）。
+
+    止める: C2（書いた yaml の model_path の pkl を読めない・合わない）・D1 の NaN
+    （手順3 の開度の列が壊れている）・B1（学習データでの外れ。乱数を替えた学習し直しの後も外れる）。
+    それ以外（B3・B4・B5・B6・C1・D1 の範囲外・穴埋め・先置き超過・すき間・H1）は注意。
+    """
+    if item.status != STATUS_NG:
+        return False
+    if item.id in ("C2", "B1"):
+        return True
+    if item.id == "D1":
+        n = item.metrics.get("nan_count", 0.0)
+        return (not math.isfinite(n)) or n > THRESHOLDS["D1.nan_count"]  # type: ignore[operator]
+    return False
+
+
+def classify_checks(items: Sequence[CheckItem]) -> list[CheckItem]:
+    """止めない NG を STATUS_WARN にした一覧を返す（止める NG はそのまま NG。何度かけても同じ）。"""
+    out: list[CheckItem] = []
+    for i in items:
+        if i.status == STATUS_NG and not is_blocking(i):
+            i = replace(i, status=STATUS_WARN)
+        out.append(i)
+    return out
+
+
+def format_warn(items: Sequence[CheckItem]) -> str:
+    """注意（STATUS_WARN）の項目と理由を 1 項目 1 行にする（無ければ空文字）。"""
+    w = warn_items(items)
+    if not w:
+        return ""
+    lines = [f"注意 {len(w)} 項目（モデルは使います。チェック表に残しました）:"]
+    for i in w:
+        lines.append(f"  {i.id} {i.name}: {i.value}（比べた相手: {i.reference}）{i.reason}")
+    return "\n".join(lines)
+
+
 def format_ng(items: Sequence[CheckItem]) -> str:
-    """NG の項目と理由を 1 項目 1 行にする。"""
-    lines = ["手順2 の学習結果のチェックで NG:"]
+    """止める NG の項目と理由を 1 項目 1 行にする。"""
+    lines = ["手順2 の学習結果のチェックで NG（モデルを使わない）:"]
     for i in ng_items(items):
         lines.append(f"  {i.id} {i.name}: {i.value}（比べた相手: {i.reference}）{i.reason}")
     return "\n".join(lines)
@@ -816,7 +862,9 @@ def run_checks_for_paths(
             table_c7 = load_forward_map(Path(c7_path))
         except Exception:  # noqa: BLE001 - C7 が読めなくても C8 の判定は続ける
             table_c7 = None
-    return run_checks(cfg=cfg, csv_path=csv_path, table_c8=table_c8, table_c7=table_c7, **kwargs)
+    return classify_checks(
+        run_checks(cfg=cfg, csv_path=csv_path, table_c8=table_c8, table_c7=table_c7, **kwargs)
+    )
 
 
 def check_fel_coverage(coverage: Any | None) -> CheckItem:
@@ -896,7 +944,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"CSV: {args.csv.name}　C8: {args.model.name}"
           f"{'　C7: ' + args.table.name if args.table else ''}　yaml: {args.config.name}")
     print(format_checks(items))
-    return 1 if ng_items(items) else 0
+    return 1 if ng_items(items) else 0  # 注意（WARN）だけなら 0
 
 
 if __name__ == "__main__":

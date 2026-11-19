@@ -8,13 +8,12 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
 from src.models.driving_mode import DrivingMode, SpeedPoint
-from src.web.deps import ModeRepoProtocol, PlanRepoProtocol, get_mode_repo, get_plan_repo
+from src.web.deps import ModeRepoProtocol, get_mode_repo
 from src.web.schemas import ModeDetailResponse, ModeResponse, ModeUpdateRequest, SpeedPointSchema
 
 router = APIRouter(prefix="/api/v1/modes", tags=["modes"])
 
 ModeRepo = Annotated[ModeRepoProtocol, Depends(get_mode_repo)]
-PlanRepo = Annotated[PlanRepoProtocol, Depends(get_plan_repo)]
 
 
 def _reject_if_system(mode: DrivingMode) -> None:
@@ -177,14 +176,11 @@ async def replace_mode(
     mode_id: str,
     repo: ModeRepo,
     file: UploadFile,
-    plan_repo: PlanRepo,
     name: Annotated[str, Form()] = "",
     description: Annotated[str, Form()] = "",
 ) -> ModeResponse:
     """基準車速 CSV を再アップロードして走行モードを差し替える。
 
-    基準軌跡が変わると学習済みの保存プラン（別の走行軌跡から学習）は無効になるため、
-    このモードの保存プランを全プロファイルぶんリセットする。
     """
     try:
         existing = await repo.get_by_id(mode_id)
@@ -216,7 +212,6 @@ async def replace_mode(
     updated = await repo.update(merged)
     if updated is None:
         raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
-    await plan_repo.reset_for_mode(mode_id)  # 軌跡変更で保存プランは無効
     return _to_response(updated)
 
 

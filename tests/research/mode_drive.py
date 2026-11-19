@@ -36,8 +36,10 @@ from __future__ import annotations
 import asyncio
 import bisect
 import contextlib
+import io
 import json
 import math
+import signal
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -768,10 +770,12 @@ def launch_band_for(
     info = meta.get("hold_pi")
     points = hold_opening_points(meta)
     if not info or points is None:
-        raise ConfigError(
-            "forward_map.launch_brake_band には pkl の meta の hold_pi と hold_opening が要ります"
-            f"（{ff_cfg.model_path}）"
+        # 段10-1 C: 前の pkl にも無いときは帯を使わずに走る（設定は変えない・ConfigError にしない）
+        say(
+            "警告: 発進のブレーキの帯は使いません（pkl の meta に hold_pi・hold_opening が"
+            f"ありません。{ff_cfg.model_path}）"
         )
+        return None
     try:
         plant_k, plant_t = float(info["K_kmh_per_pct"]), float(info["T_s"])
         lam_s, pi_lag_s = float(info["lambda_s"]), float(info["L_s"])
@@ -886,10 +890,12 @@ def make_hold_scene(
     meta = ff.table.meta
     info = meta.get("hold_pi")
     if not info:
-        raise ConfigError(
-            "forward_map.hold_pi_enabled が true ですが、pkl の meta に hold_pi がありません"
-            f"（fwd_tool attach-hold-pi で付ける。{cfg.feedforward.model_path}）"
+        # 段10-1 C: 手順2 が前の pkl からも引き継げなかったときは、保持の場面を使わずに走る
+        say(
+            "警告: 保持の場面の PI・発進のブレーキの帯は使いません（pkl の meta に hold_pi が"
+            f"ありません。{cfg.feedforward.model_path}）"
         )
+        return None
     lag = fm.brake_lag_s if fm.brake_lag_s is not None else meta.get("brake_lag_s")
     if lag is None or not float(lag) > 0.0:
         raise ConfigError(
@@ -969,16 +975,18 @@ def make_hold_scene(
     launch_bands: list[HoldInterval] = []
     if fm.launch_brake_band:
         band = launch_band_for(cfg, mode, ff.table)
-        assert band is not None
-        launch_bands = band[1]
-        if plant_c is None:  # 上り（hold_lead_in）が off のときも帯の FF に c が要る
-            plant_c = float(info["K_kmh_per_pct"]) / float(info["T_s"])
-        total_b = sum(iv.length_s for iv in launch_bands)
-        text += (f"\n    発進のブレーキの帯（2026-10-31 案 B）: {len(launch_bands)} 区間"
-                 f"（合計 {total_b:g} s）・hold_scene ＝ 3")
-        for iv in launch_bands:
-            text += (f"\n    帯 開始 {iv.start_s:.2f}s・長さ {iv.length_s:.2f}s・"
-                     f"基準の平均 {iv.mean_kmh:.2f} km/h")
+        if band is None:  # 段10-1 C: meta が無いので帯を使わない（警告は launch_band_for が出した）
+            text += "\n    発進のブレーキの帯: 使わない（pkl の meta に hold_opening なし）"
+        else:
+            launch_bands = band[1]
+            if plant_c is None:  # 上り（hold_lead_in）が off のときも帯の FF に c が要る
+                plant_c = float(info["K_kmh_per_pct"]) / float(info["T_s"])
+            total_b = sum(iv.length_s for iv in launch_bands)
+            text += (f"\n    発進のブレーキの帯（2026-10-31 案 B）: {len(launch_bands)} 区間"
+                     f"（合計 {total_b:g} s）・hold_scene ＝ 3")
+            for iv in launch_bands:
+                text += (f"\n    帯 開始 {iv.start_s:.2f}s・長さ {iv.length_s:.2f}s・"
+                         f"基準の平均 {iv.mean_kmh:.2f} km/h")
     # 2026-10-30 段14: λ＋L（1.09 s）では加速度の効き Kp×Tp×c ≒ 1.0 で、測りの遅れ
     # （窓の半分＋ブレーキの遅れ）に対して強すぎ、UDDS `133341` で 1.5 s 周期・
     # 合成 +0.3% `132812` で 2 s 周期の行き来が出た。Tp は加速度を測ってから効くまでの
@@ -2204,6 +2212,11 @@ class ModeDriveResult:
     samples: list[DriveSample] = field(default_factory=list)  # MODE_DRIVE の行（0.1s 刻み）
     # 手順 24: D の用意が間に合わずモードの時刻を止めていた秒数（段5c。止めなければ 0）
     button_hold_s: float = 0.0
+    # 段11: 一時停止していた秒数の合計・回数・周期数（受信しなければ 0）。その間の行は section が
+    # MODE_DRIVE_PAUSE（paused 列 1）で、KPI・レポートの対象から外れる
+    paused_s: float = 0.0
+    pause_count: int = 0
+    pause_cycles: int = 0
 
 
 def cut_deeper_brake_fb(ff_effort: float, fb_effort: float) -> float:
@@ -2279,6 +2292,48 @@ def compute_hold_at_s(mode: DrivingMode, h0_s: float, interval_s: float) -> floa
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 一時停止（2026-11-16 段11。SIGUSR1 で一時停止・SIGUSR2 で再開）
+# ─────────────────────────────────────────────────────────────────────
+
+PAUSE_SECTION_SUFFIX = "_PAUSE"  # 一時停止中の行の section は元の section ＋ これ（KPI から外れる）
+PAUSE_PLAN_S = 6.0  # 保つ車速の定速モードの長さ [s]（作る時間は長さに比例。超えても最後の値のまま）
+PAUSE_T0_S = 2.0  # 定速モードの中で使い始める時刻 [s]（窓・計画の先頭の端を避ける）
+
+
+def pause_hold_speed(speed_kmh: float) -> float:
+    """一時停止で保つ車速 [km/h]。押された時点の実車速。停車速度以下なら 0（停車保持）。"""
+    return speed_kmh if speed_kmh > VEHICLE_STOP_SPEED_KMH else 0.0
+
+
+def make_pause_mode(v_kmh: float, duration_s: float = PAUSE_PLAN_S) -> DrivingMode:
+    """一時停止の間の基準: 車速 v_kmh の定速（v が 0 なら停車）の DrivingMode。"""
+    from datetime import datetime  # noqa: PLC0415
+
+    return DrivingMode(
+        id="pause_hold", name="pause_hold", description="一時停止（押された時点の車速を保つ）",
+        reference_speed=[SpeedPoint(0.0, v_kmh), SpeedPoint(duration_s, v_kmh)],
+        total_duration=duration_s, max_speed=v_kmh, created_at=datetime.now(), is_system=True,
+    )
+
+
+def default_pause_setup(cfg: ResearchConfig, v_kmh: float) -> ModeDriveSetup:
+    """一時停止用の走行の準備: 定速モードで FF 候補を作り直す（開度の列は定速保持の開度になる）。
+
+    表示（say）は大量なので捨てる。走行中の本体と同じ設定・同じ表を使うので、FB（C10・DOB）や
+    安全網は本体と同じ部品がそのまま働く。
+    """
+    with contextlib.redirect_stdout(io.StringIO()):
+        return prepare_mode_drive_from(cfg, make_pause_mode(v_kmh))
+
+
+# 本体と一時停止用の _ModeRun が周期ごとに受け渡す状態（ペダルの指令・実開度・安全網の途中経過）
+_PAUSE_SHARED_ATTRS = (
+    "_prev_now", "_last_accel_actual", "_last_brake_actual", "_accel_cmd", "_brake_cmd",
+    "_accel_blocked", "_brake_blocked", "_deviation_since", "governor_cycles", "cycles",
+)
+
+
 class NoSpeedWatch:
     """基準車速が出てから一定時間、実車速が出なければ中止を知らせる（手順 24: D に入れたか）。
 
@@ -2316,6 +2371,19 @@ class NoSpeedWatch:
 class _ModeRun:
     """1 本のモード走行の状態。run() が 50ms 周期でモード終わりまで回す。"""
 
+    # 2026-11-16 段11 一時停止の既定（__init__ を通らない最小の _ModeRun でも読めるように）
+    _pause_req = False
+    _resume_req = False
+    _paused = False
+    _pause_t: float | None = None  # 一時停止したときのモードの時刻（止めている間はこの値）
+    _pause_run: _ModeRun | None = None  # 一時停止の間の制御（定速モードの _ModeRun）
+    _pause_log_t: float | None = None  # 一時停止用の _ModeRun だけ: ログに書くモードの時刻
+    _pause_real0 = 0.0
+    pause_setup_factory: Callable[[float], ModeDriveSetup] | None = None
+    pause_total_s = 0.0  # 一時停止していた秒数の合計
+    pause_count = 0
+    pause_cycles = 0
+    pause_build_s = 0.0  # 一時停止用の制御を作るのにかかった秒数（直近）
     # C13（段2u）の今の周期の値の既定。C13 以外・予測器が無効のときは動かさない（None のまま）
     _speed_est: float | None = None
     _pred_dev: float | None = None
@@ -2391,9 +2459,11 @@ class _ModeRun:
         section: str = SECTION_MODE_DRIVE,
         no_speed_abort: tuple[float, float] | None = None,
         button_plan: ModeButtonPlan | None = None,
+        pause_setup_factory: Callable[[float], ModeDriveSetup] | None = None,
     ) -> None:
         self.hw = hw
         self.cfg = cfg
+        self.pause_setup_factory = pause_setup_factory
         self.section = section  # CSV の section 列（FEL の学習用パターンは別の名前）
         self.ff = setup.ff
         self.mode = setup.mode
@@ -2718,21 +2788,146 @@ class _ModeRun:
 
     async def run(self) -> float:
         """モード終わり（または duration_s）まで回し、走った秒数を返す。異常は DriveError。"""
-        if self.button_plan is not None:
+        installed = self._install_pause_signals()
+        try:
+            if self.button_plan is not None:
+                try:
+                    return await self._run_loop()
+                finally:
+                    await self._cancel_button_tasks()
+            return await self._run_loop()
+        finally:
+            for sig in installed:
+                with contextlib.suppress(Exception):
+                    asyncio.get_running_loop().remove_signal_handler(sig)
+
+    # ── 一時停止（段11） ──
+
+    def request_pause(self) -> None:
+        """一時停止を求める（SIGUSR1 のハンドラ。次の周期の頭で受け付ける）。"""
+        self._pause_req, self._resume_req = True, False
+
+    def request_resume(self) -> None:
+        """再開を求める（SIGUSR2 のハンドラ）。一時停止中でなければ無視する。"""
+        self._resume_req, self._pause_req = True, False
+
+    def _install_pause_signals(self) -> list[int]:
+        loop = asyncio.get_running_loop()
+        installed: list[int] = []
+        for sig, handler in (
+            (signal.SIGUSR1, self.request_pause), (signal.SIGUSR2, self.request_resume),
+        ):
             try:
-                return await self._run_loop()
-            finally:
-                await self._cancel_button_tasks()
-        return await self._run_loop()
+                loop.add_signal_handler(sig, handler)
+                installed.append(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass  # 主スレッド以外などでは入れない（一時停止なしで走る）
+        return installed
+
+    def _pause_allowed(self) -> bool:
+        """手順 24 は D を押し終えるまで一時停止を受け付けない（停車保持のまま D を待つ間）。"""
+        return self.button_plan is None or self._d_finished_at is not None
+
+    def _build_pause_run(self, v_hold: float) -> _ModeRun:
+        """一時停止用の _ModeRun を作る（定速モード・本体と同じ設定。表示は捨てる）。"""
+        factory = self.pause_setup_factory or (lambda v: default_pause_setup(self.cfg, v))
+        setup = factory(v_hold)
+        with contextlib.redirect_stdout(io.StringIO()):
+            sub = _ModeRun(
+                self.hw, self.cfg, setup, self.log, PAUSE_PLAN_S,
+                section=self.section + PAUSE_SECTION_SUFFIX,
+            )
+        # 本体と同じ部品・同じ記録先を使う（片足ルール・実開度の安全網・ガバナー・調停を引き継ぐ）
+        sub.arbiter = self.arbiter
+        sub.governor = self.governor
+        sub.safety = self.safety
+        sub.interlock = self.interlock
+        sub.samples = self.samples
+        sub.cycle_ms = self.cycle_ms
+        sub._no_speed = None  # noqa: SLF001
+        sub._next_print = math.inf  # noqa: SLF001 - 状態の表示は本体の say だけ
+        return sub
+
+    def _pause_share(self, src: _ModeRun, dst: _ModeRun) -> None:
+        for name in _PAUSE_SHARED_ATTRS:
+            setattr(dst, name, getattr(src, name))
+
+    async def _pause_begin(self, t: float) -> None:
+        """一時停止が押された周期: モードの時刻 t をその場で止め、保つ車速の制御に替える。
+
+        2026-11-16 実機 1 回目の直し: 別スレッドで作る間に本体のモードが進んで、減速する基準に
+        車が追従してしまった（実機は作るのに 2.7 秒・GIL の取り合い）。今は押された周期の中で
+        作る（定速 6 秒のモードで 0.02〜0.35 秒・本体のループが数周期遅れるだけ。ペダルの指令は
+        その間そのまま）。時刻 t は押された周期で止まるので、再開はここ（基準 ≒ 保つ車速）から続く。
+        """
+        try:
+            speed = await self.hw.can.read_speed()
+        except Exception as exc:
+            raise DriveError(f"CAN 車速を読めません（{type(exc).__name__}: {exc}）") from exc
+        v_hold = pause_hold_speed(speed)
+        built_at = time.perf_counter()
+        try:
+            sub = self._build_pause_run(v_hold)
+        except Exception as exc:
+            raise DriveError(f"一時停止の制御を作れません（{type(exc).__name__}: {exc}）") from exc
+        self.pause_build_s = time.perf_counter() - built_at
+        sub._pause_log_t = t  # noqa: SLF001
+        sub._segment = self.cfg.modes.segment_at(t)  # noqa: SLF001
+        self._pause_run = sub
+        self._paused = True
+        self._pause_t = t
+        self._pause_real0 = asyncio.get_running_loop().time()
+        self.pause_count += 1
+        say(
+            f"  [一時停止] 受け付けました。モードの時刻 {t:.2f}s で止めます"
+            f"（車速 {speed:.2f} km/h・"
+            f"基準 {self.ref.at(t):.2f} km/h）。保つ車速 {v_hold:.2f} km/h"
+            + ("（停車保持）" if v_hold == 0.0 else "")
+            + f"・制御を作るのに {self.pause_build_s:.2f} 秒"
+        )
+
+    async def _pause_cycle(self, now: float) -> None:
+        """一時停止中の 1 周期。定速モードの _ModeRun._cycle を回す（モードの時刻は止めたまま）。"""
+        sub = self._pause_run
+        assert sub is not None
+        # 定速モードの外（長い一時停止）は、開度の列も基準も最後の値のまま（定速なので同じ値）
+        tau = PAUSE_T0_S + (asyncio.get_running_loop().time() - self._pause_real0)
+        self._pause_share(self, sub)
+        await sub._cycle(tau, now)  # noqa: SLF001
+        self._pause_share(sub, self)
+        self.pause_cycles += 1
+
+    async def _pause_exit(self) -> float:
+        """再開する: 一時停止用の制御を畳んで、止めたときのモードの時刻を返す。"""
+        assert self._pause_t is not None
+        t_p = self._pause_t
+        try:
+            speed = await self.hw.can.read_speed()
+        except Exception as exc:
+            raise DriveError(f"CAN 車速を読めません（{type(exc).__name__}: {exc}）") from exc
+        held_s = asyncio.get_running_loop().time() - self._pause_real0
+        self._paused = False
+        self._pause_run = None
+        self._pause_t = None
+        say(
+            f"  [一時停止を解除] モードの時刻 {t_p:.2f}s から再開します"
+            f"（{held_s:.1f} 秒止めました・車速 {speed:.2f} km/h・"
+            f"基準 {self.ref.at(t_p):.2f} km/h）"
+        )
+        return t_p
 
     async def _run_loop(self) -> float:
         loop = asyncio.get_running_loop()
         started = loop.time()
         next_tick = started
         hold_total = 0.0  # 手順 24: モードの時刻を止めていた秒数（button_plan なしは常に 0）
+        pause_total = 0.0  # 一時停止でモードの時刻を止めていた秒数（受信なしは常に 0）
         while True:
             now = loop.time()
-            t = now - started - hold_total
+            t = now - started - hold_total - pause_total
+            if self._paused:
+                assert self._pause_t is not None
+                t = self._pause_t  # 一時停止中はモードの時刻を止める
             holding = False
             if self.button_plan is not None:
                 prev_hold_t = self._hold_t
@@ -2740,15 +2935,34 @@ class _ModeRun:
                 held_t = self._hold_t if holding else prev_hold_t
                 if held_t is not None:
                     # 止めている間（と再開する周期）は、モードの時刻を止めた時刻に固定する
-                    hold_total = now - started - held_t
+                    hold_total = now - started - pause_total - held_t
                     self.button_hold_s = hold_total
                     t = held_t
             if t >= self.duration_s:
                 return t
             if not holding:
-                # モードの時刻の連続のため、止めていた分を now からも引いて渡す
-                await self._cycle(t, loop.time() - hold_total)
-                self.cycles += 1
+                if self._pause_req:
+                    self._pause_req = False
+                    if self._paused:
+                        pass  # 一時停止中の二重の要求は無視
+                    elif self._pause_allowed():
+                        await self._pause_begin(t)
+                    else:
+                        say("  [一時停止] D を押し終えるまでは受け付けません（無視しました）")
+                elif self._resume_req:
+                    self._resume_req = False
+                    if self._paused:
+                        t = await self._pause_exit()
+                        pause_total = loop.time() - started - hold_total - t
+                        self.pause_total_s = pause_total
+                if self._paused:
+                    await self._pause_cycle(loop.time() - hold_total)
+                    self.cycles += 1
+                else:
+                    # モードの時刻の連続のため、止めていた分を now からも引いて渡す
+                    # （一時停止の分は引かない: 調停・ガバナーの時刻は途切れさせない）
+                    await self._cycle(t, loop.time() - hold_total)
+                    self.cycles += 1
             next_tick += self.interval_s
             now = loop.time()
             if now - next_tick > self.interval_s:
@@ -3428,7 +3642,9 @@ class _ModeRun:
 
         deviation = speed - ref
         self.max_abs_dev = max(self.max_abs_dev, abs(deviation))
-        segment = cfg.modes.segment_at(t)
+        # 一時停止中（_pause_log_t あり）は、ログのモードの時刻・区間は止めた時刻のもの
+        t_log = t if self._pause_log_t is None else self._pause_log_t
+        segment = cfg.modes.segment_at(t_log)
         if self.cycles % cfg.control.log_every_n_cycles == 0:
             data = DriveLogData(
                 ref_speed_kmh=ref,
@@ -3447,7 +3663,8 @@ class _ModeRun:
             self.samples.append(
                 self.log.record(
                     data, section=self.section, phase=phase, pattern=segment,
-                    mode_time_s=t, governor_active=governed,
+                    mode_time_s=t_log, governor_active=governed,
+                    paused=int(self._pause_log_t is not None),
                     alarm_accel=alarm_accel, alarm_brake=alarm_brake,
                     accel_ff_pct=accel_ff, brake_ff_pct=brake_ff,
                     monitor_accel=monitor_accel, monitor_brake=monitor_brake, cycle_ms=cycle_ms,
@@ -4751,6 +4968,7 @@ async def run_mode_drive(
     section: str = SECTION_MODE_DRIVE,
     no_speed_abort: tuple[float, float] | None = None,
     button_plan: ModeButtonPlan | None = None,
+    pause_setup_factory: Callable[[float], ModeDriveSetup] | None = None,
 ) -> ModeDriveResult:
     """停車保持の状態からモードを走り、停車保持で終える。
 
@@ -4778,7 +4996,7 @@ async def run_mode_drive(
 
     run = _ModeRun(
         hw, cfg, setup, log, duration, section=section, no_speed_abort=no_speed_abort,
-        button_plan=button_plan,
+        button_plan=button_plan, pause_setup_factory=pause_setup_factory,
     )
     await log.stop_sampler()  # 50ms の制御ループと Modbus を取り合わない（記録はループから）
     log.mark(section, "")
@@ -4819,7 +5037,13 @@ async def run_mode_drive(
         stop_end_stats=None if run.stop_end is None else run.stop_end.stats,
         samples=run.samples,
         button_hold_s=run.button_hold_s,
+        paused_s=run.pause_total_s,
+        pause_count=run.pause_count,
+        pause_cycles=run.pause_cycles,
     )
+    if run.pause_count:
+        say(f"  一時停止 {run.pause_count} 回・計 {run.pause_total_s:.1f} 秒"
+            f"（{run.pause_cycles} 周期。KPI・レポートから除外）")
     say(f"モード走行 {'完了' if result.completed else '中断'}: {run_s:.1f}s・{run.cycles} 周期"
         f"（1 周期以上の遅れ {run.overruns} 回・減速G ガバナー作動 {run.governor_cycles} 周期）"
         f"・最大 |偏差| {run.max_abs_dev:.2f} km/h")

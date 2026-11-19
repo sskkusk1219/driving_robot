@@ -138,6 +138,7 @@ from tests.research.pedal_gain import apply_pedal_gains, estimate_gain_curve
 from tests.research.pedal_lag import PedalLagResult
 from tests.research.pedal_search import (
     PedalSearchResult,
+    apply_crossings,
     hold_breakaway_pct,
     hold_opening_meta,
 )
@@ -2041,6 +2042,26 @@ def _replace_seeds(seeds: Sequence[int], outliers: Sequence[int]) -> tuple[int, 
 _FORWARD_CANDIDATES = ("C7", "C8", "C10", "C11", "C12", "C13", "C14", "C15")
 
 
+def _previous_hold_meta(
+    cfg: ResearchConfig, new_path: str | Path
+) -> tuple[dict[str, Any], str] | None:
+    """前の pkl（この手順2 の前の yaml の feedforward.model_path）の meta から hold_pi と
+    hold_opening を取り出す（段10-1 C）。両方そろっていなければ None。新しい pkl と同じ・読めない
+    ・meta に無いときも None。戻り値は ({"hold_pi": ..., "hold_opening": ...}, 前の pkl の名前)。"""
+    from tests.research.fwd_map import load_forward_map  # noqa: PLC0415
+
+    prev = Path(cfg.feedforward.model_path)
+    if not cfg.feedforward.model_path or prev == Path(new_path) or not prev.exists():
+        return None
+    try:
+        meta = load_forward_map(prev).meta
+    except Exception:  # noqa: BLE001 - 壊れた pkl は引き継がない
+        return None
+    if not meta.get("hold_pi") or not meta.get("hold_opening"):
+        return None
+    return {"hold_pi": meta["hold_pi"], "hold_opening": meta["hold_opening"]}, prev.name
+
+
 def attach_hold_data(
     cfg: ResearchConfig, model_path: str | Path, csv_path: Path, pedal: PedalSearchResult | None
 ) -> Any | None:
@@ -2049,12 +2070,16 @@ def attach_hold_data(
     同じパスへ保存する（2026-10-30。fwd_tool attach-hold-pi --phase LOW_HOLD と手順13 の
     hold_opening と同じ求め方）。
 
+    段10-1 A: 点ごとの「保てた」は、帯に合計 5 s いた、または加速度の符号が変わる瞬間が 2 回以上
+    （pedal_search.apply_crossings）。瞬間で保てた点は車速・開度を瞬間の平均にする。
+    段10-1 C: 保てた点が無い・PI を求められないときは、前の pkl（yaml の今の model_path）の
+    hold_pi・hold_opening を引き継ぐ。前が無ければ付けない（発進のブレーキの帯は使わない扱い。
+    mode_drive.launch_band_for）。LOW_HOLD の行は学習に使わない。
+
     4 点の保持が無効（pedal_search.hold_points_enabled が false）・pedal が無い（作り直しだけ）
     なら何もせず None。結果はチェック項目 H1（step2_check.CheckItem）で返す:
-    付けられたら OK。点が無い・1 点も保てなかった・PI を求められないときは、日本語の理由を出し、
-    forward_map.hold_pi_enabled が true なら NG（手順2 の学習結果のチェックエラー）、false なら
-    SKIP（お知らせ。付けられた分だけは pkl に残す）。LOW_HOLD の行は学習に使わない
-    （学習データの読みは section/phase で絞るので入らない）。
+    PI も開度も 4 点から付けられたら OK。そうでなければ（引き継いだ・付けられず）、
+    forward_map.hold_pi_enabled が true なら注意（STATUS_WARN。モデルは使う）、false なら SKIP。
     """
     from tests.research import hold_pi, step2_check  # noqa: PLC0415
     from tests.research.fwd_map import load_forward_map, save_table  # noqa: PLC0415
@@ -2063,11 +2088,21 @@ def attach_hold_data(
         return None
     name = "hold_attach"
     needed = cfg.forward_map.hold_pi_enabled
-    bad = step2_check.STATUS_NG if needed else step2_check.STATUS_SKIP
+    bad = step2_check.STATUS_WARN if needed else step2_check.STATUS_SKIP
     table = load_forward_map(Path(model_path))
     problems: list[str] = []
     done: list[str] = []
-    points = pedal.hold_points
+    points = list(pedal.hold_points)
+    if points:
+        lag = table.meta.get("brake_lag_s")
+        if lag is not None and math.isfinite(float(lag)):
+            points, note = apply_crossings(points, csv_path, float(lag))
+            say(f"4 点の保持: {note}")
+        else:
+            say("4 点の保持: 瞬間の判定は使えません（brake_lag_s が pkl の meta に無い）")
+    table.meta.pop("hold_pi", None)  # 前の求め直しの値を引きずらない
+    table.meta.pop("hold_opening", None)
+    got_pi = False
     if not points:
         problems.append("4 点の保持の点がありません（クリープ車速が低すぎる）")
     elif not any(p.held for p in points):
@@ -2077,13 +2112,14 @@ def attach_hold_data(
             res = hold_pi.attach_hold_pi_low_hold(
                 table.meta, csv_path, deviation_c=cfg.forward_map.deviation_c
             )
+            got_pi = True
             done.append(
                 f"hold_pi（Kp {res['kp_pct_per_kmh']:.4f}・Ki {res['ki_pct_per_kmh_s']:.4f}・"
                 f"使った点 {res['steps_used']}/{res['steps_total']}）"
             )
         except hold_pi.HoldPiError as exc:
             problems.append(f"保持用 PI を求められません: {exc}")
-    if points:
+    if got_pi:
         try:
             min_pct = cfg.vehicle.min_brake_opening_pct
             table.meta["hold_opening"] = hold_opening_meta(
@@ -2093,19 +2129,37 @@ def attach_hold_data(
             )
             done.append(f"hold_opening（{len(points)} 点）")
         except KeyError:
+            got_pi = False
+            table.meta.pop("hold_pi", None)
+            done.clear()
             problems.append(
                 "pkl の meta に launch_breakaway_u_pct がありません（保持の開度を作れません）"
             )
+    inherited = ""
+    if not got_pi:
+        prev = _previous_hold_meta(cfg, model_path)
+        if prev is not None:
+            table.meta.update(prev[0])
+            inherited = prev[1]
+            done = [f"hold_pi・hold_opening（前の pkl {inherited} から引き継ぎ）"]
+            say(f"4 点の保持: 前の pkl {inherited} の hold_pi・hold_opening を引き継ぎました")
+        else:
+            say("4 点の保持: 前の pkl に引き継げる hold_pi・hold_opening が無いので付けません"
+                "（発進のブレーキの帯は使わない扱いで進みます）")
     if done:
         save_table(table, Path(model_path))
         say(f"4 点の保持から付けて保存: {model_path}（{'・'.join(done)}）")
+    elif not got_pi:
+        save_table(table, Path(model_path))  # 前の値を外した meta を保存（付けない）
     if problems:
         for msg in problems:
             say(f"4 点の保持の自動付与: {msg}")
         if not needed:
-            say("forward_map.hold_pi_enabled が false なので、NG にはしません（お知らせ）")
+            say("forward_map.hold_pi_enabled が false なので、注意にはしません（お知らせ）")
+        value = f"前の pkl {inherited} から引き継ぎ" if inherited else "付けられず"
+        extra = "" if inherited else "（発進のブレーキの帯は使わない扱い）"
         return step2_check.CheckItem(
-            "H1", name, bad, "付けられず", str(csv_path.name), "・".join(problems)
+            "H1", name, bad, value, str(csv_path.name), "・".join(problems) + extra
         )
     return step2_check.CheckItem(
         "H1", name, step2_check.STATUS_OK, "・".join(done), str(csv_path.name), ""
@@ -2161,9 +2215,12 @@ def build_ff_model(
         順番は「モデル作成 → チェック（C2 以外）→ OK なら yaml 書き込み → C2（yaml を読み直す）」。
         `ramp_results`（G ランプの結果。B5① 用）・`pedal`（C1 用）・`wltp_mode`（D1・B3 用）を
         チェックの材料にする。無い材料の項目は SKIP。表は yaml を書く前に表示する。
-        NG があれば、**yaml を書き換えず**（pkl は残す）`Step2CheckError` を出す。スタブ
-        （hw_mode != real）は表示するだけで止めない。C8 で NG が B1 の乱数の外れだけなら、
-        外れた乱数を別の乱数に替えて 1 回だけ学習し直して再チェックする。
+        段10-1: 止める NG（C2・D1 の NaN・B1。step2_check.is_blocking）があれば、**yaml を
+        書き換えず**（pkl は残す）`Step2CheckError` を出す。それ以外の NG は「注意」（WARN）に
+        してチェック表に残し、モデルは使う（yaml を書く）。C2 は yaml を書いた後に確かめ、NG なら
+        書く前の yaml に戻して `Step2CheckError`。スタブ（hw_mode != real）は表示するだけで
+        止めない。B1 が乱数の外れだけで止める NG なら、外れた乱数を別の乱数に替えて 1 回だけ
+        学習し直して再チェックする。
     """
     require_forward_candidate(cfg)  # 2026-10-08 段2l-6: C1〜C5 は対象外（読み込みの前に止める）
     logs = read_drive_logs(csv_path)
@@ -2305,7 +2362,12 @@ def build_ff_model(
         checks = run_checks_now()
     if hold_item is not None:
         checks.append(hold_item)
+    # 段10-1: 止める NG（C2・D1 の NaN・B1）以外は「注意」にして、モデルは使う
+    checks = step2_check.classify_checks(checks)
     say(step2_check.format_checks(checks))
+    warn_text = step2_check.format_warn(checks)
+    if warn_text:
+        say(warn_text)
     ng = step2_check.ng_items(checks)
     model_path, metrics = built.model_path, built.metrics
     if ng and not real:
@@ -2325,6 +2387,7 @@ def build_ff_model(
             research_params=research_after, checks=checks,
         )
 
+    yaml_before = cfg.source_path.read_text(encoding="utf-8")  # C2 が NG のとき戻す
     updates: dict[str, Any] = {"feedforward.model_path": model_path, **built.updates}
     for key in FF_PARAM_KEYS:
         if key in MEASURED_KEYS:
@@ -2340,6 +2403,9 @@ def build_ff_model(
     checks = [c2 if c.id == "C2" else c for c in checks]
     say(f"C2 {c2.name}: {c2.status}（{c2.value} ← 保存した pkl {model_path}。{c2.reason}）")
     if c2.status == step2_check.STATUS_NG:
+        cfg.source_path.write_text(yaml_before, encoding="utf-8")  # 書いた分を戻す
+        say(f"C2 が NG のため yaml を書く前の内容に戻しました（前のモデルのまま）。"
+            f"作った pkl は残してあります: {model_path}")
         raise step2_check.Step2CheckError([c2])
     return ModelBuildResult(
         model_path=model_path, metrics=metrics, params=after, changed=changed,

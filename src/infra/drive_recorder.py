@@ -1,0 +1,126 @@
+# ruff: noqa: E501
+"""ジョブ（ランナーのサブプロセス）の記録を DB へ書く。JobManager が使う唯一の DB 口。
+
+- ``drive_sessions``: ジョブの開始で作り（vehicle_id・run_type・mode_id）、終了で status を更新する
+- ``drive_session_messages``: ランナーの標準出力の「進行のメッセージ」
+- ``drive_logs``: ランナーが保存した CSV を取り込む（9 列＋残りは detail JSONB。対応は drive_csv.py）
+
+DB が無い環境（DATABASE_URL 未設定）では ``NullDriveRecorder``（何も書かない）を使う。
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Protocol
+
+import asyncpg
+
+from src.infra import drive_csv
+
+logger = logging.getLogger(__name__)
+
+#: CSV 取り込みで 1 回に書く行数（メモリと往復回数の釣り合い）
+IMPORT_CHUNK_ROWS = 5000
+
+#: 進行のメッセージ 1 行（seq・経過秒・時刻・level・本文）
+MessageRow = tuple[int, float, datetime, str, str]
+
+
+class DriveRecorder(Protocol):
+    async def start_session(
+        self, *, vehicle_id: str, mode_id: str | None, run_type: str
+    ) -> str | None: ...
+
+    async def add_messages(self, session_id: str, rows: Sequence[MessageRow]) -> None: ...
+
+    async def import_csv(self, session_id: str, path: Path) -> int: ...
+
+    async def end_session(self, session_id: str, status: str) -> None: ...
+
+
+class NullDriveRecorder:
+    """DB が無いときの記録先。セッションを作らない（None）ので、他の操作は呼ばれない。"""
+
+    async def start_session(
+        self,
+        *,
+        vehicle_id: str,  # noqa: ARG002
+        mode_id: str | None,  # noqa: ARG002
+        run_type: str,  # noqa: ARG002
+    ) -> str | None:
+        return None
+
+    async def add_messages(self, session_id: str, rows: Sequence[MessageRow]) -> None:
+        return None
+
+    async def import_csv(self, session_id: str, path: Path) -> int:
+        return 0
+
+    async def end_session(self, session_id: str, status: str) -> None:
+        return None
+
+
+class PgDriveRecorder:
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def start_session(
+        self, *, vehicle_id: str, mode_id: str | None, run_type: str
+    ) -> str | None:
+        session_id = str(uuid.uuid4())
+        await self._pool.execute(
+            """
+            INSERT INTO drive_sessions (id, profile_id, mode_id, run_type, started_at, status, vehicle_id)
+            VALUES ($1, NULL, $2, $3, NOW(), 'running', $4)
+            """,
+            uuid.UUID(session_id),
+            uuid.UUID(mode_id) if mode_id else None,
+            run_type,
+            vehicle_id,
+        )
+        return session_id
+
+    async def add_messages(self, session_id: str, rows: Sequence[MessageRow]) -> None:
+        if not rows:
+            return
+        sid = uuid.UUID(session_id)
+        await self._pool.executemany(
+            """
+            INSERT INTO drive_session_messages (session_id, seq, elapsed_s, time, level, message)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            [(sid, seq, elapsed, when, level, text) for seq, elapsed, when, level, text in rows],
+        )
+
+    async def import_csv(self, session_id: str, path: Path) -> int:
+        """CSV を drive_logs へ入れ、入れた行数を返す。1 本のトランザクション（途中で失敗したら 0 行）。"""
+        total = 0
+        async with self._pool.acquire() as conn, conn.transaction():
+            chunk: list[tuple[Any, ...]] = []
+            for row in drive_csv.csv_to_db_rows(session_id, drive_csv.read_csv_rows(path)):
+                chunk.append((uuid.UUID(session_id), *row[1:]))
+                if len(chunk) >= IMPORT_CHUNK_ROWS:
+                    await self._copy(conn, chunk)
+                    total += len(chunk)
+                    chunk = []
+            if chunk:
+                await self._copy(conn, chunk)
+                total += len(chunk)
+        return total
+
+    @staticmethod
+    async def _copy(conn: asyncpg.Connection, rows: list[tuple[Any, ...]]) -> None:
+        await conn.copy_records_to_table(
+            "drive_logs", records=rows, columns=list(drive_csv.DB_COLUMNS)
+        )
+
+    async def end_session(self, session_id: str, status: str) -> None:
+        await self._pool.execute(
+            "UPDATE drive_sessions SET ended_at = NOW(), status = $2 WHERE id = $1",
+            uuid.UUID(session_id),
+            status,
+        )

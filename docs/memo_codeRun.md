@@ -15,11 +15,13 @@ ssh raspi5_16gb@raspi5-16gb.local
   git commit -m "..."
   git push origin <name>
 
-## 非常停止スイッチの原点復帰確認
-.venv/bin/python tests/hardware/test_emergency_stop_home_return.py
-## 過電流の原点復帰確認
-.venv/bin/python tests/hardware/test_overcurrent_home_return.py
-## キャリブレーションの確認
+## 非常停止スイッチ・過電流の原点復帰確認（2026-11-15 変更）
+旧 `tests/hardware/test_emergency_stop_home_return.py`・`test_overcurrent_home_return.py`（古い src のアクチュエータを使うもの）は削除した。
+- GPIO の押下だけの確認: `.venv/bin/python tests/hardware/test_emergency_stop.py`
+- 原点復帰まで: WebUI（実機起動）でモード走行を始め、走行中に画面の非常停止かスイッチを押す。JobManager がランナーへ SIGINT
+  → 終了処理（原点復帰 → サーボOFF → 切断）。40 秒で終わらなければ SIGKILL。進行のメッセージ（ログ画面）に「終了処理: 完了」が出る
+- 過電流: 走行中に core が検知して `DriveError`（終了コード 5・ペダルを離す → 終了処理）
+## キャリブレーションの確認（`tests/research` 用の測り方。WebUI のキャリブレーション画面でも同じ min を測れる）
 .venv/bin/python tests/hardware/test_calibration.py
   操作方法:
   - e: +1.0mm（前進）
@@ -30,12 +32,44 @@ ssh raspi5_16gb@raspi5-16gb.local
   - q: 中止
   - アクセル → ブレーキの順に測る（アクセルだけなら `--accel-only`）
   - 表示された `min_accel_opening_pct`・`max_accel_opening_pct`・`min_brake_opening_pct`・`max_brake_opening_pct` を
-    `tests/research/config_testVehicle.yaml` の `vehicle` 節に書き写す（min は待機位置と効く開度 u の原点。段2l-6）
+    `tests/research/config_testVehicle.yaml` の `vehicle` 節に書き写す
+    （src の WebUI では「キャリブレーション」画面でジョグ → 保存すると `vehicles/<車ID>/vehicle.yaml` に書かれる）（min は待機位置と効く開度 u の原点。段2l-6）
   - min を測り直しても pkl は使い続けられる（表は u＝開度−min で持ち、走行時に yaml の min ＋ u へ戻す。停車保持は yaml の `stop_brake_offset_pct`＝min からの量。段2l-7）。動きの比率が変わる付け直しをしたときだけ手順2 をやり直す
   - 取り付け直した後の手順（手順2 を飛ばす。比率が変わらない前提）:
       1. `.venv/bin/python tests/hardware/test_calibration.py` で 4 値を測る
       2. 4 値を `tests/research/config_testVehicle.yaml` の `vehicle` 節へ書き写す
       3. `.venv/bin/python -m tests.research.main --steps 1,3 --hw real; echo "exit=$?"`
+
+## src のランナー（WebUI が起動するものと同じ。2026-11-15 段7）
+  実機は JobManager が `--hw real` で起動する（環境変数 `DRIVING_ROBOT_USE_REAL_HW=1`）。手で動かすときは次のとおり。
+  詳細は `src/robot/README.md`。
+
+  cd /home/raspi5_16gb/projects/driving_robot
+
+  ## スタブでモード走行（手順 24: Ready・D・終わりに N。手順 3 は動かさない）
+  `.venv/bin/python -m src.robot.run --vehicle test_vehicle --steps 1,24 --mode 03_WLTP_Low --hw stub --limit-s 60; echo "exit=$?"`
+  ## 学習（手順 2）/ 部分学習（12 FEL・13 保持・14 停止）
+  `.venv/bin/python -m src.robot.run --vehicle test_vehicle --steps 1,2 --hw stub`
+  ## タイムスケジュール（DB の名前か ID。JSON なら --schedule-file）
+  `DATABASE_URL=postgresql://localhost/driving_robot .venv/bin/python -m src.robot.run --vehicle test_vehicle --schedule "Maintenance_Mode" --hw stub`
+  ## 手動運転・min 測定（標準入力へ JSON 1 行ずつ）
+  `.venv/bin/python -m src.robot.run --vehicle test_vehicle --interactive`
+  ## 中断の確認（スタブ。SIGINT → 終了処理までの秒数）
+  `.venv/bin/python scripts/check_runner_interrupt.py --steps 1,24`
+
+  ## 車両フォルダ（git 管理外）
+  `vehicles/<車ID>/vehicle.yaml`（諸元・min/max・ボタン・学習の値）と `models/`（pkl）。共通設定は `config/robot_common.yaml`（ユーザーには見せない）。
+  最初の 1 台（試験車）は tests の設定から変換して作った:
+  `.venv/bin/python scripts/import_research_vehicle.py [--common-only] [--force]`（tests 側は読むだけ）
+
+## tests/research を直したあとの取り込み直し（`src/robot/core` は tests の写し。手で直さない）
+  1. `.venv/bin/python scripts/port_research.py --check`（写さず差だけ確認。差があれば 1）
+  2. `.venv/bin/python scripts/port_research.py`（写す）。`--report` で `"tests/"` を含む文字列を確認
+  3. 等価確認① 設定: `.venv/bin/python scripts/check_config_equivalence.py`
+  4. 等価確認② 走行: tests と src を同じ条件のスタブで走らせ（tests は `-m tests.research.main --steps 1,24 --limit-s 60 --hw stub`、
+     src は上のランナー）、出た CSV を
+     `.venv/bin/python scripts/check_runner_equivalence.py --tests A.csv B.csv --src C.csv`
+  5. `.venv/bin/python -m pytest -q tests/unit`（`patches.py` が差し替える名前が core に残っているかも見る）
 
 ## CANの受信確認
 sudo .venv/bin/python scripts/check_can.py
@@ -81,7 +115,7 @@ python /home/raspi5_16gb/projects/driving_robot/scripts/check_can_2.py
 
   cd /home/raspi5_16gb/projects/driving_robot
 
-  ## ハードあり本番環境
+  ## ハードあり本番環境（WebUI が制御ループをランナー（別プロセス）として起動する。Web 自体は HW を握らない）
   DRIVING_ROBOT_USE_REAL_HW=1 \
   DATABASE_URL=postgresql://localhost/driving_robot \
     .venv/bin/uvicorn src.web.app:app --host 0.0.0.0 --port 8080
@@ -112,7 +146,11 @@ python /home/raspi5_16gb/projects/driving_robot/scripts/check_can_2.py
   ────────────────────────────────────────
   変数: DATABASE_URL
   値: postgresql://localhost/driving_robot
-  省略時の挙動: in-memory DB で起動。再起動するとプロファイルなどは消える
+  省略時の挙動: in-memory DB で起動。再起動するとモード・スケジュール・セッションなどは消える
+  ────────────────────────────────────────
+  変数: DRIVING_ROBOT_VEHICLES_DIR / DRIVING_ROBOT_COMMON_CONFIG
+  値: 車両フォルダの親（既定 vehicles/）／共通 yaml（既定 config/robot_common.yaml）
+  省略時の挙動: 既定の場所を使う（検証では複製した車両フォルダを指す）
 
   ---
   確認: スタブモードで動作確認（ハード不要）
@@ -124,7 +162,7 @@ python /home/raspi5_16gb/projects/driving_robot/scripts/check_can_2.py
   ## HW なし・DB なし（最小構成）
   .venv/bin/uvicorn src.web.app:app --host 0.0.0.0 --port 8080
 
-  ## HW なし・DB あり（プロファイルを保存したい場合）
+  ## HW なし・DB あり（モード・スケジュール・走行ログを保存したい場合）
   DATABASE_URL=postgresql://localhost/driving_robot \
     .venv/bin/uvicorn src.web.app:app --host 0.0.0.0 --port 8080
 

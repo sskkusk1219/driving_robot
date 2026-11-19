@@ -24,17 +24,20 @@ def _pedal_points_to_json(points: list[PedalPoint]) -> str:
     )
 
 
+def _button_event_to_dict(e: ButtonEvent) -> dict[str, object]:
+    """JSONB の 1 イベント。button・channel（旧データ）・press_duration_s はあるものだけ書く。"""
+    d: dict[str, object] = {"time_s": e.time_s}
+    if e.button is not None:
+        d["button"] = e.button
+    if e.channel is not None:
+        d["channel"] = e.channel
+    if e.press_duration_s is not None:
+        d["press_duration_s"] = e.press_duration_s
+    return d
+
+
 def _button_events_to_json(events: list[ButtonEvent]) -> str:
-    return json.dumps(
-        [
-            {
-                "time_s": e.time_s,
-                "channel": e.channel,
-                "press_duration_s": e.press_duration_s,
-            }
-            for e in events
-        ]
-    )
+    return json.dumps([_button_event_to_dict(e) for e in events])
 
 
 def _row_to_schedule(row: asyncpg.Record) -> TimeSchedule:
@@ -55,8 +58,9 @@ def _row_to_schedule(row: asyncpg.Record) -> TimeSchedule:
         button_events=[
             ButtonEvent(
                 time_s=e["time_s"],
-                channel=e["channel"],
-                press_duration_s=e["press_duration_s"],
+                channel=e.get("channel"),
+                press_duration_s=e.get("press_duration_s"),
+                button=e.get("button"),
             )
             for e in button_raw
         ],

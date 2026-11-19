@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from src.app.stubs import InMemoryScheduleRepository
+from src.app.inmemory_repos import InMemoryScheduleRepository
 from src.infra.db import DuplicateNameError
 from src.infra.schedule_repository import (
     _button_events_to_json,

@@ -31,7 +31,8 @@ function showToast(msg, type = 'info') {
   el.className = `toast${type === 'error' ? ' error' : type === 'success' ? ' success' : ''}`;
   el.textContent = msg;
   container.appendChild(el);
-  setTimeout(() => el.remove(), 3500);
+  // エラーは「何が起きたか・次にすること」を読む時間を長めに取る
+  setTimeout(() => el.remove(), type === 'error' ? 9000 : 3500);
 }
 window.showToast = showToast;
 
@@ -51,7 +52,9 @@ async function apiFetch(method, path, body = null, isFormData = false) {
     if (res.status === 204) return {};
     const json = await res.json().catch(() => ({}));
     if (!res.ok) {
-      showToast(`エラー ${res.status}: ${json.detail ?? res.statusText}`, 'error');
+      // 409/422/423/503 などは「何が起きたか」と「次にすること」の 2 行にする（job-utils.js）
+      const e = window.describeApiError(res.status, json.detail, res.statusText);
+      showToast(e.next ? `${e.what}\n次にすること: ${e.next}` : e.what, 'error');
       return null;
     }
     return json;
@@ -66,7 +69,8 @@ window.apiFetch = apiFetch;
 function App() {
   const { useState, useEffect, useRef, useCallback } = React;
 
-  const [nav, setNav] = useState(() => lsGet('drv_nav', 'init'));
+  // ホーム画面は廃止（保存されていた 'home' は初期化へ）。既定の画面は初期化
+  const [nav, setNav] = useState(() => { const v = lsGet('drv_nav', 'init'); return v === 'home' ? 'init' : v; });
   const [robotState, setRobotState] = useState('BOOTING');
   const [activeProfileId, setActiveProfileId] = useState(() => lsGet('drv_profile_id', null));
   const [activeProfileName, setActiveProfileName] = useState(() => lsGet('drv_profile_name', null));
@@ -76,6 +80,7 @@ function App() {
   // 自動運転ページでどちらの開始/停止APIを叩くかを切り替えるために使う。
   const [activeModeKind, setActiveModeKind] = useState(() => lsGet('drv_mode_kind', 'mode'));
   const [upsLoss, setUpsLoss] = useState(false);
+  const [upsInstalled, setUpsInstalled] = useState(true); // devices.ups（false なら右上に UPS 表示を出さない）
   const [navLock, setNavLock] = useState(false);
   const [realtimeData, setRealtimeData] = useState(INIT_REALTIME);
   const realtimeBuf = useRef([]);
@@ -99,6 +104,21 @@ function App() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}/ws/realtime`);
     wsRef.current = ws;
+
+    // 読み直し（F5）・つなぎ直しでバッファが空のとき、サーバーが覚えている最近の値で埋める（過去の軌跡が消えないように）
+    ws.onopen = async () => {
+      if (realtimeBuf.current.length > 0) return;
+      try {
+        const res = await fetch('/api/v1/drive/history');
+        if (!res.ok) return;
+        const h = await res.json();
+        const now = Date.now();
+        const past = (h.samples ?? []).map(p => ({ ...p, ts: now - p.age_ms }));
+        if (past.length > 0 && realtimeBuf.current.length < past.length) {
+          realtimeBuf.current = past.concat(realtimeBuf.current.filter(d => d.ts > past[past.length - 1].ts));
+        }
+      } catch (e) { /* 取れなければ今からの値だけで描く */ }
+    };
 
     ws.onmessage = ev => {
       let d;
@@ -135,6 +155,7 @@ function App() {
     apiFetch('GET', '/api/v1/drive/status').then(async d => {
       if (!d) return;
       setRobotState(d.robot_state);
+      setUpsInstalled(d.devices?.ups !== false);
       const serverProfileId = d.active_profile_id ?? null;
       if (serverProfileId) {
         setActiveProfileId(serverProfileId);
@@ -158,7 +179,29 @@ function App() {
     };
   }, [connectWS]);
 
+  // 選んでいる走行モード・スケジュール・シーケンスがサーバーにまだ有るか確かめる（段 D）。
+  // 選択はブラウザの localStorage だけにあり、別のブラウザで消されることがある。
+  // トーストを出さないよう素の fetch を使う。無ければ選択を外し、名前が変わっていれば直す
+  const recheckSelection = useCallback(async () => {
+    const id = lsGet('drv_mode_id', null);
+    if (!id) return;
+    const kind = lsGet('drv_mode_kind', 'mode');
+    const base = kind === 'schedule' ? 'schedules' : kind === 'sequence' ? 'sequences' : 'modes';
+    try {
+      const res = await fetch(`/api/v1/${base}/${encodeURIComponent(id)}`);
+      if (res.status === 404 || res.status === 400 || res.status === 422) {
+        setActiveModeId(null);
+        setActiveModeName(null);
+      } else if (res.ok) {
+        const d = await res.json();
+        if (d?.name && d.name !== lsGet('drv_mode_name', null)) setActiveModeName(d.name);
+      }
+    } catch (e) { /* 通信できないときは判断しない */ }
+  }, []);
+  useEffect(() => { recheckSelection(); }, [recheckSelection]);
+
   const ctx = {
+    recheckSelection,
     nav, setNav,
     robotState,
     activeProfileId, setActiveProfileId,
@@ -176,8 +219,28 @@ function App() {
 
   // ── Determine which screen to render ─────────────────────
   function renderScreen() {
+    // 非常停止中・エラー中でも、「ログを確認」ではログ画面を見られる（解除・復旧はしない）。上に戻る帯を出す
+    const logsOverlay = nav === 'logs' && (robotState === 'EMERGENCY' || systemScreen === 'error');
+    if (logsOverlay) {
+      const isEmg = robotState === 'EMERGENCY' && systemScreen !== 'error';
+      return React.createElement(
+        React.Fragment, null,
+        React.createElement('div', {
+          style: {
+            display: 'flex', alignItems: 'center', gap: 12, padding: '6px 12px', marginBottom: 6,
+            border: '1.5px solid #943030', background: '#2a1212', borderRadius: 4, flexShrink: 0,
+          },
+        },
+          React.createElement('span', { style: { color: '#e05050', fontWeight: 700, fontSize: 14 } },
+            isEmg ? '非常停止中です（解除していません）' : 'エラー状態です（復旧していません）'),
+          React.createElement('div', { style: { flex: 1 } }),
+          React.createElement(window.Btn, { onClick: () => setNav('init') },
+            isEmg ? '非常停止の画面へ戻る' : 'エラーの画面へ戻る')),
+        React.createElement(window.LogsScreen));
+    }
+
     // System-level overrides
-    if (systemScreen === 'ac_loss') return React.createElement(window.AcPowerLossScreen);
+    if (systemScreen === 'ac_loss') return React.createElement(window.EmergencyResetScreen); // AC 断も非常停止の画面にまとめた（きっかけは 1 行で出す）
     if (systemScreen === 'booting') return React.createElement(window.BootingScreen);
     if (systemScreen === 'error') return React.createElement(window.ErrorScreen);
 
@@ -209,9 +272,12 @@ function App() {
         screen: NAV_LABEL[nav] ?? nav,
         activeNav: nav,
         upsLoss,
+        upsInstalled,
         locked: navLock,
         profileName: activeProfileName,
-        modeName: activeModeName,
+        // 走っているモード走行・スケジュール・シーケンスがあれば、ブラウザの選択よりそれを出す（段 B）
+        modeName: (realtimeData?.sequence?.state === 'running' ? realtimeData.sequence.name : null)
+          ?? realtimeData?.job?.mode_name ?? realtimeData?.job?.schedule_name ?? activeModeName,
         onNav: key => {
           if (navLock && key !== nav) {
             showToast('実行中は他のページに移動できません', 'error');

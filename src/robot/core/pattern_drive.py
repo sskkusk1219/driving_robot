@@ -1,0 +1,2777 @@
+# 移植元: tests/research/pattern_drive.py（scripts/port_research.py が 2026-11-19 に写した。tests の commit 4c80595+未コミットの変更あり）。手で直さない  # noqa: E501
+"""手順 2: 閉ループパターン走行 → 2次多項式 FF モデル作成。
+
+ProblemReport_20260910 手順 2:
+    2-0. ペダル探索（pedal_search.py）… クリープ車速と停車保持開度を実測し、停車保持まで行う
+         （2026-10-08 段2l-6: 不感帯の探索はやめた。待機位置・u の原点は手で測った min）
+    2-1. 本番環境で採用している 2次多項式モデル作成用のパターン走行
+    2-2. 走行結果を基にモデルを作成し、パラメータを config_testVehicle.yaml に保存
+
+引用元（パターン生成・学習は本番の関数をそのまま呼ぶ。走行ループは pattern_loop.py が
+アルゴリズムを移植した自前実装 — 遵守事項「/src の本番コードを実行しないこと」に対応）:
+    （パターン列は 2026-09-25 段4 から本番 LearningDriveManager を使わず、`build_patterns` が
+     組む。2026-10-06 段2k 段C から G ランプ走行（ramp_planner.py の段）で組む）
+    tests/research/pattern_loop.py      … PatternLoop（100ms 周期の状態機械。開度は固定値を
+                                          指令し、cap 到達・停車などの前進判定と上限G ガバナを
+                                          実車速のフィードバックで回す。アルゴリズムは
+                                          src/domain/control/learning_loop.py を移植）
+    src/app/training_service.py         … train_inverse_model → estimate_dynamics_params の順
+    src/infra/archive_manager.py        … CSV の列（drive_logs と同じ。drive_log.py）
+
+本番との違い:
+    - DB・セッション・学習サイクル・WebSocket は持たない。ログは走行前チェックから停車保持までを
+      1 本の CSV/PNG（drive_log.SessionLog）に保存し、モデル作成はパターン走行の行だけを使う。
+    - 走行ループは本番 LearningLoop のクラスを実行するのではなく、pattern_loop.py に
+      アルゴリズムを移植した自前実装（PatternLoop）を使う。本番の CycleLoopBase が持つ
+      絶対時刻グリッドスケジューリング・ウォッチドッグ・DBログバックログは、研究用の単発走行
+      には不要なため持たない。安全チェックも SafetyMonitor クラスではなく過電流しきい値の
+      直接比較で行う。
+    - FOPDT 同定・SIMC の PID 初期ゲインは計算しない（Kp/Ki/Kd は手順 4/6/8 で適合する）。
+    - 走行前の「停車保持ブレーキを踏む → 停車待ち」は 2-0 のペダル探索に置き換えた
+      （いきなり踏まない）。
+    - 走行後の緩減速は本番 _decelerate_to_stop（0.1s ごとに ±1%）ではなく stop_decel.py
+      （一方向に刻んで踏み、行き過ぎそうなら待つ）で行う。
+    - 不感帯・停車保持開度・クリープ平衡車速は 2-0 の実測を使う。estimate_dynamics_params の
+      推定値は表示のみ。
+    - 2026-10-06 段2k 段C（ProblemReport_20261001）: パターン列を「コーストダウン ×1 → G ランプ
+      （ramp_planner の段の実行順）→ クリープ域ブレーキ保持」に切り替えた（下の段4 以降の格子
+      ステップ・G 校正・通し掃引の記述は旧列の経緯。コードは段E で削除済み）。
+    - 2026-09-25 段4（ProblemReport_20260925）: パターン列を「車両に依らない測定パターン」に
+      置き換えた（`build_patterns` 参照）。コーストダウン ×2 → 格子ステップ走行（WLTP の車速 ×
+      加速度の格子を狙い、開度は較正から車両ごとに自動で決め、測定区間は開度固定）→ クリープ
+      発進 → クリープ域ブレーキ保持。旧パターン（不感帯 + 固定 % の ACCEL_SWEEP・BRAKE_HOLD・
+      トリム階段・定速階段・低開度階段など）と、それ前提の解析ツール・config キーは削除した。
+    - ペダルゲインは不感帯 + learning.*_gain_min_offset_pct 以上のサンプルで推定する
+      （pedal_gain.py。本番は +5% で、この車両のブレーキでは ≈0.38G になり定常サンプルが採れない）。
+    - スタブ走行の結果は config_testVehicle.yaml に書き戻さない（実機の値を模擬値で壊さない）。
+    - 2026-09-17 クリープ発進・クリープ域ブレーキ保持（段1。ProblemReport_20260916 課題#2）:
+      パターン列の末尾に `CreepLaunchPattern` を足す（`build_patterns` docstring
+      参照）。モデル作成では `estimate_dynamics_params` の後に `creep_curve.
+      estimate_creep_accel_curve` でクリープ加速カーブを推定し、それを基準にブレーキ側の
+      低速ペダルゲインを同定する（`pedal_gain.py`）。クリープ加速カーブは `FeedforwardParams`
+      ではなく研究側の `ff_params.ResearchFFParams` に持たせる（本番コード不変更）。
+    - 2026-09-18 惰行カーブ低速端の再同定（段2.5。ProblemReport_20260916）:
+      `estimate_dynamics_params` 直後に `coast_curve.estimate_coast_decel_curve` で
+      惰行カーブの低速端（creep_speed_kmh〜learning.coast_curve_low_max_kmh）を細ビンで
+      同定し直す（本番の COAST_CURVE_BIN_KMH=10.0 幅は 5〜10km/h を 1 ビンに潰し、
+      `ff_params.free_accel_at` がクリープ平衡速度で段差になっていた）。推定順は
+      惰行 → クリープ → ペダルゲイン が必須（クリープ・ゲインの `free_accel_at` 基準が
+      惰行カーブを使うため）。クリープ加速カーブ・ペダルゲインの基準パラメータは
+      `reference`（`before` の実測不感帯・停車保持・creep_speed_kmh を保ったまま、惰行
+      カーブだけ今回同定したものに差し替えたもの）にする。`estimate_dynamics_params` の
+      生の `after` をそのまま基準にしてはいけない（after の不感帯は表示専用の推定値で
+      2-0 実測よりかなり粗く、「不感帯以下＝ペダルオフ」判定とゲインの分母が壊れる。
+      `_estimate_research_coast_curve` / `_estimate_research_creep_curve` /
+      `_estimate_research_pedal_gains` docstring 参照）。
+    - 2026-09-19 クリープ域ブレーキの下限（段4改訂。ProblemReport_20260916）: 停止境界カーブは
+      廃止し、定数 1 個（不感帯からの超過 [%]）に置き換えた。クリープ加速カーブ推定の直後に
+      `stop_brake_floor.estimate_stop_brake_floor` で「クリープ域でブレーキを保持して実際に
+      停車できた最小の不感帯超過」を同定する（基準は他と同じ `reference`）。
+      `ff_candidate._apply_brake_trim` が低速のブレーキ開度をこの下限より浅くしない
+      （`feedforward.brake_trim_max_kmh` が人が決める値として有効な場合のみ）。
+    - 2026-09-27 手順2 の計測効率化（段7。ProblemReport_20260925 段7）: 実測（065502、約3035s）で
+      格子ステップの「惰行ステップ」と「ステップ後にステーション中心へ戻る待ち」が時間の大半を
+      占めていた（惰行の実測 a はコーストダウンと ±0.1 km/h/s 以内）。
+      - 段7a: コーストダウン ×`COAST_DOWN_COUNT`（2→1）。格子ステップの惰行ステップは
+        コーストダウンの実測 a で置き換えた。
+      - 段7b: ステップの後にステーション中心へ戻る区間を専用フェーズ（GRID_RETURN）に分けた。
+      （どちらも格子ステップ走行ごと段2k 段E で削除。上の段2k 段C の記述が今の列）
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import math
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from src.robot.core import local_gain, pedal_lag, release_gain
+from src.robot.core.app_settings import SafetySettings
+from src.robot.core.axis_monitor import AxisMonitor
+from src.robot.core.coast_curve import estimate_coast_decel_curve
+from src.robot.core.config import ConfigError, FeaturesSection, ResearchConfig, load_config
+from src.robot.core.creep_curve import estimate_creep_accel_curve
+from src.robot.core.drive_log import (
+    SECTION_DECEL_TO_STOP,
+    SECTION_PATTERN_DRIVE,
+    SECTION_PEDAL_SEARCH,
+    SECTION_PRE_DRIVE_CHECK,
+    DriveSample,
+    SessionLog,
+    read_drive_logs,
+)
+from src.robot.core.dynamics_estimation import (
+    PEDAL_GAIN_MIN_OPENING_PCT,
+    estimate_dynamics_params,
+)
+from src.robot.core.ff_candidate import train_inverse_model_effective
+from src.robot.core.ff_model import deviation_gain, export_model_coefficients
+from src.robot.core.ff_params import ResearchFFParams, research_ff_params
+from src.robot.core.hardware import HW_REAL, DriveError, ResearchHardware
+from src.robot.core.horizon_search import (
+    HorizonSearchSettings,
+    format_result_table,
+    read_pattern_groups,
+    search_ff_horizons,
+)
+from src.robot.core.learning_patterns import (
+    COAST_DOWN_ACCEL_PCT,
+    COAST_DOWN_COUNT,
+    HOLD_DURATION_S,
+)
+from src.robot.core.model_gain import _load_pkl
+from src.robot.core.pattern_loop import (
+    RAMP_TI_RATIO,
+    CreepLaunchPattern,
+    GRampPattern,
+    PatternLoop,
+    PatternLoopConfig,
+    RampResult,
+    RampStatus,
+)
+from src.robot.core.pedal_gain import apply_pedal_gains, estimate_gain_curve
+from src.robot.core.pedal_lag import PedalLagResult
+from src.robot.core.pedal_search import (
+    PedalSearchResult,
+    apply_crossings,
+    hold_breakaway_pct,
+    hold_opening_meta,
+)
+from src.robot.core.ramp_planner import (
+    CRUISE_MIN_MARGIN_KMH,
+    estimate_s,
+    stop_approach_est_s,
+    stop_approach_top_kmh,
+)
+from src.robot.core.research_types import (
+    DriveLog,
+    DriveLogData,
+    DrivingMode,
+    FeedforwardParams,
+    LearningPattern,
+    PatternKind,
+    VehicleProfile,
+)
+from src.robot.core.sample_weight import (
+    SAMPLE_WEIGHT_ENABLED,
+    SAMPLE_WEIGHT_MAX,
+    SAMPLE_WEIGHT_MIN,
+    WltpWeighting,
+)
+from src.robot.core.stop_brake_floor import (
+    CREEP_BRAKE_HOLD_FRACS,
+    creep_brake_hold_openings,
+    estimate_stop_brake_floor,
+)
+from src.robot.core.stop_decel import PHASE_APPROACH, StopDecelResult, decelerate_to_stop
+from src.robot.core.term import drive_status_line, say
+from src.robot.core.vehicle import build_vehicle_profile
+
+__all__ = ["DriveError"]  # main・テストが pattern_drive.DriveError として参照する
+
+# C8（順モデル）の学習の並列数（fwd_final.build_final_table の workers。既定 2）。学習時間の枠に
+# 合わせて変える（build_ff_model の forward_workers でも上書きできる）。乱数は省略時
+# fwd_final.DEFAULT_SEEDS
+FORWARD_WORKERS = 2
+
+# 2026-10-13 段2o-2（ユーザー決定）: 手順2 の C8 は relu（2 層 50 個・停車まぎわ除外あり・追加学習
+# なし）。fwd_final の CLI の既定（1-1 絶対誤差: logistic 30×30）は変えず、`_build_forward_model` が
+# `fwd_final.final_config` へ渡す引数だけ変える（段2n の実機 051308 の設定）
+FORWARD_HIDDEN: tuple[int, ...] = (50, 50)
+FORWARD_ACTIVATION = "relu"
+FORWARD_DROP_STOP_APPROACH = True
+
+# 2026-10-14 段2o-4（ユーザー決定）: C8 の表の u の刻み [%]。根拠: 低車速のブレーキ側の崖の幅が
+# 約 1.5%（手順2 `193155` の実測）で、0.5% 刻みなら 3 点入る。C8 の表だけ細かくし、C7 の表は
+# 2% のまま保存する（学習は変えず、表の格子だけ fwd_map.refine_u_grid で細かくする）
+FORWARD_TABLE_U_STEP_PCT = 0.5
+
+# 2026-10-14 段2o-4: 発進側の表（fwd_map.attach_launch）を作るときの加速度の窓 [s]。仮値: 発進は
+# 約 1 秒で終わり、本体の 1.0 秒窓ではなまる。段2o-4 の確認で 1.0 と比べて決める
+LAUNCH_ACCEL_WINDOW_S = 0.5
+
+# estimate_dynamics_params が推定する項目（すべて表示する）。creep_accel_* は FeedforwardParams
+# ではなく ResearchFFParams が持つ（RESEARCH_PARAM_KEYS。_print_param_changes / build_ff_model の
+# 保存処理はキーごとにどちらの器から読むかをそこで判定する）
+FF_PARAM_KEYS: tuple[str, ...] = (
+    "creep_speed_kmh",
+    "creep_rate_kmhs",
+    "creep_accel_speeds_kmh",
+    "creep_accel_kmhs",
+    "stop_brake_opening_pct",
+    "engine_brake_decel_kmhs",
+    "coast_decel_speeds_kmh",
+    "coast_decel_kmhs",
+    "pedal_gain_speeds_kmh",
+    "accel_gain_kmhs_per_pct",
+    "brake_gain_kmhs_per_pct",
+)
+# 2-0 のペダル探索で実測する項目。推定値は表示のみで書き戻さない。creep_speed_kmh は
+# 2026-09-21 追加: estimate_dynamics_params の中央値は手順2末尾のクリープ発進（打ち切り時点の
+# 上昇途中サンプルが69%）混じりで平衡より 0.24 km/h 低く出るため（実機確認）、2-0 の
+# wait_creep_stable 実測（プラトーまで待つ）を正とする。
+# 2026-10-08 段2l-6: 不感帯（accel/brake_deadband_pct）は FF_PARAM_KEYS からも外した
+# （u の原点は yaml の vehicle.min_*_opening_pct。estimate_dynamics_params の不感帯推定値は
+# 表示にも yaml にも出さない）
+MEASURED_KEYS: frozenset[str] = frozenset({"stop_brake_opening_pct", "creep_speed_kmh"})
+# FeedforwardParams ではなく ResearchFFParams が持つ項目（ProblemReport_20260916 課題#2・段4。
+# coast_band_kmhs は人が決める値なので自動保存の対象外＝ここにも FF_PARAM_KEYS にも入れない。
+# 停止ブレーキの下限・ブレーキトリムの設定キーは 2026-10-09 に yaml から外した）
+RESEARCH_PARAM_KEYS: frozenset[str] = frozenset(
+    {
+        "creep_accel_speeds_kmh",
+        "creep_accel_kmhs",
+    }
+)
+
+
+@dataclass
+class PatternDriveResult:
+    csv_path: Path  # 走行ログの CSV（SessionLog.close で保存。学習はパターン走行の行だけ）
+    samples: list[DriveSample]  # パターン走行の行
+    duration_s: float  # パターン走行の所要時間（緩減速を含まない）
+    stop: StopDecelResult | None = None
+    # G ランプ走行（段2k）の段ごとの結果（G ランプのパターンが無ければ空）
+    ramp_results: list[RampResult] = field(default_factory=list)
+
+
+@dataclass
+class ModelBuildResult:
+    model_path: str
+    metrics: dict[str, dict[str, float]]
+    params: FeedforwardParams
+    changed: list[str]
+    # ResearchFFParams（クリープ加速カーブ等。FeedforwardParams には無い研究段階のみのパラメータ）
+    research_params: ResearchFFParams = field(default_factory=ResearchFFParams)
+    # 手順2 の学習結果のチェック（step2_check.CheckItem の列。C7/C8 のとき）
+    checks: list[Any] = field(default_factory=list)
+
+
+def _comm_counts(hw: ResearchHardware) -> dict[str, tuple[dict[str, int], dict[str, int]]]:
+    """軸ごとの（op 名ごとの再送した通信の回数, 実行回数）の写し。スタブは空。"""
+    return {
+        label: (dict(getattr(axis, "retry_counts", {})), dict(getattr(axis, "op_counts", {})))
+        for label, axis in (("アクセル", hw.accel), ("ブレーキ", hw.brake))
+    }
+
+
+def _retry_summary(
+    start: dict[str, tuple[dict[str, int], dict[str, int]]],
+    end: dict[str, tuple[dict[str, int], dict[str, int]]],
+) -> str:
+    """走行中（開始〜終了の差）の通信の再送を 1 行にする。再送 0 回の op も出す。"""
+    parts: list[str] = []
+    for label, (retry_end, op_end) in end.items():
+        retry_start, op_start = start.get(label, ({}, {}))
+        items = [
+            f"{op} {retry_end.get(op, 0) - retry_start.get(op, 0)}/"
+            f"{op_end[op] - op_start.get(op, 0)} 回"
+            for op in sorted(op_end)
+            if op_end[op] - op_start.get(op, 0) > 0
+        ]
+        parts.append(f"{label} " + ("・".join(items) if items else "通信なし"))
+    return "通信の再送（再送した回数/通信した回数）: " + " ／ ".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2-1. パターン走行
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _DriveMonitor:
+    """ログ 1 行ごとに走行ログ（CSV・グラフ）へ記録し、ターミナルに表示する。"""
+
+    def __init__(
+        self, cfg: ResearchConfig, patterns: Sequence[LearningPattern], log: SessionLog
+    ) -> None:
+        self._cfg = cfg
+        self._patterns = patterns
+        self._log = log
+        self.samples: list[DriveSample] = []
+        self._last_print = -math.inf
+        self._last_pattern = -1
+        # G ランプ中の基準車速・Kp・Ki を読む口（PatternLoop.ramp_status。ループを作った後に渡す）
+        self.ramp_status: Callable[[], RampStatus | None] = lambda: None
+
+    def on_sample(
+        self,
+        data: DriveLogData,
+        pattern_index: int,
+        phase: str,
+        governor_active: bool = False,
+        alarm_accel: bool | None = None,
+        alarm_brake: bool | None = None,
+        monitor_accel: AxisMonitor | None = None,
+        monitor_brake: AxisMonitor | None = None,
+        cycle_ms: float | None = None,
+    ) -> None:
+        total = len(self._patterns)
+        kind = self._patterns[pattern_index].kind.name if pattern_index < total else "DONE"
+        # G ランプ中だけ基準（data.ref_speed_kmh ＝ v_ref）とペダル別の Kp・Ki がある
+        rs = self.ramp_status()
+        sample = self._log.record(
+            data, section=SECTION_PATTERN_DRIVE, phase=phase, pattern=f"{pattern_index + 1}:{kind}",
+            governor_active=governor_active, alarm_accel=alarm_accel, alarm_brake=alarm_brake,
+            monitor_accel=monitor_accel, monitor_brake=monitor_brake, cycle_ms=cycle_ms,
+            accel_kp=None if rs is None else rs.accel_kp,
+            accel_ki=None if rs is None else rs.accel_ki,
+            brake_kp=None if rs is None else rs.brake_kp,
+            brake_ki=None if rs is None else rs.brake_ki,
+        )
+        self.samples.append(sample)
+        elapsed = sample.elapsed_s
+
+        if pattern_index != self._last_pattern and pattern_index < total:
+            self._last_pattern = pattern_index
+            lr = self._cfg.learning
+            text = _describe(
+                self._patterns[pattern_index],
+                hold_s=lr.ramp_hold_time_s, turn_s=lr.ramp_turn_time_s,
+            )
+            say(f"── パターン {pattern_index + 1}/{total}: {text} ──")
+        if elapsed - self._last_print >= self._cfg.output.print_interval_s:
+            self._last_print = elapsed
+            # それ以外のパターンは基準・偏差は ---、ゲインは 0。Kd は常に 0
+            say(drive_status_line(
+                t_s=elapsed,
+                ref_kmh=data.ref_speed_kmh,
+                actual_kmh=data.actual_speed_kmh,
+                accel_kp=0.0 if rs is None else rs.accel_kp,
+                accel_ki=0.0 if rs is None else rs.accel_ki,
+                accel_kd=0.0,
+                brake_kp=0.0 if rs is None else rs.brake_kp,
+                brake_ki=0.0 if rs is None else rs.brake_ki,
+                brake_kd=0.0,
+                accel_pct=data.accel_opening,
+                brake_pct=data.brake_opening,
+                extra=f"{pattern_index + 1}/{total} {kind} {phase}"
+                      + ("  Gガバナー作動" if governor_active else ""),
+            ))
+
+
+def _describe(pattern: LearningPattern, *, hold_s: float = 0.0, turn_s: float = 0.0) -> str:
+    text = (f"{pattern.kind.name}  アクセル {pattern.accel_opening:.1f}%  "
+            f"ブレーキ {pattern.brake_opening:.1f}%")
+    if isinstance(pattern, GRampPattern):
+        est = estimate_s(pattern.target_g, pattern.top_kmh, hold_s=hold_s, turn_s=turn_s)
+        if pattern.lag_step:  # 2026-10-13 段2o-2: 遅れの測定の段
+            return (
+                f"遅れの測定  狙い {pattern.target_g:g}G で加速 → {pattern.top_kmh:g} km/h で"
+                "定速になるまで保持 → 開度を固定でステップ（アクセル踏み増し・戻し・離す・"
+                f"ブレーキ踏み増し・戻し）→ {pattern.target_g:g}G で減速"
+            )
+        if pattern.stop_approach:  # 2026-10-31 段2: 停止の手前の測定
+            up_g = pattern.up_g
+            est = stop_approach_est_s(
+                pattern.target_g, up_g, pattern.top_kmh,
+                hold_s=hold_s if pattern.hold_s is None else pattern.hold_s, turn_s=turn_s,
+            )
+            return (
+                f"停止の手前の測定  狙い {up_g:g}G で加速 → 上端 {pattern.top_kmh:g} km/h で "
+                f"{hold_s if pattern.hold_s is None else pattern.hold_s:g} 秒保持 → "
+                f"{pattern.target_g:g}G の一定 G で停車まで減速（見込み {est:.0f}s。停止前の戻し・"
+                "戻し・dither・途中の保持なし）"
+            )
+        extra = ""
+        if pattern.stations_kmh:  # 2026-10-13 段2o-2
+            ways = "上りだけ" if pattern.stations_up_only else "上り下りとも"  # 2026-10-14 段2o-5
+            extra = (f"。途中で {', '.join(f'{v:g}' for v in pattern.stations_kmh)} km/h を"
+                     f"{ways}定速保持")
+        if pattern.release_stations:  # 2026-10-14 段2o-5
+            extra += (f"。下りの {', '.join(f'{v:g}' for v in pattern.release_stations)} km/h で"
+                      "ブレーキを山から離す戻し")
+        if pattern.sweep_stations:  # 2026-10-31 段2
+            extra += (f"。下りの {', '.join(f'{v:g}' for v in pattern.sweep_stations)} km/h で"
+                      "ブレーキを一定の速さでゆっくり戻す（惰行に戻るまで）")
+        return (f"G ランプ  狙い {pattern.target_g:g}G で加速 → 上端 {pattern.top_kmh:g} km/h で"
+                f" {hold_s:g} 秒保持 → {pattern.target_g:g}G で減速"
+                f"（見込み {est:.0f}s。"
+                "開度は基準車速との偏差と、走行中に貯めた表・感度で決める" + extra + "）")
+    if isinstance(pattern, CreepLaunchPattern):
+        action = (
+            f"ブレーキ保持 {pattern.brake_opening:.1f}%で停車" if pattern.hold_after else "停車復帰"
+        )
+        return (f"{text}  クリープ発進 → {pattern.target_kmh:g} km/h"
+                f"（打切り{pattern.timeout_s:g}s）→ {action}")
+    return text
+
+
+def _print_patterns(
+    patterns: Sequence[LearningPattern], *, hold_s: float = 0.0, turn_s: float = 0.0
+) -> None:
+    say(f"── パターン一覧（コーストダウン → G ランプ、{len(patterns)} 本） ──")
+    for i, pattern in enumerate(patterns, start=1):
+        say(f"  {i:>2}. {_describe(pattern, hold_s=hold_s, turn_s=turn_s)}")
+
+
+def ramp_order_of(
+    patterns: Sequence[LearningPattern],
+) -> list[tuple[float, float, tuple[float, ...], bool]]:
+    """パターン列の G ランプの (狙いの G, 上端の車速, 保持する車速, 遅れのステップか) を取り出す。
+
+    2026-10-13 段2o-2: 保持する車速と lag_step を足した（結果の表と `run_pattern_drive` 用）。
+    """
+    return [
+        (p.target_g, p.top_kmh, p.stations_kmh, p.lag_step)
+        for p in patterns
+        if isinstance(p, GRampPattern)
+    ]
+
+
+def _fmt_g(value: float | None) -> str:
+    return "  -  " if value is None else f"{value:.3f}"
+
+
+def _fmt_pct(value: float | None) -> str:
+    return "  -  " if value is None else f"{value:.2f}%"
+
+
+def _ramp_total_s(r: RampResult) -> float:
+    """G ランプ 1 本の合計秒数（加速・保持・減速・途中保持・戻し・dither・ゆっくり戻す）。"""
+    return (
+        r.up_s + r.hold_s + r.down_s + r.cruise_s + r.release_s + r.dither_brake_s
+        + r.dither_accel_s + r.sweep_s + r.cruise_sine_s
+    )
+
+
+def result_table(
+    order: Sequence[tuple[Any, ...]], results: Sequence[RampResult], total_s: float,
+    *, hold_s: float = 0.0, turn_s: float = 0.0,
+) -> str:
+    """G ランプの段ごとの結果の表。results は走った順（order と同じ順で先頭から対応）。
+
+    2026-10-10 段2l-10: 「保持秒」（最高速での保持。切り替え +G → 0 を含む）の列を足した。
+    2026-10-14 段2o-5: 合計秒に戻し 秒を足し、「戻し 入った/飛ばした」の列を足した。
+    合計秒 ＝ 加速秒 ＋ 保持秒 ＋ 減速秒 ＋ 途中保持 秒（2026-10-13 段2o-2。途中の定速保持の合計と、
+    合計が ramp_cruise_hold_s に達した回数 / 入った回数を足した。上端に L が付く段は遅れの測定の
+    段で、保持秒に HOLD_STEP の 12.5 秒前後を含む）。見込み秒には保持と切り替えを
+    足す（`hold_s`・`turn_s`）。
+    """
+    head = (
+        "段 | 狙いG | 上端km/h | 見込み秒 | 加速秒 | 保持秒 | 減速秒 | 合計秒 | "
+        "加速G中央値 | 減速G中央値 | 最高km/h | 途中保持 秒 | 途中保持 達成/入った | "
+        "戻し 秒 | 戻し 入った/飛ばした | 効き始め アクセル | 効き始め ブレーキ | "
+        "dither ブレーキ 秒 | dither ブレーキ 入った/飛ばした | dither アクセル 秒 | "
+        "dither アクセル 入った/飛ばした | ゆっくり戻す 秒 | "
+        "ゆっくり戻す 入った/飛ばした/打ち切り | 保持の正弦波 秒 | 保持の正弦波 入った/飛ばした"
+    )
+    lines = [head, "-" * len(head)]
+    for i, item in enumerate(order):
+        g, top = item[0], item[1]
+        lag = len(item) > 3 and bool(item[3])  # 遅れの測定の段（上端に L を付ける）
+        top_text = f"{top:.0f}L" if lag else f"{top:.0f}"
+        est = estimate_s(g, top, hold_s=hold_s, turn_s=turn_s)
+        r = results[i] if i < len(results) else None
+        if r is None:
+            lines.append(f"{i + 1:>2} | {g:.3f} | {top_text:>6} | {est:>7.0f} | （走っていない）")
+            continue
+        lines.append(
+            f"{i + 1:>2} | {g:.3f} | {top_text:>6} | {est:>7.0f} | {r.up_s:>6.1f} "
+            f"| {r.hold_s:>6.1f} "
+            f"| {r.down_s:>6.1f} | {_ramp_total_s(r):>6.1f} "
+            f"| {_fmt_g(r.accel_g_median):>11} "
+            f"| {_fmt_g(r.decel_g_median):>11} | {r.max_speed_kmh:>7.1f}"
+            f" | {r.cruise_s:>6.1f} | {r.cruise_done}/{r.cruise_n}"
+            f" | {r.release_s:>6.1f} | {r.release_n}/{r.release_skipped}"
+            f" | {_fmt_pct(r.accel_onset_pct):>8} | {_fmt_pct(r.brake_onset_pct):>8}"
+            # 2026-10-28 段2: 効き始めの少し先での小さな動き（dither。合計秒に含む）
+            f" | {r.dither_brake_s:>6.1f} | {r.dither_brake_n}/{r.dither_brake_skipped}"
+            f" | {r.dither_accel_s:>6.1f} | {r.dither_accel_n}/{r.dither_accel_skipped}"
+            # 2026-10-31 段2: ゆっくり戻す（RAMP_RELEASE_SWEEP。合計秒に含む）
+            f" | {r.sweep_s:>6.1f} | {r.sweep_n}/{r.sweep_skipped}/{r.sweep_timeout_n}"
+            # 2026-11-10 段10c: 保持の正弦波（RAMP_CRUISE_SINE。合計秒に含む）
+            f" | {r.cruise_sine_s:>6.1f} | {r.cruise_sine_n}/{r.cruise_sine_skipped}"
+        )
+    lines.append(f"全体の所要秒数: {total_s:.0f} s（{total_s / 60:.1f} 分）")
+    return "\n".join(lines)
+
+
+POLY_CANDIDATES: tuple[str, ...] = ("C1", "C2", "C3", "C4", "C5")
+
+
+def require_forward_candidate(cfg: ResearchConfig) -> None:
+    """手順2 の対象は C7・C8（順モデル）だけ。C1〜C5（多項式）なら ConfigError。
+
+    2026-10-08 段2l-6（ProblemReport_20261001 ユーザー決定 #2）: C1〜C5 は今後使わない。
+    走る前（ハードを動かす前）に呼ぶ。C1〜C5 のコード（`_build_poly_model`・ff_candidate.py）は
+    実機確認の後の別の段で扱う。
+    """
+    candidate = cfg.feedforward.candidate
+    if candidate in POLY_CANDIDATES:
+        raise ConfigError(
+            f"feedforward.candidate = {candidate} は手順 2 の対象外です"
+            "（C1〜C5 の多項式モデルは今後使いません）。yaml の feedforward.candidate と "
+            "model_path を C7 または C8 に変えてください"
+        )
+
+
+def stop_approach_patterns(cfg: ResearchConfig) -> list[GRampPattern]:
+    """停止の手前の測定の G ランプ（一定 G で停車まで下りる。2026-10-31 段2。
+    ProblemReport_20261031_停止間際 B）。手順2（`build_patterns`）と手順14 が共有する。
+
+    `learning.stop_approach_g_levels` の G ごとに `stop_approach_counts` 本。上りは
+    `stop_approach_accel_g`、下りは G、上端は `ramp_planner.stop_approach_top_kmh`、保持は
+    `stop_approach_hold_s`。停止前の戻し・下りの戻し・dither・途中の保持には入らない
+    （`GRampPattern.stop_approach`）。`stop_approach_enabled` は見ない（呼ぶ側が決める）。
+    """
+    lr = cfg.learning
+    out: list[GRampPattern] = []
+    for g, n in zip(lr.stop_approach_g_levels, lr.stop_approach_counts, strict=True):
+        top = stop_approach_top_kmh(
+            g, release_start_kmh=lr.stop_release_start_kmh, turn_s=lr.ramp_turn_time_s,
+            settle_s=lr.stop_approach_settle_s,
+        )
+        out.extend(
+            GRampPattern(
+                kind=PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0,
+                hold_duration_s=0.0, target_g=g, top_kmh=top,
+                accel_g=lr.stop_approach_accel_g, stop_approach=True,
+                hold_s=lr.stop_approach_hold_s,
+            )
+            for _ in range(n)
+        )
+    return out
+
+
+def build_patterns(
+    cfg: ResearchConfig, profile: VehicleProfile, ramp_order: Sequence[tuple[Any, ...]],
+    *, with_lag: bool = False,
+) -> list[LearningPattern]:
+    """手順2 のパターン列（2026-10-06 段2k 段C。ProblemReport_20261001）。
+
+    格子ステップをやめ、「狙いの G で加速 → 同じ G で減速」を G の段ごとに繰り返す。構成:
+      1. コーストダウン ×`COAST_DOWN_COUNT`: 手順2 終了時の緩減速と同じ G を目標に、アクセルを
+         刻み踏みで上げて cap まで加速し惰行（開度は COAST_DOWN_ACCEL_PCT で頭打ち）。車速で
+         終わるので車両非依存（惰行カーブ用）
+      2. G ランプ: `ramp_order`（`RampPlan.execution_order()` の (狙いの G, 上端の車速)。
+         弱い G から順、2 周目があれば後ろ）の 1 要素につき `GRampPattern` 1 本。開度は走行中に
+         実測の G を見て決める。2026-10-13 段2o-2: 要素は (g, 上端) または (g, 上端, 保持する車速)。
+         3 つ目は途中で定速を保持する車速（`GRampPattern.stations_kmh`。省略なら空）
+         2026-10-14 段2o-4: 4 つ目（あれば）は保持を上りだけにするか
+         （`stations_up_only`。省略は False）
+         2026-10-14 段2o-5: 5 つ目（あれば）は下りで山からブレーキを離す戻しの車速
+         （`release_stations`。省略は空）
+         2026-10-31 段1: 6 つ目（あれば）はブレーキをゆっくり戻して惰行に戻るまでを測る車速
+         （`sweep_stations`。省略は空）
+
+    2026-10-13 段2o-2: `with_lag` が True のとき（手順2 の本番）、G ランプの後ろに遅れの測定の段を
+      足す: `learning.ramp_lag_speeds_kmh` の各車速を上端とする、狙いの G が
+      `ramp_lag_approach_g` の `GRampPattern`（lag_step=True）。保持の後に開度を固定でステップ。
+      既定 False（既存のテストと短縮用の差し込みは今までどおりの列になる）。
+
+    2026-10-08 段2l-6: クリープ域ブレーキ保持（CREEP_SETTLE の 8 本）とクリープ発進を列から外した
+    （G ランプを 0 km/h まで測るため）。`CreepLaunchPattern`・stop_brake_floor.py・関連キーの
+    コード削除は実機確認の後の別の段。
+
+    G 校正・格子ステップ・発進停車セル・通し掃引はパターン列に入れない（段E でコードごと削除）。
+    """
+    coast_accel = min(COAST_DOWN_ACCEL_PCT, profile.max_accel_opening)
+    coast_downs = [
+        LearningPattern(
+            kind=PatternKind.COAST_DOWN,
+            accel_opening=coast_accel,
+            brake_opening=0.0,
+            hold_duration_s=HOLD_DURATION_S,
+        )
+        for _ in range(COAST_DOWN_COUNT if coast_accel > 0.0 else 0)
+    ]
+    ramps: list[LearningPattern] = [
+        GRampPattern(
+            kind=PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0, hold_duration_s=0.0,
+            target_g=item[0], top_kmh=item[1],
+            stations_kmh=tuple(item[2]) if len(item) > 2 else (),
+            stations_up_only=bool(item[3]) if len(item) > 3 else False,
+            release_stations=tuple(item[4]) if len(item) > 4 else (),
+            sweep_stations=tuple(item[5]) if len(item) > 5 else (),
+        )
+        for item in ramp_order
+    ]
+    if with_lag and ramps:
+        lr = cfg.learning
+        ramps += [
+            GRampPattern(
+                kind=PatternKind.G_RAMP, accel_opening=0.0, brake_opening=0.0,
+                hold_duration_s=0.0, target_g=lr.ramp_lag_approach_g, top_kmh=float(v),
+                lag_step=True,
+            )
+            for v in lr.ramp_lag_speeds_kmh
+        ]
+    # 2026-10-31 段2: 停止の手前の測定はパターン列の先頭（コーストダウンより前）
+    approach = stop_approach_patterns(cfg) if cfg.learning.stop_approach_enabled else []
+    return [*approach, *coast_downs, *ramps]
+
+
+def _dither_onsets_from_model(cfg: ResearchConfig) -> tuple[float | None, float | None]:
+    """今の pkl（feedforward.model_path）の meta から (ブレーキ, アクセル) の効き始め（min からの量
+    [%]。`brake_onset_u_pct`・`accel_onset_u_pct`）を読む（2026-10-28 段2）。pkl が無い・読めない・
+    キーが無い・0 以下の値は None（その dither は入れない）。"""
+    from src.robot.core.fwd_map import load_forward_map  # noqa: PLC0415
+
+    try:
+        meta = load_forward_map(Path(cfg.feedforward.model_path)).meta
+    except Exception:  # noqa: BLE001 - 読めなければ dither を入れないだけ
+        return None, None
+
+    def pick(key: str) -> float | None:
+        v = meta.get(key)
+        try:
+            f = float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) and f > 0.0 else None
+
+    return pick("brake_onset_u_pct"), pick("accel_onset_u_pct")
+
+
+def loop_config_from_config(
+    cfg: ResearchConfig, *, stop_confirm_pct: float | None = None
+) -> PatternLoopConfig:
+    """config から PatternLoopConfig を組む（`run_pattern_drive` と `ramp_stub_run` で共有）。
+
+    `stop_confirm_pct` は 2-0 で測った止まった開度（G ランプの発進の開始位置。None なら停車保持
+    開度から始める）。
+    """
+    lr = cfg.learning
+    dither_onsets = (
+        _dither_onsets_from_model(cfg) if lr.ramp_dither_enabled else (None, None)
+    )
+    return PatternLoopConfig(
+        coast_timeout_s=lr.coast_timeout_s,
+        creep_launch_settle_kmhs=lr.creep_launch_settle_kmhs,
+        creep_launch_settle_s=lr.creep_launch_settle_s,
+        # コーストダウンの加速は、手順2 終了時の緩減速と同じ G・刻み・待ちで踏み進める
+        coast_accel_target_g=cfg.decel_stop.target_decel_g,
+        coast_accel_press_margin_g=cfg.decel_stop.press_margin_g,
+        coast_accel_slope_window_s=cfg.decel_stop.slope_window_s,
+        coast_accel_approach_margin_pct=cfg.decel_stop.approach_margin_pct,
+        # 高い車速からの停車復帰の G 比例ブレーキも同じ刻み方（decel_stop と同じ値）
+        calib_release_above_g=cfg.decel_stop.release_above_g,
+        calib_step_mm=cfg.decel_stop.step_mm,
+        calib_dwell_s=cfg.decel_stop.dwell_s,
+        # コーストダウンの終了判定（段7c）に使う「落ち着いた」許容幅
+        grid_settle_tol_kmh=lr.grid_settle_tol_kmh,
+        # G ランプ走行（段2k 段B）の制御と、ガバナーの踏み増しを止める割合
+        ramp_settle_time_s=lr.ramp_settle_time_s,
+        ramp_launch_time_s=lr.ramp_launch_time_s,
+        ramp_turn_time_s=lr.ramp_turn_time_s,
+        ramp_stop_time_s=lr.ramp_stop_time_s,
+        ramp_edge_g=lr.ramp_edge_g,
+        # 2026-10-18 段2o-10: 発進のゆっくり離し（① 速く → ② ゆっくり。動き出す開度を測る）
+        ramp_launch_fast_rate_pctps=lr.ramp_launch_fast_rate_pctps,
+        ramp_launch_release_margin_pct=lr.ramp_launch_release_margin_pct,
+        ramp_launch_slow_rates_pctps=tuple(lr.ramp_launch_slow_rates_pctps),
+        ramp_launch_g_rate_gps=lr.ramp_launch_g_rate_gps,
+        ramp_launch_blend_min_s=lr.ramp_launch_blend_min_s,
+        ramp_one_sided=lr.ramp_one_sided,
+        ramp_g_levels=tuple(lr.ramp_g_levels),
+        ramp_hold_time_s=lr.ramp_hold_time_s,
+        ramp_dev_deadband_kmh=lr.ramp_dev_deadband_kmh,
+        ramp_gprop_without_sensitivity=lr.ramp_gprop_without_sensitivity,
+        ramp_actuator_lag_tol_pct=lr.ramp_actuator_lag_tol_pct,
+        # 2026-10-13 段2o-2: いちばん弱い段の途中の定速保持
+        ramp_cruise_band_g=lr.ramp_cruise_band_g,
+        ramp_cruise_hold_s=lr.ramp_cruise_hold_s,
+        ramp_cruise_timeout_s=lr.ramp_cruise_timeout_s,
+        # 2026-11-10 段10c: 保持の完了時の正弦波（既定 off）
+        ramp_cruise_sine_enabled=lr.ramp_cruise_sine_enabled,
+        ramp_cruise_sine_hz=lr.ramp_cruise_sine_hz,
+        ramp_cruise_sine_amplitude_pct=lr.ramp_cruise_sine_amplitude_pct,
+        ramp_cruise_sine_periods=lr.ramp_cruise_sine_periods,
+        # 2026-10-13 段2o-2: 遅れの測定のステップ（開度を固定で持つ）
+        ramp_lag_step_g=lr.ramp_lag_step_g,
+        ramp_lag_step_hold_s=lr.ramp_lag_step_hold_s,
+        # 2026-10-14 段2o-5: 下りの戻し。安全網の車速は planner と同じ クリープ ＋ 5 km/h
+        ramp_release_fracs=tuple(lr.ramp_release_fracs),
+        ramp_release_move_s=lr.ramp_release_move_s,
+        ramp_release_hold_s=tuple(lr.ramp_release_hold_s),
+        ramp_release_enabled=lr.ramp_release_enabled,
+        # 2026-10-31 段2: ゆっくり戻す測定（RAMP_RELEASE_SWEEP）
+        ramp_release_sweep_enabled=lr.ramp_release_sweep_enabled,
+        ramp_release_sweep_rate_pct_s=lr.ramp_release_sweep_rate_pct_s,
+        ramp_release_sweep_time_s=lr.ramp_release_sweep_time_s,
+        ramp_release_sweep_timeout_s=lr.ramp_release_sweep_timeout_s,
+        # 2026-10-23 段5-8: 停止前の戻し B-1
+        stop_release_enabled=lr.stop_release_enabled,
+        stop_release_start_kmh=lr.stop_release_start_kmh,
+        stop_release_fracs=tuple(lr.stop_release_fracs),
+        stop_release_rate_pct_s=lr.stop_release_rate_pct_s,
+        stop_release_escape_s=lr.stop_release_escape_s,
+        stop_release_escape_decel_kmhs=lr.stop_release_escape_decel_kmhs,
+        stop_release_max_g=lr.stop_release_max_g,
+        # 2026-10-28 段2: 効き始めの少し先での小さな動き。効き始めは今の pkl の meta から
+        # （読めなければ入らない）
+        ramp_dither_enabled=lr.ramp_dither_enabled,
+        ramp_dither_brake_speeds_kmh=tuple(lr.ramp_dither_brake_speeds_kmh),
+        ramp_dither_deltas_pct=tuple(lr.ramp_dither_deltas_pct),
+        ramp_dither_hold_s=lr.ramp_dither_hold_s,
+        ramp_dither_brake_u0_from_onset_pct=tuple(lr.ramp_dither_brake_u0_from_onset_pct),
+        ramp_dither_max_g=lr.ramp_dither_max_g,
+        ramp_dither_accel_band_pct=lr.ramp_dither_accel_band_pct,
+        ramp_dither_accel_max_n=lr.ramp_dither_accel_max_n,
+        ramp_dither_brake_onset_u_pct=dither_onsets[0],
+        ramp_dither_accel_onset_u_pct=dither_onsets[1],
+        ramp_release_min_kmh=cfg.feedforward.creep_speed_kmh + CRUISE_MIN_MARGIN_KMH,
+        gov_soft_frac=lr.gov_soft_frac,
+        # 待機位置 ＝ min（2026-10-08 段2l-6。待機しないなら掛けない）と、発進の開始位置
+        pedal_standby=cfg.mode_drive.pedal_standby,
+        stop_confirm_pct=stop_confirm_pct,
+    )
+
+
+def _overcurrent_limit_ma(hw: ResearchHardware) -> float:
+    """過電流しきい値は本番と同じ config/settings.toml の [safety] を使う（スタブは既定値）。"""
+    if hw.settings is not None:
+        return hw.settings.safety.overcurrent_limit_ma
+    return SafetySettings().overcurrent_limit_ma
+
+
+async def _release_pedals(hw: ResearchHardware) -> None:
+    say("異常終了: ペダルを離します（両軸原点復帰）…")
+    try:
+        await asyncio.gather(hw.accel.home_return(), hw.brake.home_return())
+    except Exception as exc:
+        say(f"  警告: 原点復帰に失敗しました（{type(exc).__name__}: {exc}）")
+
+
+async def run_pattern_drive(
+    hw: ResearchHardware,
+    cfg: ResearchConfig,
+    *,
+    pedal: PedalSearchResult,
+    log: SessionLog | None = None,
+    patterns: Sequence[LearningPattern] | None = None,
+    ramp_order: Sequence[tuple[float, float]] | None = None,
+    loop_config: PatternLoopConfig | None = None,
+    top_speed_cap_kmh: float | None = None,
+) -> PatternDriveResult:
+    """本番の学習運転パターンを PatternLoop（本番 LearningLoop 相当）で走らせ、
+    緩減速で停車保持まで行う。
+
+    前提: 2-0 のペダル探索が済み、停車保持開度（pedal.stop_brake_opening_pct）で停車している。
+    `log` は走行前チェックから続く走行ログ（main が作って保存する）。無ければここで作り、
+    終わりに（異常終了でも）保存する。
+    `patterns` を渡さないときは `ramp_order`（`RampPlan.execution_order()`）から
+    `build_patterns` で作る（無ければ ConfigError）。`patterns` / `loop_config` はテストや
+    動作確認で短縮するための差し込み口。`top_speed_cap_kmh` はコーストダウン加速の上端
+    （None なら車両の最高速 × accel_speed_cap_frac のまま。2026-10-07 段2l-4）。
+    """
+    profile = pedal.apply_to_profile(build_vehicle_profile(cfg))
+    if patterns is None:
+        if ramp_order is None:
+            raise ConfigError("run_pattern_drive には patterns か ramp_order のどちらかが要ります")
+        patterns = build_patterns(cfg, profile, ramp_order, with_lag=True)
+    if loop_config is None:
+        loop_config = loop_config_from_config(cfg, stop_confirm_pct=pedal.stop_confirm_pct)
+    elif loop_config.stop_confirm_pct is None:
+        loop_config = replace(loop_config, stop_confirm_pct=pedal.stop_confirm_pct)
+    if top_speed_cap_kmh is not None:  # 2026-10-07 段2l-4: コーストダウンの上端（モード + 余裕）
+        loop_config = replace(loop_config, top_speed_cap_kmh=top_speed_cap_kmh)
+    _print_patterns(
+        patterns, hold_s=loop_config.ramp_hold_time_s, turn_s=loop_config.ramp_turn_time_s
+    )
+    if hw.is_real:
+        cap = profile.max_speed * loop_config.accel_speed_cap_frac
+        if loop_config.top_speed_cap_kmh is not None:
+            cap = min(cap, loop_config.top_speed_cap_kmh)
+        say(f"*** 実機モード: 車両が 0 → 約 {cap:.0f} km/h まで加減速します。"
+            "シャシダイナモ上で実施してください ***")
+    say(f"開始状態: 停車保持ブレーキ {pedal.stop_brake_opening_pct:.2f}%（2-0 で確定）")
+    say(f"各運転パターンの後は DRIVE_BRAKE で停車してから次へ進みます"
+        f"（{loop_config.brake_stop_timeout_s:g}s 以内に停車しなければ中断）。"
+        f"加速の打ち切り {loop_config.accel_full_range_timeout_s:g}s")
+    say(f"コーストダウン加速: 踏む速さ = {loop_config.coast_accel_rate_gain:g} ×"
+        f"（{loop_config.coast_accel_target_g:g}G − 今の G）%/s、"
+        f"±{loop_config.coast_accel_press_margin_g:g}G は保持、"
+        f"上限 = パターンの加速開度（頭打ち）、"
+        f"指令は実開度 + {loop_config.ramp_actuator_lag_tol_pct:g}% まで（追いつくのを待つ）")
+    say(f"Gガバナー: {profile.max_decel_g:g}G × {loop_config.g_limit_frac:g} 以上で頭打ち"
+        f"（0.1 秒あたり {loop_config.gov_reduce_step_pct:g}% で下げる）、"
+        f"× {loop_config.gov_release_frac:g} 未満で "
+        f"0.1 秒あたり {loop_config.gov_raise_step_pct:g}% ずつ戻す")
+    say(f"G ランプ: 基準車速（0 → 上端 → 保持 → 0 km/h。発進 "
+        f"{loop_config.ramp_launch_time_s:g} 秒で {loop_config.ramp_edge_g:g}G → +G、"
+        f"上端の手前で {loop_config.ramp_turn_time_s:g} 秒かけて +G → 0、"
+        f"上端で {loop_config.ramp_hold_time_s:g} 秒保持、"
+        f"{loop_config.ramp_turn_time_s:g} 秒かけて 0 → -G、"
+        f"停止 {loop_config.ramp_stop_time_s:g} 秒で -G → -{loop_config.ramp_edge_g:g}G）との"
+        f"偏差で開度を動かす（Kp = 1 ÷（走行中に測った感度 × "
+        f"{loop_config.ramp_settle_time_s:g} 秒）、"
+        f"Ki = Kp ÷ {RAMP_TI_RATIO * loop_config.ramp_settle_time_s:g} 秒。感度が無いペダルは"
+        "最小刻み 1 個/周期。偏差は ±"
+        f"{loop_config.ramp_dev_deadband_kmh:g} km/h の不感帯つき）。"
+        "表の開度は毎周期は足さず、保持の頭・減速の頭・発進の1回だけ引いて寄せる。"
+        "アクチュエータが指令に "
+        f"{loop_config.ramp_actuator_lag_tol_pct:g}% 以上遅れている間は基準を待たせる。"
+        "表示の acc/brk Kp・Ki は直近に計算した値（感度が無い間は 0）")
+    if loop_config.ramp_one_sided:
+        say("G ランプの片側調整: 加速は車が遅いときだけ・減速は車が速いときだけ動かし、"
+            "行き過ぎは基準を実車速に合わせる。実測 G が段の上端（隣の段との中間）を超えたら戻す"
+            "（保持と停止の直前は両方向）")
+    else:
+        say("G ランプの調整: 両方向（片側調整なし）")
+    if any(isinstance(p, GRampPattern) and p.stations_kmh for p in patterns):
+        limit_s = loop_config.ramp_turn_time_s + loop_config.ramp_cruise_timeout_s
+        say(f"途中の定速保持（段2o-2）: 実測の加速度が ±{loop_config.ramp_cruise_band_g:g}G 以内の"
+            f"時間が合計 {loop_config.ramp_cruise_hold_s:g} 秒で次へ（入ってから {limit_s:g} 秒で"
+            "打ち切り）。保持中は偏差の項が両方向")
+        if loop_config.ramp_cruise_sine_enabled:
+            say(f"保持の正弦波（段10c）: アクセルで保持しているとき、保持の完了後に指令へ "
+                f"{loop_config.ramp_cruise_sine_amplitude_pct:g}% × sin(2π × "
+                f"{loop_config.ramp_cruise_sine_hz:g} Hz) を足して "
+                f"{loop_config.ramp_cruise_sine_periods} 周期（"
+                f"{loop_config.ramp_cruise_sine_periods / loop_config.ramp_cruise_sine_hz:.1f} 秒）"
+                "続ける（phase RAMP_CRUISE_SINE。表の学習には使わない）")
+    if any(isinstance(p, GRampPattern) and p.release_stations for p in patterns):
+        fracs = " → ".join(f"{f:g}" for f in loop_config.ramp_release_fracs)
+        holds = "・".join(f"{h:g}" for h in loop_config.ramp_release_hold_s)
+        say("下りの戻し（段2o-5）: 戻す車速に着いたら（ブレーキを踏んでいるときだけ。"
+            "踏んでいなければ飛ばす）、山の開度に対して "
+            f"{fracs} 倍まで {loop_config.ramp_release_move_s:g} 秒ずつ直線に離し、"
+            f"それぞれ {holds} 秒保持（0 は待機位置）。出たら {loop_config.ramp_turn_time_s:g} "
+            f"秒かけて 0 → -G。実車速が {loop_config.ramp_release_min_kmh:g} km/h 以下で打ち切り。"
+            "戻し中は制御の項なし・表と中央値に貯めない")
+    if any(isinstance(p, GRampPattern) and p.sweep_stations for p in patterns):
+        say("ゆっくり戻す（段2 2026-10-31）: 場所に着いたら（ブレーキを踏んでいて、惰行より強い"
+            " G の"
+            "ときだけ）山の開度から（山の深さ − 効き始め）÷ "
+            f"{loop_config.ramp_release_sweep_time_s:g} 秒"
+            f"（下限 {loop_config.ramp_release_sweep_rate_pct_s:g} %/s）の速さで戻し、"
+            "加速度が惰行に戻ったら止めて、同じ速さで山の開度まで踏み増して出る。"
+            f"{loop_config.ramp_release_sweep_timeout_s:g} 秒・"
+            f"実車速 {loop_config.ramp_release_min_kmh:g} km/h 以下で打ち切り。制御の項なし")
+    if loop_config.ramp_dither_enabled:
+        b_on, a_on = (
+            loop_config.ramp_dither_brake_onset_u_pct, loop_config.ramp_dither_accel_onset_u_pct
+        )
+        deltas = "・".join(f"{d:g}" for d in loop_config.ramp_dither_deltas_pct)
+        speeds = "・".join(f"{v:g}" for v in loop_config.ramp_dither_brake_speeds_kmh)
+        lc = loop_config
+        say(f"効き始めの少し先の小さな動き（段2 2026-10-28）: u0＋Δ → u0 → u0−Δ → u0 を各 "
+            f"{lc.ramp_dither_hold_s:g} 秒（Δ ＝ {deltas}%）。ブレーキは下りで {speeds} km/h を "
+            f"切ったとき、目標減速度が {lc.ramp_dither_max_g:g}G 以下の段で、今の開度に関係なく入る"
+            f"（中心 u0 ＝ 効き始め（{'なし' if b_on is None else f'{b_on:g}%'}）＋ "
+            f"{'・'.join(f'{d:g}' for d in lc.ramp_dither_brake_u0_from_onset_pct)}% を入るたびに"
+            "順に使う）。アクセルは上りの保持の後、"
+            f"効き始め（{'なし' if a_on is None else f'{a_on:g}%'}）〜 ＋ "
+            f"{lc.ramp_dither_accel_band_pct:g}% の中なら 1 本につき最大 "
+            f"{lc.ramp_dither_accel_max_n} 回。効き始めが pkl の meta から読めないペダルは"
+            "入れない")
+    if any(isinstance(p, GRampPattern) and p.lag_step for p in patterns):
+        say(f"遅れの測定: 上端で定速になったら、開度を固定で {loop_config.ramp_lag_step_hold_s:g} "
+            f"秒ずつステップ（アクセル踏み増し {loop_config.ramp_lag_step_g:g}G 相当 → 戻し → "
+            "離す → ブレーキ踏み増し → 戻し）。結果は 2-2 で表の遅れ L に入る")
+    say("パターン走行は FF/PID を使いません（G ランプ以外は開度指令のみ。ゲインは表示のみ）")
+
+    own_log = log is None
+    session = SessionLog(cfg, hw) if log is None else log
+    if own_log:
+        session.start(SECTION_PATTERN_DRIVE, "")
+    monitor = _DriveMonitor(cfg, patterns, session)
+    finished = asyncio.Event()
+    emergency = False
+
+    async def on_complete() -> None:
+        finished.set()
+
+    async def on_emergency() -> None:
+        nonlocal emergency
+        emergency = True
+        finished.set()
+
+    learning_loop = PatternLoop(
+        on_sample=monitor.on_sample,
+        accel_driver=hw.accel,
+        brake_driver=hw.brake,
+        can_reader=hw.can,
+        profile=profile,
+        patterns=list(patterns),
+        overcurrent_limit_ma=_overcurrent_limit_ma(hw),
+        on_complete=on_complete,
+        on_emergency=on_emergency,
+        config=loop_config,
+        interval_s=cfg.control.loop_interval_s,  # yaml の周期（50 ms）。手順3・本番と同じ
+    )
+    monitor.ramp_status = learning_loop.ramp_status
+
+    try:
+        # PatternLoop の 100ms ループと Modbus を取り合わないよう、走行中はサンプラーを止める
+        # （記録は PatternLoop の on_sample コールバックから行う）
+        await session.stop_sampler()
+        session.mark(SECTION_PATTERN_DRIVE, "")
+        comm_start = _comm_counts(hw)  # 手順1 の分を混ぜないため、開始時点の値を控える
+        say(f"パターン走行を開始します（{len(patterns)} 本、"
+            f"打ち切り {cfg.learning.timeout_s:.0f}s）")
+        started = time.monotonic()
+        completed = False
+        try:
+            learning_loop.start()
+            try:
+                await asyncio.wait_for(finished.wait(), timeout=cfg.learning.timeout_s)
+            except TimeoutError as exc:
+                raise DriveError(
+                    f"パターン走行が learning.timeout_s={cfg.learning.timeout_s:.0f}s 以内に"
+                    "終わりませんでした"
+                ) from exc
+            if emergency:
+                reason = learning_loop.abort_reason or "理由不明。直前のログを確認してください"
+                raise DriveError(f"PatternLoop が非常停止しました（{reason}）")
+            completed = True
+        finally:
+            await learning_loop.stop_and_join()
+            if not completed:
+                # 本番の非常停止と同じく、まずペダルを離す（CSV・グラフの保存より先に）
+                await _release_pedals(hw)
+
+        duration = time.monotonic() - started
+        say(f"全パターン完了（{duration:.0f}s）。緩減速で停車させ、停車保持ブレーキをかけます …")
+        say(_retry_summary(comm_start, _comm_counts(hw)))
+        order = ramp_order_of(patterns)
+        if order:
+            say("── G ランプの結果 ──")
+            say(result_table(
+                order, learning_loop.ramp_results, duration,
+                hold_s=loop_config.ramp_hold_time_s, turn_s=loop_config.ramp_turn_time_s,
+            ))
+        session.mark(SECTION_DECEL_TO_STOP, PHASE_APPROACH)
+        session.start_sampler()
+        stop = await decelerate_to_stop(hw, cfg, profile, log=session)
+        say(f"停車保持: ブレーキ {stop.hold_pct:.2f}%")
+        return PatternDriveResult(
+            csv_path=session.csv_path, samples=monitor.samples, duration_s=duration, stop=stop,
+            ramp_results=list(learning_loop.ramp_results),
+        )
+    finally:
+        if own_log:
+            await session.close()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2-2. モデル作成
+# ─────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class _BuiltModel:
+    """② モデル作成の結果。updates は candidate 固有の参照用キー（config へ書く分）。"""
+
+    model_path: str
+    metrics: dict[str, dict[str, float]]
+    updates: dict[str, Any] = field(default_factory=dict)
+    # C8 のとき、学習の元にした C7 の表の pkl（チェック B1 で C8 と比べる）
+    c7_path: str | None = None
+
+
+def _forward_pkl_path(models_dir: Path, prefix: str, hw_mode: str) -> Path:
+    """順モデルの pkl 名（ローカル時刻 = JST。走行ログ CSV と揃える）。
+
+    2026-10-29 より前の pkl は UTC 名。スタブは `_stub` を付け、実機の pkl と紛れないようにする。
+    """
+    from datetime import datetime  # noqa: PLC0415
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = "" if hw_mode == HW_REAL else f"_{hw_mode}"
+    return models_dir / f"{prefix}_{stamp}{suffix}.pkl"
+
+
+@dataclass(frozen=True)
+class MeasuredLags:
+    """手順2 の遅れの測定（G ランプの後ろの HOLD_STEP。2026-10-13 段2o-2）で測れたペダル別の遅れ
+    [s]。測れなかったペダルは None（表の既定値 0.05 秒のまま）。"""
+
+    accel_s: float | None = None
+    brake_s: float | None = None
+    result: PedalLagResult | None = None  # 推定の中身（表示用）
+
+
+def _usable_lag(entry: tuple[int, float] | None, min_n: int) -> float | None:
+    """ペダル別の (件数, 中央値) が使えるなら中央値。件数が足りない・範囲外は None。"""
+    if entry is None or entry[0] < min_n or not 0.0 < entry[1] <= pedal_lag.MAX_LAG_S:
+        return None
+    return float(entry[1])
+
+
+def measure_pedal_lags(
+    csv_path: Path, *, accel_min_pct: float | None = None, brake_min_pct: float | None = None,
+) -> MeasuredLags:
+    """走行 CSV の HOLD_STEP（手順2 の遅れの測定）から、ペダル別の遅れを測る。
+
+    ペダル別の中央値（踏み増し・戻しをまとめる）を、件数が `pedal_lag.LAG_STEP_MIN_STEPS` 以上で
+    0 < L ≤ `pedal_lag.MAX_LAG_S` のときだけ採る。HOLD_STEP の無い CSV（旧形式・遅れの測定を
+    しなかった走行・スタブ）は両方 None。読めない CSV も None（遅れは既定値のまま）。
+
+    2026-10-16 段2o-6: min（待機位置）を渡すと、min から出る・min へ戻るステップは使わない
+    （遊びを通る時間が遅れに混ざるため。`pedal_lag.estimate_hold_step_lag`）。
+    """
+    try:
+        res = pedal_lag.estimate_hold_step_lag(
+            pedal_lag.read_step_rows(csv_path),
+            accel_min_pct=accel_min_pct, brake_min_pct=brake_min_pct,
+        )
+    except (OSError, ValueError):
+        return MeasuredLags()
+    n = pedal_lag.LAG_STEP_MIN_STEPS
+    return MeasuredLags(
+        accel_s=_usable_lag(res.by_pedal.get(pedal_lag.PEDAL_ACCEL), n),
+        brake_s=_usable_lag(res.by_pedal.get(pedal_lag.PEDAL_BRAKE), n),
+        result=res,
+    )
+
+
+def _say_pedal_lags(lags: MeasuredLags, speeds_kmh: Sequence[float]) -> None:
+    """遅れの測定の結果を表示する（測れたペダルは表に使う値、測れないものは既定値のまま）。"""
+    from src.robot.core.fwd_tool import DEFAULT_ACCEL_LAG_S, DEFAULT_BRAKE_LAG_S  # noqa: PLC0415
+
+    res = lags.result
+    if res is None or res.n_steps_total == 0:
+        say(f"遅れの測定: 走行ログに HOLD_STEP がありません → 表の遅れは既定値"
+            f"（アクセル {DEFAULT_ACCEL_LAG_S:g}・ブレーキ {DEFAULT_BRAKE_LAG_S:g} 秒）のまま")
+        return
+
+    def cell(key: str, group: Sequence[Any]) -> str:
+        pedal, _, kind = key.partition("_")
+        sel = [st.lag_s for st in group if st.pedal == pedal and st.press == (kind == "press")]
+        if not sel:
+            return "-"
+        med = sorted(sel)[len(sel) // 2] if len(sel) % 2 else sum(
+            sorted(sel)[len(sel) // 2 - 1:len(sel) // 2 + 1]
+        ) / 2.0
+        return f"{med:.2f}({len(sel)})"
+
+    keys = ("accel_press", "accel_release", "brake_press", "brake_release")
+    say(f"遅れ（指令の 50% 点 → 加速度の 50% 点。HOLD_STEP {res.n_steps_total} 区間・採用 "
+        f"{res.n_used} 件・min 発着で除外 {len(res.excluded_steps)} 件。表の値は 中央値(件数)）:")
+    say("  条件           アクセル踏み増し アクセル戻し ブレーキ踏み増し ブレーキ戻し")
+    say("  全体           " + " ".join(f"{cell(k, res.steps):>14}" for k in keys))
+    if speeds_kmh and res.steps:
+        for v in sorted(speeds_kmh):  # 各ステップを、いちばん近い測定車速に振り分ける
+            group = [
+                st for st in res.steps
+                if min(speeds_kmh, key=lambda x: abs(x - st.speed_kmh)) == v
+            ]
+            say(f"  {v:>4g} km/h     " + " ".join(f"{cell(k, group):>14}" for k in keys))
+    used_a = f"{lags.accel_s:.2f} 秒" if lags.accel_s is not None else (
+        f"測れず既定値 {DEFAULT_ACCEL_LAG_S:g} 秒"
+    )
+    used_b = f"{lags.brake_s:.2f} 秒" if lags.brake_s is not None else (
+        f"測れず既定値 {DEFAULT_BRAKE_LAG_S:g} 秒"
+    )
+    say(f"  → 表に使う遅れ: アクセル {used_a}・ブレーキ {used_b}（惰行はアクセルと同じ値）")
+
+
+def _forward_settings(profile: VehicleProfile, lags: MeasuredLags | None = None) -> Any:
+    """C7・C8 の u の原点は min（プロファイル。名前は不感帯のまま）。
+
+    遅れ L は既定値。2026-10-13 段2o-2: `lags`（手順2 の遅れの測定）で測れたペダルは、その値を
+    `accel_lag_s`・`brake_lag_s` に入れる（惰行の遅れ `coast_lag_s` は None のままアクセルと同じ
+    値になる）。測れなかったペダルは既定値のまま。
+    """
+    from src.robot.core.fwd_tool import DeadbandLag  # noqa: PLC0415
+
+    fp = profile.feedforward_params
+    st = DeadbandLag(fp.accel_deadband_pct, fp.brake_deadband_pct)
+    if lags is not None:
+        if lags.accel_s is not None:
+            st = replace(st, accel_lag_s=lags.accel_s)
+        if lags.brake_s is not None:
+            st = replace(st, brake_lag_s=lags.brake_s)
+    return st
+
+
+def _attach_onsets(table: Any, profile: VehicleProfile, csv_path: Path) -> None:
+    """表の meta に、ペダルの効き始め（min からの量 u [%]）を入れる（2026-10-16 段2o-6）。
+
+    手順2 の CSV の G ランプ行（HOLD_STEP 以外）から `play_onset` の折れ点で求める。惰行は表の
+    `coast_accel`（u=0 の加速度。負）の符号を反転した減速量（モデルと同じ基準）。求まらなかった
+    ペダルはキーを入れない（古い pkl もキーが無い。読む側は「効き始めなし」として扱う）。
+    """
+    from src.robot.core.play_onset import onsets_from_csv  # noqa: PLC0415
+
+    fp = profile.feedforward_params
+    amin, bmin = fp.accel_deadband_pct, fp.brake_deadband_pct
+
+    def coast_decel(v: Any) -> Any:
+        return -np.asarray(table.coast_accel(np.asarray(v, dtype=float)), dtype=float)
+
+    acc, brk = onsets_from_csv(csv_path, accel_min=amin, brake_min=bmin, coast_fn=coast_decel)
+    for label, key, res, pmin in (
+        ("アクセル", "accel_onset_u_pct", acc, amin),
+        ("ブレーキ", "brake_onset_u_pct", brk, bmin),
+    ):
+        if res.onset_pct is None:
+            say(f"  効き始め[{label}]: 求まらず（{res.reason}）。meta に入れない")
+            continue
+        table.meta[key] = res.onset_pct - pmin
+        say(f"  効き始め[{label}]: 絶対 {res.onset_pct:.2f}%（min {pmin:g}% から "
+            f"u={res.onset_pct - pmin:.2f}%）、k={res.k:.3f}")
+
+
+def _attach_returns(table: Any, csv_path: Path) -> None:
+    """表の meta に、ペダルが min へ戻るまでの時間（遅れ・戻る速さ）を入れる（2026-10-17 段2o-9）。
+
+    手順2 の CSV から `pedal_lag.estimate_pedal_return` で測る。
+    戻る時間 = 遅れ + 戻す量 ÷ 戻る速さ。
+    手順3 の開度の列（`fwd_plan`）が、切り替えのすき間をこの時間以上にするのに使う。測れなかった
+    ペダルはキーを入れない（古い pkl もキーが無い。読む側は仮の既定値を使い、表示で知らせる）。
+    """
+    res = pedal_lag.estimate_pedal_return(csv_path)
+    for label, prefix, fit in (
+        ("アクセル", "accel", res.accel), ("ブレーキ", "brake", res.brake),
+    ):
+        if not fit.measured:
+            say(f"  戻る時間[{label}]: 測れず（{fit.reason}）。meta に入れない")
+            continue
+        table.meta[f"{prefix}_return_delay_s"] = float(fit.delay_s)  # type: ignore[arg-type]
+        table.meta[f"{prefix}_return_rate_pct_s"] = float(fit.rate_pct_s)  # type: ignore[arg-type]
+        say(f"  戻る時間[{label}]: 遅れ {fit.delay_s:.3f}s・戻る速さ {fit.rate_pct_s:.0f}%/s"
+            f"（場面 {fit.n} 件、当てはめの外れ最大 {fit.max_err_s:.3f}s）")
+
+
+def _attach_pedal_track(table: Any, csv_path: Path) -> None:
+    """表の meta に、ペダルの位置の動き方と位置 → 加速度の遅れ（PedalTrack の 8 値）を入れる
+    （2026-10-26 段11-2。ProblemReport_20261026_2 段2・段3）。
+
+    手順2 の CSV と表から `pedal_lag.estimate_pedal_track` で測る。本番ではモードを走れないので、
+    yaml の pedal_track_* （モード走行の当てはめ）に頼らず手順2 から決める。ブレーキの動き（delay・
+    速さ・加速度の上限）は手順2 に速い動きが無く測れないため、アクセルの値を流用する
+    （ユーザー決定）。
+    測れなければキーを入れない（読む側は yaml の値を使い、表示で知らせる）。
+    """
+    amin = float(table.meta.get("accel_deadband_pct", math.nan))
+    bmin = float(table.meta.get("brake_deadband_pct", math.nan))
+    if not (math.isfinite(amin) and math.isfinite(bmin)):
+        say("  ペダルの動き方: 表の meta に min が無く測れず。meta に入れない")
+        return
+    fit = pedal_lag.estimate_pedal_track(csv_path, table, accel_min_pct=amin, brake_min_pct=bmin)
+    if not fit.measured:
+        say(f"  ペダルの動き方: 測れず（{fit.reason}）。meta に入れない")
+        return
+    for key in pedal_lag.PEDAL_TRACK_META_KEYS:
+        table.meta[f"pedal_track_{key}"] = float(getattr(fit, key))
+    say(f"  ペダルの動き方: delay {fit.accel_delay_s:g}s・速さ {fit.accel_max_rate_pct_s:g}%/s・"
+        f"加速度 {fit.accel_max_accel_pct_s2:g}%/s^2（アクセルで測り、ブレーキも同じ値）")
+    say(f"  　位置の RMSE {fit.rmse_pct:.3f}%・動いた行 アクセル {fit.n_moved_accel}・"
+        f"ブレーキ {fit.n_moved_brake}")
+    say(f"  位置 → 加速度の遅れ: アクセル {fit.accel_effect_lag_s:g}s・"
+        f"ブレーキ {fit.brake_effect_lag_s:g}s")
+
+
+def _attach_local_gain(
+    table: Any, csv_path: Path, brake_speeds_kmh: Sequence[float] | None = None,
+    sine_hz: float | None = None,
+) -> bool:
+    """表の meta に、局所の効きの倍率の表を入れる。dither（ブレーキ・アクセル。
+    `_attach_dither_gain`）と、定速の保持（アクセル。`_attach_cruise_gain`。2026-11-10 段7）と、
+    保持の正弦波（`_attach_cruise_sine_gain`。段10c。正弦波の区間があるときだけ）を試し、
+    どれかが入れば True。sine_hz は正弦波の周波数（learning.ramp_cruise_sine_hz。None は
+    local_gain.SINE_HZ_DEFAULT）。"""
+    ok_dither = _attach_dither_gain(table, csv_path, brake_speeds_kmh)
+    ok_cruise = _attach_cruise_gain(table, csv_path)
+    ok_sine = _attach_cruise_sine_gain(table, csv_path, sine_hz)
+    return ok_dither or ok_cruise or ok_sine
+
+
+def _attach_cruise_sine_gain(table: Any, csv_path: Path, sine_hz: float | None = None) -> bool:
+    """表の meta に、アクセルの定速の保持の正弦波（RAMP_CRUISE_SINE）から測った 1 Hz 付近の効きの
+    倍率 `local_gain_accel_hf`（と周波数 `_hz`）を入れる（2026-11-10 ProblemReport_20261109
+    段10c）。
+    正弦波の区間が無い CSV は何も言わず False（正弦波 off の手順2 は今までと同じ出力）。"""
+    hz = local_gain.SINE_HZ_DEFAULT if sine_hz is None else float(sine_hz)
+    segs = local_gain.read_sine_segments(csv_path)
+    if not segs:
+        return False
+    amin = float(table.meta.get("accel_deadband_pct", math.nan))
+    if not math.isfinite(amin):
+        say("  保持の正弦波の効き: 表の meta に min が無く測れず。meta に入れない")
+        return False
+    fit = local_gain.fit_cruise_sine(segs, table, accel_min_pct=amin, hz=hz)
+    if fit.entry is None:
+        say(f"  保持の正弦波の効き[アクセル]: 倍率の表なし（{fit.reason}）")
+        return False
+    rows = "・".join(
+        f"{rep:g}km/h {float(np.median(vals)):.2f}倍(n={len(vals)})"
+        for rep, vals in sorted(fit.by_speed.items())
+    )
+    snrs = [d["snr"] for d in fit.per_segment]
+    say(f"  保持の正弦波の効き[アクセル] {hz:g}Hz: 区間 {fit.n_segments}・倍率が出た区間 "
+        f"{fit.n_used}・SNR 中央値 {float(np.median(snrs)):.1f}（捨てた理由 {fit.reject}）")
+    say(f"    車速の行ごとの倍率の中央値: {rows}")
+    return local_gain.attach_sine_to_meta(table.meta, fit, csv_path.name)
+
+
+def _attach_cruise_gain(table: Any, csv_path: Path) -> bool:
+    """表の meta に、アクセルの定速の保持（RAMP_CRUISE・RAMP_HOLD）から測った局所の効きの倍率の表
+    `local_gain_accel_cruise` を入れる（2026-11-10 ProblemReport_20261109 段7）。
+
+    dither の `local_gain_accel` は書き換えない（別のキー）。実開度は表の遅れ `accel_lag_s` だけ
+    ずらす（meta に無ければ `local_gain.CRUISE_LAG_FALLBACK_S`）。HOLD_STEP のアクセルの
+    ステップ（開ループ）の倍率を検算として表示する。何も測れなければ False（meta は変えない）。
+    """
+    amin = float(table.meta.get("accel_deadband_pct", math.nan))
+    bmin = float(table.meta.get("brake_deadband_pct", math.nan))
+    if not (math.isfinite(amin) and math.isfinite(bmin)):
+        say("  定速の局所の効き: 表の meta に min が無く測れず。meta に入れない")
+        return False
+    segs = local_gain.read_cruise_segments(csv_path, accel_min_pct=amin, brake_min_pct=bmin)
+    lag = table.meta.get("accel_lag_s")
+    fit = local_gain.fit_cruise(
+        segs, table, accel_min_pct=amin, onset_u_pct=table.meta.get("accel_onset_u_pct"),
+        lag_s=float(lag) if lag is not None else None,
+    )
+    if fit.entry is None:
+        say(f"  定速の局所の効き[アクセル]: 倍率の表なし（{fit.reason}）")
+    else:
+        rows = "・".join(
+            f"{rep:g}km/h {float(np.median(vals)):.2f}倍(n={len(vals)})"
+            for rep, vals in sorted(fit.by_speed.items())
+        )
+        say(f"  定速の局所の効き[アクセル]: 区間 {fit.n_segments}・倍率が出た区間 {fit.n_used}"
+            f"・マス {fit.n_cells}・R² 中央値 {float(np.median(fit.r2)):.2f}"
+            f"・遅れ {fit.lag_s:.3f}s（捨てた理由 {fit.reject}）")
+        say(f"    車速の行ごとの中央値（clip 前）: {rows}")
+    hs = local_gain.hold_step_ratios(csv_path, table, accel_min_pct=amin, brake_min_pct=bmin)
+    if hs:
+        by_v: dict[float, list[float]] = {}
+        for v, ratio in hs:
+            by_v.setdefault(local_gain.accel_speed_rep(v), []).append(ratio)
+        txt = "・".join(
+            f"{rep:g}km/h {float(np.median(vals)):.2f}倍(n={len(vals)})"
+            for rep, vals in sorted(by_v.items())
+        )
+        say(f"    検算（HOLD_STEP の開ループのステップ）: {txt}")
+    else:
+        say("    検算（HOLD_STEP の開ループのステップ）: 測れず")
+    return local_gain.attach_cruise_to_meta(table.meta, fit, csv_path.name)
+
+
+def _attach_dither_gain(
+    table: Any, csv_path: Path, brake_speeds_kmh: Sequence[float] | None = None
+) -> bool:
+    """表の meta に、局所の効きの倍率の表（ブレーキ・アクセル）と効くまでの遅れを入れる
+    （2026-10-28 段3。ProblemReport_20261028）。
+
+    手順2 の CSV の dither の区間（RAMP_BRAKE_DITHER・RAMP_ACCEL_DITHER）から
+    `local_gain.fit_pedal` で測る。倍率は「実測の局所の傾き ÷ この表の傾き」なので、表を作り直したら
+    付け直す。dither が無い CSV・何も測れなかったときは meta に何も入れない（False）。
+    ブレーキの車速の行は brake_speeds_kmh（learning.ramp_dither_brake_speeds_kmh。None は
+    90・60・30）。
+    """
+    amin = float(table.meta.get("accel_deadband_pct", math.nan))
+    bmin = float(table.meta.get("brake_deadband_pct", math.nan))
+    if not (math.isfinite(amin) and math.isfinite(bmin)):
+        say("  局所の効き: 表の meta に min が無く測れず。meta に入れない")
+        return False
+    runs = local_gain.read_dither_runs(csv_path)
+    if not runs:
+        say("  局所の効き: dither の区間なし。meta に入れない")
+        return False
+    reps = list(brake_speeds_kmh) if brake_speeds_kmh else [90.0, 60.0, 30.0]
+    brake = local_gain.fit_pedal(
+        runs, local_gain.PEDAL_BRAKE, table, pedal_min_pct=bmin,
+        onset_u_pct=table.meta.get("brake_onset_u_pct"), speed_reps_kmh=reps,
+    )
+    accel = local_gain.fit_pedal(
+        runs, local_gain.PEDAL_ACCEL, table, pedal_min_pct=amin,
+        onset_u_pct=table.meta.get("accel_onset_u_pct"),
+    )
+    for label, fit in (("ブレーキ", brake), ("アクセル", accel)):
+        if fit.entry is None:
+            say(f"  局所の効き[{label}]: 倍率の表なし（{fit.reason}）")
+        else:
+            med = float(np.median(fit.cell_medians))
+            say(f"  局所の効き[{label}]: 区間 {fit.n_runs}・倍率が出た区間 {fit.n_used}・"
+                f"マス {fit.n_cells}（車速の行 {fit.entry['speed_rep_kmh']} km/h、"
+                f"列 {fit.entry['u_from_onset_pct'][0]:g}〜{fit.entry['u_from_onset_pct'][-1]:g}%）"
+                f"・中央値 {med:.2f}倍")
+        if fit.lag_s is None:
+            say(f"  効くまでの遅れ[{label}]: 測れず")
+        else:
+            say(f"  効くまでの遅れ[{label}]: {fit.lag_s:.3f}s（切り替え {fit.lag_n} 件）")
+    return local_gain.attach_to_meta(table.meta, brake, accel, csv_path.name)
+
+
+def _attach_release_gain(table: Any, csv_paths: Sequence[Path]) -> bool:
+    """表の meta に、戻す側の効き（ブレーキを 1% 戻したとき L 後に加速度が何 km/h/s 変わるか）を
+    入れる（2026-11-05 段14。ProblemReport_20261103_停車前の這う基準 段14〜）。
+
+    手順2・手順14 の CSV の「減速中の戻し」の山から `release_gain.measure_stop_release_gain` で
+    測る。山が少なく測れないときは meta に何も入れず False（表示で知らせる）。戻し量 0.3% の効きを
+    meta に入れ、0.5% の効きと、減速中とみる加速度のしきい値 −1.0 と −0.5・−2.0 の山の数を
+    並べて表示する（しきい値・量の妥当さを見るため）。
+    """
+    bmin = float(table.meta.get("brake_deadband_pct", math.nan))
+    onset = table.meta.get("brake_onset_u_pct")
+    lag = table.meta.get("brake_lag_s")
+    if not (math.isfinite(bmin) and onset is not None and lag is not None):
+        say("  戻す側の効き: 表の meta に min・効き始め・遅れ L が無く測れず。meta に入れない")
+        return False
+    kw = {"brake_min_pct": bmin, "onset_u_pct": float(onset), "lag_s": float(lag)}
+    paths = [Path(p) for p in csv_paths]
+    res = release_gain.measure_stop_release_gain(paths, **kw)
+    if res.gain_kmhs_pct is None:
+        say(f"  戻す側の効き: 測れず（{res.reason}）。meta に入れない")
+        return False
+    for name, vals in res.per_csv.items():
+        say(f"  戻す側の効き[{name}]: 中央値 {float(np.median(vals)):.2f} km/h/s/%・山 {len(vals)}")
+    say(f"  戻す側の効き: 中央値 {res.gain_kmhs_pct:.2f} km/h/s/%（山 {res.n_peaks}・"
+        f"戻し量 {res.amount_pct:g}%・減速中 ≤ {release_gain.ACCEL_MAX_KMHS:g} km/h/s）")
+    alt = release_gain.measure_stop_release_gain(paths, amount_pct=0.5, **kw)
+    if alt.gain_kmhs_pct is not None:
+        say(f"  　戻し量 0.5% で測ると {alt.gain_kmhs_pct:.2f} km/h/s/%（山 {alt.n_peaks}）")
+    else:
+        say(f"  　戻し量 0.5% で測ると測れず（{alt.reason}）")
+    for thr in (-0.5, -2.0):
+        o = release_gain.measure_stop_release_gain(paths, accel_max_kmhs=thr, **kw)
+        eff = "測れず" if o.gain_kmhs_pct is None else f"{o.gain_kmhs_pct:.2f} km/h/s/%"
+        say(f"  　減速中を {thr:g} km/h/s 以下とすると 山 {o.n_peaks}・{eff}")
+    return release_gain.attach_to_meta(table.meta, res)
+
+
+def _build_table_model(
+    profile: VehicleProfile,
+    csv_path: Path,
+    models_dir: Path,
+    hw_mode: str,
+    *,
+    announce: bool = True,
+    lags: MeasuredLags | None = None,
+    local_gain_brake_speeds_kmh: Sequence[float] | None = None,
+    local_gain_sine_hz: float | None = None,
+) -> _BuiltModel:
+    """C7: 走行 CSV から順モデルの表（車速 × 効く開度 u → 加速度）を作って保存する。
+
+    `lags`（2026-10-13 段2o-2）: 手順2 の遅れの測定で測れたペダル別の遅れ。測れたペダルは表の
+    遅れ L に使う（pkl の meta に残る）。None・測れなかったペダルは既定値。
+    """
+    from src.robot.core import fwd_tool  # noqa: PLC0415
+    from src.robot.core.fwd_map import save_table  # noqa: PLC0415
+
+    st = _forward_settings(profile, lags)
+    if announce:
+        say("順モデルの表（C7）: 車速 × 効く開度 u → 加速度 を作成 …")
+    rows = fwd_tool.read_logs([csv_path], st)
+    table = fwd_tool.table_from(rows, st)
+    _attach_onsets(table, profile, csv_path)
+    _attach_returns(table, csv_path)
+    _attach_pedal_track(table, csv_path)
+    _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh, local_gain_sine_hz)
+    _attach_release_gain(table, [csv_path])
+    path = save_table(table, _forward_pkl_path(models_dir, "fwd_table", hw_mode))
+    say(f"  u の原点（min）: アクセル {st.accel_deadband_pct:g}・"
+        f"ブレーキ {st.brake_deadband_pct:g} %（vehicle.min_*_opening_pct）、"
+        f"使えた秒 {sum(r.seconds for r in rows):.1f}")
+    say(f"モデル保存: {path}")
+    return _BuiltModel(model_path=str(path), metrics={})
+
+
+@dataclass(frozen=True)
+class _StopParts:
+    """停止側の行の材料（`_collect_stop_rows` の結果。2026-10-31 段2 で切り出し）。"""
+
+    rows: Any  # 停止側の行（stop）
+    brake_step: Any
+    brake_search: Any
+    near_stop: Any  # pattern の行のうち停車の手前の行の真偽値
+    press_stair: Any
+
+
+def _side_table_reader(
+    csv_path: Path, st: Any, *, side_table_opening_source: str, side_table_accel_window_s: float
+) -> Callable[..., Any]:
+    """発進側・停止側の表の行を CSV から読む関数 read(sections, phases=None) を返す
+    （開度の元・窓・ずれ許容なし・停車の行を残す。2026-10-31 段2 で `_attach_low_speed_tables`
+    から切り出した。読み方は変えていない）。"""
+    from src.robot.core import fwd_tool  # noqa: PLC0415
+
+    def read(sections: Sequence[str], phases: Sequence[str] | None = None) -> Any:
+        extra: dict[str, Any] = {} if phases is None else {"phases": tuple(phases)}
+        (rows,) = fwd_tool.read_logs(
+            [csv_path], st, opening_source=side_table_opening_source, actuator_lag_tol_pct=None,
+            keep_stopped=True, accel_window_s=side_table_accel_window_s, sections=tuple(sections),
+            **extra,
+        )
+        return rows
+
+    return read
+
+
+def _collect_stop_rows(read: Callable[..., Any], pattern: Any, lm: Any, creep: Any) -> _StopParts:
+    """停止側の行（BRAKE_STEP・BRAKE_SEARCH・pattern の停車の手前の行・CREEP_WAIT の u = 0 の行・
+    低速の踏む向きの階段）を集めて連結する。2026-10-31 段2（ProblemReport_20261031_停止間際 B）で
+    `_attach_low_speed_tables` から切り出した（計算は同じ）。pattern・lm（発進の区間）・creep は
+    呼ぶ側が読んだもの。"""
+    from src.robot.core.fwd_cv import stop_approach_mask  # noqa: PLC0415
+    from src.robot.core.fwd_data import (  # noqa: PLC0415
+        PHASE_BRAKE_SEARCH,
+        PHASE_BRAKE_STEP,
+        PHASE_LOW_PRESS_STAIR,
+        STOP_SPEED_KMH,
+        concat_rows,
+        stop_approach_rows,
+        take_rows,
+    )
+
+    brake_step = read((SECTION_PRE_DRIVE_CHECK,), (PHASE_BRAKE_STEP,))
+    brake_search = read((SECTION_PEDAL_SEARCH,), (PHASE_BRAKE_SEARCH,))
+    near_stop = (
+        (stop_approach_rows(pattern) | stop_approach_mask(pattern.speed_kmh, pattern.u_pct))
+        & ~lm & (pattern.speed_kmh >= STOP_SPEED_KMH)
+    )
+    creep_zero = take_rows(
+        creep, (creep.speed_kmh >= STOP_SPEED_KMH) & (np.abs(creep.u_pct) < 1e-9)
+    )
+    # 2026-10-28 段3: 低速の階段。踏む向きの行（停車を含む）は停止側の行。階段の phase が無い CSV
+    # （古い CSV）は行が 0 で、今までと同じ
+    press_stair = read((SECTION_PEDAL_SEARCH,), (PHASE_LOW_PRESS_STAIR,))
+    stop_parts = [brake_step, brake_search, take_rows(pattern, near_stop), creep_zero]
+    if len(press_stair.speed_kmh) > 0:
+        stop_parts.append(press_stair)
+    return _StopParts(
+        rows=concat_rows(stop_parts, "stop"), brake_step=brake_step, brake_search=brake_search,
+        near_stop=near_stop, press_stair=press_stair,
+    )
+
+
+def stop_rows_from_csv(
+    csv_path: Path, st: Any, *, side_table_opening_source: str = "actual",
+    side_table_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+) -> Any:
+    """CSV 1 本から停止側の表の材料（停止側の行 FwdRows）を作る（2026-10-31 段2）。
+    `_attach_low_speed_tables` の停止側と同じ集め方（手順14 が今回の CSV にも使う）。"""
+    from src.robot.core.fwd_data import (  # noqa: PLC0415
+        PHASE_CREEP_WAIT,
+        launch_mask,
+    )
+
+    read = _side_table_reader(
+        csv_path, st, side_table_opening_source=side_table_opening_source,
+        side_table_accel_window_s=side_table_accel_window_s,
+    )
+    pattern = read((SECTION_PATTERN_DRIVE,))
+    lm = launch_mask(pattern)
+    creep = read((SECTION_PEDAL_SEARCH,), (PHASE_CREEP_WAIT,))
+    return _collect_stop_rows(read, pattern, lm, creep).rows
+
+
+def rebuild_stop_side(
+    table: Any, *, source_csvs: Sequence[Path], new_csv: Path, creep_speed_kmh: float,
+    default_opening_source: str = "actual", default_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+    sub_min_weight: bool = False,
+) -> Any:
+    """今の表（pkl）の停止側だけを「作ったときの CSV の停止側の行 ＋ new_csv の停止側の行」で
+    作り直した新しい表を返す（2026-10-31 段2。手順14。ProblemReport_20261031_停止間際 B）。
+
+    停止側の行は `stop_rows_from_csv`（`_attach_low_speed_tables` と同じ集め方）を各 CSV に掛けて
+    連結し、`attach_stop` に渡す（引数も `_attach_low_speed_tables` と同じ。窓と開度の元は表の meta
+    の `stop_accel_window_s`・`side_table_opening_source`、読めなければ default_*）。遅れ L・
+    min（u の原点）・開度の元は表の meta に合わせる（`fwd_tool.settings_of_table`）。
+    他の表・meta はそのまま（attach_stop が更新する stop_* の meta だけ変わる）。meta
+    `stop_approach_csv` に new_csv の名前を残す。
+    sub_min_weight（2026-10-31 段2d 案1。learning.stop_table_sub_min_weight）: True で、停止側の
+    しきい値に届かないマスも重みで使う（`attach_stop`）。
+
+    後段で停止側に依存する処理は、`launch_rows_to_stop_max`（発進側を停止側の車速の行まで広げる）と
+    `side_row_speed_rep == "data"`（行の代表車速を学習データの中央値にする）だけ。どちらかが
+    有効な表は、これだけを掛け直しても元の作り方と同じにならないので ValueError にする
+    （停止側の戻しの層は停止側の行を使わないので掛け直し不要）。
+    """
+    from src.robot.core import fwd_tool  # noqa: PLC0415
+    from src.robot.core.fwd_data import concat_rows  # noqa: PLC0415
+    from src.robot.core.fwd_map import attach_stop  # noqa: PLC0415
+    from src.robot.core.fwd_tool import DeadbandLag  # noqa: PLC0415
+
+    meta = table.meta
+    if meta.get("launch_rows_to_stop_max") or meta.get("side_row_speed_rep") == "data":
+        raise ValueError(
+            "この表は launch_rows_to_stop_max か side_row_speed_rep: data で作られていて、"
+            "停止側だけの作り直しでは元と同じにならない"
+        )
+    base = DeadbandLag(
+        float(meta.get("accel_deadband_pct", 0.0)), float(meta.get("brake_deadband_pct", 0.0))
+    )
+    st = fwd_tool.settings_of_table(table, base)
+    opening_source = str(meta.get("side_table_opening_source", default_opening_source))
+    window = meta.get("stop_accel_window_s")
+    if window is None or not math.isfinite(float(window)):
+        window = default_accel_window_s
+    parts = [
+        stop_rows_from_csv(
+            Path(p), st, side_table_opening_source=opening_source,
+            side_table_accel_window_s=float(window),
+        )
+        for p in [*source_csvs, new_csv]
+    ]
+    rows = concat_rows(parts, "stop")
+    out = attach_stop(
+        table, rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=float(window),
+        sub_min_weight=sub_min_weight,
+    )
+    out.meta["stop_approach_csv"] = Path(new_csv).name
+    # 戻す側の効きも「作ったときの CSV ＋ new_csv」で測り直す（2026-11-05 段14。
+    # 測れなければ meta はそのまま）
+    _attach_release_gain(out, [*source_csvs, new_csv])
+    return out
+
+
+def _collect_launch_rows(read: Any, pattern: Any, lm: Any, creep: Any) -> Any:
+    """発進側の行（発進の区間・CREEP_WAIT・RAMP_LAUNCH_RELEASE の停車中の行）を連結して返す
+    （2026-10-31 段4b。`_attach_low_speed_tables` から切り出した。計算は同じ）。"""
+    from src.robot.core.fwd_data import (  # noqa: PLC0415
+        PHASE_RAMP_LAUNCH_RELEASE,
+        STOP_SPEED_KMH,
+        concat_rows,
+        take_rows,
+    )
+
+    release = read((SECTION_PATTERN_DRIVE,), (PHASE_RAMP_LAUNCH_RELEASE,))
+    release = take_rows(release, release.speed_kmh < STOP_SPEED_KMH)
+    return concat_rows([take_rows(pattern, lm), creep, release], "launch")
+
+
+def rebuild_launch_side(
+    table: Any, *, source_csvs: Sequence[Path], creep_speed_kmh: float,
+    sub_min_weight: bool = False,
+    default_opening_source: str = "actual", default_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+) -> Any:
+    """今の表（pkl）の発進側だけを、source_csvs（1 本）の発進側の行で作り直した新しい表を返す
+    （2026-10-31 段4b。ProblemReport_20261031_停止間際 案1・ユーザー決定。`rebuild_stop_side` の
+    発進側版）。
+
+    行の集め方は `_collect_launch_rows`、動き出す開度は `launch_breakaway`
+    （`_attach_low_speed_tables` と同じ。車速のしきい値は表の meta `launch_breakaway_move_kmh`）。
+    `attach_launch` のあと、元の
+    作り方と同じ順で `extend_launch_rows_to_stop_max`（meta `launch_rows_to_stop_max`）・
+    `apply_launch_accel_measured`（meta `launch_accel_side_source` が measured）を掛け直す。
+    窓と開度の元は表の meta、読めなければ default_*。遅れ L・min は表の meta に合わせる
+    （`fwd_tool.settings_of_table`）。他の表・meta はそのまま。
+    sub_min_weight: True で、しきい値に届かないマスも重みで使う（`attach_launch`・
+    `apply_launch_accel_measured`）。
+
+    動き出す開度と測り直しは CSV 1 本ごとに求めるので source_csvs は 1 本だけ。
+    `side_row_speed_rep == "data"`（停止側の行も要る）の表、発進側の窓などが meta に無くて元と同じ
+    にならない表は ValueError。
+    """
+    from src.robot.core import fwd_tool  # noqa: PLC0415
+    from src.robot.core.fwd_data import (  # noqa: PLC0415
+        PHASE_CREEP_WAIT,
+        STOP_SPEED_KMH,
+        launch_breakaway,
+        launch_mask,
+    )
+    from src.robot.core.fwd_map import (  # noqa: PLC0415
+        apply_launch_accel_measured,
+        attach_launch,
+        extend_launch_rows_to_stop_max,
+    )
+    from src.robot.core.fwd_tool import DeadbandLag  # noqa: PLC0415
+
+    meta = table.meta
+    if len(source_csvs) != 1:
+        raise ValueError("発進側の作り直しは CSV 1 本だけ（動き出す開度と測り直しが CSV 単位）")
+    if meta.get("side_row_speed_rep") == "data":
+        raise ValueError(
+            "この表は side_row_speed_rep: data で作られていて、発進側だけの作り直しでは元と同じに"
+            "ならない"
+        )
+    csv_path = Path(source_csvs[0])
+    base = DeadbandLag(
+        float(meta.get("accel_deadband_pct", 0.0)), float(meta.get("brake_deadband_pct", 0.0))
+    )
+    st = fwd_tool.settings_of_table(table, base)
+    opening_source = str(meta.get("side_table_opening_source", default_opening_source))
+    window = meta.get("side_table_accel_window_s")
+    if window is None or not math.isfinite(float(window)):
+        window = default_accel_window_s
+    window = float(window)
+    read = _side_table_reader(
+        csv_path, st, side_table_opening_source=opening_source,
+        side_table_accel_window_s=window,
+    )
+    pattern = read((SECTION_PATTERN_DRIVE,))
+    lm = launch_mask(pattern)
+    creep = read((SECTION_PEDAL_SEARCH,), (PHASE_CREEP_WAIT,))
+    launch_rows = _collect_launch_rows(read, pattern, lm, creep)
+    min_speed = float(meta.get("launch_breakaway_move_kmh", STOP_SPEED_KMH))
+    breakaway = launch_breakaway(
+        csv_path, brake_min_pct=st.brake_deadband_pct, brake_lag_s=st.brake_lag_s,
+        min_speed_kmh=min_speed, opening_source=opening_source,
+    )
+    out = attach_launch(
+        table, launch_rows, creep_speed_kmh=creep_speed_kmh, breakaway=breakaway,
+        accel_window_s=window, sub_min_weight=sub_min_weight,
+    )
+    out.meta["launch_breakaway_move_kmh"] = float(min_speed)
+    if meta.get("launch_rows_to_stop_max"):
+        out = extend_launch_rows_to_stop_max(out)
+    else:
+        out.meta["launch_rows_to_stop_max"] = False
+    if meta.get("launch_accel_side_source") == "measured":
+        out = apply_launch_accel_measured(out, pattern, sub_min_weight=sub_min_weight)
+    else:
+        out.meta["launch_accel_side_source"] = "extrapolate"
+    return out
+
+
+def _attach_low_speed_tables(
+    table: Any,
+    csv_path: Path,
+    st: Any,
+    *,
+    creep_speed_kmh: float,
+    creep_launch_min_speed_kmh: float | None = None,
+    launch_breakaway_move_kmh: float | None = None,
+    side_table_opening_source: str = "actual",
+    stop_release_layer_enabled: bool = False,
+    launch_accel_side_source: str = "extrapolate",
+    side_table_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+    launch_rows_to_stop_max: bool = False,
+    side_row_speed_rep: str = "grid",
+    stop_table_sub_min_weight: bool = False,
+    launch_table_sub_min_weight: bool = False,
+) -> Any:
+    """C8 の表に、発進側（launch_accel）と停止側（stop_accel）を付けて返す（2026-10-18 段2o-10）。
+
+    行の取り方（ニューラルネット本体の学習の行は変えない。表だけ）:
+      発進側 … PATTERN_DRIVE の発進の区間（`launch_mask`）・PEDAL_SEARCH/CREEP_WAIT・
+               PATTERN_DRIVE/RAMP_LAUNCH_RELEASE の停車中の行
+      停止側 … PRE_DRIVE_CHECK/BRAKE_STEP・PEDAL_SEARCH/BRAKE_SEARCH・PATTERN_DRIVE の停車の手前の
+               行（`stop_approach_rows`・停車まぎわの強いブレーキ `stop_approach_mask`）・
+               CREEP_WAIT の u = 0 の行
+    読み方は開度の元 side_table_opening_source（learning.side_table_opening_source。2026-10-20
+    段4-3。既定 "actual" ＝ 実開度、"cmd" ＝ 最終指令の開度。本体の st.opening_source とは独立）・
+    ずれ許容なし・停車の行を残す・窓 LAUNCH_ACCEL_WINDOW_S（従来の発進側と同じ）。表を引く制御は
+    指令の開度を出すので、cmd なら表の u の軸も指令にそろえる（発進の直後は実開度が指令より
+    遅れる）。
+    「動き出す開度」は CSV の RAMP_LAUNCH_RELEASE（無ければ BRAKE_SEARCH）から求める（開度の元は
+    同じ）。
+    stop_release_layer_enabled（learning.stop_release_layer_enabled。既定 false）が true の
+    ときだけ、停止側に戻し量ごとの層（stop_release_accel。`attach_stop_release`）も付ける。層に使う行は
+    停止側の行（上）に加えて、PATTERN_DRIVE の低速のブレーキの行（停車まぎわでなくても、戻し量を
+    持つ行。発進の区間でブレーキを離している行を含む）。false なら層は作らない（None）。
+    クリープ車速が 0 以下の車は両方とも作らない（None）。
+    2026-10-22 段5-3: 加速度の窓は side_table_accel_window_s（learning.side_table_accel_window_s。
+    既定 0.5 ＝ LAUNCH_ACCEL_WINDOW_S）。launch_accel_side_source
+    （learning.launch_accel_side_source）が "measured" のときだけ、発進側のアクセル側を
+    PATTERN_DRIVE の行の実測の点で作り直す
+    （`fwd_map.apply_launch_accel_measured`）。"extrapolate"（既定）は今まで。
+    2026-10-22 段5-4: launch_rows_to_stop_max（learning.launch_rows_to_stop_max。既定 false）が
+    true なら、発進側の表を停止側と同じ車速の行まで広げる
+    （`fwd_map.extend_launch_rows_to_stop_max`。アクセル側の測り直しの前に行う）。side_row_speed_rep（learning.side_row_speed_rep。既定
+    "grid"）が "data" なら、発進側・停止側の置き換えた行の代表車速を学習データの車速の中央値にする
+    （`fwd_map.apply_side_row_speed_rep`。最後に行う）。どちらも既定は今と同じ。
+    """
+    from src.robot.core.fwd_data import (  # noqa: PLC0415
+        PHASE_CREEP_WAIT,
+        PHASE_LOW_RELEASE_STAIR,
+        STOP_SPEED_KMH,
+        concat_rows,
+        launch_breakaway,
+        launch_mask,
+        take_rows,
+    )
+    from src.robot.core.fwd_map import (  # noqa: PLC0415
+        apply_launch_accel_measured,
+        apply_side_row_speed_rep,
+        attach_launch,
+        attach_stop,
+        attach_stop_release,
+        extend_launch_rows_to_stop_max,
+    )
+
+    read = _side_table_reader(
+        csv_path, st, side_table_opening_source=side_table_opening_source,
+        side_table_accel_window_s=side_table_accel_window_s,
+    )
+
+    pattern = read((SECTION_PATTERN_DRIVE,))
+    lm = launch_mask(pattern)
+    creep = read((SECTION_PEDAL_SEARCH,), (PHASE_CREEP_WAIT,))
+    # 発進側の行の集め方は `_collect_launch_rows`（`rebuild_launch_side` と共有）
+    launch_rows = _collect_launch_rows(read, pattern, lm, creep)
+
+    # 停止側の行の集め方は `stop_rows_from_csv`（手順14 が別の CSV にも掛ける）と共有する
+    stop = _collect_stop_rows(read, pattern, lm, creep)
+    brake_step, brake_search = stop.brake_step, stop.brake_search
+    near_stop, press_stair, stop_rows = stop.near_stop, stop.press_stair, stop.rows
+    release_stair = read((SECTION_PEDAL_SEARCH,), (PHASE_LOW_RELEASE_STAIR,))
+    release_stair = take_rows(release_stair, release_stair.speed_kmh >= STOP_SPEED_KMH)
+
+    min_speed = STOP_SPEED_KMH if creep_launch_min_speed_kmh is None else creep_launch_min_speed_kmh
+    # 段7-a: 動き出す開度だけ別のしきい値で測れる（None なら上の min_speed。比較は >=）
+    if launch_breakaway_move_kmh is not None:
+        min_speed = launch_breakaway_move_kmh
+    breakaway = launch_breakaway(
+        csv_path, brake_min_pct=st.brake_deadband_pct, brake_lag_s=st.brake_lag_s,
+        min_speed_kmh=min_speed, opening_source=side_table_opening_source,
+    )
+    table = attach_launch(
+        table, launch_rows, creep_speed_kmh=creep_speed_kmh, breakaway=breakaway,
+        accel_window_s=side_table_accel_window_s,
+        sub_min_weight=launch_table_sub_min_weight,  # 2026-10-31 段4b 案1
+    )
+    table.meta["launch_breakaway_move_kmh"] = float(min_speed)
+    table = attach_stop(
+        table, stop_rows, creep_speed_kmh=creep_speed_kmh, accel_window_s=side_table_accel_window_s,
+        sub_min_weight=stop_table_sub_min_weight,  # 2026-10-31 段2d 案1
+    )
+    if launch_rows_to_stop_max:
+        table = extend_launch_rows_to_stop_max(table)
+    else:
+        table.meta["launch_rows_to_stop_max"] = False
+    if launch_accel_side_source == "measured":
+        table = apply_launch_accel_measured(
+            table, pattern, sub_min_weight=launch_table_sub_min_weight,
+        )
+    else:
+        table.meta["launch_accel_side_source"] = "extrapolate"
+    if stop_release_layer_enabled:
+        # 2026-10-20 段4-3: 停止側の戻し量ごとの層。停止側の行に、PATTERN_DRIVE の低速のブレーキの行
+        # （動いている・u < 0。車速は attach_stop_release が stop_max_speed_kmh 未満に絞る。
+        # 発進の区間でブレーキを離している行を含む）を足す。停車の手前の行は 1 回だけ数える
+        near_or_brake = near_stop | ((pattern.u_pct < 0.0) & (pattern.speed_kmh >= STOP_SPEED_KMH))
+        release_parts = [brake_step, brake_search, take_rows(pattern, near_or_brake)]
+        if len(release_stair.speed_kmh) > 0:  # 段3: 離す向きの階段（動いている行）
+            release_parts.append(release_stair)
+        stop_release_rows = concat_rows(release_parts, "stop_release")
+        table = attach_stop_release(table, stop_release_rows, creep_speed_kmh=creep_speed_kmh)
+    if side_row_speed_rep == "data":
+        table = apply_side_row_speed_rep(table, launch_rows, stop_rows)
+    else:
+        table.meta["side_row_speed_rep"] = "grid"
+    table.meta["side_table_opening_source"] = side_table_opening_source
+    table.meta["side_table_accel_window_s"] = side_table_accel_window_s
+    table.meta["stop_release_layer_enabled"] = bool(stop_release_layer_enabled)
+    stair_press_s = float(press_stair.dt_row_s.sum())
+    stair_release_s = float(release_stair.dt_row_s.sum())
+    if stair_press_s > 0.0 or stair_release_s > 0.0:  # 古い CSV は meta も今までと同じ
+        table.meta["low_stair_press_s"] = stair_press_s
+        table.meta["low_stair_release_s"] = stair_release_s
+    if creep_speed_kmh <= 0.0:
+        say("  発進側・停止側: クリープ車速が 0 なので作らない")
+    if table.launch_accel is None:
+        say(f"  発進側: 行が足りないので作らない（{table.meta['launch_rows_s']:.1f} 秒）")
+    else:
+        say(f"  発進側: 動いている行 {table.meta['launch_rows_s']:.1f} 秒、置き換えた車速の行 "
+            f"{[round(x, 2) for x in table.meta['launch_speed_rows']]} km/h")
+    if breakaway is None:
+        say("  動き出す開度: 求まらず（車速 0 付近の深い側を 0 で埋めない）")
+    else:
+        say(f"  動き出す開度: u={breakaway.u_pct:.2f}%（{breakaway.source}、区間ごと "
+            f"{[round(x, 2) for x in breakaway.per_segment_u_pct]}）")
+    if table.stop_accel is None:
+        say(f"  停止側: 行が足りないので作らない（{table.meta['stop_rows_s']:.1f} 秒）")
+    else:
+        say(f"  停止側: 動いている行 {table.meta['stop_rows_s']:.1f} 秒、置き換えた車速の行 "
+            f"{[round(x, 2) for x in table.meta['stop_speed_rows']]} km/h"
+            f"（引く車速の上限 {table.meta['stop_max_speed_kmh']:g} km/h）")
+        layer_s = table.meta.get("stop_release_layer_s", [])
+        built = table.meta.get("stop_release_layer_built", [])
+        grid = table.meta.get("stop_release_grid_pct", [])
+        if not stop_release_layer_enabled:
+            say("  停止側の戻しの層: 作らない（learning.stop_release_layer_enabled: false）")
+        elif table.stop_release_accel is None:
+            say(f"  停止側の戻しの層: 作らない（層ごとの秒数 {[round(x, 1) for x in layer_s]}）")
+        else:
+            cells = ", ".join(
+                f"{g:g}%: {sec:.1f}秒{'' if ok else '(行不足で一つ下の層)'}"
+                for g, sec, ok in zip(grid, layer_s, built, strict=True)
+            )
+            say(f"  停止側の戻しの層: {cells}、頭打ち {table.meta['stop_release_max_pct']:.2f}%")
+    say(f"  低速の階段（段3）: 踏む向き {stair_press_s:.1f} 秒（停止側の行へ）・"
+        f"離す向き（動いている行）{stair_release_s:.1f} 秒"
+        f"（停止側の戻しの層の行へ。層 {'作る' if stop_release_layer_enabled else '作らない'}"
+        "設定）")
+    say(f"  発進側・停止側の表の開度の元: {side_table_opening_source}、加速度の窓 "
+        f"{side_table_accel_window_s:g} 秒")
+    if table.launch_accel is not None:
+        pts = table.meta.get("launch_accel_measured", {})
+        npts = {k: len(v) for k, v in pts.items()}
+        detail = f"（行ごとの点の数 {npts}）" if launch_accel_side_source == "measured" else ""
+        say(f"  発進側のアクセル側: {launch_accel_side_source}{detail}")
+        say(f"  段5-4: 発進側を停止側の車速の行まで広げる {launch_rows_to_stop_max}"
+            f"（広げた行 {table.meta.get('launch_rows_to_stop_max_rows', [])}）、行の代表車速 "
+            f"{side_row_speed_rep}（発進側 {table.meta.get('launch_speed_rep_map', {})}、"
+            f"停止側 {table.meta.get('stop_speed_rep_map', {})}）")
+    return table
+
+
+def _build_forward_model(
+    profile: VehicleProfile,
+    csv_path: Path,
+    models_dir: Path,
+    hw_mode: str,
+    *,
+    workers: int,
+    seeds: Sequence[int] | None,
+    max_iter: int | None,
+    lags: MeasuredLags | None = None,
+    creep_launch_min_speed_kmh: float | None = None,
+    launch_breakaway_move_kmh: float | None = None,
+    side_table_opening_source: str = "actual",
+    stop_release_layer_enabled: bool = False,
+    accel_release_input_enabled: bool = False,
+    launch_accel_side_source: str = "extrapolate",
+    side_table_accel_window_s: float = LAUNCH_ACCEL_WINDOW_S,
+    launch_rows_to_stop_max: bool = False,
+    side_row_speed_rep: str = "grid",
+    accel_push_input_enabled: bool = False,
+    stop_approach_exclusion: str = "depth",
+    local_gain_brake_speeds_kmh: Sequence[float] | None = None,
+    stop_table_sub_min_weight: bool = False,
+    launch_table_sub_min_weight: bool = False,
+    local_gain_sine_hz: float | None = None,
+) -> _BuiltModel:
+    """C8: C7 の表を先に作って保存し（格子と設定の元）、順モデル（NN）を全ログで学習する。
+
+    2026-10-13 段2o-2: 設定は relu（2 層 50 個・停車まぎわ除外あり・追加学習なし。ユーザー決定。
+    `fwd_final` の CLI の既定（1-1）は変えず、ここで渡す引数だけ変える）。遅れ L は `lags` で
+    測れたペダルだけ表に入れる（C7 の表を作るときと同じ）。
+
+    accel_release_input_enabled（learning.accel_release_input_enabled。既定 false。2026-10-20
+    段4-3）が true のときだけ、アクセル側のニューラルネットの入力に「アクセルの戻し量」を足し
+    （3 入力）、アクセルの戻しの表も作る。false は (車速, u) の 2 入力・戻しの表なし（0ee7c1b より
+    前と同じ）。値は pkl meta accel_release_input_enabled に残る。
+    accel_push_input_enabled（learning.accel_push_input_enabled。既定 false。2026-10-23 段5-7b）が
+    true のときだけ、アクセル側の入力に「アクセルの踏み増し量」をさらに足し（戻し量が on なら 4、
+    off なら 3 入力）、アクセルの踏み増しの表も作る。false は今までと完全に同じ。値は pkl meta
+    accel_push_input_enabled に残る。
+
+    2026-10-23 段5-8: stop_approach_exclusion（learning.stop_approach_exclusion。既定 "depth"）。
+    停車まぎわ除外（FORWARD_DROP_STOP_APPROACH）の外し方。"window" は加速度の窓が停車の瞬間に
+    かかる行だけを外す。値は pkl meta stop_approach_exclusion に残る。
+    """
+    from src.robot.core import fwd_final, fwd_tool, fwd_torch  # noqa: PLC0415
+    from src.robot.core.fwd_map import (  # noqa: PLC0415
+        LOW_RELEASE_BAND_MAX_KMH,
+        load_forward_map,
+        release_seconds_in_band,
+        save_table,
+    )
+
+    say("順モデル（C8）: まず C7 の表を作り（格子と設定の元）、続けてニューラルネットを学習 …")
+    like = _build_table_model(
+        profile, csv_path, models_dir, hw_mode, announce=False, lags=lags,
+        local_gain_brake_speeds_kmh=local_gain_brake_speeds_kmh,
+        local_gain_sine_hz=local_gain_sine_hz,
+    )
+    st = fwd_tool.settings_of_table(
+        load_forward_map(Path(like.model_path)), _forward_settings(profile, lags)
+    )
+    rows = fwd_tool.read_logs([csv_path], st)
+    use_seeds = tuple(fwd_final.DEFAULT_SEEDS if seeds is None else seeds)
+    cfg8 = fwd_final.final_config(
+        use_seeds, hidden=FORWARD_HIDDEN, activation=FORWARD_ACTIVATION,
+        drop_stop_approach=FORWARD_DROP_STOP_APPROACH,
+        table_u_step_pct=FORWARD_TABLE_U_STEP_PCT,
+        accel_release_input=accel_release_input_enabled,
+        accel_push_input=accel_push_input_enabled,
+        stop_approach_exclusion=stop_approach_exclusion,
+    )
+    use_iter = fwd_torch.MAX_ITER if max_iter is None else max_iter
+    say(f"  設定: {cfg8.name}（隠れ層 {cfg8.hidden}・{cfg8.activation}・損失 {cfg8.loss}）、"
+        f"表の u の刻み {FORWARD_TABLE_U_STEP_PCT:g}%、乱数 {list(cfg8.seeds)}、"
+        f"並列 {workers}、max_iter {use_iter}")
+    started = time.perf_counter()
+    table, secs = fwd_final.build_final_table(
+        cfg8, rows, Path(like.model_path), workers=workers, max_iter=use_iter,
+        seed_mae=True,  # 乱数ごとの MAE を meta に残す（チェック B1 の乱数の外れ用）
+    )
+    wall = time.perf_counter() - started
+    table.meta["accel_release_input_enabled"] = bool(accel_release_input_enabled)
+    table.meta["accel_push_input_enabled"] = bool(accel_push_input_enabled)
+    for seed, sec in secs:
+        say(f"    乱数{seed}: 学習 {sec:.1f} 秒")
+    say(f"  学習の合計 {sum(s for _, s in secs):.1f} 秒・壁時計 {wall:.1f} 秒")
+    table = _attach_low_speed_tables(
+        table, csv_path, st, creep_speed_kmh=profile.feedforward_params.creep_speed_kmh,
+        creep_launch_min_speed_kmh=creep_launch_min_speed_kmh,
+        launch_breakaway_move_kmh=launch_breakaway_move_kmh,
+        side_table_opening_source=side_table_opening_source,
+        stop_release_layer_enabled=stop_release_layer_enabled,
+        launch_accel_side_source=launch_accel_side_source,
+        side_table_accel_window_s=side_table_accel_window_s,
+        launch_rows_to_stop_max=launch_rows_to_stop_max,
+        side_row_speed_rep=side_row_speed_rep,
+        stop_table_sub_min_weight=stop_table_sub_min_weight,
+        launch_table_sub_min_weight=launch_table_sub_min_weight,
+    )
+    # 2026-10-14 段2o-5: 戻しの表は build_final_table が付ける（final_config の既定で作る）
+    rel_s = float(table.meta.get("release_rows_s", 0.0))
+    if table.release_grid is None:
+        say(f"  戻しの表: 戻しの行が足りないので作らない（{rel_s:.1f} 秒）")
+    else:
+        say(f"  戻しの表: 戻し量 0.3% 以上のブレーキの行 {rel_s:.1f} 秒、"
+            f"戻し量の格子 {[float(x) for x in table.release_grid]} %、"
+            f"頭打ち {table.meta['release_max_pct']:.2f} %")
+    # 2026-10-20 段4-3: アクセルの戻しの表（build_final_table が付ける）と、7.5〜20 km/h の
+    # ブレーキの戻しの行の秒数（表示だけ。表の作り方には使わない）
+    a_rel_s = float(table.meta.get("accel_release_rows_s", 0.0))
+    if table.accel_release_grid is None:
+        if accel_release_input_enabled:
+            say(f"  アクセルの戻しの表: 戻しの行が足りないので作らない（{a_rel_s:.1f} 秒）")
+        else:
+            say("  アクセルの戻し量: 入力にしない・表も作らない"
+                "（learning.accel_release_input_enabled: false）")
+    else:
+        say(f"  アクセルの戻しの表: 戻し量 0.3% 以上のアクセルの行 {a_rel_s:.1f} 秒、"
+            f"戻し量の格子 {[float(x) for x in table.accel_release_grid]} %、"
+            f"頭打ち {table.meta['accel_release_max_pct']:.2f} %")
+    # 2026-10-23 段5-7b: アクセルの踏み増しの表（build_final_table が付ける）
+    a_push_s = float(table.meta.get("accel_push_rows_s", 0.0))
+    if table.accel_push_grid is None:
+        if accel_push_input_enabled:
+            say(f"  アクセルの踏み増しの表: 行が足りないので作らない（{a_push_s:.1f} 秒）")
+        else:
+            say("  アクセルの踏み増し量: 入力にしない・表も作らない"
+                "（learning.accel_push_input_enabled: false）")
+    else:
+        say(f"  アクセルの踏み増しの表: 踏み増し量 0.3% 以上のアクセルの行 {a_push_s:.1f} 秒、"
+            f"踏み増し量の格子 {[float(x) for x in table.accel_push_grid]} %、"
+            f"頭打ち {table.meta['accel_push_max_pct']:.2f} %")
+    band_lo = float(table.meta.get("stop_max_speed_kmh", 0.0)) or 7.5
+    band_s = sum(release_seconds_in_band(r, band_lo) for r in rows)
+    table.meta["brake_release_band_lo_kmh"] = band_lo
+    table.meta["brake_release_band_hi_kmh"] = LOW_RELEASE_BAND_MAX_KMH
+    table.meta["brake_release_band_s"] = band_s
+    say(f"  戻しの行 {band_lo:g}〜{LOW_RELEASE_BAND_MAX_KMH:g} km/h（ブレーキ・戻し量 0.3% 以上）: "
+        f"{band_s:.1f} 秒")
+    _attach_onsets(table, profile, csv_path)
+    _attach_returns(table, csv_path)
+    _attach_pedal_track(table, csv_path)
+    _attach_local_gain(table, csv_path, local_gain_brake_speeds_kmh, local_gain_sine_hz)
+    _attach_release_gain(table, [csv_path])
+    path = save_table(table, _forward_pkl_path(models_dir, "fwd_model", hw_mode))
+    say(f"モデル保存: {path}")
+    return _BuiltModel(model_path=str(path), metrics={}, c7_path=like.model_path)
+
+
+def _apply_updates_to_cfg(cfg: ResearchConfig, updates: dict[str, Any]) -> None:
+    """ドット区切りキー（"feedforward.creep_speed_kmh" 等）の値を cfg（メモリ上の写し）に入れる。"""
+    for key, value in updates.items():
+        section, name = key.split(".", 1)
+        target = getattr(cfg, section, None)
+        if target is not None and hasattr(target, name):
+            setattr(target, name, value)
+
+
+def _run_step2_checks(
+    *,
+    cfg: ResearchConfig,
+    csv_path: Path,
+    built: _BuiltModel,
+    after: FeedforwardParams,
+    research_after: ResearchFFParams,
+    pedal: PedalSearchResult | None,
+    ramp_results: Sequence[Any] | None,
+    plan_mode: DrivingMode | None,
+    real: bool,
+) -> list[Any]:
+    """手順2 の学習結果のチェック（C2 の「yaml が pkl を指すか」以外。それは yaml を書いた後）。
+
+    手順3 が使う値で確かめるため、cfg の写しに「これから yaml へ書く値」（惰行・クリープ加速
+    カーブ・model_path）と 2-0 の実測（停車保持・クリープ車速。cfg は 2-0 が yaml を書く前の
+    ものなので）を入れて渡す。C1 は実機だけ、yaml を読み直した値と 2-0 の実測を比べる。
+    """
+    from src.robot.core import step2_check  # noqa: PLC0415
+
+    check_cfg = copy.deepcopy(cfg)
+    ff = check_cfg.feedforward
+    ff.model_path = built.model_path
+    ff.coast_decel_speeds_kmh = list(after.coast_decel_speeds_kmh)
+    ff.coast_decel_kmhs = list(after.coast_decel_kmhs)
+    ff.creep_accel_speeds_kmh = list(research_after.creep_accel_speeds_kmh)
+    ff.creep_accel_kmhs = list(research_after.creep_accel_kmhs)
+    if pedal is not None:
+        _apply_updates_to_cfg(check_cfg, pedal.config_updates())
+    yaml_cfg: ResearchConfig | None = None
+    if real and pedal is not None:
+        try:
+            yaml_cfg = load_config(cfg.source_path)
+        except (ConfigError, OSError):
+            yaml_cfg = None
+    return step2_check.run_checks_for_paths(
+        cfg=check_cfg, csv_path=csv_path, model_path=built.model_path, c7_path=built.c7_path,
+        plan_mode=plan_mode, ramp_results=ramp_results,
+        pedal_result=pedal if real else None,  # スタブは 2-0 が yaml を書かないので比べない
+        saved_path=None, yaml_cfg=yaml_cfg,
+    )
+
+
+def _outlier_seeds(model_path: str) -> list[int]:
+    """保存した C8 の pkl の meta（seed_mae）から、外れた乱数を返す。読めなければ空。"""
+    from src.robot.core import step2_check  # noqa: PLC0415
+    from src.robot.core.fwd_map import load_forward_map  # noqa: PLC0415
+
+    try:
+        seed_mae = load_forward_map(Path(model_path)).meta.get("seed_mae")
+    except Exception:  # noqa: BLE001 - 読めないときは学習し直さず、チェックの NG に任せる
+        return []
+    return step2_check.seed_outliers(seed_mae) if seed_mae else []
+
+
+def _only_seed_outliers_ng(checks: Sequence[Any]) -> bool:
+    """NG が B1 の 1 項目だけで、その原因に乱数の外れがあるか（= 学習し直す対象）。"""
+    from src.robot.core import step2_check  # noqa: PLC0415
+
+    ng = step2_check.ng_items(checks)
+    return (
+        len(ng) == 1 and ng[0].id == "B1" and ng[0].metrics.get("seed_outlier_count", 0.0) > 0.0
+    )
+
+
+def _replace_seeds(seeds: Sequence[int], outliers: Sequence[int]) -> tuple[int, ...]:
+    """外れた乱数を別の乱数（+100。他と重なるなら更に +100）に替える。"""
+    used = set(seeds)
+    out: list[int] = []
+    for sd in seeds:
+        if sd in outliers:
+            new = sd + 100
+            while new in used:
+                new += 100
+            used.add(new)
+            out.append(new)
+        else:
+            out.append(sd)
+    return tuple(out)
+
+
+_FORWARD_CANDIDATES = ("C7", "C8", "C10", "C11", "C12", "C13", "C14", "C15")
+
+
+def _previous_hold_meta(
+    cfg: ResearchConfig, new_path: str | Path
+) -> tuple[dict[str, Any], str] | None:
+    """前の pkl（この手順2 の前の yaml の feedforward.model_path）の meta から hold_pi と
+    hold_opening を取り出す（段10-1 C）。両方そろっていなければ None。新しい pkl と同じ・読めない
+    ・meta に無いときも None。戻り値は ({"hold_pi": ..., "hold_opening": ...}, 前の pkl の名前)。"""
+    from src.robot.core.fwd_map import load_forward_map  # noqa: PLC0415
+
+    prev = Path(cfg.feedforward.model_path)
+    if not cfg.feedforward.model_path or prev == Path(new_path) or not prev.exists():
+        return None
+    try:
+        meta = load_forward_map(prev).meta
+    except Exception:  # noqa: BLE001 - 壊れた pkl は引き継がない
+        return None
+    if not meta.get("hold_pi") or not meta.get("hold_opening"):
+        return None
+    return {"hold_pi": meta["hold_pi"], "hold_opening": meta["hold_opening"]}, prev.name
+
+
+def attach_hold_data(
+    cfg: ResearchConfig, model_path: str | Path, csv_path: Path, pedal: PedalSearchResult | None
+) -> Any | None:
+    """手順2 の 4 点の保持（LOW_HOLD。PI を使わず 1 刻み寄せで保った記録）から、保持用の PI
+    （meta["hold_pi"]）と保持の開度（meta["hold_opening"]）を求め、2-2 が保存した pkl に付けて
+    同じパスへ保存する（2026-10-30。fwd_tool attach-hold-pi --phase LOW_HOLD と手順13 の
+    hold_opening と同じ求め方）。
+
+    段10-1 A: 点ごとの「保てた」は、帯に合計 5 s いた、または加速度の符号が変わる瞬間が 2 回以上
+    （pedal_search.apply_crossings）。瞬間で保てた点は車速・開度を瞬間の平均にする。
+    段10-1 C: 保てた点が無い・PI を求められないときは、前の pkl（yaml の今の model_path）の
+    hold_pi・hold_opening を引き継ぐ。前が無ければ付けない（発進のブレーキの帯は使わない扱い。
+    mode_drive.launch_band_for）。LOW_HOLD の行は学習に使わない。
+
+    4 点の保持が無効（pedal_search.hold_points_enabled が false）・pedal が無い（作り直しだけ）
+    なら何もせず None。結果はチェック項目 H1（step2_check.CheckItem）で返す:
+    PI も開度も 4 点から付けられたら OK。そうでなければ（引き継いだ・付けられず）、
+    forward_map.hold_pi_enabled が true なら注意（STATUS_WARN。モデルは使う）、false なら SKIP。
+    """
+    from src.robot.core import hold_pi, step2_check  # noqa: PLC0415
+    from src.robot.core.fwd_map import load_forward_map, save_table  # noqa: PLC0415
+
+    if pedal is None or not cfg.pedal_search.hold_points_enabled:
+        return None
+    name = "hold_attach"
+    needed = cfg.forward_map.hold_pi_enabled
+    bad = step2_check.STATUS_WARN if needed else step2_check.STATUS_SKIP
+    table = load_forward_map(Path(model_path))
+    problems: list[str] = []
+    done: list[str] = []
+    points = list(pedal.hold_points)
+    if points:
+        lag = table.meta.get("brake_lag_s")
+        if lag is not None and math.isfinite(float(lag)):
+            points, note = apply_crossings(points, csv_path, float(lag))
+            say(f"4 点の保持: {note}")
+        else:
+            say("4 点の保持: 瞬間の判定は使えません（brake_lag_s が pkl の meta に無い）")
+    table.meta.pop("hold_pi", None)  # 前の求め直しの値を引きずらない
+    table.meta.pop("hold_opening", None)
+    got_pi = False
+    if not points:
+        problems.append("4 点の保持の点がありません（クリープ車速が低すぎる）")
+    elif not any(p.held for p in points):
+        problems.append(f"4 点の保持で 1 点も保てませんでした（{len(points)} 点）")
+    else:
+        try:
+            res = hold_pi.attach_hold_pi_low_hold(
+                table.meta, csv_path, deviation_c=cfg.forward_map.deviation_c
+            )
+            got_pi = True
+            done.append(
+                f"hold_pi（Kp {res['kp_pct_per_kmh']:.4f}・Ki {res['ki_pct_per_kmh_s']:.4f}・"
+                f"使った点 {res['steps_used']}/{res['steps_total']}）"
+            )
+        except hold_pi.HoldPiError as exc:
+            problems.append(f"保持用 PI を求められません: {exc}")
+    if got_pi:
+        try:
+            min_pct = cfg.vehicle.min_brake_opening_pct
+            table.meta["hold_opening"] = hold_opening_meta(
+                points, creep_kmh=pedal.creep_speed_kmh,
+                breakaway_pct=hold_breakaway_pct(table.meta, min_pct),
+                min_pct=min_pct, source_csv=csv_path.name,
+            )
+            done.append(f"hold_opening（{len(points)} 点）")
+        except KeyError:
+            got_pi = False
+            table.meta.pop("hold_pi", None)
+            done.clear()
+            problems.append(
+                "pkl の meta に launch_breakaway_u_pct がありません（保持の開度を作れません）"
+            )
+    inherited = ""
+    if not got_pi:
+        prev = _previous_hold_meta(cfg, model_path)
+        if prev is not None:
+            table.meta.update(prev[0])
+            inherited = prev[1]
+            done = [f"hold_pi・hold_opening（前の pkl {inherited} から引き継ぎ）"]
+            say(f"4 点の保持: 前の pkl {inherited} の hold_pi・hold_opening を引き継ぎました")
+        else:
+            say("4 点の保持: 前の pkl に引き継げる hold_pi・hold_opening が無いので付けません"
+                "（発進のブレーキの帯は使わない扱いで進みます）")
+    if done:
+        save_table(table, Path(model_path))
+        say(f"4 点の保持から付けて保存: {model_path}（{'・'.join(done)}）")
+    elif not got_pi:
+        save_table(table, Path(model_path))  # 前の値を外した meta を保存（付けない）
+    if problems:
+        for msg in problems:
+            say(f"4 点の保持の自動付与: {msg}")
+        if not needed:
+            say("forward_map.hold_pi_enabled が false なので、注意にはしません（お知らせ）")
+        value = f"前の pkl {inherited} から引き継ぎ" if inherited else "付けられず"
+        extra = "" if inherited else "（発進のブレーキの帯は使わない扱い）"
+        return step2_check.CheckItem(
+            "H1", name, bad, value, str(csv_path.name), "・".join(problems) + extra
+        )
+    return step2_check.CheckItem(
+        "H1", name, step2_check.STATUS_OK, "・".join(done), str(csv_path.name), ""
+    )
+
+
+def build_ff_model(
+    cfg: ResearchConfig,
+    csv_path: Path,
+    *,
+    hw_mode: str,
+    pedal: PedalSearchResult | None = None,
+    write_config: bool | None = None,
+    wltp_mode: DrivingMode | None = None,
+    sample_weight_enabled: bool | None = None,
+    forward_workers: int = FORWARD_WORKERS,
+    forward_seeds: Sequence[int] | None = None,
+    forward_max_iter: int | None = None,
+    ramp_results: Sequence[Any] | None = None,
+) -> ModelBuildResult:
+    """走行 CSV からモデル（candidate の種類）と物理定数を作り、実機走行なら YAML へ保存する。
+
+    ① 物理定数の推定と保存（惰行カーブ・クリープ加速カーブ・停止ブレーキ下限・ペダルゲイン。
+       candidate に依らない）と、② モデル作成（candidate で分岐）に分かれる。
+    ②（段2k 段D。ProblemReport_20261001）:
+        C1〜C5 … 2次多項式 Ridge 逆モデル（`_build_poly_model`。本番 training_service と同じ
+                  順序で、学習時点のプロファイル値を使う。A1＝そのペダルが効いている行だけで学習する
+                  研究用の `train_inverse_model_effective`）
+        C7    … 順モデルの表（`_build_table_model`。車速 × 効く開度 u → 加速度）
+        C8    … C7 の表を先に作って格子・設定の元にし、ニューラルネットの順モデルを全ログで
+                  学習した表（`_build_forward_model`）
+        どの candidate でも write_config のとき `feedforward.model_path` を作った pkl に書く
+        （`feedforward.candidate` は書き換えない）。
+    `pedal` があれば 2-0 の実測値（停車保持開度・クリープ平衡車速）をプロファイルへ反映してから
+    学習する（C7・C8 の u の原点は yaml の vehicle.min_*_opening_pct）。サンプル不足は本番の
+    LearningDataError をそのまま送出する。
+
+    `write_config` 省略時（None）は従来どおり `hw_mode == HW_REAL` で判定する。明示的に指定すると
+    実機モードでも保存を止められる（`src.robot.core.relearn` の `--dry-run` 用。段2.5）。
+
+    段2（ProblemReport_20260925。学習サンプルの WLTP 重み付け。C1〜C5 のみ）:
+        `wltp_mode` を渡すと、その基準車速から作った WLTP 格子（`wltp_grid.wltp_cells`）で
+        `WltpWeighting` を組み、`train_inverse_model_effective` に渡す。`sample_weight_enabled`
+        省略時（None）は `sample_weight.SAMPLE_WEIGHT_ENABLED` に従う（明示すれば一時的に
+        上書きできる。`src.robot.core.relearn` の `--weight` 用）。有効なのに `wltp_mode` が
+        無い場合は `ConfigError`（重みの計算に WLTP の基準車速が要るため）。
+
+    `forward_workers`・`forward_seeds`・`forward_max_iter` は C8 の学習用（並列数・乱数・
+    最大反復。省略時は FORWARD_WORKERS・fwd_final.DEFAULT_SEEDS・fwd_torch.MAX_ITER。
+    学習時間の枠に合わせて変えられる。テストは max_iter を小さくする）。
+
+    手順2 の学習結果のチェック（2026-10-16 段2o-7。`step2_check`）:
+        順番は「モデル作成 → チェック（C2 以外）→ OK なら yaml 書き込み → C2（yaml を読み直す）」。
+        `ramp_results`（G ランプの結果。B5① 用）・`pedal`（C1 用）・`wltp_mode`（D1・B3 用）を
+        チェックの材料にする。無い材料の項目は SKIP。表は yaml を書く前に表示する。
+        段10-1: 止める NG（C2・D1 の NaN・B1。step2_check.is_blocking）があれば、**yaml を
+        書き換えず**（pkl は残す）`Step2CheckError` を出す。それ以外の NG は「注意」（WARN）に
+        してチェック表に残し、モデルは使う（yaml を書く）。C2 は yaml を書いた後に確かめ、NG なら
+        書く前の yaml に戻して `Step2CheckError`。スタブ（hw_mode != real）は表示するだけで
+        止めない。B1 が乱数の外れだけで止める NG なら、外れた乱数を別の乱数に替えて 1 回だけ
+        学習し直して再チェックする。
+    """
+    require_forward_candidate(cfg)  # 2026-10-08 段2l-6: C1〜C5 は対象外（読み込みの前に止める）
+    logs = read_drive_logs(csv_path)
+    say(f"学習データ: {csv_path}（{len(logs)} 行）")
+    profile = build_vehicle_profile(cfg)
+    if pedal is not None:
+        profile = pedal.apply_to_profile(profile)
+    if write_config is None:
+        write_config = hw_mode == HW_REAL
+    if hw_mode != HW_REAL:
+        profile.id = f"{profile.id}_{hw_mode}"  # スタブのモデルは別名で保存する
+
+    candidate = cfg.feedforward.candidate
+    models_dir = Path(cfg.feedforward.model_path).parent
+    lags: MeasuredLags | None = None
+    # 2026-10-13 段2o-2: 遅れの測定（HOLD_STEP）を表の遅れ L に入れる（C10 は C8 と同じ。段2p）
+    if candidate in ("C7", "C8", "C10", "C11", "C12", "C13", "C14", "C15"):
+        lags = measure_pedal_lags(
+            csv_path,
+            accel_min_pct=profile.feedforward_params.accel_deadband_pct,
+            brake_min_pct=profile.feedforward_params.brake_deadband_pct,
+        )
+        _say_pedal_lags(lags, cfg.learning.ramp_lag_speeds_kmh)
+    if candidate == "C7":
+        built = _build_table_model(
+            profile, csv_path, models_dir, hw_mode, lags=lags,
+            local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
+            local_gain_sine_hz=cfg.learning.ramp_cruise_sine_hz,
+        )
+    elif candidate in ("C8", "C10", "C11", "C12", "C13", "C14", "C15"):  # C10〜C15: C8 と同じ pkl
+        built = _build_forward_model(
+            profile, csv_path, models_dir, hw_mode,
+            workers=forward_workers, seeds=forward_seeds, max_iter=forward_max_iter, lags=lags,
+            creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
+            launch_breakaway_move_kmh=cfg.learning.launch_breakaway_move_kmh,
+            side_table_opening_source=cfg.learning.side_table_opening_source,
+            stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
+            accel_release_input_enabled=cfg.learning.accel_release_input_enabled,
+            accel_push_input_enabled=cfg.learning.accel_push_input_enabled,
+            launch_accel_side_source=cfg.learning.launch_accel_side_source,
+            side_table_accel_window_s=cfg.learning.side_table_accel_window_s,
+            launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,
+            side_row_speed_rep=cfg.learning.side_row_speed_rep,
+            stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
+            local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
+            local_gain_sine_hz=cfg.learning.ramp_cruise_sine_hz,
+            stop_table_sub_min_weight=cfg.learning.stop_table_sub_min_weight,
+            launch_table_sub_min_weight=cfg.learning.launch_table_sub_min_weight,
+        )
+    else:
+        built = _build_poly_model(
+            cfg, csv_path, logs, profile, models_dir,
+            wltp_mode=wltp_mode, sample_weight_enabled=sample_weight_enabled,
+        )
+
+    say("estimate_dynamics_params: クリープ・惰行減速カーブ・ペダルゲインを推定 …")
+    before = profile.feedforward_params
+    after = estimate_dynamics_params(logs, before)
+
+    # 惰行カーブの低速端を先に直す（段2.5）。サンプル抽出条件（不感帯・creep_speed_kmh）は
+    # before（2-0 実測）を基準にする。差し替え先は after（他の推定値はそのまま残す）
+    after = _estimate_research_coast_curve(cfg, logs, before, after)
+
+    # 以降の研究側推定（クリープ加速カーブ・ペダルゲイン）が使う基準 reference を作る:
+    # before（2-0 実測の不感帯・停車保持・creep_speed_kmh）はそのまま保ち、惰行カーブだけ
+    # 今回同定したものに差し替える。**after をそのまま基準に使ってはいけない**——after の
+    # accel_deadband_pct/brake_deadband_pct は estimate_dynamics_params の推定値（表示専用・
+    # MEASURED_KEYS で保存対象外の参考値）で、2-0 実測（8.53%/12.00%）よりかなり粗い
+    # （実測 3.0%/3.0% 相当）。これを基準にすると「両ペダルが不感帯以下＝ペダルオフ」判定が
+    # 崩れ、待機位置（6.53%/10.00%）の行が軒並み「踏んでいる」扱いになって惰行サンプルが
+    # 995→361 点まで減り、ゲインの分母（開度−不感帯）も壊れる（accel_gain が 4.51→0.52 まで
+    # 縮む）。クリープ加速カーブ・低速ブレーキゲインの順で推定する（クリープ加速カーブを
+    # 基準に使うため、この順序は必須。ProblemReport_20260916 課題#2）
+    research_before = research_ff_params(cfg)
+    reference = replace(
+        before,
+        coast_decel_speeds_kmh=after.coast_decel_speeds_kmh,
+        coast_decel_kmhs=after.coast_decel_kmhs,
+    )
+    research_after = _estimate_research_creep_curve(cfg, logs, reference, research_before)
+    # 2026-10-08 段2l-6: クリープ域ブレーキ保持をパターン列から外したので、クリープ域ブレーキの
+    # 下限（stop_brake_floor_offset_pct）は推定しない（yaml の値を据え置く）。
+    # _estimate_research_stop_brake_floor のコード削除は実機確認の後の別の段
+    after = _estimate_research_pedal_gains(cfg, logs, reference, after, research_after)
+    _print_param_changes(before, after, research_before, research_after)
+
+    # 手順2 の学習結果のチェック（yaml を書く前）。NG なら止める（スタブは表示のみ）
+    from src.robot.core import step2_check  # noqa: PLC0415
+
+    real = hw_mode == HW_REAL
+
+    def run_checks_now() -> list[Any]:
+        return _run_step2_checks(
+            cfg=cfg, csv_path=csv_path, built=built, after=after, research_after=research_after,
+            pedal=pedal, ramp_results=ramp_results, plan_mode=wltp_mode, real=real,
+        )
+
+    # 4 点の保持（手順2 の LOW_HOLD）から PI と保持の開度を、yaml を書く前の pkl に付ける。
+    # チェック（launch_brake_band は meta の hold_pi・hold_opening を要る）より前に付ける
+    # （2026-11-01 段6b。以前は後で、終了コード 2 になった）。学習し直したら付け直す
+    hold_item = (
+        attach_hold_data(cfg, built.model_path, csv_path, pedal)
+        if candidate in _FORWARD_CANDIDATES else None
+    )
+    say()
+    say("手順2 の学習結果のチェック（手順3 に影響する範囲）:")
+    checks = run_checks_now()
+    if candidate in (
+        "C8", "C10", "C11", "C12", "C13", "C14", "C15"
+    ) and _only_seed_outliers_ng(checks):
+        outliers = _outlier_seeds(built.model_path)
+        from src.robot.core import fwd_final  # noqa: PLC0415
+
+        base_seeds = tuple(fwd_final.DEFAULT_SEEDS if forward_seeds is None else forward_seeds)
+        new_seeds = _replace_seeds(base_seeds, outliers)
+        say(step2_check.format_checks(checks))
+        say(f"乱数 {outliers} の学習データでの MAE が外れているので、{list(new_seeds)} に替えて"
+            "1 回だけ学習し直します …")
+        built = _build_forward_model(
+            profile, csv_path, models_dir, hw_mode,
+            workers=forward_workers, seeds=new_seeds, max_iter=forward_max_iter, lags=lags,
+            creep_launch_min_speed_kmh=getattr(cfg.learning, "creep_launch_min_speed_kmh", None),
+            launch_breakaway_move_kmh=cfg.learning.launch_breakaway_move_kmh,
+            side_table_opening_source=cfg.learning.side_table_opening_source,
+            stop_release_layer_enabled=cfg.learning.stop_release_layer_enabled,
+            accel_release_input_enabled=cfg.learning.accel_release_input_enabled,
+            accel_push_input_enabled=cfg.learning.accel_push_input_enabled,
+            launch_accel_side_source=cfg.learning.launch_accel_side_source,
+            side_table_accel_window_s=cfg.learning.side_table_accel_window_s,
+            launch_rows_to_stop_max=cfg.learning.launch_rows_to_stop_max,
+            side_row_speed_rep=cfg.learning.side_row_speed_rep,
+            stop_approach_exclusion=cfg.learning.stop_approach_exclusion,
+            local_gain_brake_speeds_kmh=cfg.learning.ramp_dither_brake_speeds_kmh,
+            local_gain_sine_hz=cfg.learning.ramp_cruise_sine_hz,
+            stop_table_sub_min_weight=cfg.learning.stop_table_sub_min_weight,
+            launch_table_sub_min_weight=cfg.learning.launch_table_sub_min_weight,
+        )
+        hold_item = attach_hold_data(cfg, built.model_path, csv_path, pedal)
+        checks = run_checks_now()
+    if hold_item is not None:
+        checks.append(hold_item)
+    # 段10-1: 止める NG（C2・D1 の NaN・B1）以外は「注意」にして、モデルは使う
+    checks = step2_check.classify_checks(checks)
+    say(step2_check.format_checks(checks))
+    warn_text = step2_check.format_warn(checks)
+    if warn_text:
+        say(warn_text)
+    ng = step2_check.ng_items(checks)
+    model_path, metrics = built.model_path, built.metrics
+    if ng and not real:
+        say("チェックに NG がありますが、スタブのため止めません。")
+    elif ng:
+        say(f"yaml は書き換えません。作った pkl は残してあります: {model_path}")
+        raise step2_check.Step2CheckError(checks)
+
+    if not write_config:
+        if hw_mode == HW_REAL:
+            say(f"--dry-run のため {cfg.source_path} は更新しません（推定値の確認のみ）")
+        else:
+            say(f"スタブ走行のため {cfg.source_path} は更新しません"
+                "（実機の値を模擬値で上書きしないため）")
+        return ModelBuildResult(
+            model_path=model_path, metrics=metrics, params=after, changed=[],
+            research_params=research_after, checks=checks,
+        )
+
+    yaml_before = cfg.source_path.read_text(encoding="utf-8")  # C2 が NG のとき戻す
+    updates: dict[str, Any] = {"feedforward.model_path": model_path, **built.updates}
+    for key in FF_PARAM_KEYS:
+        if key in MEASURED_KEYS:
+            continue
+        value = getattr(research_after, key) if key in RESEARCH_PARAM_KEYS else getattr(after, key)
+        updates[f"feedforward.{key}"] = list(value) if isinstance(value, tuple) else float(value)
+    changed = cfg.save(updates)
+    say(f"{cfg.source_path} に保存しました（{len(changed)} 行を更新）:")
+    for line in changed:
+        say(f"  {line}")
+    # C2: 書いた yaml を読み直して、model_path が保存した pkl を指し、読めることを確かめる
+    c2 = step2_check.check_model_path(load_config(cfg.source_path), model_path)
+    checks = [c2 if c.id == "C2" else c for c in checks]
+    say(f"C2 {c2.name}: {c2.status}（{c2.value} ← 保存した pkl {model_path}。{c2.reason}）")
+    if c2.status == step2_check.STATUS_NG:
+        cfg.source_path.write_text(yaml_before, encoding="utf-8")  # 書いた分を戻す
+        say(f"C2 が NG のため yaml を書く前の内容に戻しました（前のモデルのまま）。"
+            f"作った pkl は残してあります: {model_path}")
+        raise step2_check.Step2CheckError([c2])
+    return ModelBuildResult(
+        model_path=model_path, metrics=metrics, params=after, changed=changed,
+        research_params=research_after, checks=checks,
+    )
+
+
+def _build_poly_model(
+    cfg: ResearchConfig,
+    csv_path: Path,
+    logs: list[DriveLog],
+    profile: VehicleProfile,
+    models_dir: Path,
+    *,
+    wltp_mode: DrivingMode | None,
+    sample_weight_enabled: bool | None,
+) -> _BuiltModel:
+    """C1〜C5: 2次多項式 Ridge 逆モデル（ホライズン自動選択・実質Kp 符号確認・係数書き出し）。"""
+    enabled = SAMPLE_WEIGHT_ENABLED if sample_weight_enabled is None else sample_weight_enabled
+    if enabled and wltp_mode is None:
+        raise ConfigError(
+            "sample_weight_enabled が有効ですが wltp_mode が渡されていません"
+            "（WLTP 重み付けには基準車速が必要です）"
+        )
+
+    say("train_inverse_model_effective: 2次多項式＋標準化＋Ridge（アクセル/ブレーキの 2 モデル）"
+        "を、そのペダルが効いている行だけで学習 …")
+    # spec は WLTP 重み付けの regime 情報（h1）を取り出すためだけに使う（手順6 でホライズン
+    # 自動選択が有効でも、v0・要求加速度 dv_h1/h1 の値はどの spec で取り出しても同じ）
+    spec = cfg.features.to_feature_spec()
+
+    ft = cfg.features
+    if ft.horizon_search:
+        say("ホライズン自動選択（features.horizon_search: true）: "
+            "アクセル・ブレーキ別に交差検証 MAE が最も下がる先読みを貪欲法で選択 …")
+        settings = HorizonSearchSettings(
+            grid=ft.search_grid(),
+            max_horizons=ft.search_max_horizons,
+            min_improvement=ft.search_min_improvement,
+            cv_splits=ft.search_cv_splits,
+            regime_horizon_s=ft.h1_s,
+            past_horizons_s=ft.past_horizons_s(),
+            past_as_delta=ft.past_as_delta,
+            include_v0_sq=ft.use_v0_sq,
+            include_dv_regime_x_v0=ft.use_dv1_x_v0,
+            gain_check_speeds_kmh=tuple(ft.search_gain_check_speeds_kmh),
+            min_deviation_gain=ft.search_min_deviation_gain,
+        )
+        patterns = read_pattern_groups(csv_path)
+        accel_result, brake_result = search_ff_horizons(
+            logs, patterns, profile.feedforward_params.accel_deadband_pct,
+            profile.feedforward_params.brake_deadband_pct, settings,
+        )
+        for result in (accel_result, brake_result):
+            say(f"  {result.pedal}:")
+            for line in format_result_table(result).splitlines():
+                say(f"    {line}")
+        accel_spec, brake_spec = accel_result.spec, brake_result.spec
+        say(f"  選んだ先読み: アクセル {list(accel_spec.lookahead_horizons_s)} / "
+            f"ブレーキ {list(brake_spec.lookahead_horizons_s)}"
+            f"（停車保持・ブレーキ下限は h0_s={ft.h0_s}s 先を見続ける）")
+    else:
+        accel_spec = brake_spec = spec
+        say(f"特徴量（config features）: {spec.feature_names()}")
+
+    weighting: WltpWeighting | None = None
+    if wltp_mode is not None:
+        # wltp_grid は mode_drive を import しており、mode_drive は pattern_drive を import して
+        # いる（_overcurrent_limit_ma・_release_pedals）。モジュール先頭で import すると
+        # pattern_drive → wltp_grid → mode_drive → pattern_drive の循環になるため、ここで
+        # ローカル import する。
+        from src.robot.core.wltp_grid import (
+            GRID_ACCEL_EDGES_KMHS,
+            GRID_SPEED_EDGES_KMH,
+            edges_from_config,
+            wltp_cells,
+        )
+
+        edges = edges_from_config(GRID_SPEED_EDGES_KMH, GRID_ACCEL_EDGES_KMHS)
+        wltp_s = wltp_cells(wltp_mode, edges, spec)
+        weighting = WltpWeighting(
+            wltp_s=wltp_s, speed_edges_kmh=edges.speed_kmh, accel_edges_kmhs=edges.accel_kmhs,
+            w_min=SAMPLE_WEIGHT_MIN, w_max=SAMPLE_WEIGHT_MAX, enabled=enabled,
+        )
+        say(f"WLTP 重み付け: {'有効' if enabled else '無効'}"
+            f"（w_min={SAMPLE_WEIGHT_MIN:g}, w_max={SAMPLE_WEIGHT_MAX:g}）")
+    else:
+        say("WLTP 重み付け: 無効（wltp_mode 未指定）")
+
+    model_path, metrics = train_inverse_model_effective(
+        logs, profile, output_dir=str(models_dir), accel_spec=accel_spec, brake_spec=brake_spec,
+        stop_horizon_s=ft.h0_s, weighting=weighting,
+    )
+    say(f"モデル保存: {model_path}")
+    _print_metrics(metrics)
+
+    say("実質Kp（deviation_gain）の符号確認 …")
+    _verify_final_model_gain(model_path, ft)
+
+    coef_path = export_model_coefficients(model_path)
+    say(f"係数（元の単位に換算・参照用）: {coef_path}")
+
+    say("ペダル遅れ L: 格子ステップが無いので測りません（pedal_select_center_s は据え置き）")
+    updates: dict[str, Any] = {
+        # 参照用（走行は pkl を読む）。ホライズン・特徴量・係数の場所を config から見えるようにする
+        "feedforward.model_accel_horizons_s": list(accel_spec.lookahead_horizons_s),
+        "feedforward.model_brake_horizons_s": list(brake_spec.lookahead_horizons_s),
+        "feedforward.model_accel_features": accel_spec.feature_names(),
+        "feedforward.model_brake_features": brake_spec.feature_names(),
+        "feedforward.model_coef_path": str(coef_path),
+    }
+    return _BuiltModel(model_path=model_path, metrics=metrics, updates=updates)
+
+
+def _estimate_research_coast_curve(
+    cfg: ResearchConfig,
+    logs: list[DriveLog],
+    reference: FeedforwardParams,
+    target: FeedforwardParams,
+) -> FeedforwardParams:
+    """惰行減速カーブの低速端を細ビンで再同定する（段2.5。ProblemReport_20260916）。
+
+    estimate_dynamics_params の直後・クリープ加速カーブ推定（_estimate_research_creep_curve）の
+    前に呼ぶこと（クリープ加速カーブ・ペダルゲインの両方が free_accel_at 経由でこのカーブを
+    基準に使うため順序が必須）。
+
+    `reference` はサンプル抽出条件（不感帯・creep_speed_kmh）に使う基準で、**必ず 2-0 実測を
+    持つ `before` を渡すこと**。estimate_dynamics_params が返す after の
+    accel_deadband_pct/brake_deadband_pct は表示専用の推定値（MEASURED_KEYS で保存されない
+    参考値）で、2-0 実測（例 8.53%/12.00%）よりかなり粗い（例 3.0%/3.0%）。ここを基準にすると
+    「両ペダルが不感帯以下」判定が崩れ、待機位置の行が全部「踏んでいる」扱いになって惰行
+    サンプルが激減する（実測: 995→361 点）。
+    `target` は差し替え先（coast_decel_speeds_kmh/coast_decel_kmhs だけを上書きして返す。
+    他のフィールドは target のまま保持する）。FeedforwardParams が持つので、置き換えるだけで
+    自動保存（FF_PARAM_KEYS）に乗る。
+    """
+    lr = cfg.learning
+    say(f"coast_curve.estimate_coast_decel_curve: 惰行カーブの低速端を細ビンで再同定"
+        f"（低速 {lr.coast_curve_low_bin_kmh:g} km/h 幅・{lr.coast_curve_low_max_kmh:g} km/h まで、"
+        f"最少 {lr.coast_curve_low_min_bin_samples} 点/ビン）…")
+    curve = estimate_coast_decel_curve(
+        logs, reference,
+        low_bin_kmh=lr.coast_curve_low_bin_kmh,
+        low_max_kmh=lr.coast_curve_low_max_kmh,
+        low_min_bin_samples=lr.coast_curve_low_min_bin_samples,
+    )
+    if curve.identified:
+        say(f"  速度 {_format_param(curve.speeds_kmh)}  減速 {_format_param(curve.decels_kmh)}"
+            f"（{curve.samples} 点）")
+        return replace(
+            target, coast_decel_speeds_kmh=curve.speeds_kmh, coast_decel_kmhs=curve.decels_kmh
+        )
+    say(f"  同定できず（条件を満たす {curve.samples} 点。既存値のまま）")
+    return target
+
+
+def _estimate_research_creep_curve(
+    cfg: ResearchConfig,
+    logs: list[DriveLog],
+    params: FeedforwardParams,
+    before: ResearchFFParams,
+) -> ResearchFFParams:
+    """クリープ加速カーブを推定する（ProblemReport_20260916 課題#2）。
+
+    estimate_dynamics_params の直後・低速ブレーキゲイン推定（_estimate_research_pedal_gains）の
+    前に呼ぶこと（低速ブレーキゲインはこのカーブを基準に使うため順序が必須）。`params` は
+    2026-09-18（段2.5）から `build_ff_model` の `reference`（before の実測不感帯・
+    creep_speed_kmh を保ったまま、惰行カーブだけ今回同定したものに差し替えたもの）を渡す。
+    `estimate_dynamics_params` の生の `after` を渡してはいけない
+    （`_estimate_research_coast_curve` の docstring 参照。after の不感帯は表示専用の粗い
+    推定値で、サンプル抽出条件が壊れる）。
+    """
+    lr = cfg.learning
+    say(f"creep_curve.estimate_creep_accel_curve: クリープ加速カーブ推定"
+        f"（ビン幅 {lr.creep_curve_bin_kmh:g} km/h、"
+        f"最少 {lr.creep_curve_min_bin_samples} 点/ビン）…")
+    curve = estimate_creep_accel_curve(
+        logs, params,
+        bin_kmh=lr.creep_curve_bin_kmh, min_bin_samples=lr.creep_curve_min_bin_samples,
+    )
+    if curve.identified:
+        say(f"  速度 {_format_param(curve.speeds_kmh)}  加速度 {_format_param(curve.accel_kmhs)}"
+            f"（{curve.samples} 点）")
+        return replace(
+            before, creep_accel_speeds_kmh=curve.speeds_kmh, creep_accel_kmhs=curve.accel_kmhs
+        )
+    say(f"  同定できず（条件を満たす {curve.samples} 点。既存値のまま）")
+    return before
+
+
+def _estimate_research_stop_brake_floor(
+    cfg: ResearchConfig,
+    logs: list[DriveLog],
+    params: FeedforwardParams,
+    before: ResearchFFParams,
+) -> ResearchFFParams:
+    """クリープ域ブレーキの下限を推定する（段4改訂。ProblemReport_20260916）。
+
+    `_estimate_research_coast_curve` と同じ流儀・同じ理由: サンプル抽出条件（不感帯・
+    creep_speed_kmh）は必ず 2-0 実測を保つ `params`（`build_ff_model` の `reference`）を
+    渡すこと。`estimate_dynamics_params` の生の `after` を渡してはいけない
+    （`_estimate_research_coast_curve` の docstring 参照。after の不感帯は表示専用の粗い推定値で
+    「両ペダルが不感帯以下」判定が崩れる）。
+
+    候補開度はパターン生成（`build_patterns`）と同じ関数 `creep_brake_hold_openings`
+    （不感帯 + frac × (停車保持開度 − 不感帯)）で組む。手順2 が実際に
+    指令した開度そのものなので、`stop_brake_floor.py` の `phase` 列が使えない制約に対応する
+    （モジュール docstring 参照）。開始車速は `reference.creep_speed_kmh`（= before のクリープ
+    平衡）。
+    """
+    lr = cfg.learning
+    candidate_openings_pct = creep_brake_hold_openings(
+        params.brake_deadband_pct, params.stop_brake_opening_pct, CREEP_BRAKE_HOLD_FRACS
+    )
+    say(f"stop_brake_floor.estimate_stop_brake_floor: クリープ域ブレーキの下限を推定"
+        f"（候補開度 {_format_param(candidate_openings_pct)}、"
+        f"平衡 {params.creep_speed_kmh:.2f}±{lr.stop_brake_floor_start_tol_kmh:g} km/h）…")
+    floor = estimate_stop_brake_floor(
+        logs, params,
+        candidate_openings_pct=candidate_openings_pct,
+        start_speed_kmh=params.creep_speed_kmh,
+        start_tol_kmh=lr.stop_brake_floor_start_tol_kmh,
+        min_float_s=lr.stop_brake_floor_min_float_s,
+        opening_tol_pct=lr.stop_brake_floor_opening_tol_pct,
+    )
+    if floor.identified:
+        say(f"  停止 {_format_param(floor.stopped_pct)}  浮く {_format_param(floor.floated_pct)}"
+            f"  → offset_pct={floor.offset_pct:.2f}")
+        return replace(before, stop_brake_floor_offset_pct=floor.offset_pct)
+    say(f"  同定できず（停止 {_format_param(floor.stopped_pct)}  "
+        f"浮く {_format_param(floor.floated_pct)}。既存値のまま）")
+    return before
+
+
+def _estimate_research_pedal_gains(
+    cfg: ResearchConfig,
+    logs: list[DriveLog],
+    before: FeedforwardParams,
+    after: FeedforwardParams,
+    research: ResearchFFParams,
+) -> FeedforwardParams:
+    """ペダルゲインを「不感帯 + learning.*_gain_min_offset_pct 以上」で推定し直す。
+
+    ブレーキ側はクリープ域（速度 < creep_speed_kmh）も対象になる（`research` を基準に使う。
+    pedal_gain.estimate_gain_curve の docstring 参照）。
+
+    `before` は free_accel_at の基準（惰行カーブ・不感帯・creep_speed_kmh）に使う
+    FeedforwardParams。本番 estimate_dynamics_params はゲイン推定の基準線を意図的に
+    `current`（前回同定値）に固定している（ビンの埋まり方でゲインが揺れるのを避けるため）が、
+    2026-09-18（段2.5）からは `current` の惰行カーブが実測とずれていることが分かっているため、
+    `build_ff_model` は `reference`（before の実測不感帯・creep_speed_kmh を保ったまま、惰行
+    カーブだけ今回同定したものに差し替えたもの）を渡す（`brake_gain_kmhs_per_pct` の 5.0km/h
+    落ち込み 0.132 がこれで直るかを確認する）。`estimate_dynamics_params` の生の `after` を
+    渡してはいけない（`_estimate_research_coast_curve` の docstring 参照。after の不感帯は
+    表示専用の粗い推定値で、「不感帯以下＝ペダルオフ」判定とゲインの分母（開度−不感帯）が
+    壊れる）。
+    """
+    lr = cfg.learning
+    say(f"ペダルゲイン: 研究側の推定（開度 ≥ 不感帯 + アクセル {lr.accel_gain_min_offset_pct:g}% / "
+        f"ブレーキ {lr.brake_gain_min_offset_pct:g}%、開度 1s 定常。"
+        f"本番は +{PEDAL_GAIN_MIN_OPENING_PCT:g}%）")
+    say(f"  本番条件の推定: 速度 {_format_param(after.pedal_gain_speeds_kmh)}  "
+        f"アクセル {_format_param(after.accel_gain_kmhs_per_pct)}  "
+        f"ブレーキ {_format_param(after.brake_gain_kmhs_per_pct)}")
+    curves = {}
+    for label, is_accel, offset in (
+        ("アクセル", True, lr.accel_gain_min_offset_pct),
+        ("ブレーキ", False, lr.brake_gain_min_offset_pct),
+    ):
+        curve = estimate_gain_curve(
+            logs, before, research, is_accel=is_accel, min_offset_pct=offset,
+            creep_bin_kmh=lr.creep_curve_bin_kmh,
+            creep_min_bin_samples=lr.creep_curve_min_bin_samples,
+        )
+        if curve.identified:
+            say(f"  {label}: 使用 {curve.samples} 点・速度帯 {len(curve.speeds_kmh)} 個 → "
+                f"速度 {_format_param(curve.speeds_kmh)}  ゲイン {_format_param(curve.gains)}")
+        else:
+            say(f"  {label}: 同定できず（条件を満たす {curve.samples} 点。本番推定の値のまま）")
+        curves[is_accel] = curve
+    return apply_pedal_gains(after, accel=curves[True], brake=curves[False])
+
+
+def _print_metrics(metrics: dict[str, dict[str, float]]) -> None:
+    say("── 逆モデルの当てはまり（学習データ上。開度 [%] の誤差） ──")
+    for side, label in (("accel", "アクセル"), ("brake", "ブレーキ")):
+        m = metrics[side]
+        r2 = f"{m['r2']:.3f}" if "r2" in m else "---"
+        # below_deadband: 予測が不感帯未満だった割合（B3 の切り上げ前。A1 が効いたかの指標）
+        ratio = m.get("below_deadband")
+        below = "" if ratio is None else f"  不感帯未満の予測={100.0 * ratio:.0f}%"
+        # mae_wltp: 段2（ProblemReport_20260925）。WLTP の分布で重み付けした MAE
+        # （重みなし／ありのモデルを同じ物差しで比べるため。weighting 指定時のみ入る）
+        mae_wltp = m.get("mae_wltp")
+        wltp_text = "" if mae_wltp is None else f"  MAE_WLTP={mae_wltp:.2f}"
+        say(f"  {label}: MAE={m['mae']:.2f}  RMSE={m['rmse']:.2f}  R²={r2}  n={int(m['n'])}"
+            f"{below}{wltp_text}")
+        if "weight_mean" in m:
+            say(
+                f"    重み: min={m['weight_min']:.2f} max={m['weight_max']:.2f} "
+                f"mean={m['weight_mean']:.2f} "
+                f"下限張付={100.0 * m['weight_at_min_ratio']:.0f}% "
+                f"上限張付={100.0 * m['weight_at_max_ratio']:.0f}%"
+            )
+
+
+def _verify_final_model_gain(model_path: str, ft: FeaturesSection) -> None:
+    """保存直後の pkl の両ペダルで実質Kp（deviation_gain）の符号を確認する。
+
+    案a（ProblemReport_20260921 手順6 段2。2026-09-28）: `horizon_search.search_pedal` の
+    候補選定で除外していても、WLTP 重み付けなど探索とは学習行・重みが違う条件で最終学習した
+    結果は別物になりうる。`horizon_search: false`（固定ホライズン）のときも含め、保存した
+    pkl そのものを最後にもう一度確かめる（実機破綻の再発防止の最後の網）。
+
+    速度は `search_gain_check_speeds_kmh`（空なら確認しない）。推論時に実際にクリップされる
+    上限（pkl の `speed_clip_max`）を超える速度は確認しない。
+
+    Raises:
+        ConfigError: いずれかのペダル・速度で実質Kpが `search_min_deviation_gain` を下回る場合
+    """
+    check_speeds = ft.search_gain_check_speeds_kmh
+    if not check_speeds:
+        return
+    path = Path(model_path)
+    for side in ("accel", "brake"):
+        model, spec, meta = _load_pkl(path, side)
+        clip = meta.get("speed_clip_max")
+        speeds = [v for v in check_speeds if clip is None or v <= clip]
+        gains = {v: deviation_gain(model, spec, v, pedal=side) for v in speeds}
+        bad = {v: g for v, g in gains.items() if g < ft.search_min_deviation_gain}
+        if bad:
+            detail = ", ".join(f"{v:g}km/h={g:.2f}" for v, g in sorted(bad.items()))
+            raise ConfigError(
+                f"{side} モデル（{model_path}）の実質Kp（deviation_gain）が"
+                f"下限 {ft.search_min_deviation_gain:g} を割っています（{detail}）。"
+                "実車速のずれに逆向きに反応する pkl（ずれが自分で広がる）のため使用を止めます"
+                "（ProblemReport_20260921 手順6 段2 の再発防止）。"
+            )
+
+
+def _format_param(value: object) -> str:
+    if isinstance(value, tuple):
+        return "[" + ", ".join(f"{v:.3g}" for v in value) + "]"
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
+def _print_param_changes(
+    before: FeedforwardParams,
+    after: FeedforwardParams,
+    research_before: ResearchFFParams,
+    research_after: ResearchFFParams,
+) -> None:
+    """FF_PARAM_KEYS を順に表示する。RESEARCH_PARAM_KEYS は FeedforwardParams ではなく
+    ResearchFFParams から読む（getattr 先を出し分ける）。"""
+    say("── 物理定数（観測が足りない項目は据え置き。[実測] は 2-0 の値を採用し推定値は参考） ──")
+    for key in FF_PARAM_KEYS:
+        if key in RESEARCH_PARAM_KEYS:
+            old_value, new_value = getattr(research_before, key), getattr(research_after, key)
+        else:
+            old_value, new_value = getattr(before, key), getattr(after, key)
+        old, new = _format_param(old_value), _format_param(new_value)
+        if key in MEASURED_KEYS:
+            say(f"  [実測] {key:<24} {old}（推定は {new}）")
+            continue
+        mark = "更新" if old != new else "据置"  # 表示桁で比べる（0.500→0.500 を更新扱いしない）
+        say(f"  [{mark}] {key:<24} {old} → {new}")

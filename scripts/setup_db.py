@@ -218,6 +218,39 @@ DDL_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS idx_drive_sessions_ended_at
         ON drive_sessions (ended_at ASC)
     """,
+    # ── 段3（RPD_Phase_20261115_PortResearch）: 車両 yaml・ランナー方式への移行 ──
+    # セッションは車両 yaml のフォルダ名（vehicle_id）に紐づく。旧 profiles の行は消さず、
+    # 新しいセッションでは profile_id を NULL にする（FK は残す）。
+    """
+    ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS vehicle_id TEXT
+    """,
+    """
+    ALTER TABLE drive_sessions ALTER COLUMN profile_id DROP NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_drive_sessions_vehicle_id
+        ON drive_sessions (vehicle_id)
+    """,
+    # 走行ログの 9 列以外（CSV の約 100 列の残り）。キー = 列名、値 = CSV の文字列
+    """
+    ALTER TABLE drive_logs ADD COLUMN IF NOT EXISTS detail JSONB
+    """,
+    # 進行のメッセージ（ランナーの標準出力の say() の行）。走行ごとに残す
+    """
+    CREATE TABLE IF NOT EXISTS drive_session_messages (
+        id         BIGSERIAL PRIMARY KEY,
+        session_id UUID NOT NULL REFERENCES drive_sessions(id) ON DELETE CASCADE,
+        seq        INTEGER NOT NULL,
+        elapsed_s  DOUBLE PRECISION NOT NULL,
+        time       TIMESTAMPTZ NOT NULL,
+        level      TEXT NOT NULL DEFAULT 'INFO',
+        message    TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_drive_session_messages_session_seq
+        ON drive_session_messages (session_id, seq)
+    """,
 ]
 
 

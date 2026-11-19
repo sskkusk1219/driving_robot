@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src.app.stubs import (
+from src.app.inmemory_repos import (
     InMemoryModeRepository,
     InMemoryScheduleRepository,
     InMemorySequenceRepository,

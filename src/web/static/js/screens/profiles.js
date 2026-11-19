@@ -1,21 +1,57 @@
-// ── Profiles screens ──────────────────────────────────────
+// ── 車両プロファイル（RPD D-12） ────────────────────────────
+// 車は vehicles/<車ID>/vehicle.yaml。ID はフォルダ名（API は /api/v1/profiles/*）。
+//   人が決める値（名前・最高速・最大減速G・min/max 開度・停止判定・運転指標用）→ 編集できる
+//   学習の結果（日時・モデル・クリープ車速・停車保持の開度）→ 読むだけ（学習運転が書く）
+// ボタンの設定は共通設定（config/robot_common.yaml）へ移した（段11）。
 
 // 一覧の列幅（ヘッダと各行で同じ値。fr は minmax(0, …)、操作（4 ボタン）は固定 px）
-const PROFILE_LIST_COLS = ['minmax(0, 2fr)', 'minmax(0, 1.4fr)', 'minmax(0, 1fr)', 'minmax(0, 0.7fr)', 'minmax(0, 0.7fr)', '290px'];
+const PROFILE_LIST_COLS = ['minmax(0, 2fr)', 'minmax(0, 1.2fr)', 'minmax(0, 1fr)', 'minmax(0, 0.9fr)', 'minmax(0, 0.7fr)', '290px'];
+
+// 画面に出す vehicle.* の数値欄（キー, ラベル）。edit のときだけ出すものは別
+const VEHICLE_BASIC_FIELDS = [
+  ['max_speed_kmh', '最高速 [km/h]'],
+  ['max_decel_g', '最大減速G [G]'],
+];
+const VEHICLE_MAX_FIELDS = [
+  ['max_accel_opening_pct', 'アクセル max [%]'],
+  ['max_brake_opening_pct', 'ブレーキ max [%]'],
+];
+const VEHICLE_MIN_FIELDS = [
+  ['min_accel_opening_pct', 'アクセル min [%]'],
+  ['min_brake_opening_pct', 'ブレーキ min [%]'],
+];
+const VEHICLE_STOP_FIELDS = [
+  ['stop_deviation_threshold_kmh', '異常停止の偏差しきい値 [km/h]'],
+  ['stop_deviation_duration_s', 'しきい値が続いたら停止 [s]'],
+];
+const VEHICLE_ROADLOAD_FIELDS = [
+  ['test_mass_kg', '試験質量 [kg]'],
+  ['road_load_a0_n', '走行抵抗 a0 [N]'],
+  ['road_load_a1_n_per_kmh', 'a1 [N/(km/h)]'],
+  ['road_load_a2_n_per_kmh2', 'a2 [N/(km/h)^2]'],
+];
+function fmtNum(v) { return v == null ? '' : String(v); }
+
+function fmtFeedforward(v) {
+  if (Array.isArray(v)) return v.length ? `${v.length} 点` : '（空）';
+  if (v == null) return '—';
+  return String(v);
+}
 
 function ProfilesScreen() {
   const { useState, useEffect, useContext } = React;
   const { apiFetch, activeProfileId, setActiveProfileId, activeProfileName, setActiveProfileName, setNav } = useContext(window.AppContext);
-  const { INK, INK_SOFT, INK_MUTE, PAPER, PAPER_2, HATCH, Box, Btn, Pill, H2, Row, RowActions } = window;
+  const { INK, INK_SOFT, INK_MUTE, PAPER, PAPER_2, HATCH, Box, Btn, Pill, H2, Row, RowActions, ConfirmStopPopup } = window;
 
   const [profiles, setProfiles] = useState([]);
   const [mode, setMode] = useState('list'); // list | create | edit
   const [editTarget, setEditTarget] = useState(null);
   const [search, setSearch] = useState('');
-  const [sortKey, setSortKey] = useState(null);  // 'name' | 'max_speed'
+  const [sortKey, setSortKey] = useState(null);  // 'name' | 'max_speed_kmh'
   const [sortAsc, setSortAsc] = useState(true);
   const [editingNameId, setEditingNameId] = useState(null);
   const [editingNameValue, setEditingNameValue] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState(null);
 
   useEffect(() => { loadProfiles(); }, []);
 
@@ -33,86 +69,104 @@ function ProfilesScreen() {
     loadProfiles();
   }
 
-  function startEditName(p) {
-    setEditingNameId(p.id);
-    setEditingNameValue(p.name);
-  }
-
-  function cancelEditName() {
-    setEditingNameId(null);
-    setEditingNameValue('');
-  }
+  function startEditName(p) { setEditingNameId(p.id); setEditingNameValue(p.name); }
+  function cancelEditName() { setEditingNameId(null); setEditingNameValue(''); }
 
   async function handleSaveName(p) {
     const trimmed = editingNameValue.trim();
-    if (!trimmed) { window.showToast('プロファイル名を入力してください', 'error'); return; }
+    if (!trimmed) { window.showToast('名前を入力してください', 'error'); return; }
     if (trimmed === p.name) { cancelEditName(); return; }
     const r = await apiFetch('PUT', `/api/v1/profiles/${p.id}`, { name: trimmed });
     if (r) {
       window.showToast('名前を更新しました', 'success');
       if (p.id === activeProfileId) setActiveProfileName(trimmed);
-      setEditingNameId(null);
-      setEditingNameValue('');
+      cancelEditName();
       loadProfiles();
     }
   }
 
   async function handleCopy(p) {
-    const payload = {
-      name: `${p.name} のコピー`,
-      max_accel_opening: p.max_accel_opening,
-      max_brake_opening: p.max_brake_opening,
-      max_speed: p.max_speed,
-      max_decel_g: p.max_decel_g,
-      pid_gains: { kp: p.pid_gains?.kp ?? 1.0, ki: p.pid_gains?.ki ?? 0.0, kd: p.pid_gains?.kd ?? 0.0 },
-      stop_config: {
-        deviation_threshold_kmh: p.stop_config?.deviation_threshold_kmh ?? 2.0,
-        deviation_duration_s: p.stop_config?.deviation_duration_s ?? 4.0,
-      },
-      model_path: null,
-      dynamics_params: { pid_preview_s: p.dynamics_params?.pid_preview_s ?? 0.0 },
-    };
+    // 学習の値（pkl・feedforward）はコピーしない。min は仮値として引き継ぐ（新しい車では未測定から始まる）
+    const vehicleKeys = [...VEHICLE_BASIC_FIELDS, ...VEHICLE_MAX_FIELDS, ...VEHICLE_MIN_FIELDS, ...VEHICLE_STOP_FIELDS, ...VEHICLE_ROADLOAD_FIELDS].map(f => f[0]);
+    const payload = { name: `${p.name} のコピー` };
+    for (const k of vehicleKeys) if (p[k] != null) payload[k] = p[k];
+    if (p.road_load_source) payload.road_load_source = p.road_load_source;
     const r = await apiFetch('POST', '/api/v1/profiles/', payload);
     if (r) {
-      window.showToast(`「${r.name}」を作成しました`, 'success');
+      window.showToast(`「${r.name}」を作成しました（学習・min の測定はこれからです）`, 'success');
       loadProfiles();
     }
   }
 
-  async function handleDelete(p) {
-    if (!confirm(`「${p.name}」を削除しますか？`)) return;
+  async function doDelete(p) {
     const r = await apiFetch('DELETE', `/api/v1/profiles/${p.id}`);
+    setConfirmDelete(null);
     if (r !== null) {
-      window.showToast('プロファイルを削除しました', 'success');
+      window.showToast('車を削除しました', 'success');
+      if (p.id === activeProfileId) { setActiveProfileId(null); setActiveProfileName(null); }
       setMode('list');
       setEditTarget(null);
       loadProfiles();
     }
   }
 
+  const deletePopup = confirmDelete && (
+    <ConfirmStopPopup
+      message={`「${confirmDelete.name}」を削除しますか？（学習結果・学習データも消えます）`}
+      onYes={() => doDelete(confirmDelete)}
+      onNo={() => setConfirmDelete(null)}
+    />
+  );
+
   if (mode === 'create') {
-    return React.createElement(ProfileForm, {
-      onSave: async payload => {
-        const r = await apiFetch('POST', '/api/v1/profiles/', payload);
-        if (r) { window.showToast(`「${r.name}」を作成しました`, 'success'); setMode('list'); loadProfiles(); }
-      },
-      onCancel: () => setMode('list'),
-    });
+    return (
+      <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+        <ProfileForm
+          onSave={async payload => {
+            const r = await apiFetch('POST', '/api/v1/profiles/', payload);
+            if (!r) return;
+            window.showToast(`「${r.name}」を作成しました。次は min・max の測定です`, 'success');
+            // 作った車をそのまま選ぶ（案内の続き: ② min を測る → ③ 学習）
+            const s = await apiFetch('POST', '/api/v1/drive/select-profile', { profile_id: r.id });
+            if (s) { setActiveProfileId(r.id); setActiveProfileName(r.name); }
+            setMode('list');
+            loadProfiles();
+          }}
+          onCancel={() => setMode('list')}
+        />
+      </div>
+    );
   }
 
   if (mode === 'edit' && editTarget) {
-    return React.createElement(ProfileForm, {
-      initial: editTarget,
-      onSave: async payload => {
-        const r = await apiFetch('PUT', `/api/v1/profiles/${editTarget.id}`, payload);
-        if (r) { window.showToast(`「${r.name}」を更新しました`, 'success'); setMode('list'); setEditTarget(null); loadProfiles(); }
-      },
-      onCancel: () => { setMode('list'); setEditTarget(null); },
-      onDelete: () => handleDelete(editTarget),
-    });
+    return (
+      <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+        <ProfileForm
+          key={`${editTarget.id}:${editTarget.updated_at ?? ''}`}
+          initial={editTarget}
+          onSave={async payload => {
+            if (Object.keys(payload).length === 0) {
+              window.showToast('変更はありません', 'info');
+              return;
+            }
+            const r = await apiFetch('PUT', `/api/v1/profiles/${editTarget.id}`, payload);
+            if (r) {
+              window.showToast(`「${r.name}」を更新しました`, 'success');
+              if (r.id === activeProfileId) setActiveProfileName(r.name);
+              setEditTarget(r);   // 保存後も画面に残る（min の測定済み印など、保存後の値を見直せる）
+              loadProfiles();
+            }
+          }}
+          onCancel={() => { setMode('list'); setEditTarget(null); loadProfiles(); }}
+          onDelete={() => setConfirmDelete(editTarget)}
+          onNav={setNav}
+        />
+        {deletePopup}
+      </div>
+    );
   }
 
-  // ── List view (ProfilesA) ──────────────────────────────────
+  // ── 一覧 ────────────────────────────────────────────────────
   const activeProfile = profiles.find(p => p.id === activeProfileId);
 
   function handleSortClick(key) {
@@ -128,338 +182,242 @@ function ProfilesScreen() {
   const sorted = sortKey
     ? [...filtered].sort((a, b) => {
         const va = a[sortKey], vb = b[sortKey];
-        const cmp = typeof va === 'string' ? va.localeCompare(vb, 'ja') : va - vb;
+        const cmp = typeof va === 'string' ? va.localeCompare(vb, 'ja') : (va ?? 0) - (vb ?? 0);
         return sortAsc ? cmp : -cmp;
       })
     : filtered;
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, height: '100%' } },
+  return (
+    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 10, height: '100%' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ flex: 1 }} />
+        <input
+          type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="名前で検索…"
+          style={{ padding: '6px 12px', fontSize: 14, border: `1.3px solid ${INK}`, borderRadius: 4,
+                   fontFamily: 'inherit', background: PAPER, color: INK, outline: 'none', width: 200 }}
+        />
+        <Btn primary big onClick={() => setMode('create')}>＋ 新規作成</Btn>
+      </div>
 
-    // Header
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
-      React.createElement('div', { style: { flex: 1 } }),
-      React.createElement('input', {
-        type: 'text',
-        value: search,
-        onChange: e => setSearch(e.target.value),
-        placeholder: '名前で検索…',
-        style: {
-          padding: '6px 12px', fontSize: 14,
-          border: `1.3px solid ${INK}`, borderRadius: 4,
-          fontFamily: 'inherit', background: PAPER, color: INK, outline: 'none',
-          width: 200,
-        },
-      }),
-      React.createElement(Btn, { primary: true, big: true, onClick: () => setMode('create') }, '＋ 新規作成'),
-    ),
+      <Box style={{ padding: 0, display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+        <div style={{
+          display: 'grid', gridTemplateColumns: PROFILE_LIST_COLS.join(' '),
+          borderBottom: `1px solid ${INK}`, padding: '10px 14px', background: PAPER_2,
+          fontSize: 14, fontWeight: 700, flexShrink: 0,
+        }}>
+          <div onClick={() => handleSortClick('name')} style={{ cursor: 'pointer', userSelect: 'none' }}>{'名前' + sortIcon('name')}</div>
+          <div>最大開度 (acc/brk)</div>
+          <div onClick={() => handleSortClick('max_speed_kmh')} style={{ cursor: 'pointer', userSelect: 'none' }}>{'最高車速' + sortIcon('max_speed_kmh')}</div>
+          <div>ペダル min</div>
+          <div>学習</div>
+          <div>操作</div>
+        </div>
 
-    // Table
-    React.createElement(Box, { style: { padding: 0, display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 } },
-      // ヘッダ行
-      React.createElement('div', {
-        style: {
-          display: 'grid',
-          gridTemplateColumns: PROFILE_LIST_COLS.join(' '),
-          borderBottom: `1px solid ${INK}`,
-          padding: '10px 14px',
-          background: PAPER_2,
-          fontSize: 14, fontWeight: 700,
-          flexShrink: 0,
-        },
-      },
-        React.createElement('div', {
-          onClick: () => handleSortClick('name'),
-          style: { cursor: 'pointer', userSelect: 'none' },
-        }, '名前' + sortIcon('name')),
-        React.createElement('div', { style: { fontFamily: 'inherit' } }, '最大開度 (acc/brk)'),
-        React.createElement('div', {
-          onClick: () => handleSortClick('max_speed'),
-          style: { cursor: 'pointer', userSelect: 'none', fontFamily: 'inherit' },
-        }, '最高車速' + sortIcon('max_speed')),
-        React.createElement('div', null, 'キャリブ'),
-        React.createElement('div', null, 'モデル'),
-        React.createElement('div', null, '操作'),
-      ),
+        <div style={{ overflowY: 'auto', flex: 1, minHeight: 0 }}>
+          {sorted.length === 0
+            ? <div style={{ padding: '20px 14px', color: INK_SOFT, fontSize: 14 }}>
+                {profiles.length === 0 ? '車がありません。「＋ 新規作成」で登録してください。' : `「${search}」に一致する車がありません。`}
+              </div>
+            : sorted.map(p => {
+                const isActive = p.id === activeProfileId;
+                const minOk = p.min_accel_measured && p.min_brake_measured;
+                const nameCell = editingNameId === p.id
+                  ? (
+                    <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                      <input
+                        autoFocus value={editingNameValue} onChange={e => setEditingNameValue(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') handleSaveName(p); if (e.key === 'Escape') cancelEditName(); }}
+                        style={{ fontSize: 14, padding: '2px 6px', border: `1.3px solid ${INK}`, borderRadius: 3,
+                                 fontFamily: 'inherit', background: PAPER, color: INK, outline: 'none', width: '100%' }}
+                      />
+                      <span onClick={() => handleSaveName(p)} title="保存" style={{ cursor: 'pointer', fontSize: 16, userSelect: 'none' }}>✓</span>
+                      <span onClick={cancelEditName} title="キャンセル" style={{ cursor: 'pointer', fontSize: 16, userSelect: 'none' }}>✗</span>
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <b>{p.name}</b>
+                      {p.error && <Pill accent="ERROR" style={{ fontSize: 11 }}>yaml 異常</Pill>}
+                      <span onClick={() => startEditName(p)} title="名前を変更" style={{ cursor: 'pointer', opacity: 0.5, fontSize: 13, userSelect: 'none' }}>✎</span>
+                    </div>
+                  );
+                return (
+                  <Row
+                    key={p.id}
+                    cells={[
+                      [nameCell, PROFILE_LIST_COLS[0]],
+                      [p.max_accel_opening_pct == null ? '—' : `${p.max_accel_opening_pct} / ${p.max_brake_opening_pct} %`, PROFILE_LIST_COLS[1], 'mono'],
+                      [p.max_speed_kmh == null ? '—' : `${p.max_speed_kmh} km/h`, PROFILE_LIST_COLS[2], 'mono'],
+                      [minOk ? <Pill accent="READY">測定済み</Pill>
+                             : <Pill accent="PAUSED">{p.min_accel_measured || p.min_brake_measured ? '片方未測定' : '未測定'}</Pill>, PROFILE_LIST_COLS[3]],
+                      [p.learned ? <Pill accent="READY">あり</Pill> : <Pill>なし</Pill>, PROFILE_LIST_COLS[4]],
+                      [<RowActions
+                         isActive={isActive}
+                         onSelect={() => handleSelect(p)}
+                         onEdit={() => { setEditTarget(p); setMode('edit'); }}
+                         onCopy={() => handleCopy(p)}
+                         onDelete={() => setConfirmDelete(p)}
+                       />, PROFILE_LIST_COLS[5]],
+                    ]}
+                    style={{ padding: '12px 14px', background: isActive ? '#201e16' : 'transparent', borderBottom: `1px dashed ${INK_MUTE}` }}
+                  />
+                );
+              })}
+        </div>
+      </Box>
 
-      React.createElement('div', { style: { overflowY: 'auto', flex: 1, minHeight: 0 } },
-      sorted.length === 0
-        ? React.createElement('div', { style: { padding: '20px 14px', color: INK_SOFT, fontSize: 14 } },
-            profiles.length === 0
-              ? 'プロファイルがありません。「＋ 新規作成」で作成してください。'
-              : `「${search}」に一致するプロファイルがありません。`)
-        : sorted.map((p, i) => {
-            const isActive = p.id === activeProfileId;
-            const hasCalib = p.calibration?.is_valid;
-            const hasModel = !!p.model_path;
-
-            return React.createElement(Row, {
-              key: p.id,
-              cells: [
-                [editingNameId === p.id
-                  ? React.createElement('div', { key: 'ne', style: { display: 'flex', gap: 4, alignItems: 'center' } },
-                      React.createElement('input', {
-                        autoFocus: true,
-                        value: editingNameValue,
-                        onChange: e => setEditingNameValue(e.target.value),
-                        onKeyDown: e => {
-                          if (e.key === 'Enter') handleSaveName(p);
-                          if (e.key === 'Escape') cancelEditName();
-                        },
-                        style: {
-                          fontSize: 14, padding: '2px 6px',
-                          border: `1.3px solid ${INK}`, borderRadius: 3,
-                          fontFamily: 'inherit', background: PAPER, color: INK,
-                          outline: 'none', width: '100%',
-                        },
-                      }),
-                      React.createElement('span', {
-                        onClick: () => handleSaveName(p),
-                        title: '保存',
-                        style: { cursor: 'pointer', fontSize: 16, userSelect: 'none' },
-                      }, '✓'),
-                      React.createElement('span', {
-                        onClick: cancelEditName,
-                        title: 'キャンセル',
-                        style: { cursor: 'pointer', fontSize: 16, userSelect: 'none' },
-                      }, '✗'),
-                    )
-                  : React.createElement('div', { key: 'n', style: { display: 'flex', gap: 6, alignItems: 'center' } },
-                      React.createElement('b', null, p.name),
-                      React.createElement('span', {
-                        onClick: () => startEditName(p),
-                        title: '名前を変更',
-                        style: { cursor: 'pointer', opacity: 0.5, fontSize: 13, userSelect: 'none' },
-                      }, '✎'),
-                    ),
-                  PROFILE_LIST_COLS[0]],
-                [`${p.max_accel_opening} / ${p.max_brake_opening} %`, PROFILE_LIST_COLS[1], 'mono'],
-                [`${p.max_speed} km/h`, PROFILE_LIST_COLS[2], 'mono'],
-                [hasCalib
-                  ? React.createElement(Pill, { key: 'c', accent: 'READY' }, 'OK')
-                  : React.createElement(Pill, { key: 'c' }, '未'),
-                  PROFILE_LIST_COLS[3]],
-                [hasModel
-                  ? React.createElement(Pill, { key: 'm', accent: 'READY' }, 'あり')
-                  : React.createElement(Pill, { key: 'm' }, 'なし'),
-                  PROFILE_LIST_COLS[4]],
-                [React.createElement(RowActions, {
-                  key: 'b',
-                  isActive,
-                  onSelect: () => handleSelect(p),
-                  onEdit:   () => { setEditTarget(p); setMode('edit'); },
-                  onCopy:   () => handleCopy(p),
-                  onDelete: () => handleDelete(p),
-                }), PROFILE_LIST_COLS[5]],
-              ],
-              style: {
-                padding: '12px 14px',
-                background: isActive ? '#201e16' : 'transparent',
-                borderBottom: `1px dashed ${INK_MUTE}`,
-              },
-            });
-          }),
-      ),
-    ),
-
-    // Footer
-    React.createElement('div', { style: { display: 'flex', gap: 12, fontSize: 13, color: INK_SOFT } },
-      activeProfile
-        ? React.createElement('span', null, '選択中: ', React.createElement('b', null, activeProfile.name))
-        : React.createElement('span', null, '(未選択)'),
-      React.createElement('div', { style: { flex: 1 } }),
-      React.createElement('span', null,
-        q ? `${sorted.length} / ${profiles.length}件` : `${profiles.length}件 / プロファイル数は無制限`
-      ),
-    ),
+      <div style={{ display: 'flex', gap: 12, fontSize: 13, color: INK_SOFT }}>
+        {activeProfile ? <span>選択中: <b>{activeProfile.name}</b></span> : <span>(未選択)</span>}
+        <div style={{ flex: 1 }} />
+        <span>{q ? `${sorted.length} / ${profiles.length}件` : `${profiles.length}件`}</span>
+      </div>
+      {deletePopup}
+    </div>
   );
 }
 
-// ── ProfileForm — 新規作成・編集共用 ────────────────────────────
-function ProfileForm({ initial, onSave, onCancel, onDelete }) {
+// ── ProfileForm — 新規作成・編集共用（1 ページに収まる） ────────────────────
+// 新規作成: 基本（名前・最高速・最大減速G）とペダル max（min は未測定の仮値で作られる）
+// 編集: 基本／ペダル min・max／停止判定／運転指標用／学習の結果（読むだけ）。
+//   保存では「変えた値だけ」送る（min を送ると測定済みになるため、触っていない min は送らない）
+function ProfileForm({ initial, onSave, onCancel, onDelete, onNav }) {
   const { useState } = React;
-  const { INK, INK_SOFT, INK_MUTE, Box, Btn, H2, Input, Row } = window;
+  const { INK, INK_SOFT, INK_MUTE, HATCH, Box, Btn, Pill, H2, Input } = window;
   const isEdit = !!initial;
 
-  const [form, setForm] = useState({
-    name: initial?.name ?? '',
-    max_accel_opening: initial?.max_accel_opening ?? 80,
-    max_brake_opening: initial?.max_brake_opening ?? 80,
-    max_speed: initial?.max_speed ?? 120,
-    max_decel_g: initial?.max_decel_g ?? 0.3,
-    kp: initial?.pid_gains?.kp ?? 1.0,
-    ki: initial?.pid_gains?.ki ?? 0.0,
-    kd: initial?.pid_gains?.kd ?? 0.0,
-    deviation_threshold_kmh: initial?.stop_config?.deviation_threshold_kmh ?? 2.0,
-    deviation_duration_s: initial?.stop_config?.deviation_duration_s ?? 4.0,
-    model_path: initial?.model_path ?? '',
-    creep_speed_kmh: initial?.feedforward_params?.creep_speed_kmh ?? 7.0,
-    creep_rate_kmhs: initial?.feedforward_params?.creep_rate_kmhs ?? 0.5,
-    engine_brake_decel_kmhs: initial?.feedforward_params?.engine_brake_decel_kmhs ?? 1.0,
-    stop_brake_opening_pct: initial?.feedforward_params?.stop_brake_opening_pct ?? 20.0,
-    brake_deadband_pct: initial?.feedforward_params?.brake_deadband_pct ?? 1.0,
-    accel_deadband_pct: initial?.feedforward_params?.accel_deadband_pct ?? 1.0,
-    pid_preview_s: initial?.dynamics_params?.pid_preview_s ?? 0.0,
-  });
-
+  const initialForm = () => {
+    const f = { name: initial?.name ?? '' };
+    const all = [...VEHICLE_BASIC_FIELDS, ...VEHICLE_MAX_FIELDS, ...VEHICLE_MIN_FIELDS, ...VEHICLE_STOP_FIELDS, ...VEHICLE_ROADLOAD_FIELDS];
+    for (const [k] of all) f[k] = fmtNum(initial?.[k]);
+    if (!isEdit) { f.max_speed_kmh = '140'; f.max_decel_g = '0.4'; f.max_accel_opening_pct = '80'; f.max_brake_opening_pct = '80'; }
+    f.road_load_source = initial?.road_load_source ?? '';
+    return f;
+  };
+  const [form, setForm] = useState(initialForm);
+  const [base] = useState(initialForm);   // 変えた値だけ送るための元の値
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
   async function handleSave() {
-    if (!form.name.trim()) { window.showToast('プロファイル名を入力してください', 'error'); return; }
-    await onSave({
-      name: form.name.trim(),
-      max_accel_opening: Number(form.max_accel_opening),
-      max_brake_opening: Number(form.max_brake_opening),
-      max_speed: Number(form.max_speed),
-      max_decel_g: Number(form.max_decel_g),
-      pid_gains: { kp: Number(form.kp), ki: Number(form.ki), kd: Number(form.kd) },
-      stop_config: {
-        deviation_threshold_kmh: Number(form.deviation_threshold_kmh),
-        deviation_duration_s: Number(form.deviation_duration_s),
-      },
-      model_path: form.model_path.trim() || null,
-      feedforward_params: {
-        creep_speed_kmh: Number(form.creep_speed_kmh),
-        creep_rate_kmhs: Number(form.creep_rate_kmhs),
-        engine_brake_decel_kmhs: Number(form.engine_brake_decel_kmhs),
-        stop_brake_opening_pct: Number(form.stop_brake_opening_pct),
-        brake_deadband_pct: Number(form.brake_deadband_pct),
-        accel_deadband_pct: Number(form.accel_deadband_pct),
-      },
-      dynamics_params: {
-        pid_preview_s: Number(form.pid_preview_s),
-        // FOPDT同定値は学習サイクルが書き込む表示用メタデータ。フォーム保存で消さないよう
-        // 既存値をそのまま送り返す（本フォームに編集UIはない）。
-        fopdt_k: initial?.dynamics_params?.fopdt_k ?? null,
-        fopdt_tau: initial?.dynamics_params?.fopdt_tau ?? null,
-        fopdt_theta: initial?.dynamics_params?.fopdt_theta ?? null,
-      },
-    });
+    if (!form.name.trim()) { window.showToast('名前を入力してください', 'error'); return; }
+    const numeric = (key) => {
+      const raw = String(form[key]).trim();
+      if (raw === '') return undefined;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : NaN;
+    };
+    const bad = [];
+    const payload = {};
+    const consider = (key) => {
+      const changed = String(form[key]).trim() !== String(base[key]).trim();
+      if (isEdit && !changed) return;
+      const v = numeric(key);
+      if (v === undefined) return;       // 空欄は送らない（値を消すことはしない）
+      if (Number.isNaN(v)) { bad.push(key); return; }
+      payload[key] = v;
+    };
+    const vehicleKeys = [...VEHICLE_BASIC_FIELDS, ...VEHICLE_MAX_FIELDS];
+    if (isEdit) vehicleKeys.push(...VEHICLE_STOP_FIELDS, ...VEHICLE_ROADLOAD_FIELDS, ...VEHICLE_MIN_FIELDS);   // 新規作成では min は仮値のまま（送らない）
+    for (const [k] of vehicleKeys) consider(k);
+    if (isEdit) {
+      if (form.name.trim() !== base.name) payload.name = form.name.trim();
+      if (form.road_load_source !== base.road_load_source && form.road_load_source.trim()) payload.road_load_source = form.road_load_source.trim();
+    } else {
+      payload.name = form.name.trim();
+    }
+    // 画面で先に見る: min は max より小さく（サーバーの 422 と同じ条件）
+    const effective = (key) => (payload[key] !== undefined ? payload[key] : Number(String(base[key]).trim()));
+    for (const [minKey, maxKey, label] of [
+      ['min_accel_opening_pct', 'max_accel_opening_pct', 'アクセル'],
+      ['min_brake_opening_pct', 'max_brake_opening_pct', 'ブレーキ'],
+    ]) {
+      if (payload[minKey] === undefined && payload[maxKey] === undefined) continue;
+      const mn = effective(minKey), mx = effective(maxKey);
+      if (Number.isFinite(mn) && Number.isFinite(mx) && mn >= mx) {
+        window.showToast(`${label} max は ${label} min（${mn}%）より大きくしてください`, 'error');
+        return;
+      }
+    }
+    if (bad.length) { window.showToast(`数値として読めない欄があります: ${bad.join('、')}\n次にすること: 数字だけで入力し直してください。`, 'error'); return; }
+    await onSave(payload);
   }
 
-  const inp = (label, key, opts = {}) =>
-    React.createElement(Input, {
-      key,
-      label,
-      value: String(form[key]),
-      onChange: v => set(key, v),
-      type: opts.type ?? 'text',
-      mono: opts.mono,
-      width: '100%',
-    });
+  // 保存後（initial が更新されたとき）に、フォームの「元の値」と測定済みの印が古くならないよう、親が key で作り直す
+  const field = (label, key, opts = {}) => (
+    <Input key={key} label={label} value={String(form[key])} onChange={v => set(key, v)} type="text" mono={opts.mono ?? true} width="100%" />
+  );
+  const grid2 = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 };
+  const boxStyle = { padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, minWidth: 0 };
 
-  // calibration data
-  const calib = initial?.calibration;
-  const calibDate = calib?.calibrated_at
-    ? new Date(calib.calibrated_at).toLocaleString('ja-JP')
-    : null;
-  const accelZero   = calib?.accel_zero_pos ?? '—';
-  const accelFull   = calib?.accel_full_pos ?? '—';
-  const accelStroke = calib?.accel_stroke ?? '—';
-  const brakeZero   = calib?.brake_zero_pos ?? '—';
-  const brakeFull   = calib?.brake_full_pos ?? '—';
-  const brakeStroke = calib?.brake_stroke ?? '—';
+  const minAccelOk = !!initial?.min_accel_measured;
+  const minBrakeOk = !!initial?.min_brake_measured;
+  const ff = initial?.feedforward ?? {};
+  const readonlyRow = (label, value, title) => (
+    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 13, color: INK_SOFT, minWidth: 0 }}>
+      <span style={{ flexShrink: 0 }}>{label}</span>
+      <span title={title ?? String(value)} style={{ color: INK, fontFamily: "'JetBrains Mono', monospace", overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{value}</span>
+    </div>
+  );
+  const fmtVal = v => (v == null ? '—' : String(v));
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, height: '100%' } },
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, height: '100%', minHeight: 0 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+        <Btn onClick={onCancel}>← 一覧に戻る</Btn>
+        <H2>{isEdit ? `車の編集: ${initial.name}` : '新規作成'}</H2>
+      </div>
 
-    // Header
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
-      React.createElement(Btn, { onClick: onCancel }, '← 一覧に戻る'),
-      React.createElement(H2, {
-        sub: isEdit ? `プロファイル「${initial.name}」を編集します` : '新しい車両プロファイルを作成します'
-      }, isEdit ? 'プロファイル編集' : '新規プロファイル作成'),
-    ),
+      <div style={{
+        flex: 1, minHeight: 0, display: 'grid', gap: 12, alignContent: 'start',
+        gridTemplateColumns: isEdit ? 'repeat(3, minmax(0, 1fr))' : 'repeat(2, minmax(0, 1fr))',
+        gridTemplateRows: isEdit ? 'repeat(2, minmax(0, 1fr))' : 'auto',
+      }}>
+        <Box label="基本" style={boxStyle}>
+          {field('名前', 'name', { mono: false })}
+          <div style={grid2}>{VEHICLE_BASIC_FIELDS.map(([k, label]) => field(label, k))}</div>
+        </Box>
 
-    // 2-column body
-    React.createElement('div', {
-      style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, flex: 1, minHeight: 0, paddingTop: 12 }
-    },
+        <Box label={isEdit ? 'ペダル min・max' : 'ペダル max'} style={boxStyle}>
+          {isEdit && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, color: INK_SOFT }}>
+              <span>アクセル</span>{minAccelOk ? <Pill accent="READY">測定済み</Pill> : <Pill accent="PAUSED">未測定</Pill>}
+              <span>ブレーキ</span>{minBrakeOk ? <Pill accent="READY">測定済み</Pill> : <Pill accent="PAUSED">未測定</Pill>}
+            </div>
+          )}
+          {isEdit && <div style={grid2}>{VEHICLE_MIN_FIELDS.map(([k, label]) => field(label, k))}</div>}
+          <div style={grid2}>{VEHICLE_MAX_FIELDS.map(([k, label]) => field(label, k))}</div>
+        </Box>
 
-      // ── Left column ──────────────────────────────────────
-      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, height: '100%', minHeight: 0 } },
+        {isEdit && (
+          <Box label="停止判定" style={boxStyle}>
+            {VEHICLE_STOP_FIELDS.map(([k, label]) => field(label, k))}
+          </Box>
+        )}
 
-        // 基本情報
-        React.createElement(Box, { label: '基本情報', style: { padding: 14 } },
-          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
-            inp('プロファイル名', 'name'),
-            React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
-              inp('アクセル最大開度 [%]', 'max_accel_opening', { type: 'number', mono: true }),
-              inp('ブレーキ最大開度 [%]', 'max_brake_opening', { type: 'number', mono: true }),
-              inp('最高車速 [km/h]', 'max_speed', { type: 'number', mono: true }),
-              inp('最大減速G [G]', 'max_decel_g', { type: 'number', mono: true }),
-            ),
-          ),
-        ),
+        {isEdit && (
+          <Box label="運転指標用" style={boxStyle}>
+            <div style={grid2}>{VEHICLE_ROADLOAD_FIELDS.map(([k, label]) => field(label, k))}</div>
+            {field('走行抵抗の出どころ', 'road_load_source', { mono: false })}
+          </Box>
+        )}
 
-        // 停止判定
-        React.createElement(Box, { label: '停止判定', style: { padding: 14 } },
-          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
-            inp('逸脱閾値 [km/h]', 'deviation_threshold_kmh', { type: 'number', mono: true }),
-            inp('逸脱継続 [s]', 'deviation_duration_s', { type: 'number', mono: true }),
-          ),
-        ),
+        {isEdit && (
+          <Box label="学習の結果（読むだけ）" style={{ ...boxStyle, gridColumn: 'span 2' }}>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              {initial.learned ? <Pill accent="READY">学習済み</Pill> : <Pill>未学習</Pill>}
+            </div>
+            {readonlyRow('学習日時', initial.learned_at ? new Date(initial.learned_at).toLocaleString('ja-JP') : '—')}
+            {readonlyRow('使っているモデル', initial.model_path ?? '—')}
+            {readonlyRow('クリープ車速 [km/h]', fmtVal(ff.creep_speed_kmh))}
+            {readonlyRow('停車保持の開度 [%]（min からの量）', fmtVal(ff.stop_brake_offset_pct))}
+          </Box>
+        )}
+      </div>
 
-        // フィードフォワード（学習で自動更新／手動調整可）
-        React.createElement(Box, { label: 'フィードフォワード', style: { padding: 14 } },
-          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 } },
-            inp('クリープ車速 [km/h]', 'creep_speed_kmh', { type: 'number', mono: true }),
-            inp('クリープ加速率 [km/h/s]', 'creep_rate_kmhs', { type: 'number', mono: true }),
-            inp('コースト減速量 [km/h/s]', 'engine_brake_decel_kmhs', { type: 'number', mono: true }),
-            inp('停車時ブレーキ開度 [%]', 'stop_brake_opening_pct', { type: 'number', mono: true }),
-          ),
-        ),
-      ),
-
-      // ── Right column ─────────────────────────────────────
-      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, height: '100%', minHeight: 0 } },
-
-        // キャリブレーション
-        React.createElement(Box, { label: 'キャリブレーション', style: { padding: 14 } },
-          (!isEdit || !calib?.is_valid)
-            ? React.createElement('div', { style: { fontSize: 14, color: INK_SOFT } }, '未実施')
-            : React.createElement('div', null,
-                React.createElement(Row, {
-                  cells: [['', '1fr'], ['ZERO', '1fr', 'mono'], ['FULL', '1fr', 'mono'], ['STROKE', '1fr', 'mono']],
-                  header: true,
-                }),
-                React.createElement(Row, {
-                  cells: [
-                    ['アクセル', '1fr'],
-                    [String(accelZero), '1fr', 'mono'],
-                    [String(accelFull), '1fr', 'mono'],
-                    [String(accelStroke), '1fr', 'mono'],
-                  ],
-                }),
-                React.createElement(Row, {
-                  cells: [
-                    ['ブレーキ', '1fr'],
-                    [String(brakeZero), '1fr', 'mono'],
-                    [String(brakeFull), '1fr', 'mono'],
-                    [String(brakeStroke), '1fr', 'mono'],
-                  ],
-                }),
-                calibDate && React.createElement('div', { style: { fontSize: 12, color: INK_SOFT, marginTop: 6 } },
-                  `校正日: ${calibDate}`
-                ),
-              ),
-        ),
-
-        // モデル
-        React.createElement(Box, { label: 'モデル', style: { padding: 14 } },
-          (!isEdit || !initial?.model_path)
-            ? React.createElement('div', { style: { fontSize: 14, color: INK_SOFT } }, '未実施')
-            : React.createElement('div', { style: { fontSize: 13, color: INK_SOFT, fontFamily: 'inherit', wordBreak: 'break-all' } },
-                initial.model_path,
-              ),
-        ),
-      ),
-    ),
-
-    // Action buttons (outside grid)
-    React.createElement('div', { style: { display: 'flex', gap: 12, justifyContent: 'flex-end' } },
-      isEdit && React.createElement(Btn, { danger: true, onClick: onDelete }, '削除'),
-      React.createElement(Btn, { onClick: onCancel }, 'キャンセル'),
-      React.createElement(Btn, { primary: true, big: true, onClick: handleSave }, isEdit ? '保存' : '作成'),
-    ),
+      <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end', flexShrink: 0 }}>
+        {isEdit && <Btn danger onClick={onDelete}>削除</Btn>}
+        <Btn onClick={onCancel}>{isEdit ? '一覧に戻る' : 'キャンセル'}</Btn>
+        <Btn primary big onClick={handleSave}>{isEdit ? '保存' : '作成'}</Btn>
+      </div>
+    </div>
   );
 }
 

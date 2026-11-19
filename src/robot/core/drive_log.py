@@ -1,0 +1,837 @@
+# 移植元: tests/research/drive_log.py（scripts/port_research.py が 2026-11-19 に写した。tests の commit 4c80595+未コミットの変更あり）。手で直さない  # noqa: E501
+"""走行ログ: 走行前チェック → ペダル探索 → パターン走行 → 緩減速〜停車保持 を 1 本の CSV/PNG に。
+
+2026-09-13 A7（KAIZEN 表5-5 順6）から、手順 1 の走行前チェック以降の**すべての区間で同じ列・
+同じ意味**にした（列は `CSV_COLUMNS` のコメント）。
+    - 指示開度 FF [%]  … FF の出力をペダル別に分けた値（モード走行だけ）
+    - 指示開度 FF・PID … アクチュエータへ送った最終指令 [%]・[mm]（全区間。パターン走行・
+                         モード走行はその周期の指令、他の区間は各軸へ最後に送った目標位置）
+    - 実開度           … 両軸を 0x9000 から 14 レジスタまとめ読みした実位置 PNOW [%]・[mm]
+    - ステータス       … 区間・段・ガバナー・アラーム ＋ 軸ごとのサーボON・移動中・
+                         位置決め完了・アラームコード
+    - accel_kp 等      … G ランプの偏差の項のゲイン Kp・Ki（ペダル別。G ランプの行だけ）
+    - cycle_ms         … その行の読み取り（パターン・モード走行は 1 周期の処理）の実時間
+旧形式（〜A6 の `accel_opening`・`ff_effort_pct` などの列）の CSV も `cmd_opening`・
+`ff_effort` などで読める。
+
+`section` 列で区間を分ける:
+    PRE_DRIVE_CHECK … 走行前チェック（踏込前チェック / ブレーキを刻んで停止確認 / 踏込後チェック）
+    PEDAL_SEARCH    … 2-0 ペダル探索
+    PATTERN_DRIVE   … 2-1 パターン走行（FF モデルの学習に使うのはこの区間だけ）
+    MODE_DRIVE      … 手順 3/5/7/9 のモード走行（KPI・レポートはこの区間だけ。
+                      mode_time_s 列 = モード経過秒）
+    EXCITE          … 加振走行（一定速度に正弦波を重ねてペダル→車速の周波数応答を測る。
+                      FF・PID は使わない開ループ走行。excite.py。mode_time_s 列 = 走行経過秒）
+    DECEL_TO_STOP   … 走行後の緩減速 → 停車保持
+
+記録の仕方:
+    - パターン走行: PatternLoop（本番 LearningLoop 相当）の on_sample コールバックから
+      1 行ごとに記録する（指令開度・指令位置）。
+    - モード走行: 50ms 制御ループが log_every_n_cycles（100ms）ごとに記録する（指令開度・指令位置・
+      effort 内訳）。
+    - それ以外: バックグラウンドのサンプラーが output.csv_interval_s ごとに CAN 車速と両軸の
+      まとめ読みを記録する（指令は各軸へ最後に送った目標位置）。パターン走行中は止める
+      （100ms の制御ループと Modbus を取り合わないため）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import csv
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from src.robot.core.axis_monitor import AxisMonitor
+from src.robot.core.config import ResearchConfig
+from src.robot.core.hardware import ResearchHardware
+from src.robot.core.live_plot import LivePlot, PlotSample, save_drive_figure
+from src.robot.core.research_types import DriveLog, DriveLogData, to_jst_naive
+from src.robot.core.term import say
+from src.robot.core.vehicle import pulse_to_opening
+
+SECTION_PRE_DRIVE_CHECK = "PRE_DRIVE_CHECK"
+SECTION_PEDAL_SEARCH = "PEDAL_SEARCH"
+SECTION_PATTERN_DRIVE = "PATTERN_DRIVE"
+SECTION_MODE_DRIVE = "MODE_DRIVE"
+SECTION_FEL_DRIVE = "FEL_DRIVE"  # 手順2 の 2-3: FEL の学習用パターン走行（2026-10-19 段2s-2b）
+SECTION_EXCITE = "EXCITE"  # 加振走行（ペダル→車速の周波数応答を開ループで測る。excite.py）
+SECTION_DECEL_TO_STOP = "DECEL_TO_STOP"
+
+LIVE_PNG_NAME = "live_drive.png"
+
+PULSE_PER_MM = 100  # 位置 1 pulse = 0.01mm
+
+# 2026-09-13 A7: 手順 1 からすべての区間で同じ列（KAIZEN 4.6 節末尾のログの提案）
+CSV_COLUMNS: tuple[str, ...] = (
+    # 時間
+    "timestamp",
+    "elapsed_s",
+    "mode_time_s",  # モード経過秒（モード走行の行だけ）
+    "cycle_ms",  # この行の読み取り（パターン・モード走行は 1 周期の処理）にかかった実時間 [ms]
+    # 車速
+    "ref_speed_kmh",
+    "actual_speed_kmh",
+    "deviation_kmh",  # 実車速 − 基準車速（基準のある行だけ）
+    # 指示開度 FF（FF の出力をペダル別に分けた値。モード走行の行だけ）
+    "accel_ff_pct",
+    "brake_ff_pct",
+    # G ランプの偏差の項のゲイン（その走行で測った感度から毎周期計算した直近の値。G ランプの行だけ。
+    # 0 は感度がまだ無く最小刻みで動かしている。Kp [%/(km/h)]・Ki [%/(km/h·s)]。使っていない
+    # ペダルの値は最後に使ったときのまま）
+    "accel_kp",
+    "accel_ki",
+    "brake_kp",
+    "brake_ki",
+    # 指示開度 FF・PID（アクチュエータへ送った最終指令。ガバナーで削った後・待機位置を含む）
+    "accel_cmd_pct",
+    "brake_cmd_pct",
+    "accel_cmd_mm",
+    "brake_cmd_mm",
+    # 実開度（まとめ読みの PNOW。読めなかった行は空欄）
+    "accel_actual_pct",
+    "brake_actual_pct",
+    "accel_actual_mm",
+    "brake_actual_mm",
+    # 電流 [mA]
+    "accel_current",
+    "brake_current",
+    # ステータス
+    "section",
+    "candidate",  # V1: FF 候補名（C1〜C6）。モード走行の行だけ入る（他区間・旧 CSV は空欄）
+    "pattern",
+    "phase",
+    "governor_active",  # 減速G ガバナーが頭打ち中か（モード・パターン走行。他の区間は False）
+    "alarm_accel",  # アクセル軸のアラーム（未確認なら空欄。1.0s ごと・モード/パターン走行）
+    "alarm_brake",  # ブレーキ軸のアラーム（未確認なら空欄。1.0s ごと・モード/パターン走行）
+    "accel_servo_on",  # DSS1 SV（まとめ読み。読めなかった行は空欄。以下同じ）
+    "accel_moving",  # DSSE MOVE
+    "accel_pos_done",  # DSS1 PEND
+    "accel_alarm_code",  # ALMC（0 = アラームなし）
+    "brake_servo_on",
+    "brake_moving",
+    "brake_pos_done",
+    "brake_alarm_code",
+    # 2026-10-17 段2p: C10 が開度の列に上乗せした effort [%]（正＝アクセル側へ増やした・
+    # 負＝ブレーキ側へ増やした。モード走行の C10 の行だけ。他の候補・他の区間・旧 CSV は空欄）
+    "c10_effort_pct",
+    # 2026-10-18 段2q: C11（DOB）の外乱の推定 d ＝ 実測 − 表の予測 [km/h/s]（ペダル別）と、
+    # 開度の上乗せのうち DOB の分 [%]（c10_effort_pct は P＋DOB の合計）。C11 の行だけ、他は空欄
+    # 2026-11-02 から dob_effort_pct は C10 の I を含まない（I は c10_integral_pct）。
+    # それより前の 11-01 以降のログ（I が効いた行）は I を含む
+    "dob_accel_kmhs",
+    "dob_brake_kmhs",
+    "dob_effort_pct",
+    # 2026-10-31 ProblemReport_20261031_DOBが逆向き 段1: DOB の低速の箱の推定 [km/h/s]
+    # （dob_split_low_speed が on の C11 の行だけ。off・他は空欄）
+    "dob_accel_low_kmhs",
+    "dob_brake_low_kmhs",
+    # 2026-10-18 段2r: C12（惰行の補助）が惰行の行に出した開度 [%]（正＝アクセル・負＝ブレーキ。
+    # 補助していない周期は 0。C12 の行だけ、他は空欄）。c10_effort_pct にも同じ値が入る
+    "coast_effort_pct",
+    # 2026-10-24 段8-a: launch_move_hold が発進のブレーキに足した深さ [%]（足さない周期は 0。
+    # launch_move_hold が false の走行は空欄）
+    "launch_hold_pct",
+    # 2026-10-19 段2u: C13 の車速のフィルタの推定車速 [km/h]、L 秒先の予測車速 [km/h]（低速の行など
+    # 予測を使わない周期は空欄）、C10 の P の上乗せに使った偏差 [km/h]（基準 − 車速の向き。予測を
+    # 使った周期は 基準の L 秒先 − 予測車速、使わない周期は 基準 − CAN 車速）。C13 の行だけ
+    "speed_est_kmh",
+    "speed_pred_kmh",
+    "pred_dev_kmh",
+    # 2026-10-19 段3: 目標側に使った「ぼかした基準」[km/h]（feedforward.ref_smooth_sigma_s。
+    # σ=0 のときは ref_speed_kmh と同じ値。ref_speed_kmh・deviation_kmh は元の基準のまま）。
+    # モード走行の行だけ
+    "ref_smooth_kmh",
+    # 2026-10-19 段3a: C14 の停車の最後のブレーキの下限が指令を上げた量 [%]（ブレーキの深さの増分。
+    # 掛けなかった周期は 0。C14 の行だけ、他は空欄）。brake_ff_pct にも下限は入っている
+    "creep_floor_pct",
+    # 2026-10-20 段4-2: C15 の 停A（停車保持を遅れ分早めた行なら 1、そうでなければ 0。C15 の行だけ、
+    # 他は空欄）と 停C の τ [s]（停C の区間の行だけ。それ以外は空欄）
+    "stop_lead_active",
+    "stop_end_tau_s",
+    # 2026-10-22 段5-2: 計画がその行で引いた表（0 本体・1 発進側・2 停止側・3 戻し）。アクセル側・
+    # ブレーキ側それぞれ。C7 以降の FF の行だけ、他は空欄
+    "ff_side_accel",
+    "ff_side_brake",
+    # 2026-10-22 段5-5c: 切り替えの先読みで要る加速度を見る時刻を早めた秒数。
+    # FF の行だけ（先読みなしは空欄）
+    "ff_switch_lead_s",
+    # 2026-10-30 段4: 保持の場面の PI（forward_map.hold_pi_enabled。ProblemReport_20261030）。
+    # hold_scene ＝ その周期が保持の場面なら 1・そうでなければ 0（機能 off は空欄）、
+    # hold_pi_effort_pct ＝ PI の上乗せ [%]（場面の外は空欄）、
+    # hold_ff_pct ＝ 場面で使った保持の FF のブレーキ開度 [%]（置き換えないときは空欄）
+    "hold_scene",
+    "hold_pi_effort_pct",
+    "hold_ff_pct",
+    # 2026-10-30 段13: 先読みの P（forward_map.hold_accel_pred_enabled）。
+    # hold_accel_kmhs ＝ 帯で丸めた実測の加速度 [km/h/s]、
+    # hold_pred_dev_kmh ＝ P に使った先読みの偏差
+    # （場面の外・off は空欄）
+    "hold_accel_kmhs",
+    "hold_pred_dev_kmh",
+    # 2026-10-31 段3（ProblemReport_20261031_停止間際 FB）:
+    # 停C の先読み（forward_map.stop_end_accel_pred_enabled）。
+    # stop_pred_dev_kmh ＝ 停C の区間で P に使った先読みの偏差（区間外・off は空欄）
+    "stop_pred_dev_kmh",
+    # 2026-11-01 段6d（ProblemReport_20261031_効き始めの近くのブレーキ）: C10 の偏差の積分 I。
+    # c10_integral_pct ＝ c10_effort_pct のうち I の分 [%]（アクセル正・ブレーキ負）、
+    # c10_integral_kmhs ＝ I が出す加速度 a_I [km/h/s]。側は accel_ff_pct / brake_ff_pct で分かる。
+    # どちらかの側が on の走行だけ（I を使わない周期は 0。両方 off は空欄）
+    "c10_integral_pct",
+    "c10_integral_kmhs",
+    # 2026-11-03 ProblemReport_20261103 段1（案③。forward_map.low_speed_keep_enabled）:
+    # keep_active ＝ その周期の FF を ③ に替えたら 1・替えなければ 0（機能 off は空欄）、
+    # keep_anchor_pct / keep_anchor_accel_kmhs ＝ 起点の実ブレーキ開度 [%]・実車の加速度 [km/h/s]
+    # （起点を持つ周期だけ）、keep_ff_pct ＝ ③ の FF のブレーキ開度 [%]（替えた周期だけ）
+    "keep_active",
+    "keep_anchor_pct",
+    "keep_anchor_accel_kmhs",
+    "keep_ff_pct",
+    # 2026-11-03 ProblemReport_20261103_停車前の這う基準 段1（forward_map.stop_tail_ramp_enabled）:
+    # stop_tail_active ＝ 停車前の踏み増しの行なら 1・そうでなければ 0（機能 off は空欄）
+    "stop_tail_active",
+    # 2026-11-04 段5（forward_map.stop_approach_no_release）: stop_keep_active ＝ 停車へ向かう所の
+    # ブレーキを戻さない区間の行なら 1・他は 0／stop_keep_held ＝ 前の周期より浅くするのを止めた
+    # 周期 1・遅すぎで戻した周期 2・それ以外 0（機能 off は空欄）。2026-11-05 段15
+    # （stop_approach_step_release）: 少し戻した周期 3・戻した後に待っている周期 4
+    "stop_keep_active",
+    "stop_keep_held",
+    # 2026-11-06 発進のブレーキの帯の FB（forward_map.launch_band_step_fb）の印: 0 何もしない・
+    # 1 保った・2 踏み増した・3 FF へ離した・4 待ち・5 FF より浅く離した・6 帯の終わりで min へ
+    # 離すのを待った（機能 off は空欄）
+    "launch_step_code",
+    # 2026-11-07 段16 型 A（forward_map.launch_breakaway_observed）: 帯のある発進の並びで、
+    # その周期に有効な「その場で測った動き出す開度」u_obs [%]（ブレーキ実開度。off・未測定は空欄）
+    "launch_obs_pct",
+    # 2026-11-08 段20 B-1（forward_map.launch_band_late_release）: 帯を伸ばした周期にだけ、伸ばした
+    # 周期数 s を入れる（ほかは空欄）
+    "band_late_rows",
+    # 2026-11-08 ProblemReport_20261108 段1（forward_map.c10_play_floor）:
+    # play_floor_pct ＝ その行のペダルの車速ごとの下限の開度 [%]（符号つき・アクセル正・
+    # ブレーキ負。下限を掛けない行・off は空欄）／play_floor_active ＝ 下限で止めた周期
+    # +1（アクセル）・−1（ブレーキ）・掛けたが止めなかった 0（off・掛けない行は空欄）
+    "play_floor_pct",
+    "play_floor_active",
+    # 同 段2（forward_map.coast_assist_handover）: coast_handover ＝ 惰行の補助を新しい形で
+    # 続けている周期 1・他は 0（off は空欄）／coast_pred_dev_kmh ＝ 入る・離すに使った先読みの偏差 p
+    # [km/h]（惰行の区間の外・off は空欄）
+    "coast_handover",
+    "coast_pred_dev_kmh",
+    # 2026-11-09 ProblemReport_20261109 段2・4（forward_map.c10_small_dev_band / c10_d_term）:
+    # small_dev_p_kmh ＝ 帯の f を掛けた後の P の偏差 [km/h]／d_term_kmh ＝ D の分
+    # Td ×（need − a_meas）[km/h]／d_accel_meas_kmhs ＝ D に使った実測の加速度 [km/h/s]
+    # （掛けない行・off は空欄。D は窓に 3 点未満の周期も空欄）
+    "small_dev_p_kmh",
+    "d_term_kmh",
+    "d_accel_meas_kmhs",
+    # 2026-11-10 ProblemReport_20261109 段9（forward_map.c10_p_local_gain）:
+    # p_local_ratio ＝ 手順2 の
+    # 定速の保持から測った局所の効きの倍率（表から引いた値）／p_gain_div ＝ P の加速度を割った量
+    # k_eff（1 ＝ 割っていない）。掛けた行（7.5 km/h 以上のアクセルの C10 の行）だけ・off は空欄
+    "p_local_ratio",
+    "p_gain_div",
+    # 2026-11-16 段11: 一時停止中の行は 1（それ以外は 0）。一時停止の行は section も
+    # MODE_DRIVE_PAUSE のように末尾に _PAUSE が付き、MODE_DRIVE を数える KPI・レポートから外れる
+    "paused",
+)
+
+
+@dataclass(frozen=True)
+class DriveSample:
+    """ログ 1 行。"""
+
+    elapsed_s: float
+    timestamp: datetime  # UTC aware
+    data: DriveLogData
+    section: str
+    phase: str
+    # パターン走行は「番号:種類」（例 18:ACCEL_SWEEP）、モード走行は区間名（例 Mid）
+    pattern: str = ""
+    mode_time_s: float | None = None  # モード走行のみ、モード開始からの経過秒
+    governor_active: bool = False  # 減速G ガバナーが頭打ち中か（モード走行・パターン走行）
+    alarm_accel: bool | None = None  # アクセル軸のアラーム（未確認なら None）
+    alarm_brake: bool | None = None  # ブレーキ軸のアラーム（未確認なら None）
+    # A7: FF の出力のペダル別（モード走行だけ）・まとめ読み・この行の読み取りの実時間
+    accel_ff_pct: float | None = None
+    brake_ff_pct: float | None = None
+    monitor_accel: AxisMonitor | None = None
+    monitor_brake: AxisMonitor | None = None
+    cycle_ms: float | None = None
+    candidate: str = ""  # V1: FF 候補名（C1〜C5）。モード走行だけ入れる
+    # G ランプの偏差の項のゲイン（G ランプの行だけ。他は None ＝ 空欄）
+    accel_kp: float | None = None
+    accel_ki: float | None = None
+    brake_kp: float | None = None
+    brake_ki: float | None = None
+    c10_effort_pct: float | None = None  # C10 の上乗せ分（C10 の行だけ。他は None ＝ 空欄）
+    # C11（DOB）の外乱の推定（アクセル側・ブレーキ側）[km/h/s] と上乗せのうち DOB の分 [%]
+    dob_accel_kmhs: float | None = None
+    dob_brake_kmhs: float | None = None
+    dob_effort_pct: float | None = None
+    dob_accel_low_kmhs: float | None = None
+    dob_brake_low_kmhs: float | None = None
+    launch_hold_pct: float | None = None  # 段8-a: 発進で足したブレーキの深さ（機能 off は None）
+    coast_effort_pct: float | None = None  # C12 の惰行の補助の開度（C12 の行だけ。他は None）
+    # C13 の車速のフィルタの推定・L 秒先の予測・P の上乗せに使った偏差（C13 の行だけ。他は None）
+    speed_est_kmh: float | None = None
+    speed_pred_kmh: float | None = None
+    pred_dev_kmh: float | None = None
+    ref_smooth_kmh: float | None = None  # 目標側に使ったぼかした基準（モード走行の行だけ）
+    creep_floor_pct: float | None = None  # C14 の下限が上げた量（C14 の行だけ。他は None）
+    stop_lead_active: bool | None = None  # C15 の停A の行なら True（C15 の行だけ。他は None）
+    stop_end_tau_s: float | None = None  # C15 の停C の τ [s]（区間の行だけ。他は None）
+    ff_side_accel: int | None = None  # 計画がその行のアクセル側で引いた表（SIDE_*。FF の行だけ）
+    ff_side_brake: int | None = None  # 同、ブレーキ側
+    hold_scene: int | None = None  # 段4: 保持の場面なら 1（上りは 2）・外は 0（機能 off は None）
+    hold_pi_effort_pct: float | None = None  # 段4: PI の上乗せ（場面の外・off は None）
+    hold_ff_pct: float | None = None  # 段7: 場面で使った保持の FF の開度（置き換えないときは None）
+    hold_accel_kmhs: float | None = None  # 段13: 帯で丸めた実測の加速度（場面の外・off は None）
+    hold_pred_dev_kmh: float | None = None  # 段13: P に使った先読みの偏差（同上）
+    stop_pred_dev_kmh: float | None = None  # 段3: 停C の区間で P に使った先読みの偏差（同上）
+    c10_integral_pct: float | None = None  # 段6d: c10_effort_pct のうち I の分
+    c10_integral_kmhs: float | None = None  # 段6d: I が出す加速度 a_I
+    keep_active: int | None = None  # 案③: FF を替えた周期なら 1・替えなければ 0（機能 off は None）
+    keep_anchor_pct: float | None = None  # 案③: 起点の実ブレーキ開度（起点なしは None）
+    keep_anchor_accel_kmhs: float | None = None  # 案③: 起点の実車の加速度（同上）
+    keep_ff_pct: float | None = None  # 案③: ③ の FF のブレーキ開度（替えない周期は None）
+    stop_tail_active: int | None = None  # 停車前の踏み増しの行なら 1・他は 0（機能 off は None）
+    stop_keep_active: int | None = None  # 区間なら 1・他は 0（off は None）
+    # 保った周期 1・戻した周期 2・少し戻した 3・待ち 4・他は 0（off は None）
+    stop_keep_held: int | None = None
+    launch_step_code: int | None = None  # 発進の帯の FB の印 0〜6（off は None）
+    launch_obs_pct: float | None = None  # 段16 型 A: 測った動き出す開度 [%]（off・未測定は None）
+    band_late_rows: int | None = None  # 段20 B-1: 伸ばした周期にだけ s（ほかは None）
+    play_floor_pct: float | None = None  # 20261108 段1: 車速ごとの下限の開度（符号つき）
+    play_floor_active: int | None = None  # 同: 下限で止めた周期 +1 アクセル・−1 ブレーキ・他 0
+    coast_handover: int | None = None  # 同 段2: handover の周期 1・他 0（off は None）
+    coast_pred_dev_kmh: float | None = None  # 同 段2: 先読みの偏差 p [km/h]
+    small_dev_p_kmh: float | None = None  # 20261109 段2: 帯の f を掛けた後の P の偏差
+    d_term_kmh: float | None = None  # 同 段4: D の分 Td ×（need − a_meas）
+    d_accel_meas_kmhs: float | None = None  # 同 段4: D に使った実測の加速度
+    p_local_ratio: float | None = None  # 20261109 段9: 定速の保持から測った局所の効きの倍率
+    p_gain_div: float | None = None  # 同 段9: P の加速度を割った量 k_eff
+    ff_switch_lead_s: float | None = None  # 段5-5c: 切り替えの先読みの追加の秒数（なしは None）
+    paused: int = 0  # 段11: 一時停止中の行なら 1
+
+
+class SessionLog:
+    """1 回の走行（走行前チェック〜停車保持）のログ。
+
+    `start` で時計・グラフ・サンプラーを始め、`close` で CSV/PNG に保存する。
+    """
+
+    def __init__(self, cfg: ResearchConfig, hw: ResearchHardware, *, has_ref: bool = False) -> None:
+        self._cfg = cfg
+        self._hw = hw
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_dir = cfg.results_path
+        results_dir.mkdir(parents=True, exist_ok=True)
+        self.csv_path = results_dir / f"drive_log_{hw.hw_mode}_{stamp}.csv"
+        self.title = f"走行ログ {stamp}（{cfg.vehicle.name} / {hw.hw_mode}）"
+        self.figure_path: Path | None = None
+        self.samples: list[DriveSample] = []
+        self._plot = LivePlot(
+            results_dir / LIVE_PNG_NAME,
+            title=self.title,
+            max_speed_kmh=cfg.vehicle.max_speed_kmh,
+            has_ref=has_ref,
+            enabled=cfg.output.plot,
+        )
+        self._t0 = time.monotonic()
+        self._wall0 = datetime.now(tz=UTC)
+        self._section = ""
+        self._phase = ""
+        self._sampler: asyncio.Task[None] | None = None
+        self._sampler_stop = asyncio.Event()
+        self._closed = False
+
+    def start(self, section: str, phase: str) -> None:
+        """経過秒 0 をここにし、グラフとサンプラーを始める。"""
+        self._t0 = time.monotonic()
+        self._wall0 = datetime.now(tz=UTC)
+        self.mark(section, phase)
+        say(f"走行ログ: {self.csv_path}（{self._cfg.output.csv_interval_s:g}s 刻み。"
+            "走行前チェック〜停車保持を 1 本に記録）")
+        self._plot.start()
+        self.start_sampler()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def elapsed_s(self) -> float:
+        return time.monotonic() - self._t0
+
+    def mark(self, section: str, phase: str) -> None:
+        """サンプラーが記録する行の区間・段を切り替える。"""
+        self._section, self._phase = section, phase
+
+    def record(
+        self,
+        data: DriveLogData,
+        *,
+        section: str | None = None,
+        phase: str | None = None,
+        pattern: str = "",
+        mode_time_s: float | None = None,
+        governor_active: bool = False,
+        alarm_accel: bool | None = None,
+        alarm_brake: bool | None = None,
+        accel_ff_pct: float | None = None,
+        brake_ff_pct: float | None = None,
+        monitor_accel: AxisMonitor | None = None,
+        monitor_brake: AxisMonitor | None = None,
+        cycle_ms: float | None = None,
+        candidate: str = "",
+        accel_kp: float | None = None,
+        accel_ki: float | None = None,
+        brake_kp: float | None = None,
+        brake_ki: float | None = None,
+        c10_effort_pct: float | None = None,
+        dob_accel_kmhs: float | None = None,
+        dob_brake_kmhs: float | None = None,
+        dob_effort_pct: float | None = None,
+        dob_accel_low_kmhs: float | None = None,
+        dob_brake_low_kmhs: float | None = None,
+        coast_effort_pct: float | None = None,
+        launch_hold_pct: float | None = None,
+        speed_est_kmh: float | None = None,
+        speed_pred_kmh: float | None = None,
+        pred_dev_kmh: float | None = None,
+        ref_smooth_kmh: float | None = None,
+        creep_floor_pct: float | None = None,
+        stop_lead_active: bool | None = None,
+        stop_end_tau_s: float | None = None,
+        ff_side_accel: int | None = None,
+        ff_side_brake: int | None = None,
+        ff_switch_lead_s: float | None = None,
+        hold_scene: int | None = None,
+        hold_pi_effort_pct: float | None = None,
+        hold_ff_pct: float | None = None,
+        hold_accel_kmhs: float | None = None,
+        hold_pred_dev_kmh: float | None = None,
+        stop_pred_dev_kmh: float | None = None,
+        c10_integral_pct: float | None = None,
+        c10_integral_kmhs: float | None = None,
+        keep_active: int | None = None,
+        keep_anchor_pct: float | None = None,
+        keep_anchor_accel_kmhs: float | None = None,
+        keep_ff_pct: float | None = None,
+        stop_tail_active: int | None = None,
+        stop_keep_active: int | None = None,
+        stop_keep_held: int | None = None,
+        launch_step_code: int | None = None,
+        launch_obs_pct: float | None = None,
+        band_late_rows: int | None = None,
+        play_floor_pct: float | None = None,
+        play_floor_active: int | None = None,
+        coast_handover: int | None = None,
+        coast_pred_dev_kmh: float | None = None,
+        small_dev_p_kmh: float | None = None,
+        d_term_kmh: float | None = None,
+        d_accel_meas_kmhs: float | None = None,
+        p_local_ratio: float | None = None,
+        p_gain_div: float | None = None,
+        paused: int = 0,
+    ) -> DriveSample:
+        elapsed = self.elapsed_s()
+        sample = DriveSample(
+            elapsed_s=elapsed,
+            timestamp=self._wall0 + timedelta(seconds=elapsed),
+            data=data,
+            section=self._section if section is None else section,
+            phase=self._phase if phase is None else phase,
+            pattern=pattern,
+            mode_time_s=mode_time_s,
+            governor_active=governor_active,
+            alarm_accel=alarm_accel,
+            alarm_brake=alarm_brake,
+            accel_ff_pct=accel_ff_pct,
+            brake_ff_pct=brake_ff_pct,
+            monitor_accel=monitor_accel,
+            monitor_brake=monitor_brake,
+            cycle_ms=cycle_ms,
+            candidate=candidate,
+            accel_kp=accel_kp,
+            accel_ki=accel_ki,
+            brake_kp=brake_kp,
+            brake_ki=brake_ki,
+            c10_effort_pct=c10_effort_pct,
+            dob_accel_kmhs=dob_accel_kmhs,
+            dob_brake_kmhs=dob_brake_kmhs,
+            dob_effort_pct=dob_effort_pct,
+            dob_accel_low_kmhs=dob_accel_low_kmhs,
+            dob_brake_low_kmhs=dob_brake_low_kmhs,
+            coast_effort_pct=coast_effort_pct,
+            launch_hold_pct=launch_hold_pct,
+            speed_est_kmh=speed_est_kmh,
+            speed_pred_kmh=speed_pred_kmh,
+            pred_dev_kmh=pred_dev_kmh,
+            ref_smooth_kmh=ref_smooth_kmh,
+            creep_floor_pct=creep_floor_pct,
+            stop_lead_active=stop_lead_active,
+            stop_end_tau_s=stop_end_tau_s,
+            ff_side_accel=ff_side_accel,
+            ff_side_brake=ff_side_brake,
+            ff_switch_lead_s=ff_switch_lead_s,
+            hold_scene=hold_scene,
+            hold_pi_effort_pct=hold_pi_effort_pct,
+            hold_ff_pct=hold_ff_pct,
+            hold_accel_kmhs=hold_accel_kmhs,
+            hold_pred_dev_kmh=hold_pred_dev_kmh,
+            stop_pred_dev_kmh=stop_pred_dev_kmh,
+            c10_integral_pct=c10_integral_pct,
+            c10_integral_kmhs=c10_integral_kmhs,
+            keep_active=keep_active,
+            keep_anchor_pct=keep_anchor_pct,
+            keep_anchor_accel_kmhs=keep_anchor_accel_kmhs,
+            keep_ff_pct=keep_ff_pct,
+            stop_tail_active=stop_tail_active,
+            stop_keep_active=stop_keep_active,
+            stop_keep_held=stop_keep_held,
+            launch_step_code=launch_step_code,
+            launch_obs_pct=launch_obs_pct,
+            band_late_rows=band_late_rows,
+            play_floor_pct=play_floor_pct,
+            play_floor_active=play_floor_active,
+            coast_handover=coast_handover,
+            coast_pred_dev_kmh=coast_pred_dev_kmh,
+            small_dev_p_kmh=small_dev_p_kmh,
+            d_term_kmh=d_term_kmh,
+            d_accel_meas_kmhs=d_accel_meas_kmhs,
+            p_local_ratio=p_local_ratio,
+            p_gain_div=p_gain_div,
+            paused=paused,
+        )
+        self.samples.append(sample)
+        self._plot.push(_plot_sample(sample))
+        return sample
+
+    def start_sampler(self) -> None:
+        if self._sampler is None and not self._closed:
+            self._sampler_stop = asyncio.Event()
+            self._sampler = asyncio.get_running_loop().create_task(
+                self._sample_loop(self._sampler_stop)
+            )
+
+    async def stop_sampler(self) -> None:
+        """サンプラーを止める。読み取り中ならその 1 回が終わるのを待つ（cancel しない）。
+
+        pymodbus の execute() は応答待ち中に CancelledError を受けると ModbusIOException に
+        変えて投げ直すため、読み取り中に task.cancel() するとサンプラーが止まらず、この await が
+        戻らなかった（実機で手順 2 の停車保持の後に停止）。途中で打ち切った要求の応答が遅れて
+        届くのも避けたいので、停止フラグで読み取りの切れ目に抜けさせる。
+        """
+        task, self._sampler = self._sampler, None
+        if task is None:
+            return
+        self._sampler_stop.set()
+        await task
+
+    async def close(self) -> Path | None:
+        """サンプラーとグラフを止めて CSV/PNG を保存する（2 回目以降は何もしない）。"""
+        if self._closed:
+            return self.csv_path if self.samples else None
+        self._closed = True
+        if self._sampler is not None:
+            await self.stop_sampler()
+            # 最後の状態（停車保持など）を必ず 1 行残す。直前の段がすぐ終わるとサンプラーが
+            # まだ 1 回も読んでいないことがあるため
+            await self._read_and_record()
+        await self._plot.aclose()
+        if not self.samples:
+            say("走行ログ: 記録が 0 行のため CSV・図は保存しません")
+            return None
+        write_csv(self.samples, self.csv_path)
+        say(f"走行ログ CSV: {self.csv_path}（{len(self.samples)} 行）")
+        if self._cfg.output.plot:
+            self.figure_path = save_drive_figure(
+                [_plot_sample(s) for s in self.samples],
+                self.csv_path.with_suffix(".png"),
+                title=self.title,
+                max_speed_kmh=self._cfg.vehicle.max_speed_kmh,
+                has_ref=any(s.data.ref_speed_kmh is not None for s in self.samples),
+            )
+            say(f"走行グラフ: {self.figure_path}")
+        return self.csv_path
+
+    async def _sample_loop(self, stop: asyncio.Event) -> None:
+        loop = asyncio.get_running_loop()
+        interval = self._cfg.output.csv_interval_s
+        while not stop.is_set():
+            started = loop.time()
+            await self._read_and_record()
+            wait_s = max(0.0, interval - (loop.time() - started))
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=wait_s)
+
+    async def _read_and_record(self) -> DriveSample | None:
+        """車速と両軸のまとめ読みを 1 行記録する。読めなければ記録を飛ばすだけ（判定は各段）。
+
+        指令は各軸へ最後に送った目標位置（未指令なら原点 0）。
+        """
+        hw = self._hw
+        started = time.perf_counter()
+        try:
+            speed = await hw.can.read_speed()
+            monitor_accel, monitor_brake = await asyncio.gather(
+                hw.accel.read_monitor(), hw.brake.read_monitor()
+            )
+        except Exception:
+            return None
+        cycle_ms = 1000.0 * (time.perf_counter() - started)
+        accel_pos = hw.accel.last_command_pos or 0
+        brake_pos = hw.brake.last_command_pos or 0
+        data = DriveLogData(
+            ref_speed_kmh=None,
+            actual_speed_kmh=speed,
+            accel_opening=pulse_to_opening(accel_pos),
+            brake_opening=pulse_to_opening(brake_pos),
+            accel_pos=accel_pos,
+            brake_pos=brake_pos,
+            accel_current=monitor_accel.current_ma,
+            brake_current=monitor_brake.current_ma,
+        )
+        return self.record(
+            data, monitor_accel=monitor_accel, monitor_brake=monitor_brake, cycle_ms=cycle_ms
+        )
+
+
+def mark(log: SessionLog | None, section: str, phase: str) -> None:
+    """ログがあれば区間・段を切り替える（テストなどでログ無しに呼べるように）。"""
+    if log is not None:
+        log.mark(section, phase)
+
+
+def _plot_sample(s: DriveSample) -> PlotSample:
+    d = s.data
+    return PlotSample(s.elapsed_s, d.ref_speed_kmh, d.actual_speed_kmh,
+                      d.accel_opening, d.brake_opening)
+
+
+def _fmt(value: float | None, digits: int = 3) -> str:
+    return "" if value is None else f"{value:.{digits}f}"
+
+
+def _fmt_bool(value: bool | None) -> str:
+    return "" if value is None else ("1" if value else "0")
+
+
+def _mm(pulse: int) -> str:
+    return f"{pulse / PULSE_PER_MM:.2f}"
+
+
+def monitor_opening_pct(m: AxisMonitor | None) -> float | None:
+    """モニタの読み戻し位置を実開度 [%] にする（CSV の *_actual_pct 列と同じ値、小数 3 桁）。"""
+    if m is None:
+        return None
+    return round(pulse_to_opening(m.position_pulse), 3)
+
+
+def _actual_cells(m: AxisMonitor | None) -> tuple[str, str]:
+    if m is None:
+        return "", ""
+    return f"{pulse_to_opening(m.position_pulse):.3f}", _mm(m.position_pulse)
+
+
+def _status_cells(m: AxisMonitor | None) -> list[str]:
+    if m is None:
+        return ["", "", "", ""]
+    return [_fmt_bool(m.servo_on), _fmt_bool(m.moving), _fmt_bool(m.pos_done), str(m.alarm_code)]
+
+
+def write_csv(samples: Sequence[DriveSample], path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_COLUMNS)
+        for s in samples:
+            d = s.data
+            deviation = None if d.ref_speed_kmh is None else d.actual_speed_kmh - d.ref_speed_kmh
+            accel_actual_pct, accel_actual_mm = _actual_cells(s.monitor_accel)
+            brake_actual_pct, brake_actual_mm = _actual_cells(s.monitor_brake)
+            writer.writerow([
+                to_jst_naive(s.timestamp).isoformat(sep=" "),
+                f"{s.elapsed_s:.3f}",
+                _fmt(s.mode_time_s),
+                _fmt(s.cycle_ms, 1),
+                _fmt(d.ref_speed_kmh),
+                f"{d.actual_speed_kmh:.3f}",
+                _fmt(deviation),
+                _fmt(s.accel_ff_pct),
+                _fmt(s.brake_ff_pct),
+                _fmt(s.accel_kp, 5),
+                _fmt(s.accel_ki, 5),
+                _fmt(s.brake_kp, 5),
+                _fmt(s.brake_ki, 5),
+                f"{d.accel_opening:.3f}",
+                f"{d.brake_opening:.3f}",
+                _mm(d.accel_pos),
+                _mm(d.brake_pos),
+                accel_actual_pct,
+                brake_actual_pct,
+                accel_actual_mm,
+                brake_actual_mm,
+                f"{d.accel_current:.1f}",
+                f"{d.brake_current:.1f}",
+                s.section,
+                s.candidate,
+                s.pattern,
+                s.phase,
+                _fmt_bool(s.governor_active),
+                _fmt_bool(s.alarm_accel),
+                _fmt_bool(s.alarm_brake),
+                *_status_cells(s.monitor_accel),
+                *_status_cells(s.monitor_brake),
+                _fmt(s.c10_effort_pct),
+                _fmt(s.dob_accel_kmhs),
+                _fmt(s.dob_brake_kmhs),
+                _fmt(s.dob_effort_pct),
+                _fmt(s.dob_accel_low_kmhs),
+                _fmt(s.dob_brake_low_kmhs),
+                _fmt(s.coast_effort_pct),
+                _fmt(s.launch_hold_pct),
+                _fmt(s.speed_est_kmh),
+                _fmt(s.speed_pred_kmh),
+                _fmt(s.pred_dev_kmh),
+                _fmt(s.ref_smooth_kmh),
+                _fmt(s.creep_floor_pct),
+                _fmt_bool(s.stop_lead_active),
+                _fmt(s.stop_end_tau_s),
+                "" if s.ff_side_accel is None else str(s.ff_side_accel),
+                "" if s.ff_side_brake is None else str(s.ff_side_brake),
+                _fmt(s.ff_switch_lead_s),
+                "" if s.hold_scene is None else str(s.hold_scene),
+                _fmt(s.hold_pi_effort_pct),
+                _fmt(s.hold_ff_pct),
+                _fmt(s.hold_accel_kmhs),
+                _fmt(s.hold_pred_dev_kmh),
+                _fmt(s.stop_pred_dev_kmh),
+                _fmt(s.c10_integral_pct),
+                _fmt(s.c10_integral_kmhs),
+                "" if s.keep_active is None else str(s.keep_active),
+                _fmt(s.keep_anchor_pct),
+                _fmt(s.keep_anchor_accel_kmhs),
+                _fmt(s.keep_ff_pct),
+                "" if s.stop_tail_active is None else str(s.stop_tail_active),
+                "" if s.stop_keep_active is None else str(s.stop_keep_active),
+                "" if s.stop_keep_held is None else str(s.stop_keep_held),
+                "" if s.launch_step_code is None else str(s.launch_step_code),
+                _fmt(s.launch_obs_pct),
+                "" if s.band_late_rows is None else str(s.band_late_rows),
+                _fmt(s.play_floor_pct),
+                "" if s.play_floor_active is None else str(s.play_floor_active),
+                "" if s.coast_handover is None else str(s.coast_handover),
+                _fmt(s.coast_pred_dev_kmh),
+                _fmt(s.small_dev_p_kmh),
+                _fmt(s.d_term_kmh),
+                _fmt(s.d_accel_meas_kmhs),
+                _fmt(s.p_local_ratio),
+                _fmt(s.p_gain_div),
+                str(int(s.paused)),
+            ])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CSV の読み取り（新形式 A7〜 と旧形式 〜A6 の両方）
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _num(text: str | None) -> float | None:
+    return float(text) if text not in (None, "") else None
+
+
+def cmd_opening(row: Mapping[str, str], axis: str) -> float:
+    """最終指令の開度 [%]。新形式は `{axis}_cmd_pct`、旧形式は `{axis}_opening`。"""
+    key = f"{axis}_cmd_pct"
+    return float(row[key] if key in row else row[f"{axis}_opening"])
+
+
+def cmd_pulse(row: Mapping[str, str], axis: str) -> int:
+    """最終指令の位置 [pulse]。新形式は `{axis}_cmd_mm` × 100、旧形式は `{axis}_pos`。"""
+    key = f"{axis}_cmd_mm"
+    if key in row:
+        return round(float(row[key]) * PULSE_PER_MM)
+    return int(row[f"{axis}_pos"])
+
+
+def actual_opening(row: Mapping[str, str], axis: str) -> float | None:
+    """実開度 [%]（新形式だけ。旧形式・読めなかった行は None）。"""
+    return _num(row.get(f"{axis}_actual_pct"))
+
+
+def ff_effort(row: Mapping[str, str]) -> float | None:
+    """FF の出力（+: アクセル / −: ブレーキ）。新形式はペダル別の 2 列から組み立てる。"""
+    if "accel_ff_pct" in row:
+        accel, brake = _num(row["accel_ff_pct"]), _num(row.get("brake_ff_pct"))
+        if accel is None and brake is None:
+            return None
+        return (accel or 0.0) - (brake or 0.0)
+    return _num(row.get("ff_effort_pct"))
+
+
+def pid_effort(row: Mapping[str, str]) -> float | None:
+    """PID の出力。旧形式の `pid_effort_pct` だけ（新形式は列を持たないので None）。"""
+    return _num(row.get("pid_effort_pct"))
+
+
+def total_effort(row: Mapping[str, str]) -> float | None:
+    """合成の出力。旧形式の `effort_pct` だけ（新形式は列を持たないので None）。"""
+    return _num(row.get("effort_pct"))
+
+
+# 2026-11-10 ProblemReport_20261109 段10c: 表（本体・発進側・停止側）の学習に使わない phase。
+# 保持の正弦波（pattern_loop の RAMP_CRUISE_SINE）は 1 Hz では効きが約 3 倍に見えるので、表の傾きが
+# ゆがむのを防ぐ。CSV の phase 列と同じ文字列（学習の行を読む所が共有する）
+TRAINING_EXCLUDED_PHASES: frozenset[str] = frozenset({"RAMP_CRUISE_SINE"})
+
+
+def read_drive_logs(path: Path, *, label: str = "cmd") -> list[DriveLog]:
+    """CSV → 本番 model_training が受け取る DriveLog の列（パターン走行の行だけ）。
+
+    `section` 列があれば PATTERN_DRIVE の行だけを読む（走行前チェック・探索・緩減速を学習に
+    混ぜない）。
+    `section` 列の無い旧形式の CSV は全行を読む。
+    時刻は elapsed_s から組み立てる（ミリ秒丸めの timestamp 列より周期推定が正確なため）。
+
+    `label`:
+        "cmd"    （既定）学習ラベルは最終指令の開度（`cmd_opening`）。
+        "actual" 学習ラベルは PNOW から換算した実開度（`actual_opening`、A7 の新形式だけ）。
+                 実開度が読めなかった行（旧形式の CSV・欠測）は除外する。
+    """
+    if label not in ("cmd", "actual"):
+        raise ValueError(f"label は 'cmd' か 'actual' のみです: {label!r}")
+    origin = datetime(2000, 1, 1, tzinfo=UTC)
+    logs: list[DriveLog] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if "section" in row and row["section"] != SECTION_PATTERN_DRIVE:
+                continue
+            if (row.get("phase") or "") in TRAINING_EXCLUDED_PHASES:
+                continue  # 2026-11-10 段10c: 保持の正弦波の行は学習に使わない
+            if label == "actual":
+                accel_label = actual_opening(row, "accel")
+                brake_label = actual_opening(row, "brake")
+                if accel_label is None or brake_label is None:
+                    continue
+            else:
+                accel_label = cmd_opening(row, "accel")
+                brake_label = cmd_opening(row, "brake")
+            logs.append(
+                DriveLog(
+                    id=len(logs),
+                    session_id=path.stem,
+                    timestamp=origin + timedelta(seconds=float(row["elapsed_s"])),
+                    ref_speed_kmh=float(row["ref_speed_kmh"]) if row["ref_speed_kmh"] else None,
+                    actual_speed_kmh=float(row["actual_speed_kmh"]),
+                    accel_opening=accel_label,
+                    brake_opening=brake_label,
+                    accel_pos=cmd_pulse(row, "accel"),
+                    brake_pos=cmd_pulse(row, "brake"),
+                    accel_current=float(row["accel_current"]),
+                    brake_current=float(row["brake_current"]),
+                )
+            )
+    return logs

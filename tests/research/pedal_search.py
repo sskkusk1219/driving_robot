@@ -49,8 +49,9 @@ from __future__ import annotations
 import asyncio
 import math
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -104,6 +105,10 @@ class HoldPointResult:
     elapsed_s: float  # 基準が上がり始めてから終わるまで [s]
     initial_opening_pct: float  # 初めの開度（BRAKE_SEARCH の補間）[%]
     note: str = ""
+    # 段10-1 A: 加速度の符号が変わる瞬間（hold_crossing）の数と、保てたと判定した基準
+    # （"band" ＝ 帯に合計 hold_s・"crossings" ＝ 瞬間 2 回以上・"" ＝ 保てず）
+    crossings: int = 0
+    criterion: str = ""
 
 
 @dataclass(frozen=True)
@@ -559,6 +564,8 @@ def hold_opening_meta(
                 "in_band_s": float(p.in_band_s),
                 "elapsed_s": float(p.elapsed_s),
                 "initial_opening_pct": float(p.initial_opening_pct),
+                "criterion": p.criterion,
+                "crossings": int(p.crossings),
             }
             for p in points
         ],
@@ -567,6 +574,46 @@ def hold_opening_meta(
         "min_pct": float(min_pct),
         "source_csv": source_csv,
     }
+
+
+def apply_crossings(
+    points: Sequence[HoldPointResult], csv_path: Path, lag_s: float
+) -> tuple[list[HoldPointResult], str]:
+    """4 点の保持の結果へ、加速度の符号が変わる瞬間（hold_crossing）の判定を足す（段10-1 A）。
+
+    点ごとに CSV の LOW_HOLD（時刻の空きで分けた i 番目）から瞬間を集める。帯で保てた点は
+    今のまま（criterion "band"。瞬間の数だけ記録）。保てなかった点でも瞬間が MIN_CROSSINGS 回以上
+    なら「保てた」（criterion "crossings"）にし、車速・開度を瞬間の平均にする。
+    戻り値は (新しい点, 一行の説明)。CSV の点の数が合わない・読めないときは今のまま。
+    """
+    from tests.research import hold_crossing as hc  # noqa: PLC0415
+
+    base = [
+        replace(p, criterion=p.criterion or ("band" if p.held else "")) for p in points
+    ]
+    try:
+        per_point = hc.crossings_from_csv(Path(csv_path), lag_s)
+    except (OSError, ValueError) as exc:
+        return base, f"瞬間の判定は使えません（CSV を読めません: {exc}）"
+    if len(per_point) != len(base):
+        return base, (
+            f"瞬間の判定は使えません（CSV の LOW_HOLD の点 {len(per_point)} 個・"
+            f"結果の点 {len(base)} 個で合いません）"
+        )
+    out: list[HoldPointResult] = []
+    for p, cs in zip(base, per_point, strict=True):
+        summ = hc.summarize(cs)
+        if p.held or summ.count < hc.MIN_CROSSINGS:
+            out.append(replace(p, crossings=summ.count))
+        else:
+            out.append(replace(
+                p, held=True, speed_kmh=summ.speed_kmh, opening_pct=summ.opening_pct,
+                crossings=summ.count, criterion="crossings",
+            ))
+    got = [
+        f"{p.target_kmh:g}:{p.criterion or '保てず'}（瞬間 {p.crossings}）" for p in out
+    ]
+    return out, "瞬間の判定（L " + f"{lag_s:g}s）: " + "・".join(got)
 
 
 async def _wait_stopped(hw: ResearchHardware, cfg: ResearchConfig) -> None:
@@ -696,6 +743,7 @@ async def _run_hold_point(
         opening_pct=sum_open / n_band if n_band else None,
         in_band_s=round(in_band_s, 3), elapsed_s=round(elapsed, 3),
         initial_opening_pct=round(initial_pct, 3), note=note,
+        criterion="band" if held else "",
     )
     return result, cmd_pos
 

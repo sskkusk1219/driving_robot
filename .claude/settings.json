@@ -1,9 +1,19 @@
 {
   "permissions": {
-    "allow": [
-    ],
+    "allow": [],
     "deny": [],
     "ask": []
   },
-  "hooks": {}
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"ユーザーへの回答・説明・進捗報告・質問（AskUserQuestion の質問と選択肢を含む）は必ず日本語で書く。英語で返さない。\"}}'"
+          }
+        ]
+      }
+    ]
+  }
 }

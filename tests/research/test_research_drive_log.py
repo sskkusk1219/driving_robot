@@ -491,26 +491,33 @@ def test_band_late_rows_column_is_last_and_blank_when_off() -> None:
 def test_play_floor_and_coast_handover_columns_are_last_and_blank_when_off() -> None:
     # 2026-11-08 ProblemReport_20261108 段1・2: 下限と handover の列（off は空欄）
     # （20261109 段2・4 でこの後ろに 3 列、段9 でさらに 2 列が付いた）
-    assert dlmod.CSV_COLUMNS[-9:-5] == (
+    assert dlmod.CSV_COLUMNS[-10:-6] == (
         "play_floor_pct", "play_floor_active", "coast_handover", "coast_pred_dev_kmh",
     )
-    for name in dlmod.CSV_COLUMNS[-9:-5]:
+    for name in dlmod.CSV_COLUMNS[-10:-6]:
         assert dlmod.DriveSample.__dataclass_fields__[name].default is None
         assert name in inspect.signature(dlmod.SessionLog.record).parameters
 
 
 def test_small_dev_and_d_term_columns_are_last_and_blank_when_off() -> None:
     # 2026-11-09 段2・4: 帯・D の列（掛けない行・off は空欄）
-    # （20261109 段9 でこの後ろに 2 列が付いた）
-    assert dlmod.CSV_COLUMNS[-5:-2] == ("small_dev_p_kmh", "d_term_kmh", "d_accel_meas_kmhs")
-    for name in dlmod.CSV_COLUMNS[-5:-2]:
+    # （20261109 段9 でこの後ろに 2 列、段11 で paused 列が付いた）
+    assert dlmod.CSV_COLUMNS[-6:-3] == ("small_dev_p_kmh", "d_term_kmh", "d_accel_meas_kmhs")
+    for name in dlmod.CSV_COLUMNS[-6:-3]:
         assert dlmod.DriveSample.__dataclass_fields__[name].default is None
         assert name in inspect.signature(dlmod.SessionLog.record).parameters
 
 
 def test_p_local_gain_columns_are_last_and_blank_when_off() -> None:
     # 2026-11-10 段9: P の局所の効きの倍率と割った量（掛けない行・off は空欄）
-    assert dlmod.CSV_COLUMNS[-2:] == ("p_local_ratio", "p_gain_div")
-    for name in dlmod.CSV_COLUMNS[-2:]:
+    assert dlmod.CSV_COLUMNS[-3:-1] == ("p_local_ratio", "p_gain_div")
+    for name in dlmod.CSV_COLUMNS[-3:-1]:
         assert dlmod.DriveSample.__dataclass_fields__[name].default is None
         assert name in inspect.signature(dlmod.SessionLog.record).parameters
+
+
+def test_paused_column_is_last_and_defaults_to_zero() -> None:
+    # 2026-11-16 段11: 一時停止中の行は 1（それ以外は 0）
+    assert dlmod.CSV_COLUMNS[-1] == "paused"
+    assert dlmod.DriveSample.__dataclass_fields__["paused"].default == 0
+    assert inspect.signature(dlmod.SessionLog.record).parameters["paused"].default == 0

@@ -1,141 +1,128 @@
-// ── Learning drive screen ─────────────────────────────────
-// Reuses DriveMonitorScreen。「開始」ボタンは学習運転単体ではなく学習サイクル
-// 全体（学習運転→訓練→PID適合→再学習→PID適合）をサーバー側オーケストレータ
-// （LearningCycleOrchestrator）に委譲する。自動運転と同じ arm → 確認ポップアップ →
-// start のフロー（driveArmPath/driveCancelPath）を使い、ポップアップ表示前に
-// 停車ブレーキ踏込・走行前チェック・車速0確認を完了させる。
-// 進捗は WebSocket の cycle_progress で配信され、resultPanel と busyLabel に表示する。
-// busy（cycleActive）中はフェーズが READY に戻る訓練段階でも「開始」を再表示
-// させず、常に中断ボタンを出す（DriveMonitorScreen 側で robotState より busy を優先）。
-// 旧実装が行っていたクライアント側の自動チェーン（robotState 監視での
-// train→refine 連続発火）は削除済み: 残すとオーケストレーション中の READY 遷移
-// （フェーズごとに複数回発生）のたびに二重発火してしまうため。
+// ── 学習運転（RPD D-14） ─────────────────────────────────────
+// 開始の種類:
+//   学習（手順 2 全部）: Ready・D → ペダル探索 → G ランプ走行 → モデル作成 → 学習結果チェック（→ 補正表の学習）→ N
+//   部分学習（今の pkl への学習のやり直し）: 手順12 FEL ／ 手順13 保持の点 ／ 手順14 停止の手前
+// 学習結果チェックが NG（終了コード 8）のときは車両 yaml を書き換えず、理由と「やり直す」を出す。
+// 画面の部品は自動運転と同じ DriveMonitorScreen（グラフ・状態の 1 行。一時停止ボタンは出さない）を使う。
+// 段階表示・終了コードの意味は job-utils.js。
+
+const LEARNING_KINDS = [
+  { kind: 'full', label: '学習（全部）' },
+  { kind: 'fel',  label: '部分学習: FEL' },
+  { kind: 'hold', label: '部分学習: 保持の点' },
+  { kind: 'stop', label: '部分学習: 停止の手前' },
+];
 
 function LearningScreen() {
   const { useState, useEffect, useContext } = React;
   const { apiFetch, activeProfileId, setNav, realtimeData } = useContext(window.AppContext);
-  const { ValidationPopup } = window;
+  const { ValidationPopup, Btn, Pill, INK, INK_SOFT, INK_MUTE, HATCH } = window;
 
   const [popup, setPopup] = useState(null);
-  const [profileMaxSpeed, setProfileMaxSpeed] = useState(null);
-  const [profileMaxDecelG, setProfileMaxDecelG] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [kind, setKind] = useState('full');
+  const [dismissedJobId, setDismissedJobId] = useState(null);
 
+  const liveJob = realtimeData?.job ?? null;
+  const learningRunning = !!liveJob && liveJob.kind === 'learning';
+  const lastJob = window.useLastJob(liveJob);
+  const lines = window.useDriveLogLines();
+
+  async function loadProfile() {
+    if (!activeProfileId) return;
+    const p = await apiFetch('GET', `/api/v1/profiles/${activeProfileId}`);
+    if (p) setProfile(p);
+    return p;
+  }
   useEffect(() => {
-    if (!activeProfileId) {
-      setPopup('no_profile');
-      return;
-    }
-    apiFetch('GET', `/api/v1/profiles/${activeProfileId}`).then(p => {
-      if (!p) return;
-      if (!p.calibration?.is_valid) setPopup('no_calib');
-      if (p.max_speed) setProfileMaxSpeed(p.max_speed);
-      if (p.max_decel_g != null) setProfileMaxDecelG(p.max_decel_g);
+    if (!activeProfileId) { setPopup('no_profile'); return; }
+    loadProfile().then(p => {
+      if (p && !(p.min_accel_measured && p.min_brake_measured)) setPopup('no_min');
     });
   }, []);
+  // ジョブが終わったら（学習済みか・pkl の日時が変わったので）車の状態を読み直す
+  const liveId = liveJob?.job_id ?? null;
+  useEffect(() => { if (!liveId) loadProfile(); }, [liveId]);
 
-  const cycleProgress = realtimeData?.cycle_progress ?? null;
-  const cyclePhase = cycleProgress?.phase ?? 'IDLE';
-  const cycleActive = !['IDLE', 'COMPLETED', 'ERROR', 'ABORTED'].includes(cyclePhase);
+  // 走っている学習ジョブの種類は steps から（"2,25" → full …）。走っていなければ選んだ種類
+  const shownKind = learningRunning ? window.learningKindOf(liveJob) : kind;
+  const kindInfo = LEARNING_KINDS.find(k => k.kind === shownKind) ?? LEARNING_KINDS[0];
+  const partialNeedsModel = shownKind !== 'full' && profile && !profile.learned;
 
-  async function handleAbortCycle() {
-    const res = await apiFetch('POST', '/api/v1/drive/learning-cycle/abort');
-    if (res) window.showToast('学習サイクルの中断を要求しました', 'info');
-  }
+  // 表示するジョブ: 実行中のもの、なければ直前の学習ジョブ
+  const showLast = !liveJob && lastJob && lastJob.kind === 'learning' && lastJob.job_id !== dismissedJobId;
+  const stageJob = learningRunning ? liveJob : (showLast ? lastJob : null);
+  const stageKind = stageJob ? window.learningKindOf(stageJob) : shownKind;
+  const stage = window.deriveStages(stageKind, stageJob, lines);
 
-  const POPUP_CONFIG = {
-    no_profile: { message: '車両プロファイルを選択してください', actionLabel: 'プロファイルへ', nav: 'profiles' },
-    no_calib:   { message: 'キャリブレーションデータがありません', actionLabel: 'キャリブレーションへ', nav: 'calibration' },
-  };
-
-  const cfg = popup ? POPUP_CONFIG[popup] : null;
-  const fmt = (m) => (m == null ? '—' : m.toFixed(3));
-
-  // 規定パターンの主要速度（0→0.6→0.8→0.3→0×max_speed）と上限Gの文字情報。
-  // グラフへの基準パターン描画はしない（学習ページは実車速のみ表示）。
-  const patternText = profileMaxSpeed
-    ? `規定パターン: 0 → ${Math.round(0.6 * profileMaxSpeed)} → ${Math.round(0.8 * profileMaxSpeed)} → ${Math.round(0.3 * profileMaxSpeed)} → 0 km/h`
-      + (profileMaxDecelG != null ? `（最大減速 ${profileMaxDecelG.toFixed(2)}G 以内）` : '')
-    : null;
-
-  const PHASE_LABEL = {
-    IDLE: '待機中',
-    ARMING: '学習運転を準備中…',
-    LEARNING: '学習運転を実行中…',
-    TRAINING_1: '運転モデルを学習中(1段目)…',
-    REFINE_1: 'PID粗適合を実行中…',
-    TRAINING_2: 'サイクル全ログで再学習中(2段目)…',
-    VERIFY: '検証走行でKPIを確認中…',
-    PLAN_LEARN: 'プラン学習を実行中…',
-    REFINE_FINAL: 'PID仕上げを実行中…',
-    COMPLETED: '学習サイクルが完了しました',
-    ERROR: '学習サイクルでエラーが発生しました',
-    ABORTED: '学習サイクルを中断しました',
-  };
-
-  // 学習サイクルの進捗を DriveMonitorScreen の resultPanel 枠に表示する。
-  // 待機中（IDLE）は中身なし（現在ステータスのログ・案内文だけを出す）。
-  const resultPanel = !cycleProgress || cyclePhase === 'IDLE' ? null : (
-    <div style={{ fontSize: 12, color: INK }}>
-      {(
-        <div>
-          <div style={{ fontWeight: 700 }}>
-            {PHASE_LABEL[cyclePhase] ?? cyclePhase}
-            {cycleProgress.run_total > 0 && `（${cycleProgress.run_index}/${cycleProgress.run_total}回）`}
-          </div>
-          {cycleProgress.message && (
-            <div
-              style={{
-                color: cyclePhase === 'COMPLETED' && cycleProgress.message.includes('警告')
-                  ? STATE_TINT.ERROR.text
-                  : INK_MUTE,
-                marginTop: 2,
-              }}
-            >
-              {cycleProgress.message}
-            </div>
-          )}
-          {cycleProgress.best_cost != null && (
-            <div style={{ color: INK_MUTE, marginTop: 2 }}>
-              最良コスト {fmt(cycleProgress.best_cost)}
-              {cycleProgress.best_pid_preview_s != null && ` / PID先読み補償 ${cycleProgress.best_pid_preview_s.toFixed(2)}s`}
-            </div>
-          )}
-          {patternText && (cyclePhase === 'REFINE_1' || cyclePhase === 'REFINE_FINAL') && (
-            <div style={{ color: INK_MUTE, marginTop: 2 }}>{patternText}</div>
-          )}
+  const resultPanel = (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+      <window.StageRail defs={stage.defs} current={stage.current} state={stage.state} />
+      {learningRunning && (
+        <div style={{ fontSize: 12, color: INK_SOFT }}>
+          {window.PHASE_LABEL?.[liveJob.phase] ?? liveJob.phase}
+          {liveJob.sample?.section ? `　（${window.SECTION_LABEL?.[liveJob.sample.section] ?? liveJob.sample.section}）` : ''}
+          {liveJob.step_title && liveJob.phase === 'step' ? `　${liveJob.step_title}` : ''}
         </div>
+      )}
+      {showLast && (
+        <window.JobResultBanner job={lastJob} compact
+          onRetry={() => retryLast()} onDismiss={() => setDismissedJobId(lastJob.job_id)} onLogs={() => setNav('logs')} />
       )}
     </div>
   );
 
-  return (
-    <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-      {React.createElement(window.DriveMonitorScreen, {
-        showRefLine: false,
-        progressLabel: '学習運転',
-        profileMaxSpeed,
-        screenTitle: '学習運転',
-        driveStartPath: '/api/v1/drive/learning-cycle/start',
-        driveStartBody: {},
-        driveArmPath: '/api/v1/drive/learning-cycle/arm',
-        driveCancelPath: '/api/v1/drive/learning-cycle/cancel',
-        confirmStartMessage: '開始しますか？',
-        startedToastMessage: '学習サイクルを開始しました',
-        busy: cycleActive,
-        busyLabel: PHASE_LABEL[cyclePhase] ?? cyclePhase,
-        onAbort: handleAbortCycle,
-        resultPanel,
-        showStatusLog: true,
-        bottomRatio: 0.6,
-      })}
+  async function retryLast() {
+    const k = window.learningKindOf(lastJob);
+    setKind(k);
+    setDismissedJobId(lastJob.job_id);
+    const r = await apiFetch('POST', '/api/v1/drive/learning/start', { kind: k });
+    if (r) window.showToast('学習運転をやり直します', 'success');
+  }
 
-      {cfg && (
-        <ValidationPopup
-          message={cfg.message}
-          actionLabel={cfg.actionLabel}
-          onAction={() => setNav(cfg.nav)}
-        />
-      )}
+  const POPUP_CONFIG = {
+    no_profile: { message: '車を選択してください', actionLabel: '車両プロファイルへ', nav: 'profiles' },
+    no_min:     { message: 'この車のペダルの min が未測定です', actionLabel: 'キャリブレーションへ', nav: 'calibration' },
+  };
+  const cfg = popup ? POPUP_CONFIG[popup] : null;
+
+  return (
+    <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {/* 開始の種類 */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 13, color: INK_SOFT }}>開始の種類</span>
+        {LEARNING_KINDS.map(k => (
+          <Btn key={k.kind} primary={shownKind === k.kind} disabled={learningRunning && shownKind !== k.kind}
+               onClick={() => { if (!learningRunning) setKind(k.kind); }}>{k.label}</Btn>
+        ))}
+        <div style={{ flex: 1 }} />
+        {profile && (
+          <span style={{ fontSize: 12, color: INK_SOFT }}>
+            車: <b style={{ color: INK }}>{profile.name}</b>　{profile.learned ? <Pill accent="READY" style={{ fontSize: 11 }}>学習済み</Pill> : <Pill style={{ fontSize: 11 }}>未学習</Pill>}
+          </span>
+        )}
+      </div>
+      {partialNeedsModel && <div style={{ fontSize: 12, color: '#f0c84a' }}>この車は未学習です。部分学習の前に「学習（全部）」を行ってください。</div>}
+
+      <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        {React.createElement(window.DriveMonitorScreen, {
+          showRefLine: false,
+          jobKind: 'learning',
+          progressLabel: kindInfo.label,
+          profileMaxSpeed: profile?.max_speed_kmh ?? null,
+          driveStartPath: '/api/v1/drive/learning/start',
+          driveStartBody: { kind },
+          driveStopPath: '/api/v1/drive/stop',
+          confirmStartMessage: `${kindInfo.label} を開始しますか？`,
+          startedToastMessage: '学習運転を開始しました',
+          stopLabel: '中断',
+          confirmStopMessage: '学習運転を中断しますか？（原点へ戻して止まります）',
+          resultPanel,
+        })}
+        {cfg && (
+          <ValidationPopup message={cfg.message} actionLabel={cfg.actionLabel} onAction={() => setNav(cfg.nav)} />
+        )}
+      </div>
     </div>
   );
 }

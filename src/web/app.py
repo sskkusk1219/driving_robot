@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 import asyncio
 import logging
 import os
@@ -11,62 +12,53 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from src.app.robot_controller import InvalidStateTransition, PidTuningAborted, PreCheckFailed
-from src.app.stubs import (
+from src.app.inmemory_repos import (
     InMemoryModeRepository,
-    InMemoryPedalPlanRepository,
-    InMemoryProfileRepository,
     InMemoryScheduleRepository,
     InMemorySequenceRepository,
     InMemorySessionRepository,
-    _StubUPSMonitor,
-    build_stub_controller,
+    StubUPSMonitor,
 )
-from src.app.training_service import feature_spec_from_settings
-from src.domain.model_training import DEFAULT_FEATURE_SPEC, FeatureSpec
+from src.app.job_manager import JobError, JobManager, hw_mode_from_env
 from src.infra.db import DuplicateNameError
+from src.infra.drive_recorder import DriveRecorder, NullDriveRecorder
 from src.infra.log_buffer import LogBufferHandler
-from src.infra.settings import LearningSettings
+from src.infra.vehicle_store import (
+    DEFAULT_COMMON,
+    DEFAULT_VEHICLES_DIR,
+    VehicleExists,
+    VehicleInvalid,
+    VehicleNotFound,
+    VehicleStore,
+    VehicleStoreError,
+)
 from src.web.routers import drive, modes, profiles, schedules, sequences, sessions, ups
 from src.web.ws import broadcast_loop, realtime_ws
 
+#: ジョブの外でランナーが出す行（待機中の見張り・非常停止の後とアプリ終了の終了処理）を残すファイル
+DEFAULT_RUNNER_IDLE_LOG = Path(__file__).resolve().parents[2] / "logs" / "runner_idle.log"
 
-def _load_feature_spec_and_learning_settings() -> tuple[FeatureSpec, LearningSettings]:
-    """`config/settings.toml` から特徴量構成・学習サイクル設定を読み込む。
 
-    設定ファイルが無い開発・スタブ環境ではデフォルト値にフォールバックする
-    （本番の特徴量セット変更は config/settings.toml 経由でのみ行う）。
+async def _build_repos(app: FastAPI) -> DriveRecorder:
+    """DB が利用可能なら DB バックエンド、そうでなければ in-memory リポジトリを設定する。
+
+    走行の記録先（DriveRecorder）を返す。DB が無ければ何も書かない NullDriveRecorder。
     """
-    from src.infra.settings import load_settings  # noqa: PLC0415
-
-    try:
-        settings = load_settings()
-    except FileNotFoundError:
-        return DEFAULT_FEATURE_SPEC, LearningSettings()
-    return feature_spec_from_settings(settings.model), settings.learning
-
-
-async def _build_repos(app: FastAPI) -> None:
-    """DB が利用可能なら DB バックエンド、そうでなければ in-memory リポジトリを設定する。"""
-    app.state.feature_spec, app.state.learning_settings = _load_feature_spec_and_learning_settings()
     db_url = os.environ.get("DATABASE_URL")
     if db_url:
         from src.infra.db import create_pool  # noqa: PLC0415
+        from src.infra.drive_recorder import PgDriveRecorder  # noqa: PLC0415
         from src.infra.mode_repository import ModeRepository  # noqa: PLC0415
-        from src.infra.pedal_plan_repository import PedalPlanRepository  # noqa: PLC0415
-        from src.infra.profile_repository import ProfileRepository  # noqa: PLC0415
         from src.infra.schedule_repository import ScheduleRepository  # noqa: PLC0415
         from src.infra.sequence_repository import SequenceRepository  # noqa: PLC0415
         from src.infra.session_repository import SessionRepository  # noqa: PLC0415
 
         pool = await create_pool(db_url)
         app.state.db_pool = pool
-        app.state.profile_repo = ProfileRepository(pool)
         app.state.mode_repo = ModeRepository(pool)
         app.state.session_repo = SessionRepository(pool)
         app.state.schedule_repo = ScheduleRepository(pool)
         app.state.sequence_repo = SequenceRepository(pool)
-        app.state.plan_repo = PedalPlanRepository(pool)
 
         # 前回プロセスの異常終了で 'running' のまま残った孤児セッションを是正する。
         from src.infra.log_writer import LogWriter  # noqa: PLC0415
@@ -76,65 +68,82 @@ async def _build_repos(app: FastAPI) -> None:
             logging.getLogger(__name__).warning(
                 "起動時に未終了セッション %d 件を 'error' で終了済みに是正しました", reaped
             )
-    else:
-        app.state.db_pool = None
-        app.state.profile_repo = InMemoryProfileRepository()
-        app.state.mode_repo = InMemoryModeRepository()
-        app.state.session_repo = InMemorySessionRepository()
-        app.state.schedule_repo = InMemoryScheduleRepository()
-        app.state.sequence_repo = InMemorySequenceRepository()
-        app.state.plan_repo = InMemoryPedalPlanRepository()
+        return PgDriveRecorder(pool)
+    app.state.db_pool = None
+    app.state.mode_repo = InMemoryModeRepository()
+    app.state.session_repo = InMemorySessionRepository()
+    app.state.schedule_repo = InMemoryScheduleRepository()
+    app.state.sequence_repo = InMemorySequenceRepository()
+    return NullDriveRecorder()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # サーバーログを WebUI の「現在ステータス」へ流すためのバッファを src ロガーに付ける
+    # サーバーログ・ランナーの進行のメッセージを WebUI の「現在ステータス」へ流すバッファを src ロガーに付ける
     log_buffer = LogBufferHandler(maxlen=500)
     src_logger = logging.getLogger("src")
     src_logger.addHandler(log_buffer)
     src_logger.setLevel(logging.INFO)
     app.state.log_buffer = log_buffer
 
-    await _build_repos(app)
+    recorder = await _build_repos(app)
 
+    # 車両フォルダ・共通設定の場所（開発・検証で本物の vehicles/ を触らないよう環境変数で差し替えられる）
+    vehicles_dir = Path(os.environ.get("DRIVING_ROBOT_VEHICLES_DIR") or DEFAULT_VEHICLES_DIR)
+    common_path = Path(os.environ.get("DRIVING_ROBOT_COMMON_CONFIG") or DEFAULT_COMMON)
+    store = VehicleStore(vehicles_dir, common_path)
+    app.state.vehicle_store = store
+
+    gpio_monitor = None
     if os.environ.get("DRIVING_ROBOT_USE_REAL_HW") == "1":
-        from src.app.factory import build_real_controller  # noqa: PLC0415
+        from src.infra.gpio_monitor import GPIOMonitor  # noqa: PLC0415
         from src.infra.settings import load_settings  # noqa: PLC0415
+        from src.infra.ups_monitor import NutUPSMonitor  # noqa: PLC0415
 
-        # ベンチ検証モード: 非常停止スイッチ(GPIO)のみ実機、アクチュエータ/CAN はスタブ
-        bench_gpio_only = os.environ.get("DRIVING_ROBOT_BENCH_GPIO_ONLY") == "1"
-        controller, ups_monitor = await build_real_controller(
-            load_settings(), bench_gpio_only=bench_gpio_only
+        # 実機・ベンチ（DRIVING_ROBOT_BENCH_GPIO_ONLY=1）: 非常停止スイッチ(GPIO)と UPS は実機。
+        # アクチュエータ・CAN はランナー側（--hw real か stub。hw_mode_from_env が決める）
+        settings = load_settings()
+        gpio_off_env = os.environ.get("DRIVING_ROBOT_GPIO_DISABLED") == "1"
+        if settings.web_gpio.enabled and not gpio_off_env:
+            gpio_monitor = GPIOMonitor(
+                emergency_pin=settings.gpio.emergency_stop_pin,
+                ac_detect_pin=settings.gpio.ac_detect_pin,
+            )
+        else:
+            # 非常停止スイッチ未接続の機体用。見張りを作らない＝emergency_probe も無く、解除はピンを見ない
+            logging.getLogger(__name__).warning(
+                "非常停止スイッチ(GPIO)の見張りは無効です（%s）。画面の非常停止ボタンだけで止められます",
+                "環境変数 DRIVING_ROBOT_GPIO_DISABLED=1" if gpio_off_env else "settings.toml の [web_gpio] enabled = false",
+            )
+        ups_monitor: NutUPSMonitor | StubUPSMonitor = NutUPSMonitor(
+            nut_host=settings.ups.nut_host,
+            nut_port=settings.ups.nut_port,
+            ups_name=settings.ups.ups_name,
+            poll_interval_s=settings.ups.poll_interval_s,
         )
-        await ups_monitor.start_polling()
     else:
-        controller = build_stub_controller(profile_repo=app.state.profile_repo)
-        ups_monitor = _StubUPSMonitor()
+        ups_monitor = StubUPSMonitor()
 
-    await controller.start()
-    app.state.controller = controller
-    app.state.ups_monitor = ups_monitor
-
-    from src.app.learning_cycle import LearningCycleOrchestrator  # noqa: PLC0415
-
-    cycle_log_writer = None
-    if app.state.db_pool is not None:
-        from src.infra.log_writer import LogWriter  # noqa: PLC0415
-
-        cycle_log_writer = LogWriter(app.state.db_pool)
-    app.state.cycle_orchestrator = LearningCycleOrchestrator(
-        controller=controller,
-        profile_repo=app.state.profile_repo,
-        session_repo=app.state.session_repo,
-        log_writer=cycle_log_writer,
-        learning_timeout_s=app.state.learning_settings.learning_timeout_s,
-        mode_repo=app.state.mode_repo,
-        verify_runs=app.state.learning_settings.verify_runs,
-        verify_pattern_budget_s=app.state.learning_settings.verify_pattern_budget_s,
-        plan_learn_runs_max=app.state.learning_settings.plan_learn_runs_max,
-        plan_learn_reward_epsilon=app.state.learning_settings.plan_learn_reward_epsilon,
-        refine_final_runs=app.state.learning_settings.refine_final_runs,
+    manager = JobManager(
+        vehicles_dir=vehicles_dir,
+        common_path=common_path,
+        hw_mode=hw_mode_from_env(),
+        recorder=recorder,
+        emergency_probe=gpio_monitor.is_emergency_active if gpio_monitor is not None else None,
+        on_min_saved=store.mark_min_measured,
+        idle_log_path=Path(os.environ.get("DRIVING_ROBOT_RUNNER_IDLE_LOG") or DEFAULT_RUNNER_IDLE_LOG),
     )
+    app.state.job_manager = manager
+    app.state.gpio_enabled = gpio_monitor is not None  # 初期化ページの「非常停止(GPIO)」の表示用
+    app.state.ups_monitor = ups_monitor
+    if not isinstance(ups_monitor, StubUPSMonitor):
+        # AC 断 → JobManager.emergency（実機の UPS。GPIO の見張りが無くても繋ぐ）
+        ups_monitor.register_ac_loss_callback(lambda: manager.emergency("ac_loss"))  # type: ignore[union-attr]
+    if gpio_monitor is not None:
+        # 非常停止（GPIO）→ JobManager.emergency（ランナーへ SIGINT。終わらなければ SIGKILL）
+        gpio_monitor.register_emergency_callback(lambda: manager.emergency("switch"))
+        await gpio_monitor.start_monitoring()
+    await ups_monitor.start_polling()
 
     task = asyncio.create_task(broadcast_loop(app))
     try:
@@ -145,7 +154,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await task
         except asyncio.CancelledError:
             pass
-        await controller.shutdown()
+        await manager.shutdown()
+        if gpio_monitor is not None:
+            gpio_monitor.stop_monitoring()
         await ups_monitor.stop_polling()
         if app.state.db_pool is not None:
             await app.state.db_pool.close()
@@ -155,30 +166,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="driving_robot API",
     description="シャシダイナモ向け自動運転ロボットシステム REST API",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
 
-# app レベル例外ハンドラ: 各ルーターで同一の try/except を28箇所以上コピペしていた
-# （InvalidStateTransition→409 / PreCheckFailed→422 / PidTuningAborted→409 /
-# DuplicateNameError→409）のを一本化する。ハンドラ登録漏れが起きないため、新規
-# エンドポイントがこれらの例外を捕まえ忘れても 500 にならない（S4/W1 レビュー指摘）。
-@app.exception_handler(InvalidStateTransition)
-async def _invalid_state_transition_handler(
-    request: Request, exc: InvalidStateTransition
-) -> JSONResponse:
-    return JSONResponse(status_code=409, content={"detail": str(exc)})
+# app レベル例外ハンドラ: 各ルーターで同じ try/except を書かずに済むよう、ここで一本化する。
+@app.exception_handler(JobError)
+async def _job_error_handler(request: Request, exc: JobError) -> JSONResponse:
+    # 409 実行中・非常停止中 / 423 非常停止スイッチが押されたまま / 503 DB・ランナーを使えない
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
-@app.exception_handler(PreCheckFailed)
-async def _pre_check_failed_handler(request: Request, exc: PreCheckFailed) -> JSONResponse:
-    return JSONResponse(status_code=422, content={"detail": str(exc)})
-
-
-@app.exception_handler(PidTuningAborted)
-async def _pid_tuning_aborted_handler(request: Request, exc: PidTuningAborted) -> JSONResponse:
-    return JSONResponse(status_code=409, content={"detail": str(exc)})
+@app.exception_handler(VehicleStoreError)
+async def _vehicle_error_handler(request: Request, exc: VehicleStoreError) -> JSONResponse:
+    if isinstance(exc, VehicleNotFound):
+        status = 404
+    elif isinstance(exc, VehicleExists):
+        status = 409
+    elif isinstance(exc, VehicleInvalid):
+        status = 422
+    else:
+        status = 500
+    return JSONResponse(status_code=status, content={"detail": str(exc)})
 
 
 @app.exception_handler(DuplicateNameError)

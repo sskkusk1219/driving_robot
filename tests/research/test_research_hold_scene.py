@@ -162,11 +162,13 @@ def test_defaults_are_off_and_identical() -> None:
     assert mdmod.make_hold_scene(cfg, object()) is None
 
 
-def test_hold_pi_without_meta_is_config_error_before_run(tmp_path: Path) -> None:
+def test_hold_pi_without_meta_means_scene_not_used(tmp_path: Path, capsys) -> None:
+    # 段10-1 C: 手順2 が前の pkl からも引き継げなかったとき、ConfigError にせず場面を使わない
     cfg = _hold_cfg(tmp_path, with_hold_pi=False)
     mode = _mode([(0.0, 0.0), (1.0, 1.6), (5.0, 1.6)])
-    with pytest.raises(cfgmod.ConfigError, match="hold_pi"):
-        mdmod.prepare_mode_drive_from(cfg, mode)
+    ff = mdmod.load_feedforward(cfg)
+    assert mdmod.make_hold_scene(cfg, ff, mode) is None
+    assert "警告" in capsys.readouterr().out
 
 
 async def test_run_logs_hold_scene_and_pi(tmp_path: Path) -> None:

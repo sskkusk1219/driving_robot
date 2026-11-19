@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import math
 import sys
 import time
 from collections.abc import Awaitable, Callable
@@ -121,6 +122,7 @@ from tests.research.pattern_loop import GRampPattern
 from tests.research.pedal_arbiter import enabled_arbiter_features
 from tests.research.pedal_search import (
     PedalSearchResult,
+    apply_crossings,
     hold_breakaway_pct,
     hold_opening_meta,
     run_pedal_search,
@@ -135,7 +137,12 @@ from tests.research.ramp_planner import (
     top_speed_cap_kmh,
 )
 from tests.research.research_types import VEHICLE_STOP_SPEED_KMH, DrivingMode
-from tests.research.step2_check import Step2CheckError, check_fel_coverage, format_checks
+from tests.research.step2_check import (
+    Step2CheckError,
+    check_fel_coverage,
+    format_checks,
+    format_warn,
+)
 from tests.research.term import banner, display_width, say
 from tests.research.vehicle import STROKE_LIMIT_PULSE, feedforward_params, opening_to_pulse
 
@@ -395,6 +402,13 @@ async def prepare_step2(ctx: RunContext) -> None:
     require_forward_candidate(ctx.config)
 
 
+def _say_check_warnings(checks: list | None) -> None:
+    """段10-1: 手順2 の終わりに、注意（WARN）の項目をもう一度出す（終了コードは 0 のまま）。"""
+    text = format_warn(checks or [])
+    if text:
+        say(text)
+
+
 async def step2_pattern_drive(ctx: RunContext) -> None:
     """ペダル探索 → G ランプのパターン走行 → その CSV から順モデル（C7・C8）を作る。
 
@@ -466,6 +480,7 @@ async def step2_pattern_drive(ctx: RunContext) -> None:
         say("2-3. 学習用パターン（FEL）: 走らない（learning.fel_pattern_enabled: false）。"
             "補正表は付けません（手順12 で後から走れます）")
         say()
+        _say_check_warnings(built.checks)
         say("手順 2 完了。次は手順 3（FF のみで WLTP モード走行）です。")
         return
     say(f"2-3. 学習用パターン（FEL。手順3 と同じ候補 {candidate} で走り、"
@@ -473,6 +488,7 @@ async def step2_pattern_drive(ctx: RunContext) -> None:
     fel_run = _prepare_fel_run(ctx.config, built.model_path, cover_modes, top_cap)
     await _run_fel_learning(ctx, hw, fel_run, wltp_mode, checks=built.checks)
     say()
+    _say_check_warnings(built.checks)
     say("手順 2 完了。次は手順 3（FF のみで WLTP モード走行）です。")
 
 
@@ -623,9 +639,9 @@ async def prepare_step13(ctx: RunContext) -> None:
         raise ConfigError(f"feedforward.model_path の pkl がありません: {model_path}")
     meta = load_forward_map(Path(model_path)).meta
     if not meta.get("hold_pi"):
-        raise ConfigError(
-            f"pkl の meta に hold_pi がありません（fwd_tool attach-hold-pi で付ける）: {model_path}"
-        )
+        # 段10-1 C: hold_pi が無くても止めない（PI を使わず 1 刻み寄せで保つ。手順2 と同じ）
+        say("警告: pkl の meta に hold_pi がありません。PI を使わず 1 刻み寄せで保ちます: "
+            f"{model_path}")
     if meta.get("launch_breakaway_u_pct") is None:
         raise ConfigError(f"pkl の meta に launch_breakaway_u_pct がありません: {model_path}")
     out = hold_pkl_path(model_path)
@@ -644,15 +660,15 @@ async def step13_hold_points(ctx: RunContext) -> None:
     model_path = Path(cfg.feedforward.model_path)
     table = load_forward_map(model_path)
     info = table.meta.get("hold_pi")
-    if not info:
-        raise ConfigError(f"pkl の meta に hold_pi がありません: {model_path}")
+    pi_gains = (
+        (float(info["kp_pct_per_kmh"]), float(info["ki_pct_per_kmh_s"])) if info else None
+    )
     breakaway = hold_breakaway_pct(table.meta, cfg.vehicle.min_brake_opening_pct)
     log = ctx.session_log
     say("13-0. ペダル探索（クリープ車速・BRAKE_SEARCH・停車保持）→ 4 点の保持")
     try:
         pedal = await run_pedal_search(
-            hw, cfg, log=log, save=False, hold_points=True,
-            hold_pi=(float(info["kp_pct_per_kmh"]), float(info["ki_pct_per_kmh_s"])),
+            hw, cfg, log=log, save=False, hold_points=True, hold_pi=pi_gains,
             breakaway_pct=breakaway,
         )
     finally:
@@ -666,26 +682,35 @@ async def step13_hold_points(ctx: RunContext) -> None:
     if out.exists():
         raise DriveError(f"保存先 {out} が既にあります（上書きしません）")
     new = load_forward_map(model_path)  # 走行中に書き換わっていてもよいよう、元を読み直す
+    # 段10-1 A: 加速度の符号が変わる瞬間の判定を足す（手順2 と同じ関数）
+    lag = new.meta.get("brake_lag_s")
+    if lag is not None and math.isfinite(float(lag)):
+        points, note = apply_crossings(pedal.hold_points, log.csv_path, float(lag))
+        say(f"4 点の保持: {note}")
+    else:
+        points = list(pedal.hold_points)
+        say("4 点の保持: 瞬間の判定は使えません（brake_lag_s が pkl の meta に無い）")
     new.meta["hold_opening"] = hold_opening_meta(
-        pedal.hold_points, creep_kmh=pedal.creep_speed_kmh, breakaway_pct=breakaway,
+        points, creep_kmh=pedal.creep_speed_kmh, breakaway_pct=breakaway,
         min_pct=cfg.vehicle.min_brake_opening_pct, source_csv=log.csv_path.name,
     )
     saved = save_table(new, out)
     say()
     say("4 点の保持の結果:")
-    say("  狙い km/h  保てた  実車速 km/h  開度 %   帯の秒  かかった秒  初めの開度 %")
-    for p in pedal.hold_points:
+    say("  狙い km/h  保てた  実車速 km/h  開度 %   帯の秒  かかった秒  初めの開度 %  判定（瞬間）")
+    for p in points:
         sp = "    -    " if p.speed_kmh is None else f"{p.speed_kmh:9.3f}"
         op = "   -  " if p.opening_pct is None else f"{p.opening_pct:6.2f}"
         say(f"  {p.target_kmh:9.3f}  {'○' if p.held else '×'}      {sp}  {op}  "
-            f"{p.in_band_s:6.1f}  {p.elapsed_s:9.1f}  {p.initial_opening_pct:10.2f}"
+            f"{p.in_band_s:6.1f}  {p.elapsed_s:9.1f}  {p.initial_opening_pct:10.2f}  "
+            f"{p.criterion or '-'}（{p.crossings}）"
             f"{'  ' + p.note if p.note else ''}")
     say(f"両端: 0 km/h = {breakaway:.2f}%（min + |launch_breakaway_u_pct|）・"
         f"クリープ {pedal.creep_speed_kmh:.2f} km/h = {cfg.vehicle.min_brake_opening_pct:.2f}%")
     say(f"保存: {saved}（元の pkl・yaml の model_path は書き換えていません）")
     extra = cfg.pedal_search.hold_points_extra_kmh
     missed = [
-        p for p in pedal.hold_points
+        p for p in points
         if not p.held and any(abs(p.target_kmh - e) < 1e-6 for e in extra)
     ]
     if missed:
@@ -1003,6 +1028,11 @@ async def _mode_drive_step(ctx: RunContext, *, buttons: bool) -> None:
         notes.append("スタブ HW の結果（車両モデルは実車の同定値ではない。流れの確認用）。")
     if result.button_hold_s > 0.0:
         notes.append(f"D 待ちで {result.button_hold_s:.1f} 秒止めた（モードの時刻を止めた）。")
+    if result.pause_count > 0:
+        notes.append(
+            f"一時停止 {result.pause_count} 回・計 {result.paused_s:.1f} 秒"
+            "（押された時点の車速を保った。その間の行は KPI・レポートから除外）。"
+        )
     if limited:
         notes.append(
             f"--limit-s でモードの先頭 {result.mode_duration_s:.0f}s だけ走った（KPI は参考値）。"

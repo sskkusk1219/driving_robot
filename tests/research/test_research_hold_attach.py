@@ -52,6 +52,7 @@ def _cfg(tmp_path: Path, *, hold_pi_enabled: bool, points_enabled: bool = True):
             "pedal_search.hold_points_enabled": points_enabled,
             "forward_map.hold_pi_enabled": hold_pi_enabled,
             "vehicle.min_brake_opening_pct": 3.0,
+            "feedforward.model_path": str(tmp_path / "no_previous.pkl"),  # 前の pkl は無し
         }
     )
     return cfgmod.load_config(path)
@@ -68,12 +69,18 @@ def _write_low_hold_csv(path: Path, *, with_rows: bool = True) -> None:
                 w.writerow(["LOW_HOLD", f"{t:.3f}", f"{v:.4f}", f"{u:.4f}"])
 
 
-def _pkl(tmp_path: Path, *, breakaway: float | None = 4.0) -> Path:
+def _pkl(
+    tmp_path: Path, *, breakaway: float | None = 4.0, lag: float | None = 0.1555,
+    name: str = "m.pkl",
+) -> Path:
     table = _table()
-    table.meta["brake_lag_s"] = 0.1555
+    if lag is None:
+        table.meta.pop("brake_lag_s", None)
+    else:
+        table.meta["brake_lag_s"] = lag
     if breakaway is not None:
         table.meta["launch_breakaway_u_pct"] = -breakaway
-    return save_table(table, tmp_path / "m.pkl")
+    return save_table(table, tmp_path / name)
 
 
 def _pedal(held: bool = True, n: int = 2) -> ps.PedalSearchResult:
@@ -102,7 +109,7 @@ def test_attach_hold_data_sets_pi_and_opening(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("hold_pi_enabled", [True, False])
-def test_attach_hold_data_failure_is_ng_only_when_hold_pi_enabled(
+def test_attach_hold_data_failure_is_warn_only_when_hold_pi_enabled(
     tmp_path: Path, hold_pi_enabled: bool
 ) -> None:
     cfg = _cfg(tmp_path, hold_pi_enabled=hold_pi_enabled)
@@ -111,24 +118,24 @@ def test_attach_hold_data_failure_is_ng_only_when_hold_pi_enabled(
     pkl = _pkl(tmp_path)
     item = pdmod.attach_hold_data(cfg, pkl, csv_path, _pedal())
     assert item is not None
-    want = step2_check.STATUS_NG if hold_pi_enabled else step2_check.STATUS_SKIP
+    want = step2_check.STATUS_WARN if hold_pi_enabled else step2_check.STATUS_SKIP
     assert item.status == want
     assert "LOW_HOLD" in item.reason
     meta = load_forward_map(pkl).meta
     assert "hold_pi" not in meta
-    assert "hold_opening" in meta  # 付けられた分は残す
+    assert "hold_opening" not in meta  # 段10-1: 前の pkl も無いので付けない（帯は使わない扱い）
 
 
 def test_attach_hold_data_no_point_held_or_no_points(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path, hold_pi_enabled=True)
     csv_path = tmp_path / "step2.csv"
     _write_low_hold_csv(csv_path)
-    pkl = _pkl(tmp_path)
+    pkl = _pkl(tmp_path, lag=None)  # L が無ければ瞬間の判定は使えない（帯だけで判定）
     item = pdmod.attach_hold_data(cfg, pkl, csv_path, _pedal(held=False))
-    assert item is not None and item.status == step2_check.STATUS_NG
+    assert item is not None and item.status == step2_check.STATUS_WARN
     assert "1 点も保てません" in item.reason
     item = pdmod.attach_hold_data(cfg, pkl, csv_path, _pedal(n=0))
-    assert item is not None and item.status == step2_check.STATUS_NG
+    assert item is not None and item.status == step2_check.STATUS_WARN
     assert "点がありません" in item.reason
 
 

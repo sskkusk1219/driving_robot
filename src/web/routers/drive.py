@@ -1,113 +1,152 @@
-from dataclasses import replace
-from typing import Annotated
+# ruff: noqa: E501
+"""走行・操作 API。段3（RPD_Phase_20261115_PortResearch）で JobManager（常駐ランナーへのコマンド）に作り替えた。
+
+画面が使っているパスはできるだけ残し、意味を新しくした（一覧は src/robot/README.md の「Web API」の表）。
+選んでいる車（``active``）は ``vehicles/.active``（VehicleStore）。ジョブはこの車で走る。
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from src.app.learning_cycle import CycleBusyError, LearningCycleOrchestrator
-from src.app.robot_controller import (
-    EmergencyStillActive,
-    LogWriterProtocol,
-    RobotController,
+from src.app.job_manager import (
+    PURPOSE_CALIB,
+    PURPOSE_MANUAL,
+    JobManager,
+    JobStatus,
+    PlannedStep,
 )
-from src.app.training_service import train_and_apply
-from src.domain.learning_drive import LearningDataError
-from src.domain.model_training import FeatureSpec
-from src.domain.pid_tuning import build_tuning_trajectory_from_mode, tuning_cost
-from src.infra.settings import LearningSettings
-from src.models.calibration import CalibrationResult
-from src.models.drive_log import DriveSession
+from src.infra.vehicle_store import VehicleStore
 from src.models.system_state import RobotState
+from src.robot.schedule_spec import check_schedule, schedule_from_dict, schedule_to_dict
 from src.web.deps import (
     ModeRepoProtocol,
-    PlanRepoProtocol,
-    ProfileRepoProtocol,
     ScheduleRepoProtocol,
-    SessionRepoProtocol,
-    get_controller,
-    get_cycle_orchestrator,
-    get_feature_spec,
-    get_learning_settings,
-    get_log_writer,
+    SequenceRepoProtocol,
+    get_job_manager,
     get_mode_repo,
-    get_plan_repo,
-    get_profile_repo,
     get_schedule_repo,
-    get_session_repo,
+    get_sequence_repo,
+    get_vehicle_store,
 )
 from src.web.schemas import (
     AxisRequest,
-    CalibrationDataResponse,
-    CalibrationResultResponse,
-    CycleProgressSchema,
     DriveLogResponse,
-    DriveSessionResponse,
-    DynamicsParamsSchema,
-    FeedforwardParamsSchema,
+    JobStartResponse,
     JogRequest,
     JogResponse,
-    LearningCycleAbortResponse,
-    LearningCycleStartRequest,
-    LearningCycleStartResponse,
+    LearningStartRequest,
     LogLineSchema,
-    PIDGainsSchema,
-    PidRefineRequest,
-    PidRefineResponse,
-    PidValidateRequest,
-    PidValidateResponse,
-    PlanStatusResponse,
+    PrepareRequest,
+    SaveMaxRequest,
+    SaveMaxResponse,
+    SaveMinRequest,
+    SaveMinResponse,
     SelectProfileRequest,
     StartDriveRequest,
     StartScheduleRequest,
+    StartSequenceRequest,
     SystemStateResponse,
-    TrainModelRequest,
-    TrainModelResponse,
 )
 
 router = APIRouter(prefix="/api/v1/drive", tags=["drive"])
 
-Controller = Annotated[RobotController, Depends(get_controller)]
+Manager = Annotated[JobManager, Depends(get_job_manager)]
+Store = Annotated[VehicleStore, Depends(get_vehicle_store)]
+
+#: 開度 100% = 9500 pulse（core の開度の定義）。旧 API のジョグ量（pulse）を % へ直す
+PULSE_FULL = 9500.0
 
 
-def _to_session_response(session: DriveSession) -> DriveSessionResponse:
-    return DriveSessionResponse.model_validate(session)
-
-
-def _to_calibration_result_response(result: CalibrationResult) -> CalibrationResultResponse:
-    return CalibrationResultResponse(
-        success=result.success,
-        error_message=result.error_message,
-        data=CalibrationDataResponse(
-            accel_zero_pos=result.data.accel_zero_pos,
-            accel_full_pos=result.data.accel_full_pos,
-            accel_stroke=result.data.accel_stroke,
-            brake_zero_pos=result.data.brake_zero_pos,
-            brake_full_pos=result.data.brake_full_pos,
-            brake_stroke=result.data.brake_stroke,
-            calibrated_at=result.data.calibrated_at,
-            is_valid=result.data.is_valid,
-        )
-        if result.data is not None
-        else None,
+def _job_response(status: JobStatus) -> JobStartResponse:
+    return JobStartResponse(
+        job_id=status.job_id,
+        kind=status.spec.kind,
+        vehicle_id=status.spec.vehicle_id,
+        steps=status.spec.steps,
+        run_type=status.spec.run_type,
+        session_id=status.session_id,
+        started_at=status.started_at,
     )
+
+
+def _active_vehicle(store: VehicleStore) -> str:
+    vehicle_id = store.get_active()
+    if vehicle_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="車が選ばれていません。プロファイル画面で車を選んでから操作してください",
+        )
+    return vehicle_id
+
+
+def _devices(request: Request, store: VehicleStore) -> dict[str, bool]:
+    """機器の有無（初期化ページの表示用）。ups: 共通設定の checks.init_ups / gpio: 非常停止スイッチの見張りを
+    起動しているか（settings.toml の [gpio] enabled・環境変数・実機かスタブか）/ buttons: 車両 yaml の buttons.installed。"""
+    from src.robot import config_store  # noqa: PLC0415
+
+    ups = True
+    try:
+        ups = bool((config_store._load_yaml(store.common_path).get("checks") or {}).get("init_ups", True))  # noqa: SLF001
+    except Exception:  # noqa: BLE001 - 表示用。読めなければ「ある」扱い
+        ups = True
+    buttons = True
+    vehicle_id = store.get_active()
+    if vehicle_id is not None and store.exists(vehicle_id):
+        try:
+            buttons = bool(store.read(vehicle_id).buttons.get("installed", True))
+        except Exception:  # noqa: BLE001
+            buttons = True
+    return {
+        "ups": ups,
+        "gpio": bool(getattr(request.app.state, "gpio_enabled", False)),
+        "buttons": buttons,
+    }
+
+
+@router.get("/history")
+async def get_history(manager: Manager) -> dict[str, Any]:
+    """実行中のジョブの最近の sample（車速・基準・開度。最大 120 s）。画面を読み直したときに軌跡を描き直す用。
+
+    各点の時刻は ``age_ms``（今から何 ms 前か）。ジョブが無ければ samples は空。
+    """
+    return manager.sample_history()
 
 
 @router.get("/status", response_model=SystemStateResponse)
-async def get_status(controller: Controller) -> SystemStateResponse:
-    state = controller.get_system_state()
+async def get_status(request: Request, manager: Manager, store: Store) -> SystemStateResponse:
+    snap = manager.snapshot()
+    job = snap["job"]
     return SystemStateResponse(
-        robot_state=state.robot_state,
-        active_profile_id=state.active_profile_id,
-        active_session_id=state.active_session_id,
-        last_normal_shutdown=state.last_normal_shutdown,
-        updated_at=state.updated_at,
+        robot_state=RobotState(snap["robot_state"]),
+        active_profile_id=store.get_active(),
+        active_session_id=job["session_id"] if job else None,
+        last_normal_shutdown=True,
+        updated_at=_now(),
+        manager_state=snap["state"],
+        initialized=snap["initialized"],
+        devices=_devices(request, store),
+        job=job,
+        last_job=snap["last_job"],
+        sequence=snap["sequence"],
+        last_sequence=snap["last_sequence"],
+        prepare=snap["prepare"],
     )
+
+
+def _now() -> Any:
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    return datetime.now(tz=UTC)
 
 
 @router.get("/log", response_model=DriveLogResponse)
 async def get_drive_log(
     request: Request, after: Annotated[int | None, Query(ge=0)] = None
 ) -> DriveLogResponse:
-    """サーバーログの差分（`seq > after`）を古い順に最大 200 行返す（現在ステータス表示用）。"""
+    """サーバーログ＋ランナーの進行のメッセージの差分（`seq > after`）を古い順に最大 200 行返す。"""
     buf = getattr(request.app.state, "log_buffer", None)
     if buf is None:
         return DriveLogResponse(lines=[], last_seq=0)
@@ -116,535 +155,443 @@ async def get_drive_log(
     return DriveLogResponse(lines=[LogLineSchema(**ln) for ln in lines], last_seq=last_seq)
 
 
-@router.post("/initialize", status_code=200)
-async def initialize(controller: Controller) -> dict[str, str]:
-    await controller.initialize()
-    return {"status": "ok"}
+# ── 選んでいる車 ───────────────────────────────────────────────────────
+
+
+@router.post("/select-profile", status_code=200)
+async def select_profile(req: SelectProfileRequest, manager: Manager, store: Store) -> dict[str, str]:
+    """走らせる車を選ぶ（vehicles/.active に保存。再起動後も残る）。ジョブ実行中は変えられない。"""
+    if manager.is_busy or manager.prepare is not None:
+        raise HTTPException(status_code=409, detail="ジョブの実行中・準備中は車を変えられません")
+    if not store.exists(req.profile_id):
+        raise HTTPException(status_code=404, detail=f"車 {req.profile_id!r} が見つかりません")
+    store.set_active(req.profile_id)
+    return {"status": "ok", "profile_id": req.profile_id}
+
+
+# ── 初期化・モード走行・停止 ───────────────────────────────────────────
+
+
+@router.post("/initialize", response_model=JobStartResponse)
+async def initialize(manager: Manager, store: Store) -> JobStartResponse:
+    """初期化のジョブ（手順 1: 通信確認 → アラームリセット → サーボON → 原点復帰 ＋ ボタンサーボの確認）。
+
+    常駐ランナーが無ければ起動し、生きていれば init コマンドを送る。手順 1 を行うのはこのジョブだけ。
+    成功すると ``initialized`` が true になり（サーボ ON・接続のまま待機）、モード走行・学習を始められる。
+    """
+    return _job_response(await manager.start_init_only(_active_vehicle(store)))
 
 
 @router.post("/arm", status_code=200)
-async def arm_drive(controller: Controller) -> dict[str, str]:
-    """自動走行を準備する。READY → PRE_CHECK 遷移。
-
-    走行前チェック（車速0含む）を実施し、合格したら停車保持ブレーキまで踏み込んで
-    確認待ち（PRE_CHECK）にする。フロントは確認ポップアップを表示し、「はい」で
-    /start、「いいえ」で /cancel を呼ぶ（学習運転と同じ arm フロー）。
-    """
-    await controller.arm_auto_drive()
+async def arm_drive(manager: Manager, store: Store) -> dict[str, str]:
+    """（互換）旧「走行準備」。ジョブが走行前チェックまで自分で行うので、始められるかの確認だけ行う。"""
+    _active_vehicle(store)
+    if manager.is_busy or manager.state == "emergency":
+        raise HTTPException(status_code=409, detail="別のジョブの実行中か非常停止中です")
     return {"status": "armed"}
 
 
 @router.post("/cancel", status_code=200)
-async def cancel_drive(controller: Controller) -> dict[str, str]:
-    """自動走行を中止する（確認ポップアップ「いいえ」）。PRE_CHECK → READY。
-
-    arm でかけた保持ブレーキをリリースする。セッションは未開始のためログは残らない。
-    """
-    await controller.cancel_auto_drive()
+async def cancel_drive() -> dict[str, str]:
+    """（互換）旧「走行準備の取消」。何もしない。"""
     return {"status": "cancelled"}
 
 
-@router.post("/start", response_model=DriveSessionResponse)
+@router.post("/start", response_model=JobStartResponse)
 async def start_drive(
     req: StartDriveRequest,
-    controller: Controller,
+    manager: Manager,
+    store: Store,
     mode_repo: Annotated[ModeRepoProtocol, Depends(get_mode_repo)],
-    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
-) -> DriveSessionResponse:
-    """自動走行を開始する。
+) -> JobStartResponse:
+    """モード走行を始める（常に 24,25。走行前チェック → Ready・D・モード・N → IGN-OFF）。選んでいる車で走る。
 
-    走行モード・選択中プロファイル・LogWriter を解決して DriveLoop を起動し、
-    走行ログを `drive_logs` に記録する（DB 利用時）。
-    """
+    初期化ページの初期化が済んでいないと 409（手順 1 は初期化ページだけで行う。D-15c）。"""
+    vehicle_id = _active_vehicle(store)
     mode = await mode_repo.get_by_id(req.mode_id)
     if mode is None:
-        # mode 不在のまま start_auto_drive を呼ぶと RUNNING 遷移後に DriveLoop が
-        # 起動しない／DB の FK 違反で 500 になるため、状態遷移前に拒否する。
         raise HTTPException(status_code=404, detail=f"走行モード {req.mode_id!r} が見つかりません")
-    profile = controller.get_active_profile()
-    session = await controller.start_auto_drive(
-        req.mode_id, mode=mode, profile=profile, log_writer=log_writer
+    return _job_response(
+        await manager.start_mode_drive(vehicle_id, mode.id, mode.name, req.limit_s)
     )
-    return _to_session_response(session)
 
 
-@router.post("/pause", status_code=200)
-async def pause_drive(controller: Controller) -> dict[str, str]:
-    """自動走行を一時停止する。RUNNING → PAUSED。
+@router.post("/ign-off", response_model=JobStartResponse)
+async def ign_off(manager: Manager, store: Store) -> JobStartResponse:
+    """IGN-OFF だけを押すジョブ（手順 25。接続だけ裏で行う。初期化済みでなくても始められる）。走行・学習がエラー・中断で終わって車が Ready のままのときに使う。
 
-    基準速度タイムラインを凍結し、一時停止した瞬間の目標車速を保持して走り続ける。
-    フロントの「一時停止」ボタンから呼ぶ。
+    手順 25 は停車を確かめてからブレーキ ON でスタートを短押しする（動いていれば押さずエラー）。
     """
-    await controller.pause_auto_drive()
-    return {"status": "paused"}
-
-
-@router.post("/resume", status_code=200)
-async def resume_drive(controller: Controller) -> dict[str, str]:
-    """一時停止中の自動走行を再開する。PAUSED → RUNNING。フロントの「走行再開」ボタンから呼ぶ。"""
-    await controller.resume_auto_drive()
-    return {"status": "running"}
+    return _job_response(await manager.start_ign_off(_active_vehicle(store)))
 
 
 @router.post("/stop", status_code=200)
-async def stop_drive(controller: Controller) -> dict[str, str]:
-    await controller.stop()
+async def stop_drive(manager: Manager) -> dict[str, str]:
+    """実行中のジョブを止める（stop コマンド。停止の流れまで済ませてランナーは待機へ戻る。非常停止の状態にはならない）。無ければ何もしない。"""
+    if not manager.is_busy:
+        return {"status": "idle"}
+    await manager.stop()
     return {"status": "ok"}
 
 
+@router.post("/pause", status_code=200)
+async def pause_drive(manager: Manager) -> dict[str, Any]:
+    """一時停止（ランナーへ SIGUSR1）。モード走行の実行中だけ。それ以外は 409。"""
+    status = await manager.pause()
+    return {"status": "ok", "paused": status.paused}
+
+
+@router.post("/resume", status_code=200)
+async def resume_drive(manager: Manager) -> dict[str, Any]:
+    """再開（ランナーへ SIGUSR2）。一時停止中のモード走行だけ。それ以外は 409。"""
+    status = await manager.resume()
+    return {"status": "ok", "paused": status.paused}
+
+
 @router.post("/emergency", status_code=200)
-async def emergency_stop(controller: Controller) -> dict[str, str]:
-    await controller.emergency_stop()
+async def emergency_stop(manager: Manager) -> dict[str, str]:
+    await manager.emergency()
     return {"status": "ok"}
 
 
 @router.post("/reset-emergency", status_code=200)
-async def reset_emergency(controller: Controller) -> dict[str, str]:
-    try:
-        await controller.reset_emergency()
-    except EmergencyStillActive as e:
-        # 物理スイッチ未解除。423 Locked で「まだ解除できない」ことを表す。
-        raise HTTPException(status_code=423, detail=str(e)) from e
+async def reset_emergency(manager: Manager) -> dict[str, str]:
+    # EmergencyStillActive（423）・JobConflict（409）は app のハンドラが応答にする
+    await manager.reset_emergency()
     return {"status": "ok"}
 
 
-@router.post("/calibrate", response_model=CalibrationResultResponse)
-async def run_calibration(controller: Controller) -> CalibrationResultResponse:
-    result = await controller.run_calibration()
-    return _to_calibration_result_response(result)
+# ── 学習 ───────────────────────────────────────────────────────────────
 
 
-@router.post("/calib/jog", response_model=JogResponse)
-async def calib_jog(req: JogRequest, controller: Controller) -> JogResponse:
-    """キャリブレーション中に軸をジョグ移動する。READY から CALIBRATING へ自動遷移。"""
-    try:
-        pos = await controller.jog_axis(req.axis, req.step)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    return JogResponse(position=pos)
-
-
-@router.post("/calib/home", response_model=JogResponse)
-async def calib_home(req: AxisRequest, controller: Controller) -> JogResponse:
-    """キャリブレーション中に軸を原点復帰する。READY から CALIBRATING へ自動遷移。"""
-    try:
-        pos = await controller.home_axis(req.axis)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    return JogResponse(position=pos)
-
-
-@router.post("/calib/set-zero", response_model=JogResponse)
-async def calib_set_zero(req: AxisRequest, controller: Controller) -> JogResponse:
-    """現在位置をゼロ点として記録する。CALIBRATING 状態でのみ呼べる。"""
-    try:
-        pos = await controller.calib_set_zero(req.axis)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    return JogResponse(position=pos)
-
-
-@router.post("/calib/set-full", response_model=JogResponse)
-async def calib_set_full(req: AxisRequest, controller: Controller) -> JogResponse:
-    """現在位置をフル点として記録する。CALIBRATING 状態でのみ呼べる。"""
-    try:
-        pos = await controller.calib_set_full(req.axis)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    return JogResponse(position=pos)
-
-
-@router.post("/calib/save", response_model=CalibrationResultResponse)
-async def save_calibration(controller: Controller) -> CalibrationResultResponse:
-    """手動設定したゼロ/フル点でキャリブレーションを保存する。CALIBRATING → READY。"""
-    result = await controller.save_manual_calibration()
-    return _to_calibration_result_response(result)
-
-
-@router.post("/manual/jog", response_model=JogResponse)
-async def manual_jog(req: JogRequest, controller: Controller) -> JogResponse:
-    """手動運転中に軸をジョグ移動する。MANUAL 状態でのみ呼べる。"""
-    try:
-        pos = await controller.jog_axis(req.axis, req.step)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    return JogResponse(position=pos)
-
-
-@router.post("/manual/home", response_model=JogResponse)
-async def manual_home(req: AxisRequest, controller: Controller) -> JogResponse:
-    """手動運転中に軸を原点復帰する。MANUAL 状態でのみ呼べる。"""
-    try:
-        pos = await controller.home_axis(req.axis)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    return JogResponse(position=pos)
-
-
-@router.post("/manual/start", response_model=DriveSessionResponse)
-async def start_manual(
-    controller: Controller,
-    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
-) -> DriveSessionResponse:
-    session = await controller.start_manual(log_writer=log_writer)
-    return _to_session_response(session)
-
-
-@router.post("/manual/stop", status_code=200)
-async def stop_manual(controller: Controller) -> dict[str, str]:
-    await controller.stop_manual()
-    return {"status": "ok"}
-
-
-@router.post("/learning/arm", status_code=200)
-async def arm_learning_drive(controller: Controller) -> dict[str, str]:
-    """学習運転を準備する。READY → PRE_CHECK 遷移。
-
-    走行前チェック（車速0含む）を実施し、合格したら停車保持ブレーキまで踏み込んで
-    確認待ち（PRE_CHECK）にする。フロントは確認ポップアップを表示し、「はい」で
-    /learning/start、「いいえ」で /learning/cancel を呼ぶ。
-    """
-    await controller.arm_learning_drive()
-    return {"status": "armed"}
-
-
-@router.post("/learning/start", response_model=DriveSessionResponse)
-async def start_learning_drive(
-    controller: Controller,
-    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
-) -> DriveSessionResponse:
-    """学習走行を開始する（確認ポップアップ「はい」）。arm 後（PRE_CHECK）→ RUNNING。
-
-    開度パターン列を LearningLoop で開ループ実行し、走行ログを `drive_logs` に
-    連続記録する（DB 利用時）。
-    """
-    session = await controller.start_learning_drive(log_writer=log_writer)
-    return _to_session_response(session)
-
-
-@router.post("/learning/cancel", status_code=200)
-async def cancel_learning_drive(controller: Controller) -> dict[str, str]:
-    """学習運転を中止する（確認ポップアップ「いいえ」）。PRE_CHECK → READY。
-
-    arm でかけた保持ブレーキをリリースする。セッションは未開始のためログは残らない。
-    """
-    await controller.cancel_learning_drive()
-    return {"status": "cancelled"}
-
-
-@router.post("/learning/train", response_model=TrainModelResponse)
-async def train_learning_model(
-    req: TrainModelRequest,
-    controller: Controller,
-    profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
-    session_repo: Annotated[SessionRepoProtocol, Depends(get_session_repo)],
-    feature_spec: Annotated[FeatureSpec, Depends(get_feature_spec)],
-) -> TrainModelResponse:
-    """直近の学習走行ログから先読み 多項式Ridge 逆モデルを学習し、プロファイルに紐づけて保存する。
-
-    再学習も同一エンドポイントで実行できる（model_path を上書き更新）。
-    学習は CPU 負荷の高い同期処理のため to_thread で実行し、50ms 制御ループ・
-    WebSocket 配信・非常停止コールバックが動くイベントループをブロックしない。
-    実処理は training_service.train_and_apply に委譲する（2段階学習フローの
-    オーケストレータとロジックを共有する）。
-    """
-    state = controller.get_system_state().robot_state
-    if state in (
-        RobotState.RUNNING,
-        RobotState.PAUSED,
-        RobotState.MANUAL,
-        RobotState.CALIBRATING,
-        RobotState.PRE_CHECK,
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=f"走行・操作中はモデル学習を実行できません (現在: {state})",
-        )
-
-    profile = await profile_repo.get_by_id(req.profile_id)
-    if profile is None:
-        raise HTTPException(
-            status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
-        )
-
-    # session_ids を明示指定した場合はそれを優先する（再学習・複数選択の用途）。
-    # 次に cycle_id 指定（サイクル内全セッションで学習）。いずれも無ければ
-    # 「直近に実施した学習走行」のみを既定とする（過去の旧データ混在を避ける）。
-    session_ids = req.session_ids
-    if not session_ids and req.cycle_id:
-        session_ids = await session_repo.list_session_ids_for_cycle(req.cycle_id)
-        if not session_ids:
-            raise HTTPException(
-                status_code=422,
-                detail=f"学習サイクル {req.cycle_id!r} にセッションがありません。",
-            )
-    if not session_ids:
-        latest = await session_repo.latest_learning_session_id(req.profile_id)
-        if latest is None:
-            raise HTTPException(
-                status_code=422,
-                detail="学習走行のログがありません。先に学習走行を実施してください。",
-            )
-        session_ids = [latest]
-
-    try:
-        result = await train_and_apply(
-            profile_repo=profile_repo,
-            session_repo=session_repo,
-            controller=controller,
-            profile_id=req.profile_id,
-            session_ids=session_ids,
-            feature_spec=feature_spec,
-        )
-    except LearningDataError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-
-    return TrainModelResponse(
-        model_path=result.model_path,
-        metrics=result.metrics,
-        feedforward_params=FeedforwardParamsSchema.model_validate(result.feedforward_params),
-        pid_gains=PIDGainsSchema.model_validate(result.pid_gains),
-        pid_auto_tuned=result.pid_auto_tuned,
-        dynamics_params=DynamicsParamsSchema.model_validate(result.dynamics_params),
-    )
-
-
-@router.post("/pid-tune/validate", response_model=PidValidateResponse)
-async def pid_tune_validate(
-    req: PidValidateRequest,
-    controller: Controller,
-    profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
-    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
-) -> PidValidateResponse:
-    """規定パターンを 1 回走行し、現在の PID ゲインの追従 KPI とコストを返す。"""
-    profile = await profile_repo.get_by_id(req.profile_id)
-    if profile is None:
-        raise HTTPException(
-            status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
-        )
-    kpi = await controller.run_pid_validation(profile, log_writer)
-    return PidValidateResponse(
-        kpi_summary=kpi,
-        cost=tuning_cost(kpi),
-        pid_gains=PIDGainsSchema(
-            kp=profile.pid_gains.kp, ki=profile.pid_gains.ki, kd=profile.pid_gains.kd
-        ),
-    )
-
-
-@router.post("/pid-tune/refine", response_model=PidRefineResponse)
-async def pid_tune_refine(
-    req: PidRefineRequest,
-    controller: Controller,
-    profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
-    mode_repo: Annotated[ModeRepoProtocol, Depends(get_mode_repo)],
-    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
-) -> PidRefineResponse:
-    """規定パターン（または指定モード代表区間）を反復走行し座標降下で PID を絞り込む。"""
-    profile = await profile_repo.get_by_id(req.profile_id)
-    if profile is None:
-        raise HTTPException(
-            status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
-        )
-    # mode_id 指定時は本番モードの代表区間で評価する（適合結果の転移性向上）。
-    tuning_mode = None
-    if req.mode_id is not None:
-        mode = await mode_repo.get_by_id(req.mode_id)
-        if mode is None:
-            raise HTTPException(
-                status_code=404, detail=f"モード {req.mode_id!r} が見つかりません"
-            )
-        tuning_mode = build_tuning_trajectory_from_mode(mode)
-    best, history = await controller.run_pid_tuning_session(
-        profile, log_writer, max_runs=req.max_runs, mode=tuning_mode
-    )
-
-    # 最良ゲイン・PID 先読み補償秒数を永続化し、アクティブプロファイルの制御スタックへ反映する。
-    profile.pid_gains = best.gains
-    profile.dynamics_params = replace(profile.dynamics_params, pid_preview_s=best.pid_preview_s)
-    updated = await profile_repo.update(profile)
-    controller.refresh_active_profile(updated if updated is not None else profile)
-
-    return PidRefineResponse(
-        pid_gains=PIDGainsSchema(kp=best.kp, ki=best.ki, kd=best.kd),
-        pid_preview_s=best.pid_preview_s,
-        best_cost=min((h["cost"] for h in history), default=0.0),
-        history=history,
-    )
-
-
-@router.post("/schedule/start", response_model=DriveSessionResponse)
-async def start_schedule_drive(
-    req: StartScheduleRequest,
-    controller: Controller,
-    schedule_repo: Annotated[ScheduleRepoProtocol, Depends(get_schedule_repo)],
-    log_writer: Annotated[LogWriterProtocol | None, Depends(get_log_writer)],
-) -> DriveSessionResponse:
-    """タイムスケジュール走行を開始する。
-
-    ペダル開度とボタンイベントの統合タイムラインを ScheduleLoop で開ループ実行する。
-    """
-    try:
-        schedule = await schedule_repo.get_by_id(req.schedule_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail="schedule_id が UUID 形式ではありません") from e
-    if schedule is None:
-        raise HTTPException(
-            status_code=404, detail=f"スケジュール {req.schedule_id!r} が見つかりません"
-        )
-    profile = controller.get_active_profile()
-    session = await controller.start_schedule_drive(
-        schedule, profile=profile, log_writer=log_writer
-    )
-    return _to_session_response(session)
-
-
-@router.post("/schedule/stop", status_code=200)
-async def stop_schedule_drive(controller: Controller) -> dict[str, str]:
-    """タイムスケジュール走行を停止する。RUNNING → READY。"""
-    await controller.stop_schedule_drive()
-    return {"status": "ok"}
-
-
-@router.post("/select-profile", status_code=200)
-async def select_profile(
-    req: SelectProfileRequest,
-    controller: Controller,
-    profile_repo: Annotated[ProfileRepoProtocol, Depends(get_profile_repo)],
-) -> dict[str, str]:
-    """アクティブプロファイルを選択する。プロファイルが存在しない場合は 404。"""
-    profile = await profile_repo.get_by_id(req.profile_id)
-    if profile is None:
-        raise HTTPException(
-            status_code=404, detail=f"プロファイル {req.profile_id!r} が見つかりません"
-        )
-    controller.select_profile(profile)
-    return {"status": "ok", "profile_id": profile.id}
-
-
-def _to_cycle_progress_schema(orchestrator: LearningCycleOrchestrator) -> CycleProgressSchema:
-    return CycleProgressSchema.model_validate(orchestrator.progress)
+@router.post("/learning/start", response_model=JobStartResponse)
+async def start_learning(
+    manager: Manager, store: Store, req: LearningStartRequest | None = None
+) -> JobStartResponse:
+    """学習ジョブを始める。kind: full（手順 2）/ fel（12）/ hold（13）/ stop（14）。"""
+    kind = (req or LearningStartRequest()).kind
+    return _job_response(await manager.start_learning(_active_vehicle(store), kind))
 
 
 @router.post("/learning-cycle/arm", status_code=200)
-async def arm_learning_cycle(
-    controller: Controller,
-    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
-) -> dict[str, str]:
-    """学習サイクルを準備する(自動運転と同じ arm フロー)。READY → PRE_CHECK。
-
-    停車保持ブレーキ踏込・車速0収束待ち・走行前チェックを実施し、合格したら確認待ち
-    (PRE_CHECK)にする。フロントは確認ポップアップを表示し、「はい」で
-    /learning-cycle/start、「いいえ」で /learning-cycle/cancel を呼ぶ。
-    """
-    profile = controller.get_active_profile()
-    if profile is None:
-        raise HTTPException(status_code=404, detail="プロファイルが選択されていません")
-    try:
-        await orchestrator.arm(profile.id)
-    except CycleBusyError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-    return {"status": "armed"}
+async def arm_learning_cycle(manager: Manager, store: Store) -> dict[str, str]:
+    """（互換）旧「学習サイクルの準備」。始められるかの確認だけ行う。"""
+    return await arm_drive(manager, store)
 
 
 @router.post("/learning-cycle/cancel", status_code=200)
-async def cancel_learning_cycle(
-    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
-) -> dict[str, str]:
-    """arm 済みの学習サイクルを中止する(確認ポップアップ「いいえ」)。PRE_CHECK → READY。"""
-    await orchestrator.cancel()
+async def cancel_learning_cycle() -> dict[str, str]:
+    """（互換）旧「学習サイクルの準備の取消」。何もしない。"""
     return {"status": "cancelled"}
 
 
-@router.post("/learning-cycle/start", response_model=LearningCycleStartResponse, status_code=202)
+@router.post("/learning-cycle/start", response_model=JobStartResponse, status_code=202)
 async def start_learning_cycle(
-    req: LearningCycleStartRequest,
-    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
-    learning_settings: Annotated[LearningSettings, Depends(get_learning_settings)],
-    feature_spec: Annotated[FeatureSpec, Depends(get_feature_spec)],
-) -> LearningCycleStartResponse:
-    """arm 済みの学習サイクル(学習運転→訓練→PID適合→再学習→PID適合)を開始する
-    (確認ポップアップ「はい」)。
+    manager: Manager, store: Store, req: LearningStartRequest | None = None
+) -> JobStartResponse:
+    """学習ジョブを始める（`/learning/start` と同じ。body 省略は full）。"""
+    return await start_learning(manager, store, req)
 
-    以降のフェーズはバックグラウンドで進行し、進捗は `GET /learning-cycle/status` または
-    WebSocket(`cycle_progress`)で参照する。
+
+@router.post("/learning-cycle/abort", status_code=200)
+async def abort_learning_cycle(manager: Manager) -> dict[str, str]:
+    """学習ジョブを中断する（stop コマンド）。実行中のジョブが無ければ 409。"""
+    status = manager.current
+    if status is None or status.spec.kind != "learning":
+        raise HTTPException(status_code=409, detail="実行中の学習ジョブがありません")
+    await manager.stop()
+    return {"status": "aborting"}
+
+
+@router.get("/learning-cycle/status")
+async def get_learning_cycle_status(manager: Manager) -> dict[str, Any]:
+    """学習ジョブの進み具合（手順・phase・最新の sample）。実行中でなければ直前のジョブ。"""
+    snap = manager.snapshot()
+    return {"state": snap["state"], "job": snap["job"], "last_job": snap["last_job"]}
+
+
+# ── 手動運転・キャリブレーション（対話ジョブ） ─────────────────────────
+
+
+async def _command(
+    manager: Manager, command: dict[str, Any], *, axis: str | None = None
+) -> JogResponse:
+    reply = await manager.send_command(command)
+    if not reply.ack.get("ok"):
+        raise HTTPException(status_code=409, detail=str(reply.ack.get("message") or "失敗しました"))
+    st = reply.status or manager.current_interactive_status()
+    key = "brake_pulse" if axis == "brake" else "accel_pulse"
+    return JogResponse(position=int((st or {}).get(key) or 0))
+
+
+@router.post("/calib/jog", response_model=JogResponse)
+async def calib_jog(req: JogRequest, manager: Manager, store: Store) -> JogResponse:
+    """キャリブレーション: 軸をジョグ移動する（今の実開度から ±量）。対話ジョブが無ければ始める（初期化に時間がかかる）。
+
+    ``step`` は旧 API のまま pulse（9500 pulse = 100%）。ランナーへは % で送る。
     """
-    stage1 = req.refine_runs_stage1 or learning_settings.refine_runs_stage1
-    cycle_id = await orchestrator.start(stage1, feature_spec=feature_spec)
-    return LearningCycleStartResponse(cycle_id=cycle_id, status="started")
-
-
-@router.post("/learning-cycle/abort", response_model=LearningCycleAbortResponse, status_code=200)
-async def abort_learning_cycle(
-    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
-) -> LearningCycleAbortResponse:
-    """実行中の学習サイクルを中断する。実行中でない場合は 409。"""
-    await orchestrator.abort()
-    return LearningCycleAbortResponse(status="aborting")
-
-
-@router.get("/learning-cycle/status", response_model=CycleProgressSchema)
-async def get_learning_cycle_status(
-    orchestrator: Annotated[LearningCycleOrchestrator, Depends(get_cycle_orchestrator)],
-) -> CycleProgressSchema:
-    return _to_cycle_progress_schema(orchestrator)
-
-
-# ── エピソード型プラン学習 ────────────────────────────────────────────────
-PlanRepo = Annotated[PlanRepoProtocol, Depends(get_plan_repo)]
-
-
-def _to_plan_status(profile_id: str, mode_id: str, rec: object | None) -> PlanStatusResponse:
-    """PedalPlanRecord（または None）を状態レスポンスへ写像する。未学習は既定値。"""
-    if rec is None:
-        return PlanStatusResponse(
-            profile_id=profile_id,
-            mode_id=mode_id,
-            enabled=True,  # 未登録は既定で有効（走行完了時に学習開始）
-            iteration=0,
-            has_plan=False,
-            best_reward=None,
-            reward_history=[],
-        )
-    plan = rec.plan  # type: ignore[attr-defined]
-    return PlanStatusResponse(
-        profile_id=profile_id,
-        mode_id=mode_id,
-        enabled=rec.enabled,  # type: ignore[attr-defined]
-        iteration=rec.iteration,  # type: ignore[attr-defined]
-        has_plan=bool(plan.efforts),
-        best_reward=rec.best_reward,  # type: ignore[attr-defined]
-        reward_history=list(rec.reward_history),  # type: ignore[attr-defined]
+    await manager.ensure_interactive(_active_vehicle(store), PURPOSE_CALIB)
+    return await _command(
+        manager,
+        {
+            "cmd": "jog",
+            "axis": req.axis,
+            "amount_pct": round(req.step / PULSE_FULL * 100.0, 4),
+            "calib": True,  # max を測るため、上限をストロークの端の手前（99%）まで広げる
+        },
+        axis=req.axis,
     )
 
 
-@router.get("/plan/{profile_id}/{mode_id}", response_model=PlanStatusResponse)
-async def get_plan_status(profile_id: str, mode_id: str, plan_repo: PlanRepo) -> PlanStatusResponse:
-    """profile×mode のプラン学習状態（反復回数・有効フラグ・最良reward・履歴）を返す。"""
-    rec = await plan_repo.get(profile_id, mode_id)
-    return _to_plan_status(profile_id, mode_id, rec)
+@router.post("/calib/home", response_model=JogResponse)
+async def calib_home(req: AxisRequest, manager: Manager, store: Store) -> JogResponse:
+    """キャリブレーション: 両軸を原点へ戻す（応答の position は req.axis の実位置）。"""
+    await manager.ensure_interactive(_active_vehicle(store), PURPOSE_CALIB)
+    return await _command(manager, {"cmd": "home"}, axis=req.axis)
 
 
-@router.post("/plan/{profile_id}/{mode_id}/enable", response_model=PlanStatusResponse)
-async def enable_plan(profile_id: str, mode_id: str, plan_repo: PlanRepo) -> PlanStatusResponse:
-    """プラン学習を有効化する。"""
-    await plan_repo.set_enabled(profile_id, mode_id, True)
-    return _to_plan_status(profile_id, mode_id, await plan_repo.get(profile_id, mode_id))
+@router.post("/calib/save-min", response_model=SaveMinResponse)
+async def calib_save_min(req: SaveMinRequest, manager: Manager, store: Store) -> SaveMinResponse:
+    """今の実位置を min（ペダルに触れた位置）として車両 yaml へ保存する。保存した軸は「測定済み」になる。"""
+    vehicle_id = _active_vehicle(store)
+    await manager.ensure_interactive(vehicle_id, PURPOSE_CALIB)
+    reply = await manager.send_command({"cmd": "save_min", "axis": req.axis})
+    if not reply.ack.get("ok"):
+        raise HTTPException(status_code=409, detail=str(reply.ack.get("message") or "保存できません"))
+    info = store.read(vehicle_id)
+    st = reply.status or {}
+    return SaveMinResponse(
+        message=str(reply.ack.get("message") or ""),
+        accel_pct=st.get("accel_pct"),
+        brake_pct=st.get("brake_pct"),
+        min_accel_measured=info.min_accel_measured,
+        min_brake_measured=info.min_brake_measured,
+    )
 
 
-@router.post("/plan/{profile_id}/{mode_id}/disable", response_model=PlanStatusResponse)
-async def disable_plan(profile_id: str, mode_id: str, plan_repo: PlanRepo) -> PlanStatusResponse:
-    """プラン学習を無効化する（保存プランを適用せず学習もしない）。"""
-    await plan_repo.set_enabled(profile_id, mode_id, False)
-    return _to_plan_status(profile_id, mode_id, await plan_repo.get(profile_id, mode_id))
+@router.post("/calib/save-max", response_model=SaveMaxResponse)
+async def calib_save_max(req: SaveMaxRequest, manager: Manager, store: Store) -> SaveMaxResponse:
+    """今の実位置を max（開度上限）として車両 yaml の vehicle.max_*_opening_pct へ保存する。
+    min + 1% 以上・99% 以下でなければ 409。"""
+    await manager.ensure_interactive(_active_vehicle(store), PURPOSE_CALIB)
+    reply = await manager.send_command({"cmd": "save_max", "axis": req.axis})
+    if not reply.ack.get("ok"):
+        raise HTTPException(status_code=409, detail=str(reply.ack.get("message") or "保存できません"))
+    st = reply.status or {}
+    return SaveMaxResponse(
+        message=str(reply.ack.get("message") or ""),
+        accel_pct=st.get("accel_pct"),
+        brake_pct=st.get("brake_pct"),
+    )
 
 
-@router.post("/plan/{profile_id}/{mode_id}/reset", response_model=PlanStatusResponse)
-async def reset_plan(profile_id: str, mode_id: str, plan_repo: PlanRepo) -> PlanStatusResponse:
-    """保存プランを削除し、次回は FF 由来プランから学習をやり直す。"""
-    await plan_repo.reset(profile_id, mode_id)
-    return _to_plan_status(profile_id, mode_id, await plan_repo.get(profile_id, mode_id))
+@router.post("/manual/start", response_model=JobStartResponse)
+async def start_manual(manager: Manager, store: Store) -> JobStartResponse:
+    """手動運転を始める（対話ジョブ。初期化が済んでコマンド待ちになってから返る）。セッション（manual）を作る。"""
+    status = await manager.ensure_interactive(_active_vehicle(store), PURPOSE_MANUAL)
+    return _job_response(status)
+
+
+@router.post("/manual/jog", response_model=JogResponse)
+async def manual_jog(req: JogRequest, manager: Manager) -> JogResponse:
+    """手動運転中に軸をジョグ移動する（`/calib/jog` と同じ換算）。手動運転が始まっていなければ 409。"""
+    _require_interactive(manager, PURPOSE_MANUAL)
+    return await _command(
+        manager,
+        {"cmd": "jog", "axis": req.axis, "amount_pct": round(req.step / PULSE_FULL * 100.0, 4)},
+        axis=req.axis,
+    )
+
+
+@router.post("/manual/home", response_model=JogResponse)
+async def manual_home(req: AxisRequest, manager: Manager) -> JogResponse:
+    _require_interactive(manager, PURPOSE_MANUAL)
+    return await _command(manager, {"cmd": "home"}, axis=req.axis)
+
+
+@router.post("/manual/stop", status_code=200)
+async def stop_manual(manager: Manager) -> dict[str, str]:
+    """手動運転を終える（quit_interactive。ランナーは残る → セッションを completed にする）。"""
+    _require_interactive(manager, PURPOSE_MANUAL)
+    await manager.stop()
+    return {"status": "ok"}
+
+
+def _require_interactive(manager: JobManager, purpose: str) -> None:
+    cur = manager.current
+    if cur is None or cur.spec.kind != "interactive" or cur.spec.purpose != purpose:
+        raise HTTPException(status_code=409, detail="手動運転が始まっていません")
+
+
+# ── タイムスケジュール・シーケンス（段6） ──────────────────────────────
+
+
+async def _load_schedule_checked(
+    schedule_id: str, schedule_repo: ScheduleRepoProtocol, vehicle_id: str, manager: JobManager
+) -> dict[str, Any]:
+    """スケジュールを読み、走らせられるか検査して、ランナーへ渡す辞書にする（だめなら 404 / 422）。"""
+    try:
+        schedule = await schedule_repo.get_by_id(schedule_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="schedule_id が UUID 形式ではありません") from exc
+    if schedule is None:
+        raise HTTPException(status_code=404, detail=f"スケジュール {schedule_id!r} が見つかりません")
+    data = schedule_to_dict(schedule)
+    problem = check_schedule(schedule_from_dict(data))
+    if problem is not None:
+        raise HTTPException(status_code=422, detail=problem)
+    return data
+
+
+@router.post("/schedule/start", response_model=JobStartResponse)
+async def start_schedule_drive(
+    req: StartScheduleRequest,
+    manager: Manager,
+    store: Store,
+    schedule_repo: Annotated[ScheduleRepoProtocol, Depends(get_schedule_repo)],
+) -> JobStartResponse:
+    """タイムスケジュールを開ループで再生する（手順 1 → 走行前チェック → 再生 → 終了処理）。選んでいる車で走る。
+
+    ボタン名のないイベント（旧データ）・点が無いときは 422。
+    """
+    vehicle_id = _active_vehicle(store)
+    data = await _load_schedule_checked(req.schedule_id, schedule_repo, vehicle_id, manager)
+    return _job_response(await manager.start_schedule(vehicle_id, data))
+
+
+@router.post("/schedule/stop", status_code=200)
+async def stop_schedule_drive(manager: Manager) -> dict[str, str]:
+    return await stop_drive(manager)
+
+
+async def _plan_sequence(
+    sequence_id: str,
+    vehicle_id: str,
+    manager: JobManager,
+    sequence_repo: SequenceRepoProtocol,
+    mode_repo: ModeRepoProtocol,
+    schedule_repo: ScheduleRepoProtocol,
+) -> tuple[Any, list[PlannedStep]]:
+    """シーケンスを読み、各段の参照先を解決して検査する（/sequence/start と /prepare で共通）。"""
+    try:
+        seq = await sequence_repo.get_by_id(sequence_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="sequence_id が UUID 形式ではありません") from exc
+    if seq is None:
+        raise HTTPException(status_code=404, detail=f"シーケンス {sequence_id!r} が見つかりません")
+    steps: list[PlannedStep] = []
+    for no, st in enumerate(seq.steps, start=1):
+        if st.kind == "mode":
+            mode = await _get_or_none(mode_repo.get_by_id, st.ref_id)
+            if mode is None:
+                raise HTTPException(
+                    status_code=422, detail=f"{no} 段目の走行モード（{st.ref_id}）が見つかりません"
+                )
+            steps.append(PlannedStep("mode", st.ref_id, mode.name, st.repeat, mode_id=mode.id))
+        else:
+            try:
+                data = await _load_schedule_checked(st.ref_id, schedule_repo, vehicle_id, manager)
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    exc = HTTPException(
+                        status_code=422,
+                        detail=f"{no} 段目のタイムスケジュール（{st.ref_id}）が見つかりません",
+                    )
+                elif exc.status_code in (400, 422):
+                    exc = HTTPException(status_code=422, detail=f"{no} 段目: {exc.detail}")
+                raise exc from None
+            steps.append(PlannedStep("schedule", st.ref_id, str(data["name"]), st.repeat, schedule=data))
+    return seq, steps
+
+
+@router.post("/sequence/start")
+async def start_sequence_drive(
+    req: StartSequenceRequest,
+    manager: Manager,
+    store: Store,
+    sequence_repo: Annotated[SequenceRepoProtocol, Depends(get_sequence_repo)],
+    mode_repo: Annotated[ModeRepoProtocol, Depends(get_mode_repo)],
+    schedule_repo: Annotated[ScheduleRepoProtocol, Depends(get_schedule_repo)],
+) -> dict[str, Any]:
+    """シーケンスを始める。段（走行モード・タイムスケジュール）を順に、繰り返し回数どおり 1 回ずつジョブとして走らせる。
+
+    各段の走らせられるかは始める前に全部検査する（参照先が無い・ボタン名なしなど）。
+    どれかの段が 0 以外で終わったら残りは走らせず止める。
+    """
+    vehicle_id = _active_vehicle(store)
+    seq, steps = await _plan_sequence(
+        req.sequence_id, vehicle_id, manager, sequence_repo, mode_repo, schedule_repo
+    )
+    run, first = await manager.start_sequence(
+        vehicle_id, seq.id, seq.name, steps, seq.repeat, req.limit_s
+    )
+    return {
+        "sequence_id": run.sequence_id,
+        "name": run.name,
+        "runs_total": len(run.runs),
+        "sequence": run.to_dict(),
+        "job": _job_response(first).model_dump(mode="json"),
+    }
+
+
+@router.post("/sequence/stop", status_code=200)
+async def stop_sequence_drive(manager: Manager) -> dict[str, str]:
+    return await stop_drive(manager)
+
+
+async def _get_or_none(getter: Any, ref_id: str) -> Any:
+    """参照先の取得（UUID 形式でない ID は「見つからない」）。"""
+    try:
+        return await getter(ref_id)
+    except ValueError:
+        return None
+
+
+# ── 走行の準備（開始ポップアップの間に計画を作る。段4） ────────────────
+
+
+@router.post("/prepare")
+async def prepare_drive(
+    req: PrepareRequest,
+    manager: Manager,
+    store: Store,
+    mode_repo: Annotated[ModeRepoProtocol, Depends(get_mode_repo)],
+    schedule_repo: Annotated[ScheduleRepoProtocol, Depends(get_schedule_repo)],
+    sequence_repo: Annotated[SequenceRepoProtocol, Depends(get_sequence_repo)],
+) -> dict[str, Any]:
+    """走行の準備を始める（モード・シーケンスのモードの段の計画を、ハードに触れない別プロセスで作る）。
+
+    応答: ``{prepare_id, state: planning|ready, done, total}``。準備中・ジョブ実行中・非常停止中・
+    （モードを走るのに）未初期化は 409。参照先が無ければ 404。
+    """
+    vehicle_id = _active_vehicle(store)
+    if req.kind == "mode":
+        mode = await _get_or_none(mode_repo.get_by_id, req.id)
+        if mode is None:
+            raise HTTPException(status_code=404, detail=f"走行モード {req.id!r} が見つかりません")
+        prep = await manager.start_prepare_mode(vehicle_id, mode.id, mode.name, req.limit_s)
+    elif req.kind == "schedule":
+        data = await _load_schedule_checked(req.id, schedule_repo, vehicle_id, manager)
+        prep = await manager.start_prepare_schedule(vehicle_id, data)
+    else:
+        seq, steps = await _plan_sequence(req.id, vehicle_id, manager, sequence_repo, mode_repo, schedule_repo)
+        prep = await manager.start_prepare_sequence(
+            vehicle_id, seq.id, seq.name, steps, seq.repeat, req.limit_s
+        )
+    return {"prepare_id": prep.prepare_id, "state": prep.state, "done": prep.done, "total": prep.total}
+
+
+@router.post("/prepare/cancel", status_code=200)
+async def prepare_cancel(manager: Manager) -> dict[str, str]:
+    """準備を取り消す（計画プロセスを止め、ファイルを消す）。準備が無くても 200。"""
+    await manager.cancel_prepare()
+    return {"status": "cancelled"}
+
+
+@router.post("/prepare/go", status_code=200)
+async def prepare_go(manager: Manager) -> dict[str, Any]:
+    """「はい」: 計画ができていればすぐジョブを始め（``started``）、まだなら ``waiting``（できたら自動で始める）。
+
+    計画が失敗している・準備が無いときは 409。"""
+    state, job_id = await manager.prepare_go()
+    return {"state": state, "job_id": job_id}

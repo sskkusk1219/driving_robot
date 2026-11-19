@@ -1,7 +1,7 @@
 """研究開発用ハーネス 走行後の緩減速（stop_decel.py）のユニットテスト。
 
 スタブ車両で、不感帯の手前まで一発で動かしてから 1 刻みずつ踏むこと、上限Gを超えたときだけ
-戻すこと、停車保持開度を超えて踏まないこと、停車しなければエラーになることを確かめる。
+戻すこと、踏み増しの上限が最大開度（停車保持開度ではない）で、停車後は停車保持開度へ移すこと、停車しなければエラーになることを確かめる。
 スタブはブレーキ→減速の遅れが無いので、時間を縮めるため刻み 1mm・待ち 0.2s にしている
 （判定ロジックは既定と同じ）。惰行減速は小さい定数にして、ブレーキの効きだけで判定が動くようにする。
 """
@@ -135,17 +135,22 @@ async def test_releases_one_step_only_when_decel_exceeds_limit(tmp_path: Path) -
     await hwmod.shutdown(hw)
 
 
-async def test_waits_at_hold_opening_when_brake_is_weak(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+async def test_presses_beyond_hold_opening_then_returns_to_hold_after_stop(
+    tmp_path: Path,
 ) -> None:
+    # 効きが弱く、停車保持開度では足りない。上限は最大開度なので、それより深く踏める。
+    # 停車したあとは、停車保持開度まで戻して終わる（2026-11-19 非常停止の変更 D）。
     cfg = _tmp_cfg(tmp_path)
-    hw = await _moving_stub(cfg, speed_kmh=8.0, brake_gain=0.3)  # 停車保持開度でも 0.13G 程度
+    hw = await _moving_stub(cfg, speed_kmh=8.0, brake_gain=0.3)
     moves = _record_moves(hw.brake)  # type: ignore[arg-type]
 
-    await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg))
+    result = await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg))
 
-    assert max(pos for pos, _ in moves) == CEILING  # 停車保持開度を超えて踏まない
-    assert "上限で待機" in capsys.readouterr().out
+    positions = [pos for pos, _ in moves]
+    assert max(positions) > CEILING  # 停車保持開度を超えて踏んでいる
+    assert max(positions) <= opening_to_pulse(build_vehicle_profile(cfg).max_brake_opening)
+    assert positions[-1] == CEILING == hw.brake.position  # 停車後は停車保持開度へ戻す
+    assert result.hold_pct == PEDAL.stop_brake_opening_pct
     assert await hw.can.read_speed() < VEHICLE_STOP_SPEED_KMH
     await hwmod.shutdown(hw)
 

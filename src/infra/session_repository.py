@@ -1,13 +1,45 @@
+# ruff: noqa: E501
 """DriveSession・DriveLog を PostgreSQL から読み取る読み取り専用リポジトリ。"""
 
 from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
 import asyncpg
 
 from src.models.drive_log import DriveLog, DriveSession, LearningCycle
+
+
+@dataclass
+class SessionMessage:
+    """進行のメッセージ 1 行（drive_session_messages）。"""
+
+    seq: int
+    elapsed_s: float
+    time: datetime
+    level: str
+    message: str
+
+
+@dataclass
+class LogCsvRow:
+    """CSV 書き出し用の drive_logs の 1 行（9 列＋detail）。"""
+
+    timestamp: datetime
+    ref_speed_kmh: float | None
+    actual_speed_kmh: float
+    accel_opening: float
+    brake_opening: float
+    accel_pos: int
+    brake_pos: int
+    accel_current: float
+    brake_current: float
+    detail: dict[str, Any]
 
 
 class SessionRepository:
@@ -36,6 +68,65 @@ class SessionRepository:
             return None
         return _row_to_session(row)
 
+    async def list_messages(self, session_id: str, limit: int = 100_000) -> list[SessionMessage]:
+        """セッションの進行のメッセージを seq 昇順で返す。"""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT seq, elapsed_s, time, level, message FROM drive_session_messages
+                WHERE session_id = $1 ORDER BY seq ASC LIMIT $2
+                """,
+                uuid.UUID(session_id),
+                limit,
+            )
+        return [
+            SessionMessage(r["seq"], r["elapsed_s"], r["time"], r["level"], r["message"])
+            for r in rows
+        ]
+
+    async def log_detail_keys(self, session_id: str) -> list[str]:
+        """セッションの detail JSONB にあるキー（CSV の列名）の一覧。"""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT jsonb_object_keys(detail) AS k FROM drive_logs
+                WHERE session_id = $1 AND detail IS NOT NULL
+                """,
+                uuid.UUID(session_id),
+            )
+        return [r["k"] for r in rows]
+
+    async def iter_logs_for_csv(
+        self, session_id: str, chunk: int = 2000
+    ) -> AsyncIterator[list[LogCsvRow]]:
+        """セッションの全ログを時刻昇順に chunk 行ずつ返す（数万行でもメモリに全部は持たない）。"""
+        from src.infra.drive_csv import decode_detail  # noqa: PLC0415
+
+        async with self._pool.acquire() as conn, conn.transaction():
+            cursor = conn.cursor(
+                """
+                SELECT timestamp, ref_speed_kmh, actual_speed_kmh, accel_opening, brake_opening,
+                       accel_pos, brake_pos, accel_current, brake_current, detail
+                FROM drive_logs WHERE session_id = $1 ORDER BY timestamp ASC, id ASC
+                """,
+                uuid.UUID(session_id),
+                prefetch=chunk,
+            )
+            batch: list[LogCsvRow] = []
+            async for r in cursor:
+                batch.append(
+                    LogCsvRow(
+                        r["timestamp"], r["ref_speed_kmh"], r["actual_speed_kmh"],
+                        r["accel_opening"], r["brake_opening"], r["accel_pos"], r["brake_pos"],
+                        r["accel_current"], r["brake_current"], decode_detail(r["detail"]),
+                    )
+                )
+                if len(batch) >= chunk:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
+
     async def latest_learning_session_id(self, profile_id: str) -> str | None:
         """プロファイルの最新（開始日時が最も新しい）学習走行セッション ID を返す。
 
@@ -59,7 +150,10 @@ class SessionRepository:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT * FROM drive_logs
+                SELECT id,
+                       session_id,
+                       timestamp,
+                       ref_speed_kmh, actual_speed_kmh, accel_opening, brake_opening, accel_pos, brake_pos, accel_current, brake_current, plan_effort_pct, trim_effort_pct, applied_effort_pct, phase FROM drive_logs
                 WHERE session_id = $1
                 ORDER BY timestamp ASC
                 LIMIT $2
@@ -90,7 +184,7 @@ class SessionRepository:
             if session_ids:
                 rows = await conn.fetch(
                     """
-                    SELECT l.* FROM drive_logs l
+                    SELECT l.id, l.session_id, l.timestamp, l.ref_speed_kmh, l.actual_speed_kmh, l.accel_opening, l.brake_opening, l.accel_pos, l.brake_pos, l.accel_current, l.brake_current, l.plan_effort_pct, l.trim_effort_pct, l.applied_effort_pct, l.phase FROM drive_logs l
                     JOIN drive_sessions s ON l.session_id = s.id
                     WHERE s.profile_id = $1 AND l.session_id = ANY($2::uuid[])
                     ORDER BY l.session_id, l.timestamp ASC
@@ -103,7 +197,7 @@ class SessionRepository:
             else:
                 rows = await conn.fetch(
                     """
-                    SELECT l.* FROM drive_logs l
+                    SELECT l.id, l.session_id, l.timestamp, l.ref_speed_kmh, l.actual_speed_kmh, l.accel_opening, l.brake_opening, l.accel_pos, l.brake_pos, l.accel_current, l.brake_current, l.plan_effort_pct, l.trim_effort_pct, l.applied_effort_pct, l.phase FROM drive_logs l
                     JOIN drive_sessions s ON l.session_id = s.id
                     WHERE s.profile_id = $1
                     ORDER BY l.session_id, l.timestamp ASC
@@ -164,13 +258,14 @@ class SessionRepository:
 def _row_to_session(row: asyncpg.Record) -> DriveSession:
     return DriveSession(
         id=str(row["id"]),
-        profile_id=str(row["profile_id"]),
+        profile_id=str(row["profile_id"]) if row["profile_id"] is not None else None,
         mode_id=str(row["mode_id"]) if row["mode_id"] is not None else None,
         run_type=row["run_type"],
         started_at=row["started_at"],
         ended_at=row["ended_at"],
         status=row["status"],
         cycle_id=str(row["cycle_id"]) if row["cycle_id"] is not None else None,
+        vehicle_id=row.get("vehicle_id"),
     )
 
 

@@ -409,12 +409,15 @@ function ModesScreen() {
                         style: { cursor: 'pointer', fontSize: 16, userSelect: 'none' },
                       }, '✗'),
                     )
-                  : React.createElement('div', { key: 'n', style: { display: 'flex', alignItems: 'center', gap: 6 } },
-                      React.createElement('b', null, m.name),
+                  : React.createElement('div', { key: 'n', style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, overflow: 'hidden', paddingRight: 12 } },
+                      React.createElement('b', {
+                        title: m.name,
+                        style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                      }, m.name),
                       React.createElement('span', {
                         onClick: () => startEditName(m),
                         title: '名前を変更',
-                        style: { cursor: 'pointer', opacity: 0.5, fontSize: 13, userSelect: 'none' },
+                        style: { cursor: 'pointer', opacity: 0.5, fontSize: 13, userSelect: 'none', flexShrink: 0 },
                       }, '✎'),
                     ),
                   MODE_LIST_COLS[0]],
