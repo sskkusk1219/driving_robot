@@ -402,6 +402,10 @@ function DriveMonitorScreen({
 
   const profileSpeedMax = refProfile.reduce((m, p) => Math.max(m, p.speed_kmh), 0);
   const maxSpeed = Math.max(100, Math.ceil(Math.max(profileSpeedMax, profileMaxSpeed ?? 0) / 20) * 20);
+  // 枠3の図の縦の上限。走行モードの画面と同じ式を、図に描くモード（figProfile）の基準で計算する
+  //   （シーケンスは refProfile が空なので maxSpeed を使うと 100 固定になり、走行モードと形が変わる）
+  const figSpeedMax = figProfile.reduce((m, p) => Math.max(m, p.speed_kmh), 0);
+  const figMaxSpeed = Math.max(100, Math.ceil(Math.max(figSpeedMax, profileMaxSpeed ?? 0) / 20) * 20);
 
   function getRefSpeedAtTime(elapsedS) {
     if (refProfile.length === 0 || elapsedS < 0) return null;
@@ -433,16 +437,6 @@ function DriveMonitorScreen({
   const toFrac = elapsedS => (elapsedS - windowStartS) / WINDOW_S;
   // WS テレメトリの壁時計 ts を「走行経過秒」へ変換する（nowS・基準・進捗マーカーと同じ軸）
   const toDriveElapsedS = ts => (ts - driveStart) / 1000;
-  // 画面外(frac<0)の古い点は左端への山積みを避けるため除外する
-  const onScreen = (d, key, max, h) => {
-    const elapsedS = toDriveElapsedS(d.ts);
-    // モード終了後に止めている間は、止めた時刻より後の点（右半分）を出さない
-    if (frozenS != null && elapsedS > frozenS) return null;
-    const frac = toFrac(elapsedS);
-    return frac >= 0 && frac <= 1
-      ? { x: toXFull(frac), y: toY(d[key], max, h) }
-      : null;
-  };
 
   // 基準車速: プロファイルから直接サンプリング（モードロード済なら常に表示）
   const speedRef_pts = showRefLine && refProfile.length > 0
@@ -453,25 +447,45 @@ function DriveMonitorScreen({
       })
     : [];
 
+  // 実測の軌跡（車速・開度）。サーバー（ws.py broadcast_loop）は値が変わらない間は WebSocket を送らないので、
+  // 点が来ない間＝値は直前のまま。ボタン押下中（ペダル・車速が一定）などに線が中央の●の手前で途切れないよう、
+  //   ・点の間が空いたら、次の点の直前まで直前の値で横に引く（斜めの線にしない）
+  //   ・最後の点から現在時刻（中央の●）まで、最後の値で横に引く
+  // （2026-11-20 ProblemReport_20261120「軌跡が途切れる」）
+  const HOLD_GAP_S = 0.25;   // WS は 0.1 s 周期。これより空いたら「送られなかった＝値は同じ」とみなす
+  function trace(key, max, h) {
+    if (!isDriving || !driveStart) return [];
+    const pts = [];
+    let prev = null;
+    const push = (t, v) => {
+      if (frozenS != null && t > frozenS) return;   // モード終了後に止めている間は、止めた時刻より後を出さない
+      const frac = toFrac(t);
+      if (frac >= 0 && frac <= 1) pts.push({ x: toXFull(frac), y: toY(v, max, h) });
+    };
+    for (const d of recent) {
+      const t = toDriveElapsedS(d.ts);
+      if (prev && t - prev.t > HOLD_GAP_S) push(t - 0.1, prev.v);
+      push(t, d[key]);
+      prev = { t, v: d[key] };
+    }
+    const tEnd = frozenS != null ? Math.min(nowS, frozenS) : nowS;
+    if (prev && tEnd > prev.t) push(tEnd, prev.v);
+    return pts;
+  }
+
   // 実車速: 同一時間軸に位置合わせ（走行中のみ）。最新点は中央(frac=0.5)に張り付く
-  const speedAct_pts = isDriving && driveStart
-    ? recent.map(d => onScreen(d, 'actual_speed_kmh', maxSpeed, PH1)).filter(Boolean)
-    : [];
+  const speedAct_pts = trace('actual_speed_kmh', maxSpeed, PH1);
 
   // Axis 2: openings — axis 1 と共通の時間軸
-  const accelPts = isDriving && driveStart
-    ? recent.map(d => onScreen(d, 'accel_opening', 100, PH2)).filter(Boolean)
-    : [];
-  const brakePts = isDriving && driveStart
-    ? recent.map(d => onScreen(d, 'brake_opening', 100, PH2)).filter(Boolean)
-    : [];
+  const accelPts = trace('accel_opening', 100, PH2);
+  const brakePts = trace('brake_opening', 100, PH2);
 
   // T4: マーカーと進捗は走行中のみ
   // Axis 3: PAD_T=8, PAD_B=8 → speed=0 が baseline(y=PH3-8=52)に一致
   const G3_PAD_T = 8, G3_PAD_B = 8;
   const profilePts = figProfile.map(p => ({
     x: toXFull(figTotalS > 0 ? p.time_s / figTotalS : 0),
-    y: toY(p.speed_kmh, maxSpeed, PH3, G3_PAD_T, G3_PAD_B),
+    y: toY(p.speed_kmh, figMaxSpeed, PH3, G3_PAD_T, G3_PAD_B),
   }));
   const progressFrac = isDriving && figTotalS > 0 ? Math.min(1, nowS / figTotalS) : 0;
   const markerX = toXFull(progressFrac);
@@ -655,10 +669,13 @@ function DriveMonitorScreen({
         </div>
       </Box>
 
-      {/* 枠3: 進捗（高さ 0.5）— モード: 全体進捗の図。学習・スケジュール・シーケンス: 段階表示・結果（resultPanel） */}
+      {/* 枠3: 進捗（高さ 0.5）— モード（シーケンスのモードの段も）: 全体進捗の図。図が無いとき: 段階表示・結果（resultPanel）
+          【固定ルール】図は「走行モード」の画面と同じに描く（幅いっぱい・縦は figMaxSpeed・横に何も並べない）。
+          図を出している間は resultPanel を並べない。シーケンスの進み具合は枠3ではなく画面上の見出し行に出す（AutoDriveScreen）。
+          シーケンスで図の幅が縮む・形が変わる不具合を 3 回直している（2026-11-20）。変えるときは CLAUDE.md の「フロントエンド」節を読むこと */}
       <Box style={{ padding: '4px 10px', flex: '0.5 1 0', minHeight: 0, minWidth: 0, display: 'flex', gap: 12 }}>
-        {figProfile.length > 0 && (
-          <div style={{ flex: resultPanel ? '1 1 55%' : '1 1 100%', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+        {figProfile.length > 0 ? (
+          <div style={{ flex: '1 1 100%', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ flex: 1, minHeight: 0 }}>
               <svg viewBox={`0 0 ${VW} ${PH3}`} width="100%" height="100%" preserveAspectRatio="none" style={{ display: 'block' }}>
                 <line x1={PL} y1={PH3 - G3_PAD_B} x2={PL + PW} y2={PH3 - G3_PAD_B} stroke={HATCH} strokeWidth="0.8" />
@@ -672,13 +689,11 @@ function DriveMonitorScreen({
               </svg>
             </div>
           </div>
-        )}
-        {resultPanel && (
-          <div style={{ flex: figProfile.length > 0 ? '1 1 45%' : '1 1 100%', minWidth: 0, minHeight: 0, overflowY: 'auto', fontSize: 13 }}>
+        ) : resultPanel ? (
+          <div style={{ flex: '1 1 100%', minWidth: 0, minHeight: 0, overflowY: 'auto', fontSize: 13 }}>
             {resultPanel}
           </div>
-        )}
-        {figProfile.length === 0 && !resultPanel && <div style={{ flex: 1 }} />}
+        ) : <div style={{ flex: 1 }} />}
       </Box>
 
       {/* 枠4: 情報1行（高さ 0.5）— 左: 実車速・開度 | 中: 状態の 1 行 | 右: ボタン */}
@@ -793,16 +808,17 @@ const SEQ_TINT = {
 };
 
 // シーケンスの進み具合（「何段目/全体・何回目」）。seq は job_manager.SequenceRun.to_dict
-function SequenceProgress({ seq }) {
+function SequenceProgress({ seq, inline = false }) {
   const { INK, INK_SOFT } = window;
   const kind = seq.kind === 'schedule' ? 'スケジュール' : '走行モード';
+  const Tag = inline ? 'span' : 'div';
   return (
-    <div style={{ fontSize: 12, color: INK_SOFT, lineHeight: 1.5 }}>
+    <Tag style={{ fontSize: 12, color: INK_SOFT, lineHeight: 1.5 }}>
       <b style={{ color: INK }}>シーケンス「{seq.name}」</b>
       {'　'}全体 <b style={{ color: INK }}>{seq.cycle}/{seq.cycles}</b> 周目
       {'　'}<b style={{ color: INK }}>{seq.step_no}/{seq.steps_total}</b> 段目（{kind}「{seq.ref_name}」{seq.step_repeat}/{seq.step_repeats} 回目）
       {'　'}通算 <b style={{ color: INK }}>{seq.run_no}/{seq.runs_total}</b> 回
-    </div>
+    </Tag>
   );
 }
 
@@ -898,17 +914,20 @@ function AutoDriveScreen() {
   const ownKinds = jobKinds;
   const showResult = !isSequence && !liveJob && lastJob && ownKinds.includes(lastJob.kind) && lastJob.job_id !== dismissedJobId && (lastJob.exit_code != null || lastJob.result);
   const showSeqResult = isSequence && !liveSeq && lastSeq && lastSeq.state !== 'running' && lastSeq.started_at !== dismissedSeq;
-  const summary = isSequence && liveSeq && liveSeq.state === 'running' ? (
-      <div>
-        <SequenceProgress seq={liveSeq} />
-        {liveJob && (
-          <div style={{ fontSize: 12, color: INK_SOFT }}>
-            {window.PHASE_LABEL?.[liveJob.phase] ?? liveJob.phase}
-            {liveJob.step_title && liveJob.phase === 'step' ? `　（${liveJob.step_title}）` : ''}
-          </div>
-        )}
-      </div>
-    ) : showSeqResult ? (
+  // 走っているシーケンスの進み具合は、枠3（全体進捗の図）に並べず上の見出し行に出す（枠3は走行モードと同じ図にする）
+  const seqRunning = isSequence && liveSeq && liveSeq.state === 'running';
+  const seqHeader = seqRunning ? (
+    <div style={{ flex: '0 1 auto', minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
+      <SequenceProgress seq={liveSeq} inline />
+      {liveJob && (
+        <span style={{ fontSize: 12, color: INK_SOFT }}>
+          {'　'}{window.PHASE_LABEL?.[liveJob.phase] ?? liveJob.phase}
+          {liveJob.step_title && liveJob.phase === 'step' ? `　（${liveJob.step_title}）` : ''}
+        </span>
+      )}
+    </div>
+  ) : null;
+  const summary = showSeqResult ? (
       <SequenceResultBanner seq={lastSeq} onDismiss={() => setDismissedSeq(lastSeq.started_at)} onLogs={() => setNav('logs')} />
     ) : null;   // 走り終わった結果の帯は 3 段目に出さない（結果はログページで見る。ユーザー決定 2026-11-16）
 
@@ -917,8 +936,9 @@ function AutoDriveScreen() {
   return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontSize: 13, color: INK_SOFT, flexShrink: 0 }}>
-        <span>車: <b style={{ color: INK }}>{profile?.name ?? '—'}</b></span>
-        <span>{kindLabel}: <b style={{ color: INK }}>{activeModeName ?? '—'}</b></span>
+        <span style={{ flexShrink: 0 }}>車: <b style={{ color: INK }}>{profile?.name ?? '—'}</b></span>
+        <span style={{ flexShrink: 0 }}>{kindLabel}: <b style={{ color: INK }}>{activeModeName ?? '—'}</b></span>
+        {seqHeader}
         {devLimitS && !isSchedule && (
           <span style={{ color: '#f0c84a', border: '1px dashed #b89030', borderRadius: 4, padding: '1px 8px' }}>
             開発用: 先頭 {devLimitS} 秒で打ち切り

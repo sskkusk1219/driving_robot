@@ -26,6 +26,11 @@ NN 推論）は Web サーバーとは別プロセスのランナーで動く。
   種類 drive（モード走行）は取り込み後に消す。種類 learning（vehicles/<車ID>/data/。手順 13・14 が後で読み直す学習データ）は
   残す。DB が無い環境では取り込まず、CSV は消さない
 
+- エラーのできごと（エラーページ。RPD_Phase_20261120_ErrorLog）: ジョブの終わり（_settle）・非常停止（_enter_emergency）・
+  待機中の警告/エラーの行（_say_idle）・計画の準備の失敗・シーケンスの停止を、``ErrorRecorder``（src/app/error_recorder.py）へ
+  渡して ``error_events`` テーブルへ残す。渡すだけで待たない・失敗しても制御に影響しない。ジョブの警告/エラーの行は
+  ジョブの件の本文にまとめるので、ここのログ行には ``extra=RECORDED`` を付け、サーバーログのハンドラが二重に記録しない
+
 ここは subprocess と asyncio だけを使い、DB は ``DriveRecorder``（src/infra/drive_recorder.py）越し。
 """
 
@@ -42,6 +47,7 @@ import shutil
 import signal
 import sys
 import time
+import traceback
 import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -50,8 +56,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from src.app.error_recorder import ErrorRecorder, NullErrorRecorder
 from src.infra.button_events import LEVEL_BUTTON, button_message
 from src.infra.drive_recorder import DriveRecorder, MessageRow, NullDriveRecorder
+from src.infra.error_log_handler import RECORDED
+from src.models.error_event import (
+    CONTEXT_MESSAGES_MAX,
+    LEVEL_ERROR,
+    LEVEL_WARNING,
+    SOURCE_EMERGENCY,
+    SOURCE_IDLE,
+    SOURCE_JOB,
+    SOURCE_PREPARE,
+    SOURCE_SEQUENCE,
+    NewErrorEvent,
+)
 from src.robot import events
 
 logger = logging.getLogger(__name__)
@@ -144,6 +163,28 @@ SECTION_MODE_DRIVE = "MODE_DRIVE"
 
 #: 画面へ渡すボタン押下イベントの最大数（古いものから捨てる）
 BUTTON_EVENTS_MAX = 100
+
+#: エラーページのジョブの呼び名
+_KIND_LABEL = {
+    KIND_LEARNING: "学習運転",
+    KIND_MODE_DRIVE: "自動運転（モード走行）",
+    KIND_INTERACTIVE: "対話ジョブ",
+    KIND_INIT_ONLY: "初期化",
+    KIND_SCHEDULE: "自動運転（スケジュール）",
+    KIND_IGN_OFF: "IGN-OFF",
+}
+_PURPOSE_LABEL = {PURPOSE_MANUAL: "手動運転", PURPOSE_CALIB: "キャリブレーション"}
+
+#: 非常停止のきっかけの呼び名
+_CAUSE_LABEL = {
+    "screen": "画面の非常停止ボタン",
+    "switch": "非常停止スイッチ",
+    "ac_loss": "AC 電源断",
+    "auto": "自動（ランナーが検出）",
+}
+
+#: ジョブの件の本文に並べる警告・エラーの行の最大数
+_ISSUE_LINES_MAX = 30
 
 #: 対話ジョブが正常に閉じられたときの終了コード（0 または SIGINT/SIGTERM での中断）
 _INTERACTIVE_OK_CODES = (0, 130, 143)
@@ -611,6 +652,9 @@ class _Job:
     cmd_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     flusher: asyncio.Task[None] | None = None
+    # エラーページ用: 直前の進行メッセージ（最大 50 行）と、警告・エラーの行（水準, 文）
+    tail: deque[dict[str, str]] = field(default_factory=lambda: deque(maxlen=CONTEXT_MESSAGES_MAX))
+    issues: list[tuple[str, str]] = field(default_factory=list)
     result_event: asyncio.Event = field(default_factory=asyncio.Event)  # result が来た（ランナーが落ちたときも）
     settled: asyncio.Event = field(default_factory=asyncio.Event)  # result を受けて最終状態が決まった（次のジョブを始めてよい）
     done: asyncio.Event = field(default_factory=asyncio.Event)  # 後始末（DB への記録）まで済んだ
@@ -782,6 +826,7 @@ class JobManager:
         kill_timeout_s: float = KILL_TIMEOUT_S,
         plan_command_factory: Callable[[str, str, Path], Sequence[str]] | None = None,
         idle_log_path: Path | None = None,
+        error_recorder: ErrorRecorder | NullErrorRecorder | None = None,
     ) -> None:
         self.vehicles_dir = Path(vehicles_dir)
         self.common_path = Path(common_path)
@@ -810,6 +855,10 @@ class JobManager:
         self._last_sequence: SequenceRun | None = None
         self._job_counter = 0
         self._recent: deque[str] = deque(maxlen=200)
+        # エラーページ（error_events）への記録。省略時は何もしない
+        self._errors: ErrorRecorder | NullErrorRecorder = error_recorder or NullErrorRecorder()
+        self._tail: deque[dict[str, str]] = deque(maxlen=CONTEXT_MESSAGES_MAX)  # 直前の進行メッセージ（ジョブの内外とも）
+        self._emergency_open = False  # 非常停止の件を記録して、解除するまで書き足す間
         # 常駐ランナーが生きていて、初期化（init_only）が成功し、その後 needs_init・ランナーの終了・非常停止が
         # 無い間 True（D-15c）。サーバー起動時は False
         self._initialized = False
@@ -1200,6 +1249,7 @@ class JobManager:
                 if error is not None:
                     prep.state = PREP_ERROR
                     prep.message = f"モード「{mode_name}」の計画を作れませんでした: {error}"
+                    self._record_prepare_error(prep, prep.message)
                     self._remove_plan_dir(prep.plan_dir)
                     return
                 prep.plan_files[mode_name] = str(out)
@@ -1211,10 +1261,11 @@ class JobManager:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.exception("準備の進行で例外: %s", exc)
+            logger.exception("準備の進行で例外: %s", exc, extra=RECORDED)
             if not prep.cancelled and self._prepare is prep:
                 prep.state = PREP_ERROR
                 prep.message = f"準備の進行で予期しない例外: {type(exc).__name__}: {exc}"
+                self._record_prepare_error(prep, prep.message, traceback.format_exc())
 
     async def _run_plan_process(self, prep: PrepareRun, mode_name: str, out: Path) -> str | None:
         """計画プロセスを 1 本走らせて待つ。成功なら None、失敗なら理由（日本語）。"""
@@ -1272,6 +1323,7 @@ class JobManager:
             if from_waiting:
                 prep.state = PREP_ERROR
                 prep.message = f"始められませんでした: {exc}"
+                self._record_prepare_error(prep, prep.message)
                 return None
             if self._prepare is prep:
                 self._prepare = None
@@ -1439,11 +1491,13 @@ class JobManager:
                 except JobError as exc:
                     seq.state = SEQ_EMERGENCY if self._state == STATE_EMERGENCY else SEQ_ERROR
                     seq.message = f"{self._run_label(seq, seq.runs[seq.index])}を始められません: {exc}"
+                    self._record_sequence_error(seq, seq.message)
                     return
         except Exception as exc:  # noqa: BLE001
-            logger.exception("シーケンスの進行で例外: %s", exc)
+            logger.exception("シーケンスの進行で例外: %s", exc, extra=RECORDED)
             seq.state = SEQ_ERROR
             seq.message = f"シーケンスの進行で予期しない例外: {type(exc).__name__}: {exc}"
+            self._record_sequence_error(seq, seq.message, traceback.format_exc())
         finally:
             seq.ended_at = datetime.now(tz=UTC)
             if seq.state == SEQ_RUNNING:
@@ -1534,15 +1588,181 @@ class JobManager:
             return job
         return None
 
-    def _say_idle(self, text: str, level: str | None = None) -> None:
-        """ジョブが無い間のランナーの行（待機中の表示・見張り）。画面のサーバーログと直近の行にだけ出す。"""
+    def _say_idle(self, text: str, level: str | None = None, *, record: bool = True) -> None:
+        """ジョブが無い間のランナーの行（待機中の表示・見張り）。画面のサーバーログと直近の行に出し、
+        警告・エラーの行はエラーページへも残す（``record=False`` は別の件がもう伝えているとき）。"""
         text = text.rstrip("\r\n")
         if not text:
             return
         level = level or message_level(text)
         self._recent.append(text)
-        logger.log({"ERROR": logging.ERROR, "WARNING": logging.WARNING}.get(level, logging.INFO), "%s", text)
+        self._tail.append(self._tail_row(level, text))
+        logger.log(
+            {"ERROR": logging.ERROR, "WARNING": logging.WARNING}.get(level, logging.INFO), "%s", text,
+            extra=RECORDED,
+        )
         self._append_idle_log(level, text)
+        if record and level in ("ERROR", "WARNING"):
+            self._record_idle(level, text)
+        elif self._emergency_open and "終了処理" in text:
+            # 非常停止の後の終了処理（原点復帰 → サーボOFF → 切断・完了）の行は、非常停止の件へ書き足す
+            try:
+                self._errors.append_emergency(text)
+            except Exception as exc:  # noqa: BLE001 - 記録の失敗で制御を止めない
+                logger.debug("エラーの記録に失敗: %s", exc)
+
+    # ── エラーページへの記録（待たない・失敗しても制御に影響しない） ───────────
+
+    @staticmethod
+    def _tail_row(level: str, text: str) -> dict[str, str]:
+        return {"time": datetime.now(tz=UTC).isoformat(timespec="milliseconds"), "level": level, "text": text}
+
+    @staticmethod
+    def _title_of(text: str, limit: int = 120) -> str:
+        first = text.strip().splitlines()[0] if text.strip() else ""
+        return first[:limit]
+
+    def _record(self, ev: NewErrorEvent) -> None:
+        try:
+            self._errors.record(ev)
+        except Exception as exc:  # noqa: BLE001 - 記録の失敗で制御を止めない
+            logger.debug("エラーの記録に失敗: %s", exc)
+
+    def _record_idle(self, level: str, text: str) -> None:
+        """待機中（ジョブの外）の警告・エラーの行。非常停止の件が開いている間はその本文へ書き足す。"""
+        try:
+            if self._emergency_open:
+                self._errors.append_emergency(f"[{level}] {text}")
+                return
+            runner = self._runner
+            self._record(NewErrorEvent(
+                level=LEVEL_ERROR if level == "ERROR" else LEVEL_WARNING,
+                source=SOURCE_IDLE,
+                title=self._title_of(text),
+                detail=text,
+                context={"messages": list(self._tail)},
+                vehicle_id=runner.vehicle_id if runner is not None else None,
+                dedupe=True,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("エラーの記録に失敗: %s", exc)
+
+    @staticmethod
+    def _job_label(spec: JobSpec) -> str:
+        if spec.kind == KIND_INTERACTIVE:
+            return _PURPOSE_LABEL.get(spec.purpose or "", "対話ジョブ")
+        return _KIND_LABEL.get(spec.kind, spec.kind)
+
+    def _record_job_end(self, job: _Job, issues: list[tuple[str, str]]) -> None:
+        """ジョブの終わりの 1 件（_settle から）。非常停止のジョブは非常停止の件へ終了処理の結果を書き足す。"""
+        try:
+            st = job.status
+            code = st.exit_code
+            meaning = events.exit_meaning(code) if code is not None else "不明"
+            label = self._job_label(st.spec)
+            lines = [f"[{lv}] {tx}" for lv, tx in issues[:_ISSUE_LINES_MAX]]
+            if len(issues) > _ISSUE_LINES_MAX:
+                lines.append(f"…ほか {len(issues) - _ISSUE_LINES_MAX} 件")
+            if st.emergency and self._emergency_open:
+                text = "\n".join([f"終了処理の結果: {label}は終了コード {code}（{meaning}）で終わりました", *lines])
+                self._errors.append_emergency(
+                    text, context_patch={"job_end": {"exit_code": code, "meaning": meaning, "job_id": st.job_id}}
+                )
+                return
+            stopped_by_user = st.stop_requested and not st.emergency and code in (130, 143)
+            if st.final_status == "completed" or stopped_by_user:
+                if not issues:
+                    return
+                level = LEVEL_WARNING
+                title = (
+                    f"{label}: 利用者が停止（警告・エラーの行 {len(issues)} 件）" if stopped_by_user
+                    else f"{label}: 警告ありで完了（{len(issues)} 件）"
+                )
+                head = f"終了コード {code}（{meaning}）"
+            else:
+                level = LEVEL_ERROR
+                title = f"{label}が異常終了（終了コード {code}: {meaning}）"
+                head = f"終了コード {code}（{meaning}）"
+            parts = [head]
+            result_error = (st.result or {}).get("error")
+            if result_error:
+                parts.append(f"理由: {result_error}")
+            seq = st.sequence
+            seq_name: str | None = None
+            if seq is not None:
+                seq_name = seq.name
+                parts.append(f"シーケンス: 「{seq.name}」{self._run_label(seq, seq.runs[seq.index])}")
+            if lines:
+                parts.append(f"警告・エラーの行（{len(issues)} 件）:")
+                parts.extend(lines)
+            ctx: dict[str, Any] = {"messages": list(job.tail), "exit_code": code}
+            if seq is not None:
+                ctx["sequence_step"] = {
+                    "run_no": seq.index + 1, "runs_total": len(seq.runs), "step_no": seq.runs[seq.index].step_no,
+                }
+            self._record(NewErrorEvent(
+                level=level, source=SOURCE_JOB, title=title, detail="\n".join(parts), context=ctx,
+                job_id=st.job_id, job_kind=st.spec.kind, vehicle_id=st.spec.vehicle_id,
+                session_id=st.session_id, sequence_name=seq_name,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("エラーの記録に失敗: %s", exc)
+
+    def _record_emergency(self, cause: str, detail: str | None) -> None:
+        """非常停止に入った（_enter_emergency）。1 件にして、ジョブの終わりに終了処理の結果を書き足す。"""
+        try:
+            label = _CAUSE_LABEL.get(cause, cause)
+            parts = [f"きっかけ: {label}"]
+            if detail:
+                parts.append(f"理由: {detail}")
+            job = self._job
+            job_id = job_kind = session_id = seq_name = None
+            vehicle_id = None
+            if job is not None:
+                st = job.status
+                job_id, job_kind, session_id, vehicle_id = st.job_id, st.spec.kind, st.session_id, st.spec.vehicle_id
+                parts.append(f"そのとき: {self._job_label(st.spec)}を実行中")
+            elif self._runner is not None:
+                vehicle_id = self._runner.vehicle_id
+                parts.append("そのとき: 待機中")
+            seq = self._sequence
+            if seq is not None:
+                seq_name = seq.name
+                parts.append(f"シーケンス: 「{seq.name}」{self._run_label(seq, seq.runs[seq.index])}")
+            self._emergency_open = True
+            self._record(NewErrorEvent(
+                level=LEVEL_ERROR, source=SOURCE_EMERGENCY, title=f"非常停止（{label}）",
+                detail="\n".join(parts), context={"messages": list(self._tail), "cause": cause},
+                job_id=job_id, job_kind=job_kind, vehicle_id=vehicle_id, session_id=session_id,
+                sequence_name=seq_name,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("エラーの記録に失敗: %s", exc)
+
+    def _record_prepare_error(self, prep: PrepareRun, message: str, detail: str | None = None) -> None:
+        try:
+            seq_name = prep.name if prep.kind == "sequence" else None
+            kind = {"mode": "モード", "schedule": "スケジュール", "sequence": "シーケンス"}.get(prep.kind, prep.kind)
+            self._record(NewErrorEvent(
+                level=LEVEL_ERROR, source=SOURCE_PREPARE,
+                title=f"計画の準備に失敗（{kind}「{prep.name}」）",
+                detail=message if not detail else f"{message}\n{detail}",
+                context={"messages": list(self._tail), "prepare_id": prep.prepare_id},
+                vehicle_id=prep.vehicle_id, sequence_name=seq_name,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("エラーの記録に失敗: %s", exc)
+
+    def _record_sequence_error(self, seq: SequenceRun, message: str, detail: str | None = None) -> None:
+        """ジョブ以外の理由でシーケンスが止まった（段を始められない等）。段のジョブの失敗はジョブの件に付く。"""
+        try:
+            self._record(NewErrorEvent(
+                level=LEVEL_ERROR, source=SOURCE_SEQUENCE, title=f"シーケンス「{seq.name}」が止まりました",
+                detail=message if not detail else f"{message}\n{detail}",
+                context={"messages": list(self._tail)}, vehicle_id=seq.vehicle_id, sequence_name=seq.name,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("エラーの記録に失敗: %s", exc)
 
     def _append_idle_log(self, level: str, text: str) -> None:
         """ジョブの外の行を ``idle_log_path`` へ 1 行ずつ追記する（時刻は JST のローカル時刻）。書けなくても止めない。"""
@@ -1578,6 +1798,7 @@ class JobManager:
         job = self._current_job_of(runner)
         if job is None:
             if kind == "state" and event.get("phase") == "emergency":
+                # 非常停止の件が開いていれば、その本文へ書き足される
                 self._say_idle(f"停止の流れ: {event.get('stage')} {event.get('detail') or ''}".rstrip(), "WARNING")
             return
         job_id = event.get("job_id")
@@ -1597,7 +1818,8 @@ class JobManager:
         if level == "error":
             runner.watch_error = detail or "待機中の見張りの異常"
             runner.exiting = True
-            self._say_idle(f"待機中の見張りが異常を検出しました: {detail}", "ERROR")
+            # 非常停止の件（きっかけ auto＋理由）が伝えるので、この行は別の件にしない
+            self._say_idle(f"待機中の見張りが異常を検出しました: {detail}", "ERROR", record=False)
             self._enter_emergency("auto", detail=detail)
         else:
             self._say_idle(f"待機中の見張り（警告）: {detail}", "WARNING")
@@ -1650,6 +1872,9 @@ class JobManager:
             self._enter_emergency("auto", detail=runner.watch_error)
         elif job is None and not runner.exiting:
             self._say_idle(f"常駐ランナーが終了しました（終了コード {code}）。初期化し直してください", "WARNING")
+        if self._emergency_open and runner.exiting:
+            # 非常停止の流れの終わり（ランナーの終了）。件の本文へ書き足す
+            self._errors.append_emergency(f"常駐ランナーが終了しました（終了コード {code}）")
 
     def _say(self, job: _Job, text: str, level: str | None = None) -> None:
         """進行のメッセージを 1 行足す（ログバッファ・DB 用の溜め・直近の行）。"""
@@ -1659,9 +1884,14 @@ class JobManager:
         level = level or message_level(text)
         job.seq += 1
         self._recent.append(text)
+        row = self._tail_row(level, text)
+        job.tail.append(row)
+        self._tail.append(row)
+        if level in ("ERROR", "WARNING"):
+            job.issues.append((level, text))  # ジョブの終わりの 1 件の本文にまとめる（行ごとには記録しない）
         logger.log(
             {"ERROR": logging.ERROR, "WARNING": logging.WARNING}.get(level, logging.INFO),
-            "%s", text,
+            "%s", text, extra=RECORDED,
         )
         job.pending_messages.append(
             (job.seq, round(time.monotonic() - job.status.t0, 3), datetime.now(tz=UTC), level, text)
@@ -1711,10 +1941,10 @@ class JobManager:
             # SIGINT は送らず、画面・スイッチの非常停止と同じ状態（EMERGENCY・解除待ち）にだけ揃える。
             # 「走行終了」（stop コマンド）で出る停止の流れ（stop_requested）は非常停止の状態に入れない
             # （段階の表示 phase=emergency は apply_event が残す）
-            self._enter_emergency("auto")
+            detail = str(event.get("detail") or "")
+            self._enter_emergency("auto", detail=detail or None)
             job.status.emergency = True
             job.status.stop_requested = True
-            detail = str(event.get("detail") or "")
             self._emergency_cause_detail = detail or None
             self._say(
                 job,
@@ -1760,12 +1990,14 @@ class JobManager:
         meaning = events.exit_meaning(code) if code is not None else "不明"
         interactive = status.spec.kind == KIND_INTERACTIVE
         status.final_status = exit_to_status(code, emergency=status.emergency, interactive=interactive)
+        issues = list(job.issues)  # 終了の行（下の _say）は含めない
         self._say(
             job,
             f"ジョブ終了: 終了コード {code}（{meaning}）"
             + ("、非常停止で止めました" if status.emergency else ""),
             "INFO" if status.final_status == "completed" else "WARNING",
         )
+        self._record_job_end(job, issues)
         if job.flusher is not None:
             job.flusher.cancel()
         for pending in job.pending.values():
@@ -1815,7 +2047,7 @@ class JobManager:
 
     @staticmethod
     def _say_global(text: str) -> None:
-        logger.warning("%s", text)
+        logger.warning("%s", text, extra=RECORDED)  # 案内なので、エラーページの件にはしない
 
     async def _safe_end_session(self, session_id: str, status: str) -> None:
         try:
@@ -1965,6 +2197,7 @@ class JobManager:
         if self._state != STATE_EMERGENCY:
             self._emergency_cause = cause  # 最初のきっかけを残す（二重に来ても上書きしない）
             self._emergency_cause_detail = detail or None
+            self._record_emergency(cause, detail)  # エラーページの 1 件（ジョブの終わりに終了処理の結果を書き足す）
         self._state = STATE_EMERGENCY
 
     async def emergency(self, cause: str = "screen") -> None:
@@ -1977,9 +2210,9 @@ class JobManager:
         await self.cancel_prepare()  # 準備中なら計画を捨てる
         if job is None:
             if runner is None:
-                logger.warning("非常停止（ジョブなし）。解除するまで次のジョブを受け付けません")
+                logger.warning("非常停止（ジョブなし）。解除するまで次のジョブを受け付けません", extra=RECORDED)
                 return
-            logger.warning("非常停止（待機中）。常駐ランナーへ SIGINT を送ります（終了処理 → 終了）")
+            logger.warning("非常停止（待機中）。常駐ランナーへ SIGINT を送ります（終了処理 → 終了）", extra=RECORDED)
             runner.exiting = True
             with contextlib.suppress(ProcessLookupError):
                 runner.proc.send_signal(signal.SIGINT)
@@ -2007,6 +2240,9 @@ class JobManager:
         self._state = STATE_STANDBY
         self._emergency_cause = None
         self._emergency_cause_detail = None
+        if self._emergency_open:
+            self._emergency_open = False
+            self._errors.append_emergency("非常停止を解除しました", close=True)
         logger.info("非常停止を解除しました")
 
     async def wait_idle(self, timeout: float | None = None) -> None:

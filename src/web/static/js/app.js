@@ -24,8 +24,37 @@ const INIT_REALTIME = {
   init_steps: [],
 };
 
+// ── ブラウザ側のエラーをサーバーのエラーページへ記録する ─────────────────
+// 記録は制御に影響させない: 待たず、失敗してもトーストを出さない（出すとまた記録して無限ループになる）
+function reportClientError(message, kind, stack) {
+  try {
+    const text = String(message ?? '').slice(0, 4000);
+    if (!text || text.startsWith('ResizeObserver loop')) return;
+    fetch('/api/v1/errors/client', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: text,
+        kind,
+        stack: stack ? String(stack).slice(0, 8000) : null,
+        url: String(location.href).slice(0, 500),
+      }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (e) { /* 記録できなくても何もしない */ }
+}
+window.addEventListener('error', ev => {
+  const where = ev.filename ? ` (${ev.filename}:${ev.lineno})` : '';
+  reportClientError(`${ev.message || '画面のエラー'}${where}`, 'onerror', ev.error && ev.error.stack);
+});
+window.addEventListener('unhandledrejection', ev => {
+  const r = ev.reason;
+  reportClientError(`未処理の Promise の失敗: ${r && r.message ? r.message : String(r)}`, 'unhandledrejection', r && r.stack);
+});
+
 // ── Toast system ──────────────────────────────────────────
 function showToast(msg, type = 'info') {
+  if (type === 'error') reportClientError(msg, 'toast');
   const container = document.getElementById('toast-container');
   const el = document.createElement('div');
   el.className = `toast${type === 'error' ? ' error' : type === 'success' ? ' success' : ''}`;
@@ -258,6 +287,7 @@ function App() {
       case 'schedule':    return React.createElement(window.ScheduleScreen);
       case 'sequence':    return React.createElement(window.SequenceScreen);
       case 'logs':        return React.createElement(window.LogsScreen);
+      case 'errors':      return React.createElement(window.ErrorsScreen);
       default:            return React.createElement(window.InitScreen);
     }
   }
@@ -312,6 +342,7 @@ const NAV_LABEL = {
   auto: '自動運転',
   manual: '手動運転',
   logs: 'ログ',
+  errors: 'エラー',
 };
 
 window.AppContext = AppContext;

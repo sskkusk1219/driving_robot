@@ -51,7 +51,15 @@ function LogsScreen() {
   const [sessions, setSessions] = useState([]);
   const [cycles, setCycles] = useState([]);
   const [modeNames, setModeNames] = useState({});
-  const [selected, setSelected] = useState(null);   // { kind: 'session' | 'cycle', id }
+  // エラーページの「このセッションのログを開く」が localStorage に置いた session_id を、最初の選択にする
+  const openSessionId = React.useRef(null);
+  const [selected, setSelected] = useState(() => {   // { kind: 'session' | 'cycle', id }
+    try {
+      const id = localStorage.getItem('drv_logs_open_session');
+      if (id) { localStorage.removeItem('drv_logs_open_session'); openSessionId.current = id; return { kind: 'session', id }; }
+    } catch (e) { /* 読めなければ未選択 */ }
+    return null;
+  });
   const [expandedCycleId, setExpandedCycleId] = useState(null);
 
   useEffect(() => { loadSessions(); }, []);
@@ -62,7 +70,12 @@ function LogsScreen() {
       apiFetch('GET', '/api/v1/sessions/cycles'),
       apiFetch('GET', '/api/v1/modes/'),
     ]);
-    if (sessData) setSessions(sessData);
+    if (sessData) {
+      setSessions(sessData);
+      // 開く対象が学習サイクルの配下なら、そのサイクルを開いておく
+      const target = openSessionId.current ? sessData.find(x => x.id === openSessionId.current) : null;
+      if (target && target.cycle_id) setExpandedCycleId(target.cycle_id);
+    }
     if (cycleData) setCycles(cycleData);
     if (Array.isArray(modeData)) {
       const m = {};

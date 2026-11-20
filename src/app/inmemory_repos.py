@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """DB が無い環境（DATABASE_URL 未設定）用の in-memory リポジトリと UPS スタブ。
 
 段3（RPD_Phase_20261115_PortResearch）で、Web が古い制御（src/app/stubs.py・robot_controller）を
@@ -7,7 +8,10 @@ import しなくて済むよう、そこから必要な部分だけを写した�
 
 from __future__ import annotations
 
+import copy
 from collections.abc import AsyncIterator
+from dataclasses import replace
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -16,6 +20,7 @@ from src.infra.mode_repository import RESERVED_SYSTEM_MODE_NAME
 from src.infra.ups_monitor import UPSStatus
 from src.models.drive_log import DriveLog, DriveSession, LearningCycle
 from src.models.driving_mode import DrivingMode
+from src.models.error_event import ErrorEvent, NewErrorEvent
 from src.models.sequence import Sequence
 from src.models.time_schedule import TimeSchedule
 
@@ -263,3 +268,88 @@ class InMemorySessionRepository:
         limit: int = 100,  # noqa: ARG002
     ) -> list[LearningCycle]:
         return []
+
+
+class InMemoryErrorRepository:
+    """DB なし環境用の in-memory エラーのできごと（揮発。サーバーを止めると消える）。ErrorRepository と同じ形。"""
+
+    def __init__(self) -> None:
+        self._events: dict[int, ErrorEvent] = {}
+        self._next_id = 1
+
+    async def ensure_schema(self) -> None:
+        return None
+
+    async def insert(self, ev: NewErrorEvent, *, at: datetime) -> int:
+        event_id = self._next_id
+        self._next_id += 1
+        self._events[event_id] = ErrorEvent(
+            id=event_id, first_at=at, last_at=at, count=1, level=ev.level, source=ev.source,
+            title=ev.title, detail=ev.detail, context=copy.deepcopy(ev.context), job_id=ev.job_id,
+            job_kind=ev.job_kind, vehicle_id=ev.vehicle_id, session_id=ev.session_id,
+            sequence_name=ev.sequence_name,
+        )
+        return event_id
+
+    async def bump(self, event_id: int, *, at: datetime) -> bool:
+        cur = self._events.get(event_id)
+        if cur is None:
+            return False
+        self._events[event_id] = replace(cur, count=cur.count + 1, last_at=at, acknowledged_at=None)
+        return True
+
+    async def append_detail(
+        self, event_id: int, text: str, *, at: datetime, context_patch: dict[str, Any] | None = None
+    ) -> bool:
+        cur = self._events.get(event_id)
+        if cur is None:
+            return False
+        ctx = {**cur.context, **copy.deepcopy(context_patch or {})}
+        detail = text if not cur.detail else f"{cur.detail}\n{text}"
+        self._events[event_id] = replace(cur, detail=detail, last_at=at, context=ctx)
+        return True
+
+    async def list_events(
+        self,
+        *,
+        level: str | None = None,
+        source: str | None = None,
+        unacknowledged_only: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[ErrorEvent], int]:
+        rows = [
+            e for e in self._events.values()
+            if (level is None or e.level == level)
+            and (source is None or e.source == source)
+            and (not unacknowledged_only or e.acknowledged_at is None)
+        ]
+        rows.sort(key=lambda e: (e.last_at, e.id), reverse=True)
+        return rows[offset : offset + limit], len(rows)
+
+    async def get(self, event_id: int) -> ErrorEvent | None:
+        return self._events.get(event_id)
+
+    async def set_acknowledged(self, event_id: int, acknowledged: bool, *, at: datetime) -> bool:
+        cur = self._events.get(event_id)
+        if cur is None:
+            return False
+        self._events[event_id] = replace(cur, acknowledged_at=at if acknowledged else None)
+        return True
+
+    async def acknowledge_all(self, *, at: datetime) -> int:
+        n = 0
+        for event_id, e in list(self._events.items()):
+            if e.acknowledged_at is None:
+                self._events[event_id] = replace(e, acknowledged_at=at)
+                n += 1
+        return n
+
+    async def delete(self, event_id: int) -> bool:
+        return self._events.pop(event_id, None) is not None
+
+    async def delete_acknowledged(self) -> int:
+        ids = [i for i, e in self._events.items() if e.acknowledged_at is not None]
+        for i in ids:
+            del self._events[i]
+        return len(ids)
