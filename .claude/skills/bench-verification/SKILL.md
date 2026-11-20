@@ -44,6 +44,10 @@ FastAPI アプリ（WebUI）を安全に起動して動作確認するスキル�
   **本番 DB を汚したくないテストでは DATABASE_URL を付けずに起動する**のが安全。
   走行（モード走行・スケジュール）が DB に残ることまで確かめたいときは、**本番 DB の複製**を作る:
   `createdb -T driving_robot driving_robot_check`（確認後に `dropdb driving_robot_check`）。
+- **エラーは `error_events` へ**（エラーページ。RPD_Phase_20261120_ErrorLog）: ジョブの終わり・非常停止・待機中の警告/エラー・計画の準備の失敗・
+  シーケンスの停止・サーバーの WARNING 以上・ブラウザの赤いトーストが、サーバーを止めても残る。DB 未設定（in-memory）の起動では揮発。
+  `DATABASE_URL` を付けて起動すると、起動時に `error_events` を `CREATE TABLE IF NOT EXISTS` で用意する（本番 DB でもテーブルが増えるだけ）。
+  本番 DB を汚したくない検証でエラーページの記録まで見るときは、DB の複製（`driving_robot_check`）を使う。
 - 車両フォルダ: 既定は `vehicles/`。走らせると `vehicle.yaml`・`data/` が書き変わりうるので、検証では
   scratchpad に複製して `DRIVING_ROBOT_VEHICLES_DIR=<複製の親フォルダ>` で指す（終わったら消す）。共通設定は `DRIVING_ROBOT_COMMON_CONFIG`（既定 `config/robot_common.yaml`）。
 

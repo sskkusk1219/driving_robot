@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """PostgreSQL テーブル・インデックスを作成する初期化スクリプト。冪等実行可能（IF NOT EXISTS）。"""
 
 import asyncio
@@ -250,6 +251,30 @@ DDL_STATEMENTS = [
     """
     CREATE INDEX IF NOT EXISTS idx_drive_session_messages_session_seq
         ON drive_session_messages (session_id, seq)
+    """,
+    # エラーページのできごと（RPD_Phase_20261120_ErrorLog）。src/infra/error_repository.py の DDL_STATEMENTS と同じ
+    """
+    CREATE TABLE IF NOT EXISTS error_events (
+        id              BIGSERIAL PRIMARY KEY,
+        first_at        TIMESTAMPTZ NOT NULL,
+        last_at         TIMESTAMPTZ NOT NULL,
+        count           INTEGER NOT NULL DEFAULT 1,
+        level           TEXT NOT NULL,
+        source          TEXT NOT NULL,
+        title           TEXT NOT NULL,
+        detail          TEXT NOT NULL DEFAULT '',
+        context         JSONB NOT NULL DEFAULT '{}'::jsonb,
+        job_id          TEXT,
+        job_kind        TEXT,
+        vehicle_id      TEXT,
+        session_id      TEXT,
+        sequence_name   TEXT,
+        acknowledged_at TIMESTAMPTZ
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_error_events_last_at
+        ON error_events (last_at DESC)
     """,
 ]
 

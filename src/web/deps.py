@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Protocol
 
 from fastapi import Request
@@ -11,6 +12,7 @@ from src.infra.ups_monitor import UPSStatus
 from src.infra.vehicle_store import VehicleStore
 from src.models.drive_log import DriveLog, DriveSession, LearningCycle
 from src.models.driving_mode import DrivingMode
+from src.models.error_event import ErrorEvent
 from src.models.sequence import Sequence
 from src.models.time_schedule import TimeSchedule
 
@@ -63,6 +65,25 @@ class SessionRepoProtocol(Protocol):
     ) -> list[LearningCycle]: ...
 
 
+class ErrorRepoProtocol(Protocol):
+    async def list_events(
+        self,
+        *,
+        level: str | None = None,
+        source: str | None = None,
+        unacknowledged_only: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[ErrorEvent], int]: ...
+    async def get(self, event_id: int) -> ErrorEvent | None: ...
+    async def set_acknowledged(
+        self, event_id: int, acknowledged: bool, *, at: datetime
+    ) -> bool: ...
+    async def acknowledge_all(self, *, at: datetime) -> int: ...
+    async def delete(self, event_id: int) -> bool: ...
+    async def delete_acknowledged(self) -> int: ...
+
+
 class UPSMonitorProtocol(Protocol):
     async def get_status(self) -> UPSStatus: ...
 
@@ -103,3 +124,8 @@ def get_sequence_repo(request: Request) -> SequenceRepoProtocol:
 def get_ups_monitor(request: Request) -> UPSMonitorProtocol:
     monitor: UPSMonitorProtocol = request.app.state.ups_monitor
     return monitor
+
+
+def get_error_repo(request: Request) -> ErrorRepoProtocol:
+    repo: ErrorRepoProtocol = request.app.state.error_repo
+    return repo

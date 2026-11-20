@@ -12,7 +12,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from src.app.error_recorder import ErrorRecorder
 from src.app.inmemory_repos import (
+    InMemoryErrorRepository,
     InMemoryModeRepository,
     InMemoryScheduleRepository,
     InMemorySequenceRepository,
@@ -22,6 +24,7 @@ from src.app.inmemory_repos import (
 from src.app.job_manager import JobError, JobManager, hw_mode_from_env
 from src.infra.db import DuplicateNameError
 from src.infra.drive_recorder import DriveRecorder, NullDriveRecorder
+from src.infra.error_log_handler import ErrorLogHandler
 from src.infra.log_buffer import LogBufferHandler
 from src.infra.vehicle_store import (
     DEFAULT_COMMON,
@@ -32,7 +35,7 @@ from src.infra.vehicle_store import (
     VehicleStore,
     VehicleStoreError,
 )
-from src.web.routers import drive, modes, profiles, schedules, sequences, sessions, ups
+from src.web.routers import drive, errors, modes, profiles, schedules, sequences, sessions, ups
 from src.web.ws import broadcast_loop, realtime_ws
 
 #: ジョブの外でランナーが出す行（待機中の見張り・非常停止の後とアプリ終了の終了処理）を残すファイル
@@ -48,6 +51,7 @@ async def _build_repos(app: FastAPI) -> DriveRecorder:
     if db_url:
         from src.infra.db import create_pool  # noqa: PLC0415
         from src.infra.drive_recorder import PgDriveRecorder  # noqa: PLC0415
+        from src.infra.error_repository import ErrorRepository  # noqa: PLC0415
         from src.infra.mode_repository import ModeRepository  # noqa: PLC0415
         from src.infra.schedule_repository import ScheduleRepository  # noqa: PLC0415
         from src.infra.sequence_repository import SequenceRepository  # noqa: PLC0415
@@ -59,6 +63,12 @@ async def _build_repos(app: FastAPI) -> DriveRecorder:
         app.state.session_repo = SessionRepository(pool)
         app.state.schedule_repo = ScheduleRepository(pool)
         app.state.sequence_repo = SequenceRepository(pool)
+        error_repo = ErrorRepository(pool)
+        try:
+            await error_repo.ensure_schema()  # setup_db.py を流し忘れても書けるようにする
+        except Exception as exc:  # noqa: BLE001 - 記録の都合で起動を止めない
+            logging.getLogger(__name__).warning("error_events テーブルを用意できません: %s", exc)
+        app.state.error_repo = error_repo
 
         # 前回プロセスの異常終了で 'running' のまま残った孤児セッションを是正する。
         from src.infra.log_writer import LogWriter  # noqa: PLC0415
@@ -74,6 +84,7 @@ async def _build_repos(app: FastAPI) -> DriveRecorder:
     app.state.session_repo = InMemorySessionRepository()
     app.state.schedule_repo = InMemoryScheduleRepository()
     app.state.sequence_repo = InMemorySequenceRepository()
+    app.state.error_repo = InMemoryErrorRepository()
     return NullDriveRecorder()
 
 
@@ -87,6 +98,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.log_buffer = log_buffer
 
     recorder = await _build_repos(app)
+
+    # エラーページへの記録（RPD_Phase_20261120_ErrorLog）。書き込みは非同期のキューで、失敗しても制御に影響しない。
+    # JobManager が自分の経路で記録した行は extra の印で飛ばす
+    error_recorder = ErrorRecorder(app.state.error_repo)
+    error_recorder.start()
+    app.state.error_recorder = error_recorder
+    error_handler = ErrorLogHandler(error_recorder.record)
+    uvicorn_error_logger = logging.getLogger("uvicorn.error")
+    src_logger.addHandler(error_handler)
+    uvicorn_error_logger.addHandler(error_handler)
 
     # 車両フォルダ・共通設定の場所（開発・検証で本物の vehicles/ を触らないよう環境変数で差し替えられる）
     vehicles_dir = Path(os.environ.get("DRIVING_ROBOT_VEHICLES_DIR") or DEFAULT_VEHICLES_DIR)
@@ -132,6 +153,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         emergency_probe=gpio_monitor.is_emergency_active if gpio_monitor is not None else None,
         on_min_saved=store.mark_min_measured,
         idle_log_path=Path(os.environ.get("DRIVING_ROBOT_RUNNER_IDLE_LOG") or DEFAULT_RUNNER_IDLE_LOG),
+        error_recorder=error_recorder,
     )
     app.state.job_manager = manager
     app.state.gpio_enabled = gpio_monitor is not None  # 初期化ページの「非常停止(GPIO)」の表示用
@@ -158,6 +180,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if gpio_monitor is not None:
             gpio_monitor.stop_monitoring()
         await ups_monitor.stop_polling()
+        src_logger.removeHandler(error_handler)
+        uvicorn_error_logger.removeHandler(error_handler)
+        await error_recorder.stop()  # 溜まった記録を書き切ってから DB を閉じる
         if app.state.db_pool is not None:
             await app.state.db_pool.close()
         src_logger.removeHandler(log_buffer)
@@ -197,6 +222,7 @@ async def _duplicate_name_error_handler(request: Request, exc: DuplicateNameErro
 
 
 app.include_router(drive.router)
+app.include_router(errors.router)
 app.include_router(profiles.router)
 app.include_router(modes.router)
 app.include_router(schedules.router)
