@@ -97,7 +97,10 @@ function InitScreen() {
     if (r) { setDismissedJobId(null); window.showToast('初期化を開始しました（終わると待機に戻ります）', 'success'); }
   }
 
-  const showResult = !liveJob && lastJob?.kind === 'init_only' && lastJob.job_id !== dismissedJobId;
+  // 成功（「初期化: 完了しました」）の帯は出さない（上の「現在: 初期化済み」と各項目の ✓ で分かる。ユーザー決定 2026-11-20）。
+  // 失敗・非常停止など、理由と次の操作を伝える帯だけ出す
+  const showResult = !liveJob && lastJob?.kind === 'init_only' && lastJob.job_id !== dismissedJobId
+    && window.describeJobResult(lastJob)?.level !== 'ok';
   const statusLine = isInitJob
     ? (liveJob.stop_requested ? '停止を要求しました。終了処理中…' : (window.PHASE_LABEL?.[liveJob.phase] ?? liveJob.phase))
     : null;
