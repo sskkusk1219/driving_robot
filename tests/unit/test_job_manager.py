@@ -30,9 +30,20 @@ class FakeRecorder:
         self.imported: list[tuple[str, str]] = []
         self.fail_import = fail_import
 
-    async def start_session(self, *, vehicle_id: str, mode_id: str | None, run_type: str) -> str | None:
+    async def start_session(
+        self,
+        *,
+        vehicle_id: str,
+        mode_id: str | None,
+        run_type: str,
+        schedule_id: str | None = None,
+        schedule_name: str | None = None,
+    ) -> str | None:
         sid = f"sess{len(self.sessions) + 1}"
-        self.sessions[sid] = {"vehicle_id": vehicle_id, "mode_id": mode_id, "run_type": run_type, "status": "running"}
+        self.sessions[sid] = {
+            "vehicle_id": vehicle_id, "mode_id": mode_id, "run_type": run_type, "status": "running",
+            "schedule_id": schedule_id, "schedule_name": schedule_name,
+        }
         return sid
 
     async def add_messages(self, session_id: str, rows: Sequence[MessageRow]) -> None:
@@ -112,6 +123,17 @@ def test_mode_drive_steps_have_no_init_step() -> None:
     assert jm.MODE_DRIVE_STEPS == "24,25"
 
 
+def test_end_meaning_prefers_runner_result_meaning() -> None:
+    # B-3: stop コマンドの終わり（130）は、ランナーの result の meaning（中断（stop コマンド））を使う
+    from types import SimpleNamespace
+
+    stopped = SimpleNamespace(exit_code=130, result={"meaning": "中断（stop コマンド）。終了処理は済ませた"})
+    assert jm.JobManager._end_meaning(stopped) == "中断（stop コマンド）。終了処理は済ませた"
+    plain = SimpleNamespace(exit_code=130, result=None)
+    assert "SIGINT" in jm.JobManager._end_meaning(plain)
+    assert jm.JobManager._end_meaning(SimpleNamespace(exit_code=None, result=None)) == "不明"
+
+
 def test_learning_steps_have_no_init_step() -> None:
     assert jm.LEARNING_STEPS == {
         "full": "2,25", "fel": "12,25", "hold": "13,25", "stop": "14,25",
@@ -180,14 +202,14 @@ def test_build_serve_command_and_job_command(tmp_path: Path) -> None:
         assert gone not in cmd  # ジョブごとの指定はコマンドで送る
     mode = jm.JobSpec(jm.KIND_MODE_DRIVE, "v1", steps=jm.MODE_DRIVE_STEPS, mode_name="WLTP", limit_s=60.0, plan_file="/p.pkl", no_pre_check=True, home_at_end=False)
     assert jm.job_command(mode, "j1") == {
-        "cmd": "mode", "job_id": "j1", "mode": "WLTP", "plan_in": "/p.pkl", "limit_s": 60.0, "no_pre_check": True, "home_at_end": False,
+        "cmd": "mode", "job_id": "j1", "vehicle": "v1", "mode": "WLTP", "plan_in": "/p.pkl", "limit_s": 60.0, "no_pre_check": True, "home_at_end": False,
     }
     sched = jm.JobSpec(jm.KIND_SCHEDULE, "v1", schedule={"name": "S"})
-    assert jm.job_command(sched, "j2") == {"cmd": "schedule", "job_id": "j2", "schedule": {"name": "S"}, "no_pre_check": False, "home_at_end": True}
-    assert jm.job_command(jm.JobManager.learning_spec("v1", "full"), "j3") == {"cmd": "steps", "job_id": "j3", "steps": "2,25", "home_at_end": True}
+    assert jm.job_command(sched, "j2") == {"cmd": "schedule", "job_id": "j2", "vehicle": "v1", "schedule": {"name": "S"}, "no_pre_check": False, "home_at_end": True}
+    assert jm.job_command(jm.JobManager.learning_spec("v1", "full"), "j3") == {"cmd": "steps", "job_id": "j3", "vehicle": "v1", "steps": "2,25", "home_at_end": True}
     assert jm.job_command(jm.JobManager.ign_off_spec("v1"), "j4")["steps"] == "25"
-    assert jm.job_command(jm.JobManager.interactive_spec("v1", "calib"), "j5") == {"cmd": "interactive", "job_id": "j5", "purpose": "calib"}
-    assert jm.job_command(jm.JobManager.init_only_spec("v1"), "j6") == {"cmd": "init", "job_id": "j6"}
+    assert jm.job_command(jm.JobManager.interactive_spec("v1", "calib"), "j5") == {"cmd": "interactive", "job_id": "j5", "vehicle": "v1", "purpose": "calib"}
+    assert jm.job_command(jm.JobManager.init_only_spec("v1"), "j6") == {"cmd": "init", "job_id": "j6", "vehicle": "v1"}
 
 
 def test_run_type_by_kind() -> None:
@@ -207,6 +229,12 @@ def test_exit_to_status() -> None:
     assert jm.exit_to_status(130, emergency=False, interactive=True) == "completed"
     assert jm.exit_to_status(4, emergency=False, interactive=True) == "error"
     assert jm.exit_to_status(None, emergency=False, interactive=False) == "error"
+    # 利用者の走行終了（stop）で止めたジョブは stopped（130/143 だけ。他のコードは error・非常停止が優先）
+    assert jm.exit_to_status(130, emergency=False, interactive=False, stopped_by_user=True) == "stopped"
+    assert jm.exit_to_status(143, emergency=False, interactive=False, stopped_by_user=True) == "stopped"
+    assert jm.exit_to_status(5, emergency=False, interactive=False, stopped_by_user=True) == "error"
+    assert jm.exit_to_status(130, emergency=True, interactive=False, stopped_by_user=True) == "emergency"
+    assert jm.exit_to_status(130, emergency=False, interactive=True, stopped_by_user=True) == "completed"
 
 
 def _status(kind: str = jm.KIND_MODE_DRIVE, purpose: str | None = None) -> jm.JobStatus:
@@ -326,7 +354,7 @@ async def test_mode_drive_job_completes_and_records(tmp_path: Path, monkeypatch:
     assert mgr.state == jm.STATE_STANDBY and not mgr.is_busy and mgr.initialized
     last = mgr.last_job
     assert last is not None and last.exit_code == 0 and last.final_status == "completed"
-    assert rec.sessions["sess1"] == {"vehicle_id": "v1", "mode_id": "mode-id", "run_type": "auto", "status": "completed"}
+    assert rec.sessions["sess1"] == {"vehicle_id": "v1", "mode_id": "mode-id", "run_type": "auto", "status": "completed", "schedule_id": None, "schedule_name": None}
     texts = [m[4] for m in rec.messages["sess1"]]
     assert any("ジョブの終わり" in t for t in texts) and any("ジョブ終了" in t for t in texts)
     seqs = [m[0] for m in rec.messages["sess1"]]
@@ -344,7 +372,7 @@ async def test_learning_csv_is_kept_and_uses_steps_command(tmp_path: Path) -> No
     s = await mgr.start_learning("v1", "hold")
     assert s.spec.steps == "13,25" and s.spec.run_type == "learning"
     await mgr.wait_idle(30)
-    assert {k: v for k, v in runner_commands(tmp_path)[-1].items() if k != "job_id"} == {"cmd": "steps", "steps": "13,25", "home_at_end": True}
+    assert {k: v for k, v in runner_commands(tmp_path)[-1].items() if k != "job_id"} == {"cmd": "steps", "vehicle": "v1", "steps": "13,25", "home_at_end": True}
     assert mgr.mode_drive_spec("v1", "m", "M").steps == jm.MODE_DRIVE_STEPS
     with pytest.raises(jm.JobError):
         mgr.learning_spec("v1", "nope")
@@ -383,6 +411,42 @@ async def test_modes_schedule_and_sequence_do_not_start_more_runners(tmp_path: P
     await mgr.shutdown()
 
 
+async def test_vehicle_switch_keeps_initialized_and_commands_carry_vehicle(tmp_path: Path) -> None:
+    """初期化は機械の初期化: 車を切り替えても initialized は true・ランナーは起動し直さず、ジョブのコマンドは今の車で送る。"""
+    mgr = await make_ready(tmp_path, "0,0,0")
+    assert mgr.initialized is True and not hasattr(mgr, "initialized_for")
+    await mgr.start_mode_drive("v2", "m", "WLTP")  # 車 v2 へ切り替えた後
+    await mgr.wait_idle(30)
+    assert mgr.initialized is True and runner_starts(tmp_path) == 1
+    await mgr.start_schedule("v3", {"id": "i", "name": "S", "pedal_points": [], "button_events": []})
+    await mgr.wait_idle(30)
+    await mgr.start_init_only("v2")  # 車が違うだけでは起動し直さない（init コマンドを送る）
+    await mgr.wait_idle(30)
+    assert runner_starts(tmp_path) == 1 and mgr.initialized is True
+    cmds = runner_commands(tmp_path)
+    assert [(c["cmd"], c["vehicle"]) for c in cmds] == [("mode", "v2"), ("schedule", "v3"), ("init", "v2")]
+    await mgr.shutdown()
+
+
+def test_job_command_carries_vehicle_for_every_kind() -> None:
+    for kind, steps in ((jm.KIND_MODE_DRIVE, None), (jm.KIND_SCHEDULE, None), (jm.KIND_LEARNING, "2"), (jm.KIND_INTERACTIVE, None), (jm.KIND_INIT_ONLY, "1")):
+        spec = jm.JobSpec(kind=kind, vehicle_id="vX", steps=steps)
+        assert jm.job_command(spec, "j1")["vehicle"] == "vX"
+
+
+async def test_schedule_session_records_schedule_id_and_name(tmp_path: Path) -> None:
+    """スケジュールのジョブのセッションに、スケジュールの ID・名前が渡る。モード走行は None（O-5）。"""
+    rec = FakeRecorder()
+    mgr = await make_ready(tmp_path, "0,0", rec)
+    await mgr.start_schedule("v1", {"id": "sched-1", "name": "メンテナンスモード_v2", "pedal_points": [], "button_events": []})
+    await mgr.wait_idle(30)
+    await mgr.start_mode_drive("v1", "m", "WLTP")
+    await mgr.wait_idle(30)
+    assert rec.sessions["sess1"]["schedule_id"] == "sched-1" and rec.sessions["sess1"]["schedule_name"] == "メンテナンスモード_v2"
+    assert rec.sessions["sess2"]["schedule_id"] is None and rec.sessions["sess2"]["schedule_name"] is None
+    await mgr.shutdown()
+
+
 async def test_stop_sends_stop_command_and_does_not_enter_emergency(tmp_path: Path) -> None:
     rec = FakeRecorder()
     mgr = await make_ready(tmp_path, "h", rec)
@@ -392,7 +456,8 @@ async def test_stop_sends_stop_command_and_does_not_enter_emergency(tmp_path: Pa
     await mgr.stop()
     await mgr.wait_idle(15)
     last = mgr.last_job
-    assert last.exit_code == 130 and rec.sessions["sess1"]["status"] == "error" and last.stop_requested
+    assert last.exit_code == 130 and rec.sessions["sess1"]["status"] == "stopped" and last.stop_requested
+    assert last.final_status == "stopped"
     assert mgr.state == jm.STATE_STANDBY and mgr.snapshot()["emergency_cause"] is None  # 非常停止の状態に入らない
     assert last.emergency is False and last.emergency_stage == "start"  # 停止の流れの段階の表示は残る
     assert mgr.initialized is True  # ランナーは残り、待機している

@@ -11,9 +11,11 @@ class DriveSession:
     run_type: str  # 'auto' | 'manual' | 'learning' | 'tuning'
     started_at: datetime
     ended_at: datetime | None
-    status: str  # 'running' | 'completed' | 'error' | 'emergency'
+    status: str  # 'running' | 'completed' | 'stopped'（利用者の走行終了） | 'error' | 'emergency'
     cycle_id: str | None = None
     vehicle_id: str | None = None  # 車両 yaml のフォルダ名
+    schedule_id: str | None = None  # スケジュールのジョブだけ（その時点の ID・名前の写し）
+    schedule_name: str | None = None
 
 
 @dataclass

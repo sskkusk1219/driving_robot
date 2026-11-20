@@ -134,7 +134,7 @@ function CsvSpeedGraph({ rows, width = 600, height = 220 }) {
 
 // 一覧の列幅（ヘッダと各行で同じ値を使う。fr は minmax(0, …) にして中身の幅で列がずれないようにし、
 // プレビュー（MiniSpeedGraph 200px）と操作（4 ボタン）は固定 px にする）
-const MODE_LIST_COLS = ['minmax(0, 2fr)', 'minmax(0, 1.5fr)', '130px', '110px', '210px', '290px'];
+const MODE_LIST_COLS = ['minmax(0, 1fr)', '130px', '110px', '210px', '290px'];
 
 function ModesScreen() {
   const { useState, useEffect, useContext } = React;
@@ -347,7 +347,6 @@ function ModesScreen() {
       },
         ...[
           ['名前',     'name'],
-          ['説明',     null],
           ['長さ',     'total_duration'],
           ['最高車速', 'max_speed'],
           ['プレビュー', null],
@@ -421,17 +420,15 @@ function ModesScreen() {
                       }, '✎'),
                     ),
                   MODE_LIST_COLS[0]],
-                // 説明
-                [m.description || React.createElement('span', { key: 'd', style: { color: INK_MUTE } }, '—'), MODE_LIST_COLS[1]],
                 // 長さ
-                [fmtDuration(m.total_duration), MODE_LIST_COLS[2], 'mono'],
+                [fmtDuration(m.total_duration), MODE_LIST_COLS[1], 'mono'],
                 // 最高車速
-                [`${m.max_speed.toFixed(1)} km/h`, MODE_LIST_COLS[3], 'mono'],
+                [`${m.max_speed.toFixed(1)} km/h`, MODE_LIST_COLS[2], 'mono'],
                 // プレビュー (実データグラフ、ロード中は Hatch)
                 [detailMap[m.id]
                   ? React.createElement(MiniSpeedGraph, { key: 'g', rows: detailMap[m.id] })
                   : React.createElement(Hatch, { key: 'g', width: 160, height: 44 }),
-                MODE_LIST_COLS[4]],
+                MODE_LIST_COLS[3]],
                 // 操作
                 [React.createElement(RowActions, {
                   key: 'b',
@@ -440,7 +437,7 @@ function ModesScreen() {
                   onEdit:   () => { setEditTarget(m); setMode('edit'); },
                   onCopy:   () => handleCopy(m),
                   onDelete: () => handleDelete(m),
-                }), MODE_LIST_COLS[5]],
+                }), MODE_LIST_COLS[4]],
               ],
               style: {
                 padding: '10px 14px',

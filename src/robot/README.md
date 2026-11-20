@@ -10,6 +10,7 @@
 | `events.py` | イベント（JSON 1 行）の形式と出し口 |
 | `streaming_log.py` | `StreamingSessionLog`（core の `SessionLog` の派生。sample/csv イベント） |
 | `patches.py` | core の挙動を差し替える所（**差し替え点はここだけ**） |
+| `cancel_guard.py` | cancel 中の通信例外を CancelledError に戻す（差し替え 12） |
 | `emergency_stop.py` | 走行するジョブの非常停止の流れ（減速して停車 → N → スタート 10 秒 → 原点復帰。差し替え 10） |
 | `interrupt.py` | SIGINT / SIGTERM の扱い（終了処理を必ず走らせる） |
 | `interactive.py` | 対話ジョブ（手動運転・min 測定） |
@@ -130,16 +131,16 @@ JSON 1 行コマンドでジョブを送る。本体は `serve.py`。
 
 ### コマンド（標準入力の JSON 1 行）
 
-ジョブのコマンドは `job_id`（空でない文字列）が要る。`result` までのイベント（`state`・`sample`・`csv`・`button`・`result` …）に同じ `job_id` が付く（`events.set_job_id`）。
+ジョブのコマンドは `job_id`（空でない文字列）が要る。`vehicle`（車 ID。任意）はそのジョブで使う車で、ジョブの開始時に `vehicles/<車ID>/` の設定を読み直す（CSV・学習の保存先・キャリブの保存先もその車。無ければ起動時の `--vehicle`）。初期化（機械の初期化）は車と結びつけず、車を切り替えてもランナーは起動し直さない。`result` までのイベント（`state`・`sample`・`csv`・`button`・`result` …）に同じ `job_id` が付く（`events.set_job_id`）。
 走っている間に別のジョブのコマンドが来たら `ack ok=false`（「実行中です」）。初期化前・`needs_init` の間はジョブのコマンドは `ack ok=false`（「初期化が必要です」）。
 
 | コマンド | 項目 | 内容 |
 |---|---|---|
-| `mode` | `job_id`・`mode`（名前か ID）・`plan_in`（パスか null）・`limit_s`（秒か null）・`no_pre_check`（既定 false）・`home_at_end`（既定 true） | 手順 24,25（`--plan-in` と同じ差し替え・手順 24 の前のブレーキ ON も同じ。`plan_in` が null ならジョブの中で計画を作る） |
-| `schedule` | `job_id`・`schedule`（`schedule_to_dict` の形）・`no_pre_check`・`home_at_end` | タイムスケジュールの開ループ再生 |
-| `steps` | `job_id`・`steps`（例 `"2,25"`）・`home_at_end` | 学習 2・12〜14、IGN-OFF 25 など（`--steps` と同じ検査。**手順 1 は不可**。初期化は `init`） |
-| `interactive` | `job_id`・`purpose`（`manual`/`calib`。既定 manual） | 対話ジョブ。間は `jog`/`move`/`home`/`status`/`save_min`/`save_max`（下の「対話ジョブ」と同じ形）を受け、**`quit_interactive`** で終えて待機へ戻る（ランナーは終わらない）。終わりは原点復帰だけ |
-| `init` | `job_id` | 手順 1 をやり直す（つないでいれば本物の終了処理をしてから、原点復帰を含む初期化＋ PCA9685 の確認）。失敗したらランナーを閉じる |
+| `mode` | `job_id`・`vehicle`・`mode`（名前か ID）・`plan_in`（パスか null）・`limit_s`（秒か null）・`no_pre_check`（既定 false）・`home_at_end`（既定 true） | 手順 24,25（`--plan-in` と同じ差し替え・手順 24 の前のブレーキ ON も同じ。`plan_in` が null ならジョブの中で計画を作る） |
+| `schedule` | `job_id`・`vehicle`・`schedule`（`schedule_to_dict` の形）・`no_pre_check`・`home_at_end` | タイムスケジュールの開ループ再生 |
+| `steps` | `job_id`・`vehicle`・`steps`（例 `"2,25"`）・`home_at_end` | 学習 2・12〜14、IGN-OFF 25 など（`--steps` と同じ検査。**手順 1 は不可**。初期化は `init`） |
+| `interactive` | `job_id`・`vehicle`・`purpose`（`manual`/`calib`。既定 manual） | 対話ジョブ。間は `jog`/`move`/`home`/`status`/`save_min`/`save_max`（下の「対話ジョブ」と同じ形）を受け、**`quit_interactive`** で終えて待機へ戻る（ランナーは終わらない）。終わりは原点復帰だけ |
+| `init` | `job_id`・`vehicle` | 手順 1 をやり直す（つないでいれば本物の終了処理をしてから、原点復帰を含む初期化＋ PCA9685 の確認）。失敗したらランナーを閉じる |
 | `stop` | （`job_id` 任意） | 実行中のジョブの StopController に中断を要求（SIGINT と同じ停止の流れ。走行するジョブは停車 → N → IGN-OFF → 原点復帰）。終わったら待機へ戻る（`result` exit_code 130）。ジョブがなければ `ack` だけ |
 | `quit` | （`job_id` 任意） | 原点復帰 → サーボ OFF → 切断 → 終了（終了コード 0）。ジョブ実行中ならそのジョブを止めてから |
 
@@ -220,6 +221,7 @@ core の走行前チェックと同じ 20 mm/s。
 | 6 | 学習の手順（2・12〜14）の `Step.handler` を包む（`learning_buttons.py`。`run.py` が `wrap_step` の後に足す） | D-14b: tests の学習運転にはボタン操作が無いので、src 側で手順 24 と同じ Ready・D・N を足す（下記） |
 | 10 | `_release_pedals`（core の pattern_drive・mode_drive・excite と src の schedule_job の属性）・`button_steps.press_shift_n_after_drive`・`main.shutdown`（4）を包む（`install_emergency_stop`） | 走行するジョブ（手順 2・12〜14・24・スケジュール。対話・ボタンだけのジョブは対象外）の非常停止を `emergency_stop.py` の流れにする。きっかけは SIGINT（shutdown の前に流れを走らせる。走行前チェックが済んでいるときだけ）と自動の非常停止（DriveError。`_release_pedals` の中で走らせ、理由は今の例外の文言）。流れは `asyncio.shield` した 1 本の task で、後から来る SIGINT は同じ流れを待つだけ。流れが済んだら N の二重押しをしない。止まらないとき（`brake_kept`）と、停車しているのに N を押せないとき（`buttons_unavailable`。ブレーキは停車保持の開度で止めたまま）は shutdown で原点復帰・サーボOFF を飛ばす。秒数: スタート `buttons.ign_off_press_s`（10 s）・CAN を読めないときの踏み込み `emergency.can_lost_press_s`（src 専用キー、既定 20 s）。2026-11-19 |
 | 9 | `button_steps.press_button` を最も外側で包む（8 の後。`install_button_events`） | 段11: ボタンの押し始め・`seconds` 後の離しを `button` イベントにする（ペダルの図の矩形。ボタンなしでも出る） |
+| 12 | `_ModeRun.drive_axis`・`PatternLoop._drive_or_sense`・`_ExciteRun._drive_axis` を包む（`install_cancel_guard`。`cancel_guard.py`） | B-2: stop・SIGINT の cancel が Modbus 要求の最中に届いて ModbusIOException になっても、cancel 中なら CancelledError に戻して停止の流れに入れる（誤った「通信失敗」ERROR を出さない） |
 
 **学習の手順のボタン操作（段7b、D-14b）**: 走行前チェックの後、最初の学習の手順の前に「ブレーキを停車保持の開度（`stop_brake_opening_pct`。新しい車の仮値でもそのまま）に → スタート短押しで Ready →
 Ready から `buttons.d_press_at_s` 後に D（待つ間は車速を読み続ける）→ `after_press_wait_s` 待つ」、最後の学習の手順の後に `press_shift_n_after_drive`（ブレーキ ON で N）。

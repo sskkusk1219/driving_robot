@@ -1,17 +1,11 @@
 // ── 学習運転（RPD D-14） ─────────────────────────────────────
-// 開始の種類:
+// 学習はいつも全部学習:
 //   学習（手順 2 全部）: Ready・D → ペダル探索 → G ランプ走行 → モデル作成 → 学習結果チェック（→ 補正表の学習）→ N
-//   部分学習（今の pkl への学習のやり直し）: 手順12 FEL ／ 手順13 保持の点 ／ 手順14 停止の手前
 // 学習結果チェックが NG（終了コード 8）のときは車両 yaml を書き換えず、理由と「やり直す」を出す。
 // 画面の部品は自動運転と同じ DriveMonitorScreen（グラフ・状態の 1 行。一時停止ボタンは出さない）を使う。
 // 段階表示・終了コードの意味は job-utils.js。
 
-const LEARNING_KINDS = [
-  { kind: 'full', label: '学習（全部）' },
-  { kind: 'fel',  label: '部分学習: FEL' },
-  { kind: 'hold', label: '部分学習: 保持の点' },
-  { kind: 'stop', label: '部分学習: 停止の手前' },
-];
+const LEARNING_LABEL = '学習運転';
 
 function LearningScreen() {
   const { useState, useEffect, useContext } = React;
@@ -20,7 +14,6 @@ function LearningScreen() {
 
   const [popup, setPopup] = useState(null);
   const [profile, setProfile] = useState(null);
-  const [kind, setKind] = useState('full');
   const [dismissedJobId, setDismissedJobId] = useState(null);
 
   const liveJob = realtimeData?.job ?? null;
@@ -44,15 +37,11 @@ function LearningScreen() {
   const liveId = liveJob?.job_id ?? null;
   useEffect(() => { if (!liveId) loadProfile(); }, [liveId]);
 
-  // 走っている学習ジョブの種類は steps から（"2,25" → full …）。走っていなければ選んだ種類
-  const shownKind = learningRunning ? window.learningKindOf(liveJob) : kind;
-  const kindInfo = LEARNING_KINDS.find(k => k.kind === shownKind) ?? LEARNING_KINDS[0];
-  const partialNeedsModel = shownKind !== 'full' && profile && !profile.learned;
-
   // 表示するジョブ: 実行中のもの、なければ直前の学習ジョブ
   const showLast = !liveJob && lastJob && lastJob.kind === 'learning' && lastJob.job_id !== dismissedJobId;
   const stageJob = learningRunning ? liveJob : (showLast ? lastJob : null);
-  const stageKind = stageJob ? window.learningKindOf(stageJob) : shownKind;
+  // 段階表示の種類: 過去の部分学習のジョブは steps から読み分ける（新しく始めるのは full だけ）
+  const stageKind = stageJob ? window.learningKindOf(stageJob) : 'full';
   const stage = window.deriveStages(stageKind, stageJob, lines);
 
   const resultPanel = (
@@ -73,10 +62,8 @@ function LearningScreen() {
   );
 
   async function retryLast() {
-    const k = window.learningKindOf(lastJob);
-    setKind(k);
     setDismissedJobId(lastJob.job_id);
-    const r = await apiFetch('POST', '/api/v1/drive/learning/start', { kind: k });
+    const r = await apiFetch('POST', '/api/v1/drive/learning/start', { kind: 'full' });
     if (r) window.showToast('学習運転をやり直します', 'success');
   }
 
@@ -88,13 +75,7 @@ function LearningScreen() {
 
   return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
-      {/* 開始の種類 */}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 13, color: INK_SOFT }}>開始の種類</span>
-        {LEARNING_KINDS.map(k => (
-          <Btn key={k.kind} primary={shownKind === k.kind} disabled={learningRunning && shownKind !== k.kind}
-               onClick={() => { if (!learningRunning) setKind(k.kind); }}>{k.label}</Btn>
-        ))}
         <div style={{ flex: 1 }} />
         {profile && (
           <span style={{ fontSize: 12, color: INK_SOFT }}>
@@ -102,18 +83,17 @@ function LearningScreen() {
           </span>
         )}
       </div>
-      {partialNeedsModel && <div style={{ fontSize: 12, color: '#f0c84a' }}>この車は未学習です。部分学習の前に「学習（全部）」を行ってください。</div>}
 
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         {React.createElement(window.DriveMonitorScreen, {
           showRefLine: false,
           jobKind: 'learning',
-          progressLabel: kindInfo.label,
+          progressLabel: LEARNING_LABEL,
           profileMaxSpeed: profile?.max_speed_kmh ?? null,
           driveStartPath: '/api/v1/drive/learning/start',
-          driveStartBody: { kind },
+          driveStartBody: { kind: 'full' },
           driveStopPath: '/api/v1/drive/stop',
-          confirmStartMessage: `${kindInfo.label} を開始しますか？`,
+          confirmStartMessage: `${LEARNING_LABEL}を開始しますか？`,
           startedToastMessage: '学習運転を開始しました',
           stopLabel: '中断',
           confirmStopMessage: '学習運転を中断しますか？（原点へ戻して止まります）',

@@ -185,7 +185,9 @@ async def test_single_schedule_job(tmp_path: Path) -> None:
     assert status.spec.kind == jm.KIND_SCHEDULE and status.spec.schedule_name == "単発" and status.sequence is None
     await mgr.wait_idle(30)
     assert mgr.last_job is not None and mgr.last_job.final_status == "completed"
-    assert list(rec.sessions.values()) == [{"vehicle_id": "car", "mode_id": None, "run_type": "auto", "status": "completed"}]
+    assert list(rec.sessions.values()) == [
+        {"vehicle_id": "car", "mode_id": None, "run_type": "auto", "status": "completed", "schedule_id": "id-単発", "schedule_name": "単発"}
+    ]
     cmd = runner_commands(tmp_path)[-1]
     assert cmd["cmd"] == "schedule" and cmd["schedule"]["name"] == "単発" and cmd["home_at_end"] is True  # 単独は原点復帰する
     await mgr.shutdown()

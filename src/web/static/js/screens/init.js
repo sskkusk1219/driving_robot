@@ -38,14 +38,15 @@ function InitScreen() {
   const otherJob = !!liveJob && !isInitJob;
   const isInitializing = loading || isInitJob;
 
-  // 表示する項目: 実行中のジョブ → 終わった直後のジョブ（どの種類でも初期化の結果は持つ）→ 未実行の一覧
+  // 表示する項目: 実行中のジョブ → 直前の初期化ジョブ → 未実行の一覧
   // 未初期化（非常停止・エラーの後など）のときは、前のジョブの ✓ を今の状態として出さない（段 T）。
   // ただし直前の初期化が失敗して終わったときは、どの項目が失敗したか見られるよう結果を残す
   const lastInitFailed = lastJob?.kind === 'init_only' && lastJob.exit_code != null && lastJob.exit_code !== 0;
-  const lastStepsUsable = !!lastJob?.init_steps?.length && (initialized !== false || lastInitFailed);
+  // 直前のジョブが初期化（init_only）のときだけ、その init_steps で各項目を出す（走行など別のジョブの後は「—」のまま）
+  const lastStepsUsable = lastJob?.kind === 'init_only' && !!lastJob?.init_steps?.length && (initialized !== false || lastInitFailed);
   const fromJob = (liveJob?.init_steps?.length ? liveJob.init_steps : null)
     ?? (lastStepsUsable ? lastJob.init_steps : null);
-  const hidingLast = !liveJob && initialized === false && !!lastJob?.init_steps?.length && !lastStepsUsable;
+  const hidingLast = !liveJob && initialized === false && lastJob?.kind === 'init_only' && !!lastJob?.init_steps?.length && !lastStepsUsable;
   // 接続と Modbus 操作権は 1 項目にまとめて見せる（段 V。表示だけ。ランナーの項目は変えない）
   // ランナーの key はラベルそのもの（例「Modbus 操作権 (ブレーキ→アクセル)」）なので、key の頭の語で見分ける
   const isConn = x => x.key === 'conn' || String(x.key ?? x.label).startsWith('接続');
@@ -62,20 +63,28 @@ function InitScreen() {
     return list.filter(x => !isModbus(x)).map(x => isConn(x)
       ? { ...x, label: '接続 (アクセル/ブレーキ/CAN)', status, detail: detail || undefined } : x);
   }
-  const baseSteps = mergeConnSteps(fromJob ?? FALLBACK_INIT_STEPS);
+  // 一覧はいつも同じ（FALLBACK_INIT_STEPS の 7 項目の順＋末尾に非常停止スイッチ・ボタンサーボ）。
+  // ジョブの init_steps は、ラベルの頭の語で一覧の項目に重ねて status・detail だけ差し替える（報告がまだ無い項目は pending）。
+  // 一覧に無い項目をランナーが報告したら、機器の行の前に足す
+  const jobSteps = fromJob ? mergeConnSteps(fromJob) : [];
+  const headOf = x => FALLBACK_INIT_STEPS.find(f => String(x.label ?? x.key).startsWith(f.label.split(/[ (]/)[0]));
   const OFF_NOTE = 'なし（設定で off）';
+  const baseSteps = FALLBACK_INIT_STEPS.map(f => {
+    const hit = jobSteps.find(j => headOf(j)?.key === f.key);
+    return hit ? { ...f, status: hit.status, detail: hit.detail } : f;
+  });
+  const extraSteps = jobSteps.filter(j => !headOf(j) && !isModbus(j));
   // 設定で off の機器は「なし」と出す。UPS は初期化の項目（UPS 通信チェック）を書き換え、
-  // 非常停止(GPIO)・SG90(ボタン) は初期化の項目に無いので末尾に足す
+  // 非常停止(GPIO)・SG90(ボタン) は初期化の項目に無いので末尾に足す（devices を取れるまでは未実行の「—」）
   const steps = [
-    ...baseSteps.map(st => (devices?.ups === false && /UPS/.test(st.label))
+    ...[...baseSteps, ...extraSteps].map(st => (devices?.ups === false && /UPS/.test(st.label))
       ? { ...st, status: 'skipped', detail: OFF_NOTE } : st),
-    ...(devices ? [
-      { key: 'dev_gpio', label: '非常停止スイッチ',
-        status: devices.gpio ? 'done' : 'skipped', detail: devices.gpio ? '見張り中' : OFF_NOTE },
-      { key: 'dev_buttons', label: 'ボタンサーボ',
-        status: devices.buttons ? 'done' : 'skipped',
-        detail: devices.buttons ? '取り付け済み' : OFF_NOTE },
-    ] : []),
+    { key: 'dev_gpio', label: '非常停止スイッチ',
+      status: !devices ? 'pending' : devices.gpio ? 'done' : 'skipped',
+      detail: !devices ? undefined : devices.gpio ? '見張り中' : OFF_NOTE },
+    { key: 'dev_buttons', label: 'ボタンサーボ',
+      status: !devices ? 'pending' : devices.buttons ? 'done' : 'skipped',
+      detail: !devices ? undefined : devices.buttons ? '取り付け済み' : OFF_NOTE },
   ];
   const showingLast = !liveJob && lastStepsUsable;
 
@@ -138,7 +147,7 @@ function InitScreen() {
               </div>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 19, fontWeight: active ? 700 : 400 }}>{label}</div>
-                {detail ? <div style={{ fontSize: 12, color: INK_SOFT, marginTop: 2 }}>{detail}</div> : null}
+                {detail && status !== 'done' ? <div style={{ fontSize: 12, color: INK_SOFT, marginTop: 2 }}>{detail}</div> : null}
               </div>
               {ind.note && <div style={{ fontSize: 13, color: INK_SOFT }}>{ind.note}</div>}
             </div>

@@ -367,7 +367,8 @@ async def stub_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: p
     """標準入力を読まず、設定は共通 yaml だけ（検証は省く）で、スタブ HW のランナーを作る。"""
     cfg_common = _common_yaml(tmp_path)
 
-    def load_config(self: serve.ServeRunner):  # noqa: ANN202
+    def load_config(self: serve.ServeRunner, vehicle: str | None = None):  # noqa: ANN202
+        self.loaded_vehicles.append(vehicle)  # type: ignore[attr-defined]
         cfg = cs.load_config(cfg_common)
         cfg.vehicle.min_accel_opening_pct, cfg.vehicle.max_accel_opening_pct = 6.5, 60.0
         cfg.vehicle.min_brake_opening_pct, cfg.vehicle.max_brake_opening_pct = 2.9, 40.0
@@ -381,6 +382,7 @@ async def stub_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: p
     buf = io.StringIO()
     events.set_sink(events.EventSink(stream=buf))
     runner = serve.ServeRunner(_make_args(tmp_path))
+    runner.loaded_vehicles = []  # type: ignore[attr-defined]  # _load_config に渡された車（テスト用）
     yield runner, buf
     events.set_sink(None)
     events.set_job_id(None)
@@ -565,3 +567,31 @@ async def test_serve_init_command_reinitializes(stub_runner: Any) -> None:
     assert not first.connected  # 古い接続は本物の終了処理で閉じた
     _send(runner, {"cmd": "quit"})
     assert await asyncio.wait_for(task, 20) == 0
+
+
+def test_parse_vehicle_field() -> None:
+    assert serve.parse_serve_command('{"cmd":"mode","job_id":"j","mode":"x","vehicle":" car_b "}').vehicle == "car_b"
+    assert serve.parse_serve_command('{"cmd":"steps","job_id":"j","steps":"2","vehicle":"car_b"}').vehicle == "car_b"
+    assert serve.parse_serve_command('{"cmd":"init","job_id":"j","vehicle":"car_b"}').vehicle == "car_b"
+    assert serve.parse_serve_command('{"cmd":"mode","job_id":"j","mode":"x"}').vehicle is None
+    with pytest.raises(CommandError):
+        serve.parse_serve_command('{"cmd":"mode","job_id":"j","mode":"x","vehicle":""}')
+
+
+async def test_serve_job_loads_config_of_command_vehicle(stub_runner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ジョブはコマンドの車の設定で動く（起動時の車 car_a ではなく）。車の指定が無ければ起動時の車。"""
+    runner, buf = stub_runner
+
+    async def bad_select(cfg: Any, text: str) -> str:
+        raise ConfigError("止める")
+
+    monkeypatch.setattr(serve.run, "select_mode", bad_select)
+    task = asyncio.create_task(runner.run())
+    await _wait_for(buf, _is("state", phase="idle"))
+    assert runner.loaded_vehicles == ["car_a"]  # 起動時の初期化（コマンドに車なし → 起動時の車）
+    _send(runner, {"cmd": "mode", "job_id": "m1", "mode": "x", "vehicle": "car_b"})
+    await _wait_for(buf, _is("result", job_id="m1"))
+    assert runner.loaded_vehicles[-1] == "car_b"
+    _send(runner, {"cmd": "quit"})
+    assert await asyncio.wait_for(task, 20) == 0
+    assert runner._vehicle_of(None) == "car_a"  # noqa: SLF001
