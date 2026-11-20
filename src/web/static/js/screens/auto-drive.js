@@ -77,6 +77,8 @@ function DriveMonitorScreen({
   busyLabel = null, stopLabel = '走行終了', confirmStopMessage = '走行を終了しますか？',
   startedToastMessage = '走行を開始しました',
   startDisabledReason = null,
+  // シーケンスの開始前の枠3・基準の線に使う（選んだシーケンスの ID。走っていない間だけ使う）
+  seqPreviewId = null,
 }) {
   const { useState, useEffect, useContext, useRef } = React;
   const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeModeKind, robotState, setNavLock, setNav, recheckSelection } = useContext(window.AppContext);
@@ -264,7 +266,33 @@ function DriveMonitorScreen({
 
   // 走っているモード走行のジョブがあれば、画面の選択より優先してそのモードの基準を読む（段 B）
   const jobModeId = liveJob?.kind === 'mode_drive' ? (liveJob.mode_id ?? null) : null;
-  const refModeId = jobModeId ?? (activeModeKind === 'mode' ? activeModeId : null);
+  // シーケンスの開始前: 最初のモードの段の基準車速で枠3を描く（そのモードの段を走り出したときと同じ図。
+  //   開始で図の形が変わらないようにする。CLAUDE.md「フロントエンド」）
+  const [seqPreview, setSeqPreview] = useState(null);
+  const previewActive = !!seqPreviewId && !liveJob && !seqActive;
+  useEffect(() => {
+    if (!seqPreviewId) { setSeqPreview(null); return; }
+    let alive = true;
+    (async () => {
+      const seq = await apiFetch('GET', `/api/v1/sequences/${seqPreviewId}`);
+      if (!alive || !seq) { if (alive) setSeqPreview(null); return; }
+      const steps = seq.steps ?? [];
+      const firstMode = steps.find(st => st.kind === 'mode' && !st.missing);
+      const mode = firstMode ? await apiFetch('GET', `/api/v1/modes/${firstMode.ref_id}`) : null;
+      if (!alive) return;
+      const ref = mode?.reference_speed ?? [];
+      const first = steps[0];
+      setSeqPreview({ id: seqPreviewId,
+        segs: ref.length > 0 ? [ref] : [],
+        totalS: ref.length > 0 ? ref[ref.length - 1].time_s : 0,
+        maxSpd: ref.reduce((m, p) => Math.max(m, p.speed_kmh), 0),
+        firstModeId: first && first.kind === 'mode' && !first.missing ? first.ref_id : null });
+    })();
+    return () => { alive = false; };
+  }, [seqPreviewId]);
+  const previewOk = previewActive && seqPreview && seqPreview.id === seqPreviewId;
+  const refModeId = jobModeId ?? (activeModeKind === 'mode' ? activeModeId : null)
+    ?? (previewOk ? seqPreview.firstModeId : null);
   useEffect(() => {
     if (refModeId) {
       setModeDetail(prev => (prev && prev.id === refModeId ? prev : null));
@@ -398,16 +426,24 @@ function DriveMonitorScreen({
     ? refProfile
     : (showProgressFigure && liveJob?.kind === 'mode_drive' && modeDetail && modeDetail.id === liveJob.mode_id
         ? (modeDetail.reference_speed ?? []) : []);
-  const figTotalS = figProfile.length > 0 ? figProfile[figProfile.length - 1].time_s : 0;
-
-  const profileSpeedMax = refProfile.reduce((m, p) => Math.max(m, p.speed_kmh), 0);
+  // シーケンスの開始前は最初のモードの段の図。走行中は今の段のモードの図
+  const figSegs = figProfile.length > 0 ? [figProfile] : (previewOk && showProgressFigure ? seqPreview.segs : []);
+  const figTotalS = figProfile.length > 0 ? figProfile[figProfile.length - 1].time_s
+    : (figSegs.length > 0 ? seqPreview.totalS : 0);
+  // 開始前のシーケンスの先頭の段がモードなら、上の図に基準の線を出す（走行モードの開始前と同じ）
+  const preRefProfile = (!showRefLine && previewOk && seqPreview.firstModeId && modeDetail
+    && modeDetail.id === seqPreview.firstModeId) ? (modeDetail.reference_speed ?? []) : [];
+  const refLineProfile = showRefLine ? refProfile : preRefProfile;
+  const profileSpeedMax = refLineProfile.reduce((m, p) => Math.max(m, p.speed_kmh), 0);
   const maxSpeed = Math.max(100, Math.ceil(Math.max(profileSpeedMax, profileMaxSpeed ?? 0) / 20) * 20);
   // 枠3の図の縦の上限。走行モードの画面と同じ式を、図に描くモード（figProfile）の基準で計算する
   //   （シーケンスは refProfile が空なので maxSpeed を使うと 100 固定になり、走行モードと形が変わる）
-  const figSpeedMax = figProfile.reduce((m, p) => Math.max(m, p.speed_kmh), 0);
+  const figSpeedMax = figProfile.length > 0 ? figProfile.reduce((m, p) => Math.max(m, p.speed_kmh), 0)
+    : (figSegs.length > 0 ? seqPreview.maxSpd : 0);
   const figMaxSpeed = Math.max(100, Math.ceil(Math.max(figSpeedMax, profileMaxSpeed ?? 0) / 20) * 20);
 
   function getRefSpeedAtTime(elapsedS) {
+    const refProfile = refLineProfile;
     if (refProfile.length === 0 || elapsedS < 0) return null;
     if (elapsedS <= refProfile[0].time_s) return refProfile[0].speed_kmh;
     const last = refProfile[refProfile.length - 1];
@@ -439,7 +475,7 @@ function DriveMonitorScreen({
   const toDriveElapsedS = ts => (ts - driveStart) / 1000;
 
   // 基準車速: プロファイルから直接サンプリング（モードロード済なら常に表示）
-  const speedRef_pts = showRefLine && refProfile.length > 0
+  const speedRef_pts = refLineProfile.length > 0
     ? Array.from({ length: 150 }, (_, i) => {
         const frac  = i / 149;
         const t     = windowStartS + frac * WINDOW_S;
@@ -483,10 +519,10 @@ function DriveMonitorScreen({
   // T4: マーカーと進捗は走行中のみ
   // Axis 3: PAD_T=8, PAD_B=8 → speed=0 が baseline(y=PH3-8=52)に一致
   const G3_PAD_T = 8, G3_PAD_B = 8;
-  const profilePts = figProfile.map(p => ({
+  const profileSegs = figSegs.map(seg => seg.map(p => ({
     x: toXFull(figTotalS > 0 ? p.time_s / figTotalS : 0),
     y: toY(p.speed_kmh, figMaxSpeed, PH3, G3_PAD_T, G3_PAD_B),
-  }));
+  })));
   const progressFrac = isDriving && figTotalS > 0 ? Math.min(1, nowS / figTotalS) : 0;
   const markerX = toXFull(progressFrac);
 
@@ -575,13 +611,13 @@ function DriveMonitorScreen({
       <Box style={{ padding: '6px 0 2px', flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <GraphSvg height={PH1} yMax={maxSpeed} unit="" unitLabel="km/h">
-            {showRefLine && polyline(speedRef_pts, INK_SOFT, 1.5, '4 3')}
+            {polyline(speedRef_pts, INK_SOFT, 1.5, '4 3')}
             {polyline(speedAct_pts, '#c8922a', 2.2)}
           </GraphSvg>
           {marker(rd.actual_speed_kmh, maxSpeed, PH1, '#c8922a')}
         </div>
         <div style={{ display: 'flex', gap: 20, fontSize: 12, color: INK_SOFT, paddingLeft: PL, paddingBottom: 4, alignItems: 'center' }}>
-          {showRefLine && (
+          {(showRefLine || preRefProfile.length > 0) && (
             <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <svg width="28" height="10" style={{ flexShrink: 0 }}>
                 <line x1="0" y1="5" x2="28" y2="5" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />
@@ -674,15 +710,15 @@ function DriveMonitorScreen({
           図を出している間は resultPanel を並べない。シーケンスの進み具合は枠3ではなく画面上の見出し行に出す（AutoDriveScreen）。
           シーケンスで図の幅が縮む・形が変わる不具合を 3 回直している（2026-11-20）。変えるときは CLAUDE.md の「フロントエンド」節を読むこと */}
       <Box style={{ padding: '4px 10px', flex: '0.5 1 0', minHeight: 0, minWidth: 0, display: 'flex', gap: 12 }}>
-        {figProfile.length > 0 ? (
+        {figSegs.length > 0 ? (
           <div style={{ flex: '1 1 100%', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ flex: 1, minHeight: 0 }}>
               <svg viewBox={`0 0 ${VW} ${PH3}`} width="100%" height="100%" preserveAspectRatio="none" style={{ display: 'block' }}>
                 <line x1={PL} y1={PH3 - G3_PAD_B} x2={PL + PW} y2={PH3 - G3_PAD_B} stroke={HATCH} strokeWidth="0.8" />
-                {profilePts.length > 0 && (() => {
-                  const d = profilePts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-                  return <path d={d} fill="none" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />;
-                })()}
+                {profileSegs.map((pts, si) => {
+                  const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+                  return <path key={si} d={d} fill="none" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />;
+                })}
                 {isDriving && figTotalS > 0 && (
                   <line x1={markerX} y1={4} x2={markerX} y2={PH3 - 4} stroke="#f07070" strokeWidth="2" />
                 )}
@@ -948,6 +984,7 @@ function AutoDriveScreen() {
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         {isSequence ? (
           <DriveMonitorScreen showRefLine={false} showProgressFigure={true} jobKind={jobKinds} seqMode={true}
+            seqPreviewId={activeModeId}
             driveStartPath="/api/v1/drive/sequence/start"
             driveStartBody={activeModeId ? { sequence_id: activeModeId, ...(devLimitS ? { limit_s: devLimitS } : {}) } : null}
             prepareBody={activeModeId ? { kind: 'sequence', id: activeModeId, limit_s: devLimitS || null } : null}

@@ -224,9 +224,11 @@ async def update_mode(mode_id: str, req: ModeUpdateRequest, repo: ModeRepo) -> M
     if existing is None:
         raise HTTPException(status_code=404, detail=f"走行モード {mode_id!r} が見つかりません")
     _reject_if_system(existing)
+    if req.name is not None and not req.name.strip():
+        raise HTTPException(status_code=422, detail="走行モード名を入力してください")
     merged = DrivingMode(
         id=existing.id,
-        name=req.name if req.name is not None else existing.name,
+        name=req.name.strip() if req.name is not None else existing.name,
         description=req.description if req.description is not None else existing.description,
         reference_speed=existing.reference_speed,
         total_duration=existing.total_duration,

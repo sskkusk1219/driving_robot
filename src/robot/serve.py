@@ -124,6 +124,7 @@ class ServeCommand:
     schedule: dict[str, Any] | None = None
     steps: str | None = None
     purpose: str | None = None
+    vehicle: str | None = None  # このジョブで使う車（JobManager が今選んでいる車）。無ければ起動時の車（args.vehicle）
 
 
 def _optional_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
@@ -159,13 +160,17 @@ def parse_serve_command(line: str) -> ServeCommand:
     if job_id is None:
         raise CommandError("job_id がありません（ジョブのコマンドには job_id が要ります）")
     home_at_end = _optional_bool(obj, "home_at_end", True)
+    vehicle = obj.get("vehicle")
+    if vehicle is not None and (not isinstance(vehicle, str) or not vehicle.strip()):
+        raise CommandError(f"vehicle は車 ID（空でない文字列）か null で指定してください: {vehicle!r}")
+    vehicle = vehicle.strip() if vehicle else None
     if cmd == "init":
-        return ServeCommand(cmd, job_id=job_id, req_id=req_id)
+        return ServeCommand(cmd, job_id=job_id, req_id=req_id, vehicle=vehicle)
     if cmd == "interactive":
         purpose = obj.get("purpose", "manual")
         if purpose not in ("manual", "calib"):
             raise CommandError("purpose は manual / calib で指定してください")
-        return ServeCommand(cmd, job_id=job_id, req_id=req_id, purpose=purpose, home_at_end=True)
+        return ServeCommand(cmd, job_id=job_id, req_id=req_id, purpose=purpose, home_at_end=True, vehicle=vehicle)
     no_pre_check = _optional_bool(obj, "no_pre_check", False)
     if cmd == "mode":
         mode = obj.get("mode")
@@ -181,7 +186,7 @@ def parse_serve_command(line: str) -> ServeCommand:
             limit_s = float(limit_s)
         return ServeCommand(
             cmd, job_id=job_id, req_id=req_id, mode=mode, plan_in=Path(plan_in) if plan_in else None,
-            limit_s=limit_s, no_pre_check=no_pre_check, home_at_end=home_at_end,
+            limit_s=limit_s, no_pre_check=no_pre_check, home_at_end=home_at_end, vehicle=vehicle,
         )
     if cmd == "schedule":
         schedule = obj.get("schedule")
@@ -189,7 +194,7 @@ def parse_serve_command(line: str) -> ServeCommand:
             raise CommandError("schedule（schedule_to_dict の形の JSON オブジェクト）がありません")
         return ServeCommand(
             cmd, job_id=job_id, req_id=req_id, schedule=schedule,
-            no_pre_check=no_pre_check, home_at_end=home_at_end,
+            no_pre_check=no_pre_check, home_at_end=home_at_end, vehicle=vehicle,
         )
     # steps
     steps_text = obj.get("steps")
@@ -208,7 +213,7 @@ def parse_serve_command(line: str) -> ServeCommand:
         raise CommandError(problem)
     return ServeCommand(
         cmd, job_id=job_id, req_id=req_id, steps=steps_text.strip(),
-        no_pre_check=no_pre_check, home_at_end=home_at_end,
+        no_pre_check=no_pre_check, home_at_end=home_at_end, vehicle=vehicle,
     )
 
 
@@ -413,8 +418,11 @@ def orphan_alive() -> bool:
 class _ServeInteractive:
     """対話ジョブ: 標準入力は常駐ランナーが読むので、そこから回ってきた行（キュー）を実行する。"""
 
-    def __init__(self, runner: ServeRunner, ctx: core_main.RunContext, queue: asyncio.Queue[str | None]) -> None:
+    def __init__(
+        self, runner: ServeRunner, ctx: core_main.RunContext, queue: asyncio.Queue[str | None], vehicle: str | None = None
+    ) -> None:
         self._runner = runner
+        self._vehicle = vehicle or runner.args.vehicle
         self._ctx = ctx
         self._queue = queue
 
@@ -422,7 +430,7 @@ class _ServeInteractive:
         args = self._runner.args
         session = InteractiveSession(
             self._ctx.require_hardware(), self._ctx.config,
-            vehicle_id=args.vehicle, vehicles_dir=args.vehicles_dir,
+            vehicle_id=self._vehicle, vehicles_dir=args.vehicles_dir,
         )
         events.emit("state", phase="interactive", purpose=self._runner.purpose)
         say("対話ジョブ: コマンド待ち（jog / move / home / status / save_min / save_max。quit_interactive で待機へ戻る）")
@@ -747,12 +755,18 @@ class ServeRunner:
             return await self._run_init(command, stop, state)
         return await self._run_job(command, stop, state)
 
-    def _load_config(self) -> tuple[ResearchConfig, Path]:
+    def _vehicle_of(self, command: ServeCommand | None) -> str:
+        """このジョブで使う車。コマンドに車 ID があればそれ、無ければ起動時の車。"""
+        return (command.vehicle if command is not None and command.vehicle else None) or self.args.vehicle
+
+    def _load_config(self, vehicle: str | None = None) -> tuple[ResearchConfig, Path]:
+        """``vehicle``（無ければ起動時の車）の設定を読む。キャリブの保存先（vehicle.yaml）もその車にする。"""
         args = self.args
+        vehicle = vehicle or args.vehicle
         cfg, merged = config_store.load_vehicle_config(
-            args.vehicle, vehicles_dir=args.vehicles_dir, common_path=args.common
+            vehicle, vehicles_dir=args.vehicles_dir, common_path=args.common
         )
-        config_store.install_save_sync(cfg, args.vehicle, vehicles_dir=args.vehicles_dir, common_path=args.common)
+        config_store.install_save_sync(cfg, vehicle, vehicles_dir=args.vehicles_dir, common_path=args.common)
         return cfg, merged
 
     async def _run_init(self, command: ServeCommand, stop: StopController, state: run.RunState) -> int:
@@ -766,13 +780,14 @@ class ServeRunner:
         self.hw = None
         self.init_ctx = None
         self.watcher = None
+        vehicle = self._vehicle_of(command)
         try:
-            cfg, merged = self._load_config()
+            cfg, merged = self._load_config(vehicle)
         except ConfigError as exc:
             state.error = str(exc)
             say(f"設定の読み込みに失敗しました: {exc}")
             return 2
-        say(f"設定: 共通 {args.common.name} + 車両 {args.vehicle}（合成 yaml {merged}）")
+        say(f"設定: 共通 {args.common.name} + 車両 {vehicle}（合成 yaml {merged}）")
         ctx = core_main.RunContext(config=cfg, hw_mode=args.hw, started_at=time.monotonic())
         self.init_ctx = ctx
         patches.install_all(stop)
@@ -814,8 +829,9 @@ class ServeRunner:
 
     async def _run_job(self, command: ServeCommand, stop: StopController, state: run.RunState) -> int:
         args = self.args
+        vehicle = self._vehicle_of(command)
         try:
-            cfg, merged = self._load_config()
+            cfg, merged = self._load_config(vehicle)
             ctx_limit = command.limit_s
             schedule: schedule_spec.ScheduleData | None = None
             steps: list[core_main.Step]
@@ -829,7 +845,7 @@ class ServeRunner:
                 say(f"走行モード: {chosen!r}")
                 plan_in = command.plan_in.resolve() if command.plan_in else None
                 steps, conflict = run.build_steps_job(
-                    MODE_JOB_STEPS, vehicle=args.vehicle, plan_in=plan_in, cfg=cfg, stop=stop, state=state
+                    MODE_JOB_STEPS, vehicle=vehicle, plan_in=plan_in, cfg=cfg, stop=stop, state=state
                 )
                 if conflict is not None:
                     raise ConfigError(conflict)
@@ -847,7 +863,7 @@ class ServeRunner:
             elif command.cmd == "steps":
                 assert command.steps is not None  # noqa: S101
                 steps, conflict = run.build_steps_job(
-                    command.steps, vehicle=args.vehicle, plan_in=None, cfg=cfg, stop=stop, state=state
+                    command.steps, vehicle=vehicle, plan_in=None, cfg=cfg, stop=stop, state=state
                 )
                 if conflict is not None:
                     raise ConfigError(conflict)
@@ -856,7 +872,7 @@ class ServeRunner:
                 queue = self.interactive_queue
                 steps = [
                     run.wrap_step(
-                        run._interactive_step(lambda c: _ServeInteractive(self, c, queue)),  # noqa: SLF001
+                        run._interactive_step(lambda c: _ServeInteractive(self, c, queue, vehicle)),  # noqa: SLF001
                         stop,
                         state,
                     )
@@ -869,7 +885,7 @@ class ServeRunner:
             state.error = str(exc.code)
             say(f"設定エラー: {exc.code}")
             return 2
-        say(f"設定: 共通 {args.common.name} + 車両 {args.vehicle}（合成 yaml {merged}）")
+        say(f"設定: 共通 {args.common.name} + 車両 {vehicle}（合成 yaml {merged}）")
         say(f"CSV の置き場所: {cfg.results_path}")
 
         ctx = core_main.RunContext(config=cfg, hw_mode=args.hw, started_at=time.monotonic(), limit_s=ctx_limit)

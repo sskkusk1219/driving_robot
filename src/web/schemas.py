@@ -119,10 +119,16 @@ class DriveSessionResponse(BaseModel):
 
 
 class LearningStartRequest(BaseModel):
-    """学習の種類: full ＝ 手順 2（探索 → G ランプ → モデル作成 → チェック）、
-    fel ＝ 手順 12・hold ＝ 手順 13・stop ＝ 手順 14（今の pkl への部分的な学習のやり直し）。"""
+    """学習は全部学習（手順 2: 探索 → G ランプ → モデル作成 → チェック）だけ。kind は省略可（full）。"""
 
-    kind: Literal["full", "fel", "hold", "stop"] = "full"
+    kind: str = "full"
+
+    @field_validator("kind")
+    @classmethod
+    def _only_full(cls, v: str) -> str:
+        if v != "full":
+            raise ValueError("学習は全部学習だけです（kind は full のみ）")
+        return v
 
 
 class SaveMinRequest(BaseModel):
@@ -465,8 +471,10 @@ class SessionResponse(BaseModel):
     run_type: str
     started_at: datetime
     ended_at: datetime | None
-    status: str
+    status: str  # running / completed / stopped（利用者の走行終了）/ error / emergency
     cycle_id: str | None = None
+    schedule_id: str | None = None  # スケジュールのジョブだけ。名前は開始時点の写し（後でスケジュールが消えても残る）
+    schedule_name: str | None = None
 
 
 class CycleSummaryResponse(BaseModel):

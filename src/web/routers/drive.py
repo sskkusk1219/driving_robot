@@ -126,7 +126,7 @@ async def get_status(request: Request, manager: Manager, store: Store) -> System
         last_normal_shutdown=True,
         updated_at=_now(),
         manager_state=snap["state"],
-        initialized=snap["initialized"],
+        initialized=manager.initialized,  # 初期化は機械の初期化。車を切り替えても変わらない
         devices=_devices(request, store),
         job=job,
         last_job=snap["last_job"],
@@ -158,6 +158,23 @@ async def get_drive_log(
 # ── 選んでいる車 ───────────────────────────────────────────────────────
 
 
+def _vehicle_config_problem(store: VehicleStore, vehicle_id: str) -> str | None:
+    """車の設定（共通＋車両の合成）が読めるか確かめる。読めなければ分かる理由、読めれば None。
+    ジョブは開始時にこの車の設定を読むので、壊れた車は選ぶ時点で断る。"""
+    from src.robot import config_store  # noqa: PLC0415
+    from src.robot.core.config import ConfigError  # noqa: PLC0415
+
+    try:
+        config_store.load_vehicle_config(
+            vehicle_id, vehicles_dir=store.vehicles_dir, common_path=store.common_path
+        )
+    except ConfigError as exc:
+        return f"車 {vehicle_id!r} の設定が読めません: {exc}"
+    except Exception as exc:  # noqa: BLE001 - yaml の構文エラー等も読めない設定として扱う
+        return f"車 {vehicle_id!r} の設定が読めません（{type(exc).__name__}: {exc}）"
+    return None
+
+
 @router.post("/select-profile", status_code=200)
 async def select_profile(req: SelectProfileRequest, manager: Manager, store: Store) -> dict[str, str]:
     """走らせる車を選ぶ（vehicles/.active に保存。再起動後も残る）。ジョブ実行中は変えられない。"""
@@ -165,6 +182,9 @@ async def select_profile(req: SelectProfileRequest, manager: Manager, store: Sto
         raise HTTPException(status_code=409, detail="ジョブの実行中・準備中は車を変えられません")
     if not store.exists(req.profile_id):
         raise HTTPException(status_code=404, detail=f"車 {req.profile_id!r} が見つかりません")
+    problem = _vehicle_config_problem(store, req.profile_id)
+    if problem is not None:
+        raise HTTPException(status_code=422, detail=problem)
     store.set_active(req.profile_id)
     return {"status": "ok", "profile_id": req.profile_id}
 
@@ -268,7 +288,7 @@ async def reset_emergency(manager: Manager) -> dict[str, str]:
 async def start_learning(
     manager: Manager, store: Store, req: LearningStartRequest | None = None
 ) -> JobStartResponse:
-    """学習ジョブを始める。kind: full（手順 2）/ fel（12）/ hold（13）/ stop（14）。"""
+    """学習ジョブを始める（全部学習＝手順 2 だけ。kind は full のみ受け付ける）。"""
     kind = (req or LearningStartRequest()).kind
     return _job_response(await manager.start_learning(_active_vehicle(store), kind))
 

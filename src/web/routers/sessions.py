@@ -1,6 +1,7 @@
 # ruff: noqa: E501
 import csv
 import io
+import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
@@ -21,6 +22,14 @@ router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 
 SessionRepo = Annotated[SessionRepoProtocol, Depends(get_session_repo)]
 Store = Annotated[VehicleStore, Depends(get_vehicle_store)]
+
+
+def _require_uuid(value: str, label: str = "session_id") -> None:
+    """UUID 形式でなければ 400（DB 層の UUID 変換で 500 にしない）。"""
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{label} が UUID 形式ではありません") from None
 
 
 def _vehicle_name(store: VehicleStore, vehicle_id: str | None, cache: dict[str, str | None]) -> str | None:
@@ -49,6 +58,8 @@ def _to_response(
         ended_at=session.ended_at,
         status=session.status,
         cycle_id=session.cycle_id,
+        schedule_id=session.schedule_id,
+        schedule_name=session.schedule_name,
     )
 
 
@@ -76,12 +87,15 @@ async def list_cycles(
     repo: SessionRepo, profile_id: str | None = None
 ) -> list[CycleSummaryResponse]:
     """学習サイクル一覧を返す（ログ画面のサイクル単位グループ表示に使う）。"""
+    if profile_id is not None:
+        _require_uuid(profile_id, "profile_id")
     cycles = await repo.list_cycles(profile_id=profile_id)
     return [_to_cycle_response(c) for c in cycles]
 
 
 @router.get("/{session_id}", response_model=SessionResponse)
 async def get_session(session_id: str, repo: SessionRepo, store: Store) -> SessionResponse:
+    _require_uuid(session_id)
     session = await repo.get_by_id(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"セッション {session_id!r} が見つかりません")
@@ -91,6 +105,7 @@ async def get_session(session_id: str, repo: SessionRepo, store: Store) -> Sessi
 @router.get("/{session_id}/messages", response_model=list[MessageResponse])
 async def get_session_messages(session_id: str, repo: SessionRepo) -> list[MessageResponse]:
     """走行の進行のメッセージ（ランナーの標準出力の行）を古い順に返す。"""
+    _require_uuid(session_id)
     session = await repo.get_by_id(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"セッション {session_id!r} が見つかりません")
@@ -111,6 +126,7 @@ async def download_session_logs_csv(session_id: str, repo: SessionRepo) -> Respo
     drive_logs の 9 列＋detail JSONB を展開して全列を書く。旧セッション（detail なし）の列は空欄。
     数万行でもメモリに全部載せないよう、DB のカーソルから流しながら返す。
     """
+    _require_uuid(session_id)
     session = await repo.get_by_id(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"セッション {session_id!r} が見つかりません")
@@ -153,6 +169,7 @@ async def download_session_logs_csv(session_id: str, repo: SessionRepo) -> Respo
 
 @router.get("/{session_id}/logs", response_model=list[LogResponse])
 async def get_session_logs(session_id: str, repo: SessionRepo) -> list[LogResponse]:
+    _require_uuid(session_id)
     # 既定の limit ではセッション開始～終了の全体が取れず、グラフ・テーブルが途中で
     # 途切れてしまう。CSV ダウンロードと同じく取得上限を大きく取り、全区間を返す。
     logs = await repo.list_logs(session_id, limit=1_000_000)
@@ -183,6 +200,7 @@ async def get_session_analysis(session_id: str, repo: SessionRepo, store: Store)
     （無ければ ``{"available": false}``）。質量・走行抵抗は車の vehicle.yaml（vehicle.*）から読む。
     合否・基準の線は出さない。
     """
+    _require_uuid(session_id)
     session = await repo.get_by_id(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"セッション {session_id!r} が見つかりません")

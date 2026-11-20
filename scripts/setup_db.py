@@ -252,6 +252,30 @@ DDL_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS idx_drive_session_messages_session_seq
         ON drive_session_messages (session_id, seq)
     """,
+    # スケジュールのセッションに、どのスケジュールかを残す（ProblemReport_20261120 O-5。名前は開始時点の写し）。
+    # src/infra/drive_recorder.py の SESSION_DDL_STATEMENTS と同じ（Web サーバーの起動時にも流す）
+    """
+    ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS schedule_id UUID
+    """,
+    """
+    ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS schedule_name TEXT
+    """,
+    # 利用者の「走行終了」で止めたセッションの status 'stopped'（O-6）。status の CHECK 制約があるときだけ作り直す
+    """
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'drive_sessions_status_check'
+              AND conrelid = 'drive_sessions'::regclass
+        ) THEN
+            ALTER TABLE drive_sessions DROP CONSTRAINT drive_sessions_status_check;
+            ALTER TABLE drive_sessions
+                ADD CONSTRAINT drive_sessions_status_check
+                CHECK (status IN ('running', 'completed', 'stopped', 'error', 'emergency'));
+        END IF;
+    END $$;
+    """,
     # エラーページのできごと（RPD_Phase_20261120_ErrorLog）。src/infra/error_repository.py の DDL_STATEMENTS と同じ
     """
     CREATE TABLE IF NOT EXISTS error_events (

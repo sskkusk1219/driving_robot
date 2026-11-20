@@ -1,7 +1,7 @@
 # ruff: noqa: E501
 """ジョブ（ランナーのサブプロセス）の記録を DB へ書く。JobManager が使う唯一の DB 口。
 
-- ``drive_sessions``: ジョブの開始で作り（vehicle_id・run_type・mode_id）、終了で status を更新する
+- ``drive_sessions``: ジョブの開始で作り（vehicle_id・run_type・mode_id・スケジュールのときは schedule_id/名前）、終了で status を更新する
 - ``drive_session_messages``: ランナーの標準出力の「進行のメッセージ」
 - ``drive_logs``: ランナーが保存した CSV を取り込む（9 列＋残りは detail JSONB。対応は drive_csv.py）
 
@@ -30,9 +30,53 @@ IMPORT_CHUNK_ROWS = 5000
 MessageRow = tuple[int, float, datetime, str, str]
 
 
+#: 起動時にも流す DDL（scripts/setup_db.py と同じ内容。setup_db を流し忘れても書けるようにする。IF NOT EXISTS で何度でも安全）
+SESSION_DDL_STATEMENTS = [
+    "ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS schedule_id UUID",
+    "ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS schedule_name TEXT",
+    """
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'drive_sessions_status_check'
+              AND conrelid = 'drive_sessions'::regclass
+        ) THEN
+            ALTER TABLE drive_sessions DROP CONSTRAINT drive_sessions_status_check;
+            ALTER TABLE drive_sessions
+                ADD CONSTRAINT drive_sessions_status_check
+                CHECK (status IN ('running', 'completed', 'stopped', 'error', 'emergency'));
+        END IF;
+    END $$;
+    """,
+]
+
+
+async def ensure_session_schema(pool: asyncpg.Pool) -> None:
+    """drive_sessions の追加の列・制約を用意する（起動時）。"""
+    for stmt in SESSION_DDL_STATEMENTS:
+        await pool.execute(stmt)
+
+
+def _uuid_or_none(value: str | None) -> uuid.UUID | None:
+    """UUID 形式の文字列だけ UUID にする（空・形式違いは None。記録のために走行を止めない）。"""
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        return None
+
+
 class DriveRecorder(Protocol):
     async def start_session(
-        self, *, vehicle_id: str, mode_id: str | None, run_type: str
+        self,
+        *,
+        vehicle_id: str,
+        mode_id: str | None,
+        run_type: str,
+        schedule_id: str | None = None,
+        schedule_name: str | None = None,
     ) -> str | None: ...
 
     async def add_messages(self, session_id: str, rows: Sequence[MessageRow]) -> None: ...
@@ -51,6 +95,8 @@ class NullDriveRecorder:
         vehicle_id: str,  # noqa: ARG002
         mode_id: str | None,  # noqa: ARG002
         run_type: str,  # noqa: ARG002
+        schedule_id: str | None = None,  # noqa: ARG002
+        schedule_name: str | None = None,  # noqa: ARG002
     ) -> str | None:
         return None
 
@@ -69,18 +115,27 @@ class PgDriveRecorder:
         self._pool = pool
 
     async def start_session(
-        self, *, vehicle_id: str, mode_id: str | None, run_type: str
+        self,
+        *,
+        vehicle_id: str,
+        mode_id: str | None,
+        run_type: str,
+        schedule_id: str | None = None,
+        schedule_name: str | None = None,
     ) -> str | None:
+        """schedule_id・schedule_name はスケジュールのジョブだけ（名前はその時点の写し。後で消えても残る）。"""
         session_id = str(uuid.uuid4())
         await self._pool.execute(
             """
-            INSERT INTO drive_sessions (id, profile_id, mode_id, run_type, started_at, status, vehicle_id)
-            VALUES ($1, NULL, $2, $3, NOW(), 'running', $4)
+            INSERT INTO drive_sessions (id, profile_id, mode_id, run_type, started_at, status, vehicle_id, schedule_id, schedule_name)
+            VALUES ($1, NULL, $2, $3, NOW(), 'running', $4, $5, $6)
             """,
             uuid.UUID(session_id),
             uuid.UUID(mode_id) if mode_id else None,
             run_type,
             vehicle_id,
+            _uuid_or_none(schedule_id),
+            schedule_name or None,
         )
         return session_id
 

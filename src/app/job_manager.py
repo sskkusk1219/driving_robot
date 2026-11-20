@@ -20,7 +20,8 @@ NN 推論）は Web サーバーとは別プロセスのランナーで動く。
 - セッション（drive_sessions）: 学習（run_type learning）・モード走行とスケジュール（auto）・手動運転（manual）で作る。
   **キャリブレーション（min 測定のジョグ）と初期化だけのジョブ（init_only）は作らない**（走行ではなく、
   ログに残す値がない。進行のメッセージは画面のバッファにだけ残る）
-- 終了時の status: 終了コード 0 → completed、非常停止で止めた → emergency、それ以外 → error。
+- 終了時の status: 終了コード 0 → completed、非常停止で止めた → emergency、利用者の走行終了（stop。130/143）→ stopped、
+  それ以外 → error。
   対話ジョブ（手動・キャリブレーション）は利用者が閉じるのが通常の終わりなので 130/143 も completed
 - CSV: ランナーが ``csv`` イベントで知らせた CSV を、ジョブの終わり（異常終了も）に drive_logs へ取り込む。
   種類 drive（モード走行）は取り込み後に消す。種類 learning（vehicles/<車ID>/data/。手順 13・14 が後で読み直す学習データ）は
@@ -287,20 +288,20 @@ def build_serve_command(
 def job_command(spec: JobSpec, job_id: str) -> dict[str, Any]:
     """ジョブを常駐ランナーへ送る JSON コマンド（src/robot/README.md の「コマンド」）。"""
     if spec.kind == KIND_INIT_ONLY:
-        return {"cmd": "init", "job_id": job_id}
+        return {"cmd": "init", "job_id": job_id, "vehicle": spec.vehicle_id}
     if spec.kind == KIND_INTERACTIVE:
-        return {"cmd": "interactive", "job_id": job_id, "purpose": spec.purpose or PURPOSE_MANUAL}
+        return {"cmd": "interactive", "job_id": job_id, "vehicle": spec.vehicle_id, "purpose": spec.purpose or PURPOSE_MANUAL}
     if spec.kind == KIND_MODE_DRIVE:
         return {
-            "cmd": "mode", "job_id": job_id, "mode": spec.mode_name, "plan_in": spec.plan_file,
+            "cmd": "mode", "job_id": job_id, "vehicle": spec.vehicle_id, "mode": spec.mode_name, "plan_in": spec.plan_file,
             "limit_s": spec.limit_s, "no_pre_check": spec.no_pre_check, "home_at_end": spec.home_at_end,
         }
     if spec.kind == KIND_SCHEDULE:
         return {
-            "cmd": "schedule", "job_id": job_id, "schedule": spec.schedule,
+            "cmd": "schedule", "job_id": job_id, "vehicle": spec.vehicle_id, "schedule": spec.schedule,
             "no_pre_check": spec.no_pre_check, "home_at_end": spec.home_at_end,
         }
-    return {"cmd": "steps", "job_id": job_id, "steps": spec.steps, "home_at_end": spec.home_at_end}
+    return {"cmd": "steps", "job_id": job_id, "vehicle": spec.vehicle_id, "steps": spec.steps, "home_at_end": spec.home_at_end}
 
 
 def build_plan_command(
@@ -352,7 +353,7 @@ class JobStatus:
     result: dict[str, Any] | None = None
     exit_code: int | None = None
     ended_at: datetime | None = None
-    final_status: str | None = None  # completed / error / emergency
+    final_status: str | None = None  # completed / stopped（利用者の走行終了）/ error / emergency
     stop_requested: bool = False
     emergency: bool = False
     sequence: SequenceRun | None = None  # シーケンスの 1 段として走っているとき、その全体の進み具合
@@ -561,14 +562,21 @@ def _apply_button_event(status: JobStatus, event: dict[str, Any]) -> None:
                 break
 
 
-def exit_to_status(code: int | None, *, emergency: bool, interactive: bool) -> str:
-    """終了コードと非常停止の有無から drive_sessions.status を決める。"""
+def exit_to_status(
+    code: int | None, *, emergency: bool, interactive: bool, stopped_by_user: bool = False
+) -> str:
+    """終了コードと非常停止の有無から drive_sessions.status を決める。
+
+    利用者の「走行終了」（stop コマンド）で止めたジョブ（stopped_by_user・130/143）は ``stopped``（異常ではない）。
+    """
     if emergency:
         return "emergency"
     if code == 0:
         return "completed"
     if interactive and code in _INTERACTIVE_OK_CODES:
         return "completed"
+    if stopped_by_user and code in _INTERACTIVE_OK_CODES:
+        return "stopped"
     return "error"
 
 
@@ -862,6 +870,8 @@ class JobManager:
         # 常駐ランナーが生きていて、初期化（init_only）が成功し、その後 needs_init・ランナーの終了・非常停止が
         # 無い間 True（D-15c）。サーバー起動時は False
         self._initialized = False
+        self._last_vehicle_id: str | None = None  # 最後にジョブを始めた車（待機中のエラーの記録用）
+        self._shutting_down = False  # アプリ終了（shutdown）で止めたジョブは利用者の走行終了ではない（stopped にしない）
 
     # ── 状態 ───────────────────────────────────────────────────────
 
@@ -1054,12 +1064,9 @@ class JobManager:
         if not skip_check:
             self._check_can_start(sequence, prepared=prepared)
         runner = self._live_runner()
-        if spec.kind == KIND_INIT_ONLY:
-            if runner is not None and runner.vehicle_id != spec.vehicle_id:
-                await self._retire_runner(runner)  # 車が変わった: 前の車のランナーを終えてから起動し直す
-                runner = None
-        else:
-            ready = self._initialized and runner is not None and runner.vehicle_id == spec.vehicle_id
+        # 初期化は機械の初期化（車と結びつけない）。ジョブは今選んでいる車（spec.vehicle_id）でコマンドを送る
+        if spec.kind != KIND_INIT_ONLY:
+            ready = self._initialized and runner is not None
             if not ready:
                 if spec.kind in _INIT_REQUIRED_KINDS:
                     raise JobConflict(NOT_INITIALIZED_MESSAGE)
@@ -1071,7 +1078,11 @@ class JobManager:
         if spec.run_type is not None:
             try:
                 session_id = await self._recorder.start_session(
-                    vehicle_id=spec.vehicle_id, mode_id=spec.mode_id, run_type=spec.run_type
+                    vehicle_id=spec.vehicle_id,
+                    mode_id=spec.mode_id,
+                    run_type=spec.run_type,
+                    schedule_id=spec.schedule_id if spec.kind == KIND_SCHEDULE else None,
+                    schedule_name=spec.schedule_name if spec.kind == KIND_SCHEDULE else None,
                 )
             except Exception as exc:
                 raise JobUnavailable(
@@ -1104,6 +1115,7 @@ class JobManager:
             if session_id is not None:
                 sequence.session_ids.append(session_id)
         self._job = job
+        self._last_vehicle_id = spec.vehicle_id
         job.flusher = asyncio.create_task(self._flush_loop(job))
         self._state = STATE_RUNNING
         if spec.kind == KIND_INIT_ONLY:
@@ -1641,7 +1653,7 @@ class JobManager:
                 title=self._title_of(text),
                 detail=text,
                 context={"messages": list(self._tail)},
-                vehicle_id=runner.vehicle_id if runner is not None else None,
+                vehicle_id=self._last_vehicle_id or (runner.vehicle_id if runner is not None else None),
                 dedupe=True,
             ))
         except Exception as exc:  # noqa: BLE001
@@ -1653,12 +1665,23 @@ class JobManager:
             return _PURPOSE_LABEL.get(spec.purpose or "", "対話ジョブ")
         return _KIND_LABEL.get(spec.kind, spec.kind)
 
+    @staticmethod
+    def _end_meaning(status: Any) -> str:
+        """終了の意味の文。ランナーの result の meaning（例: 中断（stop コマンド））があればそれ、無ければコード別の一般の文。"""
+        code = status.exit_code
+        result = status.result
+        if isinstance(result, dict):
+            text = result.get("meaning")
+            if isinstance(text, str) and text:
+                return text
+        return events.exit_meaning(code) if code is not None else "不明"
+
     def _record_job_end(self, job: _Job, issues: list[tuple[str, str]]) -> None:
         """ジョブの終わりの 1 件（_settle から）。非常停止のジョブは非常停止の件へ終了処理の結果を書き足す。"""
         try:
             st = job.status
             code = st.exit_code
-            meaning = events.exit_meaning(code) if code is not None else "不明"
+            meaning = self._end_meaning(st)
             label = self._job_label(st.spec)
             lines = [f"[{lv}] {tx}" for lv, tx in issues[:_ISSUE_LINES_MAX]]
             if len(issues) > _ISSUE_LINES_MAX:
@@ -1669,7 +1692,9 @@ class JobManager:
                     text, context_patch={"job_end": {"exit_code": code, "meaning": meaning, "job_id": st.job_id}}
                 )
                 return
-            stopped_by_user = st.stop_requested and not st.emergency and code in (130, 143)
+            stopped_by_user = st.final_status == "stopped" or (
+                st.stop_requested and not st.emergency and code in (130, 143)
+            )
             if st.final_status == "completed" or stopped_by_user:
                 if not issues:
                     return
@@ -1723,7 +1748,7 @@ class JobManager:
                 job_id, job_kind, session_id, vehicle_id = st.job_id, st.spec.kind, st.session_id, st.spec.vehicle_id
                 parts.append(f"そのとき: {self._job_label(st.spec)}を実行中")
             elif self._runner is not None:
-                vehicle_id = self._runner.vehicle_id
+                vehicle_id = self._last_vehicle_id or self._runner.vehicle_id
                 parts.append("そのとき: 待機中")
             seq = self._sequence
             if seq is not None:
@@ -1987,15 +2012,23 @@ class JobManager:
     def _settle(self, job: _Job) -> None:
         status = job.status
         code = status.exit_code
-        meaning = events.exit_meaning(code) if code is not None else "不明"
+        meaning = self._end_meaning(status)
         interactive = status.spec.kind == KIND_INTERACTIVE
-        status.final_status = exit_to_status(code, emergency=status.emergency, interactive=interactive)
+        status.final_status = exit_to_status(
+            code,
+            emergency=status.emergency,
+            interactive=interactive,
+            stopped_by_user=status.stop_requested and not status.emergency and not self._shutting_down,
+        )
         issues = list(job.issues)  # 終了の行（下の _say）は含めない
         self._say(
             job,
-            f"ジョブ終了: 終了コード {code}（{meaning}）"
+            # 利用者の走行終了は使う人の言葉で（コードは出さない。ユーザー決定 2026-11-21 O-10）
+            "終了しました（停止ボタンで中断）"
+            if status.final_status == "stopped"
+            else f"ジョブ終了: 終了コード {code}（{meaning}）"
             + ("、非常停止で止めました" if status.emergency else ""),
-            "INFO" if status.final_status == "completed" else "WARNING",
+            "INFO" if status.final_status in ("completed", "stopped") else "WARNING",
         )
         self._record_job_end(job, issues)
         if job.flusher is not None:
@@ -2129,14 +2162,6 @@ class JobManager:
             with contextlib.suppress(ProcessLookupError):
                 runner.proc.kill()
 
-    async def _retire_runner(self, runner: _Runner) -> None:
-        """常駐ランナーを quit で終わらせて待つ（車が変わった初期化など）。"""
-        runner.exiting = True
-        self._write_nowait(runner, {"cmd": "quit"})
-        runner.kill_task = asyncio.create_task(self._kill_runner_after(runner))
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(runner.exited.wait(), self.kill_timeout_s + 15.0)
-
     async def stop(self) -> JobStatus | None:
         """「走行終了」（コマンド stop。ランナーは終了処理 = 停止の流れまで済ませて待機へ戻る）。
         実行中のジョブが無ければ JobConflict。非常停止の状態には入らない。
@@ -2254,6 +2279,7 @@ class JobManager:
     async def shutdown(self) -> None:
         """アプリ終了時（A-D2）: 常駐ランナーへ quit（ジョブ実行中ならランナーがそのジョブを止めてから）→
         終わるまで待つ（猶予を超えたら SIGKILL）。"""
+        self._shutting_down = True
         await self.cancel_prepare()
         job = self._job
         seq = self._sequence

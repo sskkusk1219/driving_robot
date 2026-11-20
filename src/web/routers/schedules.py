@@ -103,6 +103,8 @@ async def list_schedules(repo: ScheduleRepo) -> list[ScheduleResponse]:
 @router.post("/", response_model=ScheduleDetailResponse, status_code=201)
 async def create_schedule(req: ScheduleCreateRequest, repo: ScheduleRepo) -> ScheduleDetailResponse:
     """タイムスケジュールを新規作成する。名称重複は 409。"""
+    if not req.name.strip():
+        raise HTTPException(status_code=422, detail="スケジュール名を入力してください")
     pedal_points = _pedal_points_from_schema(req.pedal_points)
     button_events = _button_events_from_schema(req.button_events)
     schedule = TimeSchedule(
@@ -144,6 +146,8 @@ async def update_schedule(
         raise HTTPException(
             status_code=404, detail=f"スケジュール {schedule_id!r} が見つかりません"
         )
+    if req.name is not None and not req.name.strip():
+        raise HTTPException(status_code=422, detail="スケジュール名を入力してください")
     pedal_points = (
         _pedal_points_from_schema(req.pedal_points)
         if req.pedal_points is not None

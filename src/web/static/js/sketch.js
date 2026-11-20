@@ -115,7 +115,7 @@ function StateBadge({ state }) {
 }
 
 // ── TopBar ───────────────────────────────────────────────────
-function TopBar({ state, screen, upsLoss, upsInstalled = true, profileName, modeName }) {
+function TopBar({ state, screen, upsLoss, upsInstalled = true, profileName, modeName, modeLabel = 'mode' }) {
   const tint = STATE_TINT[state] || STATE_TINT.READY;
   const showUpsLoss = upsLoss || state === 'AC_LOSS';
   return (
@@ -131,7 +131,7 @@ function TopBar({ state, screen, upsLoss, upsInstalled = true, profileName, mode
       <div style={{ fontSize: 15, color: INK_SOFT }}>{screen}</div>
       <div style={{ flex: 1 }} />
       <div style={{ fontSize: 15, color: INK_SOFT }}>profile: <b>{profileName || '---'}</b></div>
-      <div style={{ fontSize: 15, color: INK_SOFT }}>mode: <b>{modeName || '---'}</b></div>
+      <div style={{ fontSize: 15, color: INK_SOFT }}>{modeName ? modeLabel : 'mode'}: <b>{modeName || '---'}</b></div>
       <StateBadge state={state} />
       {upsInstalled && <UpsIndicator acLoss={showUpsLoss} />}
     </div>
@@ -173,7 +173,7 @@ function Sidebar({ active, onNav, locked }) {
 
 // ── Frame ────────────────────────────────────────────────────
 function Frame({ children, state = 'READY', screen = '', activeNav = '',
-                 upsLoss = false, upsInstalled = true, locked = false, profileName, modeName, onNav, onGoInit }) {
+                 upsLoss = false, upsInstalled = true, locked = false, profileName, modeName, modeLabel, onNav, onGoInit }) {
   return (
     <div style={{
       width: '100%', height: '100%',
@@ -187,7 +187,7 @@ function Frame({ children, state = 'READY', screen = '', activeNav = '',
       overflow: 'hidden',
     }}>
       <TopBar state={state} screen={screen} upsLoss={upsLoss} upsInstalled={upsInstalled}
-              profileName={profileName} modeName={modeName} />
+              profileName={profileName} modeName={modeName} modeLabel={modeLabel} />
       <Sidebar active={activeNav} onNav={onNav || (() => {})} locked={locked} />
       <div style={{ padding: '12px 20px 14px', minHeight: 0, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         {children}

@@ -16,6 +16,7 @@ src/robot/README.md の「差し替え点」の表と同じ（増やしたらそ
 | 10 | `_release_pedals`（core の pattern_drive・mode_drive・excite と src の schedule_job の各モジュール属性）・button_steps.press_shift_n_after_drive・main.shutdown（差し替え 4）を包む | 走行するジョブの非常停止を「減速して停車 → N → スタート 10 秒（IGN-OFF）→ 原点復帰」にする（src/robot/emergency_stop.py。RPD_Phase_20261119_EmergencyStop）。対話・ボタンだけのジョブは従来どおり |
 | 11 | build_hardware（core.hardware・core.main・quiet_connect の各モジュール属性）を包む（**スタブのときだけ**） | スタブ車両を実車の走行前と同じ「停止・P」から始める（core は D でクリープ 5 km/h から始め、走行前チェックの停止確認はブレーキを踏む前提。チェックがハードを動かさない決定 2026-11-19 の後は車速確認が通らない） |
 | 8 | button_steps.press_button を包む（最も外側）・ensure_buttons_connected → ボタンなしのとき何もしない | `buttons.installed: false`（SG90 を外している。ユーザー決定 2026-11-16 D-15c）: PCA9685 に繋がず・サーボを動かさず、押したことにしてログに残すだけ（押す秒数・押した後の待ちは同じだけ待つ） |
+| 12 | `_ModeRun.drive_axis`（mode_drive）・`PatternLoop._drive_or_sense`（pattern_loop）・`_ExciteRun._drive_axis`（excite）を包む | B-2: stop・SIGINT の cancel が Modbus 要求の最中に届き ModbusIOException になっても、cancel 中なら CancelledError に戻して停止の流れに入れる（誤った「通信失敗」ERROR を出さない） |
 """
 
 from __future__ import annotations
@@ -149,7 +150,7 @@ async def _job_end_without_disconnect(hw: Any, mode: str) -> None:
     if mode == "keep":
         say("ジョブの終わり: 停車保持のまま待機します（原点復帰・サーボOFF・切断はしません）")
         return
-    say("ジョブの終わり: 原点復帰だけ行います（サーボON・接続のまま待機します）")
+    say("走行の終わり: ペダルを原点へ戻します")
     try:
         await asyncio.gather(hw.accel.home_return(), hw.brake.home_return())
     except Exception as exc:  # noqa: BLE001
@@ -210,6 +211,41 @@ def install_emergency_stop() -> None:
     core_excite._release_pedals = release_pedals  # type: ignore[attr-defined]  # noqa: SLF001
     schedule_job._release_pedals = release_pedals  # type: ignore[attr-defined]  # noqa: SLF001
     core_button_steps.press_shift_n_after_drive = press_shift_n_after_drive  # type: ignore[assignment]
+
+
+def install_cancel_guard() -> None:
+    """差し替え 12: 軸を動かす 3 つのメソッドを包み、cancel 中の通信例外を CancelledError に戻す。
+
+    利用者の stop コマンドや SIGINT で内側のタスクを cancel したとき、Modbus の要求の最中だと pymodbus は
+    CancelledError を ``ModbusIOException("Request cancelled outside library")`` に変えて投げる。制御ループの
+    ``except Exception`` がそれを「アクチュエータ通信に失敗しました」の DriveError（誤った ERROR）にしてしまう。
+    子のメソッドの出口で ``raise_if_cancelling`` を呼んで CancelledError に戻せば、gather も CancelledError を
+    投げ、``except Exception`` に捕まらず sleep 中に cancel が届いたときと同じ停止の流れに入る
+    （ProblemReport_20261120_src全動作チェック B-2）。包み済みなら二重に包まない。
+    """
+    from src.robot.cancel_guard import raise_if_cancelling  # noqa: PLC0415
+    from src.robot.core import excite as core_excite  # noqa: PLC0415
+    from src.robot.core import pattern_loop as core_pattern_loop  # noqa: PLC0415
+
+    def wrap(cls: Any, name: str) -> None:
+        orig = cls.__dict__[name]
+        if getattr(orig, "_cancel_guarded", False):
+            return
+
+        @functools.wraps(orig)
+        async def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return await orig(self, *args, **kwargs)
+            except Exception as exc:
+                raise_if_cancelling(exc)
+                raise
+
+        guarded._cancel_guarded = True  # type: ignore[attr-defined]  # noqa: SLF001
+        setattr(cls, name, guarded)
+
+    wrap(core_mode_drive._ModeRun, "drive_axis")  # noqa: SLF001
+    wrap(core_pattern_loop.PatternLoop, "_drive_or_sense")
+    wrap(core_excite._ExciteRun, "_drive_axis")  # noqa: SLF001
 
 
 def install_stub_button_sync() -> None:
@@ -406,4 +442,5 @@ def install_all(stop: StopController) -> None:
     install_buttons_off()
     install_button_events()
     install_emergency_stop()
+    install_cancel_guard()
     _installed = True

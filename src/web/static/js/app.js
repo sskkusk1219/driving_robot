@@ -308,6 +308,11 @@ function App() {
         // 走っているモード走行・スケジュール・シーケンスがあれば、ブラウザの選択よりそれを出す（段 B）
         modeName: (realtimeData?.sequence?.state === 'running' ? realtimeData.sequence.name : null)
           ?? realtimeData?.job?.mode_name ?? realtimeData?.job?.schedule_name ?? activeModeName,
+        // 見出しの種類（mode / スケジュール / シーケンス）。走っているものがあればそれ、無ければ選択の種類
+        modeLabel: realtimeData?.sequence?.state === 'running' ? 'シーケンス'
+          : realtimeData?.job?.mode_name ? 'mode'
+          : realtimeData?.job?.schedule_name ? 'スケジュール'
+          : activeModeKind === 'sequence' ? 'シーケンス' : activeModeKind === 'schedule' ? 'スケジュール' : 'mode',
         onNav: key => {
           if (navLock && key !== nav) {
             showToast('実行中は他のページに移動できません', 'error');

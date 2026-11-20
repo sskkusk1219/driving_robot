@@ -17,6 +17,7 @@ const SESSION_STATUS_LABEL = {
   error: 'エラー',
   emergency: '非常停止',
   aborted: '中断',
+  stopped: '停止',
 };
 
 const CYCLE_STATUS_LABEL = SESSION_STATUS_LABEL;
@@ -36,7 +37,8 @@ function formatDuration(startedAt, endedAt) {
 }
 
 function sessionTitle(s, modeNames) {
-  const modeName = s.mode_id && modeNames ? modeNames[s.mode_id] : null;
+  // モード名。無ければスケジュール名（スケジュールで走ったセッション。古いセッションは null）
+  const modeName = (s.mode_id && modeNames ? modeNames[s.mode_id] : null) ?? s.schedule_name ?? null;
   const type = RUN_TYPE_LABEL[s.run_type] ?? s.run_type;
   // 車の名前（vehicle_name）。旧プロファイル時代の行（vehicle_id なし）は出さない
   const vehicle = s.vehicle_name ?? s.vehicle_id ?? null;

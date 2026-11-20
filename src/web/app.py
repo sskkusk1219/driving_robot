@@ -69,6 +69,12 @@ async def _build_repos(app: FastAPI) -> DriveRecorder:
         except Exception as exc:  # noqa: BLE001 - 記録の都合で起動を止めない
             logging.getLogger(__name__).warning("error_events テーブルを用意できません: %s", exc)
         app.state.error_repo = error_repo
+        try:
+            from src.infra.drive_recorder import ensure_session_schema  # noqa: PLC0415
+
+            await ensure_session_schema(pool)  # drive_sessions の schedule 列・status 'stopped'（setup_db 流し忘れ対策）
+        except Exception as exc:  # noqa: BLE001 - 記録の都合で起動を止めない
+            logging.getLogger(__name__).warning("drive_sessions の追加列を用意できません: %s", exc)
 
         # 前回プロセスの異常終了で 'running' のまま残った孤児セッションを是正する。
         from src.infra.log_writer import LogWriter  # noqa: PLC0415

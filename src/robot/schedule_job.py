@@ -28,6 +28,7 @@ import contextlib
 import math
 import time
 
+from src.robot.cancel_guard import raise_if_cancelling
 from src.robot.core import button_steps
 from src.robot.core import main as core_main
 from src.robot.core.axis_monitor import AxisMonitor
@@ -146,6 +147,7 @@ class _ScheduleRun:
                 self._drive_axis(hw.brake, brake_pos, is_accel=False),
             )
         except Exception as exc:
+            raise_if_cancelling(exc)
             raise DriveError(
                 f"アクチュエータ通信に失敗しました（{type(exc).__name__}: {exc}）"
             ) from exc
