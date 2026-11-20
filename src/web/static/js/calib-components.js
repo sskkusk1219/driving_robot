@@ -121,7 +121,7 @@ function OpeningBar({ value = 0, color = '#ddd4c4', label = '' }) {
 // ── DragSlider ────────────────────────────────────────────
 // Horizontal drag slider (left=decrease, right=increase).
 // Optional zeroPos / fullPos show calibration markers.
-function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullPos, disabled }) {
+function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullPos, disabled, displayValue, unit = 'pulse', minPos, maxPos }) {
   const { useRef } = React;
   const { INK, INK_SOFT, PAPER, HATCH } = window;
 
@@ -197,11 +197,24 @@ function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullP
         </div>
       )}
 
+      {/* min（ペダルに触れた位置）の印。キャリブレーション画面だけが渡す */}
+      {minPos != null && (
+        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pct(minPos)}%`, width: 2, background: '#c8922a', pointerEvents: 'none' }}>
+          <div style={{ position: 'absolute', bottom: 4, left: 4, fontSize: 9, color: '#c8922a', fontWeight: 700, whiteSpace: 'nowrap' }}>保存済み min</div>
+        </div>
+      )}
+
+      {/* max（開度上限）の印 */}
+      {maxPos != null && (
+        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pct(maxPos)}%`, width: 2, background: '#e0607a', pointerEvents: 'none' }}>
+          <div style={{ position: 'absolute', bottom: 4, right: 4, fontSize: 9, color: '#e0607a', fontWeight: 700, whiteSpace: 'nowrap' }}>保存済み max</div>
+        </div>
+      )}
+
       {/* Current value */}
       <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2, pointerEvents: 'none' }}>
-        <div style={{ fontSize: 26, fontFamily: 'inherit', fontWeight: 700, lineHeight: 1 }}>{currentPos ?? '—'}</div>
-        <div style={{ fontSize: 10, color: INK_SOFT }}>pulse</div>
-        <div style={{ fontSize: 10, color: INK_SOFT, marginTop: 4 }}>← ドラッグ →</div>
+        <div style={{ fontSize: 26, fontFamily: 'inherit', fontWeight: 700, lineHeight: 1 }}>{displayValue ?? currentPos ?? '—'}</div>
+        <div style={{ fontSize: 10, color: INK_SOFT }}>{unit}</div>
       </div>
 
       {/* Scale labels */}
@@ -273,17 +286,20 @@ function AxisPanel({ label, axisId, selected, enabled = true, onSelect, children
 
 // ── JogRow ────────────────────────────────────────────────
 // −10/−100 ボタン + ドラッグスライダー + +10/+100 ボタン（ヒント文字 s/w/d/e つき）
-function JogRow({ axisId, currentPos, onJog, zeroPos, fullPos, disabled }) {
+// labels を渡すと、ボタンの表示を換えられる（動く量は steps のまま。既定は pulse 表示）。
+// displayValue / unit / minPos はスライダーの中央表示と min の印（キャリブレーション画面用）。
+function JogRow({ axisId, currentPos, onJog, zeroPos, fullPos, disabled, labels = ['10', '100'], displayValue, unit, minPos, maxPos }) {
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
       <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-        <JogKey label="−10"  hint="s" onClick={() => onJog(axisId, -10)} disabled={disabled} />
-        <JogKey label="−100" hint="w" onClick={() => onJog(axisId, -100)} disabled={disabled} />
+        <JogKey label={`−${labels[0]}`}  hint="s" onClick={() => onJog(axisId, -10)} disabled={disabled} />
+        <JogKey label={`−${labels[1]}`} hint="w" onClick={() => onJog(axisId, -100)} disabled={disabled} />
       </div>
-      <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} zeroPos={zeroPos} fullPos={fullPos} disabled={disabled} />
+      <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} zeroPos={zeroPos} fullPos={fullPos} disabled={disabled}
+                  displayValue={displayValue} unit={unit} minPos={minPos} maxPos={maxPos} />
       <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-        <JogKey label="+10"  hint="d" onClick={() => onJog(axisId, 10)} disabled={disabled} />
-        <JogKey label="+100" hint="e" onClick={() => onJog(axisId, 100)} disabled={disabled} />
+        <JogKey label={`+${labels[0]}`}  hint="d" onClick={() => onJog(axisId, 10)} disabled={disabled} />
+        <JogKey label={`+${labels[1]}`} hint="e" onClick={() => onJog(axisId, 100)} disabled={disabled} />
       </div>
     </div>
   );

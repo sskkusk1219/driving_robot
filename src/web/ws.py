@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 import asyncio
 import logging
 from datetime import UTC, datetime
@@ -6,17 +7,12 @@ from fastapi import WebSocket
 from starlette.applications import Starlette
 
 from src.models.system_state import RobotState
-from src.web.schemas import CycleProgressSchema, InitStepSchema, RealtimeData
+from src.web.schemas import InitStepSchema, JobSnapshotSchema, RealtimeData
 
 logger = logging.getLogger(__name__)
 
 # WebSocket配信は100ms周期で±5msのジッタ許容のため asyncio.sleep を使用（制御ループとは別基準）
 WS_BROADCAST_INTERVAL_S = 0.1
-
-# get_realtime_data（Modbus 読み取り）の上限。これを超えたら計測値はフォールバックし、
-# robot_state の配信を止めない。非常停止中に home_return がバスを占有しても
-# 状態（EMERGENCY）がフロントへ確実に届くようにするための分離措置。
-GET_REALTIME_TIMEOUT_S = 0.5
 
 # クライアント毎の送信タイムアウト。1 クライアントの TCP バックプレッシャ（送信
 # バッファ満杯）が全クライアントの監視表示（EMERGENCY 含む）を凍結させないための上限。
@@ -78,35 +74,29 @@ async def realtime_ws(ws: WebSocket) -> None:
 
 
 async def broadcast_loop(app: Starlette) -> None:
+    """JobManager の状態（ランナーのイベントから作った robot_state・車速・基準・開度・init_steps）と UPS を配信する。
+
+    RealtimeData の形は段3 以前のまま。変えたのは cycle_progress → job（実行中のジョブの状態。
+    手順・phase・最新 sample など）と、電流（accel_current_ma / brake_current_ma。ランナーの
+    sample に無いので常に 0.0）。HW は触らない（ランナーのプロセスだけが触る）。
+    """
     # 直近送信したペイロード（timestamp 除外）。値が完全に不変なら再送を省略し、アイドル中の
-    # 無駄な JSON 直列化・全クライアント送信を避ける（E4 レビュー指摘）。状態変化（EMERGENCY
-    # 遷移等）は必ず内容差として検知されるため、安全に関わる更新の遅延は発生しない。
+    # 無駄な JSON 直列化・全クライアント送信を避ける。状態変化（EMERGENCY 遷移等）は必ず内容差として
+    # 検知されるため、安全に関わる更新の遅延は発生しない。
     last_payload: tuple[object, ...] | None = None
     while True:
         await asyncio.sleep(WS_BROADCAST_INTERVAL_S)
         if not manager.has_connections:
             continue
-        controller = app.state.controller
-        state = controller.get_system_state()
-        try:
-            # HW 読み取りがストールしても robot_state の配信を止めないよう上限を設ける。
-            snapshot = await asyncio.wait_for(
-                controller.get_realtime_data(), timeout=GET_REALTIME_TIMEOUT_S
-            )
-            actual_speed = snapshot.actual_speed_kmh
-            accel_current = snapshot.accel_current_ma
-            brake_current = snapshot.brake_current_ma
-        except Exception as exc:
-            # TimeoutError も Exception のサブクラスのためここで捕捉される。
-            logger.debug("get_realtime_data 失敗/タイムアウト（フォールバック）: %s", exc)
-            actual_speed = 0.0
-            accel_current = 0.0
-            brake_current = 0.0
-        accel_opening, brake_opening = controller.current_openings
+        jobs = app.state.job_manager
+        snap = jobs.snapshot()
+        live = jobs.live_values()
+        job = snap["job"]
+        robot_state = RobotState(snap["robot_state"])
 
         init_steps = [
-            InitStepSchema(key=s.key, label=s.label, status=s.status)
-            for s in controller.init_progress
+            InitStepSchema(key=s["key"], label=s["label"], status=s["status"])
+            for s in (job["init_steps"] if job else [])
         ]
 
         ups_battery_pct: float | None = None
@@ -120,24 +110,25 @@ async def broadcast_loop(app: Starlette) -> None:
         except Exception as exc:
             logger.debug("UPS 状態取得失敗: %s", exc)
 
-        cycle_progress: CycleProgressSchema | None = None
-        orchestrator = getattr(app.state, "cycle_orchestrator", None)
-        if orchestrator is not None:
-            cycle_progress = CycleProgressSchema.model_validate(orchestrator.progress)
+        job_schema = JobSnapshotSchema.model_validate(job) if job else None
 
-        # timestamp を除いた内容で変化検知する（送信スキップ判定専用。実送信は下の RealtimeData）。
+        # timestamp・経過秒を除いた内容で変化検知する（送信スキップ判定専用。実送信は下の RealtimeData）。
+        prepare = snap.get("prepare")
         payload = (
-            state.robot_state,
-            actual_speed,
-            controller.current_ref_speed,
-            accel_opening,
-            brake_opening,
-            accel_current,
-            brake_current,
+            robot_state,
+            live["speed_kmh"],
+            live["ref_kmh"],
+            live["accel_pct"],
+            live["brake_pct"],
             ups_battery_pct,
             ups_on_battery,
             tuple((s.key, s.status) for s in init_steps),
-            cycle_progress.model_dump_json() if cycle_progress is not None else None,
+            (job["phase"], job["step"], job["sample"] and job["sample"].get("section")) if job else None,
+            (job["paused"], len(job["button_events"]), job["dev_stats"] and job["dev_stats"]["n"]) if job else None,
+            (snap["sequence"]["run_no"], snap["sequence"]["state"]) if snap["sequence"] else None,
+            snap["initialized"],
+            (prepare["id"], prepare["state"], prepare["done"], prepare["message"]) if prepare else None,
+            snap.get("emergency_cause"),
         )
         if payload == last_payload and not manager.needs_full_send:
             continue
@@ -146,17 +137,22 @@ async def broadcast_loop(app: Starlette) -> None:
 
         data = RealtimeData(
             timestamp=datetime.now(tz=UTC).isoformat(),
-            robot_state=RobotState(state.robot_state),
-            actual_speed_kmh=actual_speed,
-            # 制御ループが実際に追従している基準車速を配信する（走行中以外は None）
-            ref_speed_kmh=controller.current_ref_speed,
-            accel_opening=accel_opening,
-            brake_opening=brake_opening,
-            accel_current_ma=accel_current,
-            brake_current_ma=brake_current,
+            robot_state=robot_state,
+            actual_speed_kmh=live["speed_kmh"],
+            # ランナーの sample の基準車速（モード走行以外は None）
+            ref_speed_kmh=live["ref_kmh"],
+            accel_opening=live["accel_pct"],
+            brake_opening=live["brake_pct"],
+            accel_current_ma=0.0,
+            brake_current_ma=0.0,
             ups_battery_pct=ups_battery_pct,
             ups_on_battery=ups_on_battery,
             init_steps=init_steps,
-            cycle_progress=cycle_progress,
+            initialized=snap["initialized"],
+            job=job_schema,
+            sequence=snap["sequence"],
+            prepare=prepare,
+            emergency_cause=snap.get("emergency_cause"),
+            emergency_cause_detail=snap.get("emergency_cause_detail"),
         )
         await manager.broadcast(data.model_dump_json())

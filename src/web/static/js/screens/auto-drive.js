@@ -1,222 +1,356 @@
-// ── Auto-drive monitor screen ─────────────────────────────
-// 4枠レイアウト（縦の比率 車速 1 : ペダル 1 : 全体進捗 0.25 : 情報 0.25）
-//   車速グラフ / ペダル開度グラフ / 全体進捗（名前・経過/全体・残り） / 情報1行（実車速・基準偏差・結果・ボタン）
-// showRefLine=false（学習運転・スケジュール）は基準の線・カーブを出さず、全体時間は「—」にする。
-// showStatusLog=true（学習運転・自動運転）は最下段を「現在ステータス」（サーバーログのターミナル風表示）にし、
-// bottomRatio で最下段の縦比率（既定 0.25）を変えられる。
+// ── Auto-drive / learning monitor screen（段11 UI 見直し）─────────────────
+// 4段レイアウト（縦の比率 車速 1 : ペダル 1 : 進捗 0.5 : 情報 0.5。画面の高さに合わせて伸縮し、ページはスクロールしない）
+//   車速グラフ / ペダル開度グラフ（ボタン押下の矩形つき） / 進捗（モードの全体進捗。学習は段階表示） /
+//   情報1行（左: 実車速・開度、中: 状態の 1 行、右: 「一時停止」（モード走行のみ）と「走行終了」）
+// 非常停止ボタンはこの画面に出さない。showRefLine=false（学習運転・スケジュール）は基準の線・カーブを出さない。
 
-// 現在ステータス: GET /api/v1/drive/log を 1 秒ごとに取りに行き、ターミナル風に流す。
-// 一番下にいる間だけ新しい行へ自動スクロールし、ユーザーが上へスクロールしたら止める。
-function DriveStatusLog({ robotState, summary }) {
-  const { useState, useEffect, useRef } = React;
-  const { INK, INK_MUTE, HATCH } = window;
-  const [lines, setLines] = useState([]);
-  const lastSeqRef = useRef(0);
-  const boxRef = useRef(null);
-  const stickRef = useRef(true);
+// ボタン（スタート・P・N・D）の色。ペダルの線（アクセル #78c8f0・ブレーキ #f07070）と区別する
+const BUTTON_COLORS = { start: '#b58cf0', P: '#e0b030', N: '#58d0b0', D: '#f090c0' };
+const BUTTON_LABELS = { start: 'スタート', P: 'P', N: 'N', D: 'D' };
+// ペダルの縦軸（0〜100%）の上で、ボタンは「押していない = 0・押している = 50」
+const BUTTON_PRESSED_LEVEL = 50;
+// ログ画面の走行グラフも同じ色・高さを使う（logs.js は auto-drive.js の後に読み込まれる）
+window.BUTTON_COLORS = BUTTON_COLORS;
+window.BUTTON_LABELS = BUTTON_LABELS;
+window.BUTTON_PRESSED_LEVEL = BUTTON_PRESSED_LEVEL;
 
-  useEffect(() => {
-    let alive = true;
-    let timer = null;
-    async function poll() {
-      try {
-        const q = lastSeqRef.current > 0 ? `?after=${lastSeqRef.current}` : '';
-        const res = await fetch(`/api/v1/drive/log${q}`);
-        if (res.ok && alive) {
-          const j = await res.json();
-          if (j.last_seq < lastSeqRef.current) {
-            // サーバー再起動などで連番が巻き戻った: 取り直す
-            lastSeqRef.current = 0;
-            setLines([]);
-          } else {
-            if (j.lines.length > 0) setLines(prev => prev.concat(j.lines).slice(-500));
-            lastSeqRef.current = j.last_seq;
-          }
-        }
-      } catch (e) { /* 通信失敗は次回に再試行（トーストは出さない） */ }
-      if (alive) timer = setTimeout(poll, 1000);
-    }
-    poll();
-    return () => { alive = false; if (timer) clearTimeout(timer); };
-  }, []);
+// 状態の短い文（phase → 1 語。長い説明は PHASE_LABEL）
+const PHASE_SHORT = {
+  starting: '起動中', init: '初期化中', prepare: '準備中', pre_check: '走行前チェック中', step: '走行中',
+  step_end: '手順終了', shutdown: '終了処理中', ready: 'Ready にしています', d: 'D に入れています',
+  n: 'N に入れています', done: '完了', interactive: 'コマンド待ち',
+};
 
-  useEffect(() => {
-    const el = boxRef.current;
-    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
-  }, [lines]);
-
-  function onScroll() {
-    const el = boxRef.current;
-    if (el) stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-  }
-
-  const idleHint = robotState === 'STANDBY' ? '初期化を実行してください'
-    : robotState === 'READY' ? '「開始」を押せます'
-    : (robotState ?? '—');
-  const colorOf = lv => lv === 'ERROR' || lv === 'CRITICAL' ? '#f07070' : lv === 'WARNING' ? '#f0c84a' : INK;
-
+// 計画の事前作成つきの開始確認ポップアップ（ConfirmStopPopup と同じ見た目。計画ができてから出すので、はい／いいえだけ）
+function PrepareConfirmPopup({ message, onYes, onNo }) {
+  const { INK, PAPER } = window;
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
-      {summary && <div style={{ flexShrink: 0, paddingBottom: 3, marginBottom: 3, borderBottom: `1px solid ${HATCH}` }}>{summary}</div>}
-      <div ref={boxRef} onScroll={onScroll}
-        style={{ flex: 1, minHeight: 0, overflowY: 'auto', fontFamily: 'ui-monospace, Menlo, Consolas, monospace', fontSize: 12, lineHeight: 1.45 }}>
-        {lines.length === 0
-          ? <div style={{ color: INK_MUTE }}>{idleHint}</div>
-          : lines.map(ln => (
-              <div key={ln.seq} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: colorOf(ln.level) }}>
-                {`[${ln.t.toFixed(1).padStart(6)}s] ${ln.message}`}
-              </div>
-            ))}
+    <div style={{
+      position: 'absolute', inset: 0, zIndex: 998,
+      background: 'rgba(30,20,20,0.45)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <div style={{
+        background: PAPER, border: `2px solid ${INK}`,
+        borderRadius: 8, padding: '32px 44px',
+        textAlign: 'center', boxShadow: '4px 4px 0 rgba(0,0,0,0.2)',
+        transform: 'rotate(-0.3deg)', minWidth: 320,
+        fontFamily: "'Meiryo UI', 'Meiryo', 'Yu Gothic UI', sans-serif",
+      }}>
+        <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 24, color: INK }}>{message}</div>
+        <div style={{ display: 'flex', gap: 16, justifyContent: 'center' }}>
+          <div onClick={onYes} style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            border: '2px solid #943030', borderRadius: 6, padding: '10px 32px',
+            background: '#2a1212', color: '#e05050',
+            fontWeight: 700, fontSize: 18, fontFamily: 'inherit',
+            cursor: 'pointer',
+            boxShadow: '2px 2px 0 rgba(0,0,0,0.4)',
+          }}>はい</div>
+          <div onClick={onNo} style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            border: `2px solid ${INK}`, borderRadius: 6, padding: '10px 32px',
+            background: PAPER, color: INK,
+            fontWeight: 700, fontSize: 18, fontFamily: 'inherit', cursor: 'pointer',
+            boxShadow: '2px 2px 0 rgba(0,0,0,0.4)',
+          }}>いいえ</div>
+        </div>
       </div>
     </div>
   );
 }
 
 function DriveMonitorScreen({
-  showRefLine = true, showPause = false, profileMaxSpeed = null,
-  screenTitle = '自動走行モニター', driveStartPath = '/api/v1/drive/start', driveStartBody = null,
-  driveStopPath = '/api/v1/drive/stop', driveArmPath = null, driveCancelPath = null,
+  showRefLine = true, profileMaxSpeed = null,
+  // 枠3に全体進捗の図を出すか（既定は showRefLine と同じ。シーケンスは走行中の手順がモードのときだけ図を出す）
+  showProgressFigure = showRefLine,
+  driveStartPath = '/api/v1/drive/start', driveStartBody = null,
+  // 計画の事前作成つきの開始（自動運転画面だけ）。{kind, id, limit_s?}。null なら従来の開始（学習画面など）
+  prepareBody = null,
+  driveStopPath = '/api/v1/drive/stop',
   confirmStartMessage = '開始しますか？', resultPanel = null,
   progressLabel = null,
-  confirmOnly = false, busy = false, busyLabel = null, onAbort = null,
+  // この画面が扱うジョブの種類（learning / mode_drive / schedule。配列も可）。別の種類のジョブが走っているときは開始を止める
+  jobKind = null,
+  // シーケンスの画面: 段の切れ目（ジョブが無い間）もシーケンスが動いていれば「実行中」とみなす
+  seqMode = false,
+  busyLabel = null, stopLabel = '走行終了', confirmStopMessage = '走行を終了しますか？',
   startedToastMessage = '走行を開始しました',
-  showStatusLog = false, bottomRatio = 0.25,
+  startDisabledReason = null,
 }) {
   const { useState, useEffect, useContext, useRef } = React;
-  const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeModeKind, robotState, setNavLock, setNav } = useContext(window.AppContext);
-  const { INK, INK_SOFT, PAPER, PAPER_2, HATCH, Box, Btn, Note } = window;
+  const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeModeKind, robotState, setNavLock, setNav, recheckSelection } = useContext(window.AppContext);
+  const { INK, INK_SOFT, INK_MUTE, PAPER, PAPER_2, HATCH, Box, Btn } = window;
 
   const [modeDetail, setModeDetail] = useState(null);
   const [nowS, setNowS] = useState(0);
   const [confirmStop, setConfirmStop] = useState(false);
   const [confirmStart, setConfirmStart] = useState(false);
+  const [prepResp, setPrepResp] = useState(null);       // POST /drive/prepare の応答（WebSocket の prepare が届くまでの代わり）
+  const [startingGo, setStartingGo] = useState(false);  // 「はい」を押してから prepare が waiting / null になるまで
+  // この画面が計画の準備を始めて、まだ「はい／いいえ」に答えていない（準備中〜確認ポップアップ）
+  const [prepOwned, setPrepOwned] = useState(false);
+  const prepOwnedRef = useRef(false);                   // 画面を離れるときの取り消し用（上と同じ値）
+  const [prepErr, setPrepErr] = useState(null);         // 準備に失敗した理由（次の開始まで状態の行に残す）
+  const wasWaitingRef = useRef(false);
   const [isDriving, setIsDriving] = useState(false);
   const driveStartTimeRef = useRef(null);
-  const confirmStartRef = useRef(false);
-  // 一時停止区間の累積実時間 [ms] と、現在の一時停止開始時刻。プレイヘッド(nowS)を
-  // バックエンドの _started_at シフトと整合させ、再開後もタイムラインを連続させる。
-  const pausedAccumMsRef = useRef(0);
-  const pauseStartRef = useRef(null);
+  const pausedRef = useRef(false);
+  // モード走行の時刻は、ランナーのモードの時刻（mode_time_s）だけで進める（段 A・A'）。
+  //   モード開始前（準備・走行前チェック）は経過 0 のまま止め、モードが終わった後（停車まで減速など）は最後の時刻で止める
+  const modeJobIdRef = useRef(null);   // 今見ているジョブ（変わったら下の印を戻す）
+  const modeSeenRef = useRef(false);   // このジョブで mode_time_s が一度でも来たか
+  const lastModeTRef = useRef(null);   // 最後に来た mode_time_s
+  const frozenRef = useRef(null);      // モード終了後に止めておく時刻（止めていなければ null）
+  const [frozenS, setFrozenS] = useState(null);
 
-  // 確認ポップアップ表示中（arm 済み・未確定）に画面を離脱したら、保持ブレーキを
-  // 取り残さないよう best-effort で cancel する。confirmStartRef でアンマウント時のみ発火。
-  useEffect(() => { confirmStartRef.current = confirmStart; }, [confirmStart]);
+  // 実行中のジョブ（WebSocket の job。終わると null）。この画面のジョブか・別のジョブかを分ける
+  const liveJob = realtimeData?.job ?? null;
+  const seqActive = seqMode && realtimeData?.sequence?.state === 'running';
+  const ownKinds = jobKind ? [].concat(jobKind) : null;
+  const ownJobNow = !!liveJob && liveJob.kind !== 'interactive' && (!ownKinds || ownKinds.includes(liveJob.kind));
+  const ownJob = ownJobNow || seqActive;
+  pausedRef.current = !!liveJob?.paused;
+  const otherJob = !!liveJob && !ownJob;
+  // 計画の事前作成（WebSocket の prepare）。waiting＝「はい」の後で計画がまだ終わっていない（この画面が待っている）
+  const prepare = realtimeData?.prepare ?? null;
+  const prepWaiting = !!prepareBody && prepare?.state === 'waiting';
+  // この画面のポップアップが無いのに計画の準備中（別の画面が開いている）
+  const otherPrep = !!prepareBody && !!prepare && prepare.state !== 'waiting' && prepare.state !== 'error'
+    && !prepOwned && !startingGo;
+  // 準備中（計画づくり）と、計画ができて確認ポップアップを出している間
+  const prepNow = prepResp && !prepare ? prepResp : prepare;
+  const prepReady = prepOwned && prepNow?.state === 'ready';
+  const busy = ownJob || prepWaiting;
+  // 初期化ページの初期化が済んでいないと、モード走行・学習は始められない（D-15c。サーバーも 409 で断る）。
+  // シーケンスはモードの段があるときだけ断られるので、画面では止めずサーバーの案内に任せる
+  const needsInit = !seqMode && ownKinds != null && ownKinds.length === 1
+    && (ownKinds[0] === 'learning' || ownKinds[0] === 'mode_drive');
+  const notInitialized = needsInit && realtimeData?.initialized === false;
+  // モード走行・スケジュール（シーケンスの各段を含む）は、時刻をモードの時刻（mode_time_s）に限る。学習運転だけ従来どおり t_s。
+  //   ジョブ単位で決める（走っているジョブの種類。無いときは画面の種類）。準備中（計画作り）は経過 0 のまま止める
+  const modeTimed = liveJob
+    ? (liveJob.kind === 'mode_drive' || liveJob.kind === 'schedule')
+    : (ownKinds != null && ownKinds.every(k => k === 'mode_drive' || k === 'schedule'));
+
+  // ジョブの実行中（初期化・走行・終了処理を含む）は他ページへの離脱をロック
+  useEffect(() => {
+    setNavLock(busy || prepOwned);
+    return () => setNavLock(false);
+  }, [busy, prepOwned]);
+
+  // 画面を離れるとき、準備中・ポップアップが開いたまま（未回答）なら準備を取り消す（ベストエフォート）
   useEffect(() => () => {
-    if (confirmStartRef.current && driveCancelPath) apiFetch('POST', driveCancelPath);
+    if (prepOwnedRef.current) {
+      try { fetch('/api/v1/drive/prepare/cancel', { method: 'POST', keepalive: true }); } catch (e) { /* 無視 */ }
+    }
   }, []);
 
-  // 走行中（RUNNING / PAUSED）または busy（学習サイクル等の背後処理中）は他ページへの離脱をロック
+  // 「はい」の後の経過: waiting か null になったら「はい直後」の印を戻す。waiting 中に error になったら 1 回だけ知らせる
   useEffect(() => {
-    const driving = robotState === 'RUNNING' || robotState === 'PAUSED' || busy;
-    setNavLock(driving);
-    return () => setNavLock(false);
-  }, [robotState, busy]);
+    if (!prepareBody) return;
+    if (prepare?.state === 'waiting') {
+      wasWaitingRef.current = true;
+      setStartingGo(false);
+    } else if (!prepare) {
+      wasWaitingRef.current = false;
+      setStartingGo(false);
+    } else if (prepare.state === 'error' && wasWaitingRef.current) {
+      wasWaitingRef.current = false;
+      setStartingGo(false);
+      window.showToast(`計画を作れませんでした: ${prepare.message ?? ''}`, 'error');
+    }
+  }, [prepare?.state]);
 
-  // T1: 走行中（RUNNING / PAUSED）のみ経過時間を進める。
-  // グラフの横スクロールを滑らかにするため、整数秒の setInterval ではなく
-  // requestAnimationFrame で小数秒（nowS）を更新し、毎フレーム再描画する。
-  // （旧実装は 1Hz 更新だったため、ウィンドウが 1 秒ごとにカクッと左へ跳ねていた）
-  // 一時停止（PAUSED）中は rAF を回さず nowS を凍結し、再開時に一時停止区間の実時間を
-  // pausedAccumMs に加算してタイムライン（プレイヘッド）を連続させる。
+  // 準備に失敗したとき: 1 回だけ知らせ、準備を取り消して通常の画面に戻す（理由は状態の行に残す）
   useEffect(() => {
-    const driving = robotState === 'RUNNING' || robotState === 'PAUSED';
+    if (!prepareBody || !prepOwnedRef.current) return;
+    if (prepare?.state !== 'error') return;
+    const msg = prepare.message ?? '';
+    prepOwnedRef.current = false;
+    setPrepOwned(false);
+    setPrepResp(null);
+    setPrepErr(msg);
+    window.showToast(`準備できませんでした: ${msg}`, 'error');
+    apiFetch('POST', '/api/v1/drive/prepare/cancel');
+  }, [prepare?.state, prepOwned]);
+
+  // 走行中（RUNNING）のみ経過時間を進める。グラフの横スクロールを滑らかにするため、
+  // 整数秒の setInterval ではなく requestAnimationFrame で小数秒（nowS）を更新する。
+  useEffect(() => {
+    const driving = robotState === 'RUNNING';
     if (!driving) {
       driveStartTimeRef.current = null;
-      pausedAccumMsRef.current = 0;
-      pauseStartRef.current = null;
+      modeSeenRef.current = false;
+      lastModeTRef.current = null;
+      frozenRef.current = null;
+      setFrozenS(null);
       setIsDriving(false);
       setNowS(0);
       return;
     }
-    if (!driveStartTimeRef.current) {
+    // モード時刻で動くジョブは、モードの時刻が来るまで（下の置き直しで）起点を置かない
+    if (!driveStartTimeRef.current && !modeTimed) {
       driveStartTimeRef.current = Date.now();
-      pausedAccumMsRef.current = 0;
-      pauseStartRef.current = null;
       setIsDriving(true);
     }
-    if (robotState === 'PAUSED') {
-      // 一時停止: プレイヘッドを凍結し、再開に備えて一時停止開始時刻を記録する
-      if (pauseStartRef.current === null) pauseStartRef.current = Date.now();
-      return;
-    }
-    // RUNNING: 直前が一時停止なら、その実時間を累積へ加えてタイムラインを連続させる
-    if (pauseStartRef.current !== null) {
-      pausedAccumMsRef.current += Date.now() - pauseStartRef.current;
-      pauseStartRef.current = null;
-    }
     let raf;
+    let last = Date.now();
     const tick = () => {
-      if (driveStartTimeRef.current) {
-        setNowS((Date.now() - driveStartTimeRef.current - pausedAccumMsRef.current) / 1000);
+      const now = Date.now();
+      if (frozenRef.current != null) {   // モード終了後は最後のモードの時刻で止める
+        setNowS(frozenRef.current);
+        raf = requestAnimationFrame(tick);
+        return;
       }
+      // 一時停止中はモードの時刻が止まるので、起点を進めて経過秒を止める
+      if (driveStartTimeRef.current && pausedRef.current) driveStartTimeRef.current += now - last;
+      last = now;
+      if (driveStartTimeRef.current) setNowS((now - driveStartTimeRef.current) / 1000);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [robotState]);
+  }, [robotState, modeTimed]);
+
+  // モード走行は、ランナーの sample のモードの時刻（mode_time_s）に合わせて起点を置き直す。
+  // RUNNING には計画を作る時間（数分）も入るので、壁時計だけだと経過・進捗・グラフの位置がその分ずれる（2026-11-16 段9）。
+  // 時刻が飛んだとき（D 待ちでモードを止めた等）だけ置き直し、普段は壁時計でなめらかに進める。
+  useEffect(() => {
+    if (modeTimed) {
+      const jid = liveJob?.job_id ?? null;
+      if (modeJobIdRef.current !== jid) {
+        modeJobIdRef.current = jid;
+        modeSeenRef.current = false;
+        lastModeTRef.current = null;
+        frozenRef.current = null;
+        setFrozenS(null);
+        driveStartTimeRef.current = null;   // 別のジョブ（シーケンスの次の段など）は、モードの時刻が来るまで経過 0
+        setIsDriving(false);
+        setNowS(0);
+      }
+      if (robotState !== 'RUNNING') return;
+      const m = liveJob?.sample?.mode_time_s;
+      if (m == null) {
+        // 開始前は何もしない（経過 0・起点なし）。モードが終わった後は最後の時刻で止める
+        if (modeSeenRef.current && frozenRef.current == null && lastModeTRef.current != null) {
+          frozenRef.current = lastModeTRef.current;
+          setFrozenS(lastModeTRef.current);
+        }
+        return;
+      }
+      modeSeenRef.current = true;
+      lastModeTRef.current = m;
+      if (frozenRef.current != null) { frozenRef.current = null; setFrozenS(null); }
+      const anchorM = Date.now() - m * 1000;
+      if (!driveStartTimeRef.current || liveJob?.paused || Math.abs(driveStartTimeRef.current - anchorM) > 300) {
+        driveStartTimeRef.current = anchorM;
+        setIsDriving(true);
+      }
+      return;
+    }
+    // 学習運転はモードの時刻が無いので、ランナーの経過（t_s。走行前チェックから）に合わせる
+    const mt = liveJob?.sample?.mode_time_s ?? liveJob?.sample?.t_s;
+    if (robotState !== 'RUNNING' || mt == null) return;
+    const anchor = Date.now() - mt * 1000;
+    if (!driveStartTimeRef.current || liveJob?.paused || Math.abs(driveStartTimeRef.current - anchor) > 300) {
+      driveStartTimeRef.current = anchor;
+      setIsDriving(true);
+    }
+  }, [realtimeData, robotState]);
 
   // 表示用の整数秒（mm:ss ラベルは秒単位で十分）
   const elapsed = Math.floor(nowS);
 
+  // 走っているモード走行のジョブがあれば、画面の選択より優先してそのモードの基準を読む（段 B）
+  const jobModeId = liveJob?.kind === 'mode_drive' ? (liveJob.mode_id ?? null) : null;
+  const refModeId = jobModeId ?? (activeModeKind === 'mode' ? activeModeId : null);
   useEffect(() => {
-    if (activeModeId && activeModeKind !== 'schedule') {
-      apiFetch('GET', `/api/v1/modes/${activeModeId}`).then(d => { if (d) setModeDetail(d); });
+    if (refModeId) {
+      setModeDetail(prev => (prev && prev.id === refModeId ? prev : null));
+      apiFetch('GET', `/api/v1/modes/${refModeId}`).then(d => {
+        if (d) setModeDetail(d);
+        else if (refModeId === activeModeId) recheckSelection?.();   // 見つからない（404）なら選択を外す（段 D）
+      });
     } else {
       setModeDetail(null);
     }
-  }, [activeModeId, activeModeKind]);
+  }, [refModeId]);
 
+  // 走っているスケジュールの総時間（経過の「/」の右に出す。シーケンスのスケジュールの段も同じ）
+  const jobScheduleId = liveJob?.kind === 'schedule' ? (liveJob.schedule_id ?? null) : null;
+  const [scheduleTotalS, setScheduleTotalS] = useState(null);
+  useEffect(() => {
+    if (!jobScheduleId) { setScheduleTotalS(null); return; }
+    let alive = true;
+    apiFetch('GET', `/api/v1/schedules/${jobScheduleId}`).then(d => {
+      if (alive) setScheduleTotalS(d && d.total_duration > 0 ? d.total_duration : null);
+    });
+    return () => { alive = false; };
+  }, [jobScheduleId]);
+
+  // 開始: 確認ポップアップ → POST。409/422/503 などは apiFetch が「何が起きたか・次にすること」を出す
   async function handleStart() {
-    // confirmOnly フロー（学習サイクル等）: driveStartPath 側が自前で arm/precheck を
-    // 同期実行するため、事前の arm HTTP 呼び出しはせず確認ポップアップのみ出す。
-    if (confirmOnly) { setConfirmStart(true); return; }
-    // arm フロー（学習運転）: arm → 確認ポップアップ → はい/いいえ
-    if (driveArmPath) {
-      const r = await apiFetch('POST', driveArmPath);
-      if (r) setConfirmStart(true);
-      return;
-    }
-    const r = await apiFetch('POST', driveStartPath, driveStartBody);
-    if (r) window.showToast(startedToastMessage, 'success');
-  }
-
-  async function handleConfirmStartYes() {
-    const r = await apiFetch('POST', driveStartPath, driveStartBody);
-    if (r) window.showToast(startedToastMessage, 'success');
-    // 失敗してもダイアログは閉じる（エラーはトーストと現在ステータスに出る。サーバー側は
-    // 失敗時に READY へ戻しているので、ここで開いたままにしても押せるものが無い）
-    setConfirmStart(false);
+    if (!prepareBody) { setConfirmStart(true); return; }
+    // 計画の事前作成を始め、「準備中…」を出す。計画ができたら確認ポップアップを出す（失敗は apiFetch が知らせる）
+    setPrepErr(null);
+    setPrepResp(null);
+    prepOwnedRef.current = true;
+    setPrepOwned(true);
+    const r = await apiFetch('POST', '/api/v1/drive/prepare', prepareBody);
+    if (!r) { prepOwnedRef.current = false; setPrepOwned(false); return; }
+    setPrepResp(r);
   }
 
   async function handleConfirmStartNo() {
-    if (driveCancelPath) await apiFetch('POST', driveCancelPath);
+    prepOwnedRef.current = false;
+    setPrepOwned(false);
+    setPrepResp(null);
+    if (prepareBody) await apiFetch('POST', '/api/v1/drive/prepare/cancel');
+  }
+
+  async function handlePrepareGo() {
+    prepOwnedRef.current = false;
+    setPrepOwned(false);
+    setPrepResp(null);
+    setStartingGo(true);
+    const r = await apiFetch('POST', '/api/v1/drive/prepare/go');
+    if (!r) { setStartingGo(false); return; }
+    if (r.state === 'waiting') window.showToast('計画ができしだい開始します', 'success');
+    else window.showToast(startedToastMessage, 'success');
+  }
+
+  async function handleConfirmStartYes() {
+    if (prepareBody) { await handlePrepareGo(); return; }
     setConfirmStart(false);
+    const r = await apiFetch('POST', driveStartPath, driveStartBody);
+    if (r) window.showToast(startedToastMessage, 'success');
   }
 
   async function handleStop() {
+    // 計画の作成待ち（ジョブはまだ無い）の停止は準備の取り消し
+    if (prepWaiting && !liveJob) {
+      const rc = await apiFetch('POST', '/api/v1/drive/prepare/cancel');
+      setConfirmStop(false);
+      if (rc) window.showToast('計画の作成を取り消しました', 'success');
+      return;
+    }
     const r = await apiFetch('POST', driveStopPath);
-    if (r) { window.showToast('走行を終了しました', 'success'); setConfirmStop(false); }
+    setConfirmStop(false);
+    if (r) window.showToast('停止を要求しました（原点復帰などの終了処理に少しかかります）', 'success');
   }
 
-  async function handlePause() {
-    const r = await apiFetch('POST', '/api/v1/drive/pause');
-    if (r) window.showToast('一時停止しました', 'success');
-  }
-
-  async function handleResume() {
-    const r = await apiFetch('POST', '/api/v1/drive/resume');
-    if (r) window.showToast('走行を再開しました', 'success');
+  // 一時停止 / 再開（モード走行だけ。ランナーへ SIGUSR1 / SIGUSR2）
+  async function handlePauseToggle() {
+    const r = await apiFetch('POST', liveJob?.paused ? '/api/v1/drive/resume' : '/api/v1/drive/pause');
+    if (r) window.showToast(r.paused ? '一時停止を要求しました' : '再開を要求しました', 'success');
   }
 
   const buf = realtimeBuf.current;
   const driveStart = driveStartTimeRef.current;
   // axis 2 (開度) は走行後のバッファデータのみ。
-  // 一時停止中は基準タイムラインと同じく実測波形も凍結する。制御ループは止まらず WS
-  // テレメトリは届き続けるため、これを含めると波形がプレイヘッドより右（未来）へ伸び続け、
-  // かつ 300 点スライスの枠を食って左側の履歴が押し出される。停止開始以降の点は除外する。
-  const pausedNow = pauseStartRef.current !== null;
   const recent = driveStart
-    ? buf.filter(d => d.ts >= driveStart && !(pausedNow && d.ts > pauseStartRef.current)).slice(-300)
+    ? buf.filter(d => d.ts >= driveStart).slice(-300)
     : [];
 
   // Graph constants
@@ -255,7 +389,16 @@ function DriveMonitorScreen({
   // 全体進捗: profile data
   // showRefLine=false（学習運転・スケジュール）では基準を使わない（選択中モードの全体時間を出さない）
   const refProfile = showRefLine ? (modeDetail?.reference_speed ?? []) : [];
-  const totalDurS = refProfile.length > 0 ? refProfile[refProfile.length - 1].time_s : 0;
+  const totalDurS = refProfile.length > 0
+    ? refProfile[refProfile.length - 1].time_s
+    : (jobScheduleId && scheduleTotalS ? Math.floor(scheduleTotalS) : 0);
+
+  // 枠3の図用の基準（速度グラフの基準線・経過の合計とは別。シーケンスは走行中がモード手順で、読み込み済みの詳細がそのモードのときだけ）
+  const figProfile = showRefLine
+    ? refProfile
+    : (showProgressFigure && liveJob?.kind === 'mode_drive' && modeDetail && modeDetail.id === liveJob.mode_id
+        ? (modeDetail.reference_speed ?? []) : []);
+  const figTotalS = figProfile.length > 0 ? figProfile[figProfile.length - 1].time_s : 0;
 
   const profileSpeedMax = refProfile.reduce((m, p) => Math.max(m, p.speed_kmh), 0);
   const maxSpeed = Math.max(100, Math.ceil(Math.max(profileSpeedMax, profileMaxSpeed ?? 0) / 20) * 20);
@@ -288,19 +431,14 @@ function DriveMonitorScreen({
   const windowEndS   = nowS + HALF_S;
 
   const toFrac = elapsedS => (elapsedS - windowStartS) / WINDOW_S;
-  // WS テレメトリの壁時計 ts を「走行経過秒」へ変換する。nowS・基準・進捗マーカーは累積
-  // 一時停止時間を差し引いた走行経過秒で動くため、実測波形も同じ軸に載せないと、一時停止を
-  // 挟むたびに波形だけが停止時間分だけ右へずれてしまう。停止区間の点は凍結時点へクランプする。
-  const toDriveElapsedS = ts => {
-    let pausedMs = pausedAccumMsRef.current;
-    if (pauseStartRef.current !== null && ts > pauseStartRef.current) {
-      pausedMs += ts - pauseStartRef.current;
-    }
-    return (ts - driveStart - pausedMs) / 1000;
-  };
+  // WS テレメトリの壁時計 ts を「走行経過秒」へ変換する（nowS・基準・進捗マーカーと同じ軸）
+  const toDriveElapsedS = ts => (ts - driveStart) / 1000;
   // 画面外(frac<0)の古い点は左端への山積みを避けるため除外する
   const onScreen = (d, key, max, h) => {
-    const frac = toFrac(toDriveElapsedS(d.ts));
+    const elapsedS = toDriveElapsedS(d.ts);
+    // モード終了後に止めている間は、止めた時刻より後の点（右半分）を出さない
+    if (frozenS != null && elapsedS > frozenS) return null;
+    const frac = toFrac(elapsedS);
     return frac >= 0 && frac <= 1
       ? { x: toXFull(frac), y: toY(d[key], max, h) }
       : null;
@@ -331,11 +469,11 @@ function DriveMonitorScreen({
   // T4: マーカーと進捗は走行中のみ
   // Axis 3: PAD_T=8, PAD_B=8 → speed=0 が baseline(y=PH3-8=52)に一致
   const G3_PAD_T = 8, G3_PAD_B = 8;
-  const profilePts = refProfile.map(p => ({
-    x: toXFull(totalDurS > 0 ? p.time_s / totalDurS : 0),
+  const profilePts = figProfile.map(p => ({
+    x: toXFull(figTotalS > 0 ? p.time_s / figTotalS : 0),
     y: toY(p.speed_kmh, maxSpeed, PH3, G3_PAD_T, G3_PAD_B),
   }));
-  const progressFrac = isDriving && totalDurS > 0 ? Math.min(1, nowS / totalDurS) : 0;
+  const progressFrac = isDriving && figTotalS > 0 ? Math.min(1, nowS / figTotalS) : 0;
   const markerX = toXFull(progressFrac);
 
   const fmt = s => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
@@ -372,10 +510,52 @@ function DriveMonitorScreen({
     );
   }
 
+  // 一時停止はモード走行のジョブだけ（学習・スケジュールでは出さない）
+  const canPause = !!liveJob && liveJob.kind === 'mode_drive' && (!ownKinds || ownKinds.includes('mode_drive'));
+  // 状態の 1 行: 状態 ｜ 区間 ｜ 経過/全体 ｜ 最大|偏差| ｜ p95
+  const dev = liveJob?.dev_stats ?? null;
+  const smp = liveJob?.sample ?? null;
+  const planWaitingOnly = prepWaiting && !liveJob;   // 計画の作成待ち（ジョブはまだ始まっていない）
+  const statusText = planWaitingOnly
+    ? `計画を作成中（${prepare.done ?? 0}/${prepare.total ?? 0}）`
+    : (prepOwned && !liveJob)
+    ? '準備中'
+    : (prepErr != null && !liveJob)
+    ? `準備できませんでした: ${prepErr}`
+    : liveJob
+    ? (liveJob.paused ? '一時停止中' : (PHASE_SHORT[liveJob.phase] ?? liveJob.phase))
+    : (robotState ?? '—');
+  const sectionText = smp ? (smp.pattern || window.SECTION_LABEL?.[smp.section] || smp.section || '—') : '—';
+  const timeText = (isDriving && !planWaitingOnly)
+    ? (totalDurS > 0 ? `${fmt(elapsed)}/${fmt(totalDurS)}` : `${fmt(elapsed)}/—`)
+    : '—';
+  const statusLine = [
+    `状態 ${statusText}`,
+    `区間 ${sectionText}`,
+    `経過 ${timeText}`,
+    `最大|偏差| ${dev ? dev.max.toFixed(2) : '—'}`,
+    `p95 ${dev ? dev.p95.toFixed(2) : '—'}`,
+  ].join(' ｜ ');
+
+  // ボタン押下の矩形（ペダルの図の時間軸。start_s/end_s はサンプルの mode_time_s ?? t_s と同じ軸）。
+  // 押し始めで 0 → BUTTON_PRESSED_LEVEL に立ち、押している間は横に伸び、離して 0 に落ちる。押している最中は現在時刻まで伸ばす
+  const buttonRects = (isDriving && liveJob?.button_events ? liveJob.button_events : []).map((e, i) => {
+    const xs = toXFull(toFrac(e.start_s));
+    const xe = toXFull(toFrac(e.end_s ?? nowS));
+    if (xe < PL || xs > PL + PW) return null;
+    const x0 = Math.max(PL, xs), x1 = Math.min(PL + PW, xe);
+    const y0 = toY(0, 100, PH2), y1 = toY(BUTTON_PRESSED_LEVEL, 100, PH2);
+    return {
+      key: `${e.button}-${e.start_s}-${i}`, color: BUTTON_COLORS[e.button] ?? INK_SOFT, label: BUTTON_LABELS[e.button] ?? e.button,
+      d: `M${xs.toFixed(1)},${y0.toFixed(1)} L${xs.toFixed(1)},${y1.toFixed(1)} L${xe.toFixed(1)},${y1.toFixed(1)} L${xe.toFixed(1)},${y0.toFixed(1)}`,
+      cx: (x0 + x1) / 2, topY: y1, clipL: xs < PL, clipR: xe > PL + PW,
+    };
+  }).filter(Boolean);
+
   const rd = realtimeData;
 
   return (
-    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 10, flex: 1, minHeight: 0 }}>
+    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0 }}>
 
       {/* 枠1: speed graph — 車速とペダルは同じ高さ */}
       <Box style={{ padding: '6px 0 2px', flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
@@ -408,9 +588,25 @@ function DriveMonitorScreen({
       <Box style={{ padding: '6px 0 2px', flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <GraphSvg height={PH2} yMax={100} unit="%">
+            {/* ボタンの帯は描画範囲（縦軸より右）で切り落とす。左端より前に始まった帯は左端から見える分だけ描く */}
+            <defs><clipPath id="buttonBandClip"><rect x={PL} y={0} width={PW} height={PH2} /></clipPath></defs>
+            <g clipPath="url(#buttonBandClip)">
+              {buttonRects.map(r => (
+                <path key={r.key} d={r.d} fill={r.color} fillOpacity="0.28" stroke={r.color} strokeWidth="1.5" strokeLinejoin="round" />
+              ))}
+            </g>
             {polyline(accelPts, '#78c8f0', 2.2)}
             {polyline(brakePts, '#f07070', 2.2)}
           </GraphSvg>
+          {buttonRects.map(r => (
+            <span key={`${r.key}-l`} style={{
+              // 帯が描画範囲の端で切れているときは、ラベルを範囲の内側に寄せる（縦軸の目盛りに重ねない）
+              position: 'absolute', top: `${(r.topY / PH2) * 100}%`,
+              left: `${((r.clipL ? PL + 2 : r.clipR ? PL + PW - 2 : r.cx) / VW) * 100}%`,
+              transform: `translate(${r.clipL ? '0' : r.clipR ? '-100%' : '-50%'}, -105%)`, fontSize: 11, lineHeight: 1, color: r.color,
+              fontWeight: 700, whiteSpace: 'nowrap', pointerEvents: 'none',
+            }}>{r.label}</span>
+          ))}
           {marker(rd.accel_opening, 100, PH2, '#78c8f0')}
           {marker(rd.brake_opening, 100, PH2, '#f07070')}
         </div>
@@ -448,171 +644,322 @@ function DriveMonitorScreen({
             </svg>
             アクセル
           </span>
+          {['start', 'P', 'N', 'D'].map(k => (
+            <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <svg width="14" height="10" style={{ flexShrink: 0 }}>
+                <rect x="1" y="1" width="12" height="8" fill={BUTTON_COLORS[k]} fillOpacity="0.4" stroke={BUTTON_COLORS[k]} strokeWidth="1.2" />
+              </svg>
+              {BUTTON_LABELS[k]}
+            </span>
+          ))}
         </div>
       </Box>
 
-      {/* 枠3: 全体進捗 — 常に表示。基準カーブ・▼は showRefLine かつ基準があるときだけ */}
-      <Box style={{ padding: '6px 0 2px', flex: '0.25 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <div style={{ flex: 1, minHeight: 0 }}>
-          <svg viewBox={`0 0 ${VW} ${PH3}`} width="100%" height="100%" preserveAspectRatio="none" style={{ display: 'block' }}>
-            <line x1={PL} y1={PH3 - G3_PAD_B} x2={PL + PW} y2={PH3 - G3_PAD_B} stroke={HATCH} strokeWidth="0.8" />
-            {showRefLine && profilePts.length > 0 && (() => {
-              const d = profilePts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-              return <path d={d} fill="none" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />;
-            })()}
-            {showRefLine && isDriving && totalDurS > 0 && (
-              <>
-                <line x1={markerX} y1={4} x2={markerX} y2={PH3 - 4} stroke="#f07070" strokeWidth="2" />
-                <text x={markerX} y={14} textAnchor="middle" fontSize="13" fill="#f07070">▼</text>
-              </>
-            )}
-          </svg>
-        </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, fontFamily: 'inherit', paddingLeft: PL, paddingRight: PR, paddingBottom: 4, color: INK_SOFT }}>
-          <span>{progressLabel ?? activeModeName ?? '—'}</span>
-          <span style={{ color: '#a23232', fontWeight: 700 }}>
-            {!isDriving
-              ? ''
-              : totalDurS > 0
-                ? `${fmt(elapsed)} / ${fmt(totalDurS)}  (${Math.round(progressFrac * 100)}%)`
-                : `${fmt(elapsed)} / — (—%)`}
-          </span>
-          <span>残 {isDriving && totalDurS > 0 ? fmt(Math.max(0, totalDurS - elapsed)) : '—'}</span>
-        </div>
+      {/* 枠3: 進捗（高さ 0.5）— モード: 全体進捗の図。学習・スケジュール・シーケンス: 段階表示・結果（resultPanel） */}
+      <Box style={{ padding: '4px 10px', flex: '0.5 1 0', minHeight: 0, minWidth: 0, display: 'flex', gap: 12 }}>
+        {figProfile.length > 0 && (
+          <div style={{ flex: resultPanel ? '1 1 55%' : '1 1 100%', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+            <div style={{ flex: 1, minHeight: 0 }}>
+              <svg viewBox={`0 0 ${VW} ${PH3}`} width="100%" height="100%" preserveAspectRatio="none" style={{ display: 'block' }}>
+                <line x1={PL} y1={PH3 - G3_PAD_B} x2={PL + PW} y2={PH3 - G3_PAD_B} stroke={HATCH} strokeWidth="0.8" />
+                {profilePts.length > 0 && (() => {
+                  const d = profilePts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+                  return <path d={d} fill="none" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />;
+                })()}
+                {isDriving && figTotalS > 0 && (
+                  <line x1={markerX} y1={4} x2={markerX} y2={PH3 - 4} stroke="#f07070" strokeWidth="2" />
+                )}
+              </svg>
+            </div>
+          </div>
+        )}
+        {resultPanel && (
+          <div style={{ flex: figProfile.length > 0 ? '1 1 45%' : '1 1 100%', minWidth: 0, minHeight: 0, overflowY: 'auto', fontSize: 13 }}>
+            {resultPanel}
+          </div>
+        )}
+        {figProfile.length === 0 && !resultPanel && <div style={{ flex: 1 }} />}
       </Box>
 
-      {/* 枠4: 情報1行 — 実車速 | 基準・偏差・開度 | 結果 | ボタン */}
-      <div style={{ flex: `${bottomRatio} 1 0`, minHeight: 0, display: 'flex', gap: 10, alignItems: 'stretch', overflow: 'hidden' }}>
-        {/* 現在ステータスを出すときは、ログの幅を取るため実車速と基準・開度を縦に積む */}
-        <Box style={{ display: 'flex', gap: showStatusLog ? 6 : 14, alignItems: showStatusLog ? 'flex-start' : 'center', justifyContent: 'center', flexDirection: showStatusLog ? 'column' : 'row', padding: '4px 12px', minHeight: 0 }}>
+      {/* 枠4: 情報1行（高さ 0.5）— 左: 実車速・開度 | 中: 状態の 1 行 | 右: ボタン */}
+      <div style={{ flex: '0.5 1 0', minHeight: 0, display: 'flex', gap: 8, alignItems: 'stretch', overflow: 'hidden' }}>
+        <Box style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'center', padding: '2px 8px', minHeight: 0, flexShrink: 0 }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, whiteSpace: 'nowrap' }}>
             <span style={{ fontSize: 12, color: INK_SOFT, letterSpacing: 1 }}>実車速</span>
-            <span style={{ fontSize: 34, fontWeight: 700, lineHeight: 1, fontFamily: 'inherit' }}>
+            <span style={{ fontSize: 'clamp(22px, 3.6vh, 36px)', fontWeight: 700, lineHeight: 1, fontFamily: 'inherit' }}>
               {(typeof rd.actual_speed_kmh === 'number' ? rd.actual_speed_kmh : 0).toFixed(1)}
             </span>
             <span style={{ fontSize: 12, color: INK_SOFT }}>km/h</span>
           </div>
-          <div style={{ fontSize: 12, color: INK_SOFT, whiteSpace: 'nowrap' }}>
+          <div style={{ fontSize: 12, color: INK_SOFT, whiteSpace: 'nowrap', lineHeight: 1.5 }}>
             {showRefLine && (
               (rd.ref_speed_kmh ?? null) !== null
-                ? `基準 ${rd.ref_speed_kmh.toFixed(1)} / 偏差 ${(rd.actual_speed_kmh - rd.ref_speed_kmh).toFixed(2)}　`
-                : '基準 — / 偏差 —　'
+                ? `基準 ${rd.ref_speed_kmh.toFixed(1)} / 偏差 ${(rd.actual_speed_kmh - rd.ref_speed_kmh).toFixed(2)}`
+                : '基準 — / 偏差 —'
             )}
-            {showRefLine && showStatusLog && <br />}
+            {showRefLine && <br />}
             {`アクセル ${rd.accel_opening.toFixed(1)}% / ブレーキ ${rd.brake_opening.toFixed(1)}%`}
           </div>
         </Box>
-        {showStatusLog ? (
-          // 現在ステータス: 段の要約（resultPanel）を上に 1 つ、その下にサーバーログを流す。
-          <Box style={{ flex: 1, minWidth: 0, minHeight: 0, padding: '4px 10px', fontSize: 13, overflow: 'hidden' }}>
-            <DriveStatusLog robotState={robotState} summary={resultPanel} />
-          </Box>
-        ) : resultPanel ? (
-          // 学習運転の段の名前・メッセージ。はみ出す分は枠内でスクロール。
-          <Box style={{ flex: 1, minWidth: 0, minHeight: 0, padding: '4px 10px', overflowY: 'auto', fontSize: 13 }}>
-            {resultPanel}
-          </Box>
-        ) : <div style={{ flex: 1 }} />}
-        <div style={{ display: 'flex', flexDirection: 'row', gap: 8, flex: '0 0 30%', minHeight: 0 }}>
+        <Box style={{ flex: 1, minWidth: 0, minHeight: 0, padding: '2px 12px', display: 'flex', alignItems: 'center' }}>
+          <div style={{ minWidth: 0, fontSize: 'clamp(10px, 1.4vh, 15px)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: INK }}>
+            {statusLine}
+          </div>
+        </Box>
+        <div style={{ display: 'flex', flexDirection: 'row', gap: 8, flex: '0 0 clamp(250px, 22%, 420px)', minHeight: 0 }}>
           {busy ? (
             <>
-              <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center', fontSize: 13, color: INK_SOFT, border: `1px solid ${HATCH}`, borderRadius: 4, padding: 8 }}>
-                {busyLabel ?? '実行中…'}
-              </div>
-              {onAbort && <Btn danger big style={{ flex: 1 }} onClick={onAbort}>■ 中断</Btn>}
-            </>
-          ) : robotState === 'RUNNING' ? (
-            <>
-              {showPause && (
-                <Btn big style={{ flex: 1, borderColor: INK_SOFT, background: PAPER_2, color: INK }} onClick={handlePause}>⏸ 一時停止</Btn>
+              {canPause && (
+                <Btn big style={{ flex: 1, padding: '4px 10px', borderColor: '#b89030', color: '#f0c84a' }} disabled={!!liveJob?.stop_requested} onClick={handlePauseToggle}>
+                  {liveJob?.paused ? '再開' : '一時停止'}
+                </Btn>
               )}
-              <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
+              <Btn danger big style={{ flex: 1, padding: '4px 10px' }} disabled={!!liveJob?.stop_requested} onClick={() => setConfirmStop(true)}>
+                {liveJob?.stop_requested ? '終了処理中' : stopLabel}
+              </Btn>
             </>
-          ) : robotState === 'PAUSED' ? (
+          ) : otherJob ? (
+            <Btn big disabled style={{ flex: 1, padding: '4px 10px' }}>他のジョブが実行中</Btn>
+          ) : prepOwned ? (
+            <Btn key="preparing" big disabled style={{ flex: 1, padding: '4px 10px' }}>準備中…</Btn>
+          ) : otherPrep ? (
+            <Btn big disabled style={{ flex: 1, padding: '4px 10px' }}>準備中です</Btn>
+          ) : notInitialized ? (
             <>
-              <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleResume}>▶ 走行再開</Btn>
-              <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 走行終了</Btn>
+              <Btn big disabled style={{ flex: 1, padding: '4px 10px' }}>開始</Btn>
+              <Btn big primary style={{ flex: 1, padding: '4px 10px' }} onClick={() => setNav('init')}>初期化ページへ</Btn>
             </>
+          ) : startDisabledReason ? (
+            <Btn big disabled style={{ flex: 1, padding: '4px 10px' }}>開始（準備中）</Btn>
           ) : robotState !== 'READY' ? (
-            // READY 以外で「開始」すると 409 になるため押せなくし、初期化画面へ誘導する
-            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <Note style={{ fontSize: 11, padding: '2px 8px', lineHeight: 1.3 }}>先に初期化を実行してください（現在: {robotState}）</Note>
-              <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
-                <Btn big disabled style={{ flex: 1, padding: '4px 10px' }}>開始</Btn>
-                <Btn style={{ flex: 1 }} onClick={() => setNav('init')}>初期化へ</Btn>
-              </div>
-            </div>
+            // READY（待機）以外で「開始」すると 409 になるため押せなくする（非常停止中は画面が別になる）
+            <Btn big disabled style={{ flex: 1, padding: '4px 10px' }}>開始できません（{robotState}）</Btn>
           ) : (
-            <Btn big style={{ flex: 1, borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleStart}>開始</Btn>
+            <Btn key="start" big style={{ flex: 1, padding: '4px 10px', borderColor: '#3c8c3c', background: '#0e220e', color: '#68d468' }} onClick={handleStart}>開始</Btn>
           )}
         </div>
       </div>
 
       {confirmStop && React.createElement(window.ConfirmStopPopup, {
-        message: '走行を終了しますか？',
+        message: confirmStopMessage,
         onYes: handleStop,
         onNo: () => setConfirmStop(false),
       })}
 
-      {confirmStart && React.createElement(window.ConfirmStopPopup, {
+      {confirmStart && !prepareBody && React.createElement(window.ConfirmStopPopup, {
         message: confirmStartMessage,
         onYes: handleConfirmStartYes,
-        onNo: handleConfirmStartNo,
+        onNo: () => setConfirmStart(false),
       })}
+
+      {prepReady && !startingGo && (
+        <PrepareConfirmPopup message={confirmStartMessage}
+          onYes={handleConfirmStartYes} onNo={handleConfirmStartNo} />
+      )}
     </div>
   );
 }
 
+// 終わったシーケンス（GET /api/v1/drive/status の last_sequence）。実行中のシーケンスが終わった瞬間に取りに行く
+function useLastSequence(liveSeq) {
+  const { useState, useEffect, useRef } = React;
+  const [last, setLast] = useState(null);
+  const prevRef = useRef(null);
+  async function load() {
+    try {
+      const res = await fetch('/api/v1/drive/status');
+      if (res.ok) { const j = await res.json(); setLast(j.last_sequence ?? null); }
+    } catch (e) { /* 次の機会に */ }
+  }
+  useEffect(() => { load(); }, []);
+  const liveKey = liveSeq?.state === 'running' ? liveSeq.sequence_id + liveSeq.started_at : null;
+  useEffect(() => {
+    if (prevRef.current && !liveKey) { load(); setTimeout(load, 800); setTimeout(load, 2500); }
+    prevRef.current = liveKey;
+  }, [liveKey]);
+  return last;
+}
+
+const SEQ_STATE_INFO = {
+  completed: { level: 'ok', label: '完了しました' },
+  stopped: { level: 'warn', label: '停止しました' },
+  error: { level: 'ng', label: '途中で止まりました' },
+  emergency: { level: 'ng', label: '非常停止で止まりました' },
+};
+const SEQ_TINT = {
+  ok:   { fg: '#68d468', bg: '#0e220e', border: '#2a6c2a' },
+  warn: { fg: '#f0c84a', bg: '#221c08', border: '#b89030' },
+  ng:   { fg: '#f07070', bg: '#220e0e', border: '#943030' },
+};
+
+// シーケンスの進み具合（「何段目/全体・何回目」）。seq は job_manager.SequenceRun.to_dict
+function SequenceProgress({ seq }) {
+  const { INK, INK_SOFT } = window;
+  const kind = seq.kind === 'schedule' ? 'スケジュール' : '走行モード';
+  return (
+    <div style={{ fontSize: 12, color: INK_SOFT, lineHeight: 1.5 }}>
+      <b style={{ color: INK }}>シーケンス「{seq.name}」</b>
+      {'　'}全体 <b style={{ color: INK }}>{seq.cycle}/{seq.cycles}</b> 周目
+      {'　'}<b style={{ color: INK }}>{seq.step_no}/{seq.steps_total}</b> 段目（{kind}「{seq.ref_name}」{seq.step_repeat}/{seq.step_repeats} 回目）
+      {'　'}通算 <b style={{ color: INK }}>{seq.run_no}/{seq.runs_total}</b> 回
+    </div>
+  );
+}
+
+function SequenceResultBanner({ seq, onDismiss, onLogs }) {
+  const { INK, INK_SOFT, Btn } = window;
+  const info = SEQ_STATE_INFO[seq.state] ?? { level: 'ng', label: seq.state };
+  const t = SEQ_TINT[info.level];
+  const done = (seq.results || []).filter(r => r.final_status === 'completed').length;
+  return (
+    <div style={{ border: `1.3px solid ${t.border}`, background: t.bg, borderRadius: 4, padding: '4px 10px', display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+      <div style={{ flex: 1, minWidth: 0, fontSize: 12.5, lineHeight: 1.5 }}>
+        <div style={{ color: t.fg, fontWeight: 700 }}>シーケンス「{seq.name}」: {info.label}（{done}/{seq.runs_total} 回が完了）</div>
+        {seq.message && <div style={{ color: INK }}>{seq.message}</div>}
+        {info.level !== 'ok' && <div style={{ color: INK_SOFT }}>次にすること: 原因を進行のメッセージ（ログ画面）で確認し、必要なら最初からやり直してください（残りの段は走っていません）。</div>}
+      </div>
+      <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+        {onLogs && <Btn onClick={onLogs}>ログへ</Btn>}
+        {onDismiss && <Btn ghost onClick={onDismiss}>閉じる</Btn>}
+      </div>
+    </div>
+  );
+}
+
+// 自動運転（RPD D-15）: 走行モード・タイムスケジュール・シーケンスを選んで開始。プラン・一時停止は無い。
+//   モード: 常に手順24（スタート・D・N のボタンを自動で押して走る）
+//   タイムスケジュール（段6）: ペダル開度を時刻で再生する開ループ。ボタンはボタン名で指定したイベントだけ押す
+//   シーケンス（段6）: 段（モード・スケジュール）を順に、繰り返し回数どおり 1 回ずつ走らせる。どれかが失敗したら残りは走らせない
 function AutoDriveScreen() {
   const { useState, useEffect, useContext } = React;
-  const { apiFetch, activeProfileId, activeModeId, activeModeKind, setNav } = useContext(window.AppContext);
-  const { ValidationPopup } = window;
+  const { apiFetch, activeProfileId, activeModeId: selModeId, activeModeName: selModeName, activeModeKind: selModeKind, setNav, realtimeData } = useContext(window.AppContext);
+  const { ValidationPopup, Note, INK, INK_SOFT, INK_MUTE, Pill } = window;
 
   const [popup, setPopup] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [dismissedJobId, setDismissedJobId] = useState(null);
+  const [dismissedSeq, setDismissedSeq] = useState(null);
+  // 走っているジョブ・シーケンスがあれば、画面の選択（ブラウザの localStorage）より優先してそれを表示・使う（段 B）
+  const runJob = realtimeData?.job ?? null;
+  const runSeq = realtimeData?.sequence?.state === 'running' ? realtimeData.sequence : null;
+  let activeModeKind = selModeKind, activeModeId = selModeId, activeModeName = selModeName;
+  let followsRunning = false;
+  if (runSeq) {
+    activeModeKind = 'sequence'; activeModeId = runSeq.sequence_id ?? selModeId; activeModeName = runSeq.name ?? selModeName;
+    followsRunning = true;
+  } else if (runJob?.kind === 'mode_drive' && runJob.mode_id) {
+    activeModeKind = 'mode'; activeModeId = runJob.mode_id; activeModeName = runJob.mode_name ?? selModeName;
+    followsRunning = true;
+  } else if (runJob?.kind === 'schedule' && runJob.schedule_id) {
+    activeModeKind = 'schedule'; activeModeId = runJob.schedule_id; activeModeName = runJob.schedule_name ?? selModeName;
+    followsRunning = true;
+  }
   const isSchedule = activeModeKind === 'schedule';
+  const isSequence = activeModeKind === 'sequence';
+  const lastJob = window.useLastJob(realtimeData?.job ?? null);
+  const lastSeq = useLastSequence(realtimeData?.sequence ?? null);
+
+  // 開発用: URL に ?dev_limit_s=60 を付けると、モード走行（シーケンスのモードの段を含む）を先頭 60 秒で打ち切る（API の limit_s。動作確認用）
+  const devLimitS = (() => {
+    try {
+      const v = parseFloat(new URLSearchParams(location.search).get('dev_limit_s'));
+      return Number.isFinite(v) && v > 0 ? v : null;
+    } catch { return null; }
+  })();
 
   useEffect(() => {
+    setPopup(null);
     if (!activeProfileId) { setPopup('no_profile'); return; }
-    if (!activeModeId)    { setPopup('no_mode'); return; }
+    // 車の表示（上の行）はモードの選択が無くても出す（走っているジョブを開いたとき「車: —」にならないように）
     apiFetch('GET', `/api/v1/profiles/${activeProfileId}`).then(p => {
-      if (p && !p.calibration?.is_valid) setPopup('no_calib');
+      if (!p) return;
+      setProfile(p);
+      if (!selModeId) setPopup('no_mode');
+      else if (!(p.min_accel_measured && p.min_brake_measured)) setPopup('no_min');
+      // タイムスケジュールは学習の結果（pkl）を使わない開ループなので、学習済みでなくても走らせられる
+      else if (!p.learned && !isSchedule) setPopup('no_learned');
     });
-  }, []);
+  }, [activeProfileId, selModeId]);
 
   const POPUP_CONFIG = {
-    no_profile: { message: '車両プロファイルを選択してください',     actionLabel: 'プロファイルへ',       nav: 'profiles' },
-    no_calib:   { message: 'キャリブレーションデータがありません',   actionLabel: 'キャリブレーションへ', nav: 'calibration' },
-    no_mode:    { message: '走行モードまたはタイムスケジュールを選択してください', actionLabel: '走行モードへ', nav: 'modes' },
+    no_profile: { message: '車を選択してください',                       actionLabel: '車両プロファイルへ',   nav: 'profiles' },
+    no_min:     { message: 'この車のペダルの min が未測定です',           actionLabel: 'キャリブレーションへ', nav: 'calibration' },
+    no_learned: { message: 'この車は学習運転が済んでいません',           actionLabel: '学習運転へ',           nav: 'learning' },
+    no_mode:    { message: '走行モード・スケジュール・シーケンスを選択してください', actionLabel: '走行モードへ', nav: 'modes' },
   };
+  // 走行中（この画面のジョブ・シーケンス）は開始の前提の窓を出さない
+  // WebSocket の最初の値が来るまで（initialized が undefined の間）は、走っているジョブがあるか分からないので窓を出さない
+  const wsReady = realtimeData?.initialized !== undefined;
+  const cfg = popup && wsReady && !followsRunning ? POPUP_CONFIG[popup] : null;
 
-  const cfg = popup ? POPUP_CONFIG[popup] : null;
+  const liveJob = realtimeData?.job ?? null;
+  const liveSeq = realtimeData?.sequence ?? null;
+  const jobKinds = isSchedule ? ['schedule'] : isSequence ? ['mode_drive', 'schedule'] : ['mode_drive'];
+  const ownKinds = jobKinds;
+  const showResult = !isSequence && !liveJob && lastJob && ownKinds.includes(lastJob.kind) && lastJob.job_id !== dismissedJobId && (lastJob.exit_code != null || lastJob.result);
+  const showSeqResult = isSequence && !liveSeq && lastSeq && lastSeq.state !== 'running' && lastSeq.started_at !== dismissedSeq;
+  const summary = isSequence && liveSeq && liveSeq.state === 'running' ? (
+      <div>
+        <SequenceProgress seq={liveSeq} />
+        {liveJob && (
+          <div style={{ fontSize: 12, color: INK_SOFT }}>
+            {window.PHASE_LABEL?.[liveJob.phase] ?? liveJob.phase}
+            {liveJob.step_title && liveJob.phase === 'step' ? `　（${liveJob.step_title}）` : ''}
+          </div>
+        )}
+      </div>
+    ) : showSeqResult ? (
+      <SequenceResultBanner seq={lastSeq} onDismiss={() => setDismissedSeq(lastSeq.started_at)} onLogs={() => setNav('logs')} />
+    ) : null;   // 走り終わった結果の帯は 3 段目に出さない（結果はログページで見る。ユーザー決定 2026-11-16）
+
+  const kindLabel = isSequence ? 'シーケンス' : isSchedule ? 'タイムスケジュール' : '走行モード';
 
   return (
-    <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-      {isSchedule ? (
-        <DriveMonitorScreen showPause={false} showRefLine={false} screenTitle="自動走行モニター"
-          driveStartPath="/api/v1/drive/schedule/start"
-          driveStartBody={activeModeId ? { schedule_id: activeModeId } : null}
-          driveStopPath="/api/v1/drive/schedule/stop"
-          confirmStartMessage="開始しますか？"
-          showStatusLog={true} bottomRatio={0.6} />
-      ) : (
-        <DriveMonitorScreen showPause={true} screenTitle="自動走行モニター"
-          driveStartPath="/api/v1/drive/start"
-          driveStartBody={activeModeId ? { mode_id: activeModeId } : null}
-          driveStopPath="/api/v1/drive/stop"
-          driveArmPath="/api/v1/drive/arm"
-          driveCancelPath="/api/v1/drive/cancel"
-          confirmStartMessage="開始しますか？"
-          showStatusLog={true} bottomRatio={0.6} />
-      )}
-      {cfg && (
-        <ValidationPopup
-          message={cfg.message}
-          actionLabel={cfg.actionLabel}
-          onAction={() => setNav(cfg.nav)}
-        />
-      )}
+    <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontSize: 13, color: INK_SOFT, flexShrink: 0 }}>
+        <span>車: <b style={{ color: INK }}>{profile?.name ?? '—'}</b></span>
+        <span>{kindLabel}: <b style={{ color: INK }}>{activeModeName ?? '—'}</b></span>
+        {devLimitS && !isSchedule && (
+          <span style={{ color: '#f0c84a', border: '1px dashed #b89030', borderRadius: 4, padding: '1px 8px' }}>
+            開発用: 先頭 {devLimitS} 秒で打ち切り
+          </span>
+        )}
+      </div>
+      <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        {isSequence ? (
+          <DriveMonitorScreen showRefLine={false} showProgressFigure={true} jobKind={jobKinds} seqMode={true}
+            driveStartPath="/api/v1/drive/sequence/start"
+            driveStartBody={activeModeId ? { sequence_id: activeModeId, ...(devLimitS ? { limit_s: devLimitS } : {}) } : null}
+            prepareBody={activeModeId ? { kind: 'sequence', id: activeModeId, limit_s: devLimitS || null } : null}
+            driveStopPath="/api/v1/drive/sequence/stop"
+            confirmStartMessage={`シーケンス「${activeModeName ?? ''}」を開始しますか？（段を順に走らせます）`}
+            confirmStopMessage="シーケンスを止めますか？（走っている段を止め、残りの段は走らせません）"
+            stopLabel="シーケンス停止"
+            startedToastMessage="シーケンスを開始しました"
+            progressLabel={activeModeName}
+            resultPanel={summary} />
+        ) : isSchedule ? (
+          <DriveMonitorScreen showRefLine={false} jobKind="schedule"
+            driveStartPath="/api/v1/drive/schedule/start"
+            driveStartBody={activeModeId ? { schedule_id: activeModeId } : null}
+            prepareBody={activeModeId ? { kind: 'schedule', id: activeModeId, limit_s: null } : null}
+            driveStopPath="/api/v1/drive/schedule/stop"
+            confirmStartMessage={`スケジュール「${activeModeName ?? ''}」を再生しますか？（ペダルが開ループで動きます）`}
+            progressLabel={activeModeName}
+            resultPanel={summary} />
+        ) : (
+          <DriveMonitorScreen jobKind="mode_drive" progressLabel={activeModeName}
+            driveStartPath="/api/v1/drive/start"
+            driveStartBody={activeModeId ? { mode_id: activeModeId, ...(devLimitS ? { limit_s: devLimitS } : {}) } : null}
+            prepareBody={activeModeId ? { kind: 'mode', id: activeModeId, limit_s: devLimitS || null } : null}
+            driveStopPath="/api/v1/drive/stop"
+            confirmStartMessage={`${activeModeName ?? '走行'} を開始しますか？`}
+            resultPanel={summary} />
+        )}
+        {cfg && (
+          <ValidationPopup message={cfg.message} actionLabel={cfg.actionLabel} onAction={() => setNav(cfg.nav)} />
+        )}
+      </div>
     </div>
   );
 }

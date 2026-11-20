@@ -151,3 +151,9 @@ plan_learn_reward_epsilon = 1.0
 refine_final_runs = 0
 # 学習運転（開ループパターン走行）完了待ちのタイムアウト [s]
 learning_timeout_s = 900.0
+
+[web_gpio]
+# WebUI サーバー（src）専用: 非常停止スイッチ(GPIO)の見張りを使うか。false は未接続の機体用（見張りを
+# 起動せず、非常停止の解除もピンを見ない）。環境変数 DRIVING_ROBOT_GPIO_DISABLED=1 でも切れる。
+# tests/research は [gpio] に未知のキーがあると起動しないので、別の節にしている（[gpio] には足さない）
+enabled = true

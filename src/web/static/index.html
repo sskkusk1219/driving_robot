@@ -37,6 +37,9 @@
       box-shadow: 3px 3px 0 rgba(0,0,0,0.45);
       animation: slideIn 0.2s ease;
       pointer-events: auto;
+      white-space: pre-line;
+      max-width: 520px;
+      line-height: 1.5;
     }
     .toast.error {
       background: #2a1212;
@@ -67,6 +70,8 @@
 
   <!-- UI primitives (sketch.jsx ベース) -->
   <script type="text/babel" src="/static/js/sketch.js"></script>
+  <!-- ジョブの共通部品（API エラー文・終了コード・段階表示） -->
+  <script type="text/babel" src="/static/js/job-utils.js"></script>
   <!-- Calibration/Manual jog components -->
   <script type="text/babel" src="/static/js/calib-components.js"></script>
   <!-- Screens -->

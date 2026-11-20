@@ -1,0 +1,293 @@
+# 移植元: tests/research/dob.py（scripts/port_research.py が 2026-11-19 に写した。tests の commit 4c80595+未コミットの変更あり）。手で直さない  # noqa: E501
+"""C11（DOB = 外乱オブザーバ）の推定器（2026-10-18 段2q）。
+
+表（順モデル）が予測する加速度と、実車速から測った加速度の差を、ペダル別に一次遅れでならして
+持つ。差 d ＝ 実測 − 予測 [km/h/s]（正＝表より加速している／減速が浅い、負＝表より遅い）。
+走行ループ（mode_drive）が毎周期 `update` を呼び、開度の列を引き直すときに `fwd_plan.
+deviation_offset_detail(dob_kmhs=d)` で「要る加速度から d を引いて」表を引く。
+
+- 推定に使う開度は、実際に出した開度から min を引いた u（アクセル正・ブレーキ負・min 以下は 0）
+- u は遅れ L だけ過去のもの（アクセルの u はアクセルの遅れ、ブレーキの u はブレーキの遅れ。
+  `fwd_plan.lagged_input` と同じ向きと優先順）を使う
+- ブレーキの予測は、計画（`fwd_plan._resolve_releases`）と同じく戻しの表を引く。戻し量 ＝ 遅れた u −
+  その時刻までの直近 release_window_s 秒の u の最小（`fwd_data.release_amount` と同じ定義）。
+  2026-10-18 段2q ①' `124859` の修正: 本体の表だけで予測すると、戻している低速のブレーキで
+  「表ほど減速しない」（+0.2〜+0.4 km/h/s）と読み、踏み増して遅くなった
+- アクセルの予測も、表がアクセルの戻しの表を持つなら同様に引く（2026-10-20 段4-3）。戻し量 ＝
+  その時刻までの直近 release_window_s 秒の u の最大 − 遅れた u（`fwd_data.accel_release_amount`
+  と同じ定義）。表が持たなければ今までと同じ
+- 更新しない（値を保つ）条件: 遅れた u が 0（惰行・停車保持）／ガバナー作動／遅れた u が最大開度／
+  発進側・停止側の表の行／そのペダルの Tq が None
+- numpy 以外は import しない（fwd_plan を読むと mode_drive との循環になる。発進・停止の判定は
+  呼び出し側が出して渡す。出どころは、計画の規則が legacy なら `low_speed_sides`、pedal なら計画が
+  行ごとに決めた表（`ForwardPlan.side_accel` / `side_brake`。2026-10-22 段5-2））
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from typing import Any
+
+PEDAL_ACCEL = "accel"
+PEDAL_BRAKE = "brake"
+
+
+class PedalDisturbanceObserver:
+    """ペダル別の外乱推定器（d_accel・d_brake）。表は `accel(v, u, launch=, stop=)` を持つもの。"""
+
+    def __init__(
+        self,
+        table: Any,
+        *,
+        tq_accel_s: float | None,
+        tq_brake_s: float | None,
+        lag_accel_s: float | None,
+        lag_brake_s: float | None,
+        release_window_s: float = 0.0,
+        tq_fast_accel_s: float | None = None,
+        tq_fast_brake_s: float | None = None,
+        fast_need_kmhs: float = 0.0,
+        split_low: bool = False,
+    ) -> None:
+        self.table = table
+        self.tq_accel_s = tq_accel_s
+        self.tq_brake_s = tq_brake_s
+        # 遅れが測れていないペダルは更新しない（Tq も None のはずだが、ここでも守る）
+        self.lag_accel_s = lag_accel_s
+        self.lag_brake_s = lag_brake_s
+        self.release_window_s = release_window_s  # 0 ＝ 戻しの表を引かない
+        # 段9-d: 強い加速・減速が続く間だけ使う速い Tq（None ＝ 速くしない）。強さは update に渡す
+        # 要る加速度 need_kmhs を、アクセルの更新なら ≥ +fast_need_kmhs、ブレーキの更新なら
+        # ≤ −fast_need_kmhs で判定する
+        self.tq_fast_accel_s = tq_fast_accel_s
+        self.tq_fast_brake_s = tq_fast_brake_s
+        self.fast_need_kmhs = fast_need_kmhs
+        self.n_fast_accel = 0  # 速い Tq で更新した周期数
+        self.n_fast_brake = 0
+        self.d_accel = 0.0
+        self.d_brake = 0.0
+        self.n_accel = 0  # 推定を更新した周期数
+        self.n_brake = 0
+        # 2026-10-31 ProblemReport_20261031_DOBが逆向き 段1: 低速の箱。split_low で low_box の周期は
+        # こちらだけを更新し、本体の箱（d_accel・d_brake）には持ち込まない。リセットしない
+        # （前回の低速の値を次の低速へ引き継ぐ）
+        self.split_low = split_low
+        self.d_accel_low = 0.0
+        self.d_brake_low = 0.0
+        self.n_accel_low = 0
+        self.n_brake_low = 0
+        # (時刻, u, 最大開度か, ガバナーか) の履歴
+        self._hist: deque[tuple[float, float, bool, bool]] = deque()
+        self._prev_t: float | None = None
+        self._prev_speed: float | None = None
+
+    def estimate(self, *, is_accel: bool, low: bool = False) -> float:
+        if low:
+            return self.d_accel_low if is_accel else self.d_brake_low
+        return self.d_accel if is_accel else self.d_brake
+
+    def _delayed(self, tau: float) -> tuple[float, bool, bool] | None:
+        """時刻 τ の加速度に効く (u, 最大開度か, ガバナーか)。履歴が足りなければ None。
+        u(τ − la) > 0 ならアクセル、そうでなく u(τ − lb) < 0 ならブレーキ、
+        どちらでもなければ u ＝ 0。"""
+        la, lb = self.lag_accel_s, self.lag_brake_s
+        if la is not None:
+            e = self._at(tau - la)
+            if e is None:
+                return None
+            if e[0] > 0.0:
+                return e
+        if lb is not None:
+            e = self._at(tau - lb)
+            if e is None:
+                return None
+            if e[0] < 0.0:
+                return e
+        return 0.0, False, False
+
+    def _release(self, tau: float, u_d: float) -> float:
+        """ブレーキの遅れた u（< 0）の戻し量 ＝ u_d − 時刻 τ − lb までの直近 release_window_s 秒の
+        u の最小（その時刻を含む）。アクセル・窓 0 は 0。"""
+        if u_d >= 0.0 or self.release_window_s <= 0.0 or self.lag_brake_s is None:
+            return 0.0
+        t1 = tau - self.lag_brake_s
+        t0 = t1 - self.release_window_s
+        m = min((u for ht, u, _, _ in self._hist if t0 - 1e-9 <= ht <= t1 + 1e-9), default=u_d)
+        return max(u_d - m, 0.0)
+
+    def _accel_release(self, tau: float, u_d: float) -> float:
+        """アクセルの遅れた u（> 0）の戻し量 ＝ 時刻 τ − la までの直近 release_window_s 秒の u の
+        最大（その時刻を含む）− u_d（2026-10-20 段4-3）。ブレーキ・窓 0 は 0。"""
+        if u_d <= 0.0 or self.release_window_s <= 0.0 or self.lag_accel_s is None:
+            return 0.0
+        t1 = tau - self.lag_accel_s
+        t0 = t1 - self.release_window_s
+        m = max((u for ht, u, _, _ in self._hist if t0 - 1e-9 <= ht <= t1 + 1e-9), default=u_d)
+        return max(m - u_d, 0.0)
+
+    def _accel_push(self, tau: float, u_d: float) -> float:
+        """アクセルの遅れた u（> 0）の踏み増し量 ＝ u_d − 時刻 τ − la までの直近
+        release_window_s 秒の u の最小（その時刻を含む）（2026-10-23 段5-7b）。
+        ブレーキ・窓 0 は 0。"""
+        if u_d <= 0.0 or self.release_window_s <= 0.0 or self.lag_accel_s is None:
+            return 0.0
+        t1 = tau - self.lag_accel_s
+        t0 = t1 - self.release_window_s
+        m = min(
+            (max(u, 0.0) for ht, u, _, _ in self._hist if t0 - 1e-9 <= ht <= t1 + 1e-9),
+            default=u_d,
+        )
+        return max(u_d - m, 0.0)
+
+    def accel_push_at(self, tau: float, u_d: float) -> float:
+        """時刻 τ のアクセルの踏み増し量（`_accel_push` の公開名。段5-7b）。"""
+        return self._accel_push(tau, u_d)
+
+    def accel_release_at(self, tau: float, u_d: float) -> float:
+        """時刻 τ のアクセルの戻し量（`_accel_release` の公開名。段4-3）。"""
+        return self._accel_release(tau, u_d)
+
+    def delayed_u(self, tau: float) -> tuple[float, bool, bool] | None:
+        """時刻 τ の加速度に効く (u, 最大開度か, ガバナーか)（`_delayed` の公開名。2026-10-19 段2u:
+        C13 の車速のフィルタ・予測器が同じ引き方で表を引く）。履歴が足りなければ None。"""
+        return self._delayed(tau)
+
+    def recent_peak_brake(self, t: float) -> float | None:
+        """時刻 t の手前（t を含まない）の直近 release_window_s 秒に出したブレーキの山
+        （u の最小。負）。ブレーキが無い・履歴が無い・窓 0 は None。`_release` が戻し量に使う
+        「直近 release_window_s 秒の u の最小」と同じ量を、今の周期の開度を解く前に取る
+        （C10 の c10_release_table。2026-10-31 段4）。"""
+        if self.release_window_s <= 0.0:
+            return None
+        t0 = t - self.release_window_s
+        m = min((u for ht, u, _, _ in self._hist if t0 - 1e-9 <= ht < t - 1e-9), default=0.0)
+        return m if m < 0.0 else None
+
+    def release_at(self, tau: float, u_d: float) -> float:
+        """時刻 τ のブレーキの戻し量（`_release` の公開名。段2u）。"""
+        return self._release(tau, u_d)
+
+    def _at(self, t: float) -> tuple[float, bool, bool] | None:
+        """時刻 t 以前で最新の履歴の (u, 最大開度か, ガバナーか)。t が履歴より前なら None。"""
+        found = None
+        for ht, u, lim, gov in self._hist:
+            if ht <= t + 1e-9:
+                found = (u, lim, gov)
+            else:
+                break
+        return found
+
+    def update(
+        self,
+        *,
+        t: float,
+        speed_kmh: float,
+        u_now: float,
+        governed: bool,
+        at_limit_now: bool,
+        launch: bool,
+        stop: bool,
+        side_tables: bool = False,
+        need_kmhs: float | None = None,
+        low_box: bool = False,
+    ) -> str | None:
+        """1 周期ぶん進める。推定を更新したペダル（PEDAL_ACCEL / PEDAL_BRAKE）を返す。
+        更新しなければ None。
+
+        u_now ＝ 今の周期で出した開度 − min（アクセル正・ブレーキ負・min 以下は 0）。
+        launch・stop ＝ 今の計画の行が発進側・停止側の表を引くか（`fwd_plan.low_speed_sides`、
+        規則が pedal・dir の計画は `ForwardPlan.side_for`。段5-2）。
+        side_tables（2026-10-23 段6-2 の f。既定 False ＝ 今までと同じ）: True なら launch・stop の
+        周期も更新を止めず、その周期に計画が引いた発進側・停止側の表で予測する（戻し・踏み増しの
+        補正は付けない）。
+        need_kmhs（段9-d。既定 None ＝ 速くしない）: 今の計画の行の要る加速度 [km/h/s]。速い Tq が
+        あり、更新するペダルの向きで強いとき（アクセル ≥ +fast_need_kmhs・
+        ブレーキ ≤ −fast_need_kmhs）だけ、その周期の更新を速い Tq で行う。外れたら元の Tq に戻る
+        （推定値はそのまま引き継ぐ）。
+        low_box（段1。既定 False）: split_low かつ True の周期は、低速の箱（d_*_low）だけを
+        更新する。
+        予測（どの表を引くか）は変わらない。
+        """
+        self._hist.append((t, u_now, at_limit_now, governed))
+        prev_t, prev_v = self._prev_t, self._prev_speed
+        self._prev_t, self._prev_speed = t, speed_kmh
+        # 履歴は最大の遅れ + 余裕より古いものを捨てる（遅れ以前の 1 点は残す）
+        keep = (
+            max(
+                (self.lag_accel_s or 0.0) + self.release_window_s,
+                (self.lag_brake_s or 0.0) + self.release_window_s,
+            )
+            + 0.5
+        )
+        while len(self._hist) > 2 and self._hist[1][0] <= t - keep:
+            self._hist.popleft()
+        if prev_t is None or prev_v is None:
+            return None
+        dt = t - prev_t
+        if dt <= 0.0:
+            return None
+        delayed = self._delayed(t)
+        if delayed is None:
+            return None
+        u_d, limited, gov_d = delayed
+        if u_d == 0.0 or governed or gov_d or limited or ((launch or stop) and not side_tables):
+            return None
+        is_accel = u_d > 0.0
+        tq = self.tq_accel_s if is_accel else self.tq_brake_s
+        if tq is None or tq <= 0.0:
+            return None
+        meas = (speed_kmh - prev_v) / dt
+        release = self._release(t, u_d)
+        a_release = self._accel_release(t, u_d)
+        # 段5-7b: 表が踏み増しの表を持つときだけ踏み増し量を数える（持たなければ今までと同じ）
+        has_push = getattr(self.table, "accel_push_grid", None) is not None
+        a_push = self._accel_push(t, u_d) if has_push else 0.0
+        if side_tables and (launch or stop):
+            pred = float(self.table.accel(speed_kmh, u_d, launch=bool(launch), stop=bool(stop)))
+        elif a_release > 0.0 or a_push > 0.0:
+            extra = {"accel_push": a_push} if a_push > 0.0 else {}
+            pred = float(
+                self.table.accel(
+                    speed_kmh, u_d, launch=False, stop=False, accel_release=a_release, **extra
+                )
+            )
+        elif release > 0.0:
+            pred = float(
+                self.table.accel(speed_kmh, u_d, launch=False, stop=False, release=release)
+            )
+        else:
+            pred = float(self.table.accel(speed_kmh, u_d, launch=False, stop=False))
+        e = meas - pred
+        tq_fast = self.tq_fast_accel_s if is_accel else self.tq_fast_brake_s
+        fast = (
+            need_kmhs is not None
+            and tq_fast is not None
+            and tq_fast > 0.0
+            and self.fast_need_kmhs > 0.0
+            and (
+                need_kmhs >= self.fast_need_kmhs
+                if is_accel else need_kmhs <= -self.fast_need_kmhs
+            )
+        )
+        if fast:
+            tq = min(tq, tq_fast)  # type: ignore[type-var]
+        alpha = min(1.0, dt / tq)
+        if self.split_low and low_box:
+            if is_accel:
+                self.d_accel_low += alpha * (e - self.d_accel_low)
+                self.n_accel_low += 1
+                self.n_fast_accel += int(fast)
+                return PEDAL_ACCEL
+            self.d_brake_low += alpha * (e - self.d_brake_low)
+            self.n_brake_low += 1
+            self.n_fast_brake += int(fast)
+            return PEDAL_BRAKE
+        if is_accel:
+            self.d_accel += alpha * (e - self.d_accel)
+            self.n_accel += 1
+            self.n_fast_accel += int(fast)
+            return PEDAL_ACCEL
+        self.d_brake += alpha * (e - self.d_brake)
+        self.n_brake += 1
+        self.n_fast_brake += int(fast)
+        return PEDAL_BRAKE

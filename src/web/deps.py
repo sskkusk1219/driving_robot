@@ -1,30 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 from fastapi import Request
 
-from src.app.learning_cycle import LearningCycleOrchestrator
-from src.app.robot_controller import LogWriterProtocol, RobotController
-from src.domain.model_training import DEFAULT_FEATURE_SPEC, FeatureSpec
-from src.infra.pedal_plan_repository import PedalPlanRecord
-from src.infra.settings import LearningSettings
+from src.app.job_manager import JobManager
+from src.infra.session_repository import LogCsvRow, SessionMessage
 from src.infra.ups_monitor import UPSStatus
-from src.models.calibration import CalibrationData
+from src.infra.vehicle_store import VehicleStore
 from src.models.drive_log import DriveLog, DriveSession, LearningCycle
 from src.models.driving_mode import DrivingMode
-from src.models.profile import VehicleProfile
 from src.models.sequence import Sequence
 from src.models.time_schedule import TimeSchedule
-
-
-class ProfileRepoProtocol(Protocol):
-    async def list_all(self) -> list[VehicleProfile]: ...
-    async def get_by_id(self, profile_id: str) -> VehicleProfile | None: ...
-    async def create(self, profile: VehicleProfile) -> VehicleProfile: ...
-    async def update(self, profile: VehicleProfile) -> VehicleProfile | None: ...
-    async def delete(self, profile_id: str) -> bool: ...
-    async def save_calibration(self, profile_id: str, data: CalibrationData) -> None: ...
 
 
 class ModeRepoProtocol(Protocol):
@@ -56,6 +44,13 @@ class SessionRepoProtocol(Protocol):
     async def get_by_id(self, session_id: str) -> DriveSession | None: ...
     async def latest_learning_session_id(self, profile_id: str) -> str | None: ...
     async def list_logs(self, session_id: str, limit: int = 1000) -> list[DriveLog]: ...
+    async def list_messages(
+        self, session_id: str, limit: int = 100_000
+    ) -> list[SessionMessage]: ...
+    async def log_detail_keys(self, session_id: str) -> list[str]: ...
+    def iter_logs_for_csv(
+        self, session_id: str, chunk: int = 2000
+    ) -> AsyncIterator[list[LogCsvRow]]: ...
     async def list_logs_for_training(
         self,
         profile_id: str,
@@ -68,13 +63,6 @@ class SessionRepoProtocol(Protocol):
     ) -> list[LearningCycle]: ...
 
 
-class PlanRepoProtocol(Protocol):
-    async def get(self, profile_id: str, mode_id: str) -> PedalPlanRecord | None: ...
-    async def reset(self, profile_id: str, mode_id: str) -> None: ...
-    async def reset_for_mode(self, mode_id: str) -> None: ...
-    async def set_enabled(self, profile_id: str, mode_id: str, enabled: bool) -> None: ...
-
-
 class UPSMonitorProtocol(Protocol):
     async def get_status(self) -> UPSStatus: ...
 
@@ -82,27 +70,14 @@ class UPSMonitorProtocol(Protocol):
     def is_available(self) -> bool: ...
 
 
-def get_controller(request: Request) -> RobotController:
-    controller: RobotController = request.app.state.controller
-    return controller
+def get_job_manager(request: Request) -> JobManager:
+    manager: JobManager = request.app.state.job_manager
+    return manager
 
 
-def get_log_writer(request: Request) -> LogWriterProtocol | None:
-    """DB プールが利用可能なら走行ログを永続化する LogWriter を返す。
-
-    in-memory 環境（DB なし）では None を返し、走行ログ記録を無効化する。
-    """
-    pool = getattr(request.app.state, "db_pool", None)
-    if pool is None:
-        return None
-    from src.infra.log_writer import LogWriter  # noqa: PLC0415
-
-    return LogWriter(pool)
-
-
-def get_profile_repo(request: Request) -> ProfileRepoProtocol:
-    repo: ProfileRepoProtocol = request.app.state.profile_repo
-    return repo
+def get_vehicle_store(request: Request) -> VehicleStore:
+    store: VehicleStore = request.app.state.vehicle_store
+    return store
 
 
 def get_mode_repo(request: Request) -> ModeRepoProtocol:
@@ -123,28 +98,6 @@ def get_schedule_repo(request: Request) -> ScheduleRepoProtocol:
 def get_sequence_repo(request: Request) -> SequenceRepoProtocol:
     repo: SequenceRepoProtocol = request.app.state.sequence_repo
     return repo
-
-
-def get_plan_repo(request: Request) -> PlanRepoProtocol:
-    repo: PlanRepoProtocol = request.app.state.plan_repo
-    return repo
-
-
-def get_feature_spec(request: Request) -> FeatureSpec:
-    """学習時に使う特徴量構成。app.state 未設定（起動シーケンス外）時は現行9特徴を返す。"""
-    spec: FeatureSpec = getattr(request.app.state, "feature_spec", DEFAULT_FEATURE_SPEC)
-    return spec
-
-
-def get_learning_settings(request: Request) -> LearningSettings:
-    """2段階学習フローのデフォルトパラメータ。app.state 未設定時はデフォルト値を返す。"""
-    settings: LearningSettings = getattr(request.app.state, "learning_settings", LearningSettings())
-    return settings
-
-
-def get_cycle_orchestrator(request: Request) -> LearningCycleOrchestrator:
-    orchestrator: LearningCycleOrchestrator = request.app.state.cycle_orchestrator
-    return orchestrator
 
 
 def get_ups_monitor(request: Request) -> UPSMonitorProtocol:

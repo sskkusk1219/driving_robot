@@ -1,0 +1,76 @@
+# 移植元: tests/research/term.py（scripts/port_research.py が 2026-11-19 に写した。tests の commit 4c80595+未コミットの変更あり）。手で直さない  # noqa: E501
+"""研究開発用ハーネスのターミナル出力。
+
+「進捗はターミナルに都度 print し、現在何をやっているかユーザーが分かるようにすること」
+（ProblemReport_20260910「コードの作成と実行手順」）を満たすための最小の共通出力。
+main / hardware / 以降の走行モジュールが共有するため、循環 import を避けて別モジュールに置く。
+"""
+
+from __future__ import annotations
+
+import time
+
+_RUN_START = time.monotonic()
+
+LINE_WIDTH = 68
+
+
+def elapsed_s() -> float:
+    """ハーネス起動からの経過秒。"""
+    return time.monotonic() - _RUN_START
+
+
+def say(message: str = "") -> None:
+    """経過秒つきで 1 行出力し、即座にフラッシュする。"""
+    if message == "":
+        print(flush=True)
+        return
+    print(f"[{elapsed_s():7.1f}s] {message}", flush=True)
+
+
+def banner(text: str) -> None:
+    say("=" * LINE_WIDTH)
+    say(text)
+    say("=" * LINE_WIDTH)
+
+
+def display_width(text: str) -> int:
+    """全角文字を 2 桁として数え、ラベル幅を揃える。"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in text)
+
+
+def _gain(value: float) -> str:
+    """ゲインの表示用の丸め（有効 3 桁。0 は「0」）。"""
+    return f"{value:.3g}"
+
+
+def drive_status_line(
+    *,
+    t_s: float,
+    ref_kmh: float | None,
+    actual_kmh: float,
+    accel_kp: float,
+    accel_ki: float,
+    accel_kd: float,
+    brake_kp: float,
+    brake_ki: float,
+    brake_kd: float,
+    accel_pct: float,
+    brake_pct: float,
+    extra: str = "",
+) -> str:
+    """走行中の 1 行表示（基準車速・実車速・偏差・アクセル／ブレーキ別の Kp/Ki/Kd・開度・その他）。
+
+    基準車速を持たない走行（手順 2 のコーストダウンなど）は基準・偏差を「---」で表す。
+    手順 2 の G ランプ中は基準車速 v_ref を渡し、Kp・Ki はそのペダルで直近に計算した値
+    （感度がまだ無いペダルは 0）。偏差は 実 − 基準。
+    """
+    ref = "   ---" if ref_kmh is None else f"{ref_kmh:6.2f}"
+    dev = "   ---" if ref_kmh is None else f"{actual_kmh - ref_kmh:+6.2f}"
+    return (
+        f"t={t_s:6.1f}s 基準={ref} 実={actual_kmh:6.2f} 偏差={dev} km/h "
+        f"acc Kp={_gain(accel_kp)} Ki={_gain(accel_ki)} Kd={_gain(accel_kd)} "
+        f"brk Kp={_gain(brake_kp)} Ki={_gain(brake_ki)} Kd={_gain(brake_kd)} "
+        f"| acc={accel_pct:5.1f}% brk={brake_pct:5.1f}%"
+        f"{f' | {extra}' if extra else ''}"
+    )

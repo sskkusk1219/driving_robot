@@ -6,13 +6,14 @@ from typing import Any
 @dataclass
 class DriveSession:
     id: str
-    profile_id: str
+    profile_id: str | None  # 旧プロファイル時代の行だけ。段3 以降の走行は None（vehicle_id を使う）
     mode_id: str | None
     run_type: str  # 'auto' | 'manual' | 'learning' | 'tuning'
     started_at: datetime
     ended_at: datetime | None
     status: str  # 'running' | 'completed' | 'error' | 'emergency'
     cycle_id: str | None = None
+    vehicle_id: str | None = None  # 車両 yaml のフォルダ名
 
 
 @dataclass

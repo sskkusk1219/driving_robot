@@ -696,10 +696,10 @@ def _ng_item(item_id: str = "B5", **metrics: float) -> step2_check.CheckItem:
 def test_build_ff_model_check_ng_real_keeps_yaml_and_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """チェックが NG なら、実機でも yaml を書き換えず Step2CheckError（pkl は残る）。"""
+    """止める NG（B1 など。段10-1）なら、実機でも yaml を書き換えず Step2CheckError。pkl は残る。"""
     cfg = _tmp_cfg(tmp_path)
     _fake_table_model(monkeypatch, tmp_path)
-    monkeypatch.setattr(pdmod, "_run_step2_checks", lambda **kwargs: [_ng_item("B5")])
+    monkeypatch.setattr(pdmod, "_run_step2_checks", lambda **kwargs: [_ng_item("B1")])
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
     before = cfg.source_path.read_bytes()
@@ -708,8 +708,29 @@ def test_build_ff_model_check_ng_real_keeps_yaml_and_raises(
         pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL, pedal=PEDAL)
 
     assert cfg.source_path.read_bytes() == before
-    assert [i.id for i in info.value.items] == ["B5"]
+    assert [i.id for i in info.value.items] == ["B1"]
     assert (tmp_path / "results" / "models" / "fwd_table_fake_real.pkl").exists()
+
+
+def test_build_ff_model_non_blocking_ng_is_warn_and_writes_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """段10-1: B5 などの NG は「注意」（WARN）にして、実機でも yaml を書き、止めない。"""
+    cfg = _tmp_cfg(tmp_path)
+    _fake_table_model(monkeypatch, tmp_path)
+    monkeypatch.setattr(pdmod, "_run_step2_checks", lambda **kwargs: [_ng_item("B5")])
+    csv_path = tmp_path / "drive.csv"
+    dlmod.write_csv(_synthetic_samples(cfg), csv_path)
+    before = cfg.source_path.read_bytes()
+
+    result = pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL, pedal=PEDAL)
+
+    assert cfg.source_path.read_bytes() != before  # 書いた
+    assert result.changed
+    b5 = next(c for c in result.checks if c.id == "B5")
+    assert b5.status == step2_check.STATUS_WARN
+    out = capsys.readouterr().out
+    assert "注意 1 項目" in out and "yaml は書き換えません" not in out
 
 
 def test_build_ff_model_check_ng_stub_does_not_raise(
@@ -718,7 +739,7 @@ def test_build_ff_model_check_ng_stub_does_not_raise(
     """スタブは NG でも止めない（表示のみ）。yaml は今までどおり書き換えない。"""
     cfg = _tmp_cfg(tmp_path)
     _fake_table_model(monkeypatch, tmp_path)
-    monkeypatch.setattr(pdmod, "_run_step2_checks", lambda **kwargs: [_ng_item("B5")])
+    monkeypatch.setattr(pdmod, "_run_step2_checks", lambda **kwargs: [_ng_item("B1")])
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
     before = cfg.source_path.read_bytes()
@@ -726,7 +747,7 @@ def test_build_ff_model_check_ng_stub_does_not_raise(
     result = pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_STUB)
 
     assert cfg.source_path.read_bytes() == before
-    assert result.changed == [] and [c.id for c in result.checks] == ["B5"]
+    assert result.changed == [] and [c.id for c in result.checks] == ["B1"]
     assert "スタブのため止めません" in capsys.readouterr().out
 
 
@@ -744,11 +765,13 @@ def test_build_ff_model_post_write_c2_ng_raises(
     )
     csv_path = tmp_path / "drive.csv"
     dlmod.write_csv(_synthetic_samples(cfg), csv_path)
+    before = cfg.source_path.read_bytes()
 
     with pytest.raises(step2_check.Step2CheckError) as info:
         pdmod.build_ff_model(cfg, csv_path, hw_mode=hwmod.HW_REAL, pedal=PEDAL)
 
     assert [i.id for i in info.value.items] == ["C2"]
+    assert cfg.source_path.read_bytes() == before  # 段10-1: 書いた yaml を前の内容に戻す
 
 
 def _c8_cfg(tmp_path: Path) -> cfgmod.ResearchConfig:

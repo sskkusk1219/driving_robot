@@ -1,0 +1,37 @@
+# driving_robot の実行に要るライブラリ（.venv/bin/pip freeze の版。2026-11-15）
+# 入れ方: .venv/bin/pip install -r requirements.txt
+# 実際に import しているものを src/（src/robot/core 含む）・scripts・tests/unit から調べて載せた（段7 で削除後に見直し済み）。
+# 孫依存（numpy の依存など）は pip が解くので載せない。
+
+# --- Web サーバー（src/web） ---
+fastapi==0.136.0
+uvicorn[standard]==0.44.0
+pydantic==2.13.3
+starlette==1.0.0
+asyncpg==0.31.0
+
+# --- ハードウェア（アクチュエータ・CAN・サーボ） ---
+pymodbus==3.13.0
+pyserial==3.5
+python-can==4.6.1
+cantools==41.3.1
+smbus2==0.4.3
+# lgpio は pip で入らない。apt install python3-lgpio（.venv から system-dist-packages.pth で参照）
+
+# --- 制御・学習（tests/research → src/robot/core） ---
+numpy==2.4.4
+scipy==1.17.1
+scikit-learn==1.9.0
+# CPU 版でよい（aarch64 の PyPI 版。学習だけに使う）
+torch==2.14.1
+matplotlib==3.11.0
+PyYAML==6.0.2
+
+# --- 開発・テスト ---
+pytest==9.0.3
+pytest-asyncio==1.3.0
+httpx==0.28.1
+ruff==0.15.11
+mypy==1.20.1
+
+# 分析専用（src/・tests では import しない）の pandas は載せない: pip install pandas

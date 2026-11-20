@@ -3,49 +3,58 @@
 // タイムスケジュール: ペダル開度とボタン押下を統合タイムラインで再生する。
 // 1行=1時刻点の表エディタで編集し、保存時に pedal_points / button_events へ変換する。
 
-const CHANNEL_NAMES = {
-  0: 'スタート', 1: 'P', 2: 'N', 3: 'D',
-  4: 'オプション1', 5: 'オプション2', 6: 'オプション3', 7: 'オプション4',
-  8: 'オプション5', 9: 'オプション6', 10: 'オプション7', 11: 'オプション8',
-  12: 'オプション9', 13: 'オプション10', 14: 'オプション11', 15: 'オプション12',
+// ボタンは ch ではなくボタン名（車両 yaml の servo_map のキー）で指す（段6）。
+// ボタン名のない旧イベント（ch だけ）は読み込み時に捨てる（列は常にスタート・P・N・D）。
+const BUTTON_NAMES = { start: 'スタート', P: 'P', N: 'N', D: 'D' };
+const DEFAULT_COLUMNS = ['start', 'P', 'N', 'D'];
+const EXCLUSIVE_COLUMNS = ['P', 'N', 'D']; // P/N/D は同一行で排他（最後に押したONを優先）
+const columnLabel = (key) => BUTTON_NAMES[key] || key;
+const columnOrder = (a, b) => {
+  const ia = DEFAULT_COLUMNS.indexOf(a), ib = DEFAULT_COLUMNS.indexOf(b);
+  if (ia >= 0 && ib >= 0) return ia - ib;
+  if (ia >= 0) return -1;
+  if (ib >= 0) return 1;
+  return String(a).localeCompare(String(b));
 };
-const DEFAULT_CHANNELS = [0, 1, 2, 3];
-const EXCLUSIVE_CHANNELS = [1, 2, 3]; // P/N/D は同一行で排他（最後に押したONを優先）
 const round2 = (v) => Math.round(v * 100) / 100;
 
 // ── 表 ⇔ APIモデル 変換 ───────────────────────────────────────
 
-// rows: [{ time_s, accel, brake, buttons: { [channel]: boolean } }]
+// rows: [{ time_s, accel, brake, buttons: { [列キー]: boolean } }]（列キーはボタン名）
 function rowsToApi(rows, visibleChannels) {
   const pedal_points = rows.map(r => ({
     time_s: r.time_s, accel_opening: r.accel, brake_opening: r.brake,
   }));
   const button_events = [];
-  visibleChannels.slice().sort((a, b) => a - b).forEach(ch => {
+  visibleChannels.forEach(ch => {
     let onStart = null;
     for (const r of rows) {
       const on = !!r.buttons[ch];
       if (on && onStart === null) {
         onStart = r.time_s;
       } else if (!on && onStart !== null) {
-        button_events.push({ time_s: onStart, channel: ch, press_duration_s: round2(r.time_s - onStart) });
+        button_events.push({ time_s: onStart, button: ch, press_duration_s: round2(r.time_s - onStart) });
         onStart = null;
       }
     }
   });
-  button_events.sort((a, b) => a.time_s - b.time_s || a.channel - b.channel);
+  button_events.sort((a, b) => a.time_s - b.time_s || columnOrder(a.button, b.button));
   return { pedal_points, button_events };
 }
 
 // detail: ScheduleDetailResponse（pedal_points / button_events）
 function apiToRows(detail) {
   const pedalPoints = (detail.pedal_points || []).slice().sort((a, b) => a.time_s - b.time_s);
-  const buttonEvents = detail.button_events || [];
+  // ボタン名のない旧イベントは捨てる
+  const buttonEvents = (detail.button_events || []).filter(e => e.button);
 
   const times = new Set(pedalPoints.map(p => p.time_s));
+  // 押す時間が無いイベント（車両の既定秒数で押す）は、表示のうえでは 1 秒として扱う
+  const pressOf = (e) => (e.press_duration_s ?? 1.0);
+  const keyOf = (e) => e.button;
   buttonEvents.forEach(e => {
     times.add(e.time_s);
-    times.add(round2(e.time_s + e.press_duration_s));
+    times.add(round2(e.time_s + pressOf(e)));
   });
   const sortedTimes = Array.from(times).sort((a, b) => a - b);
 
@@ -72,19 +81,20 @@ function apiToRows(detail) {
   const rows = sortedTimes.map(t => ({ time_s: t, ...interp(t), buttons: {} }));
   if (rows.length === 0) rows.push({ time_s: 0, accel: 0, brake: 0, buttons: {} });
 
-  const channelsUsed = new Set(DEFAULT_CHANNELS);
+  const channelsUsed = new Set(DEFAULT_COLUMNS);
   buttonEvents.forEach(e => {
-    channelsUsed.add(e.channel);
-    const start = e.time_s, end = round2(e.time_s + e.press_duration_s);
+    const key = keyOf(e);
+    channelsUsed.add(key);
+    const start = e.time_s, end = round2(e.time_s + pressOf(e));
     rows.forEach(row => {
-      if (row.time_s >= start && row.time_s < end) row.buttons[e.channel] = true;
+      if (row.time_s >= start && row.time_s < end) row.buttons[key] = true;
     });
   });
 
-  return { rows, visibleChannels: Array.from(channelsUsed).sort((a, b) => a - b) };
+  return { rows, visibleChannels: Array.from(channelsUsed).sort(columnOrder) };
 }
 
-// 各 ch の連続 ON 区間（保存前プレビュー用。未終端の ON も含めて返す）
+// 各列（ボタン）の連続 ON 区間（保存前プレビュー用。未終端の ON も含めて返す）
 function computeIntervals(rows, visibleChannels) {
   const result = [];
   visibleChannels.forEach(ch => {
@@ -123,6 +133,9 @@ function validateSchedule(name, rows) {
   if (rows.length === 0) errors.push({ message: '行を1つ以上追加してください' });
 
   rows.forEach((r, i) => {
+    if (!(r.time_s >= 0)) {
+      errors.push({ rowIdx: i, field: 'time_s', message: `${i + 1}行目: 時刻は 0 以上にしてください` });
+    }
     if (i > 0 && r.time_s <= rows[i - 1].time_s) {
       errors.push({ rowIdx: i, field: 'time_s', message: `${i + 1}行目: 時刻は前の行より大きい値にしてください` });
     }
@@ -177,6 +190,7 @@ function ScheduleScreen() {
   }
 
   async function handleDelete(s) {
+    if (!confirm(`「${s.name}」を削除しますか？`)) return;
     const r = await apiFetch('DELETE', `/api/v1/schedules/${s.id}`);
     if (r !== null) {
       window.showToast('スケジュールを削除しました', 'success');
@@ -184,6 +198,21 @@ function ScheduleScreen() {
         setActiveModeId(null);
         setActiveModeName(null);
       }
+      refresh();
+    }
+  }
+
+  async function handleCopy(s) {
+    const detail = await apiFetch('GET', `/api/v1/schedules/${s.id}`);
+    if (!detail) return;
+    const r = await apiFetch('POST', '/api/v1/schedules/', {
+      name: `${s.name} のコピー`,
+      description: detail.description || '',
+      pedal_points: detail.pedal_points || [],
+      button_events: detail.button_events || [],
+    });
+    if (r) {
+      window.showToast(`「${r.name}」を作成しました`, 'success');
       refresh();
     }
   }
@@ -272,6 +301,7 @@ function ScheduleScreen() {
                     isActive={isActive}
                     onSelect={() => handleSelect(s)}
                     onEdit={running ? null : () => handleEdit(s)}
+                    onCopy={() => handleCopy(s)}
                     onDelete={running ? null : () => handleDelete(s)}
                   />
                 </div>
@@ -298,8 +328,7 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
   const [rows, setRows] = useState(() =>
     initialConverted ? initialConverted.rows : [{ time_s: 0, accel: 0, brake: 0, buttons: {} }]);
   const [visibleChannels, setVisibleChannels] = useState(() =>
-    initialConverted ? initialConverted.visibleChannels : DEFAULT_CHANNELS.slice());
-  const [addSelectValue, setAddSelectValue] = useState('');
+    initialConverted ? initialConverted.visibleChannels : DEFAULT_COLUMNS.slice());
   const [errors, setErrors] = useState([]);
   const [saving, setSaving] = useState(false);
 
@@ -318,9 +347,9 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
       if (i !== idx) return r;
       const turningOn = !r.buttons[ch];
       const buttons = { ...r.buttons };
-      if (turningOn && EXCLUSIVE_CHANNELS.includes(ch)) {
+      if (turningOn && EXCLUSIVE_COLUMNS.includes(ch)) {
         // P/N/D は同一行で共存不可。最後に押したONを優先し他は自動OFF
-        EXCLUSIVE_CHANNELS.forEach(c => { if (c !== ch) buttons[c] = false; });
+        EXCLUSIVE_COLUMNS.forEach(c => { if (c !== ch) buttons[c] = false; });
       }
       buttons[ch] = turningOn;
       return { ...r, buttons };
@@ -339,17 +368,6 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
 
   function deleteRow(idx) {
     setRows(rs => (rs.length <= 1 ? rs : rs.filter((_, i) => i !== idx)));
-  }
-
-  function addColumn(ch) {
-    setVisibleChannels(vs => [...vs, ch].sort((a, b) => a - b));
-    setAddSelectValue('');
-  }
-
-  function removeColumn(ch) {
-    const allOff = rows.every(r => !r.buttons[ch]);
-    if (!allOff) { window.showToast('この列をすべての行でOFFにしてから削除してください', 'error'); return; }
-    setVisibleChannels(vs => vs.filter(c => c !== ch));
   }
 
   async function handleSave() {
@@ -373,7 +391,6 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
   const totalDuration = rows.length ? rows[rows.length - 1].time_s : 0;
   const intervals = computeIntervals(rows, visibleChannels);
   const pedalSegments = computePedalSegments(rows);
-  const availableChannels = Array.from({ length: 12 }, (_, i) => i + 4).filter(ch => !visibleChannels.includes(ch));
   const gridCols = `84px 84px 84px ${visibleChannels.map(() => '92px').join(' ')} 1fr`;
 
   return (
@@ -381,7 +398,7 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
       {/* ヘッダ（走行モード・プロファイルのフォームと同じ並び） */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <Btn onClick={onCancel}>← 一覧に戻る</Btn>
-        <H2 sub={isEdit ? `スケジュール「${initial.name}」を編集します` : '時刻ごとにペダル開度とボタン押下を設定します'}>
+        <H2>
           {isEdit ? 'スケジュール編集' : 'スケジュール新規作成'}
         </H2>
       </div>
@@ -398,18 +415,6 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
       <Box style={{ padding: 16, marginTop: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
           <div style={{ fontSize: 14, color: INK_SOFT }}>タイムライン（{rows.length} 行 / 総時間 {totalDuration.toFixed(1)}s）</div>
-          {availableChannels.length > 0 && (
-            <select
-              value={addSelectValue}
-              onChange={e => { if (e.target.value) addColumn(Number(e.target.value)); }}
-              style={selectStyle}
-            >
-              <option value="">＋ 列追加…</option>
-              {availableChannels.map(ch => (
-                <option key={ch} value={ch}>{CHANNEL_NAMES[ch]}</option>
-              ))}
-            </select>
-          )}
         </div>
 
         <div style={{ overflowX: 'auto' }}>
@@ -422,11 +427,7 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
               <div>時刻[s]</div><div>Acc[%]</div><div>Brk[%]</div>
               {visibleChannels.map(ch => (
                 <div key={ch} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 4 }}>
-                  <span>{CHANNEL_NAMES[ch]}</span>
-                  {ch >= 4 && (
-                    <span onClick={() => removeColumn(ch)} title="列を削除"
-                          style={{ cursor: 'pointer', opacity: 0.55, fontSize: 12, userSelect: 'none' }}>✕</span>
-                  )}
+                  <span>{columnLabel(ch)}</span>
                 </div>
               ))}
               <div>操作</div>
@@ -437,7 +438,7 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
                 display: 'grid', gridTemplateColumns: gridCols, gap: 6,
                 padding: '6px 4px', borderBottom: `1px dashed ${HATCH}`, alignItems: 'center',
               }}>
-                <input type="number" step="0.1" value={r.time_s}
+                <input type="number" min="0" step="0.1" value={r.time_s}
                        onChange={e => updateRow(idx, { time_s: Number(e.target.value) })}
                        style={cellStyle(idx, 'time_s')} />
                 <input type="number" min="0" max="100" step="1" value={r.accel}
@@ -501,7 +502,7 @@ function ScheduleEditForm({ initial, onCancel, onSaved }) {
           const span = Math.max(totalDuration, 0.001);
           return (
             <div key={ch} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
-              <div style={{ width: 84, fontSize: 13, color: INK_SOFT, flexShrink: 0 }}>{CHANNEL_NAMES[ch]}</div>
+              <div style={{ width: 84, fontSize: 13, color: INK_SOFT, flexShrink: 0 }}>{columnLabel(ch)}</div>
               <div style={{ position: 'relative', flex: 1, height: 18, background: PAPER, border: `1px solid ${HATCH}`, borderRadius: 3 }}>
                 {chIntervals.map((iv, i) => {
                   const left = (iv.start / span) * 100;
@@ -553,7 +554,7 @@ const selectStyle = {
 };
 
 // ── シーケンス（走行モード／タイムスケジュールを順に並べる） ────────
-// 作成・編集・一覧・削除・保存のみ。実行（自動運転画面から走らせる）は次の段。
+// 作成・編集・一覧・削除・保存。実行は自動運転画面（段6）。
 
 const SEQ_KIND_LABEL = { mode: '走行モード', schedule: 'スケジュール' };
 const SEQ_KIND_COLOR = { mode: '#78c8f0', schedule: '#c8922a' };
@@ -565,15 +566,21 @@ function fmtMMSS(sec) {
   return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 }
 
-// 正の整数へ丸める（空・不正は 1）
-function toRepeat(v) {
-  const n = Math.floor(Number(v));
-  return Number.isFinite(n) && n >= 1 ? n : 1;
-}
-
 function SequenceScreen() {
-  const { useState, useEffect } = React;
+  const { useState, useEffect, useContext } = React;
   const { INK, INK_SOFT, INK_MUTE, PAPER, PAPER_2, HATCH, Box, Btn } = window;
+  const {
+    activeModeId, activeModeKind,
+    setActiveModeId, setActiveModeName, setActiveModeKind,
+  } = useContext(window.AppContext);
+  const selectedId = activeModeKind === 'sequence' ? activeModeId : null;
+
+  function handleSelect(s) {
+    setActiveModeId(s.id);
+    setActiveModeName(s.name);
+    setActiveModeKind('sequence');
+    window.showToast(`「${s.name}」を選択しました。自動運転ページで開始できます`, 'success');
+  }
 
   const [sequences, setSequences] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -595,6 +602,10 @@ function SequenceScreen() {
     const r = await window.apiFetch('DELETE', `/api/v1/sequences/${s.id}`);
     if (r !== null) {
       window.showToast('シーケンスを削除しました', 'success');
+      if (activeModeKind === 'sequence' && activeModeId === s.id) {
+        setActiveModeId(null);
+        setActiveModeName(null);
+      }
       refresh();
     }
   }
@@ -614,7 +625,7 @@ function SequenceScreen() {
     );
   }
 
-  const gridCols = 'minmax(0, 2fr) minmax(0, 1.8fr) minmax(0, 0.7fr) minmax(0, 1.2fr) minmax(0, 0.9fr) 150px';
+  const gridCols = 'minmax(0, 2fr) minmax(0, 1.8fr) minmax(0, 0.7fr) minmax(0, 1.2fr) minmax(0, 0.9fr) 220px';
   const q = search.trim().toLowerCase();
   const filtered = sequences.filter(s =>
     s.name.toLowerCase().includes(q) ||
@@ -684,6 +695,7 @@ function SequenceScreen() {
                 </div>
                 <div style={{ fontFamily: 'monospace' }}>× {s.repeat}</div>
                 <div style={{ display: 'flex', gap: 6 }}>
+                  <Btn primary={selectedId === s.id} disabled={s.has_missing} onClick={() => handleSelect(s)}>選択</Btn>
                   <Btn onClick={() => handleEdit(s)}>編集</Btn>
                   <Btn danger onClick={() => handleDelete(s)}>削除</Btn>
                 </div>
@@ -698,6 +710,9 @@ function SequenceScreen() {
 
 // 新規作成・編集共通のシーケンスエディタ
 // initial: SequenceResponse | null（あり=編集/PUT、なし=新規/POST）
+// 繰り返し回数として有効か（1 以上の整数。空・0・負・小数は無効）
+const isValidRepeat = (v) => v !== '' && Number.isInteger(Number(v)) && Number(v) >= 1;
+
 function SequenceEditForm({ initial, onCancel, onSaved }) {
   const { useState, useEffect } = React;
   const { INK, INK_SOFT, PAPER, PAPER_2, HATCH, Box, Btn, H2, Note, Input } = window;
@@ -711,6 +726,8 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
   const [modes, setModes] = useState(null);       // null=読み込み中
   const [schedules, setSchedules] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [refQuery, setRefQuery] = useState('');     // 参照先の検索
+  const [refAsc, setRefAsc] = useState(false);      // 参照先の並び（名前。既定は降順）
 
   useEffect(() => {
     (async () => {
@@ -723,6 +740,15 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
 
   const loaded = modes !== null && schedules !== null;
   const optionsOf = (kind) => (kind === 'mode' ? modes : schedules) || [];
+  // 参照先の選択肢: 名前で並べ替え・検索（選択中のものは絞り込みで消えても残す）
+  const refOptionsOf = (kind, selectedId) => {
+    const q = refQuery.trim().toLowerCase();
+    const list = optionsOf(kind)
+      .filter(o => o.id === selectedId || !q || o.name.toLowerCase().includes(q))
+      .slice()
+      .sort((a, b) => (refAsc ? 1 : -1) * a.name.localeCompare(b.name, 'ja', { numeric: true }));
+    return list;
+  };
 
   // 参照先の解決（一覧にある=存在。長さは現在の値）
   function resolve(step) {
@@ -766,8 +792,10 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
   }
 
   const resolved = steps.map(resolve);
-  const onePass = steps.reduce((acc, s, i) => acc + resolved[i].duration * s.repeat, 0);
-  const totalDuration = onePass * repeat;
+  const onePass = steps.reduce((acc, s, i) => acc + resolved[i].duration * Number(s.repeat), 0);
+  const totalDuration = onePass * Number(repeat);
+  const repeatInvalid = !isValidRepeat(repeat);
+  const stepRepeatInvalid = (s) => !isValidRepeat(s.repeat);
   const hasMissing = loaded && resolved.some(r => r.missing);
 
   async function handleSave() {
@@ -778,9 +806,13 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
       window.showToast(`${i + 1} 段目の参照先が見つかりません。選び直すか削除してください`, 'error');
       return;
     }
+    if (repeatInvalid || steps.some(stepRepeatInvalid)) {
+      window.showToast('繰り返し回数は 1 以上の整数にしてください', 'error');
+      return;
+    }
     const payload = {
-      name: name.trim(), description: desc, repeat: toRepeat(repeat),
-      steps: steps.map(s => ({ kind: s.kind, ref_id: s.ref_id, repeat: toRepeat(s.repeat) })),
+      name: name.trim(), description: desc, repeat: Number(repeat),
+      steps: steps.map(s => ({ kind: s.kind, ref_id: s.ref_id, repeat: Number(s.repeat) })),
     };
     setSaving(true);
     const r = isEdit
@@ -799,7 +831,7 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14, height: '100%' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <Btn onClick={onCancel}>← 一覧に戻る</Btn>
-        <H2 sub={isEdit ? `シーケンス「${initial.name}」を編集します` : '走行モードとスケジュールを順に並べます'}>
+        <H2>
           {isEdit ? 'シーケンス編集' : 'シーケンス新規作成'}
         </H2>
       </div>
@@ -809,8 +841,17 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
             <Input label="名前" value={name} onChange={v => setName(v)} width={260} />
             <Input label="説明" value={desc} onChange={v => setDesc(v)} width={360} />
-            <Input label="全体の繰り返し回数" type="number" min="1" step="1" mono
-                   value={repeat} onChange={v => setRepeat(v === '' ? '' : Number(v))} width={160} />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3, width: 160 }}>
+              <div style={{ fontSize: 13, color: INK_SOFT }}>全体の繰り返し回数</div>
+              <input type="number" min="1" step="1" value={repeat}
+                     onChange={e => setRepeat(e.target.value === '' ? '' : Number(e.target.value))}
+                     style={{
+                       width: '100%', padding: '6px 10px', borderRadius: 4, fontSize: 14,
+                       border: `1px solid ${repeatInvalid ? '#b04040' : HATCH}`,
+                       fontFamily: "'JetBrains Mono', monospace",
+                       background: PAPER, color: window.INK, outline: 'none',
+                     }} />
+            </div>
           </div>
         </Box>
 
@@ -821,6 +862,16 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
               <Btn disabled={!loaded} onClick={() => addStep('mode')}>＋ 走行モードを追加</Btn>
               <Btn disabled={!loaded} onClick={() => addStep('schedule')}>＋ スケジュールを追加</Btn>
             </div>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+            <div style={{ fontSize: 13, color: INK_SOFT }}>参照先の選択肢</div>
+            <input type="text" value={refQuery} onChange={e => setRefQuery(e.target.value)}
+                   placeholder="名前で検索…"
+                   style={{ ...selectStyle, width: 200, padding: '5px 10px' }} />
+            <Btn onClick={() => setRefAsc(a => !a)} style={{ padding: '4px 10px' }}>
+              参照先の並び: 名前{refAsc ? ' ↑' : ' ↓'}
+            </Btn>
           </div>
 
           <div style={{ overflowX: 'auto' }}>
@@ -855,15 +906,15 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
                             style={{ ...selectStyle, borderColor: missing ? '#b04040' : HATCH,
                                      color: missing ? '#f07070' : window.INK }}>
                       {missing && <option value={s.ref_id}>（見つからない）</option>}
-                      {optionsOf(s.kind).map(o => (
+                      {refOptionsOf(s.kind, s.ref_id).map(o => (
                         <option key={o.id} value={o.id}>{o.name}</option>
                       ))}
                     </select>
                     <input type="number" min="1" step="1" value={s.repeat}
                            onChange={e => updateStep(idx, { repeat: e.target.value === '' ? '' : Number(e.target.value) })}
-                           style={numberInputStyle} />
+                           style={{ ...numberInputStyle, borderColor: stepRepeatInvalid(s) ? '#b04040' : window.HATCH }} />
                     <div style={{ fontFamily: 'monospace', fontSize: 13, color: missing ? '#f07070' : INK }}>
-                      {missing ? '—' : `${fmtMMSS(r.duration * toRepeat(s.repeat))}（${(r.duration * toRepeat(s.repeat)).toFixed(1)}s）`}
+                      {missing ? '—' : `${fmtMMSS(r.duration * Number(s.repeat))}（${(r.duration * Number(s.repeat)).toFixed(1)}s）`}
                     </div>
                     <div style={{ display: 'flex', gap: 6 }}>
                       <Btn disabled={idx === 0} onClick={() => moveStep(idx, -1)} style={{ padding: '4px 10px' }}>↑</Btn>
@@ -881,7 +932,7 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 10 }}>
             <div style={{ fontSize: 14, color: INK_SOFT }}>プレビュー（1 周ぶん。段の幅は 長さ×繰り返し に比例）</div>
             <div style={{ fontSize: 14 }}>
-              合計時間（× {toRepeat(repeat)} 周）：
+              合計時間（× {repeat === '' ? '—' : repeat} 周）：
               <b style={{ fontFamily: 'monospace' }}> {fmtMMSS(totalDuration)}（{totalDuration.toFixed(1)}s）</b>
             </div>
           </div>
@@ -891,9 +942,9 @@ function SequenceEditForm({ initial, onCancel, onSaved }) {
             <div style={{ display: 'flex', height: 36, border: `1px solid ${HATCH}`, borderRadius: 3, background: PAPER, overflow: 'hidden' }}>
               {steps.map((s, idx) => {
                 const r = resolved[idx];
-                const w = r.duration * toRepeat(s.repeat);
+                const w = r.duration * Number(s.repeat);
                 const missing = loaded && r.missing;
-                const label = `${r.name} ×${toRepeat(s.repeat)}`;
+                const label = `${r.name} ×${s.repeat === '' ? '—' : s.repeat}`;
                 return (
                   <div key={idx}
                        title={`${idx + 1} 段目 ${SEQ_KIND_LABEL[s.kind]}: ${label}（${w.toFixed(1)}s）`}

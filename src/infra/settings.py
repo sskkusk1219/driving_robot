@@ -92,6 +92,15 @@ class GpioSettings:
 
 
 @dataclass
+class WebGpioSettings:
+    """WebUI サーバー専用（[web_gpio]）。tests/research が [gpio] の未知キーを拒否する。"""
+
+    # 非常停止スイッチ(GPIO)の見張りを使うか。false は未接続の機体用
+    # （見張りを起動せず、解除もピンを見ない）
+    enabled: bool = True
+
+
+@dataclass
 class ArchiveSettings:
     usb_ssd_path: str = "/mnt/usb_ssd/archive"
     active_log_days: int = 90
@@ -195,6 +204,7 @@ class AppSettings:
     can: CanSettings = field(default_factory=CanSettings)
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
     gpio: GpioSettings = field(default_factory=GpioSettings)
+    web_gpio: WebGpioSettings = field(default_factory=WebGpioSettings)
     archive: ArchiveSettings = field(default_factory=ArchiveSettings)
     control: ControlSettings = field(default_factory=ControlSettings)
     safety: SafetySettings = field(default_factory=SafetySettings)
@@ -221,6 +231,7 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
     can = CanSettings(**{k: v for k, v in raw.get("can", {}).items()})
     database = DatabaseSettings(**{k: v for k, v in raw.get("database", {}).items()})
     gpio = GpioSettings(**{k: v for k, v in raw.get("gpio", {}).items()})
+    web_gpio = WebGpioSettings(**{k: v for k, v in raw.get("web_gpio", {}).items()})
     archive = ArchiveSettings(**{k: v for k, v in raw.get("archive", {}).items()})
     control = ControlSettings(**{k: v for k, v in raw.get("control", {}).items()})
     safety = SafetySettings(**{k: v for k, v in raw.get("safety", {}).items()})
@@ -240,6 +251,7 @@ def load_settings(path: Path = Path("config/settings.toml")) -> AppSettings:
         can=can,
         database=database,
         gpio=gpio,
+        web_gpio=web_gpio,
         archive=archive,
         control=control,
         safety=safety,

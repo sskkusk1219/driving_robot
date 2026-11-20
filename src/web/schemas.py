@@ -1,39 +1,86 @@
+# ruff: noqa: E501
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.models.system_state import InitStepStatus, RobotState
-
-# ── Calibration ──────────────────────────────────────────────────────────────
-
-
-class CalibrationDataResponse(BaseModel):
-    accel_zero_pos: int
-    accel_full_pos: int
-    accel_stroke: int
-    brake_zero_pos: int
-    brake_full_pos: int
-    brake_stroke: int
-    calibrated_at: datetime
-    is_valid: bool
-
-
-class CalibrationResultResponse(BaseModel):
-    success: bool
-    error_message: str | None
-    data: CalibrationDataResponse | None
-
 
 # ── System state ──────────────────────────────────────────────────────────────
 
 
+class JobSnapshotSchema(BaseModel):
+    """JobManager のジョブ状態（src/app/job_manager.py の JobStatus.to_dict）。形は README。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    job_id: str
+    kind: str  # learning / mode_drive / interactive / init_only / schedule / ign_off
+    vehicle_id: str
+    purpose: str | None = None
+    steps: str | None = None
+    mode_id: str | None = None
+    mode_name: str | None = None
+    schedule_id: str | None = None
+    schedule_name: str | None = None
+    sequence: dict[str, Any] | None = None  # シーケンスの 1 段として走っているとき、その全体の進み具合
+    run_type: str | None = None
+    session_id: str | None = None
+    phase: str
+    step: int | None = None
+    step_title: str | None = None
+    init_steps: list[dict[str, str]] = []
+    sample: dict[str, Any] | None = None
+    interactive_status: dict[str, Any] | None = None
+    started_at: str
+    elapsed_s: float
+    exit_code: int | None = None
+    final_status: str | None = None
+    stop_requested: bool = False
+    emergency: bool = False
+    # 非常停止の流れ（減速して停車 → N → IGN-OFF → 原点復帰）の今の段と詳細。止まらずブレーキを踏んだまま終えたか
+    emergency_stage: str | None = None
+    emergency_detail: str | None = None
+    brake_kept: bool = False
+    buttons_unavailable: bool = False
+    result: dict[str, Any] | None = None
+    ended_at: str | None = None
+    paused: bool = False  # 一時停止中（モード走行）
+    # ボタン押下 [{button: start/P/N/D, seconds, start_s, end_s|None}]（時刻はサンプルの mode_time_s ?? t_s と同じ軸）
+    button_events: list[dict[str, Any]] = []
+    dev_stats: dict[str, Any] | None = None  # モード走行の |偏差| の {max, p95, n}（一時停止中の行を除く）
+
+
 class SystemStateResponse(BaseModel):
     robot_state: RobotState
-    active_profile_id: str | None
+    active_profile_id: str | None  # 選んでいる車の ID（フォルダ名）
     active_session_id: str | None
     last_normal_shutdown: bool
     updated_at: datetime
+    manager_state: str = "standby"  # standby / running / emergency
+    # 初期化ページの初期化が済んでいるか（モード走行・学習を始める条件。サーバー起動・非常停止・エラー終了で false）
+    initialized: bool = False
+    # 初期化ページが「なし（設定で off）」と出すための、機器ごとの有無（ups・gpio・buttons。true が「ある」）
+    devices: dict[str, bool] = {}
+    job: JobSnapshotSchema | None = None
+    last_job: JobSnapshotSchema | None = None
+    # シーケンスの実行中の進み具合と、直前に終わったシーケンス（段・回数・結果。形は job_manager.SequenceRun.to_dict）
+    sequence: dict[str, Any] | None = None
+    last_sequence: dict[str, Any] | None = None
+    # 走行の準備（開始ポップアップの間の計画作成）。形は job_manager.PrepareRun.to_dict。無ければ None
+    prepare: dict[str, Any] | None = None
+
+
+class JobStartResponse(BaseModel):
+    """ジョブ開始の応答。session_id は DB が無い環境・セッションを作らないジョブでは None。"""
+
+    job_id: str
+    kind: str
+    vehicle_id: str
+    steps: str | None = None
+    run_type: str | None = None
+    session_id: str | None = None
+    started_at: datetime
 
 
 class LogLineSchema(BaseModel):
@@ -55,6 +102,8 @@ class DriveLogResponse(BaseModel):
 
 class StartDriveRequest(BaseModel):
     mode_id: str
+    # 開発・動作確認用: モード走行を先頭 limit_s 秒で打ち切る（ランナーの --limit-s）。通常は指定しない
+    limit_s: float | None = Field(default=None, gt=0, le=36000)
 
 
 class DriveSessionResponse(BaseModel):
@@ -69,142 +118,33 @@ class DriveSessionResponse(BaseModel):
     status: str
 
 
-class FeedforwardParamsSchema(BaseModel):
-    """Ridge 逆FFモデルを補う車両物理定数。デフォルトは AT 標準値。"""
+class LearningStartRequest(BaseModel):
+    """学習の種類: full ＝ 手順 2（探索 → G ランプ → モデル作成 → チェック）、
+    fel ＝ 手順 12・hold ＝ 手順 13・stop ＝ 手順 14（今の pkl への部分的な学習のやり直し）。"""
 
-    model_config = ConfigDict(from_attributes=True)
-
-    creep_speed_kmh: float = 7.0
-    creep_rate_kmhs: float = 0.5
-    engine_brake_decel_kmhs: float = 1.0
-    # 惰行減速カーブ（速度依存・学習運転のコーストダウンから同定）。空=未同定で
-    # engine_brake_decel_kmhs 定数へフォールバック。FeedforwardParams と同名フィールド必須
-    # （routers/profiles.py の _ffp_from_schema が全 dataclass フィールドを getattr する）。
-    coast_decel_speeds_kmh: tuple[float, ...] = ()
-    coast_decel_kmhs: tuple[float, ...] = ()
-    # ペダルゲイン曲線（速度依存・学習運転から同定）。空=未同定でモデル出力のみを使う。
-    # 緩減速域（アクセルを踏みながら減速）の effort を解析的に出すのに使う
-    # （pedal_plan.analytic_efforts）。FeedforwardParams と同名フィールド必須。
-    pedal_gain_speeds_kmh: tuple[float, ...] = ()
-    accel_gain_kmhs_per_pct: tuple[float, ...] = ()
-    brake_gain_kmhs_per_pct: tuple[float, ...] = ()
-    stop_brake_opening_pct: float = 20.0
-    # 0.0（不感帯なし）は合法値。ge=0 のみで、負値のみ弾く
-    # （D5 レビュー指摘: model_training/pid_tuning は 0.0 を正しく扱えるよう修正済み）。
-    brake_deadband_pct: float = Field(default=1.0, ge=0.0)
-    accel_deadband_pct: float = Field(default=1.0, ge=0.0)
-    # ペダル調停（PedalArbiter）定数
-    switch_hysteresis_pct: float = 0.5
-    accel_reengage_dwell_s: float = 0.3
-    accel_rate_limit_pct_s: float = 200.0
-    brake_rate_limit_pct_s: float = 300.0
-    pid_output_limit_pct: float = 50.0
-    # 惰行遷移時のアクセル解放レート [%/s]（B-7-3。ON-OFF ハンチング抑制）
-    accel_release_rate_pct_s: float = Field(default=10.0, ge=0.0)
-    # アクセル開度の量子化しきい値 [%]（B-7-3。微小変動でサーボを震わせない）
-    accel_min_step_pct: float = Field(default=0.2, ge=0.0)
+    kind: Literal["full", "fel", "hold", "stop"] = "full"
 
 
-class PIDGainsSchema(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    kp: float
-    ki: float
-    kd: float
+class SaveMinRequest(BaseModel):
+    axis: Literal["accel", "brake", "both"] = "both"
 
 
-class DynamicsParamsSchema(BaseModel):
-    """PID 先読み補償秒数(pid_preview_s)と FOPDT 同定値(表示用)。
-
-    pid_preview_s は PID フィードバックのみに適用する基準軌跡の前倒し秒数。FF は
-    now-frame で動くため、この値は FB ループのむだ時間補償に限定される。手動微調整を
-    許容する。fopdt_* は学習サイクルの同定結果（表示用メタデータ）。
-    """
-
-    model_config = ConfigDict(from_attributes=True)
-
-    pid_preview_s: float = 0.0
-    fopdt_k: float | None = None
-    fopdt_tau: float | None = None
-    fopdt_theta: float | None = None
+class SaveMaxRequest(BaseModel):
+    axis: Literal["accel", "brake"]
 
 
-class TrainModelRequest(BaseModel):
-    profile_id: str
-    session_ids: list[str] | None = None
-    # 指定時はサイクル内の全セッション（学習運転+全適合走行）のログで学習する。
-    # session_ids と併用時は session_ids を優先する。
-    cycle_id: str | None = None
-
-
-class TrainModelResponse(BaseModel):
-    model_path: str
-    metrics: dict[str, dict[str, float]]
-    feedforward_params: FeedforwardParamsSchema
-    # 学習ログから解析的に自動適合した PID ゲイン。同定不能（区間不足）なら None。
-    pid_gains: PIDGainsSchema | None = None
-    pid_auto_tuned: bool = False
-    dynamics_params: DynamicsParamsSchema = DynamicsParamsSchema()
-
-
-class PidValidateRequest(BaseModel):
-    profile_id: str
-
-
-class PidValidateResponse(BaseModel):
-    """規定パターン 1 回走行の追従性能。"""
-
-    kpi_summary: dict[str, float]
-    cost: float
-    pid_gains: PIDGainsSchema
-
-
-class PidRefineRequest(BaseModel):
-    profile_id: str
-    max_runs: int = Field(default=15, ge=1, le=50)
-    # 指定時は本番モードの代表区間で評価走行する（適合結果の転移性向上）。None なら規定パターン。
-    mode_id: str | None = None
-
-
-class PidRefineResponse(BaseModel):
-    """閉ループ絞り込みの最良ゲイン・PID 先読み補償秒数と反復履歴。"""
-
-    pid_gains: PIDGainsSchema
-    pid_preview_s: float = 0.0
-    best_cost: float
-    history: list[dict[str, float]]
-
-
-# ── Learning cycle（2段階学習フローのオーケストレーション）───────────────────────
-
-
-class CycleProgressSchema(BaseModel):
-    """学習サイクルの進捗。WebSocket(RealtimeData.cycle_progress)・status API 共通。"""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    cycle_id: str | None
-    phase: str
-    run_index: int
-    run_total: int
-    best_cost: float | None
-    best_pid_preview_s: float | None = None
+class SaveMaxResponse(BaseModel):
     message: str
-    started_at: datetime | None
+    accel_pct: float | None = None
+    brake_pct: float | None = None
 
 
-class LearningCycleStartRequest(BaseModel):
-    # PID 粗適合（REFINE_1）の走行本数。未指定なら LearningSettings の既定を使う。
-    refine_runs_stage1: int | None = Field(default=None, ge=1, le=50)
-
-
-class LearningCycleStartResponse(BaseModel):
-    cycle_id: str
-    status: str
-
-
-class LearningCycleAbortResponse(BaseModel):
-    status: str
+class SaveMinResponse(BaseModel):
+    message: str
+    accel_pct: float | None = None
+    brake_pct: float | None = None
+    min_accel_measured: bool
+    min_brake_measured: bool
 
 
 class SelectProfileRequest(BaseModel):
@@ -260,88 +200,109 @@ class RealtimeData(BaseModel):
     ups_battery_pct: float | None = None
     ups_on_battery: bool = False
     init_steps: list[InitStepSchema] = []
-    cycle_progress: CycleProgressSchema | None = None
+    # 初期化ページの初期化が済んでいるか（false の間はモード走行・学習を始められない。D-15c）
+    initialized: bool = False
+    # 実行中のジョブの状態（段3: cycle_progress の置き換え。手順・phase・section など）
+    job: JobSnapshotSchema | None = None
+    # 実行中のシーケンスの進み具合（段の切れ目は job が None でもここは残る）
+    sequence: dict[str, Any] | None = None
+    # 走行の準備（計画作成）の状態。無ければ None
+    prepare: dict[str, Any] | None = None
+    # 非常停止のきっかけ（screen / switch / ac_loss / auto。非常停止中だけ）
+    emergency_cause: str | None = None
+    emergency_cause_detail: str | None = None  # auto のときのランナーの理由
 
 
 # ── Vehicle Profile ───────────────────────────────────────────────────────────
 
 
-class StopConfigSchema(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class ButtonsSchema(BaseModel):
+    """ボタン操作（サーボ）の値。servo_map は {ボタン名: {channel, offset_deg}}。"""
 
-    deviation_threshold_kmh: float
-    deviation_duration_s: float
+    model_config = ConfigDict(extra="allow")
 
-
-class ProfileCreateRequest(BaseModel):
-    name: str
-    max_accel_opening: float
-    max_brake_opening: float
-    max_speed: float
-    max_decel_g: float
-    pid_gains: PIDGainsSchema
-    stop_config: StopConfigSchema
-    model_path: str | None = None
-    feedforward_params: FeedforwardParamsSchema | None = None
-    dynamics_params: DynamicsParamsSchema | None = None
-
-    @field_validator("max_accel_opening", "max_brake_opening")
-    @classmethod
-    def opening_range(cls, v: float) -> float:
-        if not (0.0 <= v <= 100.0):
-            raise ValueError("開度は 0〜100% の範囲で指定してください")
-        return v
-
-    @field_validator("max_speed")
-    @classmethod
-    def speed_positive(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("最高車速は正の値を指定してください")
-        return v
+    start_short_press_s: float | None = None
+    start_long_press_s: float | None = None
+    ign_off_press_s: float | None = None
+    installed: bool | None = None  # ボタンサーボ（SG90）が付いているか。false は押したことにするだけ
+    shift_press_s: float | None = None
+    after_press_wait_s: float | None = None
+    accel_tap_opening_pct: float | None = None
+    accel_tap_on_s: float | None = None
+    accel_tap_off_s: float | None = None
+    maintenance_tap_count: int | None = None
+    n_hold_gap_s: float | None = None
+    d_press_at_s: float | None = None
+    no_speed_abort_s: float | None = None
+    no_speed_kmh: float | None = None
+    servo_rest_angle_deg: float | None = None
+    servo_map: dict[str, Any] | None = None
 
 
-class ProfileUpdateRequest(BaseModel):
-    name: str | None = None
-    max_accel_opening: float | None = None
-    max_brake_opening: float | None = None
-    max_speed: float | None = None
+class _VehicleValues(BaseModel):
+    """人が決める vehicle.* の値（更新では送ったキーだけ書く。作成では省略すると仮値）。
+
+    知らないキー（学習で決まる feedforward など）は黙って無視せず 422 にする。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_speed_kmh: float | None = None
     max_decel_g: float | None = None
-    pid_gains: PIDGainsSchema | None = None
-    stop_config: StopConfigSchema | None = None
-    model_path: str | None = None
-    feedforward_params: FeedforwardParamsSchema | None = None
-    dynamics_params: DynamicsParamsSchema | None = None
+    min_accel_opening_pct: float | None = None
+    max_accel_opening_pct: float | None = None
+    min_brake_opening_pct: float | None = None
+    max_brake_opening_pct: float | None = None
+    stop_deviation_threshold_kmh: float | None = None
+    stop_deviation_duration_s: float | None = None
+    test_mass_kg: float | None = None
+    road_load_a0_n: float | None = None
+    road_load_a1_n_per_kmh: float | None = None
+    road_load_a2_n_per_kmh2: float | None = None
+    road_load_source: str | None = None
 
-    @field_validator("max_accel_opening", "max_brake_opening")
-    @classmethod
-    def opening_range(cls, v: float | None) -> float | None:
-        if v is not None and not (0.0 <= v <= 100.0):
-            raise ValueError("開度は 0〜100% の範囲で指定してください")
-        return v
 
-    @field_validator("max_speed")
-    @classmethod
-    def speed_positive(cls, v: float | None) -> float | None:
-        if v is not None and v <= 0:
-            raise ValueError("最高車速は正の値を指定してください")
-        return v
+class ProfileCreateRequest(_VehicleValues):
+    """車の登録。id（フォルダ名）を省略すると名前から作る。新しい車は学習の値なし・min は仮値（未測定）。"""
+
+    name: str
+    id: str | None = None
+
+
+class ProfileUpdateRequest(_VehicleValues):
+    """人が決める値の更新。学習で決まる feedforward.* は書けない。送ったキーだけ書く。"""
+
+    name: str | None = None
 
 
 class ProfileResponse(BaseModel):
+    """車（vehicles/<車ID>/vehicle.yaml）の値。id はフォルダ名。"""
+
     id: str
     name: str
-    max_accel_opening: float
-    max_brake_opening: float
-    max_speed: float
-    max_decel_g: float
-    pid_gains: PIDGainsSchema
-    stop_config: StopConfigSchema
-    calibration: CalibrationDataResponse | None
-    model_path: str | None
-    feedforward_params: FeedforwardParamsSchema
-    dynamics_params: DynamicsParamsSchema = DynamicsParamsSchema()
-    created_at: datetime
-    updated_at: datetime
+    error: str | None = None  # yaml が壊れている車（一覧にだけ出る）
+    max_speed_kmh: float | None = None
+    max_decel_g: float | None = None
+    min_accel_opening_pct: float | None = None
+    max_accel_opening_pct: float | None = None
+    min_brake_opening_pct: float | None = None
+    max_brake_opening_pct: float | None = None
+    min_accel_measured: bool = False  # false ＝ 仮値（ジョグで測って save-min する）
+    min_brake_measured: bool = False
+    stop_deviation_threshold_kmh: float | None = None
+    stop_deviation_duration_s: float | None = None
+    test_mass_kg: float | None = None
+    road_load_a0_n: float | None = None
+    road_load_a1_n_per_kmh: float | None = None
+    road_load_a2_n_per_kmh2: float | None = None
+    road_load_source: str | None = None
+    buttons: ButtonsSchema = ButtonsSchema()  # 共通設定の値（読むだけ）
+    learned: bool = False  # model_path があり pkl が存在する
+    model_path: str | None = None
+    learned_at: datetime | None = None  # pkl の更新時刻
+    candidate: str | None = None  # 走る制御の候補（共通設定。読むだけ）
+    feedforward: dict[str, Any] = {}  # 学習で決まる値（読むだけ）
+    updated_at: datetime | None = None
 
 
 # ── Driving Mode ──────────────────────────────────────────────────────────────
@@ -386,34 +347,23 @@ class PedalPointSchema(BaseModel):
     brake_opening: float = Field(ge=0.0, le=100.0)
 
 
-def _reject_simultaneous_pedal_press(points: list[PedalPointSchema]) -> None:
-    """アクセル・ブレーキが同時に非ゼロとなる区間を reject する。
-
-    機構保護のため同時踏みは常に禁止（pedal_safety.enforce_pedal_exclusion 参照）。
-    線形補間区間 [p0, p1] は「アクセルが区間全体で0」または「ブレーキが区間全体で0」の
-    いずれかでない限り、区間内のどこかで両ペダルが同時に非ゼロになり得る（両端で
-    片方だけ非ゼロが入れ替わるクロスオーバーのケースを含む）。
-    """
-    for p in points:
-        if p.accel_opening > 0.0 and p.brake_opening > 0.0:
-            raise ValueError(
-                f"pedal_points の time_s={p.time_s} でアクセルとブレーキが同時に"
-                "非ゼロです（同時踏みは禁止）"
-            )
-    for p0, p1 in zip(points, points[1:], strict=False):
-        accel_zero_segment = p0.accel_opening == 0.0 and p1.accel_opening == 0.0
-        brake_zero_segment = p0.brake_opening == 0.0 and p1.brake_opening == 0.0
-        if not accel_zero_segment and not brake_zero_segment:
-            raise ValueError(
-                f"pedal_points の time_s={p0.time_s}〜{p1.time_s} の区間でアクセル・"
-                "ブレーキが同時に非ゼロとなる可能性があります（同時踏みは禁止）"
-            )
-
-
 class ButtonEventSchema(BaseModel):
+    """ボタン押下イベント。新しいイベントはボタン名（button）で指す。
+
+    channel は旧データ（ch だけを持つ）の読み込み用で、button が無いイベントは「名前なし（要再設定）」。
+    保存し直しで button を付ける。press_duration_s が無ければ車両 yaml の既定秒数で押す。
+    """
+
     time_s: float = Field(ge=0.0)
-    channel: int = Field(ge=0, le=15)
-    press_duration_s: float = Field(gt=0.0)
+    button: Literal["start", "P", "N", "D"] | None = None
+    channel: int | None = Field(default=None, ge=0, le=15)
+    press_duration_s: float | None = Field(default=None, gt=0.0)
+
+    @model_validator(mode="after")
+    def _button_or_channel(self) -> "ButtonEventSchema":
+        if self.button is None and self.channel is None:
+            raise ValueError("ボタン名（button: start / P / N / D）を指定してください")
+        return self
 
 
 class ScheduleResponse(BaseModel):
@@ -450,7 +400,6 @@ class ScheduleCreateRequest(BaseModel):
             if p.time_s <= prev:
                 raise ValueError("pedal_points の time_s は単調増加である必要があります")
             prev = p.time_s
-        _reject_simultaneous_pedal_press(v)
         return v
 
     @field_validator("button_events")
@@ -482,12 +431,26 @@ class ScheduleUpdateRequest(BaseModel):
             if p.time_s <= prev:
                 raise ValueError("pedal_points の time_s は単調増加である必要があります")
             prev = p.time_s
-        _reject_simultaneous_pedal_press(v)
         return v
+
+
+class PrepareRequest(BaseModel):
+    """走行の準備（開始ポップアップの間に計画を作る）。kind に応じた ID（モード・スケジュール・シーケンス）。"""
+
+    kind: Literal["mode", "schedule", "sequence"]
+    id: str
+    # 開発・動作確認用: モードの段を先頭 limit_s 秒で打ち切る（ランナーの --limit-s）。通常は指定しない
+    limit_s: float | None = Field(default=None, gt=0, le=36000)
 
 
 class StartScheduleRequest(BaseModel):
     schedule_id: str
+
+
+class StartSequenceRequest(BaseModel):
+    sequence_id: str
+    # 開発・動作確認用: シーケンスの走行モードの段を先頭 limit_s 秒で打ち切る（ランナーの --limit-s）。通常は指定しない
+    limit_s: float | None = Field(default=None, gt=0, le=36000)
 
 
 # ── Session / Log ─────────────────────────────────────────────────────────────
@@ -495,7 +458,9 @@ class StartScheduleRequest(BaseModel):
 
 class SessionResponse(BaseModel):
     id: str
-    profile_id: str
+    profile_id: str | None  # 旧プロファイル時代の行だけ。新しい走行は vehicle_id
+    vehicle_id: str | None = None
+    vehicle_name: str | None = None
     mode_id: str | None
     run_type: str
     started_at: datetime
@@ -514,6 +479,16 @@ class CycleSummaryResponse(BaseModel):
     ended_at: datetime | None
     session_count: int
     detail: dict[str, Any]
+
+
+class MessageResponse(BaseModel):
+    """進行のメッセージ 1 行（drive_session_messages）。"""
+
+    seq: int
+    elapsed_s: float
+    time: datetime
+    level: str
+    message: str
 
 
 class LogResponse(BaseModel):
@@ -535,18 +510,6 @@ class LogResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
-
-
-class PlanStatusResponse(BaseModel):
-    """エピソード型プラン学習の状態。自動走行画面のモード選択時に表示する（ILC の後継）。"""
-
-    profile_id: str
-    mode_id: str
-    enabled: bool
-    iteration: int  # これまでの学習反復回数（0=未学習）
-    has_plan: bool  # 保存プランが存在するか（efforts が非空）
-    best_reward: float | None  # これまでの最良走行 reward
-    reward_history: list[dict[str, object]] = []  # 反復ごとの reward/p95/採否 履歴（収束表示用）
 
 
 # ── Sequence ─────────────────────────────────────────────────────────────────

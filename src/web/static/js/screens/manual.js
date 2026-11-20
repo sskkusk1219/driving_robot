@@ -1,6 +1,6 @@
 // ── Manual drive screen ───────────────────────────────────
 
-function AxisJog({ label, axisId, currentPos, openingPct, maxPct, currentMa, onJog, onHome, enabled = true, selected = false, onSelect }) {
+function AxisJog({ label, axisId, currentPos, openingPct, maxPct, onJog, enabled = true, selected = false, onSelect }) {
   const { INK, INK_SOFT, PAPER, HATCH, Btn } = window;
   const { AxisPanel, JogRow } = window;
   const dis = !enabled;
@@ -21,12 +21,9 @@ function AxisJog({ label, axisId, currentPos, openingPct, maxPct, currentMa, onJ
         </div>
       </div>
 
-      {/* Info + home */}
+      {/* Info */}
       <div style={{ display: 'flex', gap: 12, fontSize: 12, color: INK_SOFT, alignItems: 'center' }}>
         <span>開度 <b style={{ fontFamily: 'inherit', color: INK }}>{openingPct.toFixed(1)} %</b></span>
-        <span>電流 <b style={{ fontFamily: 'inherit', color: INK }}>{currentMa} mA</b></span>
-        <div style={{ flex: 1 }} />
-        <Btn onClick={() => onHome(axisId)} disabled={dis}>原点へ戻す</Btn>
       </div>
     </AxisPanel>
   );
@@ -46,14 +43,13 @@ function ManualScreen() {
   const [popup, setPopup] = useState(null);
   const [maxBrake, setMaxBrake] = useState(null);  // アクティブプロファイルの最大開度 [%]
   const [maxAccel, setMaxAccel] = useState(null);
-  const [calib, setCalib] = useState(null);  // キャリブレーション（開度の換算に使う ZERO/FULL）
   const startedHereRef = useRef(false);  // この画面で開始した（位置は 0 と分かっている）
 
   const enabled = robotState === 'MANUAL';
   // 開始できるのは初期化済み（READY）のときだけ
   const canStart = robotState === 'READY';
 
-  // アクティブプロファイルの最大開度を取得。プロファイル・キャリブレーションが無ければポップアップ
+  // 選んでいる車の最大開度を取得。車が選ばれていなければポップアップ
   useEffect(() => {
     if (!activeProfileId) {
       setPopup('no_profile');
@@ -61,10 +57,8 @@ function ManualScreen() {
     }
     apiFetch('GET', `/api/v1/profiles/${activeProfileId}`).then(p => {
       if (!p) return;
-      if (!p.calibration?.is_valid) setPopup('no_calib');
-      if (p.calibration) setCalib(p.calibration);
-      if (p.max_brake_opening != null) setMaxBrake(p.max_brake_opening);
-      if (p.max_accel_opening != null) setMaxAccel(p.max_accel_opening);
+      if (p.max_brake_opening_pct != null) setMaxBrake(p.max_brake_opening_pct);
+      if (p.max_accel_opening_pct != null) setMaxAccel(p.max_accel_opening_pct);
     });
   }, []);
 
@@ -108,11 +102,13 @@ function ManualScreen() {
     setAxisState(axisId, s => ({ ...s, currentPos: r.position ?? s.currentPos }));
   }
 
-  async function handleHome(axisId) {
-    const r = await apiFetch('POST', '/api/v1/drive/manual/home', { axis: axisId });
+  async function handleHome() {
+    // API は軸を選べない（両軸が原点へ戻る）
+    const r = await apiFetch('POST', '/api/v1/drive/manual/home', { axis: 'brake' });
     if (!r) return;
-    setAxisState(axisId, s => ({ ...s, currentPos: r.position ?? 0 }));
-    window.showToast('原点へ戻しました', 'success');
+    setBrk(s => ({ ...s, currentPos: 0 }));
+    setAcc(s => ({ ...s, currentPos: 0 }));
+    window.showToast('両軸を原点へ戻しました', 'success');
   }
 
   async function handleStart() {
@@ -131,33 +127,26 @@ function ManualScreen() {
     }
   }
 
-  // 開度 [%]: サーバーの開度は制御ループが動いている間しか出ない（手動運転では常に 0）ので、
-  // 位置とキャリブレーションの ZERO/FULL から換算する。位置が分からないときは 0。
-  const toOpening = (pos, zero, full) => (
-    pos == null || zero == null || full == null || full === zero
-      ? 0
-      : Math.max(0, Math.min(100, ((pos - zero) / (full - zero)) * 100))
-  );
-  const brkOpeningPct = toOpening(brk.currentPos, calib?.brake_zero_pos, calib?.brake_full_pos);
-  const accOpeningPct = toOpening(acc.currentPos, calib?.accel_zero_pos, calib?.accel_full_pos);
-  const brkMa = realtimeData.brake_current_ma ?? 0;
-  const accMa = realtimeData.accel_current_ma ?? 0;
+  // 開度 [%]: 位置 [pulse] から換算する（開度の定義は 原点 0%・9500 pulse = 100%）。位置が分からないときは 0。
+  const PULSE_FULL = 9500;
+  const toOpening = pos => (pos == null ? 0 : Math.max(0, Math.min(100, (pos / PULSE_FULL) * 100)));
+  // 手動運転ジョブの実測位置（interactive_status）があればそれを優先（再読み込み後も実際と一致）。無ければ操作の応答から覚えた値
+  const job = realtimeData?.job ?? null;
+  const isManualJob = job?.kind === 'interactive' && job?.purpose === 'manual';
+  const st = isManualJob ? (job.interactive_status ?? null) : null;
+  const brkPos = st?.brake_pulse ?? brk.currentPos;
+  const accPos = st?.accel_pulse ?? acc.currentPos;
+  const brkOpeningPct = toOpening(brkPos);
+  const accOpeningPct = toOpening(accPos);
 
   return (
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 10, flex: 1, minHeight: 0 }}>
 
       {popup === 'no_profile' && (
         <ValidationPopup
-          message="車両プロファイルを選択してください"
-          actionLabel="プロファイルへ"
+          message="車を選択してください"
+          actionLabel="車両プロファイルへ"
           onAction={() => setNav('profiles')}
-        />
-      )}
-      {popup === 'no_calib' && (
-        <ValidationPopup
-          message="キャリブレーションデータがありません"
-          actionLabel="キャリブレーションへ"
-          onAction={() => setNav('calibration')}
         />
       )}
 
@@ -172,16 +161,16 @@ function ManualScreen() {
       <div style={{ display: 'flex', gap: 10, flex: 1, minHeight: 0 }}>
         <AxisJog
           label="ブレーキ" axisId="brake"
-          currentPos={brk.currentPos}
-          openingPct={brkOpeningPct} maxPct={maxBrake} currentMa={brkMa}
-          onJog={handleJog} onHome={handleHome}
+          currentPos={brkPos}
+          openingPct={brkOpeningPct} maxPct={maxBrake}
+          onJog={handleJog}
           enabled={enabled} selected={selectedAxis === 'brake'} onSelect={setSelectedAxis}
         />
         <AxisJog
           label="アクセル" axisId="accel"
-          currentPos={acc.currentPos}
-          openingPct={accOpeningPct} maxPct={maxAccel} currentMa={accMa}
-          onJog={handleJog} onHome={handleHome}
+          currentPos={accPos}
+          openingPct={accOpeningPct} maxPct={maxAccel}
+          onJog={handleJog}
           enabled={enabled} selected={selectedAxis === 'accel'} onSelect={setSelectedAxis}
         />
       </div>
@@ -195,16 +184,16 @@ function ManualScreen() {
             <div>Tab    : 軸切替 (アクセル ↔ ブレーキ)</div>
             <div>パネルをクリック : その軸を操作対象にする</div>
           </div>
-          <Note style={{ marginTop: 6 }}>ジョグ中は最大開度リミットが有効です。電流値を常時監視中。</Note>
         </Box>
 
         <div style={{ display: 'flex', gap: 10, flex: 1 }}>
           <Box style={{ padding: '10px 14px', fontSize: 13, flex: 1 }}>
             <Row cells={[['実車速',       '1.4fr'], [`${(realtimeData.actual_speed_kmh ?? 0).toFixed(1)} km/h`, '1fr', 'mono']]} />
-            <Row cells={[['ブレーキ pos', '1.4fr'], [brk.currentPos === null ? "—" : `${brk.currentPos} pulse`, '1fr', 'mono']]} />
-            <Row cells={[['アクセル pos', '1.4fr'], [acc.currentPos === null ? "—" : `${acc.currentPos} pulse`, '1fr', 'mono']]} />
+            <Row cells={[['ブレーキ pos', '1.4fr'], [brkPos == null ? "—" : `${brkPos} pulse`, '1fr', 'mono']]} />
+            <Row cells={[['アクセル pos', '1.4fr'], [accPos == null ? "—" : `${accPos} pulse`, '1fr', 'mono']]} />
           </Box>
-          <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: 6 }}>
+            <Btn onClick={handleHome} disabled={!enabled}>両軸を原点へ</Btn>
             {robotState === 'MANUAL' ? (
               <Btn danger big style={{ flex: 1 }} onClick={() => setConfirmStop(true)}>■ 運転終了</Btn>
             ) : (

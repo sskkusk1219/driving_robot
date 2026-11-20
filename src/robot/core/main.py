@@ -1,0 +1,1529 @@
+# 移植元: tests/research/main.py（scripts/port_research.py が 2026-11-19 に写した。tests の commit 4c80595+未コミットの変更あり）。手で直さない  # noqa: E501
+"""研究開発用ハーネスのエントリポイント（ProblemReport_20260910 手順 0〜10）。
+
+本番の制御スタックは層が多く、どの層が KPI を壊しているのか切り分けられない。
+そこで `tests/` 側に「FF → PID → 調停 → ペダル」だけの極端に単純な系を組み、
+手順を 1 つずつ足しながらプライマリー KPI の達成度を測る。
+
+    目標車速 → Feedforward ─┐
+                            ＋ → effort → PedalArbiter → Accel/Brake → 車両
+                 PID ───────┘                                          │
+                  ↑                                                    │
+                  └──────────────── 車速（Feedback） ───────────────────┘
+
+使い方:
+    .venv/bin/python -m src.robot.core.main --list          # 手順一覧
+    .venv/bin/python -m src.robot.core.main --upto 0        # 手順 0 まで実行
+    .venv/bin/python -m src.robot.core.main --only 3        # 手順 3 のみ
+    .venv/bin/python -m src.robot.core.main --steps 0,1     # 手順 0 と 1
+    .venv/bin/python -m src.robot.core.main --upto 1 --hw real   # 実機で初期化まで
+    .venv/bin/python -m src.robot.core.main --steps 1,2 --hw real  # 実機でパターン走行→FF モデル
+    .venv/bin/python -m src.robot.core.main --steps 1,3 --hw real  # 実機で FF のみ WLTP モード走行
+    .venv/bin/python -m src.robot.core.main --steps 1,3 --limit-s 60  # スタブで先頭 60s だけ
+    .venv/bin/python -m src.robot.core.main --steps 1,12 --hw real  # FEL の補正表だけ付け直す
+
+実行順:
+    手順 1（初期化）→ 走行前チェック（通信確認・車速 0 km/h 確認）→ 手順 2 以降（走行）
+    走行前チェックは、走行する手順の最初の 1 つの前に 1 回だけ行う。
+
+終了コード:
+    0 成功 / 2 設定エラー / 3 未実装の手順に到達 / 4 初期化エラー / 5 走行エラー
+    / 6 モデル作成エラー / 7 走行前チェックエラー
+    / 8 手順2 の学習結果のチェックが NG（yaml は書き換えていない。後の手順には進まない）
+
+ボタンの手順（20〜25。スタートスイッチ・P/N/D ボタンを PCA9685＋SG90 で押す。2026-11-12）:
+    20 IGN-ON(RLY-OFF) / 21 メンテナンスモード（先頭で 20 も行う） / 22 N レンジホールド
+    / 23 Ready / 24 モード走行（D → モード → N。車速が出なければ中止） / 25 IGN-OFF
+    例: --steps 1,21,22,23,24,25 --limit-s 60（スタブで一連の流れ。各手順の後に車両の状態を表示）
+    どの手順も手順 1（初期化）が先に要る。PCA9685 は最初にボタンを押す手順で接続する。
+
+安全上の注意:
+    `--hw real` は実アクチュエータを物理的に動かす。既定は `stub`（本番と同じスタブ HW）。
+    Claude が無人で実行してよい条件は `.claude/skills/bench-verification/SKILL.md` に従う。
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import csv
+import math
+import sys
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
+
+from src.robot.core import button_steps
+from src.robot.core.config import (
+    ConfigError,
+    ResearchConfig,
+    keys_missing_in_yaml,
+    load_config,
+    validate_config,
+)
+from src.robot.core.drive_log import (
+    SECTION_EXCITE,
+    SECTION_FEL_DRIVE,
+    SECTION_MODE_DRIVE,
+    SECTION_PRE_DRIVE_CHECK,
+    SessionLog,
+)
+from src.robot.core.excite import _format_table as excite_format_table
+from src.robot.core.excite import analyze as excite_analyze
+from src.robot.core.excite import run_excite
+from src.robot.core.fel import (
+    FelParams,
+    attach_fel,
+    fel_rows,
+    format_coverage,
+    wltp_coverage,
+)
+from src.robot.core.fel_pattern import FelPattern, format_pattern, make_pattern
+from src.robot.core.fwd_map import load_forward_map, save_table
+from src.robot.core.hardware import (
+    HW_REAL,
+    HW_STUB,
+    InitializationError,
+    PreDriveCheckError,
+    ResearchHardware,
+    build_hardware,
+    run_initialize,
+    shutdown,
+)
+from src.robot.core.learning_patterns import LearningDataError
+from src.robot.core.mode_drive import (
+    ModeButtonPlan,
+    ModeDriveSetup,
+    compute_hold_at_s,
+    controller_text,
+    fel_text,
+    load_mode,
+    prepare_mode_drive,
+    prepare_mode_drive_from,
+    run_mode_drive,
+)
+from src.robot.core.mode_report import (
+    RunInfo,
+    mode_label,
+    rows_from_samples,
+    save_config_snapshot,
+    write_mode_report,
+)
+from src.robot.core.pattern_drive import (
+    DriveError,
+    build_ff_model,
+    rebuild_stop_side,
+    require_forward_candidate,
+    run_pattern_drive,
+    stop_approach_patterns,
+)
+from src.robot.core.pattern_loop import GRampPattern
+from src.robot.core.pedal_arbiter import enabled_arbiter_features
+from src.robot.core.pedal_search import (
+    PedalSearchResult,
+    apply_crossings,
+    hold_breakaway_pct,
+    hold_opening_meta,
+    run_pedal_search,
+)
+from src.robot.core.pre_drive_check import PHASE_PRE_CHECK, run_pre_drive_check
+from src.robot.core.ramp_planner import (
+    count_bands_for_modes,
+    cruise_kwargs,
+    format_plan_table,
+    format_stop_approach,
+    plan_ramps,
+    top_speed_cap_kmh,
+)
+from src.robot.core.research_types import VEHICLE_STOP_SPEED_KMH, DrivingMode
+from src.robot.core.step2_check import (
+    Step2CheckError,
+    check_fel_coverage,
+    format_checks,
+    format_warn,
+)
+from src.robot.core.term import banner, display_width, say
+from src.robot.core.vehicle import STROKE_LIMIT_PULSE, feedforward_params, opening_to_pulse
+
+DEFAULT_CONFIG = Path("tests/research/config_testVehicle.yaml")
+
+
+class StepNotImplementedError(Exception):
+    """まだ実装していない手順。1 手順ずつ進める方針のため意図的に投げる。"""
+
+
+@dataclass
+class RunContext:
+    """1 回の実行を通して手順間で共有する状態。"""
+
+    config: ResearchConfig
+    hw_mode: str
+    started_at: float
+    # 手順 1 で構築・初期化し、以降の手順（走行）が使い回す。main が終了時に必ず片付ける。
+    hardware: ResearchHardware | None = None
+    # 走行前チェック（停車確認まで）を済ませたか。走行する手順の前に 1 回だけ行う
+    pre_drive_checked: bool = False
+    # 走行前チェック〜停車保持を 1 本に残す走行ログ。走行前チェックの直前に作り、手順 2 の停車保持の
+    # 後（異常終了なら main の finally で原点復帰の後）に保存する
+    session_log: SessionLog | None = None
+    # モード走行（手順 3）の先頭だけ走る秒数（--limit-s。動作確認用）。None ならモード全体
+    limit_s: float | None = None
+    # モード走行の準備（走行モードと FF モデル）。走行前チェックより前に読み込む
+    mode_setup: ModeDriveSetup | None = None
+    # 設定検証を済ませたか。手順0 を含まない実行でも run_steps の冒頭で 1 回だけ行う
+    config_validated: bool = False
+    # 手順 12（FEL の学習の走りだけ）の準備（走行前チェックより前に読み込む）
+    fel_setup: FelRunSetup | None = None
+
+    @property
+    def is_real_hw(self) -> bool:
+        return self.hw_mode == HW_REAL
+
+    def require_hardware(self) -> ResearchHardware:
+        """初期化済み HW を返す。未初期化なら手順 1 を先に走らせるよう促す。"""
+        if self.hardware is None or not self.hardware.initialized:
+            raise InitializationError(
+                "ハードウェアが初期化されていません。手順 1 を先に実行してください"
+                "（例: --upto 3 のように手順 1 を含めて実行する）"
+            )
+        return self.hardware
+
+
+@dataclass(frozen=True)
+class Step:
+    number: int
+    title: str
+    handler: Callable[[RunContext], Awaitable[None]]
+    drives: bool = False  # 車両を走らせる手順（前に走行前チェックを行う）
+    # 走行前チェックより前に行う準備（DB・モデルの読み込みなど。失敗しても HW に触らずに止まる）
+    prepare: Callable[[RunContext], Awaitable[None]] | None = None
+    has_ref: bool = False  # 基準車速に沿って走る手順（走行グラフに基準車速を描く）
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 0: 設定ファイルの作成・検証
+# ─────────────────────────────────────────────────────────────────────
+
+
+def validate_config_once(ctx: RunContext) -> None:
+    """設定を検証する（1 回だけ）。問題があれば ConfigError を送出する。
+
+    手順0 を通らない実行（--only 2 / --only 3 など）でも設定検証が素通りしないよう、
+    run_steps の冒頭で必ず呼ぶ。手順0 からも呼ばれるため、二重表示を防ぐために
+    ctx.config_validated で 1 回だけに制限する。
+    """
+    if ctx.config_validated:
+        return
+    cfg = ctx.config
+    problems = validate_config(cfg)
+    if problems:
+        say(f"設定の検証で {len(problems)} 件の問題が見つかりました:")
+        for problem in problems:
+            say(f"  ✗ {problem}")
+        raise ConfigError("設定ファイルを修正してから再実行してください")
+    say("設定の検証: OK（値域・相互整合）")
+    missing = keys_missing_in_yaml(cfg.source_path)
+    if missing:
+        say(f"yaml に無く既定値が効いている設定: {', '.join(missing)}")
+    ctx.config_validated = True
+
+
+async def step0_setup(ctx: RunContext) -> None:
+    """テスト用車両プロファイルを読み込み、値域を検証して要約を表示する。
+
+    以降の手順が参照するディレクトリ（results / models）もここで作る。
+    """
+    cfg = ctx.config
+    say(f"設定ファイル: {cfg.source_path}")
+
+    validate_config_once(ctx)
+
+    for label, directory in (
+        ("結果", cfg.results_path),
+        ("モデル", Path(cfg.feedforward.model_path).parent),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        say(f"{label}ディレクトリ: {directory}")
+
+    settings_path = Path(cfg.hardware.settings_path)
+    if settings_path.exists():
+        say(f"本番ハードウェア設定: {settings_path}（存在確認 OK）")
+    else:
+        say(f"警告: 本番ハードウェア設定が見つかりません: {settings_path}")
+        say("      手順 1（初期化）で必要になります。")
+        say("      config/settings.toml.example からコピーしてください")
+
+    say()
+    _print_summary(cfg)
+    say()
+    say("書き戻しテスト（コメント保持の確認）:")
+    changed = cfg.save({"pid.kp": cfg.pid.kp})
+    say(f"  {changed[0] if changed else '変更なし'}  ← 同値で上書きし、読み直して一致を確認")
+
+    say()
+    say("手順 0 完了。次は手順 1（初期化）です。")
+
+
+def _print_summary(cfg: ResearchConfig) -> None:
+    """ユーザーが「今どの値で走ろうとしているか」を 1 画面で確認できる要約。"""
+    ff = cfg.feedforward
+    ps = cfg.pedal_search
+    rows: list[tuple[str, str]] = [
+        ("車両名", cfg.vehicle.name),
+        ("最高速", f"{cfg.vehicle.max_speed_kmh:.1f} km/h"),
+        ("最大減速G", f"{cfg.vehicle.max_decel_g:.2f} G"),
+        ("開度上限 (アクセル/ブレーキ)",
+         f"{cfg.vehicle.max_accel_opening_pct:.0f} / {cfg.vehicle.max_brake_opening_pct:.0f} %"),
+        ("開度 0%→100%", f"原点 0 → {STROKE_LIMIT_PULSE} pulse（キャリブレーション不使用）"),
+        ("ペダル探索",
+         f"{ps.step_mm:g}mm 刻み（ブレーキ踏み込み {ps.brake_step_mm:g}mm）・"
+         f"待ち {ps.dwell_s:g}s・停車保持 +{ps.stop_hold_margin_pct:g}%"),
+        ("クリープ安定判定",
+         f"{ps.creep_window_s:g}s 平均の傾き < {ps.creep_settle_kmhs:g} km/h/s・"
+         f"最短 {ps.creep_settle_min_s:g}s・最大 {ps.creep_timeout_s:g}s"),
+        ("走行後の緩減速",
+         f"目標 {cfg.decel_stop.target_decel_g:g}G（踏み増し < "
+         f"{cfg.decel_stop.target_decel_g - cfg.decel_stop.press_margin_g:g}G・戻し > "
+         f"{cfg.decel_stop.release_above_g:g}G）・{cfg.decel_stop.step_mm:g}mm 刻み・"
+         f"待ち {cfg.decel_stop.dwell_s:g}s"),
+        ("FF モデル", ff.model_path),
+        ("FF モデル学習済み", "はい" if ff.is_model_trained else "いいえ（手順 2 で作成）"),
+        ("FF カーブ同定済み", "はい" if ff.is_curves_identified else "いいえ（手順 2 で同定）"),
+        ("触れた位置 min (アクセル/ブレーキ)",
+         f"{cfg.vehicle.min_accel_opening_pct:.1f} / {cfg.vehicle.min_brake_opening_pct:.1f} %"
+         "（待機位置・u の原点）"),
+        ("PID ゲイン", f"Kp={cfg.pid.kp:g}  Ki={cfg.pid.ki:g}  Kd={cfg.pid.kd:g}"),
+        ("PID 出力上限", f"{cfg.pid.output_limit_pct:.0f} %"),
+        ("調停オプション", _arbiter_summary(cfg)),
+        ("減速G ガバナー（モード走行）",
+         f"{'有効' if cfg.mode_drive.decel_governor else '無効'}"
+         f"（{cfg.vehicle.max_decel_g:g}G × 0.98 で頭打ち・"
+         f"{cfg.mode_drive.governor_reduce_step_pct:g}%/周期ずつ下げる）"),
+        ("制御周期 / ログ周期",
+         f"{cfg.control.loop_interval_ms} ms / {cfg.control.log_interval_ms} ms"
+         f"（{cfg.control.log_every_n_cycles} サイクルごと）"),
+        ("モード走行", cfg.modes.wltp_mode_name),
+        ("PID 適合パターン", cfg.modes.tuning_mode_name),
+        ("適合の最大走行本数", f"{cfg.tuning.max_runs} 本（採用基準 {cfg.tuning.select_metric}）"),
+        ("KPI 最大逸脱", f"|dev| <= {cfg.kpi.max_abs_deviation_kmh:.1f} km/h（例外なし）"),
+        ("KPI p95", f"p95 <= {cfg.kpi.p95_deviation_kmh:.1f} km/h"),
+        ("KPI 振動抑制",
+         f"±{cfg.kpi.reversal_band_kmh:.1f} km/h の符号反転 <= "
+         f"{cfg.kpi.reversal_limit_per_window:g} 回 / {cfg.kpi.reversal_window_s:g} s"),
+        ("出力先", f"{cfg.output.results_dir}（CSV {cfg.output.csv_interval_s:g}s 刻み）"),
+    ]
+    width = max(display_width(label) for label, _ in rows)
+    say("── テスト用車両プロファイル 要約 " + "─" * 34)
+    for label, value in rows:
+        pad = " " * (width - display_width(label))
+        say(f"  {label}{pad} : {value}")
+    say("─" * 68)
+
+
+def _arbiter_summary(cfg: ResearchConfig) -> str:
+    enabled = enabled_arbiter_features(cfg.arbiter)
+    return " + ".join(enabled) if enabled else "すべて無効（符号で振り分けのみ）"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 1: 初期化（本番の初期化シーケンスを引用）
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def step1_initialize(ctx: RunContext) -> None:
+    """ハードウェアを構築し、本番と同じ順で初期化して合否を表示する。
+
+    サーボ通信チェック → エラー消去 → サーボON → CAN 通信チェック → UPS 通信チェック
+    → アクチュエータ初期位置（原点復帰）。1 項目でも NG なら例外で止める。
+    """
+    if ctx.hardware is not None and ctx.hardware.initialized:
+        say("すでに初期化済みです（スキップ）")
+        return
+
+    hw = build_hardware(ctx.config, ctx.hw_mode)
+    # 構築できた時点で ctx に持たせる。以降で失敗しても main の finally が片付けられるように。
+    ctx.hardware = hw
+    if hw.is_real:
+        say("実機モード: アクチュエータが物理的に動きます。周囲の安全を確認してください")
+
+    report = await run_initialize(hw, ctx.config.checks)
+    say(f"初期化 OK {report.ok_count} 項目 / SKIP {report.skip_count} 項目")
+    say("手順 1 完了。次は走行前チェック（通信確認・車速 0 km/h 確認）→ 手順 2 です。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 走行前チェック（手順 1 と手順 2 の間。本番の走行前チェックを引用）
+# ─────────────────────────────────────────────────────────────────────
+
+PRE_DRIVE_CHECK_TITLE = (
+    "走行前チェック（通信確認・車速 0 km/h 確認。ブレーキは次の手順が 2 なら小刻みに、"
+    "それ以外は停車保持開度（min ＋ stop_brake_offset_pct）まで一気に踏む）"
+)
+
+
+async def pre_drive_check(ctx: RunContext, *, has_ref: bool = False, next_step: int) -> None:
+    """初期化済み HW で走行前チェックを行い、停車保持の状態にする。"""
+    hw = ctx.require_hardware()
+    if hw.buttons_connected:
+        # ボタンの手順（20〜23）の後はペダルが待機位置にある。原点にいることを確かめる前に戻す
+        await button_steps.return_pedals_to_origin(hw)
+    if ctx.session_log is None:
+        log = SessionLog(ctx.config, hw, has_ref=has_ref)
+        log.start(SECTION_PRE_DRIVE_CHECK, PHASE_PRE_CHECK)
+        ctx.session_log = log
+    await run_pre_drive_check(hw, ctx.config, log=ctx.session_log, next_step=next_step)
+    ctx.pre_drive_checked = True
+    say("走行前チェック完了。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 2: 閉ループパターン走行 → 2次多項式 FF モデル作成
+# ─────────────────────────────────────────────────────────────────────
+
+
+# candidate ごとの、手順2 が作るモデルの種類（表示用）
+_CANDIDATE_KIND: dict[str, str] = {
+    **dict.fromkeys(("C1", "C2", "C3", "C4", "C5"), "2次多項式 Ridge 逆モデル"),
+    "C7": "順モデルの表",
+    "C8": "順モデル",
+    "C10": "順モデル（C8 と同じ pkl。走行中に偏差の分を上乗せする）",  # 2026-10-17 段2p
+    "C11": "順モデル（C8 と同じ pkl。C10 に外乱オブザーバ DOB の分を足す）",  # 2026-10-18 段2q
+    "C12": "順モデル（C8 と同じ pkl。C11 に惰行の行の補助を足す）",  # 2026-10-18 段2r
+    "C13": "順モデル（C8 と同じ pkl。C12 に遅れの予測器と車速のフィルタを足す）",  # 2026-10-19 段2u
+    "C14": "順モデル（C8 と同じ pkl。C12 に停車の最後のブレーキの下限を足す）",  # 段3a
+    # 段4-2
+    "C15": "順モデル（C8 と同じ pkl。C12 に停A（停車保持を早める）・停C（停車まぎわの P）を足す）",
+}
+
+
+async def prepare_step2(ctx: RunContext) -> None:
+    """走行前チェックの前（ハードを動かす前）に、手順2 の対象外の candidate を止める。"""
+    require_forward_candidate(ctx.config)
+
+
+def _say_check_warnings(checks: list | None) -> None:
+    """段10-1: 手順2 の終わりに、注意（WARN）の項目をもう一度出す（終了コードは 0 のまま）。"""
+    text = format_warn(checks or [])
+    if text:
+        say(text)
+
+
+async def step2_pattern_drive(ctx: RunContext) -> None:
+    """ペダル探索 → G ランプのパターン走行 → その CSV から順モデル（C7・C8）を作る。
+
+    2026-10-08 段2l-6: C1〜C5（多項式）は対象外。走る前に ConfigError で止める。
+    """
+    require_forward_candidate(ctx.config)
+    hw = ctx.require_hardware()
+    log = ctx.session_log
+    # 段2k（ProblemReport_20261001）: G ランプの段と上端の車速は選んだモード
+    # （modes.coverage_mode_names）の車速 × 加速度の秒数から作るので、走る前（2-0 の前）に
+    # 全モードの基準車速を読む
+    # （DB が読めないならここで止まる）。wltp_mode は MAE_WLTP（2-2）用
+    cfg = ctx.config
+    wltp_mode = await load_mode(cfg, cfg.modes.wltp_mode_name)
+    cover_modes = [
+        wltp_mode if name == cfg.modes.wltp_mode_name else await load_mode(cfg, name)
+        for name in cfg.modes.coverage_mode_names
+    ]
+    lr = cfg.learning
+    # 2026-10-07 段2l-4: 上端 = min(モードの最高車速 + 余裕, 車両の最高速)。ランプと惰行で共通
+    top_cap = top_speed_cap_kmh(cover_modes, lr.ramp_top_margin_kmh, cfg.vehicle.max_speed_kmh)
+    plan = plan_ramps(
+        count_bands_for_modes(
+            cover_modes, lr.ramp_g_levels, cruise_kwargs(cfg)["cruise_min_kmh"]
+        ),  # 2026-10-14 段2o-5: 戻しの数えは クリープ ＋ 5 km/h 以上で終わる減速
+        mode_min_s=lr.ramp_mode_min_s, max_speed_kmh=top_cap,
+        budget_s=lr.ramp_time_budget_s,
+        max_passes=lr.ramp_max_passes,  # 2026-10-17 段2o-8
+        hold_s=lr.ramp_hold_time_s, turn_s=lr.ramp_turn_time_s,
+        min_at_g_s=lr.ramp_min_at_g_s, launch_s=lr.ramp_launch_time_s, edge_g=lr.ramp_edge_g,
+        **cruise_kwargs(cfg),  # 2026-10-13 段2o-2: いちばん弱い段の途中の定速保持
+    )
+    say(f"G ランプの段（モード: {', '.join(cfg.modes.coverage_mode_names)}、"
+        f"最高速 {top_cap:.1f} km/h）:")
+    say(format_plan_table(plan))
+    approach_text = format_stop_approach(cfg)  # 2026-10-31 段2: 停止の手前の測定（別行の説明）
+    if approach_text:
+        say(approach_text)
+    if not plan.levels:
+        say("警告: 走る段が 1 つもありません（ramp_g_levels・ramp_mode_min_s を確認）")
+    candidate = cfg.feedforward.candidate
+    say(f"feedforward.candidate = {candidate}: "
+        f"この種類のモデルを作ります（{_CANDIDATE_KIND[candidate]}）")
+    say("2-0. ペダル探索（クリープ車速と停車保持開度を車速応答で測り、停車保持する）")
+    pedal = await run_pedal_search(hw, ctx.config, log=log)
+    say()
+    say("2-1. パターン走行（コーストダウン → G ランプ。PatternLoop）→ 緩減速で停車保持")
+    drive = await run_pattern_drive(hw, ctx.config, pedal=pedal, log=log,
+                                   ramp_order=plan.execution_order(),
+                                   top_speed_cap_kmh=top_cap)
+    if log is not None:
+        await log.close()  # 停車保持まで記録したら保存し、その CSV（パターン走行の行）で学習する
+    say()
+    say(f"2-2. 物理定数の推定とモデル作成（candidate={candidate}: {_CANDIDATE_KIND[candidate]}）")
+    # 重み付けは SAMPLE_WEIGHT_ENABLED のときだけ有効（無効でも wltp_mode を渡すと MAE_WLTP が出る）
+    built = await asyncio.to_thread(
+        build_ff_model,
+        ctx.config, drive.csv_path, hw_mode=hw.hw_mode, pedal=pedal, wltp_mode=wltp_mode,
+        ramp_results=drive.ramp_results,  # チェック B5① 用（走行中の最後の効き始め）
+    )
+    if hw.is_real:
+        ctx.config = load_config(ctx.config.source_path)  # 以降の手順は書き戻した値で走る
+    # 2026-10-19 段2s-2b: 2-2 のチェックが NG なら build_ff_model が Step2CheckError を出すので
+    # ここには来ない（学習の走りは走らない）。スタブは yaml を書かないので、2-2 が作った pkl の
+    # パスを直接渡す
+    say()
+    if not ctx.config.learning.fel_pattern_enabled:
+        # 2026-10-20 段4-3: 設定で 2-3 を走らない（ユーザー決定。約 43 → 32 分。pkl は 2-2 のまま）
+        say("2-3. 学習用パターン（FEL）: 走らない（learning.fel_pattern_enabled: false）。"
+            "補正表は付けません（手順12 で後から走れます）")
+        say()
+        _say_check_warnings(built.checks)
+        say("手順 2 完了。次は手順 3（FF のみで WLTP モード走行）です。")
+        return
+    say(f"2-3. 学習用パターン（FEL。手順3 と同じ候補 {candidate} で走り、"
+        f"補正表を {built.model_path} に付ける）")
+    fel_run = _prepare_fel_run(ctx.config, built.model_path, cover_modes, top_cap)
+    await _run_fel_learning(ctx, hw, fel_run, wltp_mode, checks=built.checks)
+    say()
+    _say_check_warnings(built.checks)
+    say("手順 2 完了。次は手順 3（FF のみで WLTP モード走行）です。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 学習用パターン（FEL）の走り: 手順2 の 2-3 と手順 12 が共有する
+# ─────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class FelRunSetup:
+    """学習の走りの準備: 走る設定（FEL なし・表は model_path）・パターン・走行の準備・表。"""
+
+    cfg: ResearchConfig
+    model_path: str
+    pattern: FelPattern
+    setup: ModeDriveSetup
+    wltp_mode: DrivingMode
+
+
+def _prepare_fel_run(
+    cfg: ResearchConfig, model_path: str, cover_modes: list[DrivingMode], top_cap: float,
+    wltp_mode: DrivingMode | None = None,
+) -> FelRunSetup:
+    """パターンを作り、手順3 と同じ候補（cfg.feedforward.candidate）で走る準備をする。
+
+    走る設定は model_path の表を使い、FEL は fel.enabled に関係なく使わない（この走りは
+    補正表を作る側。新しい pkl にはまだ補正表が無い）。ここで失敗しても HW には触れない。
+    """
+    table = load_forward_map(Path(model_path))
+    pattern = make_pattern(cfg, cover_modes, top_cap_kmh=top_cap, table=table)
+    say(format_pattern(pattern))
+    run_cfg = replace(
+        cfg,
+        feedforward=replace(cfg.feedforward, model_path=str(model_path)),
+        fel=replace(cfg.fel, enabled=False),
+    )
+    say(f"走行の準備（候補 {run_cfg.feedforward.candidate}・FEL なし）:")
+    setup = prepare_mode_drive_from(run_cfg, pattern.mode)
+    return FelRunSetup(
+        cfg=run_cfg, model_path=str(model_path), pattern=pattern, setup=setup,
+        wltp_mode=wltp_mode if wltp_mode is not None else cover_modes[0],
+    )
+
+
+async def _run_fel_learning(
+    ctx: RunContext,
+    hw: ResearchHardware,
+    run: FelRunSetup,
+    wltp_mode: DrivingMode,
+    *,
+    checks: list | None = None,
+    limit_s: float | None = None,
+) -> None:
+    """学習用パターンを走り、その CSV から補正表（cell・nn）を作って pkl に付ける。
+
+    走りが止まった・補正表を作れなかったときは、pkl を補正表なしのまま残して DriveError にする
+    （手順2 の 2-2 の結果は消さない）。埋まり方（WLTP が通るマスの割合）を出して、お知らせとして
+    step2_check の項目 F1 に足す（NG にはしない）。
+    """
+    try:
+        log = _session_log_for_drive(ctx, hw, section=SECTION_FEL_DRIVE, has_ref=True)
+        result = await run_mode_drive(
+            hw, run.cfg, run.setup, log=log, limit_s=limit_s, section=SECTION_FEL_DRIVE
+        )
+        await log.close()  # 停車保持まで記録したら保存し、その CSV で補正表を作る
+        if not result.completed:
+            raise DriveError(f"学習の走りが中断しました: {result.abort_reason}")
+        params = FelParams.from_config(run.cfg.fel)
+        table = load_forward_map(Path(run.model_path))
+        rows = await asyncio.to_thread(fel_rows, log.csv_path, table, params)
+        if len(rows) == 0:
+            raise DriveError("学習の走りの行がありません（補正表を作れません）")
+        new = await asyncio.to_thread(
+            attach_fel, table, rows, params, source=log.csv_path.name
+        )
+        path = save_table(new, Path(run.model_path))
+        info = new.meta["fel"]
+        say(f"補正表を付けて保存: {path}")
+        say(f"  学習 {info['source_csv']}・行 {info['rows']}（{info['total_seconds']:.0f} 秒）・"
+            f"マス {info['occupied_cells']}・補正あり(cell) "
+            f"{info['cells_with_correction']['cell']}・offset {info['offset_kmhs']}")
+        cov = wltp_coverage(new, wltp_mode, params)
+        say()
+        if cov is not None:
+            say(format_coverage(cov))
+        item = check_fel_coverage(cov)
+        say()
+        say("手順2 の学習結果のチェック（お知らせ）:")
+        say(format_checks([item]))
+        if checks is not None:
+            checks.append(item)
+    except DriveError as exc:
+        say(f"学習の走りを完了できませんでした: {exc}")
+        say(f"手順2 の結果（pkl {run.model_path}）は補正表なしのまま残してあります。")
+        raise
+    except Exception as exc:  # noqa: BLE001 - どんな失敗でも 2-2 の結果は残して走行エラーで終える
+        say(f"学習の走りを完了できませんでした（{type(exc).__name__}: {exc}）")
+        say(f"手順2 の結果（pkl {run.model_path}）は補正表なしのまま残してあります。")
+        raise DriveError(f"学習の走り（FEL）: {type(exc).__name__}: {exc}") from exc
+
+
+async def prepare_step12(ctx: RunContext) -> None:
+    """走行前チェックの前に、モード（DB）と今の pkl からパターンと走行の準備を作っておく。"""
+    cfg = ctx.config
+    require_forward_candidate(cfg)
+    wltp_mode = await load_mode(cfg, cfg.modes.wltp_mode_name)
+    cover_modes = [
+        wltp_mode if name == cfg.modes.wltp_mode_name else await load_mode(cfg, name)
+        for name in cfg.modes.coverage_mode_names
+    ]
+    top_cap = top_speed_cap_kmh(
+        cover_modes, cfg.learning.ramp_top_margin_kmh, cfg.vehicle.max_speed_kmh
+    )
+    model_path = cfg.feedforward.model_path
+    if not Path(model_path).exists():
+        raise ConfigError(f"feedforward.model_path の pkl がありません: {model_path}")
+    ctx.fel_setup = _prepare_fel_run(cfg, model_path, cover_modes, top_cap, wltp_mode)
+
+
+async def step12_fel_learning(ctx: RunContext) -> None:
+    """学習用パターンだけを走り、今の pkl（yaml の model_path）に補正表を付け直す。"""
+    hw = ctx.require_hardware()
+    run = ctx.fel_setup
+    if run is None:  # prepare_step12 が走行前チェックの前に作る
+        raise ConfigError("学習用パターンと FF モデルが読み込まれていません")
+    await _run_fel_learning(ctx, hw, run, run.wltp_mode, limit_s=ctx.limit_s)
+    say()
+    say("手順 12 完了。補正表を付け直しました（次は手順 3 で fel.enabled を切り替えて比べます）。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 13: 4 点の保持の開度（2026-10-30 段6。ProblemReport_20261030）
+# ─────────────────────────────────────────────────────────────────────
+
+
+def hold_pkl_path(model_path: str | Path) -> Path:
+    """手順13 の保存先: 元の pkl と同じ場所の `<元の stem>_hold.pkl`。"""
+    src = Path(model_path)
+    return src.with_name(f"{src.stem}_hold{src.suffix}")
+
+
+async def prepare_step13(ctx: RunContext) -> None:
+    """走行前チェックの前に、今の pkl に meta["hold_pi"]・launch_breakaway_u_pct があり、
+    保存先がまだ無いことを確かめる（ハードを動かす前に止める）。"""
+    cfg = ctx.config
+    model_path = cfg.feedforward.model_path
+    if not Path(model_path).exists():
+        raise ConfigError(f"feedforward.model_path の pkl がありません: {model_path}")
+    meta = load_forward_map(Path(model_path)).meta
+    if not meta.get("hold_pi"):
+        # 段10-1 C: hold_pi が無くても止めない（PI を使わず 1 刻み寄せで保つ。手順2 と同じ）
+        say("警告: pkl の meta に hold_pi がありません。PI を使わず 1 刻み寄せで保ちます: "
+            f"{model_path}")
+    if meta.get("launch_breakaway_u_pct") is None:
+        raise ConfigError(f"pkl の meta に launch_breakaway_u_pct がありません: {model_path}")
+    out = hold_pkl_path(model_path)
+    if out.exists():
+        raise ConfigError(f"保存先 {out} が既にあります（上書きしません）")
+
+
+async def step13_hold_points(ctx: RunContext) -> None:
+    """ペダル探索 → 4 点の保持だけを走り、今の pkl（yaml の model_path）に保持の開度
+    （meta["hold_opening"]）を付け足して `<元の stem>_hold.pkl` に保存する。
+
+    yaml へは何も書かない（save=False。model_path も書き換えない）。元の pkl も書き換えない。
+    """
+    hw = ctx.require_hardware()
+    cfg = ctx.config
+    model_path = Path(cfg.feedforward.model_path)
+    table = load_forward_map(model_path)
+    info = table.meta.get("hold_pi")
+    pi_gains = (
+        (float(info["kp_pct_per_kmh"]), float(info["ki_pct_per_kmh_s"])) if info else None
+    )
+    breakaway = hold_breakaway_pct(table.meta, cfg.vehicle.min_brake_opening_pct)
+    log = ctx.session_log
+    say("13-0. ペダル探索（クリープ車速・BRAKE_SEARCH・停車保持）→ 4 点の保持")
+    try:
+        pedal = await run_pedal_search(
+            hw, cfg, log=log, save=False, hold_points=True, hold_pi=pi_gains,
+            breakaway_pct=breakaway,
+        )
+    finally:
+        if log is not None:
+            await log.close()  # 失敗してもそこまでのログを残す
+    if log is None or log.csv_path is None:
+        raise DriveError("走行ログがありません（source_csv を決められません）")
+    if not pedal.hold_points:
+        raise DriveError("4 点の保持の点がありません（クリープ車速が低すぎる）")
+    out = hold_pkl_path(model_path)
+    if out.exists():
+        raise DriveError(f"保存先 {out} が既にあります（上書きしません）")
+    new = load_forward_map(model_path)  # 走行中に書き換わっていてもよいよう、元を読み直す
+    # 段10-1 A: 加速度の符号が変わる瞬間の判定を足す（手順2 と同じ関数）
+    lag = new.meta.get("brake_lag_s")
+    if lag is not None and math.isfinite(float(lag)):
+        points, note = apply_crossings(pedal.hold_points, log.csv_path, float(lag))
+        say(f"4 点の保持: {note}")
+    else:
+        points = list(pedal.hold_points)
+        say("4 点の保持: 瞬間の判定は使えません（brake_lag_s が pkl の meta に無い）")
+    new.meta["hold_opening"] = hold_opening_meta(
+        points, creep_kmh=pedal.creep_speed_kmh, breakaway_pct=breakaway,
+        min_pct=cfg.vehicle.min_brake_opening_pct, source_csv=log.csv_path.name,
+    )
+    saved = save_table(new, out)
+    say()
+    say("4 点の保持の結果:")
+    say("  狙い km/h  保てた  実車速 km/h  開度 %   帯の秒  かかった秒  初めの開度 %  判定（瞬間）")
+    for p in points:
+        sp = "    -    " if p.speed_kmh is None else f"{p.speed_kmh:9.3f}"
+        op = "   -  " if p.opening_pct is None else f"{p.opening_pct:6.2f}"
+        say(f"  {p.target_kmh:9.3f}  {'○' if p.held else '×'}      {sp}  {op}  "
+            f"{p.in_band_s:6.1f}  {p.elapsed_s:9.1f}  {p.initial_opening_pct:10.2f}  "
+            f"{p.criterion or '-'}（{p.crossings}）"
+            f"{'  ' + p.note if p.note else ''}")
+    say(f"両端: 0 km/h = {breakaway:.2f}%（min + |launch_breakaway_u_pct|）・"
+        f"クリープ {pedal.creep_speed_kmh:.2f} km/h = {cfg.vehicle.min_brake_opening_pct:.2f}%")
+    say(f"保存: {saved}（元の pkl・yaml の model_path は書き換えていません）")
+    extra = cfg.pedal_search.hold_points_extra_kmh
+    missed = [
+        p for p in points
+        if not p.held and any(abs(p.target_kmh - e) < 1e-6 for e in extra)
+    ]
+    if missed:
+        say()
+        say("*" * 60)
+        say(f"*** 警告: {', '.join(f'{p.target_kmh:g}' for p in missed)} km/h が保てなかった"
+            "＝ D1（この車で一定の基準が保てない。シミュレータ側の問題として報告し、"
+            "段7 以降は止めて聞く） ***")
+        say("*" * 60)
+    say()
+    say("手順 13 完了。使うには yaml の model_path を保存先へ替えます（自動では替えません）。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 14: 停止の手前の測定（2026-10-31 段2。ProblemReport_20261031_停止間際 B）
+# ─────────────────────────────────────────────────────────────────────
+
+
+def stop_pkl_path(model_path: str | Path) -> Path:
+    """手順14 の保存先: 元の pkl と同じ場所の `<元の stem>_stop.pkl`。"""
+    src = Path(model_path)
+    return src.with_name(f"{src.stem}_stop{src.suffix}")
+
+
+def _pkl_source_csvs(meta: dict, results_dir: Path) -> list[Path]:
+    """pkl の meta `sources`（学習に使った CSV 名。'+' かカンマ区切りの文字列、または list）を
+    results_dir 内のパスにする。"""
+    raw = meta.get("sources")
+    if isinstance(raw, str):
+        names = [n for part in raw.split("+") for n in part.split(",")]
+    elif raw:
+        names = [str(n) for n in raw]
+    else:
+        names = []
+    return [results_dir / n.strip() for n in names if n.strip()]
+
+
+async def prepare_step14(ctx: RunContext) -> None:
+    """走行前チェックの前に、今の pkl とその学習に使った CSV があり、保存先がまだ無いことを
+    確かめる（ハードを動かす前に止める）。"""
+    cfg = ctx.config
+    model_path = cfg.feedforward.model_path
+    if not Path(model_path).exists():
+        raise ConfigError(f"feedforward.model_path の pkl がありません: {model_path}")
+    meta = load_forward_map(Path(model_path)).meta
+    sources = _pkl_source_csvs(meta, cfg.results_path)
+    if not sources:
+        raise ConfigError(f"pkl の meta に sources（学習に使った CSV）がありません: {model_path}")
+    missing = [p for p in sources if not p.exists()]
+    if missing:
+        raise ConfigError(
+            "pkl の学習に使った CSV が results にありません: " + ", ".join(str(p) for p in missing)
+        )
+    if meta.get("launch_rows_to_stop_max") or meta.get("side_row_speed_rep") == "data":
+        raise ConfigError(
+            "この pkl は launch_rows_to_stop_max か side_row_speed_rep: data で作られていて、"
+            f"停止側だけの作り直しは使えません: {model_path}"
+        )
+    out = stop_pkl_path(model_path)
+    if out.exists():
+        raise ConfigError(f"保存先 {out} が既にあります（上書きしません）")
+
+
+def _stub_like_pedal(cfg: ResearchConfig) -> PedalSearchResult:
+    """ペダル探索をしない手順14 の 2-0 の代わり。クリープ車速・停車保持の開度は yaml の値
+    （手順2 が書いたもの）から作る（`ramp_stub_run._stub_pedal` と同じ形）。"""
+    hold = cfg.stop_brake_opening_pct  # min ＋ feedforward.stop_brake_offset_pct
+    return PedalSearchResult(
+        creep_speed_kmh=feedforward_params(cfg).creep_speed_kmh,
+        stop_confirm_pct=hold - cfg.pedal_search.stop_hold_margin_pct,
+        stop_brake_opening_pct=hold,
+        brake_min_pct=cfg.vehicle.min_brake_opening_pct,
+    )
+
+
+def _down_seconds_in_stop_band(csv_path: Path, n_patterns: int) -> dict[int, float]:
+    """CSV の PATTERN_DRIVE の RAMP_DOWN で、実車速が 0.5〜7.5 km/h だった秒数をパターン番号
+    （1 始まり）ごとに返す。秒数は行の elapsed_s の差（1 秒を超える欠けは数えない）。"""
+    out: dict[int, float] = {}
+    prev: tuple[int, float] | None = None
+    with csv_path.open(encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                t = float(row["elapsed_s"])
+                v = float(row["actual_speed_kmh"])
+                idx = int(row["pattern"].split(":")[0])
+            except (KeyError, ValueError):
+                prev = None
+                continue
+            if row.get("section") == "PATTERN_DRIVE" and row.get("phase") == "RAMP_DOWN":
+                if prev is not None and prev[0] == idx and 0.5 <= v < 7.5:
+                    out[idx] = out.get(idx, 0.0) + min(max(0.0, t - prev[1]), 1.0)
+                prev = (idx, t)
+            else:
+                prev = None
+    return {i: out.get(i, 0.0) for i in range(1, n_patterns + 1)}
+
+
+def _stop_measured_counts(table) -> list[tuple[float, int]]:
+    """停止側の表の「実測」マス数（車速の行ごと、ブレーキ側＝u < 0）。停止側が無ければ空。"""
+    from src.robot.core.fwd_map import POINT_MEASURED  # noqa: PLC0415
+
+    if table.stop_kind is None:
+        return []
+    neg = table.u_grid < 0.0
+    top = float(table.meta.get("stop_max_speed_kmh", 0.0))
+    return [
+        (float(table.speed_rep[r]), int((table.stop_kind[r][neg] == POINT_MEASURED).sum()))
+        for r in range(len(table.speed_rep))
+        if table.speed_edges[r] < top
+    ]
+
+
+async def step14_stop_approach(ctx: RunContext) -> None:
+    """停止の手前の測定（一定 G で停車まで下りる G ランプ 4 本）だけを走り、今の pkl
+    （yaml の model_path）の停止側の表を作り直して `<元の stem>_stop.pkl` に保存する。
+
+    ペダル探索はしない（クリープ車速・停車保持の開度は yaml から）。停止側の表は
+    「pkl の sources の CSV の停止側の行 ＋ 今回の CSV の停止側の行」で作り直す
+    （`rebuild_stop_side`）。他の表・meta はそのまま（meta `stop_approach_csv` だけ足す）。
+    yaml へは何も書かない。元の pkl も書き換えない。learning.stop_approach_enabled に関係なく走る。
+    """
+    hw = ctx.require_hardware()
+    cfg = ctx.config
+    model_path = Path(cfg.feedforward.model_path)
+    table = load_forward_map(model_path)
+    sources = _pkl_source_csvs(table.meta, cfg.results_path)
+    patterns = stop_approach_patterns(cfg)
+    pedal = _stub_like_pedal(cfg)
+    log = ctx.session_log
+    # 走行前チェックは停車保持の開度まで踏んで止めた状態で終わる。ブレーキを min へ離すと
+    # クリープで動き出すので離さず、アクセルを待機位置・ブレーキを停車保持の開度に置くだけ
+    say("14-0. アクセルを待機位置、ブレーキを停車保持の開度（min ＋ stop_brake_offset_pct）に置く")
+    v = cfg.vehicle
+    await asyncio.gather(
+        hw.accel.move_to_position(opening_to_pulse(v.min_accel_opening_pct)),
+        hw.brake.move_to_position(opening_to_pulse(pedal.stop_brake_opening_pct)),
+    )
+    waited = 0.0
+    while await hw.can.read_speed() >= VEHICLE_STOP_SPEED_KMH:  # 停車を待つ
+        await asyncio.sleep(0.1)
+        waited += 0.1
+        if waited > 60.0:
+            raise DriveError("停車しません（停車保持の開度で止まらない）")
+    say("14-1. 停止の手前の測定（一定 G で停車まで）")
+    try:
+        drive = await run_pattern_drive(hw, cfg, pedal=pedal, log=log, patterns=patterns)
+    finally:
+        if log is not None:
+            await log.close()  # 失敗してもそこまでのログを残す
+    csv_path = drive.csv_path
+    out = stop_pkl_path(model_path)
+    if out.exists():
+        raise DriveError(f"保存先 {out} が既にあります（上書きしません）")
+    say("14-2. 停止側の表の作り直し（pkl の学習に使った CSV の停止側の行 ＋ 今回の CSV）")
+    old = load_forward_map(model_path)  # 走行中に書き換わっていてもよいよう、元を読み直す
+    new = rebuild_stop_side(
+        old, source_csvs=sources, new_csv=csv_path,
+        creep_speed_kmh=feedforward_params(cfg).creep_speed_kmh,
+        default_opening_source=cfg.learning.side_table_opening_source,
+        default_accel_window_s=cfg.learning.side_table_accel_window_s,
+        sub_min_weight=cfg.learning.stop_table_sub_min_weight,  # 2026-10-31 段2d 案1
+    )
+    saved = save_table(new, out)
+    secs = _down_seconds_in_stop_band(csv_path, len(patterns))
+    say()
+    say("停止の手前の測定の結果:")
+    say("  番号  狙い G(下り)  上端 km/h  0.5〜7.5 km/h を RAMP_DOWN で走った秒")
+    for i, pat in enumerate(patterns, start=1):
+        assert isinstance(pat, GRampPattern)
+        say(f"  {i:>4}  {pat.target_g:12g}  {pat.top_kmh:9g}  {secs.get(i, 0.0):12.1f}")
+    before = _stop_measured_counts(old)
+    after = _stop_measured_counts(new)
+    say("停止側の表の「実測」マス数（ブレーキ側。車速の行ごと）:")
+    say("  行の車速 km/h  作り直す前  作り直した後")
+    for (spd, n_after), n_before in zip(
+        after, [n for _, n in before] + [0] * len(after), strict=False
+    ):
+        say(f"  {spd:13.2f}  {n_before:10d}  {n_after:12d}")
+    if not after:
+        say("  （停止側の表が作れませんでした＝行不足）")
+    say(f"保存: {saved}（元の pkl・yaml の model_path は書き換えていません）")
+    say()
+    say("手順 14 完了。使うには yaml の model_path を保存先へ替えます（自動では替えません）。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 3: FF のみで WLTP モード走行 → CSV / 図 / レポート
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def prepare_step3(ctx: RunContext) -> None:
+    """走行前チェックの前に、走行モード（DB）と FF モデルを読み込んでおく。"""
+    ctx.mode_setup = await prepare_mode_drive(ctx.config, ctx.config.modes.wltp_mode_name)
+
+
+def _session_log_for_drive(
+    ctx: RunContext, hw: ResearchHardware, *, section: str = SECTION_MODE_DRIVE,
+    has_ref: bool = True,
+) -> SessionLog:
+    """走行前チェックから続くログがあればそれを、前の手順で閉じていれば新しく作って使う。
+
+    `has_ref`/`section` は手順 11（加振走行）向け: 基準車速が無い走行（`has_ref=False`）は
+    グラフに基準線を描かない。
+    """
+    log = ctx.session_log
+    if log is None or log.closed:
+        log = SessionLog(ctx.config, hw, has_ref=has_ref)
+        log.start(section, "")
+        ctx.session_log = log
+    return log
+
+
+def _fel_text_of(cfg: ResearchConfig, setup: ModeDriveSetup) -> str | None:
+    """レポート 5 章の FEL の 1 行。表の候補（補正表を持てる FF）でなければ None。"""
+    table = getattr(setup.ff, "table", None)
+    return None if table is None else fel_text(cfg, table)
+
+
+async def step3_mode_drive_ff(ctx: RunContext) -> None:
+    """停車保持の状態からモードを走り、CSV（0.1s 刻み）・走行時の設定・レポートを残す。"""
+    await _mode_drive_step(ctx, buttons=False)
+
+
+async def step24_mode_drive_buttons(ctx: RunContext) -> None:
+    """手順 3 と同じ流れ。0 秒にスタート短押しで Ready・3 秒後に D・終わりに N を押す。
+
+    走行前チェックで停車保持の開度にしておく。D が間に合わないモード（走り出す時刻 − h0_s が
+    D の押し終わりより早い）は、その時刻でモードの時刻を止め、D の後に再開する。
+    基準車速が出てから `buttons.no_speed_abort_s` の間、車速が出なければ（D に入っていない
+    可能性）中止する。中止したときも、ブレーキを停車保持の開度にして N を押してから終わる。
+    """
+    await _mode_drive_step(ctx, buttons=True)
+
+
+def build_button_plan(
+    hw: ResearchHardware, cfg: ResearchConfig, setup: ModeDriveSetup
+) -> ModeButtonPlan:
+    """手順 24: モード中のボタンの予定を組む。止める時刻（hold_at_s）は走る前に計算して表示する。"""
+    hold_at_s = compute_hold_at_s(setup.mode, cfg.features.h0_s, cfg.control.loop_interval_s)
+    b = cfg.buttons
+    if hold_at_s is None:
+        say("手順 24: 基準車速が動かないため、モードの時刻は止めません")
+    else:
+        say(
+            f"手順 24: Ready は 0 秒・D は {b.d_press_at_s:g} 秒。D が間に合わなければ"
+            f"モードの時刻 {hold_at_s:.2f}s で止めます（hold_at_s = 走り出す時刻 − h0_s "
+            f"{cfg.features.h0_s:g}s − 1 周期）"
+        )
+    return ModeButtonPlan(
+        ready_press=lambda: button_steps.press_ready_in_mode(hw, cfg),
+        d_press=lambda: button_steps.press_shift_d_in_mode(hw, cfg),
+        d_press_at_s=b.d_press_at_s,
+        after_d_wait_s=b.after_press_wait_s,
+        hold_at_s=hold_at_s,
+    )
+
+
+# ボタンを押す手順（20〜25 のうち、モード走行の中で押す 24 を除く）。この手順の前に、
+# 後ろの走行の手順の準備（読み込み・計画作成）を済ませ、ボタン操作の途中で車を待たせない
+BUTTON_STEP_NUMBERS = frozenset({20, 21, 22, 23, 25})
+
+
+def preload_target(steps: list[Step], index: int) -> Step | None:
+    """steps[index] が最初のボタン手順のとき、前倒しで準備する走行の手順を返す。なければ None。"""
+    if steps[index].number not in BUTTON_STEP_NUMBERS:
+        return None
+    if any(s.number in BUTTON_STEP_NUMBERS for s in steps[:index]):
+        return None  # 最初のボタン手順ではない
+    for later in steps[index + 1 :]:
+        if later.drives and later.prepare is not None:
+            return later
+    return None
+
+
+def button_step_conflict(steps: list[Step]) -> str | None:
+    """手順 23（Ready 単独）と 24 が同じ実行にあれば、設定エラーの文を返す。なければ None。"""
+    numbers = {step.number for step in steps}
+    if 23 in numbers and 24 in numbers:
+        return (
+            "手順24 の中で Ready にするため、手順23 と同じ実行にできません"
+            "（Ready でスタートを押すと IGN-OFF になる）"
+        )
+    return None
+
+
+async def _mode_drive_step(ctx: RunContext, *, buttons: bool) -> None:
+    """手順 3（buttons=False）と手順 24（buttons=True）の共通の流れ。違いは次の 3 点だけ:
+    走行の中で Ready（0 秒）・D（d_press_at_s 後）を押す・走行の後に N を押す・
+    車速が出なければ中止する。"""
+    hw = ctx.require_hardware()
+    setup = ctx.mode_setup
+    if setup is None:  # prepare_step3 が走行前チェックの前に作る
+        raise ConfigError("走行モードと FF モデルが読み込まれていません")
+    cfg = ctx.config
+    log = _session_log_for_drive(ctx, hw)
+    started_at = datetime.now()
+    no_speed_abort = None
+    button_plan = None
+    if buttons:
+        no_speed_abort = (cfg.buttons.no_speed_abort_s, cfg.buttons.no_speed_kmh)
+        button_plan = build_button_plan(hw, cfg, setup)
+    result = await run_mode_drive(
+        hw, cfg, setup, log=log, limit_s=ctx.limit_s, no_speed_abort=no_speed_abort,
+        button_plan=button_plan,
+    )
+    if buttons:
+        # 終わったら（中止でも）停車保持の開度で N を押す。D のままペダルを離さない
+        await button_steps.press_shift_n_after_drive(hw, cfg)
+    await log.close()  # 停車保持まで記録したら保存し、その行でレポートを作る
+
+    limited = result.mode_duration_s < setup.mode.total_duration
+    notes = []
+    if not hw.is_real:
+        notes.append("スタブ HW の結果（車両モデルは実車の同定値ではない。流れの確認用）。")
+    if result.button_hold_s > 0.0:
+        notes.append(f"D 待ちで {result.button_hold_s:.1f} 秒止めた（モードの時刻を止めた）。")
+    if result.pause_count > 0:
+        notes.append(
+            f"一時停止 {result.pause_count} 回・計 {result.paused_s:.1f} 秒"
+            "（押された時点の車速を保った。その間の行は KPI・レポートから除外）。"
+        )
+    if limited:
+        notes.append(
+            f"--limit-s でモードの先頭 {result.mode_duration_s:.0f}s だけ走った（KPI は参考値）。"
+        )
+    # 走ったときの yaml と git の版を CSV の隣へ保存する（研究系の設定は走行ログに残らない）
+    snapshot_path = snapshot_text = code_version = None
+    if ctx.config.source_path is not None:
+        try:
+            snapshot_path, snapshot_text, code_version = save_config_snapshot(
+                ctx.config.source_path, log.csv_path
+            )
+            say(f"走行時の設定を保存しました: {snapshot_path}（コードの版: {code_version}）")
+        except OSError as exc:
+            say(f"警告: 走行時の設定を保存できませんでした（{exc}）")
+    info = RunInfo(
+        label=mode_label(result.mode_name),
+        title="手順 24: モード走行（Ready → D → モード → N）" if buttons else "手順 3: モード走行",
+        controller=controller_text(ctx.config),
+        csv_path=log.csv_path,
+        hw_mode=hw.hw_mode,
+        mode_name=result.mode_name,
+        started_at=started_at,
+        mode_duration_s=result.mode_duration_s,
+        run_duration_s=result.run_duration_s,
+        completed=result.completed,
+        limited=limited,
+        abort_reason=result.abort_reason,
+        cycles=result.cycles,
+        overruns=result.overruns,
+        interlock=(
+            None if result.interlock is None else (
+                result.interlock.accel_events, result.interlock.accel_s,
+                result.interlock.brake_events, result.interlock.brake_s,
+            )
+        ),
+        c10_settings=result.c10_settings,
+        c10_summary=None if result.c10 is None else result.c10.summary(),
+        dob_settings=result.dob_settings,
+        dob_summary=None if result.dob is None else result.dob.summary(),
+        coast_settings=result.coast_settings,
+        coast_summary=None if result.coast_stats is None else result.coast_stats.summary(),
+        predictor_settings=result.predictor_settings,
+        predictor_summary=None if result.predictor is None else result.predictor.summary(),
+        creep_floor_settings=result.creep_floor_settings,
+        creep_floor_summary=(
+            None if result.creep_floor_stats is None else result.creep_floor_stats.summary()
+        ),
+        stop_end_settings=result.stop_end_settings,
+        stop_lead_summary=(
+            None if result.stop_lead_stats is None else result.stop_lead_stats.summary()
+        ),
+        stop_end_summary=(
+            None if result.stop_end_stats is None else result.stop_end_stats.summary()
+        ),
+        ref_smooth_sigma_s=ctx.config.feedforward.ref_smooth_sigma_s,
+        ref_smooth_max_kmh=ctx.config.feedforward.ref_smooth_max_kmh,
+        ref_smooth_brake_from_kmhs=ctx.config.feedforward.ref_smooth_brake_from_kmhs,
+        ref_smooth_brake_to_kmhs=ctx.config.feedforward.ref_smooth_brake_to_kmhs,
+        ref_smooth_brake_side=ctx.config.feedforward.ref_smooth_brake_side,
+        low_speed_side_rule=ctx.config.forward_map.low_speed_side_rule,
+        switch_lead_enabled=ctx.config.forward_map.switch_lead_enabled,
+        fel_text=_fel_text_of(ctx.config, setup),
+        config_snapshot_path=snapshot_path,
+        config_text=snapshot_text,
+        code_version=code_version,
+        notes=notes,
+    )
+    rows = rows_from_samples(result.samples)
+    say()
+    if rows:
+        try:
+            await asyncio.to_thread(
+                write_mode_report, rows, ctx.config, info, ctx.config.results_path
+            )
+        except Exception as exc:  # 走行ログは保存済み。レポートは CSV から作り直せる
+            say(f"警告: レポートを作れませんでした（{type(exc).__name__}: {exc}）。作り直し:")
+            say(f"  .venv/bin/python -m src.robot.core.mode_report {log.csv_path}")
+    else:
+        say("モード走行の行が無いため、レポートは作りません")
+    if not result.completed:
+        raise DriveError(result.abort_reason)
+    say()
+    if buttons:
+        say("手順 24 完了。")
+    else:
+        say("手順 3 完了。次は手順 4（Kp のみ適合）です。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 11: 加振走行（ペダル→車速の周波数応答。ProblemReport_20260921 の 1.4Hz ばたつき対策）
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def step11_excite(ctx: RunContext) -> None:
+    """停車保持の状態から加振走行を行い、CSV と周波数応答の表を残す。
+
+    FF・PID は使わない開ループ走行なので、手順 2/3 のような FF モデル・走行モード（DB）の
+    読み込みは不要（`prepare` なし）。基準車速を持たないので `has_ref=False`。
+    """
+    hw = ctx.require_hardware()
+    log = _session_log_for_drive(ctx, hw, section=SECTION_EXCITE, has_ref=False)
+    result = await run_excite(hw, ctx.config, log=log, limit_s=ctx.limit_s)
+    await log.close()  # 停車保持まで記録したら保存し、その CSV で周波数応答を求める
+
+    if result.samples:
+        blocks = excite_analyze(log.csv_path, skip_s=ctx.config.excite.analysis_skip_s)
+        say()
+        if blocks:
+            say(excite_format_table(blocks, None))
+        else:
+            say("加振ブロックの行が skip_s で全て捨てられたため、周波数応答は出しません"
+                f"（.venv/bin/python -m src.robot.core.excite --analyze {log.csv_path} で"
+                "後から確認できます）")
+    else:
+        say("加振走行の行が無いため、周波数応答は出しません")
+    if not result.completed:
+        raise DriveError(result.abort_reason)
+    say()
+    say("手順 11 完了。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 20〜25: スタートスイッチ・P/N/D ボタンを押す（ProblemReport_20261112）
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def step20_ign_on(ctx: RunContext) -> None:
+    await button_steps.ign_on_rly_off(ctx.require_hardware(), ctx.config)
+    say("手順 20 完了。")
+
+
+async def step21_maintenance(ctx: RunContext) -> None:
+    await button_steps.maintenance_mode(ctx.require_hardware(), ctx.config)
+    say("手順 21 完了。")
+
+
+async def step22_n_hold(ctx: RunContext) -> None:
+    await button_steps.n_range_hold(ctx.require_hardware(), ctx.config)
+    say("手順 22 完了。")
+
+
+async def step23_ready(ctx: RunContext) -> None:
+    await button_steps.ready(ctx.require_hardware(), ctx.config)
+    say("手順 23 完了。")
+
+
+async def step25_ign_off(ctx: RunContext) -> None:
+    await button_steps.ign_off(ctx.require_hardware(), ctx.config)
+    say("手順 25 完了。")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 手順 4 以降（1 手順ずつ実装する方針のため、未実装は明示的に停止する）
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _pending(number: int) -> Callable[[RunContext], Awaitable[None]]:
+    async def handler(ctx: RunContext) -> None:  # noqa: RUF029
+        raise StepNotImplementedError(
+            f"手順 {number} は未実装です。"
+            "手順は 1 つずつ実装し、ユーザーの動作確認を経て次へ進みます"
+            "（docs/Problem/ProblemReport_20260910.md「遵守事項」）。"
+        )
+
+    return handler
+
+
+STEPS: tuple[Step, ...] = (
+    Step(0, "設定作成・検証（config_testVehicle.yaml）", step0_setup),
+    Step(1, "初期化（サーボ通信・エラー消去・CAN・UPS・初期位置）", step1_initialize),
+    Step(
+        2,
+        "ペダル探索 → 閉ループパターン走行 → 2次多項式 FF モデル作成",
+        step2_pattern_drive,
+        drives=True,
+        prepare=prepare_step2,
+    ),
+    Step(
+        3,
+        "FF のみで WLTP モード走行 → CSV/図/レポート",
+        step3_mode_drive_ff,
+        drives=True,
+        prepare=prepare_step3,
+        has_ref=True,
+    ),
+    Step(4, "Kp のみ適合（最大 10 本）", _pending(4)),
+    Step(5, "FF + Kp で WLTP モード走行", _pending(5)),
+    Step(6, "Kp + Ki 適合", _pending(6)),
+    Step(7, "FF + Kp + Ki で WLTP モード走行", _pending(7)),
+    Step(8, "Kp + Ki + Kd 適合", _pending(8)),
+    Step(9, "FF + Kp + Ki + Kd で WLTP モード走行", _pending(9)),
+    Step(10, "制約の追加（不感帯 / レートリミット / 先読み / ILC）", _pending(10)),
+    Step(
+        11,
+        "加振走行（ペダル→車速の周波数応答）",
+        step11_excite,
+        drives=True,
+    ),
+    Step(
+        12,
+        "学習用パターンだけを走り、今の pkl（yaml の model_path）に補正表を付け直す",
+        step12_fel_learning,
+        drives=True,
+        prepare=prepare_step12,
+        has_ref=True,
+    ),
+    Step(
+        13,
+        "ペダル探索 → 4 点の保持だけを走り、今の pkl に保持の開度を付けて別名で保存",
+        step13_hold_points,
+        drives=True,
+        prepare=prepare_step13,
+    ),
+    Step(
+        14,
+        "停止の手前の測定（一定 G で停車まで 4 本）だけを走り、今の pkl の停止側の表を作り直して"
+        "別名で保存",
+        step14_stop_approach,
+        drives=True,
+        prepare=prepare_step14,
+    ),
+    Step(20, "IGN-ON(RLY-OFF)（スタートを長押し）", step20_ign_on),
+    Step(21, "メンテナンスモード（先頭で 20 も行う。P・N・P でアクセル踏み）", step21_maintenance),
+    Step(22, "N レンジホールド（N を 2 回押す）", step22_n_hold),
+    Step(23, "Ready（ブレーキ ON でスタートを短押し）", step23_ready),
+    Step(
+        24,
+        "モード走行（0 秒 Ready・3 秒後 D・間に合わなければ止めて再開・終わりに N）",
+        step24_mode_drive_buttons,
+        drives=True,
+        prepare=prepare_step3,
+        has_ref=True,
+    ),
+    Step(25, "IGN-OFF（停車中にブレーキ ON でスタートを短押し）", step25_ign_off),
+)
+_STEP_BY_NUMBER = {step.number: step for step in STEPS}
+MAX_STEP = max(_STEP_BY_NUMBER)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m src.robot.core.main",
+        description="研究開発用ハーネス: FF/PID を 1 段ずつ足して KPI 達成度を測る",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_steps_help(),
+    )
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument(
+        "--upto",
+        type=int,
+        metavar="N",
+        help=f"手順 0 から N までを順に実行する（0〜{MAX_STEP}、既定 0）",
+    )
+    target.add_argument("--only", type=int, metavar="N", help="手順 N だけを実行する")
+    target.add_argument(
+        "--steps", metavar="LIST", help="実行する手順をカンマ区切りで指定する（例 0,2,3）"
+    )
+    parser.add_argument(
+        "--config", type=Path, default=DEFAULT_CONFIG, help=f"設定ファイル（既定 {DEFAULT_CONFIG}）"
+    )
+    parser.add_argument(
+        "--hw",
+        choices=(HW_STUB, HW_REAL),
+        default=HW_STUB,
+        help=f"ハードウェアモード。{HW_REAL} は実アクチュエータが動く（既定 {HW_STUB}）",
+    )
+    parser.add_argument(
+        "--limit-s",
+        type=float,
+        metavar="S",
+        help="モード走行（手順 3）をモードの先頭 S 秒で打ち切る（動作確認用。KPI は参考値）",
+    )
+    parser.add_argument(
+        "--retrain",
+        type=Path,
+        metavar="CSV",
+        help="走行せずに、既存の走行 CSV から FF モデルだけを作り直す"
+        "（手順 2-2 のモデル作成だけを実行する。--hw real なら設定ファイルへ書き戻す）",
+    )
+    parser.add_argument("--list", action="store_true", help="手順一覧を表示して終了する")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="実行する手順を表示するだけで走らせない"
+    )
+    return parser
+
+
+def _steps_help() -> str:
+    lines = ["手順:"]
+    for step in STEPS:
+        if step.drives and not any(s.drives for s in STEPS if s.number < step.number):
+            lines.append(f"   -  {PRE_DRIVE_CHECK_TITLE}（走行する手順の前に 1 回）")
+        lines.append(f"  {step.number:>2}  {step.title}")
+    return "\n".join(lines)
+
+
+def resolve_steps(args: argparse.Namespace) -> list[Step]:
+    """CLI 引数から実行対象の手順を決める（既定は手順 0 のみ）。"""
+    if args.only is not None:
+        numbers = [args.only]
+    elif args.steps is not None:
+        try:
+            numbers = [int(token) for token in args.steps.split(",") if token.strip()]
+        except ValueError as exc:
+            raise SystemExit(f"--steps の書式が不正です: {args.steps!r}") from exc
+        if not numbers:
+            raise SystemExit("--steps に手順番号がありません")
+    else:
+        upto = 0 if args.upto is None else args.upto
+        numbers = list(range(0, upto + 1))
+
+    unknown = sorted({n for n in numbers if n not in _STEP_BY_NUMBER})
+    if unknown:
+        raise SystemExit(
+            f"手順 {', '.join(map(str, unknown))} は存在しません（0〜{MAX_STEP}）"
+        )
+    return [_STEP_BY_NUMBER[n] for n in numbers]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.list:
+        print(_steps_help())
+        return 0
+
+    if args.retrain is not None:
+        return retrain_only(args)
+
+    steps = resolve_steps(args)
+    conflict = button_step_conflict(steps)
+    if conflict is not None:
+        say(f"設定エラー: {conflict}")
+        return 2
+    if args.limit_s is not None and args.limit_s <= 0.0:
+        raise SystemExit("--limit-s は正の秒数で指定してください")
+    banner("研究開発用ハーネス（ProblemReport_20260910）")
+    say(f"ハードウェアモード: {args.hw}")
+    if args.hw == HW_REAL:
+        say("*** 実機モード: アクセル/ブレーキアクチュエータが物理的に動きます ***")
+    say("実行する手順: " + ", ".join(str(step.number) for step in steps))
+    if args.limit_s is not None:
+        say(f"モード走行は先頭 {args.limit_s:g}s で打ち切ります（動作確認用）")
+    if args.dry_run:
+        checked = False
+        for step in steps:
+            if step.drives and not checked:
+                say(f"  (dry-run) {PRE_DRIVE_CHECK_TITLE}")
+                checked = True
+            say(f"  (dry-run) 手順 {step.number}: {step.title}")
+        return 0
+
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        say(f"設定の読み込みに失敗しました: {exc}")
+        return 2
+
+    ctx = RunContext(
+        config=config, hw_mode=args.hw, started_at=time.monotonic(), limit_s=args.limit_s
+    )
+    # 全手順を 1 つのイベントループで回す。手順 1 で開いた HW 接続（pymodbus/python-can の
+    # クライアントはループに紐づく）を手順 2 以降で使い回すため、手順ごとに asyncio.run
+    # しないこと。
+    return asyncio.run(run_steps(ctx, steps))
+
+
+def retrain_only(args: argparse.Namespace) -> int:
+    """走行せずに、既存の走行 CSV から FF モデルだけを作り直す（手順 2-2 だけ）。
+
+    レポート 表 5-5 の関門 2（A1 学習行の選別）を、実機を動かさずに確かめるための入口。
+    """
+    banner("FF モデルの作り直し（走行なし・手順 2-2 のみ）")
+    csv_path = args.retrain
+    if not csv_path.exists():
+        say(f"走行 CSV がありません: {csv_path}")
+        return 2
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        say(f"設定の読み込みに失敗しました: {exc}")
+        return 2
+    say(f"ハードウェアモード: {args.hw}（走行はしません）")
+    # WLTP の基準車速は DB から読む（学習結果のチェック D1・B3 と重み付けに使う）。読めなければ
+    # None（D1 は SKIP）。retrain_only は asyncio ループの外（同期関数）から呼ばれるので asyncio.run
+    wltp_mode = None
+    try:
+        wltp_mode = asyncio.run(load_mode(config, config.modes.wltp_mode_name))
+    except Exception as exc:  # noqa: BLE001 - DB が無くても作り直しは続ける
+        say(f"注: WLTP のモードを DB から読めません（{type(exc).__name__}）→ チェック D1 は SKIP")
+    try:
+        # 走行の材料（ramp_results・pedal）は無い。それを使う項目（B5①・C1）は SKIP
+        build_ff_model(config, csv_path, hw_mode=args.hw, pedal=None, wltp_mode=wltp_mode)
+    except Step2CheckError as exc:
+        say(f"手順2 の学習結果のチェックエラー: {exc}")
+        return 8
+    except LearningDataError as exc:
+        say(f"モデル作成エラー: {exc}")
+        return 6
+    say()
+    say("完了（FF モデルの作り直し）")
+    return 0
+
+
+async def run_steps(ctx: RunContext, steps: list[Step]) -> int:
+    """手順を順に実行する。終了時は成否にかかわらず必ず HW を片付ける。"""
+    exit_code = 0
+    try:
+        try:
+            # 手順0 を含まない実行（--only 2 / --only 3 など）でも、手順を 1 つも動かす前に
+            # 設定検証を通す。ループ内の except ConfigError では拾えない位置のため個別に囲む
+            validate_config_once(ctx)
+        except ConfigError as exc:
+            say(f"設定エラー: {exc}")
+            exit_code = 2
+            return exit_code
+        prepared: set[int] = set()  # ボタン手順の前に準備を済ませた走行の手順
+        for index, step in enumerate(steps):
+            try:
+                # ボタン手順が先にある実行は、最初のボタン手順の直前に走行の手順の準備を済ませる
+                target = preload_target(steps, index)
+                if target is not None:
+                    ctx.require_hardware()
+                    say()
+                    banner(f"手順 {target.number} の準備（ボタン操作の前に読み込み）")
+                    await target.prepare(ctx)
+                    prepared.add(target.number)
+                # 手順 1（初期化）→ [準備] → 走行前チェック → 走行する手順
+                # （本番も走行開始前に必ず行う）
+                if step.drives:
+                    ctx.require_hardware()
+                    if step.prepare is not None and step.number not in prepared:
+                        say()
+                        banner(f"手順 {step.number} の準備（走行前チェックの前に読み込み）")
+                        await step.prepare(ctx)
+                    if not ctx.pre_drive_checked:
+                        say()
+                        banner(PRE_DRIVE_CHECK_TITLE)
+                        await pre_drive_check(ctx, has_ref=step.has_ref, next_step=step.number)
+                say()
+                banner(f"手順 {step.number}: {step.title}")
+                await step.handler(ctx)
+            except StepNotImplementedError as exc:
+                say(f"停止: {exc}")
+                exit_code = 3
+                break
+            except ConfigError as exc:
+                say(f"設定エラー: {exc}")
+                exit_code = 2
+                break
+            except InitializationError as exc:
+                say(f"初期化エラー: {exc}")
+                exit_code = 4
+                break
+            except PreDriveCheckError as exc:
+                say(f"走行前チェックエラー: {exc}")
+                exit_code = 7
+                break
+            except DriveError as exc:
+                say(f"走行エラー: {exc}")
+                exit_code = 5
+                break
+            except Step2CheckError as exc:
+                say(f"手順2 の学習結果のチェックエラー: {exc}")
+                say("yaml は書き換えていません。後の手順には進みません。")
+                exit_code = 8
+                break
+            except LearningDataError as exc:
+                say(f"モデル作成エラー: {exc}")
+                exit_code = 6
+                break
+    finally:
+        log = ctx.session_log
+        if log is not None:
+            await log.stop_sampler()  # 終了処理（原点復帰・切断）中に読みに行かない
+        # 途中で失敗しても、ペダルを踏んだままプロセスを終わらせない
+        if ctx.hardware is not None:
+            say()
+            await shutdown(ctx.hardware)
+        if log is not None:
+            await log.close()  # 異常終了でもそこまでのログを残す（ペダルを離した後に保存）
+    if exit_code == 0:
+        say()
+        say(f"完了（手順 {', '.join(str(s.number) for s in steps)}）")
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

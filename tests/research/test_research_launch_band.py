@@ -372,12 +372,16 @@ def test_launch_band_for_overlap_with_lead_in_is_dropped(tmp_path: Path) -> None
     assert bands == []
 
 
-def test_launch_band_for_missing_meta_or_curve_is_config_error(tmp_path: Path) -> None:
+def test_launch_band_for_missing_opening_means_band_not_used(tmp_path: Path, capsys) -> None:
+    # 段10-1 C: meta に hold_opening（か hold_pi）が無いときは ConfigError にせず帯を使わない
     cfg = _band_cfg(tmp_path, with_opening=False)
     mode = _mode_weak()
     ff = mdmod.load_feedforward(cfg)
-    with pytest.raises(cfgmod.ConfigError, match="hold_opening"):
-        mdmod.launch_band_for(cfg, mode, ff.table)
+    assert mdmod.launch_band_for(cfg, mode, ff.table) is None
+    assert "警告" in capsys.readouterr().out
+    # 計画への入力にも帯を入れない（メタが無くても走れる）
+    _, _, kwargs = mdmod.forward_map_plan_args(cfg, mode, stop_end=False, table=ff.table)
+    assert kwargs["launch_band"] is None
     cfg2 = _band_cfg(tmp_path)
     ff2 = mdmod.load_feedforward(cfg2)
     cfg2.feedforward.creep_accel_speeds_kmh = []

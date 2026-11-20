@@ -10,11 +10,11 @@
                （遊びの中で減速は出ない）
     3. 刻み   … step_mm 踏む → dwell_s 待つ → 直近 slope_window_s の車速の傾き（最小二乗）で
                  減速度を出す
-                 目標 − press_margin_g 未満 → 1 刻み踏み増し（上限 = 停車保持開度）
+                 目標 − press_margin_g 未満 → 1 刻み踏み増し（上限 = ブレーキの最大開度）
                  release_above_g 超え     → 1 刻み戻す（接近位置より浅くはしない）
                  それ以外                 → 保持
                  車速を読むたびに VEHICLE_STOP_SPEED_KMH 未満なら停止確認
-    4. 停車保持 … 停車保持開度まで刻んで踏む（通常はすでに到達している）
+    4. 停車保持 … 停車保持開度まで刻んで動かす（浅い所にいれば踏み、max まで踏んでいれば戻す）
 
 連続移動にしないのは、実機の効き（効き始め以降 1% ≈ 0.065G）とむだ時間から、ブレーキの最低速度
 10mm/s でも減速が出たのを見てから止めるまでに 0.35〜0.6G まで行き過ぎる見込みのため。
@@ -76,7 +76,9 @@ async def decelerate_to_stop(
     started = loop.time()
     step = max(1, round(d.step_mm * 100))
     hold_pct = max(0.0, min(ff.stop_brake_opening_pct, profile.max_brake_opening))
-    ceiling = opening_to_pulse(hold_pct)
+    hold_pulse = opening_to_pulse(hold_pct)
+    # 踏み増しの上限は停車保持開度でなくブレーキの最大開度（効きが足りなければ停車保持より深く踏む）
+    ceiling = opening_to_pulse(max(0.0, profile.max_brake_opening))
     approach_pct = max(0.0, ff.brake_deadband_pct - d.approach_margin_pct)
     approach = min(ceiling, opening_to_pulse(approach_pct))
     press_below_kmhs = (d.target_decel_g - d.press_margin_g) * G_TO_KMHS
@@ -86,12 +88,12 @@ async def decelerate_to_stop(
     say(f"緩減速: 目標 {d.target_decel_g:g}G"
         f"（{d.target_decel_g - d.press_margin_g:g}G 未満で踏み増し・"
         f"{d.release_above_g:g}G 超えで戻す）、{d.step_mm:g}mm 刻み・待ち {d.dwell_s:g}s、"
-        f"上限 = 停車保持 {hold_pct:.2f}%")
+        f"上限 = 最大開度 {pulse_to_opening(ceiling):.2f}%")
     await hw.accel.move_to_position(0)
     current = await hw.brake.read_position()
     pos = min(max(current, approach), ceiling)
     if current > approach:
-        # 最後のパターンでブレーキを踏んだまま終わった場合は、そこ（上限まで）から刻む
+        # 最後のパターンでブレーキを踏んだまま終わった場合は、そこ（最大開度まで）から刻む
         say(f"  接近: ブレーキはすでに {pulse_to_opening(current):.2f}% を踏んでいるため "
             f"{pulse_to_opening(pos):.2f}% から刻みます")
     else:
@@ -134,7 +136,7 @@ async def decelerate_to_stop(
     mark(log, SECTION_DECEL_TO_STOP, PHASE_STOP_HOLD)
     say(f"  停止確認: ブレーキ {pulse_to_opening(pos):.2f}% → "
         f"停車保持 {hold_pct:.2f}% まで刻みます")
-    await step_to_position(hw.brake, pos, ceiling, step_pulse=step, dwell_s=HOLD_STEP_DWELL_S)
+    await step_to_position(hw.brake, pos, hold_pulse, step_pulse=step, dwell_s=HOLD_STEP_DWELL_S)
     result = StopDecelResult(
         hold_pct=hold_pct,
         duration_s=loop.time() - started,

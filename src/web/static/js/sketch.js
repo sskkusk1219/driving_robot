@@ -114,7 +114,7 @@ function StateBadge({ state }) {
 }
 
 // ── TopBar ───────────────────────────────────────────────────
-function TopBar({ state, screen, upsLoss, profileName, modeName }) {
+function TopBar({ state, screen, upsLoss, upsInstalled = true, profileName, modeName }) {
   const tint = STATE_TINT[state] || STATE_TINT.READY;
   const showUpsLoss = upsLoss || state === 'AC_LOSS';
   return (
@@ -132,7 +132,7 @@ function TopBar({ state, screen, upsLoss, profileName, modeName }) {
       <div style={{ fontSize: 15, color: INK_SOFT }}>profile: <b>{profileName || '---'}</b></div>
       <div style={{ fontSize: 15, color: INK_SOFT }}>mode: <b>{modeName || '---'}</b></div>
       <StateBadge state={state} />
-      <UpsIndicator acLoss={showUpsLoss} />
+      {upsInstalled && <UpsIndicator acLoss={showUpsLoss} />}
     </div>
   );
 }
@@ -172,7 +172,7 @@ function Sidebar({ active, onNav, locked }) {
 
 // ── Frame ────────────────────────────────────────────────────
 function Frame({ children, state = 'READY', screen = '', activeNav = '',
-                 upsLoss = false, locked = false, profileName, modeName, onNav, onGoInit }) {
+                 upsLoss = false, upsInstalled = true, locked = false, profileName, modeName, onNav, onGoInit }) {
   return (
     <div style={{
       width: '100%', height: '100%',
@@ -180,18 +180,18 @@ function Frame({ children, state = 'READY', screen = '', activeNav = '',
       fontFamily: "'Noto Sans JP', 'Meiryo UI', 'Yu Gothic UI', sans-serif",
       color: INK,
       display: 'grid',
-      gridTemplateColumns: '200px 1fr',
-      gridTemplateRows: '52px 1fr',
+      gridTemplateColumns: '190px minmax(0, 1fr)',
+      gridTemplateRows: '48px minmax(0, 1fr)',
       position: 'relative',
       overflow: 'hidden',
     }}>
-      <TopBar state={state} screen={screen} upsLoss={upsLoss}
+      <TopBar state={state} screen={screen} upsLoss={upsLoss} upsInstalled={upsInstalled}
               profileName={profileName} modeName={modeName} />
       <Sidebar active={activeNav} onNav={onNav || (() => {})} locked={locked} />
-      <div style={{ padding: '20px 28px 24px', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ padding: '12px 20px 14px', minHeight: 0, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         {children}
       </div>
-      {state === 'EMERGENCY' && <EmergencyOverlay onGoInit={onGoInit || (() => {})} />}
+      {/* 非常停止中は app.js が EmergencyResetScreen（停止シーケンスの記録・解除ボタン）を出す。上に重ねていたオーバーレイは外した（解除ボタンが画面の下に隠れていたため） */}
     </div>
   );
 }
@@ -590,14 +590,14 @@ function ValidationPopup({ message, actionLabel = 'OK', onAction }) {
 }
 
 // ── RowActions — 一覧行の操作ボタン共通コンポーネント ────────────
-// onSelect, onEdit, onCopy, onDelete: handler 関数
+// onSelect, onEdit, onCopy, onDelete: handler 関数（null/未指定のボタンは灰色の押せない表示）
 // isActive: 選択中かどうか (true のとき「選択」ボタンを primary スタイルに)
 function RowActions({ onSelect, isActive, onEdit, onCopy, onDelete }) {
   return React.createElement('div', { style: { display: 'flex', gap: 6 } },
     React.createElement(Btn, { primary: isActive, onClick: onSelect }, '選択'),
-    React.createElement(Btn, { onClick: onEdit }, '編集'),
-    React.createElement(Btn, { onClick: onCopy }, 'コピー'),
-    React.createElement(Btn, { danger: true, onClick: onDelete }, '削除'),
+    React.createElement(Btn, { onClick: onEdit, disabled: !onEdit }, '編集'),
+    React.createElement(Btn, { onClick: onCopy, disabled: !onCopy }, 'コピー'),
+    React.createElement(Btn, { danger: true, onClick: onDelete, disabled: !onDelete }, '削除'),
   );
 }
 

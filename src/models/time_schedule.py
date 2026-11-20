@@ -23,8 +23,11 @@ class ButtonEvent:
     """時刻ごとのボタン押下イベント。"""
 
     time_s: float  # 押下開始時刻 [s]
-    channel: int  # PCA9685 チャンネル（0-15、ButtonServoDriver のマッピング参照）
-    press_duration_s: float  # 押下時間 [s]（ボタンごとに設定）
+    # 旧データだけが持つ PCA9685 のチャンネル（0-15）。新しいイベントはボタン名（button）で指す。
+    # button が無い旧イベントは「名前なし（要再設定）」で、実行時はエラーにする（推測で押さない）
+    channel: int | None = None
+    press_duration_s: float | None = None  # 押下時間 [s]。None なら車両 yaml の既定秒数
+    button: str | None = None  # ボタン名: start / P / N / D（車両 yaml の servo_map のキー）
 
 
 @dataclass

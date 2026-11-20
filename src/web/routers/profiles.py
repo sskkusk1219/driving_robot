@@ -1,222 +1,106 @@
-from dataclasses import fields, replace
-from datetime import UTC, datetime
+# ruff: noqa: E501
+"""車（プロファイル）API。段4（RPD_Phase_20261115_PortResearch）で DB の profiles から車両 yaml に置き換えた。
+
+パス（``/api/v1/profiles/*``）は画面の呼び先のまま。ID は車のフォルダ名（vehicles/<ID>/）。
+人が決める値（vehicle.*）だけ書ける（ボタンの設定は共通設定へ移した。段11）。学習で決まる feedforward.* は読むだけ。
+"""
+
+from __future__ import annotations
+
 from typing import Annotated
-from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from src.app.robot_controller import RobotController
-from src.models.profile import (
-    DynamicsParams,
-    FeedforwardParams,
-    PIDGains,
-    StopConfig,
-    VehicleProfile,
-)
-from src.web.deps import ProfileRepoProtocol, get_controller, get_profile_repo
+from src.app.job_manager import JobManager
+from src.infra.vehicle_store import NEW_VEHICLE_DEFAULTS, VehicleInfo, VehicleStore
+from src.web.deps import get_job_manager, get_vehicle_store
 from src.web.schemas import (
-    CalibrationDataResponse,
-    DynamicsParamsSchema,
-    FeedforwardParamsSchema,
-    PIDGainsSchema,
+    ButtonsSchema,
     ProfileCreateRequest,
     ProfileResponse,
     ProfileUpdateRequest,
-    StopConfigSchema,
 )
 
 router = APIRouter(prefix="/api/v1/profiles", tags=["profiles"])
 
-ProfileRepo = Annotated[ProfileRepoProtocol, Depends(get_profile_repo)]
-Controller = Annotated[RobotController, Depends(get_controller)]
+Store = Annotated[VehicleStore, Depends(get_vehicle_store)]
+Manager = Annotated[JobManager, Depends(get_job_manager)]
 
 
-def _ffp_from_schema(s: FeedforwardParamsSchema) -> FeedforwardParams:
-    return FeedforwardParams(**{f.name: getattr(s, f.name) for f in fields(FeedforwardParams)})
-
-
-def _dyn_from_schema(s: DynamicsParamsSchema) -> DynamicsParams:
-    return DynamicsParams(**{f.name: getattr(s, f.name) for f in fields(DynamicsParams)})
-
-
-def _ffp_merged(existing: FeedforwardParams, s: FeedforwardParamsSchema) -> FeedforwardParams:
-    """クライアントが明示送信したフィールドのみ既存値へ上書きする（更新用）。
-
-    WebUI のフォームは編集可能な項目だけを送るため、スキーマ既定値で欠損を埋めて
-    丸ごと置換すると、学習サイクルが同定した非フォーム項目（惰行減速カーブ
-    coast_decel_speeds_kmh / coast_decel_kmhs 等）が消える（2026-07-15 実機で発生）。
-    model_fields_set（リクエストボディに実際に含まれたキー）で送信有無を判別し、
-    明示送信された空タプルはクリアとして尊重する。
-    """
-    names = {f.name for f in fields(FeedforwardParams)}
-    overrides = {n: getattr(s, n) for n in s.model_fields_set if n in names}
-    return replace(existing, **overrides)
-
-
-def _dyn_merged(existing: DynamicsParams, s: DynamicsParamsSchema) -> DynamicsParams:
-    """クライアントが明示送信したフィールドのみ既存値へ上書きする（更新用）。
-
-    fopdt_* は学習サイクルが書き込む同定値。_ffp_merged と同じ理由でフィールド単位に
-    マージする（フォーム側の「既存値を送り返す」対処に依存しない）。
-    """
-    names = {f.name for f in fields(DynamicsParams)}
-    overrides = {n: getattr(s, n) for n in s.model_fields_set if n in names}
-    return replace(existing, **overrides)
-
-
-def _to_response(p: VehicleProfile) -> ProfileResponse:
-    calib = None
-    if p.calibration is not None:
-        calib = CalibrationDataResponse(
-            accel_zero_pos=p.calibration.accel_zero_pos,
-            accel_full_pos=p.calibration.accel_full_pos,
-            accel_stroke=p.calibration.accel_stroke,
-            brake_zero_pos=p.calibration.brake_zero_pos,
-            brake_full_pos=p.calibration.brake_full_pos,
-            brake_stroke=p.calibration.brake_stroke,
-            calibrated_at=p.calibration.calibrated_at,
-            is_valid=p.calibration.is_valid,
-        )
+def to_response(info: VehicleInfo) -> ProfileResponse:
+    v = info.vehicle
     return ProfileResponse(
-        id=p.id,
-        name=p.name,
-        max_accel_opening=p.max_accel_opening,
-        max_brake_opening=p.max_brake_opening,
-        max_speed=p.max_speed,
-        max_decel_g=p.max_decel_g,
-        pid_gains=PIDGainsSchema(kp=p.pid_gains.kp, ki=p.pid_gains.ki, kd=p.pid_gains.kd),
-        stop_config=StopConfigSchema(
-            deviation_threshold_kmh=p.stop_config.deviation_threshold_kmh,
-            deviation_duration_s=p.stop_config.deviation_duration_s,
-        ),
-        calibration=calib,
-        model_path=p.model_path,
-        feedforward_params=FeedforwardParamsSchema.model_validate(p.feedforward_params),
-        dynamics_params=DynamicsParamsSchema.model_validate(p.dynamics_params),
-        created_at=p.created_at,
-        updated_at=p.updated_at,
+        id=info.id,
+        name=info.name,
+        error=info.error,
+        max_speed_kmh=v.get("max_speed_kmh"),
+        max_decel_g=v.get("max_decel_g"),
+        min_accel_opening_pct=v.get("min_accel_opening_pct"),
+        max_accel_opening_pct=v.get("max_accel_opening_pct"),
+        min_brake_opening_pct=v.get("min_brake_opening_pct"),
+        max_brake_opening_pct=v.get("max_brake_opening_pct"),
+        min_accel_measured=info.min_accel_measured,
+        min_brake_measured=info.min_brake_measured,
+        stop_deviation_threshold_kmh=v.get("stop_deviation_threshold_kmh"),
+        stop_deviation_duration_s=v.get("stop_deviation_duration_s"),
+        test_mass_kg=v.get("test_mass_kg"),
+        road_load_a0_n=v.get("road_load_a0_n"),
+        road_load_a1_n_per_kmh=v.get("road_load_a1_n_per_kmh"),
+        road_load_a2_n_per_kmh2=v.get("road_load_a2_n_per_kmh2"),
+        road_load_source=v.get("road_load_source"),
+        buttons=ButtonsSchema(**info.buttons),
+        learned=info.learned,
+        model_path=info.model_path,
+        learned_at=info.learned_at,
+        candidate=info.candidate,
+        feedforward=info.feedforward,
+        updated_at=info.updated_at,
     )
 
 
 @router.get("/", response_model=list[ProfileResponse])
-async def list_profiles(repo: ProfileRepo) -> list[ProfileResponse]:
-    profiles = await repo.list_all()
-    return [_to_response(p) for p in profiles]
+async def list_profiles(store: Store) -> list[ProfileResponse]:
+    return [to_response(i) for i in store.list_all()]
 
 
 @router.post("/", response_model=ProfileResponse, status_code=201)
-async def create_profile(req: ProfileCreateRequest, repo: ProfileRepo) -> ProfileResponse:
-    now = datetime.now(tz=UTC)
-    profile = VehicleProfile(
-        id=str(uuid4()),
-        name=req.name,
-        max_accel_opening=req.max_accel_opening,
-        max_brake_opening=req.max_brake_opening,
-        max_speed=req.max_speed,
-        max_decel_g=req.max_decel_g,
-        pid_gains=PIDGains(kp=req.pid_gains.kp, ki=req.pid_gains.ki, kd=req.pid_gains.kd),
-        stop_config=StopConfig(
-            deviation_threshold_kmh=req.stop_config.deviation_threshold_kmh,
-            deviation_duration_s=req.stop_config.deviation_duration_s,
-        ),
-        calibration=None,
-        model_path=req.model_path,
-        created_at=now,
-        updated_at=now,
-        feedforward_params=(
-            _ffp_from_schema(req.feedforward_params)
-            if req.feedforward_params is not None
-            else FeedforwardParams()
-        ),
-        dynamics_params=(
-            _dyn_from_schema(req.dynamics_params)
-            if req.dynamics_params is not None
-            else DynamicsParams()
-        ),
+async def create_profile(req: ProfileCreateRequest, store: Store) -> ProfileResponse:
+    values = req.model_dump(exclude={"name", "id"}, exclude_none=True)
+    # 作成で渡せるのは雛形の仮値を置き換える数値（諸元・開度）だけ。走行抵抗などは作成後に更新で入れる
+
+    template_values = {k: v for k, v in values.items() if k in NEW_VEHICLE_DEFAULTS}
+    info = store.create(
+        req.name,
+        vehicle_id=req.id,
+        values=template_values,
     )
-    created = await repo.create(profile)
-    return _to_response(created)
+    rest_vehicle = {k: v for k, v in values.items() if k not in NEW_VEHICLE_DEFAULTS}
+    if rest_vehicle:
+        info = store.update(info.id, vehicle=rest_vehicle)
+    return to_response(info)
 
 
 @router.get("/{profile_id}", response_model=ProfileResponse)
-async def get_profile(profile_id: str, repo: ProfileRepo) -> ProfileResponse:
-    try:
-        profile = await repo.get_by_id(profile_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="profile_id が UUID 形式ではありません")
-    if profile is None:
-        raise HTTPException(status_code=404, detail=f"プロファイル {profile_id!r} が見つかりません")
-    return _to_response(profile)
+async def get_profile(profile_id: str, store: Store) -> ProfileResponse:
+    return to_response(store.read(profile_id))
 
 
 @router.put("/{profile_id}", response_model=ProfileResponse)
 async def update_profile(
-    profile_id: str, req: ProfileUpdateRequest, repo: ProfileRepo, controller: Controller
+    profile_id: str, req: ProfileUpdateRequest, store: Store, manager: Manager
 ) -> ProfileResponse:
-    try:
-        existing = await repo.get_by_id(profile_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="profile_id が UUID 形式ではありません")
-    if existing is None:
-        raise HTTPException(status_code=404, detail=f"プロファイル {profile_id!r} が見つかりません")
-    merged = VehicleProfile(
-        id=existing.id,
-        name=req.name if req.name is not None else existing.name,
-        max_accel_opening=(
-            req.max_accel_opening
-            if req.max_accel_opening is not None
-            else existing.max_accel_opening
-        ),
-        max_brake_opening=(
-            req.max_brake_opening
-            if req.max_brake_opening is not None
-            else existing.max_brake_opening
-        ),
-        max_speed=req.max_speed if req.max_speed is not None else existing.max_speed,
-        max_decel_g=req.max_decel_g if req.max_decel_g is not None else existing.max_decel_g,
-        pid_gains=(
-            PIDGains(kp=req.pid_gains.kp, ki=req.pid_gains.ki, kd=req.pid_gains.kd)
-            if req.pid_gains is not None
-            else existing.pid_gains
-        ),
-        stop_config=(
-            StopConfig(
-                deviation_threshold_kmh=req.stop_config.deviation_threshold_kmh,
-                deviation_duration_s=req.stop_config.deviation_duration_s,
-            )
-            if req.stop_config is not None
-            else existing.stop_config
-        ),
-        calibration=existing.calibration,
-        model_path=req.model_path if req.model_path is not None else existing.model_path,
-        created_at=existing.created_at,
-        updated_at=existing.updated_at,
-        feedforward_params=(
-            _ffp_merged(existing.feedforward_params, req.feedforward_params)
-            if req.feedforward_params is not None
-            else existing.feedforward_params
-        ),
-        dynamics_params=(
-            _dyn_merged(existing.dynamics_params, req.dynamics_params)
-            if req.dynamics_params is not None
-            else existing.dynamics_params
-        ),
-    )
-    updated = await repo.update(merged)
-    if updated is None:
-        raise HTTPException(status_code=404, detail=f"プロファイル {profile_id!r} が見つかりません")
-    # 編集が「アクティブプロファイル」なら制御スタック（in-memory）へ即時反映する。
-    # これをしないと stop_brake_opening_pct 等を編集しても arm のブレーキ踏込量が
-    # 旧値のまま変わらない（コントローラが古い _active_profile を保持し続けるため）。
-    controller.refresh_active_profile(updated)
-    return _to_response(updated)
+    """人が決める値の更新（送ったキーだけ）。値が core の検証に通らなければ 422（日本語の理由）。"""
+    current = manager.current
+    if current is not None and current.spec.vehicle_id == profile_id:
+        raise HTTPException(status_code=409, detail="この車のジョブが実行中のため変更できません")
+    vehicle = req.model_dump(exclude_none=True)
+    return to_response(store.update(profile_id, vehicle=vehicle))
 
 
 @router.delete("/{profile_id}", status_code=204)
-async def delete_profile(profile_id: str, repo: ProfileRepo) -> None:
-    try:
-        deleted = await repo.delete(profile_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="profile_id が UUID 形式ではありません")
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"プロファイル {profile_id!r} が見つかりません")
+async def delete_profile(profile_id: str, store: Store, manager: Manager) -> None:
+    """車のフォルダ（yaml・pkl・学習データ）を消す。確認は画面側。この車のジョブが走っていれば 409。"""
+    current = manager.current
+    if current is not None and current.spec.vehicle_id == profile_id:
+        raise HTTPException(status_code=409, detail="この車のジョブが実行中のため削除できません")
+    store.delete(profile_id)

@@ -11,6 +11,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
 
 from src.models.time_schedule import ButtonEvent, PedalPoint, TimeSchedule
+from src.robot.schedule_spec import ESTIMATE_PRESS_S
 from src.web.deps import ScheduleRepoProtocol, get_schedule_repo
 from src.web.schemas import (
     ButtonEventSchema,
@@ -29,7 +30,9 @@ ScheduleRepo = Annotated[ScheduleRepoProtocol, Depends(get_schedule_repo)]
 def _total_duration(pedal_points: list[PedalPoint], button_events: list[ButtonEvent]) -> float:
     """タイムラインの総時間を末尾のペダル点・ボタンイベント（押下終了）から算出する。"""
     pedal_end = pedal_points[-1].time_s if pedal_points else 0.0
-    button_end = max((e.time_s + e.press_duration_s for e in button_events), default=0.0)
+    button_end = max(
+        (e.time_s + (e.press_duration_s or ESTIMATE_PRESS_S) for e in button_events), default=0.0
+    )
     return max(pedal_end, button_end)
 
 
@@ -61,6 +64,7 @@ def _to_detail_response(s: TimeSchedule) -> ScheduleDetailResponse:
         button_events=[
             ButtonEventSchema(
                 time_s=e.time_s,
+                button=e.button,  # type: ignore[arg-type]
                 channel=e.channel,
                 press_duration_s=e.press_duration_s,
             )
@@ -80,7 +84,12 @@ def _pedal_points_from_schema(points: list[PedalPointSchema]) -> list[PedalPoint
 
 def _button_events_from_schema(events: list[ButtonEventSchema]) -> list[ButtonEvent]:
     return [
-        ButtonEvent(time_s=e.time_s, channel=e.channel, press_duration_s=e.press_duration_s)
+        ButtonEvent(
+            time_s=e.time_s,
+            channel=e.channel,
+            press_duration_s=e.press_duration_s,
+            button=e.button,
+        )
         for e in events
     ]
 

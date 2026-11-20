@@ -51,3 +51,6 @@ tests/research/results/
 # 公開しない車の値（質量・走行抵抗など）とユーザー提供のノート
 tests/research/private/
 docs/ideas/sim_ver6.ipynb
+
+# 車両ごとの設定（学習した値・走行抵抗・車両固有の値を含む。公開しない）
+vehicles/
