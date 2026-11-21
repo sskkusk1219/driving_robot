@@ -5,7 +5,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
 from src.infra import drive_csv
@@ -15,13 +15,22 @@ from src.models.drive_log import DriveSession, LearningCycle
 from src.robot import config_store
 from src.utils.time import to_jst_naive
 from src.web.analysis import build_analysis, build_figure
-from src.web.deps import SessionRepoProtocol, get_session_repo, get_vehicle_store
+from src.web.deps import ErrorRepoProtocol, SessionRepoProtocol, get_session_repo, get_vehicle_store
 from src.web.schemas import CycleSummaryResponse, LogResponse, MessageResponse, SessionResponse
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 
 SessionRepo = Annotated[SessionRepoProtocol, Depends(get_session_repo)]
 Store = Annotated[VehicleStore, Depends(get_vehicle_store)]
+
+
+def _optional_error_repo(request: Request) -> ErrorRepoProtocol | None:
+    """エラーの保存先（無い環境では None。CSV はエラー列を空にして出す）。"""
+    repo: ErrorRepoProtocol | None = getattr(request.app.state, "error_repo", None)
+    return repo
+
+
+ErrorRepo = Annotated[ErrorRepoProtocol | None, Depends(_optional_error_repo)]
 
 
 def _require_uuid(value: str, label: str = "session_id") -> None:
@@ -119,12 +128,16 @@ async def get_session_messages(session_id: str, repo: SessionRepo) -> list[Messa
 
 
 @router.get("/{session_id}/logs.csv")
-async def download_session_logs_csv(session_id: str, repo: SessionRepo) -> Response:
+async def download_session_logs_csv(
+    session_id: str, repo: SessionRepo, error_repo: ErrorRepo
+) -> Response:
     """セッションの走行ログを CSV でダウンロードさせる。
 
     列は研究ハーネス（tests/research）の CSV と同じ（core の drive_log.CSV_COLUMNS の順）。
     drive_logs の 9 列＋detail JSONB を展開して全列を書く。旧セッション（detail なし）の列は空欄。
-    数万行でもメモリに全部載せないよう、DB のカーソルから流しながら返す。
+    末尾にボタン（btn_start・btn_P・btn_N・btn_D）とエラー（error_level・error_title）の列を足し、
+    先頭に BOM を付ける（Excel の文字化け対策）。ログの範囲の外のボタン・エラーは時刻順に行を足す。
+    数万行でもメモリに全部載せないよう、DB のカーソルから流しながら返す（ボタン・エラーは数件なので先に読む）。
     """
     _require_uuid(session_id)
     session = await repo.get_by_id(session_id)
@@ -132,32 +145,44 @@ async def download_session_logs_csv(session_id: str, repo: SessionRepo) -> Respo
         raise HTTPException(status_code=404, detail=f"セッション {session_id!r} が見つかりません")
 
     header = drive_csv.csv_header(await repo.log_detail_keys(session_id))
+    presses = parse_button_presses(await repo.list_messages(session_id))
+    errors = await error_repo.list_by_session(session_id) if error_repo is not None else []
+    overlay = drive_csv.CsvOverlay(presses, errors)
+
+    def encode(rows: list[list[str]]) -> str:
+        buf = io.StringIO()
+        csv.writer(buf, lineterminator="\n").writerows(rows)
+        return buf.getvalue()
 
     async def body() -> AsyncIterator[str]:
-        buf = io.StringIO()
-        writer = csv.writer(buf, lineterminator="\n")
-        writer.writerow(header)
-        yield buf.getvalue()
+        yield "\ufeff" + encode([header])
+        first = True
+        last_ts = None
         async for batch in repo.iter_logs_for_csv(session_id):
-            buf = io.StringIO()
-            writer = csv.writer(buf, lineterminator="\n")
+            rows: list[list[str]] = []
             for r in batch:
-                writer.writerow(
-                    drive_csv.db_to_csv_cells(
-                        timestamp=r.timestamp,
-                        ref_speed_kmh=r.ref_speed_kmh,
-                        actual_speed_kmh=r.actual_speed_kmh,
-                        accel_opening=r.accel_opening,
-                        brake_opening=r.brake_opening,
-                        accel_pos=r.accel_pos,
-                        brake_pos=r.brake_pos,
-                        accel_current=r.accel_current,
-                        brake_current=r.brake_current,
-                        detail=r.detail,
-                        columns=header,
-                    )
+                if first:
+                    first = False
+                    rows.extend(drive_csv.extra_row(header, t, c) for t, c in overlay.rows_before(r.timestamp))
+                last_ts = r.timestamp
+                cells = drive_csv.db_to_csv_cells(
+                    timestamp=r.timestamp,
+                    ref_speed_kmh=r.ref_speed_kmh,
+                    actual_speed_kmh=r.actual_speed_kmh,
+                    accel_opening=r.accel_opening,
+                    brake_opening=r.brake_opening,
+                    accel_pos=r.accel_pos,
+                    brake_pos=r.brake_pos,
+                    accel_current=r.accel_current,
+                    brake_current=r.brake_current,
+                    detail=r.detail,
+                    columns=header,
                 )
-            yield buf.getvalue()
+                rows.append(drive_csv.with_extra(cells, overlay.cells_for(r.timestamp)))
+            yield encode(rows)
+        tail = overlay.rows_only() if last_ts is None else overlay.rows_after(last_ts)
+        if tail:
+            yield encode([drive_csv.extra_row(header, t, c) for t, c in tail])
 
     filename = f"session_{session_id}_{to_jst_naive(session.started_at):%Y%m%d_%H%M%S}.csv"
     return StreamingResponse(

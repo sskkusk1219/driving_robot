@@ -327,6 +327,11 @@ class InMemoryErrorRepository:
         rows.sort(key=lambda e: (e.last_at, e.id), reverse=True)
         return rows[offset : offset + limit], len(rows)
 
+    async def list_by_session(self, session_id: str) -> list[ErrorEvent]:
+        rows = [e for e in self._events.values() if e.session_id == session_id]
+        rows.sort(key=lambda e: (e.first_at, e.id))
+        return rows
+
     async def get(self, event_id: int) -> ErrorEvent | None:
         return self._events.get(event_id)
 

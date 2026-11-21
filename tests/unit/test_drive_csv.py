@@ -93,7 +93,7 @@ def test_roundtrip_csv_to_db_to_csv(tmp_path: Path) -> None:
     assert len(rows) == 2
     dbs = [drive_csv.csv_row_to_db("s", r, detail_as_json=False) for r in original]
     header = drive_csv.csv_header({k for db in dbs for k in db[10]})
-    assert header == list(cols)
+    assert header == [*cols, *drive_csv.EXTRA_COLUMNS]
     for src_row, db in zip(original, dbs, strict=True):
         cells = drive_csv.db_to_csv_cells(
             timestamp=db[1], ref_speed_kmh=db[2], actual_speed_kmh=db[3], accel_opening=db[4],
@@ -113,7 +113,8 @@ def test_roundtrip_csv_to_db_to_csv(tmp_path: Path) -> None:
 def test_header_appends_unknown_detail_keys() -> None:
     h = drive_csv.csv_header({"accel_kp", "old_column_x"})
     assert h[: len(drive_csv.csv_columns())] == list(drive_csv.csv_columns())
-    assert h[-1] == "old_column_x"
+    assert h[-7] == "old_column_x"
+    assert h[-6:] == list(drive_csv.EXTRA_COLUMNS)
 
 
 def test_decode_detail_variants() -> None:
@@ -121,3 +122,77 @@ def test_decode_detail_variants() -> None:
     assert drive_csv.decode_detail('{"a": "1"}') == {"a": "1"}
     assert drive_csv.decode_detail({"a": "1"}) == {"a": "1"}
     assert drive_csv.decode_detail("broken") == {}
+
+
+# ---- ボタン・エラーの列（CsvOverlay） ----
+
+from types import SimpleNamespace  # noqa: E402
+
+_T0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+
+def _t(sec: float) -> datetime:
+    from datetime import timedelta
+
+    return _T0 + timedelta(seconds=sec)
+
+
+def _err(level: str, title: str, at: float) -> SimpleNamespace:
+    return SimpleNamespace(level=level, title=title, first_at=_t(at))
+
+
+def _press(button: str, seconds: float, at: float) -> dict:
+    return {"button": button, "seconds": seconds, "time": _t(at)}
+
+
+def test_header_ends_with_button_and_error_columns() -> None:
+    h = drive_csv.csv_header({"old_x"})
+    assert h[-6:] == ["btn_start", "btn_P", "btn_N", "btn_D", "error_level", "error_title"]
+    assert h[-7] == "old_x"
+
+
+def test_overlay_button_interval_is_half_open() -> None:
+    ov = drive_csv.CsvOverlay([_press("N", 1.0, 10)], [])
+    assert ov.rows_before(_t(0)) == []
+    assert ov.cells_for(_t(9.9))[:4] == ["0", "0", "0", "0"]
+    assert ov.cells_for(_t(10))[:4] == ["0", "0", "1", "0"]
+    assert ov.cells_for(_t(10.9))[2] == "1"
+    assert ov.cells_for(_t(11))[2] == "0"
+
+
+def test_overlay_error_goes_to_first_row_at_or_after_first_at() -> None:
+    ov = drive_csv.CsvOverlay([], [_err("WARNING", "w", 5), _err("ERROR", "e", 5.5)])
+    assert ov.cells_for(_t(4))[4:] == ["", ""]
+    assert ov.cells_for(_t(6))[4:] == ["ERROR", "w / e"]
+    assert ov.cells_for(_t(7))[4:] == ["", ""]
+    assert ov.rows_after(_t(7)) == []
+
+
+def test_overlay_adds_rows_outside_range() -> None:
+    ov = drive_csv.CsvOverlay(
+        [_press("start", 2.0, -5), _press("D", 1.0, 100)], [_err("ERROR", "early", -3), _err("WARNING", "late", 120)]
+    )
+    before = ov.rows_before(_t(0))
+    assert [t for t, _ in before] == [_t(-5), _t(-3)]
+    assert before[0][1] == ["1", "0", "0", "0", "", ""]
+    assert before[1][1] == ["0", "0", "0", "0", "ERROR", "early"]
+    assert ov.cells_for(_t(0)) == ["0", "0", "0", "0", "", ""]
+    after = ov.rows_after(_t(50))
+    assert [t for t, _ in after] == [_t(100), _t(120)]
+    assert after[0][1] == ["0", "0", "0", "1", "", ""]
+    assert after[1][1] == ["0", "0", "0", "0", "WARNING", "late"]
+
+
+def test_overlay_rows_only_when_no_log_rows() -> None:
+    ov = drive_csv.CsvOverlay([_press("P", 1.0, 3)], [_err("ERROR", "x", 1)])
+    rows = ov.rows_only()
+    assert [t for t, _ in rows] == [_t(1), _t(3)]
+
+
+def test_extra_row_fills_only_timestamp_and_extras() -> None:
+    h = drive_csv.csv_header(set())
+    row = drive_csv.extra_row(h, _t(0), ["0", "1", "0", "0", "ERROR", "x"])
+    assert len(row) == len(h)
+    assert row[h.index("timestamp")] == "2026-01-01 09:00:00"
+    assert row[-6:] == ["0", "1", "0", "0", "ERROR", "x"]
+    assert sum(1 for c in row if c != "") == 1 + 6
