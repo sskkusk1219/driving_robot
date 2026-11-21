@@ -150,6 +150,14 @@ class ErrorRepository:
             )
         return [_row_to_event(r) for r in rows], int(total)
 
+    async def list_by_session(self, session_id: str) -> list[ErrorEvent]:
+        """その走行（session_id）のできごとを first_at の古い順に返す（ログ CSV に重ねる用）。"""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM error_events WHERE session_id = $1 ORDER BY first_at, id", session_id
+            )
+        return [_row_to_event(r) for r in rows]
+
     async def get(self, event_id: int) -> ErrorEvent | None:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM error_events WHERE id = $1", event_id)
