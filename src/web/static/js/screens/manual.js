@@ -9,7 +9,8 @@ function AxisJog({ label, axisId, currentPos, openingPct, maxPct, onJog, enabled
     <AxisPanel label={label} axisId={axisId} selected={selected} enabled={enabled} onSelect={onSelect}>
 
       {/* Jog buttons + drag slider */}
-      <JogRow axisId={axisId} currentPos={currentPos} onJog={onJog} disabled={dis} />
+      <JogRow axisId={axisId} currentPos={currentPos} onJog={onJog} disabled={dis}
+              displayValue={currentPos == null ? '—' : openingPct.toFixed(2)} unit="% (開度)" />
 
       {/* Opening bar */}
       <div>
@@ -84,7 +85,7 @@ function ManualScreen() {
     }
   }, [robotState]);
 
-  // キー操作（キャリブレーションと同じ割り当て）: d/s = ±10、e/w = ±100、Tab = 軸切替
+  // キー操作（キャリブレーションと同じ割り当て）: 3/2 = ±1 pulse（0.01%）、e/w = ±10、d/s = ±100、c/x = ±1000（10%）、Tab = 軸切替
   useJogKeys({
     enabled: enabled && !confirmStart && !confirmStop && !popup,
     selectedAxis, setSelectedAxis,
@@ -179,8 +180,10 @@ function ManualScreen() {
       <div style={{ display: 'flex', gap: 10 }}>
         <Box label="キーボードショートカット" style={{ padding: '10px 12px', flex: 1 }}>
           <div style={{ fontSize: 12, lineHeight: 1.7, fontFamily: 'inherit' }}>
-            <div>d / s  : ±10 pulse</div>
-            <div>e / w  : ±100 pulse</div>
+            <div>3 / 2  : ±0.01 %</div>
+            <div>e / w  : ±0.1 %</div>
+            <div>d / s  : ±1 %</div>
+            <div>c / x  : ±10 %</div>
             <div>Tab    : 軸切替 (アクセル ↔ ブレーキ)</div>
             <div>パネルをクリック : その軸を操作対象にする</div>
           </div>
@@ -189,8 +192,8 @@ function ManualScreen() {
         <div style={{ display: 'flex', gap: 10, flex: 1 }}>
           <Box style={{ padding: '10px 14px', fontSize: 13, flex: 1 }}>
             <Row cells={[['実車速',       '1.4fr'], [`${(realtimeData.actual_speed_kmh ?? 0).toFixed(1)} km/h`, '1fr', 'mono']]} />
-            <Row cells={[['ブレーキ pos', '1.4fr'], [brkPos == null ? "—" : `${brkPos} pulse`, '1fr', 'mono']]} />
-            <Row cells={[['アクセル pos', '1.4fr'], [accPos == null ? "—" : `${accPos} pulse`, '1fr', 'mono']]} />
+            <Row cells={[['ブレーキ開度', '1.4fr'], [brkPos == null ? "—" : `${brkOpeningPct.toFixed(2)} %`, '1fr', 'mono']]} />
+            <Row cells={[['アクセル開度', '1.4fr'], [accPos == null ? "—" : `${accOpeningPct.toFixed(2)} %`, '1fr', 'mono']]} />
           </Box>
           <div style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: 6 }}>
             <Btn onClick={handleHome} disabled={!enabled}>両軸を原点へ</Btn>

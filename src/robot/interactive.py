@@ -188,22 +188,26 @@ def plan_move(
     return MovePlan(tuple(moves), target, clamped, release)
 
 
-#: jog の目標開度をそろえる目盛り [%]。画面のジョグの量は pulse（10 pulse ≒ 0.105%）なので、
-#: そのまま足すと 4.42% のように半端な値になり、min を決めた値（例 4.2%）にちょうど合わせられない（2026-11-16 段9）
-JOG_GRID_PCT = 0.1
+#: jog の目標開度をそろえる目盛り [%]（0.01% の目盛り。1 pulse ≒ 0.0105%）。画面のジョグの量は pulse なので、
+#: そのまま足すと 4.42% のように半端な値になり、min を決めた値（例 4.2%）にちょうど合わせられない（2026-11-16 段9）。
+#: 2026-11-21 に ±1 pulse のジョグを足すため、0.1% から細かくした（0.1% だと 1 pulse が丸められて動かない）
+JOG_GRID_PCT = 0.01
 
 
 def on_jog_grid(opening_pct: float) -> float:
     """保存する min・max をジョグの目盛り（``JOG_GRID_PCT``）に丸める。
 
-    ジョグの行き先は 0.1% の目盛りだが、pulse（9500 = 100%）にすると半端になる（47.3% → 4493.5 → 4494
+    ジョグの行き先は 0.01% の目盛り（1 pulse ≒ 0.0105%。2026-11-21 に 0.1% から細かくした）だが、pulse（9500 = 100%）にすると半端になる（47.3% → 4493.5 → 4494
     pulse ＝ 47.305%）。実位置をそのまま保存すると 47.31 になり、狙った値とずれる（2026-11-16 段11 実機）。
     """
     return round(round(opening_pct / JOG_GRID_PCT) * JOG_GRID_PCT, 4)
 
 
 def jog_target(axis: str, amount_pct: float, accel_pct: float, brake_pct: float) -> float:
-    """jog の目標開度 = 今の実開度 + 量 を ``JOG_GRID_PCT`` の目盛りに丸めた値（0 未満は 0。max は plan_move が収める）。"""
+    """jog の目標開度 = 今の実開度 + 量 を ``JOG_GRID_PCT``（0.01%）の目盛りに丸めた値（0 未満は 0。max は plan_move が収める）。
+
+    1 pulse（≒0.0105%）を足しても丸めで消えない（目盛りの半分 0.005% ＝ 0.475 pulse 未満の誤差）。
+    """
     now = accel_pct if axis == "accel" else brake_pct
     target = round((now + amount_pct) / JOG_GRID_PCT) * JOG_GRID_PCT
     return max(0.0, round(target, 4))

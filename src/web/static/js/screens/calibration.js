@@ -1,7 +1,7 @@
 // ── キャリブレーション: ペダルの min（触れた位置）と max（開度上限）を測る ──────────
 // 開度は「原点 0%・9500 pulse = 100%」で固定。
 //   開始 ＝ 対話ジョブを始める（初期化 → コマンド待ち。最初の API 呼び出しで始まる）
-//   ジョグ ＝ POST /drive/calib/jog（pulse 指定。10 pulse ≒ 0.1%・100 pulse ≒ 1%。キャリブレーション中は max を超えて 99% まで動かせる）
+//   ジョグ ＝ POST /drive/calib/jog（pulse 指定。1 pulse ≒ 0.01%・10 pulse ≒ 0.1%・100 pulse ≒ 1%・1000 pulse ≒ 10%。ボタンの表示はキリの良い値で、実際は 9500 pulse = 100% なので少し大きい（10 は 10.5%）。キャリブレーション中は max を超えて 99% まで動かせる）
 //   ここを min として保存 ＝ POST /drive/calib/save-min ／ ここを max として保存 ＝ POST /drive/calib/save-max
 //   終了 ＝ POST /drive/stop（原点へ戻って待機に戻る）
 
@@ -15,7 +15,7 @@ function AxisMinPanel({ label, axisId, openingPct, pos, minPct, measured, maxPct
   return (
     <AxisPanel label={label} axisId={axisId} selected={selected} enabled={enabled} onSelect={onSelect}>
       <JogRow axisId={axisId} currentPos={pos} onJog={onJog} disabled={dis}
-              labels={['0.1', '1']} displayValue={openingPct == null ? '—' : openingPct.toFixed(2)} unit="% (開度)" minPos={minPos} maxPos={maxPos} />
+              labels={['0.01', '0.1', '1', '10']} displayValue={openingPct == null ? '—' : openingPct.toFixed(2)} unit="% (開度)" minPos={minPos} maxPos={maxPos} />
 
       {/* 開度バー（0〜100%）。保存済み min（緑）・max（赤）の位置に印 */}
       <div>

@@ -257,16 +257,31 @@ def test_plan_move_clamps_and_one_pedal_rule() -> None:
 def test_jog_target() -> None:
     assert jog_target("accel", 2.0, 10.0, 5.0) == 12.0
     assert jog_target("brake", -9.0, 10.0, 5.0) == 0.0
-    # 画面の 10 pulse（≒0.105%）を足しても 0.1% の目盛りに止まる
-    assert jog_target("brake", 10 / 95, 0.0, 4.105) == 4.2
-    assert jog_target("brake", -10 / 95, 0.0, 4.2) == 4.1
+    # 画面の 10 pulse（≒0.105%）を足しても 0.01% の目盛りに止まる
+    assert jog_target("brake", 10 / 95, 0.0, 4.105) == 4.21
+    assert jog_target("brake", -10 / 95, 0.0, 4.21) == 4.1
+    # 1 pulse（1/95 %）も丸めで消えず、0.01 動く（2026-11-21）
+    assert jog_target("brake", 1 / 95, 0.0, 4.2) == 4.21
+    assert jog_target("brake", -1 / 95, 0.0, 4.21) == 4.2
+    # 1 pulse 押すと、どの位置からでも実際に 1 pulse 動く（0 にならない）
+    from src.robot.core.vehicle import opening_to_pulse, pulse_to_opening
+
+    for p in range(0, 9500, 7):
+        for d in (1, -1, 1000, -1000, 10):
+            if not 0 <= p + d <= 9500:
+                continue
+            amount = round(d / 95, 4)  # API の換算（drive.py）
+            t = jog_target("accel", amount, pulse_to_opening(p), 0.0)
+            assert opening_to_pulse(t) == p + d, (p, d)
 
 
 def test_saved_min_max_snap_to_jog_grid() -> None:
     from src.robot.interactive import on_jog_grid
 
-    assert on_jog_grid(4494 / 95) == 47.3  # 47.305%（47.3% の行き先の pulse）→ 47.3
-    assert on_jog_grid(399 / 95) == 4.2
+    assert on_jog_grid(4494 / 95) == 47.31  # 47.3053%（4494 pulse）→ 0.01% の目盛りで 47.31
+    assert on_jog_grid(47.3) == 47.3
+    assert on_jog_grid(399 / 95) == 4.2  # 4.2% = 399 pulse
+    assert on_jog_grid(400 / 95) == 4.21  # 4.2105% → 0.01% の目盛り
 
 
 VEHICLE_YAML = """\
@@ -315,9 +330,9 @@ async def test_interactive_session_stub(
         await sess.execute(parse_command('{"cmd":"move","axis":"accel","target_pct":7.25}'))
         await sess.execute(parse_command('{"cmd":"save_min","axis":"accel"}'))
         text = (vdir / "vehicle.yaml").read_text(encoding="utf-8")
-        # 保存は 0.1% のジョグの目盛りに丸める（7.25 → 7.3）
-        assert "min_accel_opening_pct: 7.3" in text and "# アクセルの min" in text
-        assert cfg.vehicle.min_accel_opening_pct == 7.3
+        # 保存は 0.01% のジョグの目盛りに丸める（7.25 はそのまま）
+        assert "min_accel_opening_pct: 7.25" in text and "# アクセルの min" in text
+        assert cfg.vehicle.min_accel_opening_pct == 7.25
         # 0 は min にできる（max 未満）が max 以上は拒否
         assert await sess.execute(parse_command('{"cmd":"status"}'))
         assert not await sess.execute(parse_command('{"cmd":"quit"}'))

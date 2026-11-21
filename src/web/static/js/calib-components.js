@@ -1,9 +1,10 @@
 // ── JogKey ────────────────────────────────────────────────
 // Square jog button with label and keyboard shortcut hint
-function JogKey({ label, hint, onClick, disabled }) {
+function JogKey({ label, hint, onClick, disabled, size = 64 }) {
   const { INK, INK_SOFT, PAPER, PAPER_2, HATCH } = window;
   const style = {
-    width: 64, height: 64,
+    // 幅は size 以上で文字に合わせて広がる（「−0.01」が 48px に収まらない）。列の中では一番広いボタンにそろう
+    minWidth: size, height: size, padding: '0 4px', boxSizing: 'border-box',
     display: 'flex', flexDirection: 'column',
     alignItems: 'center', justifyContent: 'center',
     border: `2px solid ${INK}`,
@@ -226,7 +227,8 @@ function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullP
 
 // ── useJogKeys ────────────────────────────────────────────
 // キャリブレーション・手動運転共通のキー操作。
-//   d / s = +10 / −10、e / w = +100 / −100、Tab = 軸切替、Enter = onEnter(axis)（任意）
+//   キーボードの上の段ほど小さい量（ボタンの並びと同じ。左手の左列が −・右列が +）:
+//   3 / 2 = +1 / −1 pulse（0.01%）、e / w = ±10（0.1%）、d / s = ±100（1%）、c / x = ±1000（10%）、Tab = 軸切替、Enter = onEnter(axis)（任意）
 // 入力欄（input/textarea/select）と修飾キー付きは無視。応答待ちの間のキーリピートは捨てる。
 // enabled が false の間は何もしない。onJog(axisId, step) / onEnter(axisId) は Promise を返せる。
 function useJogKeys({ enabled, selectedAxis, setSelectedAxis, onJog, onEnter }) {
@@ -248,7 +250,7 @@ function useJogKeys({ enabled, selectedAxis, setSelectedAxis, onJog, onEnter }) 
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       const axis = st.selectedAxis;
-      const steps = { d: 10, s: -10, e: 100, w: -100 };
+      const steps = { 3: 1, 2: -1, e: 10, w: -10, d: 100, s: -100, c: 1000, x: -1000 };
       const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
       if (k in steps) {
         e.preventDefault();
@@ -285,21 +287,28 @@ function AxisPanel({ label, axisId, selected, enabled = true, onSelect, children
 }
 
 // ── JogRow ────────────────────────────────────────────────
-// −10/−100 ボタン + ドラッグスライダー + +10/+100 ボタン（ヒント文字 s/w/d/e つき）
-// labels を渡すと、ボタンの表示を換えられる（動く量は steps のまま。既定は pulse 表示）。
+// −1/−10/−100/−1000 ボタン（左列）+ ドラッグスライダー + +1/+10/+100/+1000 ボタン（右列）。小さい量が上。
+// ヒント文字は 2/w/s/x（−）と 3/e/d/c（+）＝キーボードの上の段から。4 段になるので JogKey は 48px。
+// 表示はキャリブレーション・手動運転とも開度 %（キリの良い値。実際は 9500 pulse = 100% なので 10 は 10.53%）。
 // displayValue / unit / minPos はスライダーの中央表示と min の印（キャリブレーション画面用）。
-function JogRow({ axisId, currentPos, onJog, zeroPos, fullPos, disabled, labels = ['10', '100'], displayValue, unit, minPos, maxPos }) {
+const JOG_STEPS = [1, 10, 100, 1000];
+const JOG_HINTS_NEG = ['2', 'w', 's', 'x'];
+const JOG_HINTS_POS = ['3', 'e', 'd', 'c'];
+function JogRow({ axisId, currentPos, onJog, zeroPos, fullPos, disabled, labels = ['0.01', '0.1', '1', '10'], displayValue, unit, minPos, maxPos }) {
+  const col = { display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 6 };
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 8 }}>
-      <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-        <JogKey label={`−${labels[0]}`}  hint="s" onClick={() => onJog(axisId, -10)} disabled={disabled} />
-        <JogKey label={`−${labels[1]}`} hint="w" onClick={() => onJog(axisId, -100)} disabled={disabled} />
+      <div style={col}>
+        {JOG_STEPS.map((st, i) => (
+          <JogKey key={st} size={48} label={`−${labels[i]}`} hint={JOG_HINTS_NEG[i]} onClick={() => onJog(axisId, -st)} disabled={disabled} />
+        ))}
       </div>
       <DragSlider currentPos={currentPos} axisId={axisId} onJog={onJog} zeroPos={zeroPos} fullPos={fullPos} disabled={disabled}
                   displayValue={displayValue} unit={unit} minPos={minPos} maxPos={maxPos} />
-      <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-        <JogKey label={`+${labels[0]}`}  hint="d" onClick={() => onJog(axisId, 10)} disabled={disabled} />
-        <JogKey label={`+${labels[1]}`} hint="e" onClick={() => onJog(axisId, 100)} disabled={disabled} />
+      <div style={col}>
+        {JOG_STEPS.map((st, i) => (
+          <JogKey key={st} size={48} label={`+${labels[i]}`} hint={JOG_HINTS_POS[i]} onClick={() => onJog(axisId, st)} disabled={disabled} />
+        ))}
       </div>
     </div>
   );
