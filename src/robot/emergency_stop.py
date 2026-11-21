@@ -45,7 +45,7 @@ from src.robot.core.mode_drive import standby_openings
 from src.robot.core.pre_drive_check import DIRECT_PRESS_SPEED_MM_S
 from src.robot.core.stop_decel import decelerate_to_stop, step_to_position
 from src.robot.core.term import say
-from src.robot.core.vehicle import build_vehicle_profile, opening_to_pulse
+from src.robot.core.vehicle import build_vehicle_profile, opening_to_pulse, pulse_to_opening
 
 CAN_LOST_PRESS_DEFAULT_S = 20.0
 START_PRESS_DEFAULT_S = 10.0
@@ -365,8 +365,8 @@ async def _n_loop(hw: Any, cfg: Any) -> None:
         except Exception:  # noqa: BLE001
             current = 0
         target = max(level, current)  # 今より浅くはしない（まだ動いているかもしれない）
-        _emit("n_press", f"{i}/{len(levels)} 回目: ブレーキ {target} pulse で N")
-        say(f"N の確認 {i}/{len(levels)}: ブレーキを {target} pulse（{target / 100.0:.1f}mm）まで踏んで N を押します")
+        _emit("n_press", f"{i}/{len(levels)} 回目: ブレーキ {pulse_to_opening(target):.1f}% で N")
+        say(f"N の確認 {i}/{len(levels)}: ブレーキを {pulse_to_opening(target):.1f}%（{target / 100.0:.1f}mm）まで踏んで N を押します")
         press_failed = False
         try:
             await _move_brake(hw, target)
@@ -460,7 +460,7 @@ async def _can_lost_flow(hw: Any, cfg: Any, *, accel_done: bool) -> None:
     seconds = max(0.0, _can_lost_press_s * max(0, max_pulse - current) / span)
     n_steps = max(1, math.ceil(seconds / CAN_LOST_STEP_DWELL_S))
     step_pulse = max(1, math.ceil(max(0, max_pulse - current) / n_steps))
-    say(f"  ブレーキ {current} → {max_pulse} pulse を約 {seconds:.1f}s かけて踏みます")
+    say(f"  ブレーキ {pulse_to_opening(current):.1f} → {pulse_to_opening(max_pulse):.1f}% を約 {seconds:.1f}s かけて踏みます")
     await _try(
         step_to_position(hw.brake, current, max_pulse, step_pulse=step_pulse, dwell_s=CAN_LOST_STEP_DWELL_S),
         "ブレーキを刻んで踏む",
