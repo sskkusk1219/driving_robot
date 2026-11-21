@@ -122,7 +122,7 @@ function OpeningBar({ value = 0, color = '#ddd4c4', label = '' }) {
 // ── DragSlider ────────────────────────────────────────────
 // Horizontal drag slider (left=decrease, right=increase).
 // Optional zeroPos / fullPos show calibration markers.
-function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullPos, disabled, displayValue, unit = 'pulse', minPos, maxPos }) {
+function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullPos, disabled, displayValue, unit = '% (開度)', minPos, maxPos }) {
   const { useRef } = React;
   const { INK, INK_SOFT, PAPER, HATCH } = window;
 
@@ -214,13 +214,13 @@ function DragSlider({ currentPos, maxPulse = 9500, axisId, onJog, zeroPos, fullP
 
       {/* Current value */}
       <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2, pointerEvents: 'none' }}>
-        <div style={{ fontSize: 26, fontFamily: 'inherit', fontWeight: 700, lineHeight: 1 }}>{displayValue ?? currentPos ?? '—'}</div>
+        <div style={{ fontSize: 26, fontFamily: 'inherit', fontWeight: 700, lineHeight: 1 }}>{displayValue ?? (currentPos == null ? '—' : (currentPos / maxPulse * 100).toFixed(2))}</div>
         <div style={{ fontSize: 10, color: INK_SOFT }}>{unit}</div>
       </div>
 
       {/* Scale labels */}
-      <div style={{ position: 'absolute', top: 4, left: 6, fontSize: 12, color: INK_SOFT, pointerEvents: 'none' }}>0</div>
-      <div style={{ position: 'absolute', top: 4, right: 6, fontSize: 12, color: INK_SOFT, pointerEvents: 'none' }}>{maxPulse}</div>
+      <div style={{ position: 'absolute', top: 4, left: 6, fontSize: 12, color: INK_SOFT, pointerEvents: 'none' }}>0 %</div>
+      <div style={{ position: 'absolute', top: 4, right: 6, fontSize: 12, color: INK_SOFT, pointerEvents: 'none' }}>100 %</div>
     </div>
   );
 }
