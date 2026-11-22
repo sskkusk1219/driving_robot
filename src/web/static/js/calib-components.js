@@ -245,6 +245,7 @@ function useJogKeys({ enabled, selectedAxis, setSelectedAxis, onJog, onEnter }) 
     }
     function onKeyDown(e) {
       const st = latest.current;
+      if (window.__drvViewer) return; // 閲覧中のウィンドウはキー操作でジョグしない
       if (!st.enabled) return;
       const tag = (e.target && e.target.tagName) || '';
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;

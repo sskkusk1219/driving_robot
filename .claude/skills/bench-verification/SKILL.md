@@ -65,7 +65,13 @@ FastAPI アプリ（WebUI）を安全に起動して動作確認するスキル�
    （DB なし・車両は既定のままなら環境変数なしでよい）
 3. **疎通確認**: `curl -s http://localhost:8081/api/v1/drive/status`
    （`/` は 307 → `/static/index.html`）
-4. 走行系の確認（スタブ）: `POST /api/v1/drive/select-profile {"profile_id":"<車ID>"}` → `POST /drive/initialize`（手順 1。**これが済むまで学習・モード走行は 409。`GET /drive/status` の `initialized` が true になる**）→
+4. **変更系の API（GET 以外）は「操作」のウィンドウからしか通らない**（2026-11-22 操作権。`src/web/control.py`）。
+   curl の POST は 403「閲覧用のウィンドウでは操作できません」になる。Playwright で画面を開いて「操作」を選び、
+   そのページで `fetch(path, {method:'POST', headers:{...window.drvControlHeaders(), 'Content-Type':'application/json'}, body})` で叩く。
+   - 操作権は 1 つだけ。**ユーザーが別の画面で「操作」を持っていると Claude は操作できない**（奪い取りはない）→ 止めてユーザーに頼む。
+   - 操作のタブを閉じてから約 10 s は操作権が空かない（読み直しを待つ）。2 タブ目は `isolatedContext` を分けると別のウィンドウになる。
+   - GET（状態・ログ・CSV）は curl のままでよい。
+   走行系の確認（スタブ）: `POST /api/v1/drive/select-profile {"profile_id":"<車ID>"}` → `POST /drive/initialize`（手順 1。**これが済むまで学習・モード走行は 409。`GET /drive/status` の `initialized` が true になる**）→
    `POST /drive/start {"mode_id":"…","limit_s":60}`（モード走行・手順 24,25）→ `GET /drive/status` の `job`/`last_job` を見る
    （`exit_code` 0・`result.meaning` 成功）。スケジュールは `POST /drive/schedule/start {"schedule_id":"…"}`。
    スタブの車は応答が実車と別物（制御ゲインの判断には使えない）。流れの確認だけに使う。

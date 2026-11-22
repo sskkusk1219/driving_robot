@@ -1,5 +1,6 @@
 # ruff: noqa: E501
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -64,13 +65,30 @@ manager = ConnectionManager()
 
 
 async def realtime_ws(ws: WebSocket) -> None:
+    """リアルタイム配信。クエリの client_id / instance_id で操作権の持ち主と結び付ける（無ければ閲覧のみ）。
+
+    接続直後に {"type":"control","role":"operator|duplicate|viewer"} を 1 通送る
+    （配信本体のメッセージには "type" が無い）。クライアントは 2 s ごとに "ping" を送る。
+    """
     await manager.connect(ws)
+    lock = getattr(ws.app.state, "control", None)
+    client_id = ws.query_params.get("client_id")
+    instance_id = ws.query_params.get("instance_id")
+    role = "viewer"
+    if lock is not None and client_id and instance_id:
+        role = lock.on_connect(client_id, instance_id, ws)
     try:
+        await ws.send_text(json.dumps({"type": "control", "role": role}))
         while True:
-            await ws.receive_text()
+            msg = await ws.receive_text()
+            if lock is not None and msg == "ping":
+                lock.on_ping(ws)
     except Exception as exc:
         logger.debug("WebSocket接続終了: %s", exc)
+    finally:
         manager.disconnect(ws)
+        if lock is not None:
+            lock.on_disconnect(ws)
 
 
 async def broadcast_loop(app: Starlette) -> None:
@@ -86,6 +104,9 @@ async def broadcast_loop(app: Starlette) -> None:
     last_payload: tuple[object, ...] | None = None
     while True:
         await asyncio.sleep(WS_BROADCAST_INTERVAL_S)
+        control = getattr(app.state, "control", None)
+        if control is not None:
+            control.tick()  # 接続が無くても期限切れで操作権を空ける
         if not manager.has_connections:
             continue
         jobs = app.state.job_manager
@@ -112,6 +133,8 @@ async def broadcast_loop(app: Starlette) -> None:
 
         job_schema = JobSnapshotSchema.model_validate(job) if job else None
 
+        control_held = control.held if control is not None else False
+
         # timestamp・経過秒を除いた内容で変化検知する（送信スキップ判定専用。実送信は下の RealtimeData）。
         prepare = snap.get("prepare")
         payload = (
@@ -129,6 +152,7 @@ async def broadcast_loop(app: Starlette) -> None:
             snap["initialized"],
             (prepare["id"], prepare["state"], prepare["done"], prepare["message"]) if prepare else None,
             snap.get("emergency_cause"),
+            control_held,
         )
         if payload == last_payload and not manager.needs_full_send:
             continue
@@ -154,5 +178,6 @@ async def broadcast_loop(app: Starlette) -> None:
             prepare=prepare,
             emergency_cause=snap.get("emergency_cause"),
             emergency_cause_detail=snap.get("emergency_cause_detail"),
+            control_held=control_held,
         )
         await manager.broadcast(data.model_dump_json())

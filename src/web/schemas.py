@@ -217,6 +217,8 @@ class RealtimeData(BaseModel):
     # 非常停止のきっかけ（screen / switch / ac_loss / auto。非常停止中だけ）
     emergency_cause: str | None = None
     emergency_cause_detail: str | None = None  # auto のときのランナーの理由
+    # 操作権を誰かが持っているか（操作ウィンドウの選択画面で「使用中」を出すため）
+    control_held: bool = False
 
 
 # ── Vehicle Profile ───────────────────────────────────────────────────────────

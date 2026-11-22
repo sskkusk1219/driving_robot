@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -35,6 +36,8 @@ from src.infra.vehicle_store import (
     VehicleStore,
     VehicleStoreError,
 )
+from src.web.control import ControlLock
+from src.web.routers import control as control_router
 from src.web.routers import drive, errors, modes, profiles, schedules, sequences, sessions, ups
 from src.web.ws import broadcast_loop, realtime_ws
 
@@ -102,6 +105,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     src_logger.addHandler(log_buffer)
     src_logger.setLevel(logging.INFO)
     app.state.log_buffer = log_buffer
+
+    app.state.control = ControlLock()
 
     recorder = await _build_repos(app)
 
@@ -227,6 +232,7 @@ async def _duplicate_name_error_handler(request: Request, exc: DuplicateNameErro
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
+app.include_router(control_router.router)
 app.include_router(drive.router)
 app.include_router(errors.router)
 app.include_router(profiles.router)
@@ -251,7 +257,39 @@ class _NoCacheStaticMiddleware(BaseHTTPMiddleware):
         return response
 
 
+
+
+#: 閲覧ウィンドウにも通す変更系の経路（エラーの報告・確認。削除は確認ではないので含めない）
+_VIEWER_ALLOWED_POST = (
+    "/api/v1/errors/client",
+    "/api/v1/errors/acknowledge-all",
+)
+_VIEWER_ALLOWED_POST_RE = re.compile(r"^/api/v1/errors/[^/]+/(acknowledge|unacknowledge)$")
+
+
+class _ControlLockMiddleware(BaseHTTPMiddleware):
+    """/api/v1/ への GET 以外は、操作権の持ち主のウィンドウ（X-Client-Id / X-Instance-Id）だけ通す。
+
+    app.state.control が無いアプリ（lifespan を通さない単体テスト）では素通りにする。
+    """
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        path = request.url.path
+        lock = getattr(request.app.state, "control", None)
+        if (
+            lock is not None
+            and path.startswith("/api/v1/")
+            and request.method not in ("GET", "HEAD", "OPTIONS")
+            and not path.startswith("/api/v1/control")
+            and not (request.method == "POST" and (path in _VIEWER_ALLOWED_POST or _VIEWER_ALLOWED_POST_RE.match(path)))
+            and not lock.is_operator(request.headers.get("X-Client-Id"), request.headers.get("X-Instance-Id"))
+        ):
+            return JSONResponse(status_code=403, content={"detail": "閲覧用のウィンドウでは操作できません"})
+        return await call_next(request)
+
+
 app.add_middleware(_NoCacheStaticMiddleware)
+app.add_middleware(_ControlLockMiddleware)
 
 _static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")

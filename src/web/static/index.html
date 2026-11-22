@@ -51,6 +51,9 @@
       color: #54bc54;
       border: 1.5px solid #2a6c2a;
     }
+    /* 閲覧中のウィンドウ: 本文（ナビ以外）は見るだけ。ログ・エラー画面には付けない */
+    .drv-viewer-lock { opacity: 0.6; }
+    .drv-viewer-lock button, .drv-viewer-lock input, .drv-viewer-lock select, .drv-viewer-lock textarea { pointer-events: none; }
     @keyframes slideIn {
       from { opacity: 0; transform: translateX(20px); }
       to   { opacity: 1; transform: translateX(0); }

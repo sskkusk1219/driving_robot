@@ -32,7 +32,8 @@ function errFmt(t) { return t ? new Date(t).toLocaleString('ja-JP') : ''; }
 
 function ErrorsScreen() {
   const { useState, useEffect, useContext } = React;
-  const { apiFetch, setNav } = useContext(window.AppContext);
+  const { apiFetch, setNav, controlRole } = useContext(window.AppContext);
+  const isViewer = controlRole === 'viewer'; // 閲覧中はエラーの削除を押せない
   const { Btn, Note, ConfirmStopPopup, INK, PAPER_2, HATCH } = window;
 
   const [items, setItems] = useState(null);          // null = 読み込み中
@@ -89,7 +90,7 @@ function ErrorsScreen() {
         </div>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', flexShrink: 0 }}>
           <Btn onClick={acknowledgeAll}>すべて確認済みにする</Btn>
-          <Btn danger onClick={() => setConfirm({ message: '確認済みのエラーをすべて削除しますか？', onYes: deleteAcknowledged })}>確認済みを削除</Btn>
+          <Btn danger disabled={isViewer} onClick={() => setConfirm({ message: '確認済みのエラーをすべて削除しますか？', onYes: deleteAcknowledged })}>確認済みを削除</Btn>
         </div>
         {items === null
           ? <div style={{ fontSize: 13, color: '#888' }}>読み込み中…</div>
@@ -129,7 +130,8 @@ function ErrorsScreen() {
 
 function ErrorDetail({ eventId, setConfirm, onChanged, onDeleted, onOpenSession }) {
   const { useState, useEffect, useContext } = React;
-  const { apiFetch } = useContext(window.AppContext);
+  const { apiFetch, controlRole } = useContext(window.AppContext);
+  const isViewer = controlRole === 'viewer';
   const { Btn, INK, INK_SOFT, INK_MUTE, HATCH, PAPER } = window;
   const [e, setE] = useState(null);   // null = 読み込み中
 
@@ -174,7 +176,7 @@ function ErrorDetail({ eventId, setConfirm, onChanged, onDeleted, onOpenSession 
         </div>
         <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
           <Btn onClick={toggleAck}>{e.acknowledged_at ? '確認済みを戻す' : '確認済みにする'}</Btn>
-          <Btn danger onClick={() => setConfirm({ message: 'このエラーを削除しますか？', onYes: remove })}>削除</Btn>
+          <Btn danger disabled={isViewer} onClick={() => setConfirm({ message: 'このエラーを削除しますか？', onYes: remove })}>削除</Btn>
           {e.session_id && <Btn onClick={() => onOpenSession(e.session_id)}>このセッションのログを開く</Btn>}
         </div>
       </div>
