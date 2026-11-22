@@ -8,7 +8,7 @@
 const LEARNING_LABEL = '学習運転';
 
 function LearningScreen() {
-  const { useState, useEffect, useContext } = React;
+  const { useState, useEffect, useContext, useRef } = React;
   const { apiFetch, activeProfileId, setNav, realtimeData } = useContext(window.AppContext);
   const { ValidationPopup, Btn, Pill, INK, INK_SOFT, INK_MUTE, HATCH } = window;
 
@@ -42,7 +42,14 @@ function LearningScreen() {
   const stageJob = learningRunning ? liveJob : (showLast ? lastJob : null);
   // 段階表示の種類: 過去の部分学習のジョブは steps から読み分ける（新しく始めるのは full だけ）
   const stageKind = stageJob ? window.learningKindOf(stageJob) : 'full';
-  const stage = window.deriveStages(stageKind, stageJob, lines);
+  const rawStage = window.deriveStages(stageKind, stageJob, lines);
+  // 段は戻さない: 進行のメッセージは 500 行で流れる・画面を途中で開くと無いので、ジョブごとに今までの最大を覚える
+  // （チェック NG＝終了コード 8 のときは deriveStages が合わせた check をそのまま使う）
+  const maxStageRef = useRef({ jobId: null, current: -1 });
+  if (maxStageRef.current.jobId !== (stageJob?.job_id ?? null)) maxStageRef.current = { jobId: stageJob?.job_id ?? null, current: -1 };
+  const ngCheck = rawStage.state === 'ng' && (stageJob?.exit_code ?? stageJob?.result?.exit_code) === 8;
+  if (!ngCheck) maxStageRef.current.current = Math.max(maxStageRef.current.current, rawStage.current);
+  const stage = ngCheck ? rawStage : { ...rawStage, current: Math.max(rawStage.current, maxStageRef.current.current) };
 
   const resultPanel = (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
@@ -50,8 +57,9 @@ function LearningScreen() {
       {learningRunning && (
         <div style={{ fontSize: 12, color: INK_SOFT }}>
           {window.PHASE_LABEL?.[liveJob.phase] ?? liveJob.phase}
-          {liveJob.sample?.section ? `　（${window.SECTION_LABEL?.[liveJob.sample.section] ?? liveJob.sample.section}）` : ''}
-          {liveJob.step_title && liveJob.phase === 'step' ? `　${liveJob.step_title}` : ''}
+          {liveJob.sample?.section ? `　（${stage.defs[stage.current]?.label ?? window.SECTION_LABEL?.[liveJob.sample.section] ?? liveJob.sample.section}）` : ''}
+          {liveJob.step_title && liveJob.phase === 'step'
+            ? `　${liveJob.step === 2 ? 'ペダル探索 → パターン走行 → 順モデル作成' : liveJob.step_title}` : ''}
         </div>
       )}
       {showLast && (
