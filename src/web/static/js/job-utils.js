@@ -3,7 +3,7 @@
 // ・EXIT_CODE_INFO / describeJobResult: ランナーの終了コードの意味（src/robot/README.md の表）
 // ・useDriveLogLines: GET /api/v1/drive/log（進行のメッセージ）を 1 秒ごとに取る
 // ・useLastJob: 実行中のジョブが終わったあとの最後のジョブ（GET /api/v1/drive/status の last_job）
-// ・deriveStages / StageRail: 学習運転の段階表示（手順2 の段階）
+// ・deriveStages / StageRail: 学習運転の段階表示（手順2: ペダル探索・低速の保持・停止手前・コーストダウン・G ランプ・遅れの測定・モデル作成・チェック）
 // ・JobResultBanner: 終わったジョブの結果（終了コードの意味・理由・次の操作）
 
 // ── API エラー → 「何が起きたか」「次にすること」 ───────────────────────────
@@ -265,9 +265,10 @@ function useLastJob(liveJob) {
 window.useLastJob = useLastJob;
 
 // ── 学習運転の段階表示 ───────────────────────────────────────────
-// 手順2（full）の段階: 準備 → ペダル探索(2-0) → G ランプ走行(2-1) → モデル作成(2-2) → 学習結果チェック → 補正表(2-3)
-// ジョブの phase・step と、走行ログの section（PEDAL_SEARCH など）から決める。モデル作成・チェックは
-// 走行ログの行が無いので、進行のメッセージ（"2-2." の行・チェック表の見出し・"2-3." の行）で見分ける。
+// 手順2（full）の段階: 準備 → ペダル探索(2-0) → 低速の保持(4 点) → 停止手前の測定 → コーストダウン → G ランプ走行 → 遅れの測定(2-1) → モデル作成(2-2) → 学習結果チェック
+// ジョブの phase・step と、走行ログの section（PEDAL_SEARCH など）・phase（LOW_HOLD・HOLD_STEP）・pattern（COAST_DOWN）から決める。
+// 停止手前・遅れの測定・G ランプは pattern が同じ G_RAMP なので、パターン開始のメッセージ（"── パターン n/N: …"）でも見分ける。
+// モデル作成・チェックは走行ログの行が無いので、進行のメッセージ（"2-2." の行・チェック表の見出し）で見分ける。
 const SECTION_LABEL = {
   PRE_DRIVE_CHECK: '走行前チェック',
   PEDAL_SEARCH: 'ペダル探索',
@@ -310,10 +311,13 @@ const LEARNING_STAGES = {
   full: [
     ...LEARNING_HEAD,
     { key: 'pedal', label: 'ペダル探索',     hint: '2-0 クリープ車速・停車保持の開度', sections: ['PEDAL_SEARCH'], marker: /2-0\./ },
-    { key: 'ramp',  label: 'G ランプ走行',   hint: '2-1 コーストダウン・G ランプ', sections: ['PATTERN_DRIVE'], marker: /2-1\./ },
-    { key: 'model', label: 'モデル作成',     hint: '2-2 物理定数の推定・FF モデル', sections: [], marker: /2-2\./ },
+    { key: 'hold',     label: '低速の保持（4 点）', hint: '2-0 クリープより下の 4 点の車速を保つ', sections: [], phases: ['LOW_HOLD'], marker: /4 点の保持:/ },
+    { key: 'approach', label: '停止手前の測定',   hint: '2-1 一定 G で停車まで下りる', sections: ['PATTERN_DRIVE'], marker: /── パターン \d+\/\d+: 停止の手前の測定/ },
+    { key: 'coast',    label: 'コーストダウン',   hint: '2-1 加速して惰行で減速', sections: [], patternRe: /COAST_DOWN/, marker: /── パターン \d+\/\d+: COAST_DOWN/ },
+    { key: 'ramp',     label: 'G ランプ走行',     hint: '2-1 狙いの G で加速・減速', sections: [], marker: /── パターン \d+\/\d+: G ランプ/ },
+    { key: 'lag',      label: '遅れの測定',       hint: '2-1 定速から開度をステップ → 緩減速で停車', sections: ['DECEL_TO_STOP'], phases: ['HOLD_STEP'], marker: /── パターン \d+\/\d+: 遅れの測定/ },
+    { key: 'model', label: 'モデル作成',     hint: '2-2 物理定数の推定・FF モデル（順モデル）', sections: [], marker: /2-2\./ },
     { key: 'check', label: '学習結果チェック', hint: '2-2 のチェック（NG なら yaml を書かない）', sections: [], marker: /id \| 名前 \| 判定|学習結果のチェック/ },
-    { key: 'fel',   label: '補正表の学習',   hint: '2-3 学習用パターン（設定で省略あり）', sections: ['FEL_DRIVE'], marker: /2-3\./ },
     ...LEARNING_TAIL,
   ],
   fel: [
@@ -358,7 +362,14 @@ function deriveStages(kind, job, lines) {
   if (job.phase === 'pre_check') bump('chk');
   if (job.phase === 'ready' || job.phase === 'd') bump('rd');
   const secIdx = sec ? defs.findIndex(d => d.sections.includes(sec)) : -1;
-  if (secIdx >= 0 && (job.step === 2 || (job.step >= 12 && job.step <= 14))) idx = Math.max(idx, secIdx);
+  const phs = job.sample?.phase ?? null;
+  const pat = job.sample?.pattern ?? null;
+  const phIdx = phs ? defs.findIndex(d => d.phases?.includes(phs)) : -1;
+  const patIdx = pat ? defs.findIndex(d => d.patternRe?.test(pat)) : -1;
+  if (job.step === 2 || (job.step >= 12 && job.step <= 14)) {
+    // 段は進むだけで戻らない（section・phase・pattern のどれか進んだ方）
+    idx = Math.max(idx, secIdx, phIdx, patIdx);
+  }
   if (job.phase === 'n') bump('n');
   if (job.step === 25) bump('off');
   // 進行のメッセージ（このジョブの分だけ）
