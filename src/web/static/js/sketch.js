@@ -115,7 +115,7 @@ function StateBadge({ state }) {
 }
 
 // ── TopBar ───────────────────────────────────────────────────
-function TopBar({ state, screen, upsLoss, upsInstalled = true, profileName, modeName, modeLabel = 'mode' }) {
+function TopBar({ state, screen, upsLoss, upsInstalled = true, profileName, modeName, modeLabel = 'mode', viewer = false }) {
   const tint = STATE_TINT[state] || STATE_TINT.READY;
   const showUpsLoss = upsLoss || state === 'AC_LOSS';
   return (
@@ -129,6 +129,11 @@ function TopBar({ state, screen, upsLoss, upsInstalled = true, profileName, mode
       <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: 1, color: INK }}><span style={{ fontSize: 12 }}>ﾈﾝ0系</span> あま</div>
       <div style={{ width: 1, height: 20, background: HATCH }} />
       <div style={{ fontSize: 15, color: INK_SOFT }}>{screen}</div>
+      {viewer && (
+        <div style={{
+          fontSize: 12, color: INK_SOFT, border: `1px solid ${HATCH}`, borderRadius: 10, padding: '1px 8px',
+        }}>閲覧中</div>
+      )}
       <div style={{ flex: 1 }} />
       <div style={{ fontSize: 15, color: INK_SOFT }}>profile: <b>{profileName || '---'}</b></div>
       <div style={{ fontSize: 15, color: INK_SOFT }}>{modeName ? modeLabel : 'mode'}: <b>{modeName || '---'}</b></div>
@@ -172,8 +177,24 @@ function Sidebar({ active, onNav, locked }) {
 }
 
 // ── Frame ────────────────────────────────────────────────────
+// 閲覧中の本文: 押す・入力する操作だけを捕まえて止める（pointer-events:none だとスクロールまで止まるため）
+const _viewerBlock = (e) => { e.preventDefault(); e.stopPropagation(); };
+const _viewerStop = (e) => { e.stopPropagation(); };
+const VIEWER_BLOCK_HANDLERS = {
+  onClickCapture: _viewerBlock,
+  onDoubleClickCapture: _viewerBlock,
+  onMouseDownCapture: _viewerBlock,
+  onPointerDownCapture: _viewerBlock,
+  onTouchStartCapture: _viewerStop, // preventDefault すると指でのスクロールが止まる
+  onKeyDownCapture: _viewerBlock,
+  onChangeCapture: _viewerBlock,
+  onInputCapture: _viewerBlock,
+  onPasteCapture: _viewerBlock,
+  onDropCapture: _viewerBlock,
+};
+
 function Frame({ children, state = 'READY', screen = '', activeNav = '',
-                 upsLoss = false, upsInstalled = true, locked = false, profileName, modeName, modeLabel, onNav, onGoInit }) {
+                 upsLoss = false, upsInstalled = true, locked = false, profileName, modeName, modeLabel, onNav, onGoInit, viewer = false, viewerLock = false }) {
   return (
     <div style={{
       width: '100%', height: '100%',
@@ -187,9 +208,9 @@ function Frame({ children, state = 'READY', screen = '', activeNav = '',
       overflow: 'hidden',
     }}>
       <TopBar state={state} screen={screen} upsLoss={upsLoss} upsInstalled={upsInstalled}
-              profileName={profileName} modeName={modeName} modeLabel={modeLabel} />
+              profileName={profileName} modeName={modeName} modeLabel={modeLabel} viewer={viewer} />
       <Sidebar active={activeNav} onNav={onNav || (() => {})} locked={locked} />
-      <div style={{ padding: '12px 20px 14px', minHeight: 0, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <div className={viewerLock ? 'drv-viewer-lock' : undefined} {...(viewerLock ? VIEWER_BLOCK_HANDLERS : {})} style={{ padding: '12px 20px 14px', minHeight: 0, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         {children}
       </div>
       {/* 非常停止中は app.js が EmergencyResetScreen（停止シーケンスの記録・解除ボタン）を出す。上に重ねていたオーバーレイは外した（解除ボタンが画面の下に隠れていたため） */}

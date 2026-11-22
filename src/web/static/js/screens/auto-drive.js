@@ -143,8 +143,8 @@ function DriveMonitorScreen({
 
   // 画面を離れるとき、準備中・ポップアップが開いたまま（未回答）なら準備を取り消す（ベストエフォート）
   useEffect(() => () => {
-    if (prepOwnedRef.current) {
-      try { fetch('/api/v1/drive/prepare/cancel', { method: 'POST', keepalive: true }); } catch (e) { /* 無視 */ }
+    if (prepOwnedRef.current && !window.__drvViewer) {
+      try { fetch('/api/v1/drive/prepare/cancel', { method: 'POST', keepalive: true, headers: window.drvControlHeaders() }); } catch (e) { /* 無視 */ }
     }
   }, []);
 

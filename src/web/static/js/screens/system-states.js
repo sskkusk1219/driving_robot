@@ -262,7 +262,25 @@ function EmergencyResetScreen() {
   );
 }
 
+// ── 操作権の選択（起動直後・読み直し後に出す）─────────────────
+// 操作は 1 ウィンドウだけ。使用中なら「操作」は押せない。閲覧はいくつでも
+function ControlChooserScreen({ held, onOperate, onView }) {
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 28 }}>
+      <div style={{ textAlign: 'center' }}>
+        <div style={{ fontSize: 40, fontWeight: 800, letterSpacing: 1 }}><span style={{ fontSize: 22 }}>ﾈﾝ0系</span> あま</div>
+      </div>
+      <div style={{ display: 'flex', gap: 24, alignItems: 'center' }}>
+        <Btn primary big disabled={held} onClick={onOperate}>操作</Btn>
+        <Btn big onClick={onView}>閲覧</Btn>
+      </div>
+      {held && <div style={{ fontSize: 16, color: INK_SOFT }}>使用中</div>}
+    </div>
+  );
+}
+
 Object.assign(window, {
+  ControlChooserScreen,
   BootingScreen,
   ErrorScreen,
   AcPowerLossScreen,
