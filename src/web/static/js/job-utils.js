@@ -172,6 +172,10 @@ function JobResultBanner({ job, onRetry, onDismiss, onLogs, compact = false }) {
   const { INK, INK_SOFT, INK_MUTE, Btn } = window;
   const r = describeJobResult(job);
   if (!r) return null;
+  // 自分で止めたとき（非常停止ではなく、終了コード 130・143 または stop_requested）は帯を出さない。IgnOffNotice は出す
+  const code = job.exit_code ?? job.result?.exit_code ?? null;
+  const userStopped = !job.emergency && (code === 130 || code === 143 || job.stop_requested);
+  if (userStopped) return <IgnOffNotice job={job} compact={compact} />;
   const t = LEVEL_TINT[r.level] ?? LEVEL_TINT.ng;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -298,6 +302,22 @@ const EMERGENCY_STAGE_LABEL = {
   error: '流れが途中で失敗しました（終了処理へ進みます）',
 };
 window.EMERGENCY_STAGE_LABEL = EMERGENCY_STAGE_LABEL;
+
+// 状態の短い文（phase → 1 語。長い説明は PHASE_LABEL）
+const PHASE_SHORT = {
+  starting: '起動中', init: '初期化中', prepare: '準備中', pre_check: '走行前チェック中', step: '走行中',
+  step_end: '手順終了', shutdown: '終了処理中', ready: 'Ready にしています', d: 'D に入れています',
+  n: 'N に入れています', done: '完了', interactive: 'コマンド待ち',
+};
+window.PHASE_SHORT = PHASE_SHORT;
+
+// 中断（stop_requested）後の停止の流れ。本当の非常停止（stop_requested でない）は今までどおり
+function jobStoppingText(job) {
+  if (!(job && job.phase === 'emergency' && job.stop_requested)) return null;
+  return '停止中';
+}
+window.jobPhaseShort = job => jobStoppingText(job) ?? (PHASE_SHORT[job?.phase] ?? job?.phase);
+window.jobPhaseLabel = job => jobStoppingText(job) ?? (PHASE_LABEL[job?.phase] ?? job?.phase);
 
 const STG_CHK  = { key: 'chk',   label: '走行前チェック', hint: '通信・車速 0・ブレーキ停止の確認', sections: ['PRE_DRIVE_CHECK'] };
 const STG_RD   = { key: 'rd',    label: 'Ready・D',       hint: 'ブレーキを踏んでスタート短押し → D', sections: [], marker: /\[学習\] Ready のため/ };

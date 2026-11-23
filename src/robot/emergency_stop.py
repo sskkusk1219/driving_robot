@@ -46,6 +46,7 @@ from src.robot.core.pre_drive_check import DIRECT_PRESS_SPEED_MM_S
 from src.robot.core.stop_decel import decelerate_to_stop, step_to_position
 from src.robot.core.term import say
 from src.robot.core.vehicle import build_vehicle_profile, opening_to_pulse, pulse_to_opening
+from src.robot.streaming_log import SAMPLE_INTERVAL_S
 
 CAN_LOST_PRESS_DEFAULT_S = 20.0
 START_PRESS_DEFAULT_S = 10.0
@@ -247,8 +248,49 @@ async def wait_if_running() -> None:
         await asyncio.shield(_task)
 
 
+def _commanded_opening(axis: Any, previous: float) -> float:
+    """軸の直近の指令位置 [pulse] → 開度 [%]。バスは使わない。分からなければ前回値。"""
+    # 実機のドライバは _last_commanded_pos、スタブの軸は last_command_pos
+    pos = getattr(axis, "_last_commanded_pos", None)
+    if pos is None:
+        pos = getattr(axis, "last_command_pos", None)
+    if isinstance(pos, int | float) and not isinstance(pos, bool):
+        return round(pulse_to_opening(int(pos)), 3)
+    return previous
+
+
+async def _stream_samples(hw: Any) -> None:
+    """流れの間、制御ループの代わりに sample イベント（車速・指令開度）を出し続ける（画面のグラフ用。2026-11-23）。
+
+    車速は CAN から読む（読めない回は出さない。CAN 断は流れの側が扱う）。開度は直近の指令位置（Modbus は読まない）。
+    """
+    accel_pct = brake_pct = 0.0
+    while True:
+        try:
+            speed = float(await hw.can.read_speed())
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            speed = None
+        if speed is not None:
+            accel_pct = _commanded_opening(getattr(hw, "accel", None), accel_pct)
+            brake_pct = _commanded_opening(getattr(hw, "brake", None), brake_pct)
+            events.emit(
+                "sample",
+                speed_kmh=round(speed, 3),
+                accel_cmd_pct=accel_pct,
+                brake_cmd_pct=brake_pct,
+                accel_actual_pct=None,
+                brake_actual_pct=None,
+                ref_kmh=None,
+                section="STOPPING",
+            )
+        await asyncio.sleep(SAMPLE_INTERVAL_S)
+
+
 async def _flow(hw: Any, reason: str) -> None:
     """流れの本体。例外は外へ出さない（出しても終了処理は続けたいので、警告を出して終える）。"""
+    streamer = asyncio.ensure_future(_stream_samples(hw))
     try:
         await _flow_body(hw, reason)
     except asyncio.CancelledError:
@@ -256,6 +298,9 @@ async def _flow(hw: Any, reason: str) -> None:
     except Exception as exc:  # noqa: BLE001
         say(f"  警告: 非常停止の流れが途中で失敗しました（{type(exc).__name__}: {exc}）。終了処理へ進みます")
         _emit("error", f"{type(exc).__name__}: {exc}")
+    finally:
+        streamer.cancel()
+        await asyncio.gather(streamer, return_exceptions=True)
 
 
 async def _flow_body(hw: Any, reason: str) -> None:

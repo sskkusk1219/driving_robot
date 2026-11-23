@@ -98,8 +98,11 @@ async def test_pause_freezes_mode_clock_holds_reference_and_excludes_kpi(tmp_pat
     t_p = float(next(iter(t_frozen)))
     assert 2.5 < t_p < 3.5
     # 保つ基準: 一時停止中の基準は一定（定速）
-    refs = {r["ref_speed_kmh"] for r in paused}
-    assert len(refs) == 1
+    # （2026-11-23: 作っている間は本体のモードの止めた時刻の基準・作り終えたら保つ車速の一定値。
+    # 作っている間の基準は止めた時刻で一定、切り替え後も一定なので、値は高々 2 通り）
+    refs = [r["ref_speed_kmh"] for r in paused]
+    assert len(set(refs)) <= 2
+    assert refs == sorted(refs, key=lambda x: x != refs[0])  # 切り替えは 1 回だけ（行き来しない）
     # 再開は止めた時刻から続く（時刻が飛ばない）
     times = [float(r["mode_time_s"]) for r in mode_rows]
     after = [x for x in times if x >= t_p - 1e-6]
@@ -178,3 +181,102 @@ async def test_pause_longer_than_plan_wraps_time_and_keeps_running(
     result, log = await _run(tmp_path, [(2.5, signal.SIGUSR1), (5.0, signal.SIGUSR2)])
     assert result.completed and result.pause_count == 1
     assert result.paused_s == pytest.approx(2.5, abs=0.3)
+
+
+async def test_cycles_keep_running_while_building_and_rows_are_paused(tmp_path: Path) -> None:
+    # 2026-11-23: 作る 0.5 s の間も、モードの時刻は止めたまま本体の制御の周期が回り続ける
+    # （CAN を読み続ける）。その間の行は一時停止の行（section に _PAUSE・paused=1）で KPI 外
+    result, log = await _run(
+        tmp_path, [(3.0, signal.SIGUSR1), (5.5, signal.SIGUSR2)], build_s=0.5
+    )
+    assert result.completed and result.pause_count == 1
+    with log.csv_path.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    paused = [r for r in rows if r["paused"] == "1"]
+    first = next(i for i, r in enumerate(rows) if r["paused"] == "1")
+    # 受け付けた周期から作り終えるまで（0.5 s ≒ 10 周期）の行が途切れず並ぶ
+    head = rows[first : first + 8]
+    assert all(r["paused"] == "1" for r in head)
+    assert all(r["section"] == dlmod.SECTION_MODE_DRIVE + mdmod.PAUSE_SECTION_SUFFIX for r in head)
+    assert len({r["mode_time_s"] for r in paused}) == 1
+    # 作っている間もペダルの値・車速が数値のまま（NaN・0 除算なし）
+    for r in head:
+        assert float(r["actual_speed_kmh"]) == float(r["actual_speed_kmh"])
+        assert float(r["accel_cmd_pct"]) == float(r["accel_cmd_pct"])
+    # KPI から外れる
+    mode_rows = [r for r in rows if r["section"] == dlmod.SECTION_MODE_DRIVE]
+    assert len(mrmod.rows_from_csv(log.csv_path)) == len(mode_rows)
+    assert result.pause_cycles >= 40
+
+
+async def test_resume_while_building_restores_clock_and_section(tmp_path: Path) -> None:
+    # 作っている途中（作るのに 1.5 s）で再開が来たら、作り終えるのを待たず止めた時刻から再開する
+    result, log = await _run(
+        tmp_path, [(3.0, signal.SIGUSR1), (3.6, signal.SIGUSR2)], build_s=1.5
+    )
+    assert result.completed and result.pause_count == 1
+    assert result.paused_s == pytest.approx(0.6, abs=0.2)
+    assert result.run_duration_s == pytest.approx(8.0, abs=0.3)
+    with log.csv_path.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    first = next(i for i, r in enumerate(rows) if r["paused"] == "1")
+    t_p = float(rows[first]["mode_time_s"])
+    after = next(r for r in rows[first:] if r["paused"] == "0")
+    assert float(after["mode_time_s"]) - t_p < 0.15
+    assert after["section"] == dlmod.SECTION_MODE_DRIVE  # section が元に戻っている
+    # 再開後の行はすべて通常の行
+    later = [r for r in rows[first + 1 :] if r["mode_time_s"] and float(r["mode_time_s"]) > t_p]
+    assert all(r["paused"] == "0" for r in later)
+
+
+async def test_build_failure_raises_drive_error(tmp_path: Path) -> None:
+    def broken(_v: float) -> mdmod.ModeDriveSetup:
+        raise RuntimeError("boom")
+
+    cfg = _tmp_cfg(tmp_path)
+    cfg.mode_drive.pedal_standby = False
+    cfg.forward_map.hold_pi_enabled = False
+    hw = await _held_stub(cfg)
+    mode = _mode([(0.0, 0.0), (0.6, 0.0), (2.0, 6.0), (7.0, 6.0), (7.6, 0.0), (8.0, 0.0)])
+    log = dlmod.SessionLog(cfg, hw, has_ref=True)
+    log.start(dlmod.SECTION_MODE_DRIVE, "")
+    asyncio.get_running_loop().call_later(2.0, os.kill, os.getpid(), signal.SIGUSR1)
+    result = await mdmod.run_mode_drive(
+        hw, cfg, mdmod.ModeDriveSetup(mode, FakeFF()),  # type: ignore[arg-type]
+        log=log, pause_setup_factory=broken,
+    )
+    await log.close()
+    assert not result.completed
+    assert "一時停止の制御を作れません" in result.abort_reason and "boom" in result.abort_reason
+
+
+async def test_building_mutes_only_the_builder_thread_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 作る別スレッドの print だけ捨て、その間の本体の say（警告・エラー）は残す
+    def noisy(v_kmh: float) -> mdmod.ModeDriveSetup:
+        print("FACTORY_NOISE")
+        time.sleep(0.6)
+        print("FACTORY_NOISE_2")
+        return _factory(v_kmh)
+
+    cfg = _tmp_cfg(tmp_path)
+    cfg.mode_drive.pedal_standby = False
+    cfg.forward_map.hold_pi_enabled = False
+    hw = await _held_stub(cfg)
+    mode = _mode([(0.0, 0.0), (0.6, 0.0), (2.0, 6.0), (7.0, 6.0), (7.6, 0.0), (8.0, 0.0)])
+    log = dlmod.SessionLog(cfg, hw, has_ref=True)
+    log.start(dlmod.SECTION_MODE_DRIVE, "")
+    loop = asyncio.get_running_loop()
+    loop.call_later(2.5, os.kill, os.getpid(), signal.SIGUSR1)
+    loop.call_later(3.0, mdmod.say, "MAIN_SAY_DURING_BUILD")
+    loop.call_later(4.0, os.kill, os.getpid(), signal.SIGUSR2)
+    result = await mdmod.run_mode_drive(
+        hw, cfg, mdmod.ModeDriveSetup(mode, FakeFF()),  # type: ignore[arg-type]
+        log=log, pause_setup_factory=noisy,
+    )
+    await log.close()
+    assert result.completed
+    out = capsys.readouterr().out
+    assert "MAIN_SAY_DURING_BUILD" in out
+    assert "FACTORY_NOISE" not in out

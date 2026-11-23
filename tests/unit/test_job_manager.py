@@ -264,6 +264,44 @@ def test_apply_event_state_init_sample_csv_result() -> None:
     assert d["result"]["meaning"] == "走行エラー" and d["kind"] == "mode_drive"
 
 
+def _btn(st: jm.JobStatus, phase: str, now: float) -> None:
+    jm.apply_event(st, {"type": "button", "button": "N", "phase": phase, "seconds": 1.2}, now=now)
+
+
+def test_button_time_continues_from_last_mode_time_after_mode_ends() -> None:
+    st = _status()
+    jm.apply_event(st, {"type": "sample", "mode_time_s": 100.0, "t_s": 130.0}, now=50.0)
+    jm.apply_event(st, {"type": "sample", "t_s": 140.0, "section": "DECEL_TO_STOP"}, now=51.0)  # mode_time_s なし
+    _btn(st, "start", 52.0)
+    _btn(st, "end", 53.2)
+    ev = st.button_events[0]
+    assert ev["start_s"] == pytest.approx(102.0) and ev["end_s"] == pytest.approx(103.2)
+
+
+def test_button_time_continues_during_stopping_samples_mode() -> None:
+    st = _status()
+    jm.apply_event(st, {"type": "sample", "mode_time_s": 10.0, "t_s": 20.0}, now=5.0)
+    jm.apply_event(st, {"type": "sample", "section": "STOPPING"}, now=6.0)
+    _btn(st, "start", 7.0)
+    assert st.button_events[0]["start_s"] == pytest.approx(12.0)
+
+
+def test_button_time_continues_during_stopping_samples_learning() -> None:
+    st = _status(jm.KIND_LEARNING)
+    jm.apply_event(st, {"type": "sample", "t_s": 40.0}, now=5.0)
+    jm.apply_event(st, {"type": "sample", "section": "STOPPING"}, now=6.0)
+    _btn(st, "start", 8.5)
+    assert st.button_events[0]["start_s"] == pytest.approx(43.5)
+
+
+def test_button_time_paused_does_not_advance() -> None:
+    st = _status()
+    jm.apply_event(st, {"type": "sample", "mode_time_s": 10.0}, now=5.0)
+    st.paused = True
+    _btn(st, "start", 9.0)
+    assert st.button_events[0]["start_s"] == pytest.approx(10.0)
+
+
 def test_derive_robot_state() -> None:
     assert jm.derive_robot_state(jm.STATE_STANDBY, None) == "READY"
     assert jm.derive_robot_state(jm.STATE_EMERGENCY, None) == "EMERGENCY"

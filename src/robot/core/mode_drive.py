@@ -37,14 +37,15 @@ from __future__ import annotations
 import asyncio
 import bisect
 import contextlib
-import io
 import json
 import math
 import os
 import signal
+import sys
+import threading
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -2325,13 +2326,53 @@ def make_pause_mode(v_kmh: float, duration_s: float = PAUSE_PLAN_S) -> DrivingMo
     )
 
 
+class _ThreadMuteStdout:
+    """stdout の薄い皮: 「捨てる」と登録したスレッドの書き込みだけ捨て、他は元の stdout へ通す。
+
+    contextlib.redirect_stdout はプロセス全体の sys.stdout を差し替えるので、別スレッドで一時停止の
+    制御を作る間に本体が出す say（警告・エラー。WebUI が読む）まで捨ててしまう。そのため別スレッドの
+    表示だけを捨てる（2026-11-23）。write/flush 以外の属性は元へ委譲する。
+    """
+
+    def __init__(self, wrapped: Any) -> None:
+        self._wrapped = wrapped
+        self._local = threading.local()
+
+    def write(self, text: str) -> int:
+        if getattr(self._local, "depth", 0) > 0:
+            return len(text)
+        return self._wrapped.write(text)
+
+    def flush(self) -> None:
+        if getattr(self._local, "depth", 0) == 0:
+            self._wrapped.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+
+@contextlib.contextmanager
+def mute_this_thread_stdout() -> Iterator[None]:
+    """このスレッドの print だけ捨てる（他のスレッドの書き込みは元の stdout へ通る）。"""
+    out = sys.stdout
+    if not isinstance(out, _ThreadMuteStdout):
+        out = _ThreadMuteStdout(out)  # 1 回入れたら残す（入れ子・二重には重ねない）
+        sys.stdout = out
+    local = out._local  # noqa: SLF001
+    local.depth = getattr(local, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        local.depth -= 1
+
+
 def default_pause_setup(cfg: ResearchConfig, v_kmh: float) -> ModeDriveSetup:
     """一時停止用の走行の準備: 定速モードで FF 候補を作り直す（開度の列は定速保持の開度になる）。
 
     表示（say）は大量なので捨てる。走行中の本体と同じ設定・同じ表を使うので、FB（C10・DOB）や
     安全網は本体と同じ部品がそのまま働く。
     """
-    with contextlib.redirect_stdout(io.StringIO()):
+    with mute_this_thread_stdout():
         return prepare_mode_drive_from(cfg, make_pause_mode(v_kmh))
 
 
@@ -2391,7 +2432,11 @@ class _ModeRun:
     pause_total_s = 0.0  # 一時停止していた秒数の合計
     pause_count = 0
     pause_cycles = 0
-    pause_build_s = 0.0  # 一時停止用の制御を作るのにかかった秒数（直近）
+    pause_build_s = 0.0  # 一時停止用の制御を作るのにかかった秒数（直近・スレッド内で計る）
+    pause_build_cycles = 0  # 作っている間に回した周期の数（直近）
+    _pause_build_task: asyncio.Future[tuple[_ModeRun, float]] | None = None
+    _pause_section0: str | None = None  # 作っている間だけ: 元の section（_PAUSE を付ける前）
+    _pause_v_hold = 0.0
     # C13（段2u）の今の周期の値の既定。C13 以外・予測器が無効のときは動かさない（None のまま）
     _speed_est: float | None = None
     _pred_dev: float | None = None
@@ -2805,6 +2850,7 @@ class _ModeRun:
                     await self._cancel_button_tasks()
             return await self._run_loop()
         finally:
+            self._pause_discard_build()  # 作っている途中なら結果を捨てる（警告なし）
             for sig in installed:
                 with contextlib.suppress(Exception):
                     asyncio.get_running_loop().remove_signal_handler(sig)
@@ -2836,14 +2882,19 @@ class _ModeRun:
         """手順 24 は D を押し終えるまで一時停止を受け付けない（停車保持のまま D を待つ間）。"""
         return self.button_plan is None or self._d_finished_at is not None
 
-    def _build_pause_run(self, v_hold: float) -> _ModeRun:
-        """一時停止用の _ModeRun を作る（定速モード・本体と同じ設定。表示は捨てる）。"""
+    def _build_pause_run(self, v_hold: float, base_section: str | None = None) -> _ModeRun:
+        """一時停止用の _ModeRun を作る（定速モード・本体と同じ設定。表示は捨てる）。
+
+        別スレッドから呼ばれる。本体の section は作っている間 _PAUSE 付きに替わるので、
+        元の section は base_section で受け取る。
+        """
         factory = self.pause_setup_factory or (lambda v: default_pause_setup(self.cfg, v))
-        setup = factory(v_hold)
-        with contextlib.redirect_stdout(io.StringIO()):
+        with mute_this_thread_stdout():
+            setup = factory(v_hold)
             sub = _ModeRun(
                 self.hw, self.cfg, setup, self.log, PAUSE_PLAN_S,
-                section=self.section + PAUSE_SECTION_SUFFIX,
+                section=(self.section if base_section is None else base_section)
+                + PAUSE_SECTION_SUFFIX,
             )
         # 本体と同じ部品・同じ記録先を使う（片足ルール・実開度の安全網・ガバナー・調停を引き継ぐ）
         sub.arbiter = self.arbiter
@@ -2856,48 +2907,110 @@ class _ModeRun:
         sub._next_print = math.inf  # noqa: SLF001 - 状態の表示は本体の say だけ
         return sub
 
+    def _timed_build_pause_run(self, v_hold: float, base_section: str) -> tuple[_ModeRun, float]:
+        """別スレッドで走る本体: 一時停止用の制御と、作るのにかかった秒数を返す。"""
+        started = time.perf_counter()
+        sub = self._build_pause_run(v_hold, base_section)
+        return sub, time.perf_counter() - started
+
     def _pause_share(self, src: _ModeRun, dst: _ModeRun) -> None:
         for name in _PAUSE_SHARED_ATTRS:
             setattr(dst, name, getattr(src, name))
 
-    async def _pause_begin(self, t: float) -> None:
-        """一時停止が押された周期: モードの時刻 t をその場で止め、保つ車速の制御に替える。
+    @staticmethod
+    def _swallow_build_result(task: asyncio.Future[object]) -> None:
+        """捨てた作り込みの結果・例外を拾う（未処理例外の警告を出さない）。"""
+        if not task.cancelled():
+            task.exception()
 
-        2026-11-16 実機 1 回目の直し: 別スレッドで作る間に本体のモードが進んで、減速する基準に
-        車が追従してしまった（実機は作るのに 2.7 秒・GIL の取り合い）。今は押された周期の中で
-        作る（定速 6 秒のモードで 0.02〜0.35 秒・本体のループが数周期遅れるだけ。ペダルの指令は
-        その間そのまま）。時刻 t は押された周期で止まるので、再開はここ（基準 ≒ 保つ車速）から続く。
+    def _pause_discard_build(self) -> None:
+        """作っている途中のタスクの結果を捨てる（再開・走行の終わり・例外のとき）。"""
+        task = self._pause_build_task
+        self._pause_build_task = None
+        if task is not None:
+            task.add_done_callback(self._swallow_build_result)
+        if self._pause_section0 is not None:
+            self.section = self._pause_section0
+            self._pause_section0 = None
+            self._pause_log_t = None
+
+    async def _pause_begin(self, t: float) -> None:
+        """一時停止が押された周期: モードの時刻 t をその場で止め、保つ車速の制御を別スレッドで作る。
+
+        2026-11-16 実機 1 回目: 別スレッドで作る間に本体のモードの時刻が進み、減速する基準に
+        車が追従した（作るのに 2.7 秒）。次に押された周期の中で同期で作ったら、実機で 0.41 秒
+        イベントループが止まり、CAN の受信が途切れて 0.4 秒の古さの判定で非常停止になった
+        （2026-11-23 ProblemReport_20261123 ①）。今は、先にモードの時刻 t を止めてから別スレッドで
+        作る。作っている間は本体の制御を止めた時刻の基準のまま毎周期回し（CAN を読み続ける・
+        この間の行は一時停止の行）、作り終えたら _pause_cycle で一時停止用の制御へ切り替える。
+        再開はここ（基準 ≒ 保つ車速）から続く。
         """
         try:
             speed = await self.hw.can.read_speed()
         except Exception as exc:
             raise DriveError(f"CAN 車速を読めません（{type(exc).__name__}: {exc}）") from exc
         v_hold = pause_hold_speed(speed)
-        built_at = time.perf_counter()
-        try:
-            sub = self._build_pause_run(v_hold)
-        except Exception as exc:
-            raise DriveError(f"一時停止の制御を作れません（{type(exc).__name__}: {exc}）") from exc
-        self.pause_build_s = time.perf_counter() - built_at
-        sub._pause_log_t = t  # noqa: SLF001
-        sub._segment = self.cfg.modes.segment_at(t)  # noqa: SLF001
-        self._pause_run = sub
         self._paused = True
         self._pause_t = t
         self._pause_real0 = asyncio.get_running_loop().time()
         self.pause_count += 1
+        self.pause_build_cycles = 0
+        self._pause_v_hold = v_hold
+        # 作っている間の行は一時停止の扱い（KPI 外）
+        self._pause_section0 = self.section
+        self.section = self._pause_section0 + PAUSE_SECTION_SUFFIX
+        self._pause_log_t = t
+        self._pause_build_task = asyncio.ensure_future(
+            asyncio.to_thread(self._timed_build_pause_run, v_hold, self._pause_section0)
+        )
         say(
             f"  [一時停止] 受け付けました。モードの時刻 {t:.2f}s で止めます"
             f"（車速 {speed:.2f} km/h・"
             f"基準 {self.ref.at(t):.2f} km/h）。保つ車速 {v_hold:.2f} km/h"
             + ("（停車保持）" if v_hold == 0.0 else "")
-            + f"・制御を作るのに {self.pause_build_s:.2f} 秒"
+            + "・保つ制御を別スレッドで作ります"
+        )
+
+    def _pause_switch_if_built(self) -> None:
+        """作り終えていれば一時停止用の制御へ切り替える（毎周期の頭）。失敗は DriveError。"""
+        task = self._pause_build_task
+        if task is None or not task.done():
+            return
+        assert self._pause_t is not None
+        self._pause_build_task = None
+        try:
+            sub, build_s = task.result()
+        except Exception as exc:
+            self._pause_discard_build()
+            raise DriveError(f"一時停止の制御を作れません（{type(exc).__name__}: {exc}）") from exc
+        t = self._pause_t
+        # 本体の section・時刻の印を元へ戻す（以後の行は sub が _PAUSE 付きで書く）
+        assert self._pause_section0 is not None
+        self.section = self._pause_section0
+        self._pause_section0 = None
+        self._pause_log_t = None
+        sub._pause_log_t = t  # noqa: SLF001
+        sub._segment = self.cfg.modes.segment_at(t)  # noqa: SLF001
+        self.pause_build_s = build_s
+        self._pause_run = sub
+        self._pause_real0 = asyncio.get_running_loop().time()
+        say(
+            f"  [一時停止] 保つ制御に切り替えました。保つ車速 {self._pause_v_hold:.2f} km/h"
+            f"・制御を作るのに {build_s:.2f} 秒"
+            f"（作っている間 {self.pause_build_cycles} 周期）"
         )
 
     async def _pause_cycle(self, now: float) -> None:
-        """一時停止中の 1 周期。定速モードの _ModeRun._cycle を回す（モードの時刻は止めたまま）。"""
+        """一時停止中の 1 周期。作っている間は本体の _cycle（時刻は止めたまま）、
+        作り終えたら定速モードの _ModeRun._cycle を回す。"""
+        self._pause_switch_if_built()
         sub = self._pause_run
-        assert sub is not None
+        if sub is None:
+            assert self._pause_t is not None
+            await self._cycle(self._pause_t, now)
+            self.pause_build_cycles += 1
+            self.pause_cycles += 1
+            return
         # 定速モードの外（長い一時停止）は、開度の列も基準も最後の値のまま（定速なので同じ値）
         tau = PAUSE_T0_S + (asyncio.get_running_loop().time() - self._pause_real0)
         self._pause_share(self, sub)
@@ -2906,7 +3019,10 @@ class _ModeRun:
         self.pause_cycles += 1
 
     async def _pause_exit(self) -> float:
-        """再開する: 一時停止用の制御を畳んで、止めたときのモードの時刻を返す。"""
+        """再開する: 一時停止用の制御を畳んで、止めたときのモードの時刻を返す。
+
+        作っている途中なら、作り終えるのを待たず結果を捨てて再開する。
+        """
         assert self._pause_t is not None
         t_p = self._pause_t
         try:
@@ -2914,6 +3030,8 @@ class _ModeRun:
         except Exception as exc:
             raise DriveError(f"CAN 車速を読めません（{type(exc).__name__}: {exc}）") from exc
         held_s = asyncio.get_running_loop().time() - self._pause_real0
+        building = self._pause_build_task is not None
+        self._pause_discard_build()
         self._paused = False
         self._pause_run = None
         self._pause_t = None
@@ -2921,6 +3039,7 @@ class _ModeRun:
             f"  [一時停止を解除] モードの時刻 {t_p:.2f}s から再開します"
             f"（{held_s:.1f} 秒止めました・車速 {speed:.2f} km/h・"
             f"基準 {self.ref.at(t_p):.2f} km/h）"
+            + ("・制御を作っている途中で再開（結果は捨てました）" if building else "")
         )
         return t_p
 

@@ -532,3 +532,39 @@ async def test_moving_and_button_press_fails_goes_on_to_deeper_levels(env: Any) 
     await es.run(hw, "SIGINT による中断")
     assert presses == [BUTTON_N] * 4
     assert es.brake_kept and not es.buttons_unavailable
+
+
+def _stopping_samples(env: Any) -> list[dict[str, Any]]:
+    return [x for x in env.events if x["type"] == "sample"]
+
+
+async def test_flow_streams_stopping_samples_with_speed_and_commanded_openings(env: Any) -> None:
+    hw = env.attach(_make_hw(speed=40.0))
+    hw.accel._last_commanded_pos = opening_to_pulse(10.0)
+    hw.brake._last_commanded_pos = opening_to_pulse(20.0)
+    await es.run(hw, "SIGINT による中断")
+    samples = _stopping_samples(env)
+    assert samples
+    first = samples[0]
+    assert first["section"] == "STOPPING"
+    assert first["speed_kmh"] == 40.0
+    assert first["accel_cmd_pct"] == pytest.approx(10.0, abs=0.01)
+    assert first["brake_cmd_pct"] == pytest.approx(20.0, abs=0.01)
+    assert first["ref_kmh"] is None
+    assert "t_s" not in first and "mode_time_s" not in first
+
+
+async def test_samples_skipped_when_speed_unreadable(env: Any) -> None:
+    hw = env.attach(_make_hw(speed=None))  # CAN 断: 出さない
+    await es.run(hw, "CAN 車速を読めません")
+    assert _stopping_samples(env) == []
+
+
+async def test_samples_stop_after_flow_ends(env: Any) -> None:
+    hw = env.attach(_make_hw(speed=40.0))
+    await es.run(hw, "")
+    n = len(_stopping_samples(env))
+    assert n > 0
+    for _ in range(5):
+        await _real_sleep(0)
+    assert len(_stopping_samples(env)) == n  # 流れが終わったあとは出ない
