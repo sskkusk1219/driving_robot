@@ -856,3 +856,8 @@ cp tests/research/config_testVehicle.yaml /tmp/config_stub.yaml
 ```bash
 .venv/bin/python -m tests.research.main --steps 1,3 --hw real; echo "exit=$?"
 ```
+
+
+## 手動運転のスイッチ（スタート・P・N・D。WebUI・src）
+
+- 手動運転中だけ `POST /api/v1/drive/manual/button {"button":"start|P|N|D","action":"down|up"}`。押している間だけ押す（down を 0.5 s ごとに送り直し、1.5 s 届かなければランナーが離す）。画面ではキー u / i / o / p とボタン。詳細は `src/robot/README.md` の `button` コマンド。

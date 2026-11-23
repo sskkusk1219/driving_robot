@@ -39,6 +39,8 @@ from src.web.schemas import (
     JogResponse,
     LearningStartRequest,
     LogLineSchema,
+    ManualButtonRequest,
+    ManualButtonResponse,
     PrepareRequest,
     SaveMaxRequest,
     SaveMaxResponse,
@@ -421,6 +423,21 @@ async def manual_jog(req: JogRequest, manager: Manager) -> JogResponse:
         {"cmd": "jog", "axis": req.axis, "amount_pct": round(req.step / PULSE_FULL * 100.0, 4)},
         axis=req.axis,
     )
+
+
+@router.post("/manual/button", response_model=ManualButtonResponse)
+async def manual_button(req: ManualButtonRequest, manager: Manager) -> ManualButtonResponse:
+    """手動運転のスイッチ（スタート・P・N・D）を押す／離す。押している間だけ押す操作。
+
+    down は 0.5 s ごとに送り直す（1.5 s 届かなければランナーが離す）。ジョグの順番待ちは通らない。
+    手動運転でなければ 409、ランナーが断った（別のスイッチを押している等）ときも 409（message 付き）。
+    """
+    _require_interactive(manager, PURPOSE_MANUAL)
+    ack = await manager.send_button(req.button, req.action)
+    message = str(ack.get("message") or "")
+    if not ack.get("ok"):
+        raise HTTPException(status_code=409, detail=message or "スイッチを操作できません")
+    return ManualButtonResponse(ok=True, message=message)
 
 
 @router.post("/manual/home", response_model=JogResponse)

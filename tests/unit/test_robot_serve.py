@@ -595,3 +595,65 @@ async def test_serve_job_loads_config_of_command_vehicle(stub_runner: Any, monke
     _send(runner, {"cmd": "quit"})
     assert await asyncio.wait_for(task, 20) == 0
     assert runner._vehicle_of(None) == "car_a"  # noqa: SLF001
+
+
+# ── 手動運転のスイッチ（button コマンド。押し続け） ───────────────────
+
+
+def test_parse_button_command() -> None:
+    c = parse_serve_command('{"cmd":"button","button":"P","action":"down","id":3}')
+    assert (c.cmd, c.button, c.action, c.req_id, c.job_id) == ("button", "P", "down", 3, None)
+    for bad in (
+        '{"cmd":"button","button":"X","action":"down"}',
+        '{"cmd":"button","button":"D","action":"hold"}',
+        '{"cmd":"button","action":"up"}',
+    ):
+        with pytest.raises(CommandError):
+            parse_serve_command(bad)
+
+
+async def test_serve_button_only_in_manual_and_released_at_end(stub_runner: Any) -> None:
+    runner, buf = stub_runner
+    task = asyncio.create_task(runner.run())
+    await _wait_for(buf, _is("state", phase="idle"))
+    hw = runner.hw
+    _send(runner, {"cmd": "button", "button": "start", "action": "down", "id": 1})  # 待機中 → NG
+    await _wait_for(buf, _is("ack", id=1, ok=False))
+    _send(runner, {"cmd": "interactive", "job_id": "c1", "purpose": "calib"})
+    await _wait_for(buf, _is("state", phase="interactive", job_id="c1"))
+    _send(runner, {"cmd": "button", "button": "start", "action": "down", "id": 2})  # キャリブ → NG
+    await _wait_for(buf, _is("ack", id=2, ok=False))
+    _send(runner, {"cmd": "quit_interactive"})
+    await _wait_for(buf, _is("result", job_id="c1"))
+    await _wait_for(buf, lambda e: e["type"] == "state" and e.get("phase") == "idle" and runner.job_task is None and e["ts"] > 0 and runner.purpose is None)
+
+    # 手動運転: ジョグの最中でも button は即 ack され、先押し優先・quit_interactive で離す
+    orig_execute = serve.InteractiveSession.execute
+
+    async def slow_execute(self: Any, command: Any) -> None:
+        if getattr(command, "op", None) == "jog" or getattr(command, "cmd", None) == "jog":
+            await asyncio.sleep(1.0)
+        await orig_execute(self, command)
+
+    serve.InteractiveSession.execute = slow_execute  # type: ignore[method-assign]
+    try:
+        _send(runner, {"cmd": "interactive", "job_id": "i1", "purpose": "manual"})
+        await _wait_for(buf, _is("state", phase="interactive", job_id="i1"))
+        _send(runner, {"cmd": "jog", "axis": "accel", "amount_pct": 2, "id": 10})
+        await asyncio.sleep(0.1)
+        _send(runner, {"cmd": "button", "button": "N", "action": "down", "id": 11})
+        await _wait_for(buf, _is("ack", id=11, ok=True), timeout=0.8)  # ジョグ(1 s)より先に返る
+        assert not any(e["type"] == "status" and e.get("id") == 10 for e in _parse_events(buf))
+        _send(runner, {"cmd": "button", "button": "D", "action": "down", "id": 12})
+        await _wait_for(buf, _is("ack", id=12, ok=False))
+        assert runner.button_hold is not None and runner.button_hold.pressed == "N"
+        _send(runner, {"cmd": "quit_interactive"})
+        await _wait_for(buf, _is("result", job_id="i1"))
+    finally:
+        serve.InteractiveSession.execute = orig_execute  # type: ignore[method-assign]
+    assert runner.button_hold is None
+    ev = _parse_events(buf)
+    assert [e["phase"] for e in ev if e["type"] == "button"] == ["start", "end"]  # 離してから待機へ
+    assert hw.buttons.history and hw.buttons.history[-1].channel == 1
+    _send(runner, {"cmd": "quit", "job_id": "q1"})
+    assert await asyncio.wait_for(task, 20) == 0

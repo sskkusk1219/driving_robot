@@ -43,6 +43,7 @@ from src.robot import (
     schedule_job,
     schedule_spec,
 )
+from src.robot.button_hold import ButtonHold
 from src.robot.core import button_steps as core_button_steps
 from src.robot.core import main as core_main
 from src.robot.core.config import ConfigError, ResearchConfig
@@ -60,9 +61,13 @@ STARTUP_JOB_ID = "init"
 
 JOB_COMMANDS = ("mode", "schedule", "steps", "interactive", "init")
 CONTROL_COMMANDS = ("stop", "quit", "quit_interactive")
+#: 手動運転のスイッチ（スタート・P・N・D）。キューに入れず、その場で ButtonHold へ渡す（button_hold.py）
+BUTTON_COMMAND = "button"
+BUTTON_NAMES = ("start", "P", "N", "D")
+BUTTON_ACTIONS = ("down", "up")
 #: 対話ジョブの間だけ受ける操作（interactive.py の ``quit`` は対話の終わりではなくランナーの quit なので除く）
 INTERACTIVE_ONLY_OPS = tuple(c for c in INTERACTIVE_OPS if c != "quit")
-SERVE_COMMANDS = (*JOB_COMMANDS, *CONTROL_COMMANDS, *INTERACTIVE_ONLY_OPS)
+SERVE_COMMANDS = (*JOB_COMMANDS, *CONTROL_COMMANDS, BUTTON_COMMAND, *INTERACTIVE_ONLY_OPS)
 
 #: 待機中の見張りの間隔 [s]（A-D3）
 WATCH_INTERVAL_S = 1.0
@@ -124,6 +129,8 @@ class ServeCommand:
     schedule: dict[str, Any] | None = None
     steps: str | None = None
     purpose: str | None = None
+    button: str | None = None  # button コマンド: start / P / N / D
+    action: str | None = None  # button コマンド: down / up
     vehicle: str | None = None  # このジョブで使う車（JobManager が今選んでいる車）。無ければ起動時の車（args.vehicle）
 
 
@@ -154,6 +161,14 @@ def parse_serve_command(line: str) -> ServeCommand:
     job_id = obj.get("job_id")
     if job_id is not None and (not isinstance(job_id, str) or not job_id.strip()):
         raise CommandError(f"job_id は空でない文字列で指定してください: {job_id!r}")
+    if cmd == BUTTON_COMMAND:
+        button = obj.get("button")
+        action = obj.get("action")
+        if button not in BUTTON_NAMES:
+            raise CommandError(f"button は {' / '.join(BUTTON_NAMES)} で指定してください: {button!r}")
+        if action not in BUTTON_ACTIONS:
+            raise CommandError(f"action は {' / '.join(BUTTON_ACTIONS)} で指定してください: {action!r}")
+        return ServeCommand(cmd, job_id=job_id, req_id=req_id, raw=text, button=button, action=action)
     if cmd in INTERACTIVE_ONLY_OPS or cmd in ("stop", "quit", "quit_interactive"):
         return ServeCommand(cmd, job_id=job_id, req_id=req_id, raw=text)
     # ここから先はジョブのコマンド
@@ -432,21 +447,28 @@ class _ServeInteractive:
             self._ctx.require_hardware(), self._ctx.config,
             vehicle_id=self._vehicle, vehicles_dir=args.vehicles_dir,
         )
-        events.emit("state", phase="interactive", purpose=self._runner.purpose)
-        say("対話ジョブ: コマンド待ち（jog / move / home / status / save_min / save_max。quit_interactive で待機へ戻る）")
-        events.emit("status", id=None, **(await session.status()))
-        while True:
-            line = await self._queue.get()
-            if line is None:
-                say("対話ジョブ: 終了します（待機へ戻ります）")
-                return
-            try:
-                command = parse_command(line)
-            except CommandError as exc:
-                say(f"対話: コマンドが不正です（{exc}）")
-                events.emit("ack", id=None, cmd=None, ok=False, message=str(exc))
-                continue
-            await session.execute(command)
+        hold = ButtonHold(self._ctx.require_hardware(), self._ctx.config)
+        self._runner.button_hold = hold
+        try:
+            events.emit("state", phase="interactive", purpose=self._runner.purpose)
+            say("対話ジョブ: コマンド待ち（jog / move / home / status / save_min / save_max / button。quit_interactive で待機へ戻る）")
+            events.emit("status", id=None, **(await session.status()))
+            while True:
+                line = await self._queue.get()
+                if line is None:
+                    say("対話ジョブ: 終了します（待機へ戻ります）")
+                    return
+                try:
+                    command = parse_command(line)
+                except CommandError as exc:
+                    say(f"対話: コマンドが不正です（{exc}）")
+                    events.emit("ack", id=None, cmd=None, ok=False, message=str(exc))
+                    continue
+                await session.execute(command)
+        finally:
+            # 運転終了・中断・非常停止のどれでも、押しているスイッチを離してから先へ進む（D6）
+            self._runner.button_hold = None
+            await asyncio.shield(hold.release_all())
 
 
 class ServeRunner:
@@ -462,6 +484,7 @@ class ServeRunner:
         self.needs_init = False
         self.closing = False
         self.interactive_queue: asyncio.Queue[str | None] | None = None
+        self.button_hold: ButtonHold | None = None  # 手動運転の間だけ（_ServeInteractive.run が作る）
         self.purpose: str | None = None
         self.final_job_id: str | None = None
         self._final_result_emitted = False
@@ -605,6 +628,18 @@ class ServeRunner:
                 self._ack(cmd, True, "対話を終えて待機へ戻ります", req_id=command.req_id)
             else:
                 self._ack(cmd, False, "対話ジョブではありません", req_id=command.req_id)
+            return None
+        if cmd == BUTTON_COMMAND:
+            hold = self.button_hold
+            if hold is None or self.purpose != "manual":
+                self._ack(cmd, False, "手動運転の間だけ使えます", req_id=command.req_id)
+                return None
+            assert command.button is not None
+            if command.action == "down":
+                ok, message = await hold.down(command.button)
+            else:
+                ok, message = await hold.up(command.button)
+            self._ack(cmd, ok, message, req_id=command.req_id)
             return None
         if cmd in INTERACTIVE_ONLY_OPS:
             if self.interactive_queue is not None:

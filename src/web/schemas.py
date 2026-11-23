@@ -164,6 +164,18 @@ class JogRequest(BaseModel):
     step: int = Field(ge=-5000, le=5000)
 
 
+class ManualButtonRequest(BaseModel):
+    """手動運転のスイッチ（スタート・P・N・D）。down は押す（押している間 0.5 s ごとに送り直す）、up は離す。"""
+
+    button: Literal["start", "P", "N", "D"]
+    action: Literal["down", "up"]
+
+
+class ManualButtonResponse(BaseModel):
+    ok: bool
+    message: str
+
+
 class AxisRequest(BaseModel):
     axis: Literal["accel", "brake"]
 
