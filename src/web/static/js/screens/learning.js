@@ -56,9 +56,9 @@ function LearningScreen() {
       <window.StageRail defs={stage.defs} current={stage.current} state={stage.state} />
       {learningRunning && (
         <div style={{ fontSize: 12, color: INK_SOFT }}>
-          {window.PHASE_LABEL?.[liveJob.phase] ?? liveJob.phase}
-          {liveJob.sample?.section ? `　（${stage.defs[stage.current]?.label ?? window.SECTION_LABEL?.[liveJob.sample.section] ?? liveJob.sample.section}）` : ''}
-          {liveJob.step_title && liveJob.phase === 'step'
+          {window.jobPhaseLabel(liveJob)}
+          {!(liveJob.phase === 'emergency' && liveJob.stop_requested) && liveJob.sample?.section ? `　（${stage.defs[stage.current]?.label ?? window.SECTION_LABEL?.[liveJob.sample.section] ?? liveJob.sample.section}）` : ''}
+          {!(liveJob.phase === 'emergency' && liveJob.stop_requested) && liveJob.step_title && liveJob.phase === 'step'
             ? `　${liveJob.step === 2 ? 'ペダル探索 → パターン走行 → 順モデル作成' : liveJob.step_title}` : ''}
         </div>
       )}
@@ -104,7 +104,7 @@ function LearningScreen() {
           confirmStartMessage: `${LEARNING_LABEL}を開始しますか？`,
           startedToastMessage: '学習運転を開始しました',
           stopLabel: '中断',
-          confirmStopMessage: '学習運転を中断しますか？（原点へ戻して止まります）',
+          confirmStopMessage: '学習運転を中断しますか？',
           resultPanel,
         })}
         {cfg && (

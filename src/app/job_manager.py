@@ -348,6 +348,10 @@ class JobStatus:
     init_steps: list[dict[str, str]] = field(default_factory=list)
     sample: dict[str, Any] | None = None
     sample_at: float | None = None  # monotonic
+    # 押下の時刻の物差し。時刻つきの最後の sample の（時刻, 到着 monotonic）。mode_time_s を一度でも受けたら
+    # モードの時刻、無ければ t_s。時刻の欄が無い sample（STOPPING など）の間は、ここからの経過を足す
+    time_ref: tuple[float, float] | None = None
+    mode_time_seen: bool = False
     interactive_status: dict[str, Any] | None = None
     csv_files: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] | None = None
@@ -402,6 +406,18 @@ class JobStatus:
         if t is None:
             t = sm.get("t_s")
         return float(t) if t is not None else 0.0
+
+    def time_at(self, now: float) -> float:
+        """画面の横軸と同じ物差しの「今」の時刻（最後の時刻つき sample の時刻 ＋ 到着からの経過）。
+
+        一時停止中は時刻が止まるので経過を足さない。時刻つきの sample が一つも無ければ 0。
+        """
+        if self.time_ref is None:
+            return 0.0
+        t, at = self.time_ref
+        if self.paused:
+            return t
+        return t + max(0.0, now - at)
 
     def dev_stats(self) -> dict[str, Any] | None:
         """|偏差| の最大・p95（モード走行の行だけ。まだ無ければ None）。"""
@@ -516,9 +532,10 @@ def apply_event(status: JobStatus, event: dict[str, Any], *, now: float | None =
         status.sample = {k: v for k, v in event.items() if k not in ("type", "ts")}
         status.sample_at = time.monotonic() if now is None else now
         status.sample_history.append((status.sample_at, status.sample))
+        _update_time_ref(status, status.sample, status.sample_at)
         _add_deviation(status, status.sample)
     elif kind == "button":
-        _apply_button_event(status, event)
+        _apply_button_event(status, event, time.monotonic() if now is None else now)
     elif kind == "csv":
         status.csv_files.append(
             {"path": event.get("path"), "kind": event.get("kind"), "rows": event.get("rows")}
@@ -541,10 +558,20 @@ def _add_deviation(status: JobStatus, sample: dict[str, Any]) -> None:
     bisect.insort(status.dev_abs, abs(float(speed) - float(ref)))
 
 
-def _apply_button_event(status: JobStatus, event: dict[str, Any]) -> None:
-    """button イベント（phase=start/end）を押下の記録にする。時刻は最新 sample の時刻。"""
+def _update_time_ref(status: JobStatus, sample: dict[str, Any], at: float) -> None:
+    """押下の時刻の物差しを更新する。mode_time_s を受けたジョブはそれだけ、無いジョブは t_s。"""
+    m = sample.get("mode_time_s")
+    if m is not None:
+        status.mode_time_seen = True
+        status.time_ref = (float(m), at)
+    elif not status.mode_time_seen and sample.get("t_s") is not None:
+        status.time_ref = (float(sample["t_s"]), at)
+
+
+def _apply_button_event(status: JobStatus, event: dict[str, Any], now: float) -> None:
+    """button イベント（phase=start/end）を押下の記録にする。時刻は画面の横軸と同じ物差しの今。"""
     name = str(event.get("button", ""))
-    now_s = status.sample_time_s()
+    now_s = status.time_at(now)
     if event.get("phase") == "start":
         status.button_events.append(
             {
@@ -559,6 +586,8 @@ def _apply_button_event(status: JobStatus, event: dict[str, Any]) -> None:
         for item in reversed(status.button_events):
             if item["button"] == name and item["end_s"] is None:
                 item["end_s"] = max(now_s, item["start_s"])
+                if event.get("hold") and event.get("seconds") is not None:
+                    item["seconds"] = float(event["seconds"])  # 押し続け: 実際に押した秒数
                 break
 
 

@@ -14,13 +14,6 @@ window.BUTTON_COLORS = BUTTON_COLORS;
 window.BUTTON_LABELS = BUTTON_LABELS;
 window.BUTTON_PRESSED_LEVEL = BUTTON_PRESSED_LEVEL;
 
-// 状態の短い文（phase → 1 語。長い説明は PHASE_LABEL）
-const PHASE_SHORT = {
-  starting: '起動中', init: '初期化中', prepare: '準備中', pre_check: '走行前チェック中', step: '走行中',
-  step_end: '手順終了', shutdown: '終了処理中', ready: 'Ready にしています', d: 'D に入れています',
-  n: 'N に入れています', done: '完了', interactive: 'コマンド待ち',
-};
-
 // 計画の事前作成つきの開始確認ポップアップ（ConfirmStopPopup と同じ見た目。計画ができてから出すので、はい／いいえだけ）
 function PrepareConfirmPopup({ message, onYes, onNo }) {
   const { INK, PAPER } = window;
@@ -104,7 +97,10 @@ function DriveMonitorScreen({
   const modeSeenRef = useRef(false);   // このジョブで mode_time_s が一度でも来たか
   const lastModeTRef = useRef(null);   // 最後に来た mode_time_s
   const frozenRef = useRef(null);      // モード終了後に止めておく時刻（止めていなければ null）
+  const preStopRef = useRef({ jobId: null, section: null, ref: null, dev: null });   // 停止の流れ（STOPPING）の前の最後の区間・基準・偏差
   const [frozenS, setFrozenS] = useState(null);
+  // 実測・ペダルの点（受け取ったときの経過秒 t を 1 回だけ決めて持つ。一時停止中も過去の点がずれない）
+  const ptsRef = useRef({ jobId: null, lastTs: 0, list: [] });
 
   // 実行中のジョブ（WebSocket の job。終わると null）。この画面のジョブか・別のジョブかを分ける
   const liveJob = realtimeData?.job ?? null;
@@ -200,11 +196,6 @@ function DriveMonitorScreen({
     let last = Date.now();
     const tick = () => {
       const now = Date.now();
-      if (frozenRef.current != null) {   // モード終了後は最後のモードの時刻で止める
-        setNowS(frozenRef.current);
-        raf = requestAnimationFrame(tick);
-        return;
-      }
       // 一時停止中はモードの時刻が止まるので、起点を進めて経過秒を止める
       if (driveStartTimeRef.current && pausedRef.current) driveStartTimeRef.current += now - last;
       last = now;
@@ -234,8 +225,9 @@ function DriveMonitorScreen({
       if (robotState !== 'RUNNING') return;
       const m = liveJob?.sample?.mode_time_s;
       if (m == null) {
-        // 開始前は何もしない（経過 0・起点なし）。モードが終わった後は最後の時刻で止める
-        if (modeSeenRef.current && frozenRef.current == null && lastModeTRef.current != null) {
+        // 開始前は何もしない（経過 0・起点なし）。モードが終わった後は最後の時刻を覚えておく（経過・赤線だけが使う。横軸は壁時計で進める）
+        // 中断（stop_requested）後の停止の流れは覚えない
+        if (!liveJob?.stop_requested && modeSeenRef.current && frozenRef.current == null && lastModeTRef.current != null) {
           frozenRef.current = lastModeTRef.current;
           setFrozenS(lastModeTRef.current);
         }
@@ -262,7 +254,19 @@ function DriveMonitorScreen({
   }, [realtimeData, robotState]);
 
   // 表示用の整数秒（mm:ss ラベルは秒単位で十分）
-  const elapsed = Math.floor(nowS);
+  // モード時刻のジョブ（走行モード・スケジュール・シーケンスの段）は、経過と枠3の赤線を次の時刻で止める
+  //   (1) モードが終わった後は最後のモードの時刻（frozenS）、(2) 走行終了を押した後はその時の nowS。先に来た方
+  const stopHoldRef = useRef({ jobId: null, s: null });
+  const holdJobId = liveJob?.job_id ?? null;
+  if (stopHoldRef.current.jobId !== holdJobId) stopHoldRef.current = { jobId: holdJobId, s: null };
+  if (modeTimed && liveJob?.stop_requested) {
+    if (stopHoldRef.current.s == null) stopHoldRef.current.s = nowS;
+  } else {
+    stopHoldRef.current.s = null;
+  }
+  const holdCands = modeTimed ? [frozenS, stopHoldRef.current.s].filter(v => v != null) : [];
+  const shownNowS = holdCands.length > 0 ? Math.min(nowS, ...holdCands) : nowS;
+  const elapsed = Math.floor(shownNowS);
 
   // 走っているモード走行のジョブがあれば、画面の選択より優先してそのモードの基準を読む（段 B）
   const jobModeId = liveJob?.kind === 'mode_drive' ? (liveJob.mode_id ?? null) : null;
@@ -377,9 +381,25 @@ function DriveMonitorScreen({
   const buf = realtimeBuf.current;
   const driveStart = driveStartTimeRef.current;
   // axis 2 (開度) は走行後のバッファデータのみ。
-  const recent = driveStart
-    ? buf.filter(d => d.ts >= driveStart).slice(-300)
-    : [];
+  //   点は受け取ったときの経過秒 t を 1 回だけ決めて持つ（ts − driveStart で毎回計算し直すと、一時停止中に左へ流れる）。
+  //   t は sample.mode_time_s があればそれ、無ければ（STOPPING・学習運転など）壁時計 (ts − 起点)/1000
+  const pts = ptsRef.current;
+  const ptsJobId = liveJob?.job_id ?? null;
+  if (pts.jobId !== ptsJobId || !driveStart) { pts.jobId = ptsJobId; pts.list = []; pts.lastTs = 0; }
+  if (driveStart) {
+    const fresh = [];
+    for (let i = buf.length - 1; i >= 0 && buf[i].ts > pts.lastTs; i--) fresh.push(buf[i]);
+    fresh.reverse();
+    for (const d of fresh) {
+      pts.lastTs = d.ts;
+      if (d.ts < driveStart) continue;
+      if (d.job?.job_id != null && liveJob?.job_id != null && d.job.job_id !== liveJob.job_id) continue;
+      const m = d.job?.sample?.mode_time_s;
+      pts.list.push({ ...d, t: m != null ? m : (d.ts - driveStart) / 1000 });
+    }
+    if (pts.list.length > 600) pts.list.splice(0, pts.list.length - 600);
+  }
+  const recent = driveStart ? pts.list.slice(-300) : [];
 
   // Graph constants
   const VW = 900, PL = 50, PR = 16, PH1 = 120, PH2 = 120, PH3 = 60;
@@ -433,7 +453,9 @@ function DriveMonitorScreen({
   // 開始前のシーケンスの先頭の段がモードなら、上の図に基準の線を出す（走行モードの開始前と同じ）
   const preRefProfile = (!showRefLine && previewOk && seqPreview.firstModeId && modeDetail
     && modeDetail.id === seqPreview.firstModeId) ? (modeDetail.reference_speed ?? []) : [];
-  const refLineProfile = showRefLine ? refProfile : preRefProfile;
+  // シーケンスの走行中は、走っている段がモードで詳細が読み込み済みなら、その基準を 1 軸目の線に使う
+  const liveRefProfile = (!showRefLine && seqMode) ? figProfile : [];
+  const refLineProfile = showRefLine ? refProfile : (liveRefProfile.length > 0 ? liveRefProfile : preRefProfile);
   const profileSpeedMax = refLineProfile.reduce((m, p) => Math.max(m, p.speed_kmh), 0);
   const maxSpeed = Math.max(100, Math.ceil(Math.max(profileSpeedMax, profileMaxSpeed ?? 0) / 20) * 20);
   // 枠3の図の縦の上限。走行モードの画面と同じ式を、図に描くモード（figProfile）の基準で計算する
@@ -471,8 +493,6 @@ function DriveMonitorScreen({
   const windowEndS   = nowS + HALF_S;
 
   const toFrac = elapsedS => (elapsedS - windowStartS) / WINDOW_S;
-  // WS テレメトリの壁時計 ts を「走行経過秒」へ変換する（nowS・基準・進捗マーカーと同じ軸）
-  const toDriveElapsedS = ts => (ts - driveStart) / 1000;
 
   // 基準車速: プロファイルから直接サンプリング（モードロード済なら常に表示）
   const speedRef_pts = refLineProfile.length > 0
@@ -494,18 +514,16 @@ function DriveMonitorScreen({
     const pts = [];
     let prev = null;
     const push = (t, v) => {
-      if (frozenS != null && t > frozenS) return;   // モード終了後に止めている間は、止めた時刻より後を出さない
       const frac = toFrac(t);
       if (frac >= 0 && frac <= 1) pts.push({ x: toXFull(frac), y: toY(v, max, h) });
     };
     for (const d of recent) {
-      const t = toDriveElapsedS(d.ts);
+      const t = d.t;
       if (prev && t - prev.t > HOLD_GAP_S) push(t - 0.1, prev.v);
       push(t, d[key]);
       prev = { t, v: d[key] };
     }
-    const tEnd = frozenS != null ? Math.min(nowS, frozenS) : nowS;
-    if (prev && tEnd > prev.t) push(tEnd, prev.v);
+    if (prev && nowS > prev.t) push(nowS, prev.v);
     return pts;
   }
 
@@ -523,7 +541,7 @@ function DriveMonitorScreen({
     x: toXFull(figTotalS > 0 ? p.time_s / figTotalS : 0),
     y: toY(p.speed_kmh, figMaxSpeed, PH3, G3_PAD_T, G3_PAD_B),
   })));
-  const progressFrac = isDriving && figTotalS > 0 ? Math.min(1, nowS / figTotalS) : 0;
+  const progressFrac = isDriving && figTotalS > 0 ? Math.min(1, shownNowS / figTotalS) : 0;
   const markerX = toXFull(progressFrac);
 
   const fmt = s => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
@@ -573,9 +591,13 @@ function DriveMonitorScreen({
     : (prepErr != null && !liveJob)
     ? `準備できませんでした: ${prepErr}`
     : liveJob
-    ? (liveJob.paused ? '一時停止中' : (PHASE_SHORT[liveJob.phase] ?? liveJob.phase))
+    ? (liveJob.paused ? '一時停止中' : window.jobPhaseShort(liveJob))
     : (robotState ?? '—');
-  const sectionText = smp ? (smp.pattern || window.SECTION_LABEL?.[smp.section] || smp.section || '—') : '—';
+  const isStoppingFlow = liveJob?.sample?.section === 'STOPPING';
+  if (preStopRef.current.jobId !== (liveJob?.job_id ?? null)) preStopRef.current = { jobId: liveJob?.job_id ?? null, section: null, ref: null, dev: null };
+  const sectionTextNow = smp ? (smp.pattern || window.SECTION_LABEL?.[smp.section] || smp.section || '—') : '—';
+  if (liveJob && smp && !isStoppingFlow) preStopRef.current.section = sectionTextNow;
+  const sectionText = isStoppingFlow ? (preStopRef.current.section ?? '—') : sectionTextNow;
   const timeText = (isDriving && !planWaitingOnly)
     ? (totalDurS > 0 ? `${fmt(elapsed)}/${fmt(totalDurS)}` : `${fmt(elapsed)}/—`)
     : '—';
@@ -591,7 +613,7 @@ function DriveMonitorScreen({
   // 押し始めで 0 → BUTTON_PRESSED_LEVEL に立ち、押している間は横に伸び、離して 0 に落ちる。押している最中は現在時刻まで伸ばす
   const buttonRects = (isDriving && liveJob?.button_events ? liveJob.button_events : []).map((e, i) => {
     const xs = toXFull(toFrac(e.start_s));
-    const xe = toXFull(toFrac(e.end_s ?? nowS));
+    const xe = Math.max(xs, toXFull(toFrac(e.end_s ?? nowS)));   // 逆向きの箱は描かない（幅 0）
     if (xe < PL || xs > PL + PW) return null;
     const x0 = Math.max(PL, xs), x1 = Math.min(PL + PW, xe);
     const y0 = toY(0, 100, PH2), y1 = toY(BUTTON_PRESSED_LEVEL, 100, PH2);
@@ -603,6 +625,11 @@ function DriveMonitorScreen({
   }).filter(Boolean);
 
   const rd = realtimeData;
+  if (liveJob && smp && !isStoppingFlow) {
+    const okRef = typeof rd?.ref_speed_kmh === 'number' && typeof rd?.actual_speed_kmh === 'number';
+    preStopRef.current.ref = okRef ? rd.ref_speed_kmh : null;
+    preStopRef.current.dev = okRef ? rd.actual_speed_kmh - rd.ref_speed_kmh : null;
+  }
 
   return (
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0 }}>
@@ -617,7 +644,7 @@ function DriveMonitorScreen({
           {marker(rd.actual_speed_kmh, maxSpeed, PH1, '#c8922a')}
         </div>
         <div style={{ display: 'flex', gap: 20, fontSize: 12, color: INK_SOFT, paddingLeft: PL, paddingBottom: 4, alignItems: 'center' }}>
-          {(showRefLine || preRefProfile.length > 0) && (
+          {(showRefLine || preRefProfile.length > 0 || refLineProfile.length > 0) && (
             <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <svg width="28" height="10" style={{ flexShrink: 0 }}>
                 <line x1="0" y1="5" x2="28" y2="5" stroke={INK_SOFT} strokeWidth="1.5" strokeDasharray="4 3" />
@@ -744,7 +771,11 @@ function DriveMonitorScreen({
           </div>
           <div style={{ fontSize: 12, color: INK_SOFT, whiteSpace: 'nowrap', lineHeight: 1.5 }}>
             {showRefLine && (
-              (rd.ref_speed_kmh ?? null) !== null
+              isStoppingFlow
+                ? (preStopRef.current.ref != null
+                    ? `基準 ${preStopRef.current.ref.toFixed(1)} / 偏差 ${preStopRef.current.dev.toFixed(2)}`
+                    : '基準 — / 偏差 —')
+                : (rd.ref_speed_kmh ?? null) !== null
                 ? `基準 ${rd.ref_speed_kmh.toFixed(1)} / 偏差 ${(rd.actual_speed_kmh - rd.ref_speed_kmh).toFixed(2)}`
                 : '基準 — / 偏差 —'
             )}
@@ -949,38 +980,13 @@ function AutoDriveScreen() {
   const jobKinds = isSchedule ? ['schedule'] : isSequence ? ['mode_drive', 'schedule'] : ['mode_drive'];
   const ownKinds = jobKinds;
   const showResult = !isSequence && !liveJob && lastJob && ownKinds.includes(lastJob.kind) && lastJob.job_id !== dismissedJobId && (lastJob.exit_code != null || lastJob.result);
-  const showSeqResult = isSequence && !liveSeq && lastSeq && lastSeq.state !== 'running' && lastSeq.started_at !== dismissedSeq;
-  // 走っているシーケンスの進み具合は、枠3（全体進捗の図）に並べず上の見出し行に出す（枠3は走行モードと同じ図にする）
-  const seqRunning = isSequence && liveSeq && liveSeq.state === 'running';
-  const seqHeader = seqRunning ? (
-    <div style={{ flex: '0 1 auto', minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
-      <SequenceProgress seq={liveSeq} inline />
-      {liveJob && (
-        <span style={{ fontSize: 12, color: INK_SOFT }}>
-          {'　'}{window.PHASE_LABEL?.[liveJob.phase] ?? liveJob.phase}
-          {liveJob.step_title && liveJob.phase === 'step' ? `　（${liveJob.step_title}）` : ''}
-        </span>
-      )}
-    </div>
-  ) : null;
+  const showSeqResult = isSequence && !liveSeq && lastSeq && lastSeq.state !== 'running' && lastSeq.state !== 'stopped' && lastSeq.started_at !== dismissedSeq;
   const summary = showSeqResult ? (
       <SequenceResultBanner seq={lastSeq} onDismiss={() => setDismissedSeq(lastSeq.started_at)} onLogs={() => setNav('logs')} />
     ) : null;   // 走り終わった結果の帯は 3 段目に出さない（結果はログページで見る。ユーザー決定 2026-11-16）
 
-  const kindLabel = isSequence ? 'シーケンス' : isSchedule ? 'タイムスケジュール' : '走行モード';
-
   return (
     <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontSize: 13, color: INK_SOFT, flexShrink: 0 }}>
-        <span style={{ flexShrink: 0 }}>車: <b style={{ color: INK }}>{profile?.name ?? '—'}</b></span>
-        <span style={{ flexShrink: 0 }}>{kindLabel}: <b style={{ color: INK }}>{activeModeName ?? '—'}</b></span>
-        {seqHeader}
-        {devLimitS && !isSchedule && (
-          <span style={{ color: '#f0c84a', border: '1px dashed #b89030', borderRadius: 4, padding: '1px 8px' }}>
-            開発用: 先頭 {devLimitS} 秒で打ち切り
-          </span>
-        )}
-      </div>
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         {isSequence ? (
           <DriveMonitorScreen showRefLine={false} showProgressFigure={true} jobKind={jobKinds} seqMode={true}
@@ -989,7 +995,7 @@ function AutoDriveScreen() {
             driveStartBody={activeModeId ? { sequence_id: activeModeId, ...(devLimitS ? { limit_s: devLimitS } : {}) } : null}
             prepareBody={activeModeId ? { kind: 'sequence', id: activeModeId, limit_s: devLimitS || null } : null}
             driveStopPath="/api/v1/drive/sequence/stop"
-            confirmStartMessage={`シーケンス「${activeModeName ?? ''}」を開始しますか？（段を順に走らせます）`}
+            confirmStartMessage={`シーケンス「${activeModeName ?? ''}」を開始しますか？`}
             confirmStopMessage="シーケンスを止めますか？（走っている段を止め、残りの段は走らせません）"
             stopLabel="シーケンス停止"
             startedToastMessage="シーケンスを開始しました"
@@ -1001,7 +1007,7 @@ function AutoDriveScreen() {
             driveStartBody={activeModeId ? { schedule_id: activeModeId } : null}
             prepareBody={activeModeId ? { kind: 'schedule', id: activeModeId, limit_s: null } : null}
             driveStopPath="/api/v1/drive/schedule/stop"
-            confirmStartMessage={`スケジュール「${activeModeName ?? ''}」を再生しますか？（ペダルが開ループで動きます）`}
+            confirmStartMessage={`スケジュール「${activeModeName ?? ''}」を開始しますか？`}
             progressLabel={activeModeName}
             resultPanel={summary} />
         ) : (
@@ -1010,7 +1016,7 @@ function AutoDriveScreen() {
             driveStartBody={activeModeId ? { mode_id: activeModeId, ...(devLimitS ? { limit_s: devLimitS } : {}) } : null}
             prepareBody={activeModeId ? { kind: 'mode', id: activeModeId, limit_s: devLimitS || null } : null}
             driveStopPath="/api/v1/drive/stop"
-            confirmStartMessage={`${activeModeName ?? '走行'} を開始しますか？`}
+            confirmStartMessage={`走行モード「${activeModeName ?? '走行'}」を開始しますか？`}
             resultPanel={summary} />
         )}
         {cfg && (

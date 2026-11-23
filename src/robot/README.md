@@ -11,7 +11,7 @@
 | `streaming_log.py` | `StreamingSessionLog`（core の `SessionLog` の派生。sample/csv イベント） |
 | `patches.py` | core の挙動を差し替える所（**差し替え点はここだけ**） |
 | `cancel_guard.py` | cancel 中の通信例外を CancelledError に戻す（差し替え 12） |
-| `emergency_stop.py` | 走行するジョブの非常停止の流れ（減速して停車 → N → スタート 10 秒 → 原点復帰。差し替え 10） |
+| `emergency_stop.py` | 走行するジョブの非常停止の流れ（減速して停車 → N → スタート 10 秒 → 原点復帰。差し替え 10。流れの間は 0.2 s ごとに `sample`（section=STOPPING・車速は CAN・開度は直近の指令位置）を出して画面のグラフを動かす） |
 | `interrupt.py` | SIGINT / SIGTERM の扱い（終了処理を必ず走らせる） |
 | `interactive.py` | 対話ジョブ（手動運転・min 測定） |
 | `schedule_spec.py` | タイムスケジュール再生の純粋な部分（データ・補間・頭打ち（同時踏みは許す）・ボタン名の検査。core を import しない） |
