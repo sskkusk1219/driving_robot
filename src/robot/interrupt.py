@@ -112,7 +112,11 @@ class StopController:
         if exc is not None:
             if self.requested:
                 # cancel の余波の例外（通信の失敗など）。中断として扱い、後の手順に進まない
-                say(f"中断中に手順が例外で終わりました（{type(exc).__name__}: {exc}）")
+                if "cancelled outside library" in str(exc):
+                    # 自分の中断（cancel）で読み書きが打ち切られただけ。異常ではない（message_level が ERROR にしない文にする）
+                    say("中断により通信を打ち切りました（自分の停止要求による。異常ではありません）")
+                else:
+                    say(f"中断中に手順が例外で終わりました（{type(exc).__name__}: {exc}）")
                 raise Interrupted from exc
             raise exc
         if self.requested:

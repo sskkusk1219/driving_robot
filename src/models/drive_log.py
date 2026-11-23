@@ -16,6 +16,8 @@ class DriveSession:
     vehicle_id: str | None = None  # 車両 yaml のフォルダ名
     schedule_id: str | None = None  # スケジュールのジョブだけ（その時点の ID・名前の写し）
     schedule_name: str | None = None
+    sequence_run_id: str | None = None  # シーケンスの段だけ（同じ実行の段は同じ ID）
+    sequence_name: str | None = None
 
 
 @dataclass

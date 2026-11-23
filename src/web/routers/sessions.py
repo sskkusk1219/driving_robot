@@ -69,6 +69,8 @@ def _to_response(
         cycle_id=session.cycle_id,
         schedule_id=session.schedule_id,
         schedule_name=session.schedule_name,
+        sequence_run_id=session.sequence_run_id,
+        sequence_name=session.sequence_name,
     )
 
 

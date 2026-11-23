@@ -43,7 +43,7 @@ from src.robot import (
     schedule_job,
     schedule_spec,
 )
-from src.robot.button_hold import ButtonHold
+from src.robot.button_hold import KEEPALIVE_SUFFIX, ButtonHold
 from src.robot.core import button_steps as core_button_steps
 from src.robot.core import main as core_main
 from src.robot.core.config import ConfigError, ResearchConfig
@@ -254,6 +254,7 @@ def decide_after_job(
     kept: bool = False,
     hw_connected: bool = True,
     stopped: bool = False,
+    init: bool = False,
 ) -> JobDecision:
     """ジョブの終了コード・例外の文・診断・ハードの状態から、待機へ戻すか、ランナーを閉じるか。
 
@@ -261,6 +262,7 @@ def decide_after_job(
     |---|---|
     | 診断にハード異常（ブレーキ軸・アクセル軸の異常・CAN を読めない）            | 閉じる |
     | ブレーキを保ったまま終えた（brake_kept / buttons_unavailable）              | 待機（needs_init） |
+    | 初期化（init）を停止コマンドで中断した                                       | 閉じる（接続途中の HW を残さない） |
     | 停止コマンドで中断した                                                       | 待機 |
     | 終了コード 0・2・3・6・7・8                                                  | 待機 |
     | 終了コード 4・5 で、接続が閉じている                                         | 閉じる |
@@ -274,6 +276,9 @@ def decide_after_job(
         return JobDecision(True, False, "ハードの異常（" + "、".join(diag.notes or ["軸・CAN の診断"]) + "）")
     if kept:
         return JobDecision(False, True, "ブレーキを保ったまま終えたため、次は初期化が必要です")
+    if stopped and init and code != 0:
+        # 初期化の途中で打ち切ると、接続しかけた HW（シリアルポート）が残る。次の初期化が同じポートを開けず失敗するので閉じる
+        return JobDecision(True, False, "初期化を中断したため、接続の途中だった機器を閉じます")
     if stopped:
         return JobDecision(False, False, "停止コマンドで中断しました")
     if code in IDLE_CODES:
@@ -494,8 +499,12 @@ class ServeRunner:
 
     # ── 出力 ──
 
-    def _ack(self, cmd: str | None, ok: bool, message: str, *, job_id: str | None = None, req_id: Any = None) -> None:
-        say(f"serve: {cmd} → {'OK' if ok else 'NG'} {message}")
+    def _ack(
+        self, cmd: str | None, ok: bool, message: str, *, job_id: str | None = None, req_id: Any = None,
+        quiet: bool = False,
+    ) -> None:
+        if not quiet:  # quiet: 0.5 s ごとの送り直しの ack は進行のメッセージに溜めない（応答のイベントは出す）
+            say(f"serve: {cmd} → {'OK' if ok else 'NG'} {message}")
         fields: dict[str, Any] = {"id": req_id, "cmd": cmd, "ok": ok, "message": message}
         if job_id is not None:
             fields["job_id"] = job_id
@@ -639,7 +648,10 @@ class ServeRunner:
                 ok, message = await hold.down(command.button)
             else:
                 ok, message = await hold.up(command.button)
-            self._ack(cmd, ok, message, req_id=command.req_id)
+            self._ack(
+                cmd, ok, message, req_id=command.req_id,
+                quiet=ok and command.action == "down" and message.endswith(KEEPALIVE_SUFFIX),
+            )
             return None
         if cmd in INTERACTIVE_ONLY_OPS:
             if self.interactive_queue is not None:
@@ -758,6 +770,7 @@ class ServeRunner:
         decision = decide_after_job(
             code, error=state.error, diag=diag, kept=kept, hw_connected=connected,
             stopped=stop.requested and self.exit_after is None,
+            init=command.cmd == "init",
         )
         close = decision.close
         exit_code: int | None = None
@@ -807,11 +820,17 @@ class ServeRunner:
     async def _run_init(self, command: ServeCommand, stop: StopController, state: run.RunState) -> int:
         """手順 1（初期化。原点復帰を含む）＋ PCA9685 の確認。ペダルは原点復帰以外では動かさない。"""
         args = self.args
-        if self.hw is not None and getattr(self.hw, "connected", False):
+        leftover = self.hw
+        if leftover is None and self.init_ctx is not None:
+            leftover = self.init_ctx.hardware  # 中断された初期化の取り残し（self.hw に入る前に打ち切られた分）
+        if leftover is not None:
             say("初期化のやり直し: いったん本物の終了処理（原点復帰 → サーボOFF → 切断）をします")
             patches.set_job_end("full")
             emergency_stop.reset()
-            await core_main.shutdown(self.hw)
+            try:
+                await core_main.shutdown(leftover)
+            except Exception as exc:  # noqa: BLE001 - 接続しかけの HW は終了処理が失敗しうる。新しい接続は続ける
+                say(f"  警告: 前の接続の終了処理で例外（{type(exc).__name__}: {exc}）")
         self.hw = None
         self.init_ctx = None
         self.watcher = None

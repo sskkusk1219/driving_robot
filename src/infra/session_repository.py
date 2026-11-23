@@ -268,6 +268,8 @@ def _row_to_session(row: asyncpg.Record) -> DriveSession:
         vehicle_id=row.get("vehicle_id"),
         schedule_id=str(row["schedule_id"]) if row.get("schedule_id") is not None else None,
         schedule_name=row.get("schedule_name"),
+        sequence_run_id=str(row["sequence_run_id"]) if row.get("sequence_run_id") is not None else None,
+        sequence_name=row.get("sequence_name"),
     )
 
 

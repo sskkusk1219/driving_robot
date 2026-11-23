@@ -103,6 +103,8 @@ function LearningScreen() {
           driveStopPath: '/api/v1/drive/stop',
           confirmStartMessage: `${LEARNING_LABEL}を開始しますか？`,
           startedToastMessage: '学習運転を開始しました',
+          keepTraceAfterStop: true,
+          sectionLabel: learningRunning ? (stage.defs[stage.current]?.label ?? null) : null,
           stopLabel: '中断',
           confirmStopMessage: '学習運転を中断しますか？',
           resultPanel,

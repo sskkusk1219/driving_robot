@@ -1,5 +1,13 @@
 // ── Modes screens ─────────────────────────────────────────
 
+// 終わりの車速 0 km/h が続いている長さ [s]（最後の行の時刻 − 末尾の 0 km/h の連なりの先頭の時刻。サーバーの検査と同じ条件で 1 秒以上）
+function trailingZeroSpan(vals) {
+  if (vals.length === 0 || vals[vals.length - 1].speed_kmh !== 0) return 0;
+  let i = vals.length - 1;
+  while (i > 0 && vals[i - 1].speed_kmh === 0) i--;
+  return vals[vals.length - 1].time_s - vals[i].time_s;
+}
+
 // 一覧用ミニグラフ: 軸なし・ラベルなしで速度プロファイルの形だけ表示
 function MiniSpeedGraph({ rows }) {
   const W = 200, H = 50;
@@ -61,7 +69,17 @@ function CsvSpeedGraph({ rows, width = 600, height = 220 }) {
     }, 'CSVをアップロードするとプレビューが表示されます');
   }
 
-  const totalDur = rows[rows.length - 1].time_s;
+  // 数値に読めない行は描かない。有効な点が 2 つ未満（または時間が 0）なら枠だけ（NaN 座標を出さない）
+  rows = rows.filter(r => Number.isFinite(r.time_s) && Number.isFinite(r.speed_kmh));
+  const totalDur = rows.length > 0 ? rows[rows.length - 1].time_s : 0;
+  if (rows.length < 2 || !(totalDur > 0)) {
+    return React.createElement('svg', { viewBox: `0 0 ${W} ${H}`, width, height, style: { display: 'block' } },
+      React.createElement('rect', {
+        x: padL, y: padT, width: pw, height: ph,
+        fill: 'none', stroke: window.INK, strokeWidth: '1.2',
+      }),
+    );
+  }
   const maxSpeed = Math.max(...rows.map(r => r.speed_kmh), 1);
 
   // Y軸最大値をキリの良い値に切り上げ
@@ -151,6 +169,7 @@ function ModesScreen() {
   const [sortAsc, setSortAsc] = useState(true);
   const [editingNameId, setEditingNameId] = useState(null);
   const [editingNameValue, setEditingNameValue] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState(null); // 削除確認中のモード
 
   useEffect(() => { loadModes(); }, []);
 
@@ -220,18 +239,26 @@ function ModesScreen() {
     window.showToast(`「${m.name}」を選択しました`, 'success');
   }
 
-  async function handleDelete(m) {
-    if (!confirm(`「${m.name}」を削除しますか？`)) return;
+  async function doDelete(m) {
     const r = await apiFetch('DELETE', `/api/v1/modes/${m.id}`);
+    setConfirmDelete(null);
     if (r !== null) {
       window.showToast('走行モードを削除しました', 'success');
       if (activeModeKind === 'mode' && activeModeId === m.id) {
         setActiveModeId(null);
         setActiveModeName(null);
       }
+      setMode('list');
+      setEditTarget(null);
       loadModes();
     }
   }
+
+  const deletePopup = confirmDelete && React.createElement(window.ConfirmStopPopup, {
+    message: `「${confirmDelete.name}」を削除しますか？`,
+    onYes: () => doDelete(confirmDelete),
+    onNo: () => setConfirmDelete(null),
+  });
 
   if (mode === 'create') {
     return React.createElement(ModeCreate, {
@@ -241,7 +268,7 @@ function ModesScreen() {
   }
 
   if (mode === 'edit' && editTarget) {
-    return React.createElement(ModeEdit, {
+    return React.createElement('div', { style: { position: 'relative', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 } }, React.createElement(ModeEdit, {
       initial: editTarget,
       referenceSpeed: detailMap[editTarget.id] || [],
       onSave: async (name, description, file) => {
@@ -264,18 +291,8 @@ function ModesScreen() {
         }
       },
       onCancel: () => { setMode('list'); setEditTarget(null); },
-      onDelete: async () => {
-        if (!confirm(`「${editTarget.name}」を削除しますか？`)) return;
-        const r = await apiFetch('DELETE', `/api/v1/modes/${editTarget.id}`);
-        if (r !== null) {
-          window.showToast('走行モードを削除しました', 'success');
-          if (activeModeKind === 'mode' && activeModeId === editTarget.id) { setActiveModeId(null); setActiveModeName(null); }
-          setMode('list');
-          setEditTarget(null);
-          loadModes();
-        }
-      },
-    });
+      onDelete: () => setConfirmDelete(editTarget),
+    }), deletePopup);
   }
 
   const fmtDuration = (s) => {
@@ -310,7 +327,7 @@ function ModesScreen() {
       })
     : filtered;
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, height: '100%' } },
+  return React.createElement('div', { style: { position: 'relative', display: 'flex', flexDirection: 'column', gap: 14, height: '100%' } },
 
     // ── ヘッダ ──────────────────────────────────────────────
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
@@ -436,7 +453,7 @@ function ModesScreen() {
                   onSelect: () => handleSelect(m),
                   onEdit:   () => { setEditTarget(m); setMode('edit'); },
                   onCopy:   () => handleCopy(m),
-                  onDelete: () => handleDelete(m),
+                  onDelete: () => setConfirmDelete(m),
                 }), MODE_LIST_COLS[4]],
               ],
               style: {
@@ -448,6 +465,7 @@ function ModesScreen() {
           }),
       ),
     ),
+    deletePopup,
   );
 }
 
@@ -501,6 +519,7 @@ function ModeEdit({ initial, referenceSpeed, onSave, onCancel, onDelete }) {
         { ok: !hasNonMono,     msg: '時刻 単調増加' },
         { ok: !hasNegSpeed,    msg: `車速範囲 0 – ${maxS.toFixed(1)} km/h` },
         { ok: vals.length > 0, msg: `サンプル数 ${vals.length} 行` },
+        { ok: trailingZeroSpan(vals) >= 1.0, msg: '終わりの車速 0 km/h が 1 秒以上' },
       ],
     };
   }
@@ -733,6 +752,7 @@ function ModeCreate({ onSave, onCancel }) {
       { ok: !hasNonMono, msg: '時刻 単調増加' },
       { ok: !hasNegSpeed, msg: `車速範囲 0 – ${maxS.toFixed(1)} km/h` },
       { ok: vals.length > 0, msg: `サンプル数 ${vals.length} 行` },
+      { ok: trailingZeroSpan(vals) >= 1.0, msg: '終わりの車速 0 km/h が 1 秒以上' },
     ];
 
     return { rows: vals, sample, validations: results };
@@ -876,7 +896,7 @@ function ModeCreate({ onSave, onCancel }) {
           ),
         ),
 
-        React.createElement(Note, null, 'CSVの1列目は秒単位の時刻、2列目は km/h の基準車速。ヘッダ行は必須です。'),
+        React.createElement(Note, null, 'CSVの1列目は秒単位の時刻、2列目は km/h の基準車速。ヘッダ行は必須です。最後は車速 0 km/h が 1 秒以上続くこと。'),
 
         React.createElement('div', { style: { flex: 1 } }),
 

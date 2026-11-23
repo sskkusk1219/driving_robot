@@ -126,6 +126,9 @@ def _diag(**kw: Any) -> emergency_stop.Diagnosis:
         # 停止コマンド・ブレーキ保持
         (130, {"stopped": True}, False, False),
         (5, {"stopped": True, "error": "x"}, False, False),
+        # 初期化を中断したら閉じる（接続途中の HW を残さない。成功済み・初期化以外の中断は待機）
+        (130, {"stopped": True, "init": True}, True, False),
+        (0, {"stopped": True, "init": True}, False, False),
         (5, {"kept": True, "hw_connected": False}, False, True),
         (5, {"kept": True, "diag": _diag(brake_faulty=True)}, True, False),
         # シグナルの中断は閉じる・未知は安全側

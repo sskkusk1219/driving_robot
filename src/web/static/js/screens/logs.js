@@ -74,9 +74,9 @@ function LogsScreen() {
     ]);
     if (sessData) {
       setSessions(sessData);
-      // 開く対象が学習サイクルの配下なら、そのサイクルを開いておく
+      // 開く対象が学習サイクル・シーケンスの配下なら、そのグループを開いておく
       const target = openSessionId.current ? sessData.find(x => x.id === openSessionId.current) : null;
-      if (target && target.cycle_id) setExpandedCycleId(target.cycle_id);
+      if (target && (target.cycle_id || target.sequence_run_id)) setExpandedCycleId(target.cycle_id || target.sequence_run_id);
     }
     if (cycleData) setCycles(cycleData);
     if (Array.isArray(modeData)) {
@@ -86,20 +86,44 @@ function LogsScreen() {
     }
   }
 
-  // cycle_id を持つセッションはサイクル配下へ、持たないセッションはフラットのまま。
+  // cycle_id を持つセッションはサイクル配下へ、sequence_run_id を持つセッションはシーケンス配下へ。どちらも持たないセッションはフラットのまま。
+  // シーケンスのグループはサイクルと同じ描き方（id＝sequence_run_id。サーバーに一覧が無いので、配下のセッションから作る）
   const membersByCycle = {};
   const flatSessions = [];
   for (const s of sessions) {
     if (s.cycle_id) (membersByCycle[s.cycle_id] ??= []).push(s);
+    else if (s.sequence_run_id) (membersByCycle[s.sequence_run_id] ??= []).push(s);
     else flatSessions.push(s);
   }
   for (const members of Object.values(membersByCycle)) {
     members.sort((a, b) => new Date(a.started_at) - new Date(b.started_at));
   }
+  const seqGroups = [];
+  for (const s of sessions) {
+    if (s.cycle_id || !s.sequence_run_id || seqGroups.some(g => g.id === s.sequence_run_id)) continue;
+    const ms = membersByCycle[s.sequence_run_id];
+    const bad = ms.find(m => m.status === 'emergency' || m.status === 'error');
+    seqGroups.push({
+      id: s.sequence_run_id, isSequence: true, name: s.sequence_name ?? '',
+      started_at: ms[0].started_at,
+      ended_at: ms.some(m => !m.ended_at) ? null : ms.reduce((a, m) => (new Date(m.ended_at) > new Date(a) ? m.ended_at : a), ms[0].ended_at),
+      status: bad ? bad.status : (ms.find(m => m.status === 'running')?.status ?? ms[ms.length - 1].status),
+      session_count: ms.length,
+    });
+  }
   const items = [
     ...flatSessions.map(s => ({ kind: 'session', startedAt: s.started_at, session: s })),
-    ...cycles.map(c => ({ kind: 'cycle', startedAt: c.started_at, cycle: c, members: membersByCycle[c.id] || [] })),
+    ...[...cycles, ...seqGroups].map(c => ({ kind: 'cycle', startedAt: c.started_at, cycle: c, members: membersByCycle[c.id] || [] })),
   ].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+
+  // エラーページから開いたセッションの行を、一覧の中でスクロールして見える所へ出す（1 回だけ）
+  const listRef = React.useRef(null);
+  const scrolledRef = React.useRef(false);
+  useEffect(() => {
+    if (scrolledRef.current || !openSessionId.current || !listRef.current) return;
+    const el = listRef.current.querySelector(`[data-session-id="${openSessionId.current}"]`);
+    if (el) { el.scrollIntoView({ block: 'nearest' }); scrolledRef.current = true; }
+  });
 
   const isSel = (kind, id) => selected?.kind === kind && selected?.id === id;
   const rowStyle = (on, nested) => ({
@@ -108,7 +132,7 @@ function LogsScreen() {
     border: `${on ? 2 : 1}px solid ${on ? INK : HATCH}`,
   });
   const sessionRow = (s, nested) => (
-    <div key={s.id} onClick={() => setSelected({ kind: 'session', id: s.id })} style={rowStyle(isSel('session', s.id), nested)}>
+    <div key={s.id} data-session-id={s.id} onClick={() => setSelected({ kind: 'session', id: s.id })} style={rowStyle(isSel('session', s.id), nested)}>
       <div style={{ fontWeight: 700, fontSize: 13, lineHeight: 1.35 }}>{sessionTitle(s, modeNames)}</div>
       <div style={{ fontSize: 11, color: '#888' }}>
         <span style={{ color: statusColor(s.status), fontWeight: statusColor(s.status) === '#666' ? 400 : 700 }}>{SESSION_STATUS_LABEL[s.status] ?? s.status}</span>
@@ -118,7 +142,7 @@ function LogsScreen() {
   );
 
   const selSession = selected?.kind === 'session' ? sessions.find(s => s.id === selected.id) : null;
-  const selCycle = selected?.kind === 'cycle' ? cycles.find(c => c.id === selected.id) : null;
+  const selCycle = selected?.kind === 'cycle' ? [...cycles, ...seqGroups].find(c => c.id === selected.id) : null;
 
   return (
     <div style={{ display: 'flex', gap: 12, flex: 1, minHeight: 0 }}>
@@ -126,7 +150,7 @@ function LogsScreen() {
         {items.length === 0
           ? <Note>セッションログがありません。</Note>
           : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, overflowY: 'auto', flex: 1, minHeight: 0 }}>
+            <div ref={listRef} style={{ display: 'flex', flexDirection: 'column', gap: 6, overflowY: 'auto', flex: 1, minHeight: 0 }}>
               {items.map(item => item.kind === 'session' ? sessionRow(item.session, false) : (
                 <div key={item.cycle.id} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                   <div onClick={() => {
@@ -134,8 +158,8 @@ function LogsScreen() {
                     setExpandedCycleId(prev => prev === item.cycle.id && isSel('cycle', item.cycle.id) ? null : item.cycle.id);
                   }} style={rowStyle(isSel('cycle', item.cycle.id), false)}>
                     <div style={{ fontWeight: 700, fontSize: 13 }}>
-                      <span style={{ display: 'inline-block', marginRight: 6, padding: '0 6px', border: `1px solid ${INK}`, borderRadius: 3, fontSize: 11 }}>学習サイクル</span>
-                      {new Date(item.cycle.started_at).toLocaleString('ja-JP')}
+                      <span style={{ display: 'inline-block', marginRight: 6, padding: '0 6px', border: `1px solid ${INK}`, borderRadius: 3, fontSize: 11 }}>{item.cycle.isSequence ? 'シーケンス' : '学習サイクル'}</span>
+                      {item.cycle.isSequence ? `${item.cycle.name}　` : ''}{new Date(item.cycle.started_at).toLocaleString('ja-JP')}
                     </div>
                     <div style={{ fontSize: 11, color: '#888' }}>
                       <span style={{ color: statusColor(item.cycle.status), fontWeight: statusColor(item.cycle.status) === '#666' ? 400 : 700 }}>{CYCLE_STATUS_LABEL[item.cycle.status] ?? item.cycle.status}</span>
@@ -251,7 +275,7 @@ function CycleDetail({ cycle, members }) {
   }, [memberKey]);
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, gap: 6 }}>
-      <div style={{ fontWeight: 700, fontSize: 14, flexShrink: 0 }}>学習サイクル　{new Date(cycle.started_at).toLocaleString('ja-JP')}</div>
+      <div style={{ fontWeight: 700, fontSize: 14, flexShrink: 0 }}>{cycle.isSequence ? `シーケンス　${cycle.name}` : '学習サイクル'}　{new Date(cycle.started_at).toLocaleString('ja-JP')}</div>
       {groups === null
         ? <div style={{ fontSize: 13, color: '#888' }}>読み込み中…</div>
         : groups.length === 0

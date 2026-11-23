@@ -260,6 +260,13 @@ DDL_STATEMENTS = [
     """
     ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS schedule_name TEXT
     """,
+    # シーケンスの実行 1 回ぶんを束ねる（drive_recorder.py の SESSION_DDL_STATEMENTS と同じ）
+    """
+    ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS sequence_run_id UUID
+    """,
+    """
+    ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS sequence_name TEXT
+    """,
     # 利用者の「走行終了」で止めたセッションの status 'stopped'（O-6）。status の CHECK 制約があるときだけ作り直す
     """
     DO $$

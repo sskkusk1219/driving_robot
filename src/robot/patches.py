@@ -171,7 +171,11 @@ async def _emergency_before_shutdown(hw: Any) -> None:
         await emergency_stop.wait_if_running()
         return
     if _stop is not None and _stop.requested and emergency_stop.armed():
-        await emergency_stop.run(hw, f"{_stop.signal_name or '中断要求'} による中断")
+        if _stop.signal_name in ("stop", "quit", "EOF"):
+            # 通常の停止（「中断」「走行終了」）。非常停止ではないので文言を分ける
+            await emergency_stop.run(hw, emergency_stop.PLAIN_STOP_REASON)
+        else:
+            await emergency_stop.run(hw, f"{_stop.signal_name or '中断要求'} による中断")
 
 
 def _reason_of_current_exception() -> str:
@@ -415,6 +419,13 @@ def install_button_events() -> None:
     途中で例外・中断になっても出す）。``seconds`` が無限（押し続け）のときは start に ``hold: true``、end は離したとき。
     """
     inner_press = core_button_steps.press_button
+    core_say = core_button_steps.say
+
+    def hold_aware_say(message: str = "") -> None:
+        # core は押す秒数を {seconds:g}s と書くので、押し続け（無限）は「infs 押します」になる。文を直す
+        core_say(message.replace(" infs 押します", " 押し続けます（離すまで）"))
+
+    core_button_steps.say = hold_aware_say  # type: ignore[assignment]
 
     async def press_button(hw: Any, cfg: Any, button: str, seconds: float, **kwargs: Any) -> None:
         if math.isinf(seconds):

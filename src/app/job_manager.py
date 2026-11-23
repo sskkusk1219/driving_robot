@@ -142,9 +142,10 @@ LEARNING_STEPS: dict[str, str] = {
 #: （エラー終了の後は初期化済みの印が消えるが、車を IGN-OFF に戻す手段が要るため）
 IGN_OFF_STEPS = "25"
 
-#: 初期化済みでないと始められない種類（モード走行・学習・スケジュール・IGN-OFF。シーケンスの段はモード走行・スケジュールのジョブ）。
-#: 初期化は初期化ページだけ（ユーザー決定 2026-11-20）。手動運転・キャリブレーションだけは未初期化なら内部で初期化してから始める
-_INIT_REQUIRED_KINDS = (KIND_LEARNING, KIND_MODE_DRIVE, KIND_SCHEDULE, KIND_IGN_OFF)
+#: 初期化済みでないと始められない種類（モード走行・学習・スケジュール・IGN-OFF・手動運転・キャリブレーション。シーケンスの段はモード走行・スケジュールのジョブ）。
+#: 初期化は初期化ページだけ（ユーザー決定 2026-11-20）。手動運転・キャリブレーション（対話ジョブ）も同じ
+#: （内部での自動初期化はしない。ユーザー決定 2026-11-24）
+_INIT_REQUIRED_KINDS = (KIND_LEARNING, KIND_MODE_DRIVE, KIND_SCHEDULE, KIND_IGN_OFF, KIND_INTERACTIVE)
 
 #: 初期化が要るのに済んでいないときの案内（画面にも同じ文を出す）
 NOT_INITIALIZED_MESSAGE = (
@@ -766,6 +767,7 @@ class SequenceRun:
     current_job: _Job | None = None
     plan_files: dict[str, str] | None = None  # 準備済みのとき: モード名 → 計画ファイル（2 段目以降は走行前チェックなし）
     plan_dir: Path | None = None  # シーケンスが終わったら消す
+    run_id: str = field(default_factory=lambda: str(uuid.uuid4()))  # この実行 1 回の ID（各段のセッションを束ねる）
 
     @property
     def current(self) -> RunItem:
@@ -1091,21 +1093,36 @@ class JobManager:
 
         初期化（init_only）は、常駐ランナーが無ければ ``--serve`` で起動し、生きていれば ``init`` コマンドを送る。
         それ以外のジョブは、初期化済みの常駐ランナーへコマンドで送る（ランナーは起動しない）。"""
+        if spec.kind == KIND_INIT_ONLY and self._emergency_probe is not None and self._emergency_probe():
+            # 非常停止スイッチが押されたまま（または断線）。エッジが来ないので、ここでレベルを見て非常停止に入る
+            await self.emergency("switch")
+            raise EmergencyStillActive(
+                "非常停止スイッチが押されています（または断線しています）。スイッチを戻してから解除し、初期化してください"
+            )
         if not skip_check:
             self._check_can_start(sequence, prepared=prepared)
         runner = self._live_runner()
+        if spec.kind == KIND_INIT_ONLY and runner is not None and runner.exiting:
+            # 終わりかけの旧ランナー（初期化の中断で閉じるなど）が同じシリアルポートを持ったまま。終わるのを待ってから新しく起こす
+            try:
+                await asyncio.wait_for(runner.exited.wait(), self.kill_timeout_s)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    runner.proc.kill()
+                await runner.exited.wait()
+            runner = self._live_runner()
         # 初期化は機械の初期化（車と結びつけない）。ジョブは今選んでいる車（spec.vehicle_id）でコマンドを送る
         if spec.kind != KIND_INIT_ONLY:
             ready = self._initialized and runner is not None
-            if not ready:
-                if spec.kind in _INIT_REQUIRED_KINDS:
-                    raise JobConflict(NOT_INITIALIZED_MESSAGE)
-                await self._auto_init(spec.vehicle_id)  # スケジュール・手動・キャリブ・IGN-OFF: 初期化から続ける
-                runner = self._live_runner()
-                if runner is None:
-                    raise JobConflict("常駐ランナーが終了しました。初期化してからやり直してください")
+            if not ready and spec.kind in _INIT_REQUIRED_KINDS:
+                raise JobConflict(NOT_INITIALIZED_MESSAGE)
         session_id: str | None = None
         if spec.run_type is not None:
+            seq_kw = (
+                {"sequence_run_id": sequence.run_id, "sequence_name": sequence.name}
+                if sequence is not None
+                else {}
+            )
             try:
                 session_id = await self._recorder.start_session(
                     vehicle_id=spec.vehicle_id,
@@ -1113,6 +1130,7 @@ class JobManager:
                     run_type=spec.run_type,
                     schedule_id=spec.schedule_id if spec.kind == KIND_SCHEDULE else None,
                     schedule_name=spec.schedule_name if spec.kind == KIND_SCHEDULE else None,
+                    **seq_kw,
                 )
             except Exception as exc:
                 raise JobUnavailable(
@@ -1172,16 +1190,6 @@ class JobManager:
                     await self._safe_end_session(session_id, "error")
                 raise JobUnavailable(f"ランナーへコマンドを送れません: {exc}") from exc
         return status
-
-    async def _auto_init(self, vehicle_id: str) -> None:
-        """初期化済みでない常駐ランナーに、手動運転・キャリブレーションの前の初期化をさせる（終わるまで待つ）。"""
-        await self._start_locked(self.init_only_spec(vehicle_id), skip_check=True)
-        job = self._job
-        if job is not None:
-            await job.settled.wait()
-        if not self._initialized:
-            code = self._last.exit_code if self._last is not None else None
-            raise JobConflict(f"初期化に失敗しました（終了コード {code}）。進行のメッセージを確認してください")
 
     async def start_mode_drive(
         self, vehicle_id: str, mode_id: str, mode_name: str, limit_s: float | None = None

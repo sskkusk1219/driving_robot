@@ -317,6 +317,7 @@ function ProfileForm({ initial, onSave, onCancel, onDelete, onNav }) {
     const vehicleKeys = [...VEHICLE_BASIC_FIELDS, ...VEHICLE_MAX_FIELDS];
     if (isEdit) vehicleKeys.push(...VEHICLE_STOP_FIELDS, ...VEHICLE_ROADLOAD_FIELDS, ...VEHICLE_MIN_FIELDS);   // 新規作成では min は仮値のまま（送らない）
     for (const [k] of vehicleKeys) consider(k);
+    const labelOf = Object.fromEntries(vehicleKeys);   // 内部名 → 画面の欄の名前
     if (isEdit) {
       if (form.name.trim() !== base.name) payload.name = form.name.trim();
       if (form.road_load_source !== base.road_load_source && form.road_load_source.trim()) payload.road_load_source = form.road_load_source.trim();
@@ -336,7 +337,7 @@ function ProfileForm({ initial, onSave, onCancel, onDelete, onNav }) {
         return;
       }
     }
-    if (bad.length) { window.showToast(`数値として読めない欄があります: ${bad.join('、')}\n次にすること: 数字だけで入力し直してください。`, 'error'); return; }
+    if (bad.length) { window.showToast(`数値として読めない欄があります: ${bad.map(k => labelOf[k] ?? k).join('、')}\n次にすること: 数字だけで入力し直してください。`, 'error'); return; }
     await onSave(payload);
   }
 
