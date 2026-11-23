@@ -30,6 +30,163 @@ function AxisJog({ label, axisId, currentPos, openingPct, maxPct, onJog, enabled
   );
 }
 
+// ── スイッチ（スタート・P・N・D）: 押している間だけ押す ─────────────────
+// 押しているスイッチは最大 1 つ（先に押した方が優先。先を離しても、後から押していた側は押されない）。
+// 押している間は SWITCH_KEEPALIVE_MS ごとに「まだ押している」（down）を送り直す。ランナー側は
+// 1.5 s 届かなければ離す。キーは u / i / o / p。
+const SWITCHES = [
+  { id: 'start', label: 'スタート', key: 'u' },
+  { id: 'P', label: 'P', key: 'i' },
+  { id: 'N', label: 'N', key: 'o' },
+  { id: 'D', label: 'D', key: 'p' },
+];
+const SWITCH_KEEPALIVE_MS = 500;
+
+function useManualSwitches({ enabled, keysEnabled }) {
+  const { useState, useEffect, useRef } = React;
+  const [pressed, setPressed] = useState(null);
+  const pressedRef = useRef(null);
+  const timerRef = useRef(null);
+  const chainRef = useRef(Promise.resolve());   // 送る順番を保つ（down → up が入れ替わらない）
+  const inflightRef = useRef(false);
+  const latest = useRef({});
+  latest.current = { enabled, keysEnabled };
+
+  function stopTimer() {
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+  }
+  function clearPressed() {
+    stopTimer();
+    pressedRef.current = null;
+    setPressed(null);
+  }
+  function send(button, action) {
+    // 送る順番は守る。応答が NG（別のスイッチを押している等）なら押している状態を消す（トーストは apiFetch が出す）
+    const job = chainRef.current.then(async () => {
+      inflightRef.current = true;
+      try {
+        if (action === 'up') {
+          // 離すのは静かに送る（運転終了で手動運転が無くなった後の 409 でトーストを出さない）
+          await fetch('/api/v1/drive/manual/button', {
+            method: 'POST', keepalive: true,
+            headers: window.drvControlHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ button, action }),
+          }).catch(() => {});
+          return;
+        }
+        const r = await window.apiFetch('POST', '/api/v1/drive/manual/button', { button, action });
+        if (!r && pressedRef.current === button) clearPressed();
+      } finally {
+        inflightRef.current = false;
+      }
+    });
+    chainRef.current = job.catch(() => {});
+    return job;
+  }
+
+  function down(button) {
+    const st = latest.current;
+    if (window.__drvViewer || !st.enabled) return;
+    if (pressedRef.current) return;               // 画面側でも先押し優先
+    pressedRef.current = button;
+    setPressed(button);
+    send(button, 'down');
+    timerRef.current = setInterval(() => {
+      if (pressedRef.current !== button || inflightRef.current) return;
+      send(button, 'down');
+    }, SWITCH_KEEPALIVE_MS);
+  }
+  function up(button) {
+    if (!button || pressedRef.current !== button) return;    // 押していないスイッチを離しても何もしない
+    clearPressed();
+    return send(button, 'up');
+  }
+  function releaseAll() {
+    const b = pressedRef.current;
+    if (b) return up(b);
+    return Promise.resolve();
+  }
+
+  // 手動運転でなくなったら離す
+  useEffect(() => { if (!enabled) releaseAll(); }, [enabled]);
+
+  // キー（u / i / o / p）。ペダルのキーと同じ除外条件。押したまま画面を離れる・隠す・フォーカスを失うと離す
+  useEffect(() => {
+    const keyToButton = k => (SWITCHES.find(sw => sw.key === k) || {}).id;
+    function onKeyDown(e) {
+      if (e.repeat) return;                       // キーリピートは無視（押し直しが要る）
+      if (window.__drvViewer) return;
+      if (!latest.current.keysEnabled) return;
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const b = keyToButton(e.key.length === 1 ? e.key.toLowerCase() : e.key);
+      if (!b) return;
+      e.preventDefault();
+      down(b);
+    }
+    function onKeyUp(e) {
+      const b = keyToButton(e.key.length === 1 ? e.key.toLowerCase() : e.key);
+      if (b) up(b);
+    }
+    function onHidden() { releaseAll(); }
+    function onVisibility() { if (document.hidden) releaseAll(); }
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onHidden);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onHidden);
+      document.removeEventListener('visibilitychange', onVisibility);
+      releaseAll();                               // 画面を離れる（unmount）
+    };
+  }, []);
+
+  return { pressed, down, up };
+}
+
+// スイッチの枠。Btn はポインタのイベントを渡さないので、素の div を Btn と同じ見た目で作る。
+function SwitchPanel({ enabled, pressed, down, up }) {
+  const { Box, INK, INK_MUTE, PAPER_2, HATCH } = window;
+  return (
+    <Box label="スイッチ" style={{ padding: '10px 12px' }}>
+      <div style={{ display: 'flex', gap: 6, height: '100%' }}>
+        {SWITCHES.map(sw => {
+          const on = pressed === sw.id;
+          const dim = pressed != null && !on;       // 押している間、残りは薄く
+          return (
+            <div key={sw.id}
+                 data-switch={sw.id}
+                 onPointerDown={e => {
+                   if (!enabled) return;
+                   e.preventDefault();
+                   try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* 無視 */ }
+                   down(sw.id);
+                 }}
+                 onPointerUp={() => up(sw.id)}
+                 onPointerCancel={() => up(sw.id)}
+                 onLostPointerCapture={() => up(sw.id)}
+                 style={{
+                   display: 'flex', alignItems: 'center', justifyContent: 'center',
+                   border: `1.5px solid ${on ? '#c8922a' : HATCH}`, borderRadius: 5, padding: '6px 10px', minWidth: 48, boxSizing: 'border-box',
+                   background: !enabled ? PAPER_2 : on ? '#3a2a0a' : PAPER_2,
+                   color: !enabled ? INK_MUTE : on ? '#f0c060' : INK,
+                   fontFamily: 'inherit', fontWeight: on ? 700 : 500, fontSize: 14, whiteSpace: 'nowrap',
+                   cursor: enabled ? 'pointer' : 'not-allowed',
+                   opacity: !enabled ? 0.6 : dim ? 0.4 : 1,
+                   userSelect: 'none', touchAction: 'none',
+                 }}>
+              {sw.label}
+            </div>
+          );
+        })}
+      </div>
+    </Box>
+  );
+}
+
 function ManualScreen() {
   const { useState, useEffect, useContext, useRef } = React;
   const { apiFetch, activeProfileId, realtimeData, robotState, setNav, setNavLock } = useContext(window.AppContext);
@@ -91,6 +248,9 @@ function ManualScreen() {
     selectedAxis, setSelectedAxis,
     onJog: handleJog,
   });
+
+  // スイッチ（スタート・P・N・D）。キーはペダルのキーと同じ条件（ポップアップ表示中は反応しない）
+  const sw = useManualSwitches({ enabled, keysEnabled: enabled && !confirmStart && !confirmStop && !popup });
 
   function setAxisState(axisId, updater) {
     if (axisId === 'brake') setBrk(updater);
@@ -178,7 +338,7 @@ function ManualScreen() {
 
       {/* Bottom: shortcuts | status + button */}
       <div style={{ display: 'flex', gap: 10 }}>
-        <Box label="キーボードショートカット" style={{ padding: '10px 12px', flex: 1 }}>
+        <Box label="キーボードショートカット" style={{ padding: '10px 12px', flex: '0 1 auto' }}>
           <div style={{ fontSize: 12, lineHeight: 1.7, fontFamily: 'inherit' }}>
             <div>3 / 2  : ±0.01 %</div>
             <div>e / w  : ±0.1 %</div>
@@ -186,8 +346,11 @@ function ManualScreen() {
             <div>c / x  : ±10 %</div>
             <div>Tab    : 軸切替 (アクセル ↔ ブレーキ)</div>
             <div>パネルをクリック : その軸を操作対象にする</div>
+            <div>u / i / o / p : スタート / P / N / D（押している間）</div>
           </div>
         </Box>
+
+        <SwitchPanel enabled={enabled} pressed={sw.pressed} down={sw.down} up={sw.up} />
 
         <div style={{ display: 'flex', gap: 10, flex: 1 }}>
           <Box style={{ padding: '10px 14px', fontSize: 13, flex: 1 }}>
@@ -218,7 +381,7 @@ function ManualScreen() {
       {confirmStop && (
         <ConfirmStopPopup
           message="運転を終了しますか？"
-          onYes={handleStop}
+          onYes={async () => { await sw.up(sw.pressed); handleStop(); }}
           onNo={() => setConfirmStop(false)}
         />
       )}

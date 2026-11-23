@@ -830,3 +830,30 @@ def test_idle_log_disabled_by_default(tmp_path: Path) -> None:
     m = make_manager(tmp_path)
     m._say_idle("原点復帰しました")
     assert not (tmp_path / "logs").exists()
+
+
+async def test_send_button_skips_cmd_lock_and_hold_writes_button_row_at_end(tmp_path: Path) -> None:
+    """手動運転のスイッチ: ジョグの順番待ち（cmd_lock）を通らず、hold の BUTTON 行は離したとき（end）に正しい秒数で 1 行。"""
+    rec = FakeRecorder()
+    mgr = await make_ready(tmp_path, "", rec)
+    with pytest.raises(jm.JobConflict):
+        await mgr.send_button("D", "down")  # 手動運転でない
+    await mgr.ensure_interactive("v1", jm.PURPOSE_MANUAL)
+    job = mgr._job  # noqa: SLF001
+    assert job is not None
+    async with job.cmd_lock:  # ジョグの実行中を模す
+        ack = await asyncio.wait_for(mgr.send_button("D", "down"), 3)
+    assert ack["ok"]
+    await asyncio.sleep(0.3)
+    assert not [m for m in job.pending_messages if m[3] == jm.LEVEL_BUTTON]  # 押し始めでは書かない
+    assert job.status.button_events[-1]["end_s"] is None
+    await mgr.send_button("D", "up")
+    await asyncio.sleep(0.3)
+    rows = [m for m in rec.messages.get("sess1", []) + job.pending_messages if m[3] == jm.LEVEL_BUTTON]
+    assert len(rows) == 1
+    assert json.loads(rows[0][4]) == {"button": "D", "seconds": 1.5}
+    assert job.status.button_events[-1]["seconds"] == 1.5 and job.status.button_events[-1]["end_s"] is not None
+    sent = [c for c in runner_commands(tmp_path) if c["cmd"] == "button"]
+    assert [(c["button"], c["action"]) for c in sent] == [("D", "down"), ("D", "up")]
+    await mgr.stop()
+    await mgr.wait_idle(15)

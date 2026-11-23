@@ -183,6 +183,15 @@ def handle_line(line):
             result(jid, 0, runner_exit=True)
         sys.exit(0)
     # 対話の操作
+    if kind == "button" and job is not None and job["kind"] == "interactive":
+        # 手動運転のスイッチ: ジョグの順番とは別に即 ack。down で押し始め（hold）、up で離す（押した秒数 1.5 s）
+        log(json.dumps(cmd, ensure_ascii=False, sort_keys=True))
+        emit("ack", id=cmd.get("id"), cmd=kind, ok=True, message="OK", job_id=job["job_id"])
+        if cmd["action"] == "down":
+            emit("button", button=cmd["button"], phase="start", seconds=None, hold=True, job_id=job["job_id"])
+        else:
+            emit("button", button=cmd["button"], phase="end", seconds=1.5, hold=True, job_id=job["job_id"])
+        return
     if job is not None and job["kind"] == "interactive":
         log(json.dumps(cmd, ensure_ascii=False, sort_keys=True))
         ok = kind != "bad"

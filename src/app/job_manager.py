@@ -53,7 +53,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -687,6 +687,7 @@ class _Job:
     pending: dict[int, _Pending] = field(default_factory=dict)
     next_cmd_id: int = 1
     cmd_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # 標準入力への書き込みだけを守る（send_button は cmd_lock を通らない）
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     flusher: asyncio.Task[None] | None = None
     # エラーページ用: 直前の進行メッセージ（最大 50 行）と、警告・エラーの行（水準, 文）
@@ -2006,16 +2007,23 @@ class JobManager:
                 "減速して停車 → N → IGN-OFF → 原点復帰の後、非常停止を解除してください",
                 "WARNING",
             )
-        if kind == "button" and event.get("phase") == "start":
-            # ボタン押下の機械可読な記録（level BUTTON・time は押し始めの壁時計）。ログ画面の走行グラフが読む
+        if kind == "button" and (
+            (event.get("phase") == "start" and not event.get("hold"))
+            or (event.get("phase") == "end" and event.get("hold"))
+        ):
+            # ボタン押下の機械可読な記録（level BUTTON・time は押し始めの壁時計）。ログ画面の走行グラフが読む。
+            # 押し続け（hold）は押し始めの時点で秒数が決まらないので、離したとき（end）に
+            # 「押し始めの時刻 ＝ 今 − 秒数」・実際の秒数で 1 行書く
+            seconds = float(event.get("seconds") or 0.0)
+            back = seconds if event.get("hold") else 0.0
             job.seq += 1
             job.pending_messages.append(
                 (
                     job.seq,
-                    round(time.monotonic() - job.status.t0, 3),
-                    datetime.now(tz=UTC),
+                    round(max(0.0, time.monotonic() - job.status.t0 - back), 3),
+                    datetime.now(tz=UTC) - timedelta(seconds=back),
                     LEVEL_BUTTON,
-                    button_message(str(event.get("button", "")), float(event.get("seconds") or 0.0)),
+                    button_message(str(event.get("button", "")), seconds),
                 )
             )
         if kind == "state" and event.get("phase") == "interactive":
@@ -2373,6 +2381,43 @@ class JobManager:
             raise JobConflict(f"初期化に失敗しました（終了コード {code}）。進行のメッセージを確認してください")
         return job.status
 
+    async def send_button(
+        self, button: str, action: str, *, timeout: float = COMMAND_TIMEOUT_S
+    ) -> dict[str, Any]:
+        """手動運転のスイッチ（スタート・P・N・D）の down / up をランナーへ送り、ack を返す。
+
+        ペダルのジョグ（``send_command``）の順番待ち（cmd_lock）を通らない。ランナーは button を
+        キューに入れずその場で処理するので、ジョグの最中でも即座に返る。"""
+        job = self._job
+        if (
+            job is None
+            or job.status.spec.kind != KIND_INTERACTIVE
+            or job.status.spec.purpose != PURPOSE_MANUAL
+            or not job.status.interactive_ready
+        ):
+            raise JobConflict("スイッチを操作できる手動運転がありません")
+        stdin = job.proc.stdin
+        if stdin is None or job.proc.returncode is not None:
+            raise JobConflict("手動運転は終了しています")
+        cmd_id = job.next_cmd_id
+        job.next_cmd_id += 1
+        loop = asyncio.get_running_loop()
+        pending = _Pending(ack=loop.create_future(), status=loop.create_future())
+        job.pending[cmd_id] = pending
+        try:
+            async with job.write_lock:
+                line = {"cmd": "button", "button": button, "action": action, "id": cmd_id}
+                stdin.write((json.dumps(line, ensure_ascii=False) + "\n").encode())
+                await stdin.drain()
+            try:
+                return await asyncio.wait_for(pending.ack, timeout)
+            except TimeoutError as exc:
+                raise JobUnavailable("スイッチ操作の応答がありません") from exc
+            except asyncio.CancelledError:
+                raise JobConflict("手動運転が終了しました") from None
+        finally:
+            job.pending.pop(cmd_id, None)
+
     async def send_command(
         self, command: dict[str, Any], *, timeout: float = COMMAND_TIMEOUT_S
     ) -> InteractiveReply:
@@ -2394,8 +2439,9 @@ class JobManager:
             pending = _Pending(ack=loop.create_future(), status=loop.create_future())
             job.pending[cmd_id] = pending
             try:
-                stdin.write((json.dumps({**command, "id": cmd_id}, ensure_ascii=False) + "\n").encode())
-                await stdin.drain()
+                async with job.write_lock:
+                    stdin.write((json.dumps({**command, "id": cmd_id}, ensure_ascii=False) + "\n").encode())
+                    await stdin.drain()
                 try:
                     ack = await asyncio.wait_for(pending.ack, timeout)
                 except TimeoutError as exc:

@@ -24,7 +24,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import functools
+import math
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -410,11 +412,24 @@ def install_button_events() -> None:
     """差し替え 9: press_button（8 のボタンなしの経路も含めた最も外側）に button イベント（start/end）を付ける。
 
     押す秒数 ``seconds`` だけ「押している」。end は start から ``seconds`` 後（押した後の待ちは含めない。
-    途中で例外・中断になっても出す）。
+    途中で例外・中断になっても出す）。``seconds`` が無限（押し続け）のときは start に ``hold: true``、end は離したとき。
     """
     inner_press = core_button_steps.press_button
 
     async def press_button(hw: Any, cfg: Any, button: str, seconds: float, **kwargs: Any) -> None:
+        if math.isinf(seconds):
+            # 押し続け（手動運転のスイッチ。button_hold.py）: 離す（取り消し）まで押す。
+            # start は seconds なし・hold:true、end は実際に押した秒数を付けて出す
+            events.emit("button", button=button, phase="start", seconds=None, hold=True)
+            t_start = time.monotonic()
+            try:
+                await inner_press(hw, cfg, button, seconds, **kwargs)
+            finally:
+                events.emit(
+                    "button", button=button, phase="end", hold=True,
+                    seconds=round(time.monotonic() - t_start, 3),
+                )
+            return
         sec = round(float(seconds), 3)
         events.emit("button", button=button, phase="start", seconds=sec)
         asyncio.get_running_loop().call_later(

@@ -10,6 +10,7 @@
 | `events.py` | イベント（JSON 1 行）の形式と出し口 |
 | `streaming_log.py` | `StreamingSessionLog`（core の `SessionLog` の派生。sample/csv イベント） |
 | `patches.py` | core の挙動を差し替える所（**差し替え点はここだけ**） |
+| `button_hold.py` | 手動運転のスイッチ（スタート・P・N・D）の押し続け（`button` コマンド。`ButtonHold`） |
 | `cancel_guard.py` | cancel 中の通信例外を CancelledError に戻す（差し替え 12） |
 | `emergency_stop.py` | 走行するジョブの非常停止の流れ（減速して停車 → N → スタート 10 秒 → 原点復帰。差し替え 10。流れの間は 0.2 s ごとに `sample`（section=STOPPING・車速は CAN・開度は直近の指令位置）を出して画面のグラフを動かす） |
 | `interrupt.py` | SIGINT / SIGTERM の扱い（終了処理を必ず走らせる） |
@@ -197,6 +198,7 @@ SIGINT・SIGTERM は、走行中のジョブがあれば今どおり中断（非
 | `save_min` | `{"cmd":"save_min","axis":"accel"}`（`both` も可） | 今の実位置を `vehicle.min_*_opening_pct` として車両 yaml へ（コメントは保つ） |
 | `save_max` | `{"cmd":"save_max","axis":"accel"}` | 今の実位置を `vehicle.max_*_opening_pct` として車両 yaml へ（min+1% 以上・99% 以下。段11） |
 | `quit` | `{"cmd":"quit"}` | 終了 |
+| `button` | `{"cmd":"button","button":"start｜P｜N｜D","action":"down｜up"}` | **手動運転（`purpose=manual`）の間だけ**。スイッチを押している間だけ押す（`down` で押し始め、`up` で離す）。**キューに入れず、その場で処理して ack**（ペダルの `jog` の最中でも即返る）。押しているスイッチは最大 1 つで、**先に押した方が優先**（別のボタンの `down` は NG「スイッチ「X」を押しています」）。先を離しても後から押していた側は押されない（押し直し）。押している間は **0.5 s ごとに `down` を送り直す**（同じボタンの `down` は押し続けの確認）。最後の `down` から **1.5 s（`KEEPALIVE_TIMEOUT_S`）届かなければ離す**。運転終了・中断・非常停止では、押しているスイッチを離してから先へ進む。`button` イベントは押し始めが `seconds: null, hold: true`、離したとき `phase: end`（実際に押した秒数つき）。実装は `button_hold.py`（core の `press_button` に無限秒を渡し、離すとき取り消す） |
 
 開度の定義は core と同じ（原点 0%・9500 pulse = 100%）。開度は 0〜`vehicle.max_*_opening_pct` に収める
 （超えたら max にして ack に書く）。`jog`・`move` に `"calib":true` を付けると（キャリブレーション画面だけ）上限を
@@ -220,7 +222,7 @@ core の走行前チェックと同じ 20 mm/s。
 | 8 | `button_steps.press_button` を最も外側で包む・`ensure_buttons_connected`（core_hardware・button_steps・schedule_job の名前の取り込みも）→ ボタンなしのとき何もしない | D-15c（ユーザー決定 2026-11-16）: 車両 yaml の src 専用キー `buttons.installed: false`（SG90 を外している）のとき、PCA9685 に繋がずサーボを動かさず、`ボタンなし: 「…」を押したことにします` をログに残すだけ（押す秒数・押した後の待ちは同じだけ待つ。ブレーキ ON などの前提動作は元のまま）。設定は `patches.configure(cfg)` がランナーの起動時に渡す。段11 でボタンの設定（`buttons:` 全部）は共通設定へ移した（車両 yaml に `buttons:` が残っていても無視する） |
 | 6 | 学習の手順（2・12〜14）の `Step.handler` を包む（`learning_buttons.py`。`run.py` が `wrap_step` の後に足す） | D-14b: tests の学習運転にはボタン操作が無いので、src 側で手順 24 と同じ Ready・D・N を足す（下記） |
 | 10 | `_release_pedals`（core の pattern_drive・mode_drive・excite と src の schedule_job の属性）・`button_steps.press_shift_n_after_drive`・`main.shutdown`（4）を包む（`install_emergency_stop`） | 走行するジョブ（手順 2・12〜14・24・スケジュール。対話・ボタンだけのジョブは対象外）の非常停止を `emergency_stop.py` の流れにする。きっかけは SIGINT（shutdown の前に流れを走らせる。走行前チェックが済んでいるときだけ）と自動の非常停止（DriveError。`_release_pedals` の中で走らせ、理由は今の例外の文言）。流れは `asyncio.shield` した 1 本の task で、後から来る SIGINT は同じ流れを待つだけ。流れが済んだら N の二重押しをしない。止まらないとき（`brake_kept`）と、停車しているのに N を押せないとき（`buttons_unavailable`。ブレーキは停車保持の開度で止めたまま）は shutdown で原点復帰・サーボOFF を飛ばす。秒数: スタート `buttons.ign_off_press_s`（10 s）・CAN を読めないときの踏み込み `emergency.can_lost_press_s`（src 専用キー、既定 20 s）。2026-11-19 |
-| 9 | `button_steps.press_button` を最も外側で包む（8 の後。`install_button_events`） | 段11: ボタンの押し始め・`seconds` 後の離しを `button` イベントにする（ペダルの図の矩形。ボタンなしでも出る） |
+| 9 | `button_steps.press_button` を最も外側で包む（8 の後。`install_button_events`） | 段11: ボタンの押し始め・`seconds` 後の離しを `button` イベントにする（ペダルの図の矩形。ボタンなしでも出る）。`seconds` が無限（手動運転の押し続け）のときは start に `seconds: null, hold: true`、end は離したとき（実際の秒数つき） |
 | 12 | `_ModeRun.drive_axis`・`PatternLoop._drive_or_sense`・`_ExciteRun._drive_axis` を包む（`install_cancel_guard`。`cancel_guard.py`） | B-2: stop・SIGINT の cancel が Modbus 要求の最中に届いて ModbusIOException になっても、cancel 中なら CancelledError に戻して停止の流れに入れる（誤った「通信失敗」ERROR を出さない） |
 
 **学習の手順のボタン操作（段7b、D-14b）**: 走行前チェックの後、最初の学習の手順の前に「ブレーキを停車保持の開度（`stop_brake_opening_pct`。新しい車の仮値でもそのまま）に → スタート短押しで Ready →
@@ -315,6 +317,7 @@ NOT NULL の列が空欄の行は 0 にする。`kind=drive` の CSV（と隣の
 | 残した（意味変更） | `POST /stop` | 実行中のジョブへ SIGINT（無ければ `{"status":"idle"}`） |
 | 残した | `POST /emergency`・`/reset-emergency` | 非常停止・解除（423 スイッチ押下中・409 終了処理中） |
 | 残した（意味変更） | `POST /manual/start・jog・home・stop` | 手動運転（対話ジョブ）。jog の `step` は pulse のまま（% へ換算） |
+| 足した | `POST /manual/button {button: start｜P｜N｜D, action: down｜up}` | 手動運転のスイッチ。`{ok, message}`。手動運転でなければ 409・ランナーが断ったとき（別のスイッチを押している等）も 409（message つき）。ジョグの順番待ちは通らない。down は 0.5 s ごとに送り直す |
 | 残した（意味変更） | `POST /calib/jog・home` | キャリブレーション（対話ジョブ。最初の呼び出しで始まる）。終わりは `/stop` |
 | 残した（意味変更） | `POST /learning-cycle/start・abort`・`GET /learning-cycle/status` | 学習ジョブ（body 省略は full）・中断・状態 |
 | 残した（互換） | `POST /arm`・`/cancel`・`/learning-cycle/arm`・`/learning-cycle/cancel` | 旧「準備」の確認ポップアップ用。arm は始められるかの確認だけ・cancel は何もしない（段5 で画面から外す） |
