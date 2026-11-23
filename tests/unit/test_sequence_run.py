@@ -99,6 +99,9 @@ async def test_sequence_runs_all_steps_in_order_one_session_each(tmp_path: Path)
     assert len(rec.sessions) == 6 and all(v["status"] == "completed" for v in rec.sessions.values())
     assert [v["mode_id"] for v in rec.sessions.values()] == [None, None, "mode-1"] * 2
     assert {v["run_type"] for v in rec.sessions.values()} == {"auto"}
+    # 全段のセッションが同じ実行 ID・シーケンス名で束ねられる
+    assert {v["sequence_run_id"] for v in rec.sessions.values()} == {seq.run_id} and seq.run_id
+    assert {v["sequence_name"] for v in rec.sessions.values()} == {"S"}
     assert [r["final_status"] for r in done.results] == ["completed"] * 6
     d = done.to_dict()
     assert d["run_no"] == 6 and d["state"] == "completed" and len(d["session_ids"]) == 6
@@ -186,7 +189,7 @@ async def test_single_schedule_job(tmp_path: Path) -> None:
     await mgr.wait_idle(30)
     assert mgr.last_job is not None and mgr.last_job.final_status == "completed"
     assert list(rec.sessions.values()) == [
-        {"vehicle_id": "car", "mode_id": None, "run_type": "auto", "status": "completed", "schedule_id": "id-単発", "schedule_name": "単発"}
+        {"vehicle_id": "car", "mode_id": None, "run_type": "auto", "status": "completed", "schedule_id": "id-単発", "schedule_name": "単発", "sequence_run_id": None, "sequence_name": None}
     ]
     cmd = runner_commands(tmp_path)[-1]
     assert cmd["cmd"] == "schedule" and cmd["schedule"]["name"] == "単発" and cmd["home_at_end"] is True  # 単独は原点復帰する

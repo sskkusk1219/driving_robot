@@ -34,6 +34,9 @@ MessageRow = tuple[int, float, datetime, str, str]
 SESSION_DDL_STATEMENTS = [
     "ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS schedule_id UUID",
     "ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS schedule_name TEXT",
+    # シーケンスの実行 1 回ぶんを束ねる（段ごとに 1 セッションできるので、ログ画面でまとめて見せるため）
+    "ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS sequence_run_id UUID",
+    "ALTER TABLE drive_sessions ADD COLUMN IF NOT EXISTS sequence_name TEXT",
     """
     DO $$
     BEGIN
@@ -77,6 +80,8 @@ class DriveRecorder(Protocol):
         run_type: str,
         schedule_id: str | None = None,
         schedule_name: str | None = None,
+        sequence_run_id: str | None = None,
+        sequence_name: str | None = None,
     ) -> str | None: ...
 
     async def add_messages(self, session_id: str, rows: Sequence[MessageRow]) -> None: ...
@@ -97,6 +102,8 @@ class NullDriveRecorder:
         run_type: str,  # noqa: ARG002
         schedule_id: str | None = None,  # noqa: ARG002
         schedule_name: str | None = None,  # noqa: ARG002
+        sequence_run_id: str | None = None,  # noqa: ARG002
+        sequence_name: str | None = None,  # noqa: ARG002
     ) -> str | None:
         return None
 
@@ -122,13 +129,16 @@ class PgDriveRecorder:
         run_type: str,
         schedule_id: str | None = None,
         schedule_name: str | None = None,
+        sequence_run_id: str | None = None,
+        sequence_name: str | None = None,
     ) -> str | None:
-        """schedule_id・schedule_name はスケジュールのジョブだけ（名前はその時点の写し。後で消えても残る）。"""
+        """schedule_id・schedule_name はスケジュールのジョブだけ（名前はその時点の写し。後で消えても残る）。
+        sequence_run_id・sequence_name はシーケンスの段だけ（同じ実行の段は同じ sequence_run_id）。"""
         session_id = str(uuid.uuid4())
         await self._pool.execute(
             """
-            INSERT INTO drive_sessions (id, profile_id, mode_id, run_type, started_at, status, vehicle_id, schedule_id, schedule_name)
-            VALUES ($1, NULL, $2, $3, NOW(), 'running', $4, $5, $6)
+            INSERT INTO drive_sessions (id, profile_id, mode_id, run_type, started_at, status, vehicle_id, schedule_id, schedule_name, sequence_run_id, sequence_name)
+            VALUES ($1, NULL, $2, $3, NOW(), 'running', $4, $5, $6, $7, $8)
             """,
             uuid.UUID(session_id),
             uuid.UUID(mode_id) if mode_id else None,
@@ -136,6 +146,8 @@ class PgDriveRecorder:
             vehicle_id,
             _uuid_or_none(schedule_id),
             schedule_name or None,
+            _uuid_or_none(sequence_run_id),
+            sequence_name or None,
         )
         return session_id
 

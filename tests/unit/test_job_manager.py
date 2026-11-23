@@ -38,11 +38,14 @@ class FakeRecorder:
         run_type: str,
         schedule_id: str | None = None,
         schedule_name: str | None = None,
+        sequence_run_id: str | None = None,
+        sequence_name: str | None = None,
     ) -> str | None:
         sid = f"sess{len(self.sessions) + 1}"
         self.sessions[sid] = {
             "vehicle_id": vehicle_id, "mode_id": mode_id, "run_type": run_type, "status": "running",
             "schedule_id": schedule_id, "schedule_name": schedule_name,
+            "sequence_run_id": sequence_run_id, "sequence_name": sequence_name,
         }
         return sid
 
@@ -392,7 +395,7 @@ async def test_mode_drive_job_completes_and_records(tmp_path: Path, monkeypatch:
     assert mgr.state == jm.STATE_STANDBY and not mgr.is_busy and mgr.initialized
     last = mgr.last_job
     assert last is not None and last.exit_code == 0 and last.final_status == "completed"
-    assert rec.sessions["sess1"] == {"vehicle_id": "v1", "mode_id": "mode-id", "run_type": "auto", "status": "completed", "schedule_id": None, "schedule_name": None}
+    assert rec.sessions["sess1"] == {"vehicle_id": "v1", "mode_id": "mode-id", "run_type": "auto", "status": "completed", "schedule_id": None, "schedule_name": None, "sequence_run_id": None, "sequence_name": None}
     texts = [m[4] for m in rec.messages["sess1"]]
     assert any("ジョブの終わり" in t for t in texts) and any("ジョブ終了" in t for t in texts)
     seqs = [m[0] for m in rec.messages["sess1"]]
@@ -510,11 +513,12 @@ async def test_stop_sends_stop_command_and_does_not_enter_emergency(tmp_path: Pa
 
 async def test_emergency_sends_sigint_closes_runner_and_blocks_until_reset(tmp_path: Path) -> None:
     rec = FakeRecorder()
-    probe = {"pressed": True}
+    probe = {"pressed": False}  # 初期化はスイッチが戻っているときだけ通る
     mgr = await make_ready(tmp_path, "h", rec, emergency_probe=lambda: probe["pressed"])
     await mgr.start_mode_drive("v1", "m", "WLTP")
     await wait_until(lambda: mgr.current is not None and mgr.current.sample is not None)
     assert mgr.snapshot()["emergency_cause"] is None
+    probe["pressed"] = True
     await mgr.emergency("switch")
     assert mgr.snapshot()["emergency_cause"] == "switch" and mgr.initialized is False
     await mgr.emergency("ac_loss")  # 二重に来ても最初のきっかけを残す
@@ -679,12 +683,33 @@ async def test_schedule_and_ign_off_without_init_are_409_and_start_nothing(tmp_p
     assert not mgr.is_busy and mgr.sequence is None and mgr.prepare is None and runner_starts(tmp_path) == 0
 
 
-async def test_calibration_without_init_runs_init_first(tmp_path: Path) -> None:
+async def test_interactive_without_init_is_refused(tmp_path: Path) -> None:
+    """手動運転・キャリブレーションも未初期化なら 409（内部で初期化しない。2026-11-24）。"""
     mgr = make_manager(tmp_path)
-    st = await mgr.ensure_interactive("v1", jm.PURPOSE_CALIB)  # 手動・キャリブだけは内部で初期化してから始める
-    assert st.interactive_ready and runner_starts(tmp_path) == 1 and mgr.initialized
+    for purpose in (jm.PURPOSE_MANUAL, jm.PURPOSE_CALIB):
+        with pytest.raises(jm.JobConflict, match="初期化ページ"):
+            await mgr.ensure_interactive("v1", purpose)
+    assert not mgr.is_busy and runner_starts(tmp_path) == 0
+
+
+async def test_calibration_after_init_runs(tmp_path: Path) -> None:
+    mgr = await make_ready(tmp_path, "h")
+    st = await mgr.ensure_interactive("v1", jm.PURPOSE_CALIB)
+    assert st.interactive_ready and runner_starts(tmp_path) == 1
     await mgr.stop()
     await mgr.wait_idle(15)
+    await mgr.shutdown()
+
+
+async def test_init_with_switch_pressed_enters_emergency(tmp_path: Path) -> None:
+    """起動時・初期化時に非常停止スイッチが HIGH なら、非常停止に入って 423 で断る（#22）。"""
+    probe = {"pressed": True}
+    mgr = make_manager(tmp_path, emergency_probe=lambda: probe["pressed"])
+    with pytest.raises(jm.EmergencyStillActive):
+        await mgr.start_init_only("v1")
+    assert mgr.state == jm.STATE_EMERGENCY and not mgr.initialized and runner_starts(tmp_path) == 0
+    probe["pressed"] = False
+    await mgr.reset_emergency()
     await mgr.shutdown()
 
 

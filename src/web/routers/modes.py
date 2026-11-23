@@ -84,6 +84,10 @@ def _detect_columns(fieldnames: list[str]) -> tuple[str, str]:
     return time_col, speed_col
 
 
+#: CSV の終わりに要る、車速 0 km/h が続く長さ [s]
+_MIN_TRAILING_ZERO_S = 1.0
+
+
 def _parse_csv(content: bytes) -> list[SpeedPoint]:
     """CSV をパースして SpeedPoint リストを返す。
 
@@ -111,6 +115,18 @@ def _parse_csv(content: bytes) -> list[SpeedPoint]:
         prev_time = t
     if not points:
         raise ValueError("CSV にデータ行がありません")
+    # 最後は車速 0 km/h が 1 秒以上続くこと（停車で終わらない基準だと、終端で止め切れない）
+    zero_from = points[-1].time_s
+    for p in reversed(points):
+        if p.speed_kmh != 0:
+            break
+        zero_from = p.time_s
+    zero_span = points[-1].time_s - zero_from if points[-1].speed_kmh == 0 else 0.0
+    if zero_span < _MIN_TRAILING_ZERO_S:
+        raise ValueError(
+            f"最後に車速 0 km/h が {_MIN_TRAILING_ZERO_S:g} 秒以上続く行が要ります"
+            f"（今は {zero_span:g} 秒）"
+        )
     return points
 
 

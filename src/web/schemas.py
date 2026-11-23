@@ -489,6 +489,9 @@ class SessionResponse(BaseModel):
     cycle_id: str | None = None
     schedule_id: str | None = None  # スケジュールのジョブだけ。名前は開始時点の写し（後でスケジュールが消えても残る）
     schedule_name: str | None = None
+    # シーケンスの段だけ。同じ実行の段は同じ sequence_run_id（ログ画面でまとめる用）。名前は開始時点の写し
+    sequence_run_id: str | None = None
+    sequence_name: str | None = None
 
 
 class CycleSummaryResponse(BaseModel):

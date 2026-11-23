@@ -30,6 +30,7 @@ def emitted(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     from src.robot import schedule_job
 
     monkeypatch.setattr(button_steps, "press_button", button_steps.press_button)
+    monkeypatch.setattr(button_steps, "say", button_steps.say)
     monkeypatch.setattr(button_steps, "ensure_buttons_connected", button_steps.ensure_buttons_connected)
     monkeypatch.setattr(core_hardware, "ensure_buttons_connected", core_hardware.ensure_buttons_connected)
     monkeypatch.setattr(schedule_job, "ensure_buttons_connected", schedule_job.ensure_buttons_connected)
@@ -128,3 +129,19 @@ async def test_finite_press_event_unchanged(cfg: Any, emitted: list[dict[str, An
     ev = [e for e in emitted if e["event"] == "button"]
     assert ev[0] == {"event": "button", "button": "start", "phase": "start", "seconds": 0.05}
     assert ev[1]["phase"] == "end" and ev[1]["seconds"] == 0.05 and "hold" not in ev[1]
+
+
+async def test_hold_line_says_hold_not_infs(
+    cfg: Any, emitted: list[dict[str, Any]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """押し続けのログは「infs 押します」ではなく「押し続けます（離すまで）」と書く。"""
+    hw = await _hw(cfg)
+    hold = button_hold.ButtonHold(hw, cfg)
+    await hold.down("start")
+    await asyncio.sleep(0.2)
+    await hold.up("start")
+    out = capsys.readouterr().out
+    assert "infs" not in out and "押し続けます（離すまで）" in out
+    from src.infra.button_events import parse_button_text
+
+    assert parse_button_text("  ボタン「P」を ch0 145° で 押し続けます（離すまで） …") is None  # 秒数が無い行は読まない（BUTTON 行を使う）

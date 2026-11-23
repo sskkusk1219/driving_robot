@@ -24,6 +24,9 @@ from src.robot.core import button_steps as core_button_steps
 from src.robot.core.button_servo import button_name
 from src.robot.core.term import say
 
+#: keepalive（送り直し）の down への ack の文の末尾。進行のメッセージに溜めない目印
+KEEPALIVE_SUFFIX = "」を押し続けています"
+
 #: 見張りの時間切れ [s]。送り直しは 0.5 s ごと → 2 回取りこぼしても離さない幅（仮の値）
 KEEPALIVE_TIMEOUT_S = 1.5
 #: 見張りが時刻を見る間隔 [s]
@@ -71,7 +74,7 @@ class ButtonHold:
             if current is not None:
                 if current == button:
                     self._last_down = now
-                    return True, f"「{button_name(button)}」を押し続けています"
+                    return True, f"「{button_name(button)}{KEEPALIVE_SUFFIX}"
                 return False, f"スイッチ「{button_name(current)}」を押しています"
             self._button = button
             self._last_down = now

@@ -303,10 +303,17 @@ async def _flow(hw: Any, reason: str) -> None:
         await asyncio.gather(streamer, return_exceptions=True)
 
 
+#: 通常の停止（stop・quit・EOF コマンド）の理由の文。非常停止ではないので、ログの文言を分ける
+PLAIN_STOP_REASON = "中断"
+
+
 async def _flow_body(hw: Any, reason: str) -> None:
     cfg = _ctx.config
     say("=" * 60)
-    say(f"非常停止の流れを始めます（理由: {reason or '中断要求'}）")
+    if reason == PLAIN_STOP_REASON:
+        say(f"停止の流れを始めます（理由: {reason}）")
+    else:
+        say(f"非常停止の流れを始めます（理由: {reason or '中断要求'}）")
     _emit("start", reason or "")
     diag = await classify(hw, reason)
     for note in diag.notes:

@@ -144,3 +144,12 @@ async def test_session_response_schedule_fields_default_none(client: AsyncClient
     app.state.session_repo = _SessionRepo([_session()])
     detail = (await client.get(f"/api/v1/sessions/{SESSION_ID}")).json()
     assert detail["schedule_id"] is None and detail["schedule_name"] is None
+
+
+async def test_session_response_has_sequence_fields(client: AsyncClient) -> None:
+    rid = "00000000-0000-0000-0000-0000000000e1"
+    app.state.session_repo = _SessionRepo([_session(sequence_run_id=rid, sequence_name="夜間")])
+    listed = (await client.get("/api/v1/sessions/")).json()
+    assert listed[0]["sequence_run_id"] == rid and listed[0]["sequence_name"] == "夜間"
+    app.state.session_repo = _SessionRepo([_session()])
+    assert (await client.get("/api/v1/sessions/")).json()[0]["sequence_run_id"] is None

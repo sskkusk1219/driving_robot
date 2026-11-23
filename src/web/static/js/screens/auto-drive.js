@@ -72,6 +72,10 @@ function DriveMonitorScreen({
   startDisabledReason = null,
   // シーケンスの開始前の枠3・基準の線に使う（選んだシーケンスの ID。走っていない間だけ使う）
   seqPreviewId = null,
+  // 学習の画面だけ: 中断・終了のあとも、最後の走行の線を次のジョブが始まるまで残す
+  keepTraceAfterStop = false,
+  // 状態の行の「区間」に出す文字（学習の画面は今の段の名前。無ければ走行ログの区間名）
+  sectionLabel = null,
 }) {
   const { useState, useEffect, useContext, useRef } = React;
   const { apiFetch, realtimeData, realtimeBuf, activeModeId, activeModeName, activeModeKind, robotState, setNavLock, setNav, recheckSelection } = useContext(window.AppContext);
@@ -101,6 +105,7 @@ function DriveMonitorScreen({
   const [frozenS, setFrozenS] = useState(null);
   // 実測・ペダルの点（受け取ったときの経過秒 t を 1 回だけ決めて持つ。一時停止中も過去の点がずれない）
   const ptsRef = useRef({ jobId: null, lastTs: 0, list: [] });
+  const keptTraceRef = useRef(null);   // keepTraceAfterStop: 走行中の最後の線（{ jobId, nowS, speed, accel, brake }）
 
   // 実行中のジョブ（WebSocket の job。終わると null）。この画面のジョブか・別のジョブかを分ける
   const liveJob = realtimeData?.job ?? null;
@@ -489,8 +494,12 @@ function DriveMonitorScreen({
   // 左半分=過去(実測+基準)、中央=現在、右半分=未来(基準の先読み)。
   const WINDOW_S = 30;
   const HALF_S = WINDOW_S / 2;
-  const windowStartS = nowS - HALF_S;   // クランプしない（now を常に中央に保つ）。走行前は nowS=0 → [-15, +15]
-  const windowEndS   = nowS + HALF_S;
+  // 中断・終了のあと（keepTraceAfterStop）は、最後の走行の線とその時刻の窓をそのまま見せる
+  const keptView = keepTraceAfterStop && !isDriving && keptTraceRef.current
+    && (!liveJob || liveJob.job_id === keptTraceRef.current.jobId) ? keptTraceRef.current : null;
+  const viewNowS = keptView ? keptView.nowS : nowS;
+  const windowStartS = viewNowS - HALF_S;   // クランプしない（now を常に中央に保つ）。走行前は nowS=0 → [-15, +15]
+  const windowEndS   = viewNowS + HALF_S;
 
   const toFrac = elapsedS => (elapsedS - windowStartS) / WINDOW_S;
 
@@ -528,11 +537,14 @@ function DriveMonitorScreen({
   }
 
   // 実車速: 同一時間軸に位置合わせ（走行中のみ）。最新点は中央(frac=0.5)に張り付く
-  const speedAct_pts = trace('actual_speed_kmh', maxSpeed, PH1);
+  const speedAct_pts = keptView ? keptView.speed : trace('actual_speed_kmh', maxSpeed, PH1);
 
   // Axis 2: openings — axis 1 と共通の時間軸
-  const accelPts = trace('accel_opening', 100, PH2);
-  const brakePts = trace('brake_opening', 100, PH2);
+  const accelPts = keptView ? keptView.accel : trace('accel_opening', 100, PH2);
+  const brakePts = keptView ? keptView.brake : trace('brake_opening', 100, PH2);
+  if (keepTraceAfterStop && isDriving && driveStart) {
+    keptTraceRef.current = { jobId: liveJob?.job_id ?? null, nowS, speed: speedAct_pts, accel: accelPts, brake: brakePts };
+  }
 
   // T4: マーカーと進捗は走行中のみ
   // Axis 3: PAD_T=8, PAD_B=8 → speed=0 が baseline(y=PH3-8=52)に一致
@@ -595,7 +607,7 @@ function DriveMonitorScreen({
     : (robotState ?? '—');
   const isStoppingFlow = liveJob?.sample?.section === 'STOPPING';
   if (preStopRef.current.jobId !== (liveJob?.job_id ?? null)) preStopRef.current = { jobId: liveJob?.job_id ?? null, section: null, ref: null, dev: null };
-  const sectionTextNow = smp ? (smp.pattern || window.SECTION_LABEL?.[smp.section] || smp.section || '—') : '—';
+  const sectionTextNow = smp ? (sectionLabel || smp.pattern || window.SECTION_LABEL?.[smp.section] || smp.section || '—') : '—';
   if (liveJob && smp && !isStoppingFlow) preStopRef.current.section = sectionTextNow;
   const sectionText = isStoppingFlow ? (preStopRef.current.section ?? '—') : sectionTextNow;
   const timeText = (isDriving && !planWaitingOnly)
@@ -996,8 +1008,7 @@ function AutoDriveScreen() {
             prepareBody={activeModeId ? { kind: 'sequence', id: activeModeId, limit_s: devLimitS || null } : null}
             driveStopPath="/api/v1/drive/sequence/stop"
             confirmStartMessage={`シーケンス「${activeModeName ?? ''}」を開始しますか？`}
-            confirmStopMessage="シーケンスを止めますか？（走っている段を止め、残りの段は走らせません）"
-            stopLabel="シーケンス停止"
+            confirmStopMessage="走行を終了しますか？（走っている段を止め、残りの段は走らせません）"
             startedToastMessage="シーケンスを開始しました"
             progressLabel={activeModeName}
             resultPanel={summary} />

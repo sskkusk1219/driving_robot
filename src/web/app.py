@@ -176,6 +176,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # 非常停止（GPIO）→ JobManager.emergency（ランナーへ SIGINT。終わらなければ SIGKILL）
         gpio_monitor.register_emergency_callback(lambda: manager.emergency("switch"))
         await gpio_monitor.start_monitoring()
+        if gpio_monitor.is_emergency_active():
+            # 起動時にスイッチが押されたまま（または断線）。エッジが来ないので、ここで非常停止に入る（画面の非常停止と同じ扱い）
+            logging.getLogger(__name__).warning("起動時に非常停止スイッチが押されています（または断線）。非常停止に入ります")
+            await manager.emergency("switch")
     await ups_monitor.start_polling()
 
     task = asyncio.create_task(broadcast_loop(app))

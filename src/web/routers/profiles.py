@@ -65,6 +65,10 @@ async def list_profiles(store: Store) -> list[ProfileResponse]:
 
 @router.post("/", response_model=ProfileResponse, status_code=201)
 async def create_profile(req: ProfileCreateRequest, store: Store) -> ProfileResponse:
+    name = req.name.strip()
+    if any((i.name or "").strip() == name for i in store.list_all()):
+        # 同じ名前の車を作ると画面で見分けられない（ID だけ test_vehicle_2 のように変わって作られていた）
+        raise HTTPException(status_code=409, detail=f"車の名前「{name}」は既に使われています")
     values = req.model_dump(exclude={"name", "id"}, exclude_none=True)
     # 作成で渡せるのは雛形の仮値を置き換える数値（諸元・開度）だけ。走行抵抗などは作成後に更新で入れる
 
@@ -103,4 +107,8 @@ async def delete_profile(profile_id: str, store: Store, manager: Manager) -> Non
     current = manager.current
     if current is not None and current.spec.vehicle_id == profile_id:
         raise HTTPException(status_code=409, detail="この車のジョブが実行中のため削除できません")
+    if store.get_active() == profile_id:
+        raise HTTPException(
+            status_code=409, detail="選択中の車は削除できません。別の車を選んでから削除してください"
+        )
     store.delete(profile_id)

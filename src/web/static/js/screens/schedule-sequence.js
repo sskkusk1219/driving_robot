@@ -169,6 +169,7 @@ function ScheduleScreen() {
   const [mode, setMode] = useState('list'); // list | create | edit
   const [editTarget, setEditTarget] = useState(null);
   const [search, setSearch] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState(null); // 削除確認中の行
 
   const running = robotState === 'RUNNING';
   const selectedId = activeModeKind === 'schedule' ? activeModeId : null;
@@ -189,9 +190,9 @@ function ScheduleScreen() {
     window.showToast(`「${s.name}」を選択しました。自動運転ページで開始できます`, 'success');
   }
 
-  async function handleDelete(s) {
-    if (!confirm(`「${s.name}」を削除しますか？`)) return;
+  async function doDelete(s) {
     const r = await apiFetch('DELETE', `/api/v1/schedules/${s.id}`);
+    setConfirmDelete(null);
     if (r !== null) {
       window.showToast('スケジュールを削除しました', 'success');
       if (activeModeKind === 'schedule' && activeModeId === s.id) {
@@ -240,7 +241,7 @@ function ScheduleScreen() {
   );
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, height: '100%' }}>
+    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 14, height: '100%' }}>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <div style={{ flex: 1 }} />
@@ -302,7 +303,7 @@ function ScheduleScreen() {
                     onSelect={() => handleSelect(s)}
                     onEdit={running ? null : () => handleEdit(s)}
                     onCopy={() => handleCopy(s)}
-                    onDelete={running ? null : () => handleDelete(s)}
+                    onDelete={running ? null : () => setConfirmDelete(s)}
                   />
                 </div>
               );
@@ -310,6 +311,13 @@ function ScheduleScreen() {
           )}
         </div>
       </Box>
+      {confirmDelete && (
+        <window.ConfirmStopPopup
+          message={`「${confirmDelete.name}」を削除しますか？`}
+          onYes={() => doDelete(confirmDelete)}
+          onNo={() => setConfirmDelete(null)}
+        />
+      )}
     </div>
   );
 }
@@ -587,6 +595,7 @@ function SequenceScreen() {
   const [mode, setMode] = useState('list'); // list | create | edit
   const [editTarget, setEditTarget] = useState(null);
   const [search, setSearch] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState(null); // 削除確認中の行
 
   async function refresh() {
     setLoading(true);
@@ -597,9 +606,9 @@ function SequenceScreen() {
 
   useEffect(() => { refresh(); }, []);
 
-  async function handleDelete(s) {
-    if (!confirm(`「${s.name}」を削除しますか？`)) return;
+  async function doDelete(s) {
     const r = await window.apiFetch('DELETE', `/api/v1/sequences/${s.id}`);
+    setConfirmDelete(null);
     if (r !== null) {
       window.showToast('シーケンスを削除しました', 'success');
       if (activeModeKind === 'sequence' && activeModeId === s.id) {
@@ -697,13 +706,20 @@ function SequenceScreen() {
                 <div style={{ display: 'flex', gap: 6 }}>
                   <Btn primary={selectedId === s.id} disabled={s.has_missing} onClick={() => handleSelect(s)}>選択</Btn>
                   <Btn onClick={() => handleEdit(s)}>編集</Btn>
-                  <Btn danger onClick={() => handleDelete(s)}>削除</Btn>
+                  <Btn danger onClick={() => setConfirmDelete(s)}>削除</Btn>
                 </div>
               </div>
             ))
           )}
         </div>
       </Box>
+      {confirmDelete && (
+        <window.ConfirmStopPopup
+          message={`「${confirmDelete.name}」を削除しますか？`}
+          onYes={() => doDelete(confirmDelete)}
+          onNo={() => setConfirmDelete(null)}
+        />
+      )}
     </div>
   );
 }
