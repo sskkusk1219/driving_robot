@@ -1338,20 +1338,40 @@ pedal_search:
   # 決める時期: 段6 の実機で 1.6 が保てるか（保てなければ D1）
   hold_points_extra_kmh: [1.6]
 
-# ── 走行後の緩減速（手順 2 のパターン走行の後。停車保持まで） ────────────
-#   ブレーキの min − approach_margin_pct までは最高速度で動かし（減速は出ない）、そこから
-#   step_mm 踏む → dwell_s 待つ → 直近 slope_window_s の車速の傾きで減速度を判定する。
-#   目標 − margin 未満なら 1 刻み踏み増し、release_above_g を超えたときだけ 1 刻み戻す。
-#   踏み増しの上限は feedforward.stop_brake_offset_pct（停車保持開度＝ブレーキ min ＋ この量）。
+# ── 走行後の緩減速（走行の終わり・中断・非常停止。停車保持まで） ────────────
+#   2026-11-24（ProblemReport_20261124_停車の0.2G減速）: 0.1 s 周期の PI。
+#   ブレーキを効き始め（min ＋ 表の meta brake_onset_u_pct。表が無ければ min）まで最高速度で動かし、
+#   誤差 ＝ 目標 G − 測った減速 G、開度 ＝ 基準開度 ＋ Kp·誤差 ＋ (Kp/Ti)·∫誤差 dt。
+#   Kp [%/G] ＝ p_fraction ÷ 局所の効き k [G/%]、Ti ＝ ti_lag_multiple × ブレーキの遅れ。
+#   開度の枠は 効き始め〜最大開度。release_above_g を超えたら戻す側へ。停車したら step_mm 刻みで
+#   停車保持開度（feedforward.stop_brake_offset_pct）へ動かす。
 decel_stop:
-  target_decel_g: 0.2             # 目標減速度 [G]
-  press_margin_g: 0.02            # 目標 − これ 未満なら踏み増す [G]
-  release_above_g: 0.3            # これを超えたときだけ 1 刻み戻す [G]（vehicle.max_decel_g 以下）
-  step_mm: 0.5                    # 1 刻みの移動量 [mm]（0.5mm ≈ 0.53%）
-  dwell_s: 1.0                    # 1 刻みごとの待ち [s]（ブレーキ→減速の遅れ 0.3〜1.0s より長く）
-  slope_window_s: 1.0             # 減速度を出す車速の傾きの窓 [s]
-  approach_margin_pct: 1.0        # ブレーキの min の何 % 手前まで最高速度で動かすか [%]
+  target_decel_g: 0.2             # 目標減速度 [G]（ユーザー決定 2026-11-24）
+  release_above_g: 0.3            # これを超えたら PI の積分を止めて戻す側へ [G]（vehicle.max_decel_g 以下）
+  # 以下の 3 つは停車保持への刻み（停車後）と pattern_loop の惰行補助が使う。PI では使わない
+  press_margin_g: 0.02            # pattern_loop の惰行補助（coast_accel）の保持幅 [G]。停車の PI では未使用
+  step_mm: 0.5                    # 停車保持開度へ動かすときの 1 刻みの移動量 [mm]（0.5mm ≈ 0.53%）
+  dwell_s: 1.0                    # 未使用（停車の PI は 0.1 s 周期。互換のため残す）
+  slope_window_s: 1.0             # 減速度を出す車速の傾きの窓 [s]。FB の先読み Tp・保持 PI・惰行補助が使う（PI は下の pi_slope_window_s）
+  approach_margin_pct: 1.0        # pattern_loop の惰行補助が使う。停車の PI は効き始めまで動かすので未使用
   timeout_s: 60.0                 # これを超えても停車しなければエラー [s]
+  # 2026-11-24 PI の値（段1）。どれも仮値で、決める時期は段5 の実機（非常停止 C・D と学習の終わり）
+  # 減速度を測る窓 [s]: ユーザーが 0.5 s で決定（仮値）。0.1 s 差分は標準偏差 2〜3 km/h/s で目標 7 km/h/s に
+  # 大きい→均すのに必要な長さと遅れの短さの折り合い。slope_window_s は他の制御が使うので別のキーにした。
+  # 効く先: 減速度の測りの遅れ・ばらつき。踏んでは戻すが出たら長くする
+  pi_slope_window_s: 0.5
+  # P だけで誤差の何割を埋めるか: 仮値（データ由来ではない）。Kp ＝ これ ÷ 局所の効き k。
+  # 0.5 ＝ P 単独で誤差の半分。ブレーキの遅れ（0.3〜1.0 s）の間に踏みすぎないよう 1 未満。
+  # 効く先: 0.2G に届く速さと行き過ぎ
+  p_fraction: 0.5
+  # 表（pkl）が無いときの局所の効き [G/%]: 仮値。「強めの効き」を仮定＝Kp が小さく弱く踏む側
+  # （この車の実測値には頼らない。この車の効き始め以降の実測 約 0.065 G/% の 2 倍強）。
+  # 表があればその車速・開度の傾き × meta local_gain_brake で置き換わる。効く先: 表なしの車の踏み方
+  default_local_gain_g_per_pct: 0.15
+  # 表（meta dither_brake_lag_s）が無いときのブレーキの遅れ [s]: 仮値。長めに置く＝Ti が長く I が弱い側
+  default_lag_s: 1.0
+  # Ti ＝ これ × ブレーキの遅れ: C10 の I（Ti=4τ）と同じ。効く先: 偏りを消す速さ
+  ti_lag_multiple: 4.0
 
 # ── KPI（product-requirements.md のプライマリーKPI。合否判定に使う） ──
 kpi:

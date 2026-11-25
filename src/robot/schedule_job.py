@@ -43,7 +43,12 @@ from src.robot.core.hardware import (
 )
 from src.robot.core.pattern_drive import _overcurrent_limit_ma, _release_pedals
 from src.robot.core.research_types import VEHICLE_STOP_SPEED_KMH, DriveLogData
-from src.robot.core.stop_decel import PHASE_APPROACH, PHASE_STOP_HOLD, decelerate_to_stop
+from src.robot.core.stop_decel import (
+    PHASE_APPROACH,
+    PHASE_STOP_HOLD,
+    decelerate_to_stop,
+    load_brake_table,
+)
 from src.robot.core.term import say
 from src.robot.core.vehicle import build_vehicle_profile, opening_to_pulse
 from src.robot.schedule_spec import (
@@ -283,7 +288,9 @@ async def _finish_stopped(
         say(f"終端の車速 {speed:.2f} km/h: 緩減速で停車させます …")
         log.mark(SECTION_DECEL_TO_STOP, PHASE_APPROACH)
         log.start_sampler()
-        stop = await decelerate_to_stop(hw, cfg, build_vehicle_profile(cfg), log=log)
+        stop = await decelerate_to_stop(
+            hw, cfg, build_vehicle_profile(cfg), log=log, table=load_brake_table(cfg)
+        )
         say(f"停車保持: ブレーキ {stop.hold_pct:.2f}%")
         return
     hold_pct = cfg.stop_brake_opening_pct

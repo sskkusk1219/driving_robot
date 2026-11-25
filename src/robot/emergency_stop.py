@@ -22,6 +22,11 @@
 CAN を読めない:
     アクセルを原点へ → ブレーキを ``emergency.can_lost_press_s`` 秒（最小〜最大の通し）かけて最大開度まで
     刻んで踏む → 10 秒保つ → N → 離す → スタート 10 秒 → 原点復帰
+    刻みの 1 段ごと・保持中にも車速を読み直し、0.5 秒続けて読めたら戻ったとみなす（2026-11-24）:
+    止まっていれば刻み・保持を飛ばして N の確認（``_n_loop``）へ、動いていれば今の開度から 0.2G の PI
+    （core の decelerate_to_stop に start_pulse を渡す）で止めて ``_n_loop`` へ。PI の途中でまた読めなく
+    なったら、そのときの開度から刻みへ戻る。行き来は全体の時間に上限（``CAN_LOST_FLOW_LIMIT_S``）を置き、
+    超えたらそれ以後は読み直さず今までどおり最大開度・10 秒保持・N へ。ずっと読めないときは今までと同じ。
 アクチュエータの異常:
     ブレーキ軸の異常: 両軸をすぐ原点復帰 → スタート 10 秒。
     アクセル軸だけの異常: アクセルを原点へ戻し（戻せなくても進む）、ブレーキで上の流れ。
@@ -43,7 +48,7 @@ from src.robot.core import button_steps as core_button_steps
 from src.robot.core.button_servo import BUTTON_N, BUTTON_START
 from src.robot.core.mode_drive import standby_openings
 from src.robot.core.pre_drive_check import DIRECT_PRESS_SPEED_MM_S
-from src.robot.core.stop_decel import decelerate_to_stop, step_to_position
+from src.robot.core.stop_decel import decelerate_to_stop, load_brake_table
 from src.robot.core.term import say
 from src.robot.core.vehicle import build_vehicle_profile, opening_to_pulse, pulse_to_opening
 from src.robot.streaming_log import SAMPLE_INTERVAL_S
@@ -61,6 +66,15 @@ PROBE_RETRY_WAIT_S = 0.3
 CAN_LOST_STEP_DWELL_S = 0.5
 #: max まで踏んだ後に保つ秒数 [s]（CAN を読めないとき。車が止まるのを待つ）
 CAN_LOST_HOLD_S = 10.0
+#: CAN が戻ったとみなす「続けて読めた時間」[s]（ユーザー決定 2026-11-24）
+CAN_RECOVER_S = 0.5
+#: 読み直しの間隔 [s]（CAN は 10 Hz）
+CAN_PROBE_INTERVAL_S = 0.1
+#: 刻み ⇄ PI の行き来を含む CAN 断の流れ全体の上限 [s]。仮値（データ由来ではない）。
+#: 刻み 20 s（emergency.can_lost_press_s の既定）＋ 保持 10 s ＋ PI（decel_stop.timeout_s の既定 60 s）
+#: で 1 往復 90 s。2 往復ぶんを見て 180 s。超えたら読み直しをやめ、最大開度・10 秒保持・N へ進む
+#: （止める側に倒す）。効く先: CAN が出たり消えたりするときに流れが終わらないことの防止だけ
+CAN_LOST_FLOW_LIMIT_S = 180.0
 #: 停車確認の N を何段に分けるか（停車保持〜最大開度を 3 等分 → 開度は 4 つ）
 N_LEVELS = 4
 
@@ -330,13 +344,13 @@ async def _flow_body(hw: Any, reason: str) -> None:
         say("アクセル軸の異常: アクセルを原点復帰します（戻せなくても進みます）")
         await _try(hw.accel.home_return(), "アクセル原点復帰")
     if not diag.can_ok:
-        await _can_lost_flow(hw, cfg, accel_done=diag.accel_faulty)
+        await _can_lost_flow(hw, cfg, accel_done=diag.accel_faulty, accel_faulty=diag.accel_faulty)
         return
     stopped = (diag.speed_kmh or 0.0) <= cfg.buttons.no_speed_kmh
     if not stopped:
         outcome = await _decelerate(hw, cfg, accel_faulty=diag.accel_faulty)
         if outcome == "can_lost":
-            await _can_lost_flow(hw, cfg, accel_done=True)
+            await _can_lost_flow(hw, cfg, accel_done=True, accel_faulty=diag.accel_faulty)
             return
     else:
         if not diag.accel_faulty:
@@ -362,16 +376,30 @@ class _NoopAccel:
         return None
 
 
-async def _decelerate(hw: Any, cfg: Any, *, accel_faulty: bool = False) -> str:
-    """0.2G で停車させる。'ok' / 'timeout'（止まらず）/ 'can_lost'（途中で CAN が読めなくなった）。"""
+def _decel_target(hw: Any, accel_faulty: bool) -> Any:
+    """緩減速に渡す hw。アクセル軸が動かせないときは、ブレーキだけで止める（アクセルを何もしない置き物に）。"""
+    if not accel_faulty:
+        return hw
+    target = copy.copy(hw)
+    target.accel = _NoopAccel()
+    return target
+
+
+async def _decelerate(
+    hw: Any, cfg: Any, *, accel_faulty: bool = False, start_pulse: int | None = None
+) -> str:
+    """0.2G で停車させる。'ok' / 'timeout'（止まらず）/ 'can_lost'（途中で CAN が読めなくなった）。
+
+    start_pulse を渡すと、そのブレーキ位置（今の開度）から PI を始める（CAN が戻ったとき）。
+    表（FF モデルの pkl）が読めれば局所の効き・効き始めに使う（読めなければいちばん弱い既定）。
+    """
     _emit("decel", "0.2G で停車させます")
     say("走行中: アクセルを原点へ戻し、0.2G で停車させます")
     try:
-        target = hw
-        if accel_faulty:  # アクセル軸が動かせない。ブレーキだけで止める
-            target = copy.copy(hw)
-            target.accel = _NoopAccel()
-        await decelerate_to_stop(target, cfg, build_vehicle_profile(cfg))
+        await decelerate_to_stop(
+            _decel_target(hw, accel_faulty), cfg, build_vehicle_profile(cfg),
+            table=load_brake_table(cfg), start_pulse=start_pulse,
+        )
     except Exception as exc:  # noqa: BLE001
         say(f"  緩減速が最後までいきませんでした（{type(exc).__name__}: {exc}）")
         try:
@@ -497,28 +525,125 @@ async def _home_both(hw: Any) -> None:
     )
 
 
-async def _can_lost_flow(hw: Any, cfg: Any, *, accel_done: bool) -> None:
-    """CAN を読めない: max まで刻んで踏む → 10 秒保つ → N → 離す → スタート → 原点復帰。"""
+def _now() -> float:
+    """経過時間の時計 [s]（テストで差し替える）。"""
+    return asyncio.get_running_loop().time()
+
+
+class _RecoveryProbe:
+    """CAN 車速が戻ったかの判定: 続けて読めた時間が ``CAN_RECOVER_S`` 以上なら戻ったとみなす。"""
+
+    def __init__(self) -> None:
+        self._since: float | None = None
+        self.speed_kmh: float | None = None  # 直近に読めた車速
+
+    async def poll(self, hw: Any) -> bool:
+        """車速を 1 回読む。戻ったとみなせたら True。読めなければ連続を切る。"""
+        now = _now()
+        speed = await _read_speed(hw)
+        if speed is None:
+            self._since = None
+            return False
+        self.speed_kmh = speed
+        if self._since is None:
+            self._since = now
+        return now - self._since >= CAN_RECOVER_S
+
+
+async def _dwell(hw: Any, seconds: float, probe: _RecoveryProbe | None) -> bool:
+    """seconds 待つ。probe があれば待つ間 車速を読み直し、戻ったとみなせたら待ちを切り上げて True。"""
+    if probe is None:
+        await asyncio.sleep(seconds)
+        return False
+    end = _now() + seconds
+    while True:
+        if await probe.poll(hw):
+            return True
+        remaining = end - _now()
+        if remaining <= 0.0:
+            return False
+        await asyncio.sleep(min(CAN_PROBE_INTERVAL_S, remaining))
+
+
+async def _press_by_steps(
+    hw: Any, current: int, max_pulse: int, step_pulse: int, probe: _RecoveryProbe | None
+) -> tuple[int, bool]:
+    """current から max_pulse まで step_pulse ずつ踏む（1 段ごとに待つ。待つ間に車速を読み直す）。
+
+    戻り値: (最後に指令した位置, CAN が戻ったか)。踏む指令に失敗したら（今までと同じく）そこで刻みをやめる。
+    """
+    pos = current
+    while pos != max_pulse:
+        pos = min(max_pulse, pos + step_pulse)
+        try:
+            await hw.brake.move_to_position(pos, smooth_over_s=CAN_LOST_STEP_DWELL_S)
+        except Exception as exc:  # noqa: BLE001
+            say(f"  警告: ブレーキを刻んで踏むに失敗しました（{type(exc).__name__}: {exc}）")
+            return pos, False
+        if await _dwell(hw, CAN_LOST_STEP_DWELL_S, probe):
+            return pos, True
+    return pos, False
+
+
+async def _after_can_recovered(hw: Any, cfg: Any, pos: int, speed: float | None, accel_faulty: bool) -> str:
+    """CAN が戻ったときの続き。'done'（N の確認まで済んだ）/ 'can_lost'（PI の途中でまた読めなくなった）。
+
+    止まっていれば（no_speed_kmh 以下）刻み・保持を飛ばして N の確認へ。動いていれば今の開度から
+    0.2G の PI で止めて N の確認へ（PI が止まらず終わっても N の確認で深く踏む）。
+    """
+    no_speed = cfg.buttons.no_speed_kmh
+    if speed is not None and speed <= no_speed:
+        say(f"CAN 車速が戻りました（{speed:.2f} km/h ≦ {no_speed:g} km/h）: 刻み・保持を飛ばして N の確認へ進みます")
+        await _n_loop(hw, cfg)
+        return "done"
+    say(f"CAN 車速が戻りました（{'不明' if speed is None else f'{speed:.2f} km/h'}）: 今のブレーキ {pulse_to_opening(pos):.1f}% から 0.2G で停車させます")
+    outcome = await _decelerate(hw, cfg, accel_faulty=accel_faulty, start_pulse=pos)
+    if outcome == "can_lost":
+        return "can_lost"
+    await _n_loop(hw, cfg)
+    return "done"
+
+
+async def _can_lost_flow(hw: Any, cfg: Any, *, accel_done: bool, accel_faulty: bool = False) -> None:
+    """CAN を読めない: max まで刻んで踏む → 10 秒保つ → N → 離す → スタート → 原点復帰。
+
+    刻みの 1 段ごと・保持中に車速を読み直し、戻ったら止まっていれば N の確認へ、動いていれば今の開度から
+    0.2G の PI で止めて N の確認へ。PI の途中でまた読めなくなったら、そのときの開度から刻みへ戻る
+    （全体の時間は ``CAN_LOST_FLOW_LIMIT_S`` まで。超えたら読み直さず今までどおりに進める）。
+    """
+    started = _now()
     _emit("can_lost", "CAN 車速を読めません: ブレーキを刻んで最大開度まで踏みます")
     say("CAN 車速を読めません: アクセルを原点へ戻し、ブレーキを最大開度まで刻んで踏みます")
     if not accel_done:
         await _try(hw.accel.move_to_position(0), "アクセルを原点へ")
     min_pulse, _hold, max_pulse = _brake_pulses(cfg)
-    try:
-        current = await hw.brake.read_position()
-    except Exception:  # noqa: BLE001
-        current = min_pulse
-    span = max(1, max_pulse - min_pulse)
-    seconds = max(0.0, _can_lost_press_s * max(0, max_pulse - current) / span)
-    n_steps = max(1, math.ceil(seconds / CAN_LOST_STEP_DWELL_S))
-    step_pulse = max(1, math.ceil(max(0, max_pulse - current) / n_steps))
-    say(f"  ブレーキ {pulse_to_opening(current):.1f} → {pulse_to_opening(max_pulse):.1f}% を約 {seconds:.1f}s かけて踏みます")
-    await _try(
-        step_to_position(hw.brake, current, max_pulse, step_pulse=step_pulse, dwell_s=CAN_LOST_STEP_DWELL_S),
-        "ブレーキを刻んで踏む",
-    )
-    say(f"  最大開度で {CAN_LOST_HOLD_S:g}s 保ちます")
-    await asyncio.sleep(CAN_LOST_HOLD_S)
+    probe: _RecoveryProbe | None = _RecoveryProbe()
+    while True:
+        try:
+            current = await hw.brake.read_position()
+        except Exception:  # noqa: BLE001
+            current = min_pulse
+        span = max(1, max_pulse - min_pulse)
+        seconds = max(0.0, _can_lost_press_s * max(0, max_pulse - current) / span)
+        n_steps = max(1, math.ceil(seconds / CAN_LOST_STEP_DWELL_S))
+        step_pulse = max(1, math.ceil(max(0, max_pulse - current) / n_steps))
+        say(f"  ブレーキ {pulse_to_opening(current):.1f} → {pulse_to_opening(max_pulse):.1f}% を約 {seconds:.1f}s かけて踏みます")
+        pos, recovered = await _press_by_steps(hw, current, max_pulse, step_pulse, probe)
+        if not recovered:
+            say(f"  最大開度で {CAN_LOST_HOLD_S:g}s 保ちます")
+            recovered = await _dwell(hw, CAN_LOST_HOLD_S, probe)
+        if not recovered:
+            break
+        speed = probe.speed_kmh if probe is not None else None
+        if await _after_can_recovered(hw, cfg, pos, speed, accel_faulty) == "done":
+            return
+        # PI の途中でまた読めなくなった: そのときの開度から刻みへ戻る
+        _emit("can_lost", "CAN 車速をまた読めません: 今の開度から刻んで踏みます")
+        if _now() - started >= CAN_LOST_FLOW_LIMIT_S:
+            say(f"  CAN 断の流れが {CAN_LOST_FLOW_LIMIT_S:g}s を超えたので、車速の読み直しをやめて最大開度まで進めます")
+            probe = None
+        else:
+            probe = _RecoveryProbe()
     _emit("n_press", "最大開度で N を押します")
     await _try(core_button_steps.press_button(hw, cfg, BUTTON_N, cfg.buttons.shift_press_s), "N の押下")
     await _release_and_ign_off(hw, cfg)

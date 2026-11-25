@@ -1,13 +1,15 @@
-"""研究開発用ハーネス 走行後の緩減速（stop_decel.py）のユニットテスト。
+"""研究開発用ハーネス 走行後の緩減速（stop_decel.py。0.2G の PI）のユニットテスト。
 
-スタブ車両で、不感帯の手前まで一発で動かしてから 1 刻みずつ踏むこと、上限Gを超えたときだけ
-戻すこと、踏み増しの上限が最大開度（停車保持開度ではない）で、停車後は停車保持開度へ移すこと、停車しなければエラーになることを確かめる。
-スタブはブレーキ→減速の遅れが無いので、時間を縮めるため刻み 1mm・待ち 0.2s にしている
-（判定ロジックは既定と同じ）。惰行減速は小さい定数にして、ブレーキの効きだけで判定が動くようにする。
+スタブ車両で、効き始めへの接近・0.2G に近づくこと・0.3G 超えで戻すこと・最大開度で頭打ち・
+表が無いときの既定・途中の開度から始めること・停車保持開度へ移すこと・タイムアウトを確かめる。
+スタブはブレーキ→減速の遅れが無いので、時間を縮めるため減速度の窓を 0.3s にしている。
+惰行減速は小さい定数にして、ブレーキの効きだけで判定が動くようにする。
+スタブ車の G の値は合否に使わない（流れの確認だけ。範囲は広く取る）。
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,13 +19,12 @@ from tests.research import config as cfgmod
 from tests.research import hardware as hwmod
 from tests.research import stop_decel as sdmod
 from tests.research.pedal_search import PedalSearchResult
-from tests.research.research_types import VEHICLE_STOP_SPEED_KMH
+from tests.research.research_types import G_TO_KMHS, VEHICLE_STOP_SPEED_KMH
 from tests.research.vehicle import build_vehicle_profile, opening_to_pulse
 
 FAST = {
     "decel_stop.step_mm": 1.0,
-    "decel_stop.dwell_s": 0.2,
-    "decel_stop.slope_window_s": 0.2,
+    "decel_stop.pi_slope_window_s": 0.3,
 }
 # 2026-10-08 段2l-6: 触れた位置 min は yaml の vehicle.min_*_opening_pct（_tmp_cfg で書く）
 MIN_ACCEL_PCT = 6.3
@@ -34,8 +35,7 @@ PEDAL = PedalSearchResult(
     stop_brake_opening_pct=22.0,
 )
 STEP = 100  # 1mm [pulse]
-APPROACH = opening_to_pulse(MIN_BRAKE_PCT - 1.0)  # min − approach_margin_pct
-CEILING = opening_to_pulse(PEDAL.stop_brake_opening_pct)
+APPROACH = opening_to_pulse(MIN_BRAKE_PCT)  # 表なし ＝ 効き始めは min
 
 
 def _tmp_cfg(tmp_path: Path, **extra: float) -> cfgmod.ResearchConfig:
@@ -93,65 +93,160 @@ def test_decel_from_slope_is_least_squares() -> None:
     assert sdmod.decel_from_slope([(0.0, 10.0)]) == 0.0
 
 
-async def test_approaches_at_once_then_presses_one_step_at_a_time(tmp_path: Path) -> None:
+class _FakeTable:
+    """meta と accel だけ持つ表。accel(v, u) = slope × u（u はブレーキが負 ＝ 減速が負）。"""
+
+    def __init__(self, meta: dict, slope_kmhs_per_pct: float = 2.0) -> None:
+        self.meta = meta
+        self.slope = slope_kmhs_per_pct
+
+    def accel(self, v: float, u: float, **_: object) -> float:
+        return self.slope * u
+
+
+def test_local_gain_k_defaults_without_table_and_reads_table_slope() -> None:
+    assert sdmod.local_gain_k_g_per_pct(
+        None, 50.0, 10.0, min_pct=8.4, default_k=0.15) == 0.15
+    table = _FakeTable({"brake_onset_u_pct": 1.0})
+    k = sdmod.local_gain_k_g_per_pct(table, 50.0, 12.0, min_pct=8.4, default_k=0.15)
+    assert k == pytest.approx(2.0 / G_TO_KMHS)
+    # 表の傾きが 0 以下なら既定
+    flat = _FakeTable({}, slope_kmhs_per_pct=0.0)
+    assert sdmod.local_gain_k_g_per_pct(flat, 50.0, 12.0, min_pct=8.4, default_k=0.15) == 0.15
+
+
+def test_local_gain_k_multiplies_meta_local_gain_ratio() -> None:
+    entry = {
+        "speed_rep_kmh": [50.0], "u_from_onset_pct": [0.0, 5.0],
+        "ratio": [[2.0, 2.0]], "n": [[1, 1]],
+    }
+    table = _FakeTable({"brake_onset_u_pct": 1.0, "local_gain_brake": entry})
+    k = sdmod.local_gain_k_g_per_pct(table, 50.0, 12.0, min_pct=8.4, default_k=0.15)
+    assert k == pytest.approx(2.0 * 2.0 / G_TO_KMHS)
+
+
+async def test_without_table_approaches_min_and_stops_with_weakest_default(
+    tmp_path: Path,
+) -> None:
     cfg = _tmp_cfg(tmp_path)
-    hw = await _moving_stub(cfg, speed_kmh=20.0, brake_gain=1.5)
+    hw = await _moving_stub(cfg, speed_kmh=10.0, brake_gain=1.5)
     moves = _record_moves(hw.brake)  # type: ignore[arg-type]
 
     result = await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg))
 
-    # 不感帯の手前までは速度指定なし（最高速度）で一発
+    # 表なし: 効き始めは min。接近は速度指定なし（最高速度）で一発
     assert moves[0] == (APPROACH, None)
-    # その後は 1 刻みずつ踏み増すだけ（上限Gを超えないので戻さない）
-    positions = [pos for pos, _ in moves]
-    assert all(0 < b - a <= STEP for a, b in zip(positions, positions[1:], strict=False))
-    assert all(smooth is not None for _, smooth in moves[1:])
-    assert result.releases == 0
-    assert result.presses >= 1
+    ceiling = opening_to_pulse(build_vehicle_profile(cfg).max_brake_opening)
+    assert all(APPROACH <= pos <= ceiling for pos, _ in moves)
+    # 既定は「強めの効き」を仮定して弱く踏む（スタブより強い仮定）ので 0.3G は超えない
     assert result.max_decel_g < cfg.decel_stop.release_above_g
-    # 停車保持開度で止まっている
-    assert max(positions) == CEILING == hw.brake.position
+    assert hw.brake.position == opening_to_pulse(PEDAL.stop_brake_opening_pct)
     assert hw.accel.position == 0
     assert await hw.can.read_speed() < VEHICLE_STOP_SPEED_KMH
     await hwmod.shutdown(hw)
 
 
-async def test_releases_one_step_only_when_decel_exceeds_limit(tmp_path: Path) -> None:
-    # 1 刻みで約 0.18G 変わる強いブレーキ。0.25G を超えたら戻す
-    cfg = _tmp_cfg(tmp_path, **{"decel_stop.release_above_g": 0.25})
-    hw = await _moving_stub(cfg, speed_kmh=20.0, brake_gain=6.0)
+async def test_pi_approaches_target_g_with_table(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    hw = await _moving_stub(cfg, speed_kmh=25.0, brake_gain=1.5)
     moves = _record_moves(hw.brake)  # type: ignore[arg-type]
+    # スタブの効き（1.5 km/h/s per %）と同じ傾きの表・遅れ 0.25 s（Ti = 1 s）
+    table = _FakeTable({"dither_brake_lag_s": 0.25}, slope_kmhs_per_pct=1.5)
 
-    result = await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg))
+    result = await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg), table=table)
 
-    positions = [pos for pos, _ in moves]
-    deltas = [b - a for a, b in zip(positions, positions[1:], strict=False)]
-    assert result.releases >= 1
-    assert -STEP in deltas  # 戻すのは 1 刻みだけ
-    assert all(-STEP <= d <= STEP for d in deltas)
-    assert min(positions) == APPROACH  # 接近位置より浅くは戻さない
-    assert hw.brake.position == CEILING
+    pi_moves = moves[1:]
+    assert pi_moves
+    assert all(smooth is not None for _, smooth in pi_moves[:-1])  # 周期ごとの滑らかな指令
+    # 目標 0.2G に近づく（スタブの値は目安。0.3G は大きく超えない）
+    assert 0.12 < result.max_decel_g < 0.35
+    assert hw.brake.position == opening_to_pulse(PEDAL.stop_brake_opening_pct)
     assert await hw.can.read_speed() < VEHICLE_STOP_SPEED_KMH
     await hwmod.shutdown(hw)
 
 
-async def test_presses_beyond_hold_opening_then_returns_to_hold_after_stop(
-    tmp_path: Path,
-) -> None:
-    # 効きが弱く、停車保持開度では足りない。上限は最大開度なので、それより深く踏める。
-    # 停車したあとは、停車保持開度まで戻して終わる（2026-11-19 非常停止の変更 D）。
+async def test_approach_goes_to_onset_from_table_meta(tmp_path: Path) -> None:
     cfg = _tmp_cfg(tmp_path)
-    hw = await _moving_stub(cfg, speed_kmh=8.0, brake_gain=0.3)
+    hw = await _moving_stub(cfg, speed_kmh=12.0, brake_gain=1.5)
+    moves = _record_moves(hw.brake)  # type: ignore[arg-type]
+    table = _FakeTable({"brake_onset_u_pct": 2.0})
+
+    await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg), table=table)
+
+    assert moves[0] == (opening_to_pulse(MIN_BRAKE_PCT + 2.0), None)
+    # PI は効き始めより浅くは戻さない（枠の下限）
+    assert all(pos >= moves[0][0] for pos, _ in moves[:-1] if pos > 0)
+    await hwmod.shutdown(hw)
+
+
+async def test_starts_from_given_opening_without_reading_position(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)
+    hw = await _moving_stub(cfg, speed_kmh=12.0, brake_gain=1.5)
     moves = _record_moves(hw.brake)  # type: ignore[arg-type]
 
-    result = await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg))
+    async def must_not_read() -> int:
+        raise AssertionError("start_pulse があるのでブレーキ位置は読まない")
+
+    hw.brake.read_position = must_not_read  # type: ignore[method-assign]
+    start = opening_to_pulse(15.0)
+
+    await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg), start_pulse=start)
+
+    assert moves[0] == (start, None)  # 接近は飛ばして今の開度から
+    await hwmod.shutdown(hw)
+
+
+async def test_releases_when_decel_exceeds_limit(tmp_path: Path) -> None:
+    # 強く踏んだ位置（約 0.9G 相当）から始める。0.3G 超えなので PI は戻す側へ動く
+    cfg = _tmp_cfg(tmp_path)
+    hw = await _moving_stub(cfg, speed_kmh=60.0, brake_gain=1.5)
+    moves = _record_moves(hw.brake)  # type: ignore[arg-type]
+    start = opening_to_pulse(30.0)
+
+    result = await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg), start_pulse=start)
+
+    hold = opening_to_pulse(PEDAL.stop_brake_opening_pct)
+    pi_positions = [pos for pos, _ in moves[1:] if pos != hold]
+    assert min(pi_positions) < start  # 戻している
+    assert max(pi_positions) <= start  # 0.3G 超えの間は踏み増さない
+    assert result.max_decel_g > cfg.decel_stop.release_above_g
+    await hwmod.shutdown(hw)
+
+
+async def test_clamps_at_max_opening_and_does_not_wind_up(tmp_path: Path) -> None:
+    # ブレーキが効かない車。最大開度の近くから始めると、最大開度で頭打ちになり超えない
+    cfg = _tmp_cfg(tmp_path, **{"decel_stop.timeout_s": 2.0})
+    hw = await _moving_stub(cfg, speed_kmh=20.0, brake_gain=0.0)
+    moves = _record_moves(hw.brake)  # type: ignore[arg-type]
+    ceiling = opening_to_pulse(build_vehicle_profile(cfg).max_brake_opening)
+
+    with pytest.raises(hwmod.DriveError, match="停車しません"):
+        await sdmod.decelerate_to_stop(
+            hw, cfg, _profile(cfg), start_pulse=ceiling - 50
+        )
 
     positions = [pos for pos, _ in moves]
-    assert max(positions) > CEILING  # 停車保持開度を超えて踏んでいる
-    assert max(positions) <= opening_to_pulse(build_vehicle_profile(cfg).max_brake_opening)
-    assert positions[-1] == CEILING == hw.brake.position  # 停車後は停車保持開度へ戻す
-    assert result.hold_pct == PEDAL.stop_brake_opening_pct
-    assert await hw.can.read_speed() < VEHICLE_STOP_SPEED_KMH
+    assert max(positions) == ceiling == hw.brake.position
+    await hwmod.shutdown(hw)
+
+
+async def test_holds_opening_until_slope_window_is_filled(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path, **{"decel_stop.pi_slope_window_s": 0.6})
+    hw = await _moving_stub(cfg, speed_kmh=20.0, brake_gain=1.5)
+    moves = _record_moves(hw.brake)  # type: ignore[arg-type]
+    stamps: list[float] = []
+    original = hw.brake.move_to_position
+
+    async def stamped(pos: int, *, smooth_over_s: float | None = None) -> None:
+        stamps.append(asyncio.get_running_loop().time())
+        await original(pos, smooth_over_s=smooth_over_s)
+
+    hw.brake.move_to_position = stamped  # type: ignore[method-assign]
+    await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg))
+
+    # 接近の指令（1 本目）から PI の最初の指令（2 本目）まで、窓 0.6s は開度を保つ
+    assert len(moves) >= 2
+    assert stamps[1] - stamps[0] >= 0.55
     await hwmod.shutdown(hw)
 
 
@@ -174,3 +269,8 @@ async def test_raises_when_can_fails(tmp_path: Path) -> None:
     with pytest.raises(hwmod.DriveError, match="CAN 車速を読めません"):
         await sdmod.decelerate_to_stop(hw, cfg, _profile(cfg))
     await hwmod.shutdown(hw)
+
+
+def test_load_brake_table_is_none_without_model(tmp_path: Path) -> None:
+    cfg = _tmp_cfg(tmp_path)  # model_path は存在しない pkl
+    assert sdmod.load_brake_table(cfg) is None

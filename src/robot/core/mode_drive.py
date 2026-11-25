@@ -1,4 +1,4 @@
-# 移植元: tests/research/mode_drive.py（scripts/port_research.py が 2026-11-19 に写した。tests の commit 4c80595+未コミットの変更あり）。手で直さない  # noqa: E501
+# 移植元: tests/research/mode_drive.py（scripts/port_research.py が 2026-11-24 に写した。tests の commit 6e2de06+未コミットの変更あり）。手で直さない  # noqa: E501
 """手順 3: 走行モード管理の WLTP を FF だけで走り、車速追従を記録する（手順 5/7/9 で PID を足す）。
 
     基準車速 → FF（手順 2 のモデル）──┐
@@ -5309,7 +5309,10 @@ async def _finish_stopped(
         say(f"モード終了時の車速 {speed:.2f} km/h: 緩減速で停車させます …")
         log.mark(SECTION_DECEL_TO_STOP, PHASE_APPROACH)
         log.start_sampler()
-        stop = await decelerate_to_stop(hw, cfg, profile, log=log)
+        # 局所の効き・効き始めは走行に使った表（ForwardMapFeedforward）の meta から。
+        # 多項式モデルなど表が無いときは None（いちばん弱い既定で止める）
+        table = run.ff.table if isinstance(run.ff, ForwardMapFeedforward) else None
+        stop = await decelerate_to_stop(hw, cfg, profile, log=log, table=table)
         say(f"停車保持: ブレーキ {stop.hold_pct:.2f}%")
         return
     hold_pct = cfg.stop_brake_opening_pct  # min ＋ offset（max で頭打ち。段2l-7）
