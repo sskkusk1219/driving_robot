@@ -283,10 +283,9 @@ def _print_summary(cfg: ResearchConfig) -> None:
          f"{ps.creep_window_s:g}s 平均の傾き < {ps.creep_settle_kmhs:g} km/h/s・"
          f"最短 {ps.creep_settle_min_s:g}s・最大 {ps.creep_timeout_s:g}s"),
         ("走行後の緩減速",
-         f"目標 {cfg.decel_stop.target_decel_g:g}G（踏み増し < "
-         f"{cfg.decel_stop.target_decel_g - cfg.decel_stop.press_margin_g:g}G・戻し > "
-         f"{cfg.decel_stop.release_above_g:g}G）・{cfg.decel_stop.step_mm:g}mm 刻み・"
-         f"待ち {cfg.decel_stop.dwell_s:g}s"),
+         f"目標 {cfg.decel_stop.target_decel_g:g}G の PI（戻し > "
+         f"{cfg.decel_stop.release_above_g:g}G）・"
+         f"減速度の窓 {cfg.decel_stop.pi_slope_window_s:g}s・P {cfg.decel_stop.p_fraction:g}"),
         ("FF モデル", ff.model_path),
         ("FF モデル学習済み", "はい" if ff.is_model_trained else "いいえ（手順 2 で作成）"),
         ("FF カーブ同定済み", "はい" if ff.is_curves_identified else "いいえ（手順 2 で同定）"),

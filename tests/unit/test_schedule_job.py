@@ -47,7 +47,7 @@ def fast_decel(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """終端の緩減速（実時間で 20 秒かかる）を、呼ばれた車速を控えるだけの偽物に差し替える。本物は専用テストで通す。"""
     calls: list[float] = []
 
-    async def fake(hw: Any, cfg: Any, profile: Any, *, log: Any = None) -> Any:
+    async def fake(hw: Any, cfg: Any, profile: Any, *, log: Any = None, **kw: Any) -> Any:
         calls.append(await hw.can.read_speed())
         return SimpleNamespace(hold_pct=cfg.stop_brake_opening_pct)
 
@@ -103,10 +103,13 @@ async def test_end_of_schedule_decelerates_to_stop_with_real_core_function(
 ) -> None:
     """core の本物の decelerate_to_stop で、動いたまま終わった車が止まり停車保持になる（スタブ）。"""
     cfg = make_cfg(tmp_path)
-    cfg.decel_stop.dwell_s = 0.2
-    cfg.decel_stop.slope_window_s = 0.4
+    cfg.decel_stop.pi_slope_window_s = 0.3
     monkeypatch.setattr(schedule_job, "decelerate_to_stop", core_stop_decel.decelerate_to_stop)
     hw = await make_hw(cfg)
+    hw.can.vehicle.brake_gain_kmhs_per_pct = 6.0
+    # スタブの効き（6 km/h/s per %）と同じ傾きの表・遅れ 0.2 s（schedule_job は load_brake_table で表を読む）
+    table = SimpleNamespace(meta={"dither_brake_lag_s": 0.2}, accel=lambda v, u, **kw: 6.0 * u)
+    monkeypatch.setattr(schedule_job, "load_brake_table", lambda c: table)
     s = schedule([(0.0, 0.0, 0.0), (0.4, 30.0, 0.0), (0.8, 0.0, 0.0)])
     await schedule_job.run_schedule_drive(hw, cfg, s, log=FakeLog())  # type: ignore[arg-type]
     assert await hw.can.read_speed() < VEHICLE_STOP_SPEED_KMH

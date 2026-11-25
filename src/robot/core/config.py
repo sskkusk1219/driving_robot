@@ -1,4 +1,4 @@
-# 移植元: tests/research/config.py（scripts/port_research.py が 2026-11-19 に写した。tests の commit 4c80595+未コミットの変更あり）。手で直さない  # noqa: E501
+# 移植元: tests/research/config.py（scripts/port_research.py が 2026-11-24 に写した。tests の commit 6e2de06+未コミットの変更あり）。手で直さない  # noqa: E501
 """`config_testVehicle.yaml` の読み込み・検証・（コメント保持）保存。
 
 研究開発用ハーネス（`tests/research/main.py`）が参照する唯一の設定ソース。
@@ -660,6 +660,12 @@ class DecelStopSection:
     slope_window_s: float = 1.0
     approach_margin_pct: float = 1.0
     timeout_s: float = 60.0
+    # 2026-11-24 PI（ProblemReport_20261124_停車の0.2G減速）。値の根拠・効く先は yaml に書く
+    pi_slope_window_s: float = 0.5
+    p_fraction: float = 0.5
+    default_local_gain_g_per_pct: float = 0.15
+    default_lag_s: float = 1.0
+    ti_lag_multiple: float = 4.0
 
 
 @dataclass
@@ -2881,6 +2887,14 @@ def validate_config(cfg: ResearchConfig) -> list[str]:
     need(ds.slope_window_s > 0.0, "decel_stop.slope_window_s は正値")
     need(ds.approach_margin_pct >= 0.0, "decel_stop.approach_margin_pct は 0 以上")
     need(ds.timeout_s > 0.0, "decel_stop.timeout_s は正値")
+    need(ds.pi_slope_window_s > 0.0, "decel_stop.pi_slope_window_s は正値")
+    need(0.0 < ds.p_fraction <= 1.0, f"decel_stop.p_fraction は 0 超 1 以下: {ds.p_fraction}")
+    need(
+        ds.default_local_gain_g_per_pct > 0.0,
+        "decel_stop.default_local_gain_g_per_pct は正値",
+    )
+    need(ds.default_lag_s > 0.0, "decel_stop.default_lag_s は正値")
+    need(ds.ti_lag_multiple > 0.0, "decel_stop.ti_lag_multiple は正値")
 
     k = cfg.kpi
     need(k.max_abs_deviation_kmh > 0.0, "kpi.max_abs_deviation_kmh は正値")

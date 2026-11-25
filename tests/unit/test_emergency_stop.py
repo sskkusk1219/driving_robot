@@ -131,10 +131,14 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     events_seen: list[dict[str, Any]] = []
     monkeypatch.setattr(events, "emit", lambda t, **f: events_seen.append({"type": t, **f}))
 
+    clock = SimpleNamespace(t=0.0)  # 偽の時計。待ち（asyncio.sleep）の秒数だけ進む
+
     async def fast_sleep(s: float, *a: Any) -> None:
+        clock.t += max(0.0, s)
         await _real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(es, "_now", lambda: clock.t)
     monkeypatch.setattr(es, "CAN_LOST_HOLD_S", 0.0)
     monkeypatch.setattr(es, "PROBE_TIMEOUT_S", 1.0)
     monkeypatch.setattr(es, "PROBE_RETRY_WAIT_S", 0.0)
@@ -142,7 +146,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     cfg = _cfg(tmp_path, **{"buttons.ign_off_press_s": 10.0, "emergency.can_lost_press_s": 20.0})
     ctx = SimpleNamespace(config=cfg, pre_drive_checked=True)
     es.configure(ctx, enabled=True)
-    e = SimpleNamespace(cfg=cfg, ctx=ctx, events=events_seen, hw=None, stop_at_n=1, decel_stops=True, decel_calls=0, steps=[])
+    e = SimpleNamespace(cfg=cfg, ctx=ctx, events=events_seen, hw=None, stop_at_n=1, decel_stops=True, decel_calls=0, decel_kwargs=[], clock=clock)
 
     def attach(hw: Any) -> Any:
         e.hw = hw
@@ -161,6 +165,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 
         async def fake_decel(h: Any, c: Any, profile: Any, **kw: Any) -> Any:
             e.decel_calls += 1
+            e.decel_kwargs.append(kw)
             h.log.append(("decel",))
             h.accel.position = 0
             h.brake.position = opening_to_pulse(c.stop_brake_opening_pct)
@@ -168,21 +173,19 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
                 raise RuntimeError("緩減速で 60s 以内に停車しません")
             h.can.speed = 0.0
 
-        async def fake_step(axis: Any, start: int, target: int, *, step_pulse: int, dwell_s: float) -> int:
-            e.steps.append((start, target, step_pulse, dwell_s))
-            axis.position = target
-            axis.log.append(("brake", "stepped", target))
-            return target
-
         monkeypatch.setattr(button_steps, "press_button", fake_press)
         monkeypatch.setattr(button_steps, "set_brake", fake_set_brake)
         monkeypatch.setattr(es, "decelerate_to_stop", fake_decel)
-        monkeypatch.setattr(es, "step_to_position", fake_step)
         return hw
 
     e.attach = attach
     yield e
     es.reset()
+
+
+def _brake_steps(hw: Any) -> list[int]:
+    """CAN 断の刻みで指令したブレーキ位置の並び（move_to_position の記録）。"""
+    return [x[2] for x in hw.log if x[:2] == ("brake", "move")]
 
 
 def _presses(hw: Any) -> list[tuple[str, float]]:
@@ -253,12 +256,10 @@ async def test_can_lost_steps_to_max_then_n_release_start(env: Any) -> None:
     await es.run(hw, "CAN 車速を読めません")
     assert env.decel_calls == 0
     mx = opening_to_pulse(env.cfg.vehicle.max_brake_opening_pct)
-    assert len(env.steps) == 1
-    start, target, step_pulse, dwell = env.steps[0]
-    assert target == mx
+    steps = _brake_steps(hw)
+    assert steps[-1] == mx
     # 最小から最大までを 20 秒で踏む: 刻み数 × 刻みの待ち ≒ 20 秒
-    n_steps = -(-(mx - start) // step_pulse)
-    assert abs(n_steps * dwell - 20.0) <= 1.0
+    assert abs(len(steps) * es.CAN_LOST_STEP_DWELL_S - 20.0) <= 1.0
     kinds = [x[1] if x[0] == "press" else x[0] for x in hw.log if x[0] in ("press", "set_brake")]
     assert kinds == [BUTTON_N, "set_brake", BUTTON_START]
     assert ("brake", "home") in hw.log
@@ -270,9 +271,8 @@ async def test_can_lost_press_time_is_proportional_to_remaining(env: Any) -> Non
     min_p, _hold, mx = es._brake_pulses(env.cfg)  # noqa: SLF001
     hw.brake.position = (min_p + mx) // 2  # すでに半分踏んでいる
     await es.run(hw, "")
-    start, target, step_pulse, dwell = env.steps[0]
-    n_steps = -(-(target - start) // step_pulse)
-    assert abs(n_steps * dwell - 10.0) <= 1.0
+    steps = _brake_steps(hw)
+    assert abs(len(steps) * es.CAN_LOST_STEP_DWELL_S - 10.0) <= 1.0
 
 
 async def test_brake_axis_fault_homes_then_start(env: Any) -> None:
@@ -329,7 +329,7 @@ async def test_accel_fault_and_can_lost_goes_to_can_lost_flow(env: Any) -> None:
     hw = env.attach(_make_hw(speed=None))
     hw.accel.monitor_error = True
     await es.run(hw, "")
-    assert len(env.steps) == 1
+    assert _brake_steps(hw)[-1] == opening_to_pulse(env.cfg.vehicle.max_brake_opening_pct)
     assert [b for b, _ in _presses(hw)] == [BUTTON_N, BUTTON_START]
 
 
@@ -342,7 +342,7 @@ async def test_decel_fails_because_can_dropped_goes_to_can_lost(env: Any, monkey
 
     monkeypatch.setattr(es, "decelerate_to_stop", broken_decel)
     await es.run(hw, "")
-    assert len(env.steps) == 1  # 最大開度まで刻んで踏んだ
+    assert _brake_steps(hw)[-1] == opening_to_pulse(env.cfg.vehicle.max_brake_opening_pct)  # 最大開度まで刻んで踏んだ
     assert [b for b, _ in _presses(hw)] == [BUTTON_N, BUTTON_START]
 
 
@@ -354,7 +354,7 @@ async def test_decel_timeout_goes_to_n_loop(env: Any, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(es, "decelerate_to_stop", timeout_decel)
     await es.run(hw, "")
-    assert env.steps == []
+    assert _brake_steps(hw) == []
     assert [b for b, _ in _presses(hw)] == [BUTTON_N, BUTTON_START]
 
 
@@ -568,3 +568,122 @@ async def test_samples_stop_after_flow_ends(env: Any) -> None:
     for _ in range(5):
         await _real_sleep(0)
     assert len(_stopping_samples(env)) == n  # 流れが終わったあとは出ない
+
+
+# ── CAN 断の途中で車速が戻る（2026-11-24 ProblemReport_20261124_停車の0.2G減速 段3）──────────
+
+
+class ScriptedCan:
+    """偽の時計に沿って車速が読める・読めないを切り替える CAN。segments は (開始, 終了, 車速) の並び
+    （どれにも当たらない時刻は読めない）。N を押したら止まる（speed に 0.0 を入れる）。"""
+
+    def __init__(self, hw_log: list[Any], clock: Any, segments: list[tuple[float, float, float]]) -> None:
+        self.log = hw_log
+        self.clock = clock
+        self.segments = segments
+        self.forced: float | None = None
+
+    @property
+    def speed(self) -> float | None:
+        return self.forced if self.forced is not None else self._scripted()
+
+    @speed.setter
+    def speed(self, value: float | None) -> None:
+        self.forced = value
+
+    def _scripted(self) -> float | None:
+        for start, end, v in self.segments:
+            if start <= self.clock.t < end:
+                return v
+        return None
+
+    async def read_speed(self) -> float:
+        v = self.speed
+        if v is None:
+            raise TimeoutError("CAN 車速が更新されていません")
+        return v
+
+    async def close(self) -> None:
+        self.log.append(("can", "close"))
+
+
+def _scripted_hw(env: Any, segments: list[tuple[float, float, float]]) -> Any:
+    hw = _make_hw(speed=None)
+    hw.can = ScriptedCan(hw.log, env.clock, segments)
+    return env.attach(hw)
+
+
+async def test_can_recovers_while_stopped_skips_rest_of_steps_and_goes_to_n_loop(env: Any) -> None:
+    hw = _scripted_hw(env, [(3.0, 1e9, 0.0)])  # 3 秒後に戻る・止まっている
+    await es.run(hw, "")
+    full = opening_to_pulse(env.cfg.vehicle.max_brake_opening_pct)
+    steps = _brake_steps(hw)
+    assert steps and steps[-1] < full  # 刻みを途中でやめた（最大開度まで踏んでいない）
+    assert env.decel_calls == 0  # 止まっているので PI は走らない
+    # 0.5 秒続けて読めてから戻ったとみなす（3.0 秒の直後ではない）
+    assert env.clock.t >= 3.0 + es.CAN_RECOVER_S
+    assert [b for b, _ in _presses(hw)] == [BUTTON_N, BUTTON_START]
+    assert not es.brake_kept
+
+
+async def test_can_recovers_while_moving_runs_pi_from_current_opening(env: Any) -> None:
+    hw = _scripted_hw(env, [(3.0, 1e9, 25.0)])  # 3 秒後に戻る・走っている
+    await es.run(hw, "")
+    assert env.decel_calls == 1
+    start = env.decel_kwargs[0]["start_pulse"]
+    full = opening_to_pulse(env.cfg.vehicle.max_brake_opening_pct)
+    min_p, _hold, _mx = es._brake_pulses(env.cfg)  # noqa: SLF001
+    assert min_p < start < full  # 刻みの途中の開度から始める
+    assert [b for b, _ in _presses(hw)] == [BUTTON_N, BUTTON_START]
+    assert env.events and "decel" in _stages(env)
+
+
+async def test_can_flicker_shorter_than_recover_time_is_not_recovery(env: Any) -> None:
+    # 0.3 秒だけ読める（0.5 秒に満たない）→ 戻ったとみなさず、最大開度まで刻んで保つ今までの流れ
+    hw = _scripted_hw(env, [(3.0, 3.3, 25.0)])
+    await es.run(hw, "")
+    assert env.decel_calls == 0
+    assert _brake_steps(hw)[-1] == opening_to_pulse(env.cfg.vehicle.max_brake_opening_pct)
+    assert [b for b, _ in _presses(hw)] == [BUTTON_N, BUTTON_START]
+
+
+async def test_can_lost_again_during_pi_goes_back_to_steps_from_that_opening(env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    hw = _scripted_hw(env, [(3.0, 1e9, 25.0)])
+    deep = opening_to_pulse(20.0)
+    calls: list[int] = []
+
+    async def pi_then_can_lost(h: Any, c: Any, profile: Any, **kw: Any) -> Any:
+        calls.append(kw["start_pulse"])
+        if len(calls) == 1:
+            # PI の途中で CAN が途切れる（そのときの開度は deep）。2 秒後に止まって戻る
+            h.brake.position = deep
+            h.can.segments = [(env.clock.t + 2.0, 1e9, 0.0)]
+            raise RuntimeError("緩減速中に CAN 車速を読めません")
+        raise AssertionError("2 回目は止まっているので PI は走らない")
+
+    monkeypatch.setattr(es, "decelerate_to_stop", pi_then_can_lost)
+    await es.run(hw, "")
+    assert len(calls) == 1
+    steps = _brake_steps(hw)
+    assert deep < steps[-1] and all(p > deep for p in steps[steps.index(next(p for p in steps if p > deep)):])
+    assert _stages(env).count("can_lost") == 2  # 断 → PI → また断
+    assert [b for b, _ in _presses(hw)] == [BUTTON_N, BUTTON_START]
+
+
+async def test_can_flapping_is_bounded_by_total_time_limit(env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 戻る → PI で途切れる、を繰り返す CAN。全体の上限を超えたら読み直しをやめて最大開度・N へ進む
+    monkeypatch.setattr(es, "CAN_LOST_FLOW_LIMIT_S", 5.0)
+    hw = _scripted_hw(env, [(1.0, 1e9, 25.0)])
+    calls = 0
+
+    async def always_cut(h: Any, c: Any, profile: Any, **kw: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        h.can.segments = [(env.clock.t + 1.0, 1e9, 25.0)]  # 1 秒後にまた戻る（走っている）
+        raise RuntimeError("緩減速中に CAN 車速を読めません")
+
+    monkeypatch.setattr(es, "decelerate_to_stop", always_cut)
+    await es.run(hw, "")
+    assert 1 <= calls < 20  # 終わる
+    assert _brake_steps(hw)[-1] == opening_to_pulse(env.cfg.vehicle.max_brake_opening_pct)
+    assert [b for b, _ in _presses(hw)] == [BUTTON_N, BUTTON_START]
