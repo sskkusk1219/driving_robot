@@ -3,6 +3,7 @@
 //   車速グラフ / ペダル開度グラフ（ボタン押下の矩形つき） / 進捗（モードの全体進捗。学習は段階表示） /
 //   情報1行（左: 実車速・開度、中: 状態の 1 行、右: 「一時停止」（モード走行のみ）と「走行終了」）
 // 非常停止ボタンはこの画面に出さない。showRefLine=false（学習運転・スケジュール）は基準の線・カーブを出さない。
+// 枠4の基準/偏差の行は showDevLine（走行モード・シーケンス・スケジュールで出す。学習運転は出さない）。
 
 // ボタン（スタート・P・N・D）の色。ペダルの線（アクセル #78c8f0・ブレーキ #f07070）と区別する
 const BUTTON_COLORS = { start: '#b58cf0', P: '#e0b030', N: '#58d0b0', D: '#f090c0' };
@@ -57,6 +58,8 @@ function DriveMonitorScreen({
   showRefLine = true, profileMaxSpeed = null,
   // 枠3に全体進捗の図を出すか（既定は showRefLine と同じ。シーケンスは走行中の手順がモードのときだけ図を出す）
   showProgressFigure = showRefLine,
+  // 枠4の「基準 / 偏差」の行を出すか（既定は showRefLine と同じ。シーケンス・スケジュールは基準の線を出さないが、行は出す）
+  showDevLine = showRefLine,
   driveStartPath = '/api/v1/drive/start', driveStartBody = null,
   // 計画の事前作成つきの開始（自動運転画面だけ）。{kind, id, limit_s?}。null なら従来の開始（学習画面など）
   prepareBody = null,
@@ -782,7 +785,7 @@ function DriveMonitorScreen({
             <span style={{ fontSize: 12, color: INK_SOFT }}>km/h</span>
           </div>
           <div style={{ fontSize: 12, color: INK_SOFT, whiteSpace: 'nowrap', lineHeight: 1.5 }}>
-            {showRefLine && (
+            {showDevLine && (
               isStoppingFlow
                 ? (preStopRef.current.ref != null
                     ? `基準 ${preStopRef.current.ref.toFixed(1)} / 偏差 ${preStopRef.current.dev.toFixed(2)}`
@@ -791,7 +794,7 @@ function DriveMonitorScreen({
                 ? `基準 ${rd.ref_speed_kmh.toFixed(1)} / 偏差 ${(rd.actual_speed_kmh - rd.ref_speed_kmh).toFixed(2)}`
                 : '基準 — / 偏差 —'
             )}
-            {showRefLine && <br />}
+            {showDevLine && <br />}
             {`アクセル ${rd.accel_opening.toFixed(1)}% / ブレーキ ${rd.brake_opening.toFixed(1)}%`}
           </div>
         </Box>
@@ -1001,7 +1004,7 @@ function AutoDriveScreen() {
     <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         {isSequence ? (
-          <DriveMonitorScreen showRefLine={false} showProgressFigure={true} jobKind={jobKinds} seqMode={true}
+          <DriveMonitorScreen showRefLine={false} showProgressFigure={true} showDevLine={true} jobKind={jobKinds} seqMode={true}
             seqPreviewId={activeModeId}
             driveStartPath="/api/v1/drive/sequence/start"
             driveStartBody={activeModeId ? { sequence_id: activeModeId, ...(devLimitS ? { limit_s: devLimitS } : {}) } : null}
@@ -1013,7 +1016,7 @@ function AutoDriveScreen() {
             progressLabel={activeModeName}
             resultPanel={summary} />
         ) : isSchedule ? (
-          <DriveMonitorScreen showRefLine={false} jobKind="schedule"
+          <DriveMonitorScreen showRefLine={false} showDevLine={true} jobKind="schedule"
             driveStartPath="/api/v1/drive/schedule/start"
             driveStartBody={activeModeId ? { schedule_id: activeModeId } : null}
             prepareBody={activeModeId ? { kind: 'schedule', id: activeModeId, limit_s: null } : null}
